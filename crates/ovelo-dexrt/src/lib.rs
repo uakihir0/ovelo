@@ -71,6 +71,7 @@ pub struct Vm {
     defs: HashMap<u32, usize>,
     /// method_idx → host implementation (framework bridge).
     hosts: HashMap<u32, HostCall>,
+    hosts_named: HashMap<(String, String), HostCall>,
 }
 
 impl Vm {
@@ -93,6 +94,7 @@ impl Vm {
             defined,
             defs,
             hosts: HashMap::new(),
+            hosts_named: HashMap::new(),
         })
     }
 
@@ -129,6 +131,12 @@ impl Vm {
                 self.hosts.insert(midx, f.clone());
                 found = true;
             }
+        }
+        if found {
+            // A DEX may reference the same method through a subclass
+            // descriptor; fall back to (name, sig) in call_builtin.
+            self.hosts_named
+                .insert((name.to_string(), proto_desc.to_string()), f);
         }
         Ok(found)
     }
@@ -301,23 +309,51 @@ impl Vm {
         }
         let mut cur = sub;
         for _ in 0..64 {
-            let Some(def) = self.def_of(cur) else { break };
-            if def.interfaces_off != 0 {
-                if let Ok(list) = self.dex.type_list(def.interfaces_off) {
-                    if list.contains(&(sup as u16)) {
-                        return true;
+            match self.def_of(cur) {
+                Some(def) => {
+                    if def.interfaces_off != 0 {
+                        if let Ok(list) = self.dex.type_list(def.interfaces_off) {
+                            if list.contains(&(sup as u16)) {
+                                return true;
+                            }
+                        }
+                    }
+                    cur = def.superclass_idx;
+                    if cur == u32::MAX {
+                        break;
                     }
                 }
-            }
-            cur = def.superclass_idx;
-            if cur == u32::MAX {
-                break;
+                None => {
+                    // Host framework class — no class_def; walk the
+                    // builtin hierarchy instead.
+                    let Ok(desc) = self.dex.type_descriptor(cur) else { break };
+                    let Some(sup_desc) = Self::framework_super(&desc) else { break };
+                    match self.dex.type_index_of(sup_desc) {
+                        Ok(Some(next)) => cur = next,
+                        _ => break,
+                    }
+                }
             }
             if cur == sup {
                 return true;
             }
         }
         false
+    }
+
+    /// Superclass descriptor for a host-provided framework class (the
+    /// bridged widget tree; `None` at `Object`/unknown).
+    fn framework_super(d: &str) -> Option<&'static str> {
+        Some(match d {
+            "Landroid/view/ViewGroup;" => "Landroid/view/View;",
+            "Landroid/widget/LinearLayout;" => "Landroid/view/ViewGroup;",
+            "Landroid/widget/TextView;" => "Landroid/view/View;",
+            "Landroid/widget/Button;" => "Landroid/widget/TextView;",
+            "Landroid/app/Activity;" => "Landroid/content/ContextWrapper;",
+            "Landroid/content/ContextWrapper;" => "Landroid/content/Context;",
+            "Landroid/view/View;" | "Landroid/content/Context;" => "Ljava/lang/Object;",
+            _ => return None,
+        })
     }
 
     /// Known supers of builtin throwable descriptors.
@@ -500,8 +536,32 @@ impl Vm {
 
     /// Builtin method table: (class descriptor, name) — never silent success,
     /// only listed signatures are served. Registered host methods win.
+    /// Host stub lookup by `(name, proto)` — the DEX may reference a
+    /// framework method through a subclass descriptor the exact-midx
+    /// registration doesn't cover (e.g. `LSubAct;.setContentView`).
+    fn host_named(&self, midx: u32) -> Rt<Option<HostCall>> {
+        let mid = self.dex.method(midx).map_err(E::Vm)?;
+        let name = self.dex.string(mid.name_idx).map_err(E::Vm)?;
+        let p = self.dex.proto(mid.proto_idx as u32).map_err(E::Vm)?;
+        let mut sig = String::from("(");
+        for t in self.dex.proto_params(p).map_err(E::Vm)? {
+            sig.push_str(&self.dex.type_descriptor(t as u32).map_err(E::Vm)?);
+        }
+        sig.push(')');
+        sig.push_str(&self.dex.type_descriptor(p.return_type_idx).map_err(E::Vm)?);
+        Ok(self
+            .hosts_named
+            .get(&(name.to_string(), sig))
+            .cloned())
+    }
+
     fn call_builtin(&mut self, midx: u32, args: &[V]) -> Rt<Option<V>> {
-        if let Some(f) = self.hosts.get(&midx).cloned() {
+        let host = self
+            .hosts
+            .get(&midx)
+            .cloned()
+            .or(self.host_named(midx)?);
+        if let Some(f) = host {
             return f.borrow_mut()(self, args).map_err(E::Vm);
         }
         let mid = self.dex.method(midx).map_err(E::Vm)?;

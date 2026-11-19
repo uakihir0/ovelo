@@ -39,8 +39,11 @@ impl ViewRootImpl {
         }
     }
 
-    /// `setContentView` — attach and invalidate.
-    pub fn set_content_view(&mut self, v: Box<dyn Drawable>) {
+    /// `setContentView` — attach and invalidate. Re-attaching a
+    /// previously drawn (clean) view still marks it dirty, or the next
+    /// traversal would be skipped and the old frame kept.
+    pub fn set_content_view(&mut self, mut v: Box<dyn Drawable>) {
+        v.invalidate();
         self.content = Some(v);
     }
 
