@@ -13,6 +13,9 @@ use std::fmt;
 pub enum ErrorCategory {
     /// APK signature verification failed (v2/v3 scheme, signer mismatch).
     PkgSignature,
+    /// Package input rejected before install: malformed ZIP, traversal,
+    /// limits exceeded, unsupported container format.
+    PkgInvalid,
     /// DEX could not be verified or executed (bad header, unknown opcode,
     /// unimplemented semantics).
     DexUnsupported,
@@ -33,6 +36,7 @@ impl ErrorCategory {
     pub fn code(self) -> &'static str {
         match self {
             Self::PkgSignature => "PKG_SIGNATURE",
+            Self::PkgInvalid => "PKG_INVALID",
             Self::DexUnsupported => "DEX_UNSUPPORTED",
             Self::AbiSymbol => "ABI_SYMBOL",
             Self::GpuFeature => "GPU_FEATURE",
