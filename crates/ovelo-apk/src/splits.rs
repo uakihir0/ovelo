@@ -229,7 +229,7 @@ pub fn resolve_splits<'m>(members: &'m [SplitMember], profile: &DeviceProfile) -
     for m in members {
         match &m.kind {
             SplitKind::Base | SplitKind::Feature(_) => picked.push(m),
-            SplitKind::Abi(a) => {
+            SplitKind::Abi(_) => {
                 // `universal` ranks after every listed ABI but still
                 // serves as the fallback when nothing specific matches.
                 let rank = |s: &SplitMember| {
