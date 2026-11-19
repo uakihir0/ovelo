@@ -246,6 +246,13 @@ fn bidi_runs(text: &str) -> Vec<(std::ops::Range<usize>, bool)> {
     out
 }
 
+/// NFC-compose `s` (canonical composition: a base char plus its
+/// combining marks folds into the precomposed form where one exists).
+fn nfc_str(s: &str) -> String {
+    use unicode_normalization::UnicodeNormalization;
+    s.nfc().collect()
+}
+
 /// Mark/ZWJ chars that must stay in their base char's font run (the
 /// common combining blocks — enough for cluster-joined shaping).
 fn is_combining(c: char) -> bool {
@@ -327,8 +334,15 @@ impl FontSet {
             return None;
         }
         let mut out = Vec::new();
-        for (range, fi, rtl) in self.itemize(text, size_px) {
-            self.shape_subrun(&text[range], fi, rtl, size_px, &mut out);
+        for (range, fi, rtl, compose) in self.itemize(text, size_px) {
+            let owned;
+            let sub: &str = if compose {
+                owned = nfc_str(&text[range]);
+                &owned
+            } else {
+                &text[range]
+            };
+            self.shape_subrun(sub, fi, rtl, size_px, &mut out);
         }
         Some(out)
     }
@@ -337,30 +351,57 @@ impl FontSet {
     /// maximal consecutive same-font sub-runs emitted in visual order
     /// (reversed inside RTL runs). Combining marks stay with their base
     /// char's font run so they keep anchor context. Returns
-    /// `(byte range in text, font index, rtl)` per sub-run.
+    /// `(byte range in text, font index, rtl, compose)` per sub-run —
+    /// `compose` flags runs whose text must be NFC-composed before
+    /// shaping (the run's font covers the precomposed form but not the
+    /// bare mark).
     fn itemize(
         &self,
         text: &str,
         size_px: f32,
-    ) -> Vec<(std::ops::Range<usize>, Option<usize>, bool)> {
+    ) -> Vec<(std::ops::Range<usize>, Option<usize>, bool, bool)> {
         let mut out = Vec::new();
         for (run, rtl) in bidi_runs(text) {
             let base = run.start;
             let sub = &text[run];
-            let mut segs: Vec<(std::ops::Range<usize>, Option<usize>)> = Vec::new();
+            let mut segs: Vec<(std::ops::Range<usize>, Option<usize>, bool)> =
+                Vec::new();
             let mut start = 0usize;
             let mut cur: Option<usize> = None;
             let mut started = false;
+            let mut compose = false;
             for (b, c) in sub.char_indices() {
                 if is_combining(c) && started {
-                    // A mark joins the run only when the current font
-                    // covers it — or nothing does. A mark another font
-                    // covers splits off: shaped in the base font it
-                    // would rasterize as .notdef instead of its glyph.
+                    // A mark joins the run when the current font covers
+                    // it. Otherwise prefer NFC: when composing the run
+                    // with the mark yields chars the current font covers
+                    // (e.g. a precomposed form), keep it and compose at
+                    // shape time so the accent lands on the base glyph
+                    // rather than drawing as .notdef or splitting off to
+                    // another font without anchor context.
                     let covered_here = cur.is_some_and(|i| {
                         self.fonts[i].advance_for(c, size_px).is_some()
                     });
-                    if covered_here || self.font_index_for(c, size_px).is_none() {
+                    if covered_here {
+                        continue;
+                    }
+                    if cur.is_some_and(|i| {
+                        let mut scratch =
+                            String::with_capacity(b - start + c.len_utf8());
+                        scratch.push_str(&sub[start..b]);
+                        scratch.push(c);
+                        let comp = nfc_str(&scratch);
+                        comp != scratch
+                            && comp
+                                .chars()
+                                .all(|cc| self.fonts[i].advance_for(cc, size_px).is_some())
+                    }) {
+                        compose = true;
+                        continue;
+                    }
+                    if self.font_index_for(c, size_px).is_none() {
+                        // Nothing covers the mark: keep it with the base
+                        // char (it draws as .notdef either way).
                         continue;
                     }
                 }
@@ -369,19 +410,20 @@ impl FontSet {
                     cur = fi;
                     started = true;
                 } else if fi != cur {
-                    segs.push((start..b, cur));
+                    segs.push((start..b, cur, compose));
                     start = b;
                     cur = fi;
+                    compose = false;
                 }
             }
             if started {
-                segs.push((start..sub.len(), cur));
+                segs.push((start..sub.len(), cur, compose));
             }
             if rtl {
                 segs.reverse();
             }
-            for (r, fi) in segs {
-                out.push((base + r.start..base + r.end, fi, rtl));
+            for (r, fi, comp) in segs {
+                out.push((base + r.start..base + r.end, fi, rtl, comp));
             }
         }
         out
@@ -458,11 +500,12 @@ impl FontSet {
     }
 
     /// Per-char advances for `text`, itemized the same way
-    /// [`FontSet::shaped_run`] draws it: each bidi/font sub-run is shaped
-    /// by its own font, cluster advances land on the cluster's leading
-    /// char, other members take 0, and a font that can't produce shaped
-    /// glyphs falls back to per-char advances (what shape_subrun draws)
-    /// — so measured width equals drawn width.
+    /// [`FontSet::shaped_run`] draws it: each bidi/font sub-run is
+    /// NFC-composed and shaped by its own font, cluster advances land
+    /// on the cluster's leading original char, other members take 0,
+    /// and a font that can't produce shaped glyphs falls back to
+    /// per-char advances (what shape_subrun draws) — so measured width
+    /// equals drawn width.
     pub fn char_advances(&self, text: &str, size_px: f32) -> Vec<f32> {
         let mut byte_to_ci = vec![usize::MAX; text.len() + 1];
         let chars: Vec<(usize, char)> = text.char_indices().collect();
@@ -471,52 +514,129 @@ impl FontSet {
         }
         let n = chars.len();
         let mut out: Vec<Option<f32>> = vec![None; n];
-        for (range, fi, _rtl) in self.itemize(text, size_px) {
-            let sub = &text[range.clone()];
-            let Some(i) = fi else { continue };
-            // Shape only when the font can also draw the shaped run;
-            // shape_subrun's per-char fallback measures advance_for.
-            match if self.fonts[i].can_shape_glyphs() {
-                self.fonts[i].shaped_advances(sub, size_px)
+        for (range, fi, _rtl, compose) in self.itemize(text, size_px) {
+            let orig = &text[range.clone()];
+            let owned;
+            let sub: &str = if compose {
+                owned = nfc_str(orig);
+                &owned
             } else {
-                None
-            } {
-                Some(glyphs) => {
-                    let mut leaders: Vec<usize> = Vec::new();
-                    let mut sums: std::collections::HashMap<usize, f32> =
-                        std::collections::HashMap::new();
-                    for (byte, adv) in glyphs {
-                        let ci = byte_to_ci
-                            .get(range.start + byte)
-                            .copied()
-                            .unwrap_or(usize::MAX);
-                        if ci >= n {
-                            continue;
+                orig
+            };
+            // Advances per composed char first.
+            let cchars: Vec<char> = sub.chars().collect();
+            let mut comp_adv: Vec<Option<f32>> = vec![None; cchars.len()];
+            if let Some(i) = fi {
+                // Shape only when the font can also draw the shaped
+                // run; shape_subrun's per-char fallback measures
+                // advance_for.
+                match if self.fonts[i].can_shape_glyphs() {
+                    self.fonts[i].shaped_advances(sub, size_px)
+                } else {
+                    None
+                } {
+                    Some(glyphs) => {
+                        let mut byte_to_cci = vec![usize::MAX; sub.len() + 1];
+                        for (cci, (b, _)) in sub.char_indices().enumerate() {
+                            byte_to_cci[b] = cci;
                         }
-                        if !sums.contains_key(&ci) {
-                            leaders.push(ci);
+                        let mut leaders: Vec<usize> = Vec::new();
+                        let mut sums: std::collections::HashMap<usize, f32> =
+                            std::collections::HashMap::new();
+                        for (byte, adv) in glyphs {
+                            let cci = byte_to_cci
+                                .get(byte)
+                                .copied()
+                                .unwrap_or(usize::MAX);
+                            if cci >= cchars.len() {
+                                continue;
+                            }
+                            if !sums.contains_key(&cci) {
+                                leaders.push(cci);
+                            }
+                            *sums.entry(cci).or_insert(0.0) += adv;
                         }
-                        *sums.entry(ci).or_insert(0.0) += adv;
-                    }
-                    leaders.sort_unstable();
-                    for (k, &ci) in leaders.iter().enumerate() {
-                        out[ci] = Some(sums[&ci]);
-                        let end = leaders
-                            .get(k + 1)
-                            .copied()
-                            .unwrap_or_else(|| byte_to_ci[range.end].min(n));
-                        for m in ci + 1..end {
-                            if self.fonts[i].advance_for(chars[m].1, size_px).is_some() {
-                                out[m] = Some(0.0);
+                        leaders.sort_unstable();
+                        for (k, &cci) in leaders.iter().enumerate() {
+                            comp_adv[cci] = Some(sums[&cci]);
+                            let end = leaders
+                                .get(k + 1)
+                                .copied()
+                                .unwrap_or(cchars.len());
+                            for m in cci + 1..end {
+                                if self.fonts[i]
+                                    .advance_for(cchars[m], size_px)
+                                    .is_some()
+                                {
+                                    comp_adv[m] = Some(0.0);
+                                }
                             }
                         }
                     }
+                    None => {
+                        for (cci, &c) in cchars.iter().enumerate() {
+                            comp_adv[cci] = self.fonts[i].advance_for(c, size_px);
+                        }
+                    }
                 }
-                None => {
-                    for (b, c) in sub.char_indices() {
-                        let ci = byte_to_ci[range.start + b];
-                        if ci < n {
-                            out[ci] = self.fonts[i].advance_for(c, size_px);
+            }
+            // Expand onto the original chars: split `orig` into
+            // base+marks clusters — each maps to a fixed span of
+            // composed chars — and land the span's summed advance on
+            // the cluster's first original char.
+            let mut spans: Vec<(usize, usize, usize, usize)> = Vec::new();
+            {
+                let mut byte0 = 0usize; // cluster start byte in `orig`
+                let mut start_ci = 0usize; // cluster start, orig chars
+                let mut olen = 0usize; // orig chars in the cluster
+                let mut cs = 0usize; // composed chars consumed
+                for (ci, (b, c)) in orig.char_indices().enumerate() {
+                    if is_combining(c) && olen > 0 {
+                        olen += 1;
+                        continue;
+                    }
+                    if olen > 0 {
+                        let clen = if compose {
+                            nfc_str(&orig[byte0..b]).chars().count()
+                        } else {
+                            olen
+                        };
+                        spans.push((start_ci, olen, cs, clen));
+                        cs += clen;
+                    }
+                    byte0 = b;
+                    start_ci = ci;
+                    olen = 1;
+                }
+                if olen > 0 {
+                    let clen = if compose {
+                        nfc_str(&orig[byte0..]).chars().count()
+                    } else {
+                        olen
+                    };
+                    spans.push((start_ci, olen, cs, clen));
+                }
+            }
+            let base_ci = byte_to_ci
+                .get(range.start)
+                .copied()
+                .unwrap_or(usize::MAX);
+            for &(os, ol, cs, cl) in &spans {
+                let mut total = 0f32;
+                let mut any = false;
+                for v in comp_adv[cs..(cs + cl).min(comp_adv.len())]
+                    .iter()
+                    .flatten()
+                {
+                    total += v;
+                    any = true;
+                }
+                if any && base_ci < n {
+                    let g = base_ci + os;
+                    out[g] = Some(total);
+                    for m in 1..ol {
+                        if g + m < n {
+                            out[g + m] = Some(0.0);
                         }
                     }
                 }
@@ -606,5 +726,77 @@ mod tests {
         let drawn: f32 = run.iter().map(|g| g.x_adv).sum();
         let measured: f32 = fs.char_advances("fi", 16.0).iter().sum();
         assert!((drawn - measured).abs() < 0.01, "{drawn} vs {measured}");
+    }
+
+    /// A mark the base font doesn't cover must not split off to its own
+    /// font when the base font covers the NFC precomposed form — the
+    /// run composes before shaping so the accent lands on the glyph.
+    #[test]
+    fn mark_joins_base_run_via_nfc_composition() {
+        struct Fake {
+            covered: &'static [char],
+        }
+        impl GlyphSource for Fake {
+            fn name(&self) -> &str {
+                "fake"
+            }
+            fn advance_for(&self, c: char, _s: f32) -> Option<f32> {
+                self.covered.contains(&c).then_some(5.0)
+            }
+            fn ascent(&self, _s: f32) -> f32 {
+                8.0
+            }
+            fn descent(&self, _s: f32) -> f32 {
+                2.0
+            }
+            fn shaped_glyphs(
+                &self,
+                text: &str,
+                _rtl: bool,
+                _s: f32,
+            ) -> Option<Vec<ShapedGlyph>> {
+                Some(
+                    text.chars()
+                        .map(|_| ShapedGlyph {
+                            bmp: GlyphBmp {
+                                xmin: 0,
+                                ymin: 0,
+                                w: 0,
+                                h: 0,
+                                cov: Vec::new(),
+                            },
+                            x_adv: 5.0,
+                            x_off: 0.0,
+                            y_off: 0.0,
+                        })
+                        .collect(),
+                )
+            }
+            fn can_shape_glyphs(&self) -> bool {
+                true
+            }
+            fn shaped_advances(&self, text: &str, _s: f32) -> Option<Vec<(usize, f32)>> {
+                Some(
+                    text.char_indices()
+                        .map(|(b, _)| (b, 5.0))
+                        .collect(),
+                )
+            }
+        }
+        // Base font covers 'e' and precomposed 'é' but NOT the mark;
+        // second font covers the mark alone.
+        let base = Fake {
+            covered: &['e', '\u{E9}'],
+        };
+        let mut fs = FontSet::new();
+        fs.push(Box::new(base));
+        fs.push(Box::new(Fake {
+            covered: &['\u{301}'],
+        }));
+        let run = fs.shaped_run("e\u{301}", 16.0).expect("run");
+        // One composed glyph ("é") from the base font, not e+mark split.
+        assert_eq!(run.len(), 1);
+        // Measured: the composed width lands on 'e', the mark takes 0.
+        assert_eq!(fs.char_advances("e\u{301}", 16.0), vec![5.0, 0.0]);
     }
 }
