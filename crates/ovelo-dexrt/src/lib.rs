@@ -236,15 +236,36 @@ impl Vm {
         E::Throw(h)
     }
 
-    /// Run `<clinit>` once per class (reentrancy-safe).
+    /// Run `<clinit>` once per class, superclass first (reentrancy-safe).
+    /// `clinit` states: 0 = new, 1 = running, 2 = done, 3 = failed.
     fn ensure_init(&mut self, class_idx: u32) -> Rt<()> {
         let rt = self.classes.entry(class_idx).or_default();
         match rt.clinit {
             2 => return Ok(()),
             1 => return Ok(()), // recursive init: in progress
+            3 => {
+                return Err(self.throw_builtin(
+                    "Ljava/lang/NoClassDefFoundError;",
+                    "class initialization previously failed",
+                ))
+            }
             _ => {}
         }
         self.classes.get_mut(&class_idx).unwrap().clinit = 1;
+        let fail = |this: &mut Self, e: E| -> Rt<()> {
+            this.classes.get_mut(&class_idx).unwrap().clinit = 3;
+            Err(e)
+        };
+        // Superclasses initialize before their subclasses.
+        let sup = self
+            .def_of(class_idx)
+            .map(|d| d.superclass_idx)
+            .unwrap_or(u32::MAX);
+        if sup != u32::MAX && sup != class_idx {
+            if let Err(e) = self.ensure_init(sup) {
+                return fail(self, e);
+            }
+        }
         let cd = match self.class_data_of(class_idx) {
             Ok(cd) => cd,
             Err(_) => {
@@ -256,10 +277,12 @@ impl Vm {
             for m in &cd.direct_methods {
                 let mid = self.dex.method(m.method_idx).map_err(E::Vm)?;
                 if self.dex.string(mid.name_idx).map_err(E::Vm)? == "<clinit>" {
-                    self.exec(Loc {
+                    if let Err(e) = self.exec(Loc {
                         class_idx,
                         em: *m,
-                    }, Vec::new())?;
+                    }, Vec::new()) {
+                        return fail(self, e);
+                    }
                     break;
                 }
             }
