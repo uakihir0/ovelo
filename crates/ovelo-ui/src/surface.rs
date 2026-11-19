@@ -59,12 +59,18 @@ pub struct Surface {
     clips: Vec<Rect>,
 }
 
+/// `Surface::new`'s size rule, checked without allocating.
+pub(crate) fn check_size(w: usize, h: usize) -> Result<()> {
+    if w == 0 || h == 0 || w > 16384 || h > 16384 {
+        return Err(err("ui.surface.size"));
+    }
+    Ok(())
+}
+
 impl Surface {
     /// New transparent `w`×`h` surface.
     pub fn new(w: usize, h: usize) -> Result<Self> {
-        if w == 0 || h == 0 || w > 16384 || h > 16384 {
-            return Err(err("ui.surface.size"));
-        }
+        check_size(w, h)?;
         Ok(Self {
             w,
             h,
