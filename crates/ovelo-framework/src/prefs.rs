@@ -32,6 +32,13 @@ pub enum PrefValue {
     StrSet(HashSet<String>),
 }
 
+/// Maximum prefs file size we will read — far above any real usage; a
+/// tampered or corrupt oversized file is treated as absent rather than
+/// exhausting the worker's memory.
+const MAX_PREFS_FILE: u64 = 4 * 1024 * 1024;
+/// Maximum entries parsed from one document.
+const MAX_PREFS_ENTRIES: usize = 10_000;
+
 /// An editor-backed key/value store with XML persistence.
 pub struct SharedPreferences {
     path: PathBuf,
@@ -43,10 +50,14 @@ pub struct SharedPreferences {
 impl SharedPreferences {
     /// Open (or lazily create) the store at `path`.
     pub fn open(path: PathBuf) -> Self {
-        let map = std::fs::read_to_string(&path)
-            .ok()
-            .map(|s| parse_map(&s))
-            .unwrap_or_default();
+        let map = match std::fs::metadata(&path) {
+            Ok(m) if m.len() > MAX_PREFS_FILE => HashMap::new(),
+            Ok(_) => std::fs::read_to_string(&path)
+                .ok()
+                .map(|s| parse_map(&s))
+                .unwrap_or_default(),
+            Err(_) => HashMap::new(),
+        };
         Self {
             path,
             map,
@@ -222,6 +233,7 @@ fn write_map(map: &HashMap<String, PrefValue>) -> String {
 fn parse_map(s: &str) -> HashMap<String, PrefValue> {
     let mut out = HashMap::new();
     let mut rest = s;
+    let mut entries = 0usize;
     while let Some(i) = rest.find('<') {
         let end = match rest[i..].find('>') {
             Some(j) => i + j,
@@ -238,6 +250,10 @@ fn parse_map(s: &str) -> HashMap<String, PrefValue> {
         let name = it.next().unwrap_or("");
         match name {
             "int" | "long" | "float" | "boolean" => {
+                entries += 1;
+                if entries > MAX_PREFS_ENTRIES {
+                    break;
+                }
                 if let (Some(key), Some(val)) = (attr(tag_body, "name"), attr(tag_body, "value")) {
                     let v = match name {
                         "int" => val.parse::<i32>().ok().map(PrefValue::Int),
@@ -251,6 +267,10 @@ fn parse_map(s: &str) -> HashMap<String, PrefValue> {
                 }
             }
             "string" => {
+                entries += 1;
+                if entries > MAX_PREFS_ENTRIES {
+                    break;
+                }
                 if let Some(key) = attr(tag_body, "name") {
                     // <string name="k">text</string>
                     let text_start = end + 1;
@@ -264,6 +284,10 @@ fn parse_map(s: &str) -> HashMap<String, PrefValue> {
                 }
             }
             "set" => {
+                entries += 1;
+                if entries > MAX_PREFS_ENTRIES {
+                    break;
+                }
                 if let Some(key) = attr(tag_body, "name") {
                     let text_start = end + 1;
                     if let Some(c) = rest[text_start..].find("</set>") {
