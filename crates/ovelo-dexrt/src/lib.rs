@@ -1096,9 +1096,9 @@ impl Vm {
     /// int binary op with a literal operand (lit16/lit8 families).
     fn binop_lit(&mut self, op: u8, b: i32, lit: i32) -> Rt<i32> {
         Ok(match op {
-            0xd0 => b.wrapping_add(lit),
-            0xd1 => lit.wrapping_sub(b),
-            0xd2 => b.wrapping_mul(lit),
+            0xd0 | 0xd8 => b.wrapping_add(lit),
+            0xd1 | 0xd9 => lit.wrapping_sub(b),
+            0xd2 | 0xda => b.wrapping_mul(lit),
             0xd3 | 0xdb => {
                 if lit == 0 {
                     return Err(self.throw_builtin(
