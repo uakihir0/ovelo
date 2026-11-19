@@ -71,7 +71,11 @@ pub struct Vm {
     defs: HashMap<u32, usize>,
     /// method_idx → host implementation (framework bridge).
     hosts: HashMap<u32, HostCall>,
-    hosts_named: HashMap<(String, String), HostCall>,
+    /// (name, sig) → candidate host fns with the class idx they were
+    /// registered on; used when the DEX references a framework method
+    /// through a subclass descriptor. Only a reference whose class is
+    /// the owner or a subclass of it may resolve — see `host_named`.
+    hosts_named: HashMap<(String, String), Vec<(u32, HostCall)>>,
 }
 
 impl Vm {
@@ -135,8 +139,11 @@ impl Vm {
         if found {
             // A DEX may reference the same method through a subclass
             // descriptor; fall back to (name, sig) in call_builtin.
+            let owner = self.dex.type_index_of(class_desc)?.unwrap_or(u32::MAX);
             self.hosts_named
-                .insert((name.to_string(), proto_desc.to_string()), f);
+                .entry((name.to_string(), proto_desc.to_string()))
+                .or_default()
+                .push((owner, f));
         }
         Ok(found)
     }
@@ -549,10 +556,19 @@ impl Vm {
         }
         sig.push(')');
         sig.push_str(&self.dex.type_descriptor(p.return_type_idx).map_err(E::Vm)?);
-        Ok(self
-            .hosts_named
-            .get(&(name.to_string(), sig))
-            .cloned())
+        // The reference's declaring class must be the registered owner
+        // or a subclass of it — otherwise an unrelated class naming the
+        // same method (e.g. `Dialog.setContentView` when only
+        // `Activity.setContentView` is bridged) would steal the call.
+        let key = (name.to_string(), sig);
+        for (owner, f) in self.hosts_named.get(&key).into_iter().flatten() {
+            if *owner == mid.class_idx as u32
+                || self.assignable(mid.class_idx as u32, *owner)
+            {
+                return Ok(Some(f.clone()));
+            }
+        }
+        Ok(None)
     }
 
     fn call_builtin(&mut self, midx: u32, args: &[V]) -> Rt<Option<V>> {

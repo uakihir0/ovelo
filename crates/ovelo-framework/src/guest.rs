@@ -549,7 +549,10 @@ mod tests {
     const M_TTEXT: u16 = 0xED06;
     const M_BSIZE: u16 = 0xED07;
     const M_SCV2: u16 = 0xED08;
+    const M_DINIT: u16 = 0xED09;
+    const M_DCV: u16 = 0xED0A;
     const T_VIEW: u16 = 0xEE03;
+    const T_DLG: u16 = 0xEE04;
     const S_HELLO: u16 = 0xE501;
     const S_CLICKED: u16 = 0xE502;
 
@@ -582,6 +585,19 @@ mod tests {
                     &["Landroid/view/View;"],
                     vec![0x000e],
                 )],
+            ),
+            // An UNRELATED class with the same name+sig — its call must
+            // not reach Activity's host stub.
+            ext(
+                "Landroid/app/Dialog;",
+                vec![
+                    dir("<init>", &["Landroid/content/Context;"], vec![0x000e]),
+                    virt(
+                        "setContentView",
+                        &["Landroid/view/View;"],
+                        vec![0x000e],
+                    ),
+                ],
             ),
             ext(
                 "Landroid/widget/TextView;",
@@ -627,6 +643,12 @@ mod tests {
                 }],
             )
         };
+        // LSubAct subclasses Activity — so a setContentView reference
+        // via it is a legit subclass ref (unlike Dialog's).
+        let sub_act = C {
+            sup: Some("Landroid/app/Activity;"),
+            ..cls("LSubAct;", vec![])
+        };
         // LAct.onCreate(Bundle): this=v4, savedState=v5.
         let act = C {
             sup: Some("Landroid/app/Activity;"),
@@ -653,6 +675,11 @@ mod tests {
                             0x206e, M_BCLICK, 0x0010,   // invoke-virtual {v0,v1} Button.setOnClickListener
                             0x206e, M_BCLICK, 0x0050,   // invoke-virtual {v0,v5} — null clears it
                             0x206e, M_BCLICK, 0x0010,   // re-set the listener
+                            0x0322, T_DLG,              // new-instance v3,Dialog
+                            0x2070, M_DINIT, 0x0043,    // invoke-direct {v3,v4} Dialog.<init>
+                            // Dialog.setContentView must NOT reach Activity's stub
+                            // (v1 is a listener, not a view — a wrong dispatch errors).
+                            0x206e, M_DCV, 0x0013,
                             0x206e, M_SCV2, 0x0004,     // invoke-virtual {v4,v0} LSubAct.setContentView
                             0x000e,
                         ],
@@ -662,6 +689,7 @@ mod tests {
         };
         let mut classes = stubs;
         classes.push(listener);
+        classes.push(sub_act);
         classes.push(act);
         let (mut b, ix) = build(&classes);
         patch(&mut b, T_BTN, ix.t("Landroid/widget/Button;") as u16);
@@ -674,7 +702,10 @@ mod tests {
         patch(&mut b, M_TTEXT, ix.m("Landroid/widget/TextView;", "setText") as u16);
         patch(&mut b, M_BSIZE, ix.m("Landroid/widget/Button;", "setTextSize") as u16);
         patch(&mut b, M_SCV2, ix.m("LSubAct;", "setContentView") as u16);
+        patch(&mut b, M_DINIT, ix.m("Landroid/app/Dialog;", "<init>") as u16);
+        patch(&mut b, M_DCV, ix.m("Landroid/app/Dialog;", "setContentView") as u16);
         patch(&mut b, T_VIEW, ix.t("Landroid/view/View;") as u16);
+        patch(&mut b, T_DLG, ix.t("Landroid/app/Dialog;") as u16);
         patch(&mut b, S_HELLO, ix.s_idx("Hello") as u16);
         patch(&mut b, S_CLICKED, ix.s_idx("Clicked") as u16);
         b
