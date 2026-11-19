@@ -87,6 +87,14 @@ fn is_macho_executable(path: &Path) -> bool {
         }
     }
 
+    // metadata() resolves the link: opening a fifo/socket/device would
+    // block the gate forever, so only real files get read.
+    let Ok(meta) = std::fs::metadata(path) else {
+        return false;
+    };
+    if !meta.is_file() {
+        return false;
+    }
     let Ok(mut f) = std::fs::File::open(path) else {
         return false;
     };
