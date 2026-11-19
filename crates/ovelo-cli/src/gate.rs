@@ -36,6 +36,65 @@ pub struct GateItem {
     pub verdict: Verdict,
 }
 
+/// Executables a distribution carries: the file itself, or every file
+/// under `Contents/MacOS` for an `.app`-style bundle. Bundled helpers
+/// get the same signature/entitlement audit — a helper with looser
+/// permissions must not slip the gate (§10).
+fn binaries(path: &Path) -> Result<Vec<std::path::PathBuf>> {
+    if path.is_file() {
+        return Ok(vec![path.to_path_buf()]);
+    }
+    let macos = path.join("Contents").join("MacOS");
+    let mut bins: Vec<std::path::PathBuf> = if macos.is_dir() {
+        std::fs::read_dir(&macos)
+            .map_err(|e| io_err("read_dir", e))?
+            .filter_map(|e| e.ok().map(|e| e.path()))
+            .filter(|p| p.is_file())
+            .collect()
+    } else {
+        Vec::new()
+    };
+    bins.sort();
+    if bins.is_empty() {
+        return Err(OveloError::new(
+            ErrorCategory::PkgInvalid,
+            Phase::Install,
+            "gate.bundle.macos",
+        )
+        .with_detail(path.display().to_string()));
+    }
+    Ok(bins)
+}
+
+fn io_err(op: &str, e: std::io::Error) -> OveloError {
+    OveloError::new(ErrorCategory::HostCrash, Phase::Service, format!("gate.{op}"))
+        .with_detail(e.to_string())
+}
+
+/// Merge per-binary verdicts: any Fail wins, else Warn, else Skip,
+/// else Pass.
+fn combine(name: &'static str, items: Vec<GateItem>) -> GateItem {
+    for v in ["fail", "warn", "skip"] {
+        if let Some(i) = items.iter().find(|i| {
+            matches!(
+                (&i.verdict, v),
+                (Verdict::Fail(_), "fail")
+                    | (Verdict::Warn(_), "warn")
+                    | (Verdict::Skip(_), "skip")
+            )
+        }) {
+            return GateItem {
+                name,
+                verdict: i.verdict.clone(),
+            };
+        }
+    }
+    GateItem {
+        name,
+        verdict: Verdict::Pass,
+    }
+}
+
 /// Run every gate check against the binary/app at `path`.
 pub fn evaluate(path: &Path) -> Result<Vec<GateItem>> {
     if !path.exists() {
