@@ -19,6 +19,17 @@ fn err(cause: &str) -> OveloError {
     OveloError::new(ErrorCategory::GpuFeature, Phase::Gpu, cause)
 }
 
+/// One composited layer (a `SurfaceControl` position + z-order entry).
+#[derive(Debug, Clone, Copy)]
+pub struct Layer {
+    /// Guest surface to read.
+    pub surface_id: u64,
+    /// Left offset in output px.
+    pub x: i32,
+    /// Top offset in output px.
+    pub y: i32,
+}
+
 /// Compositor-side owner of every guest surface.
 #[derive(Default)]
 pub struct Presenter {
@@ -92,6 +103,61 @@ impl Presenter {
         Ok(Some(self.registry.present(frame)?))
     }
 
+    /// Multi-layer composition (P3): composite the newest frame of each
+    /// `layers` entry — bottom→top order, each at its (x,y) offset — onto
+    /// the output surface's geometry, then run it through the registry
+    /// like [`Presenter::display`]. Layers with nothing queued contribute
+    /// nothing; unreleased buffers always recycle.
+    pub fn display_layers(
+        &mut self,
+        output_id: u64,
+        layers: &[Layer],
+    ) -> Result<Option<Presented>> {
+        let (w, h) = {
+            let win = self
+                .windows
+                .get(&output_id)
+                .ok_or_else(|| err("host.surface.unknown"))?;
+            (win.queue().width(), win.queue().height())
+        };
+        let mut out = ovelo_ui::Surface::new(w, h)?;
+        let mut any = false;
+        for l in layers {
+            let win = self
+                .windows
+                .get_mut(&l.surface_id)
+                .ok_or_else(|| err("host.surface.unknown"))?;
+            let Some(id) = win.queue_mut().acquire() else {
+                continue;
+            };
+            {
+                let px = win
+                    .queue()
+                    .read(id)
+                    .ok_or_else(|| err("host.frame.missing"))?;
+                out.blit(l.x, l.y, px.width(), px.height(), px.pixels())?;
+            }
+            win.queue_mut().release(id)?;
+            any = true;
+        }
+        if !any {
+            return Ok(None);
+        }
+        Ok(Some(self.registry.present(Frame {
+            surface_id: output_id,
+            generation: self
+                .windows
+                .get(&output_id)
+                .unwrap()
+                .queue()
+                .generation(),
+            size: (w as u32, h as u32),
+            color_space: ColorSpace::SrgbPremul,
+            premultiplied: true,
+            buffer: out.pixels().to_vec(),
+        })?))
+    }
+
     /// The guest app died: no frame of its surface may display again.
     pub fn stop_worker(&mut self, surface_id: u64) {
         self.registry.stop_worker(surface_id);
@@ -134,6 +200,33 @@ mod tests {
     }
 
     #[test]
+    #[test]
+    fn layers_compose_in_order() {
+        let mut p = Presenter::new();
+        let out = p.attach(2, 4, 4).unwrap();
+        let top = p.attach(2, 2, 2).unwrap();
+        {
+            let w = p.producer(top).unwrap();
+            w.lock()
+                .unwrap()
+                .fill_rect(ovelo_ui::Rect::new(0, 0, 2, 2), ovelo_ui::Color::srgb(200, 0, 0));
+            w.unlock_and_post().unwrap();
+        }
+        let pr = p
+            .display_layers(
+                out,
+                &[Layer {
+                    surface_id: top,
+                    x: 1,
+                    y: 1,
+                }],
+            )
+            .unwrap()
+            .unwrap();
+        // top layer's red pixel landed at (1,1) of the 4x4 output.
+        assert_eq!(pr.frame.buffer[(1 * 4 + 1) * 4], 200);
+    }
+
     fn dead_worker_shows_nothing() {
         let mut p = Presenter::new();
         let s = p.attach(2, 4, 4).unwrap();
