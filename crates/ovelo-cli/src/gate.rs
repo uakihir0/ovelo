@@ -105,9 +105,13 @@ pub fn evaluate(path: &Path) -> Result<Vec<GateItem>> {
         )
         .with_detail(path.display().to_string()));
     }
+    let bins = binaries(path)?;
     Ok(vec![
-        check_signature(path),
-        check_entitlements(path),
+        combine("signature", bins.iter().map(|b| check_signature(b)).collect()),
+        combine(
+            "entitlements",
+            bins.iter().map(|b| check_entitlements(b)).collect(),
+        ),
         check_notarization(path),
     ])
 }
