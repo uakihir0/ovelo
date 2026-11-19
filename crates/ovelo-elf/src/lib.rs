@@ -306,6 +306,9 @@ impl<'a> ElfFile<'a> {
         // explicitly instead of silently dropping them.
         for i in 0..n {
             let tag = u64at(data, dbase + i * 16)? as i64;
+            if tag == DT_NULL {
+                break; // bytes past DT_NULL are padding, not entries
+            }
             if matches!(tag, DT_ANDROID_REL | DT_ANDROID_RELA | DT_ANDROID_RELSZ | DT_ANDROID_RELASZ) {
                 return Err(err("elf.reloc.packed"));
             }
@@ -499,13 +502,15 @@ pub fn load_chain<'a>(
         std::collections::HashMap::new();
     let mut visiting: std::collections::HashSet<String> =
         std::collections::HashSet::new();
+    let mut ordered: std::collections::HashSet<String> =
+        std::collections::HashSet::new();
     let mut stack = vec![soname.to_string()];
     // DFS so dependencies load before their dependents; `visiting` marks the
     // in-progress path so cyclic DT_NEEDED graphs terminate (the cycle edge
     // is treated as already-satisfied and load order within a cycle is
     // unspecified).
     while let Some(name) = stack.last().cloned() {
-        if loaded.contains_key(&name) {
+        if ordered.contains(&name) {
             stack.pop();
             continue;
         }
@@ -524,7 +529,7 @@ pub fn load_chain<'a>(
         let elf = &parsed[&name];
         let mut missing: Vec<String> = Vec::new();
         for dep in &elf.needed {
-            if provided.contains_key(dep) || loaded.contains_key(dep) {
+            if provided.contains_key(dep) || ordered.contains(dep) {
                 continue;
             }
             if needed_allow.contains(&dep.as_str()) {
@@ -540,7 +545,7 @@ pub fn load_chain<'a>(
             .iter()
             .filter(|d| {
                 provided.contains_key(*d)
-                    && !loaded.contains_key(*d)
+                    && !ordered.contains(*d)
                     && !visiting.contains(*d)
             })
             .cloned()
@@ -549,22 +554,54 @@ pub fn load_chain<'a>(
             stack.extend(pending);
             continue;
         }
-        let elf = parsed.remove(&name).unwrap();
-        let so = map_one(image, name.clone(), elf, next_base, &loaded)?;
-        loaded.insert(name.clone(), so);
+        // All provided dependencies parsed or loading; this object is next.
         order.push(name.clone());
+        ordered.insert(name.clone());
         visiting.remove(&name);
         stack.pop();
+    }
+    // Phase 2 — map every object and build the merged export table before
+    // any relocation runs: ld.so semantics. Cyclic DT_NEEDED graphs resolve
+    // fully because every export is visible to every object.
+    let mut global: std::collections::HashMap<String, u64> =
+        std::collections::HashMap::new();
+    for name in &order {
+        let elf = parsed.remove(name).unwrap();
+        let so = map_segments(image, name.clone(), elf, next_base)?;
+        for (sym, addr) in &so.exports {
+            global.entry(sym.clone()).or_insert(*addr); // first-defined wins
+        }
+        loaded.insert(name.clone(), so);
+    }
+    // Phase 3 — relocate, then read each object's initializers (INIT_ARRAY
+    // entries are themselves relocated on AArch64).
+    for name in &order {
+        let so = loaded.get_mut(name).unwrap();
+        let sym_count = symbol_count(&so.elf, so.elf.strtab.0);
+        for r in &so.elf.relocs {
+            r.apply(image, so.bias, &so.elf, sym_count, &global, &so.exports)?;
+        }
+        let bias = so.bias;
+        if so.elf.init_fn != 0 {
+            so.initializers.push(bias + so.elf.init_fn);
+        }
+        if let Some((addr, count)) = so.elf.init_array {
+            for i in 0..count {
+                let entry = image.read_u64(bias + addr + i * 8)?;
+                if entry != 0 {
+                    so.initializers.push(entry);
+                }
+            }
+        }
     }
     Ok(order.into_iter().map(|n| loaded.remove(&n).unwrap()).collect())
 }
 
-fn map_one<'a>(
+fn map_segments<'a>(
     image: &mut Image,
     soname: String,
     elf: ElfFile<'a>,
     next_base: &mut u64,
-    loaded: &std::collections::HashMap<String, LoadedSo<'a>>,
 ) -> Result<LoadedSo<'a>> {
     let min_v = elf
         .phdrs
@@ -627,30 +664,12 @@ fn map_one<'a>(
         }
     }
 
-    // Relocate. The image grants temporary write access to RELRO-free pages
-    // during load; this phase happens before any guest code runs.
-    for r in &elf.relocs {
-        r.apply(image, bias, &elf, sym_count, loaded, &exports)?;
-    }
-
-    let mut initializers = Vec::new();
-    if elf.init_fn != 0 {
-        initializers.push(bias + elf.init_fn);
-    }
-    if let Some((addr, count)) = elf.init_array {
-        for i in 0..count {
-            let entry = image.read_u64(bias + addr + i * 8)?;
-            if entry != 0 {
-                initializers.push(entry);
-            }
-        }
-    }
     Ok(LoadedSo {
         elf,
         bias,
         soname,
         exports,
-        initializers,
+        initializers: Vec::new(), // filled after the relocation phase
     })
 }
 
@@ -939,6 +958,33 @@ mod tests {
         let mut next = 0x4000_0000;
         let sos = load_chain(&mut img, "a.so", &a, provided, &[], &mut next).unwrap();
         assert_eq!(sos.len(), 2); // cycle tolerated, both load
+    }
+
+    #[test]
+    fn cyclic_needed_resolves_imports() {
+        // a.so GLOB_DAT-imports "bfn" defined by b.so; b.so needs a.so.
+        // Map-all-then-relocate resolves the back-edge.
+        let spec_a = |slot: u64| Spec {
+            needed: vec!["b.so".into()],
+            syms: vec![("bfn".into(), 0)],
+            relas: vec![(slot, 1025, 1, 0)], // GLOB_DAT bfn
+            ..Default::default()
+        };
+        let (_t, slot0, _i) = build(&spec_a(0));
+        let (a, ..) = build(&spec_a(slot0));
+        let (b, ..) = build(&Spec {
+            needed: vec!["a.so".into()],
+            syms: vec![("bfn".into(), 0x2340)],
+            ..Default::default()
+        });
+        let mut provided = std::collections::HashMap::new();
+        provided.insert("b.so".to_string(), b.as_slice());
+        let mut img = Image::new();
+        let mut next = 0x4000_0000;
+        let sos = load_chain(&mut img, "a.so", &a, provided, &[], &mut next).unwrap();
+        let (a_so, b_so) = (sos.iter().find(|s| s.soname == "a.so").unwrap(),
+                            sos.iter().find(|s| s.soname == "b.so").unwrap());
+        assert_eq!(img.read_u64(a_so.bias + slot0).unwrap(), b_so.bias + 0x2340);
     }
 
     #[test]

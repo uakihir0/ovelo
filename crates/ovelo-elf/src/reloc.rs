@@ -5,7 +5,7 @@
 //! RELATIVE). `R_AARCH64_NONE`/`COPY`/`ABS64`... — anything else is rejected
 //! with `AbiSymbol` before any initializer runs (design doc §05).
 
-use crate::{bionic, errd, ElfFile, Image, LoadedSo, PT_LOAD};
+use crate::{bionic, errd, ElfFile, Image, PT_LOAD};
 use ovelo_error::Result;
 
 const R_NONE: u32 = 0;
@@ -85,9 +85,14 @@ impl Reloc {
         bias: u64,
         elf: &ElfFile<'_>,
         sym_count: usize,
-        loaded: &std::collections::HashMap<String, LoadedSo<'_>>,
+        global: &std::collections::HashMap<String, u64>,
         exports: &std::collections::HashMap<String, u64>,
     ) -> Result<()> {
+        // A no-op relocation writes nothing: accept it even at offset zero
+        // or outside the load segments (some linkers emit padding entries).
+        if self.kind()? == RelocKind::None {
+            return Ok(());
+        }
         // The relocation destination must lie inside this object's own
         // PT_LOAD segments — never another object's memory (and never
         // unmapped space); `write_raw` bypasses page perms, so the check
@@ -105,7 +110,7 @@ impl Reloc {
         }
         let slot = bias + self.offset;
         match self.kind()? {
-            RelocKind::None => Ok(()),
+            RelocKind::None => Ok(()), // unreachable — returned above
             RelocKind::Relative => {
                 image.write_raw(slot, &(bias.wrapping_add(self.addend as u64)).to_le_bytes())
             }
@@ -117,7 +122,7 @@ impl Reloc {
                 let name = elf.symbol_name(self.sym, sym_count)?;
                 let value = exports
                     .get(&name)
-                    .or_else(|| loaded.values().find_map(|s| s.exports.get(&name)))
+                    .or_else(|| global.get(&name))
                     .copied()
                     .or_else(|| bionic::shim_addr(&name))
                     .ok_or_else(|| errd("elf.symbol.undefined", name.clone()))?;
