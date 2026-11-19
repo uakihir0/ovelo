@@ -227,7 +227,8 @@ fn run_app(store: &InstallStore, package: &str) -> Result<(), OveloError> {
     let mut presenter = ovelo_host::Presenter::new();
     let sid = presenter.attach(3, 720, 1280)?;
     let win = ovelo_host::HostWindow::new(&disp(&rec.app.package), sid, presenter);
-    ovelo_host::run(win)
+    // The dexrt↔framework dispatch drains its queue through this hook.
+    ovelo_host::run(win, |_| {})
 }
 
 fn cmd() -> Result<(), OveloError> {
