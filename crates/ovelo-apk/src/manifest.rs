@@ -551,7 +551,16 @@ pub fn parse_manifest(b: &[u8]) -> Result<ManifestInfo> {
                 if let Some(n) = el.android_str("name") {
                     let q = qualify(&info.package, n);
                     info.activities.push(q.clone());
-                    cur_activity_for_filter = Some(q);
+                    // An alias launches its targetActivity, not itself.
+                    cur_activity_for_filter = Some(
+                        if el.name == "activity-alias" {
+                            el.android_str("targetActivity")
+                                .map(|t| qualify(&info.package, t))
+                                .unwrap_or(q)
+                        } else {
+                            q
+                        },
+                    );
                 }
             }
             "service" => {

@@ -480,6 +480,9 @@ impl Vm {
                 // stub: the host models the base behavior, so return the
                 // proto's default (None for void) instead of failing —
                 // e.g. Activity.<init> or super.onCreate().
+                // Only constructors and void methods on non-DEX classes are
+                // host no-ops — a value-returning stub (Math.abs) answering
+                // with a default would let the app compute on a lie.
                 if self.def_of(mid.class_idx as u32).is_none() {
                     let p = self.dex.proto(mid.proto_idx as u32).map_err(E::Vm)?;
                     let ret = self
@@ -489,7 +492,7 @@ impl Vm {
                     if ret == "V" {
                         Ok(None)
                     } else {
-                        Ok(Some(V::default_for(&ret)))
+                        vm("dexrt.invoke.unresolved")
                     }
                 } else {
                     vm("dexrt.invoke.unresolved")
