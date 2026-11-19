@@ -573,13 +573,11 @@ impl FontSet {
                                 .get(k + 1)
                                 .copied()
                                 .unwrap_or(cchars.len());
-                            for m in cci + 1..end {
-                                if self.fonts[i]
-                                    .advance_for(cchars[m], size_px)
-                                    .is_some()
-                                {
-                                    comp_adv[m] = Some(0.0);
-                                }
+                            for m in comp_adv.iter_mut().take(end).skip(cci + 1) {
+                                // Non-leader chars drew no advance of
+                                // their own — the shaper folded them
+                                // into the leader's cluster.
+                                *m = Some(0.0);
                             }
                         }
                     }
@@ -862,6 +860,66 @@ mod tests {
             .map(|g| g.x_adv)
             .sum();
         assert!((drawn - 13.0).abs() < 0.01);
+    }
+
+    /// When the shaper folds an uncovered mark into the base char's
+    /// cluster the mark drew zero width — measure must not hand it the
+    /// half-em fallback.
+    #[test]
+    fn shaped_absorbed_mark_measures_zero() {
+        struct Absorb;
+        impl GlyphSource for Absorb {
+            fn name(&self) -> &str {
+                "absorb"
+            }
+            fn advance_for(&self, c: char, _s: f32) -> Option<f32> {
+                (c == 'a').then_some(5.0)
+            }
+            fn ascent(&self, _s: f32) -> f32 {
+                8.0
+            }
+            fn descent(&self, _s: f32) -> f32 {
+                2.0
+            }
+            fn shaped_glyphs(
+                &self,
+                _text: &str,
+                _rtl: bool,
+                _s: f32,
+            ) -> Option<Vec<ShapedGlyph>> {
+                // One glyph for the whole "a + mark" cluster.
+                Some(vec![ShapedGlyph {
+                    bmp: GlyphBmp {
+                        xmin: 0,
+                        ymin: 0,
+                        w: 0,
+                        h: 0,
+                        cov: Vec::new(),
+                    },
+                    x_adv: 6.0,
+                    x_off: 0.0,
+                    y_off: 0.0,
+                }])
+            }
+            fn can_shape_glyphs(&self) -> bool {
+                true
+            }
+            fn shaped_advances(&self, _t: &str, _s: f32) -> Option<Vec<(usize, f32)>> {
+                Some(vec![(0, 6.0)])
+            }
+        }
+        let mut fs = FontSet::new();
+        fs.push(Box::new(Absorb));
+        // The mark is a member of the leader's shaped cluster: 0, not
+        // the half-em fallback.
+        assert_eq!(fs.char_advances("a\u{301}", 16.0), vec![6.0, 0.0]);
+        let drawn: f32 = fs
+            .shaped_run("a\u{301}", 16.0)
+            .expect("run")
+            .iter()
+            .map(|g| g.x_adv)
+            .sum();
+        assert!((drawn - 6.0).abs() < 0.01);
     }
 
     /// Decomposed Hangul jamos compose across what plain combining-mark
