@@ -337,6 +337,9 @@ impl DexFile {
         }
         let mut r = R::at(&self.bytes, off as usize);
         let n = r.u32()? as usize;
+        if n > (r.end - r.p) / 2 {
+            return Err(err("dex.typelist.bounds"));
+        }
         let mut out = Vec::with_capacity(n);
         for _ in 0..n {
             out.push(r.u16()?);
@@ -404,12 +407,19 @@ impl DexFile {
         // encoded_catch_handler_list follows the try array.
         let list_start = r.p - code_off as usize;
         let n_handlers = if tries_size > 0 { r.uleb128()? as usize } else { 0 };
+        // Cap speculative allocation: each handler needs at least a few bytes.
+        if n_handlers > r.end - r.p {
+            return Err(err("dex.handler.bounds"));
+        }
         let mut handlers = Vec::with_capacity(n_handlers);
         let mut handler_base_offsets = Vec::with_capacity(n_handlers);
         for _ in 0..n_handlers {
             handler_base_offsets.push(r.p - code_off as usize);
             let count = r.sleb128()?;
             let pairs = count.unsigned_abs() as usize;
+            if pairs > r.end - r.p {
+                return Err(err("dex.handler.bounds"));
+            }
             let mut pairs_vec = Vec::with_capacity(pairs);
             for _ in 0..pairs {
                 pairs_vec.push((r.uleb128()?, r.uleb128()?));
@@ -578,6 +588,13 @@ impl DexFile {
         let insns_len = code.insns.len() as u32;
 
         let decoded = decode_all(&code.insns)?;
+        // Executable instruction starts (payload blocks are data, not code).
+        let exec_starts: HashSet<u32> = decoded
+            .iter()
+            .filter(|i| !i.is_payload())
+            .map(|i| i.offset)
+            .collect();
+        // All decoded block starts + the method-end sentinel: legal try edges.
         let mut boundaries: HashSet<u32> = decoded.iter().map(|i| i.offset).collect();
         boundaries.insert(insns_len); // end-of-method is a legal try boundary
 
@@ -599,16 +616,23 @@ impl DexFile {
                 }
             }
             if let Some(t) = i.target {
-                // Branch/switch target must land on an instruction boundary.
-                if !boundaries.contains(&t) {
-                    return Err(err("dex.code.branch_target"));
-                }
-                // Payload opcodes must point at the matching payload block.
                 match i.name {
-                    "packed-switch" => expect_payload(&decoded, t, 0x0100)?,
-                    "sparse-switch" => expect_payload(&decoded, t, 0x0200)?,
+                    // Payload references must point at the matching data block.
+                    "packed-switch" => {
+                        expect_payload(&decoded, t, 0x0100)?;
+                        verify_switch_cases(&decoded, t, i.offset, &exec_starts, false)?;
+                    }
+                    "sparse-switch" => {
+                        expect_payload(&decoded, t, 0x0200)?;
+                        verify_switch_cases(&decoded, t, i.offset, &exec_starts, true)?;
+                    }
                     "fill-array-data" => expect_payload(&decoded, t, 0x0300)?,
-                    _ => {}
+                    // Ordinary branches must land on executable instructions.
+                    _ => {
+                        if !exec_starts.contains(&t) {
+                            return Err(err("dex.code.branch_target"));
+                        }
+                    }
                 }
             }
             if let Some(idx) = i.idx {
@@ -619,20 +643,21 @@ impl DexFile {
         for t in &code.tries {
             let end = t.start_addr + t.insn_count as u32;
             if t.insn_count == 0
-                || !boundaries.contains(&t.start_addr)
+                || !exec_starts.contains(&t.start_addr)
                 || end > insns_len
+                || !boundaries.contains(&end)
             {
                 return Err(err("dex.try.bounds"));
             }
         }
         for h in &code.handlers {
             for (_, addr) in &h.handlers {
-                if !boundaries.contains(addr) {
+                if !exec_starts.contains(addr) {
                     return Err(err("dex.handler.addr"));
                 }
             }
             if let Some(a) = h.catch_all_addr {
-                if !boundaries.contains(&a) {
+                if !exec_starts.contains(&a) {
                     return Err(err("dex.handler.addr"));
                 }
             }
@@ -654,8 +679,12 @@ impl DexFile {
                     return Err(bad("string"));
                 }
             }
-            "const-class" | "check-cast" | "instance-of" | "new-instance" | "new-array"
-            | "const-method-type" => {
+            "const-method-type" => {
+                if idx >= n_protos {
+                    return Err(bad("proto"));
+                }
+            }
+            "const-class" | "check-cast" | "instance-of" | "new-instance" | "new-array" => {
                 if idx >= n_types {
                     return Err(bad("type"));
                 }
@@ -696,6 +725,36 @@ impl DexFile {
     }
 }
 
+/// Validate every case destination of a switch payload: signed offsets are
+/// relative to the switch instruction and must land on executable starts.
+fn verify_switch_cases(
+    decoded: &[Insn],
+    payload_off: u32,
+    switch_off: u32,
+    exec_starts: &HashSet<u32>,
+    sparse: bool,
+) -> Result<()> {
+    let payload = decoded
+        .iter()
+        .find(|p| p.offset == payload_off)
+        .ok_or_else(|| err("dex.code.switch_payload"))?;
+    let size = *payload.raw.get(1).ok_or_else(|| err("dex.payload.bounds"))? as usize;
+    // targets live after ident+size(+first_key for packed) [+keys for sparse].
+    let first_target_unit = if sparse { 2 + size * 2 } else { 4 };
+    for i in 0..size {
+        let u = first_target_unit + i * 2;
+        if u + 1 >= payload.raw.len() {
+            return Err(err("dex.payload.bounds"));
+        }
+        let delta = (payload.raw[u] as u32) | ((payload.raw[u + 1] as u32) << 16);
+        let target = (switch_off as i64) + (delta as i32) as i64;
+        if target < 0 || !exec_starts.contains(&(target as u32)) {
+            return Err(err("dex.code.branch_target"));
+        }
+    }
+    Ok(())
+}
+
 fn expect_payload(decoded: &[Insn], target: u32, ident: u16) -> Result<()> {
     let ok = decoded
         .iter()
@@ -718,6 +777,9 @@ fn dedup(v: impl IntoIterator<Item = u32>, cause: &str) -> Result<()> {
 }
 
 fn read_encoded_fields(r: &mut R, count: usize) -> Result<Vec<EncodedField>> {
+    if count > (r.end - r.p) / 2 {
+        return Err(err("dex.classdata.bounds"));
+    }
     let mut out = Vec::with_capacity(count);
     let mut idx = 0u32;
     for _ in 0..count {
@@ -733,6 +795,9 @@ fn read_encoded_fields(r: &mut R, count: usize) -> Result<Vec<EncodedField>> {
 }
 
 fn read_encoded_methods(r: &mut R, count: usize) -> Result<Vec<EncodedMethod>> {
+    if count > (r.end - r.p) / 3 {
+        return Err(err("dex.classdata.bounds"));
+    }
     let mut out = Vec::with_capacity(count);
     let mut idx = 0u32;
     for _ in 0..count {
@@ -795,6 +860,9 @@ fn read_table<T>(b: &[u8], off: u32, count: usize, item: usize, f: impl Fn(&mut 
 fn parse_map(b: &[u8], map_off: u32) -> Result<Vec<MapItem>> {
     let mut r = R::at(b, map_off as usize);
     let count = r.u32()? as usize;
+    if count > (r.end - r.p) / 12 {
+        return Err(err("dex.map.bounds"));
+    }
     let mut out = Vec::with_capacity(count);
     for _ in 0..count {
         let ty = r.u16()?;
@@ -863,7 +931,7 @@ mod tests {
             off
         }
         fn align4(&mut self) {
-            while self.pos() % 4 != 0 {
+            while !self.pos().is_multiple_of(4) {
                 self.u8(0);
             }
         }
@@ -935,10 +1003,7 @@ mod tests {
         // 4: if-eqz v0, -4           -> 0x0038, -4 -> target 0
         // 5: move-exception v2       -> 0x020d  (handler)
         // 6: return-void             -> 0x000e
-        let insns: [u16; 7] = [0x0012, 0x0122, 0x0000, 0x0428, 0x0038, 0xfffc, 0x020d | 0x0e << 8 << 0];
-        // note: last entry packs two 1-unit insns: move-exception(0x020d) then return-void(0x000e) needs 8 units total
         let insns: [u16; 8] = [0x0012, 0x0122, 0x0000, 0x0428, 0x0038, 0xfffc, 0x020d, 0x000e];
-        let _ = insns;
         b.u32(8); // insns_size
         for w in insns {
             b.u16(w);
@@ -1004,7 +1069,7 @@ mod tests {
         h.extend((method_ids_off as u32).to_le_bytes());
         h.extend(1u32.to_le_bytes());
         h.extend((class_defs_off as u32).to_le_bytes());
-        h.extend(((total - 0x70) as u32).to_le_bytes()); // data_size approx
+        h.extend((total - 0x70).to_le_bytes()); // data_size approx
         h.extend(0x70u32.to_le_bytes()); // data_off approx
         b.b[..0x70].copy_from_slice(&h);
 

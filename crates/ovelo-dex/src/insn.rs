@@ -52,6 +52,8 @@ pub enum Format {
     /// `op vAA, +BBBBBBBB` (i32 branch/switch offset).
     /// `op vAA, +BBBBBBBB`.
     F31t,
+    /// `op +BBBBBBBB` (i32 branch, no register operand; `30t`).
+    F30t,
     /// `op vAA, +BBBBBBBB` (i32 literal).
     F31i,
     /// `op vAA, +BBBBBBBB` (wide i32).
@@ -70,10 +72,8 @@ pub enum Format {
     /// `op {vC..vG}, meth@BBBB, proto@HHHH` (invoke-polymorphic).
     /// `op {vC..vG}, meth@BBBB, proto@HHHH`.
     F45cc,
-    /// `op {vCCCC..}, meth@BBBB, proto@HHHH`.
-    /// `op {vCCCC..+AA}, meth@BBBB, proto@HHHH`.
+    /// `op {vCCCC..+AA}, meth@BBBB, proto@HHHH` (range polymorphic call).
     F4rcc,
-    /// `op vAA, lit64`.
     /// `op vAA, lit64`.
     F51l,
 }
@@ -85,8 +85,9 @@ impl Format {
             Self::F10x | Self::F12x | Self::F11n | Self::F11x | Self::F10t => 1,
             Self::F20t | Self::F22x | Self::F21t | Self::F21s | Self::F21h | Self::F21c
             | Self::F23x | Self::F22t | Self::F22c | Self::F22s | Self::F22b => 2,
-            Self::F31t | Self::F31i | Self::F31l | Self::F31c | Self::F32x
-            | Self::F35c | Self::F3rc | Self::F45cc | Self::F4rcc => 3,
+            Self::F30t | Self::F31t | Self::F31i | Self::F31l | Self::F31c
+            | Self::F32x | Self::F35c | Self::F3rc => 3,
+            Self::F45cc | Self::F4rcc => 4,
             Self::F51l => 5,
         }
     }
@@ -208,6 +209,10 @@ pub fn decode(insns: &[u16], off: usize) -> Result<(Insn, usize)> {
             insn.regs = vec![high8, w(1) & 0xff];
             insn.lit = Some((w(1) >> 8) as u8 as i8 as i64);
         }
+        Format::F30t => {
+            let delta = ((w(1) as u32) | ((w(2) as u32) << 16)) as i32;
+            insn.target = Some(((off as i64) + delta as i64) as u32);
+        }
         Format::F31t => {
             insn.regs = vec![high8];
             let delta = ((w(1) as u32) | ((w(2) as u32) << 16)) as i32;
@@ -223,14 +228,16 @@ pub fn decode(insns: &[u16], off: usize) -> Result<(Insn, usize)> {
         }
         Format::F32x => insn.regs = vec![w(1), w(2)],
         Format::F35c => {
-            let count = a as usize;
-            insn.idx = Some(w(1) as u32);
-            let r2 = w(2);
-            let mut regs = vec![r2 & 0x0f, (r2 >> 4) & 0x0f, (r2 >> 8) & 0x0f, r2 >> 12, b4];
-            regs.truncate(count);
+            // w0 high byte = A|G: B (high nibble) is the arg count, A (low
+            // nibble) is the optional 5th register.
+            let count = b4 as usize;
             if count > 5 {
                 return Err(err("dex.insn.regcount"));
             }
+            insn.idx = Some(w(1) as u32);
+            let r2 = w(2);
+            let mut regs = vec![r2 & 0x0f, (r2 >> 4) & 0x0f, (r2 >> 8) & 0x0f, r2 >> 12, a];
+            regs.truncate(count);
             insn.regs = regs;
         }
         Format::F3rc => {
@@ -241,24 +248,23 @@ pub fn decode(insns: &[u16], off: usize) -> Result<(Insn, usize)> {
             insn.lit = Some(count as i64); // reg range start + count
         }
         Format::F45cc => {
-            let count = a as usize;
-            if count > 4 {
+            // Same A|G layout as 35c; w2 = C..F regs, w3 = HHHH proto idx.
+            let count = b4 as usize;
+            if count > 5 {
                 return Err(err("dex.insn.regcount"));
             }
-            // BBBB = method idx, HHHH = proto idx (idx carries method; lit
-            // carries proto so the verifier can bounds-check both).
-            insn.idx = Some(w(1) as u32);
-            insn.lit = Some(w(2) as u32 as i64);
-            let r3 = w(3);
-            insn.regs = vec![r3 & 0x0f, (r3 >> 4) & 0x0f, (r3 >> 8) & 0x0f, r3 >> 12, b4];
-            insn.regs.truncate(count);
+            insn.idx = Some(w(1) as u32); // method
+            insn.lit = Some(w(3) as u32 as i64); // proto
+            let r2 = w(2);
+            let mut regs = vec![r2 & 0x0f, (r2 >> 4) & 0x0f, (r2 >> 8) & 0x0f, r2 >> 12, a];
+            regs.truncate(count);
+            insn.regs = regs;
         }
         Format::F4rcc => {
-            insn.idx = Some(w(1) as u32);
-            insn.lit = Some(w(2) as u32 as i64);
-            insn.regs = vec![w(3)];
-            // register count in AA preserved in lit high half? keep simple:
-            // verifier re-reads AA from raw[0].
+            // AA = range count, CCCC = first register, HHHH = proto idx.
+            insn.idx = Some(w(1) as u32); // method
+            insn.lit = Some(w(3) as u32 as i64); // proto
+            insn.regs = vec![w(2)]; // range start
         }
         Format::F51l => {
             insn.regs = vec![high8];
@@ -408,7 +414,7 @@ fn opcode_info(op: u8) -> Option<(&'static str, Format)> {
         0x27 => ("throw", F11x),
         0x28 => ("goto", F10t),
         0x29 => ("goto/16", F20t),
-        0x2a => ("goto/32", F31t),
+        0x2a => ("goto/32", F30t),
         0x2b => ("packed-switch", F31t),
         0x2c => ("sparse-switch", F31t),
         0x2d => ("cmpl-float", F23x),
@@ -599,3 +605,54 @@ fn opcode_info(op: u8) -> Option<(&'static str, Format)> {
 }
 
 
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn decode_goto32_has_no_register() {
+        // goto/32 +3 over a 1-unit insn landing on unit 4.
+        let (i, sz) = decode(&[0x002a, 3, 0, 0x000e], 0).unwrap();
+        assert_eq!(sz, 3);
+        assert_eq!(i.name, "goto/32");
+        assert!(i.regs.is_empty());
+        assert_eq!(i.target, Some(3));
+    }
+
+    #[test]
+    fn decode_45cc_four_units() {
+        // invoke-polymorphic {v2, v5}, meth@1, proto@7 — count nibble high.
+        let (i, sz) = decode(&[0x20fa, 1, 0x0052, 7], 0).unwrap();
+        assert_eq!(sz, 4);
+        assert_eq!(i.regs, vec![2, 5]);
+        assert_eq!(i.idx, Some(1));
+        assert_eq!(i.lit, Some(7));
+    }
+
+    #[test]
+    fn decode_4rcc_four_units() {
+        // invoke-polymorphic/range {v9..+3}, meth@2, proto@4.
+        let (i, sz) = decode(&[0x03fb, 2, 9, 4], 0).unwrap();
+        assert_eq!(sz, 4);
+        assert_eq!(i.regs, vec![9]);
+        assert_eq!(i.idx, Some(2));
+        assert_eq!(i.lit, Some(4));
+    }
+
+    #[test]
+    fn decode_35c_counts_from_high_nibble() {
+        // invoke-static {v0}, meth@0: count=1 (high nibble), no 5th reg.
+        let (i, _) = decode(&[0x1071, 0, 0], 0).unwrap();
+        assert_eq!(i.name, "invoke-static");
+        assert_eq!(i.regs, vec![0]);
+        // count=5, G=v6: regs = C..F + G.
+        let (i, _) = decode(&[0x5671, 0, 0x4321], 0).unwrap();
+        assert_eq!(i.regs, vec![1, 2, 3, 4, 6]);
+    }
+
+    #[test]
+    fn decode_45cc_truncated_rejected() {
+        assert!(decode(&[0x10fa, 0, 0], 0).is_err());
+    }
+}
