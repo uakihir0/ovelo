@@ -77,9 +77,6 @@ pub fn layout(
     let adv = |c: char| fonts.advance(c, size);
 
     // Break opportunities at char boundaries (UAX#14 handles kinsoku NS/CJ).
-    let bounds: Vec<usize> = std::iter::once(0)
-        .chain(text.char_indices().map(|(i, c)| i + c.len_utf8()))
-        .collect();
     let mut breakset: std::collections::HashSet<usize> =
         std::collections::HashSet::new();
     for (byte, op) in linebreaks(text) {
