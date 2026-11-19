@@ -256,14 +256,18 @@ fn run_app(store: &InstallStore, package: &str) -> Result<(), OveloError> {
     let mut fonts = ovelo_ui::FontSet::new();
     fonts.load_dirs(&["/System/Library/Fonts", "/System/Library/Fonts/Supplemental"]);
     let fonts = std::rc::Rc::new(fonts);
-    let ui = ovelo_framework::GuestUi::new(720, 1280, fonts);
     // P3 worker supervision: the whole guest dispatch (VM build → register
     // → instantiate → lifecycle callbacks) runs under catch_unwind. A panic
     // writes a crash report and bumps the generation; the worker restarts
     // once, then stays down — a guest failure never propagates to the host.
+    // Each attempt gets a fresh GuestUi: guest view objects bind host
+    // handles inside it, so a crashed attempt's views/listeners must not
+    // leak into the restarted VM.
     let mut sup = worker::Supervisor::new(data_dir.join("diagnostics"));
-    let mut guest = loop {
+    let (mut guest, ui) = loop {
+        let fonts2 = fonts.clone();
         let out = sup.supervise("guest-dispatch", || {
+            let ui = ovelo_framework::GuestUi::new(720, 1280, fonts2);
             let vm = (|| -> Result<_, OveloError> {
                 let (_cd, entries) =
                     parse_central_directory(&bytes, &ZipLimits::default())?;
@@ -297,10 +301,10 @@ fn run_app(store: &InstallStore, package: &str) -> Result<(), OveloError> {
                     println!("callback {} ({})", cb, if ran { "dex" } else { "framework" });
                 }
             }
-            g
+            (g, ui)
         });
         match out {
-            worker::Outcome::Ok(g) => break g,
+            worker::Outcome::Ok(pair) => break pair,
             worker::Outcome::Crashed(path) => {
                 println!("crash    guest dispatch panicked -> {}", path.display());
                 if sup.restartable() {
@@ -308,7 +312,8 @@ fn run_app(store: &InstallStore, package: &str) -> Result<(), OveloError> {
                     println!("restart  worker generation {}", sup.generation());
                     continue;
                 }
-                break None;
+                // Still need a ui for the fallback demo tree.
+                break (None, ovelo_framework::GuestUi::new(720, 1280, fonts.clone()));
             }
         }
     };
