@@ -20,6 +20,7 @@
 //! * [`window`] — thin winit glue (one window per app instance, Esc → Back,
 //!   ⌘C/V clipboard hooks). Untestable headless parts stay here and thin.
 
+mod event_loop;
 mod frame;
 mod ime;
 mod input;
@@ -27,10 +28,12 @@ mod launch;
 pub mod present;
 mod window;
 
+pub use event_loop::{run, HostWindow};
 pub use frame::{ColorSpace, Frame, SurfaceRegistry};
 pub use ime::{map_winit as map_ime_event, ImeEvent, InputConnection};
 pub use input::{MotionAction, MotionEvent, PointerState, Translator};
 pub use launch::{bundle_layout, LaunchRecord};
+pub use present::Presenter;
 pub use window::{map_host_key, HostApp, HostKey};
 
 pub use ovelo_error;
