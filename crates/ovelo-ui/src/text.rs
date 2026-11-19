@@ -55,9 +55,23 @@ pub fn layout(
     max_width: Option<i32>,
     ellipsize: bool,
 ) -> TextLayout {
-    let rtl = !text.is_empty() && {
-        let info = BidiInfo::new(text, None);
-        !info.levels.is_empty() && info.levels[0].is_rtl()
+    // Base direction per paragraph (hard splits on \n are paragraphs too in
+    // the UBA model when separated by B class; winit-independent).
+    let paras: Vec<(usize, usize, bool)> = if text.is_empty() {
+        vec![(0, 0, false)]
+    } else {
+        BidiInfo::new(text, None)
+            .paragraphs
+            .iter()
+            .map(|p| (p.range.start, p.range.end, p.level.is_rtl()))
+            .collect()
+    };
+    let para_rtl = |byte: usize| -> bool {
+        paras
+            .iter()
+            .find(|(s, e, _)| byte >= *s && byte < *e)
+            .map(|(_, _, r)| *r)
+            .unwrap_or(false)
     };
     let size = style.size_px;
     let adv = |c: char| fonts.advance(c, size);
@@ -66,57 +80,65 @@ pub fn layout(
     let bounds: Vec<usize> = std::iter::once(0)
         .chain(text.char_indices().map(|(i, c)| i + c.len_utf8()))
         .collect();
-    let breakable: Vec<bool> = {
-        let mut v = vec![false; bounds.len()];
-        for (byte, op) in linebreaks(text) {
-            if op == BreakOpportunity::Allowed || op == BreakOpportunity::Mandatory {
-                if let Some(i) = bounds.iter().position(|&b| b == byte) {
-                    v[i] = true;
-                }
-            }
+    let mut breakset: std::collections::HashSet<usize> =
+        std::collections::HashSet::new();
+    for (byte, op) in linebreaks(text) {
+        if op == BreakOpportunity::Allowed || op == BreakOpportunity::Mandatory {
+            breakset.insert(byte);
         }
-        v[bounds.len() - 1] = true;
-        v
-    };
+    }
+    breakset.insert(text.len());
 
-    // Per-char advances by byte start index.
+    // Per-char advances by byte start index: shaped cluster advances from the
+    // primary font where available (kerning/ligatures), fallback otherwise.
+    let shaped = fonts.char_advances(text, size);
     let mut ch_adv: Vec<(usize, f32)> = text
         .char_indices()
-        .map(|(i, c)| (i, adv(c)))
+        .zip(shaped)
+        .map(|((i, _), a)| (i, a))
         .collect();
 
     let mut lines: Vec<Line> = Vec::new();
     let mut seg_start = 0usize; // index into ch_adv
     let mut i = 0usize;
+    // Running max char index whose byte start is a breakable boundary —
+    // keeps wrap scans O(n) total instead of O(n²) rescans.
+    let mut last_break: usize = 0;
+    // Running width since seg_start — avoids resumming per char.
+    let mut run_w: f32 = 0.0;
     while i < ch_adv.len() {
-        let byte_end = ch_adv[i].0 + text[ch_adv[i].0..].chars().next().unwrap().len_utf8();
+        if breakset.contains(&ch_adv[i].0) && i > 0 {
+            last_break = i;
+        }
         // Hard break?
         if text[ch_adv[i].0..].starts_with('\n') {
-            push_line(&mut lines, text, &ch_adv, seg_start, i, rtl, false);
+            push_line(&mut lines, text, &ch_adv, seg_start, i, para_rtl(ch_adv[seg_start.min(ch_adv.len()-1)].0), false);
             seg_start = i + 1;
             i += 1;
+            run_w = 0.0;
             continue;
         }
+        run_w += ch_adv[i].1;
         if let Some(maxw) = max_width {
-            let w: f32 = ch_adv[seg_start..=i].iter().map(|(_, a)| *a).sum();
-            if w > maxw as f32 && i > seg_start {
-                // Walk back to the last allowed break.
-                let mut b = i;
-                let mut ok = false;
-                while b > seg_start {
-                    let byte = ch_adv[b].0;
-                    if let Some(bi) = bounds.iter().position(|&x| x == byte) {
-                        if breakable[bi] {
-                            ok = true;
-                            break;
-                        }
-                    }
-                    b -= 1;
-                }
-                if ok {
-                    push_line(&mut lines, text, &ch_adv, seg_start, b, rtl, false);
+            if run_w > maxw as f32 && i > seg_start {
+                let seg_byte = ch_adv[seg_start].0;
+                let cur_byte = ch_adv[i].0;
+                let b = if last_break > seg_start
+                    && ch_adv[last_break].0 > seg_byte
+                    && ch_adv[last_break].0 < cur_byte
+                {
+                    last_break
+                } else if breakset.contains(&seg_byte) && seg_byte != 0 && i > seg_start {
+                    // break exactly at segment start makes no progress; skip
+                    usize::MAX
+                } else {
+                    usize::MAX
+                };
+                if b != usize::MAX {
+                    push_line(&mut lines, text, &ch_adv, seg_start, b, para_rtl(seg_byte), false);
                     seg_start = b;
                     i = b;
+                    run_w = ch_adv[b].1;
                     continue;
                 }
                 // No break point in range: emit an ellipsized prefix that fits.
@@ -131,27 +153,26 @@ pub fn layout(
                         acc += ch_adv[j].1;
                         j += 1;
                     }
-                    push_ell(&mut lines, text, &ch_adv, seg_start, j, rtl, ell_w);
-                    // skip to next hard break
+                    push_ell(&mut lines, text, &ch_adv, seg_start, j, para_rtl(seg_byte), ell_w);
                     while i < ch_adv.len() && !text[ch_adv[i].0..].starts_with('\n') {
                         i += 1;
                     }
                     seg_start = i;
+                    run_w = 0.0;
                     continue;
                 }
             }
         }
-        let _ = byte_end;
         i += 1;
     }
     if seg_start < ch_adv.len() {
-        push_line(&mut lines, text, &ch_adv, seg_start, ch_adv.len(), rtl, false);
+        push_line(&mut lines, text, &ch_adv, seg_start, ch_adv.len(), para_rtl(ch_adv[seg_start].0), false);
     }
     if text.is_empty() || text.ends_with('\n') {
         lines.push(Line {
             range: (text.len(), text.len()),
             width: 0,
-            rtl,
+            rtl: para_rtl(text.len().saturating_sub(1)),
             ellipsized: false,
         });
     }
@@ -181,6 +202,17 @@ fn push_line(
     rtl: bool,
     ell: bool,
 ) {
+    if e <= s {
+        // Empty line (e.g. text starting with '\n').
+        let bs = ch_adv.get(s).map(|(b, _)| *b).unwrap_or(0);
+        lines.push(Line {
+            range: (bs, bs),
+            width: 0,
+            rtl,
+            ellipsized: ell,
+        });
+        return;
+    }
     let (bs, be) = (ch_adv[s].0, ch_adv[e - 1].0);
     let end = be + text[be..].chars().next().unwrap().len_utf8();
     // Trim trailing spaces from the measured width (Minikin behavior).
@@ -266,6 +298,9 @@ mod tests {
         assert_eq!(l.height, 20);
         let l2 = layout("ab\n", st(), &fs(), None, false);
         assert_eq!(l2.lines.len(), 2); // "ab", trailing empty
+        let l3 = layout("\nab", st(), &fs(), None, false);
+        assert_eq!(l3.lines.len(), 2); // leading empty line + "ab"
+        assert_eq!(l3.lines[0].width, 0);
     }
 
     #[test]

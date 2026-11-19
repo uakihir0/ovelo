@@ -23,6 +23,12 @@ pub trait GlyphSource {
     fn ascent(&self, size_px: f32) -> f32;
     /// Line descent at `size_px` (positive downward).
     fn descent(&self, size_px: f32) -> f32;
+    /// Shaped per-cluster advances (cluster byte offset, px advance) for
+    /// `text`, when the font supports shaping. `None` = no shaping; layout
+    /// then uses `advance_for` per char.
+    fn shaped_advances(&self, _text: &str, _size_px: f32) -> Option<Vec<(usize, f32)>> {
+        None
+    }
 }
 
 /// A TTF/OTF face kept as owned bytes; `ttf_parser::Face` is rebuilt per call
@@ -67,7 +73,7 @@ impl TtfFont {
 
     /// Shape `text` with rustybuzz; returns per-cluster advances in px.
     /// Falls back to raw cmap advances when shaping yields no glyphs.
-    pub fn shaped_advances(&self, text: &str, size_px: f32) -> Vec<(usize, f32)> {
+    pub fn shape(&self, text: &str, size_px: f32) -> Vec<(usize, f32)> {
         let upm = self.face().units_per_em() as f32;
         let scale = size_px / upm;
         let rb_face = rustybuzz::Face::from_slice(&self.bytes, 0)
@@ -105,6 +111,9 @@ impl GlyphSource for TtfFont {
     fn descent(&self, size_px: f32) -> f32 {
         let face = self.face();
         -face.descender() as f32 * size_px / face.units_per_em() as f32
+    }
+    fn shaped_advances(&self, text: &str, size_px: f32) -> Option<Vec<(usize, f32)>> {
+        Some(self.shape(text, size_px))
     }
 }
 
@@ -178,6 +187,40 @@ impl FontSet {
             d = d.max(f.descent(size_px));
         }
         (a, d)
+    }
+
+    /// Per-char advances for `text`: the primary font's shaped cluster
+    /// advances where it covers the text (kerning/ligatures correct);
+    /// uncovered chars use per-glyph fallback. Ligature members after the
+    /// first keep `None` here and share their leading cluster's advance
+    /// only if the cluster maps to their byte offset; otherwise they fall
+    /// back to per-glyph metrics.
+    pub fn char_advances(&self, text: &str, size_px: f32) -> Vec<f32> {
+        let mut byte_to_ci = vec![usize::MAX; text.len() + 1];
+        for (ci, (b, _)) in text.char_indices().enumerate() {
+            byte_to_ci[b] = ci;
+        }
+        let n = text.chars().count();
+        let mut out: Vec<Option<f32>> = vec![None; n];
+        if let Some(f0) = self.fonts.first() {
+            if let Some(clusters) = f0.shaped_advances(text, size_px) {
+                for (byte, adv) in clusters {
+                    if let Some(&ci) = byte_to_ci.get(byte) {
+                        if ci < n {
+                            out[ci] = Some(adv);
+                        }
+                    }
+                }
+            } else {
+                for (ci, (_, c)) in text.char_indices().enumerate() {
+                    out[ci] = f0.advance_for(c, size_px);
+                }
+            }
+        }
+        text.char_indices()
+            .enumerate()
+            .map(|(ci, (_, c))| out[ci].unwrap_or_else(|| self.advance(c, size_px)))
+            .collect()
     }
 
     /// Number of registered fonts.
