@@ -327,6 +327,52 @@ impl FontSet {
         self.fonts.iter().find_map(|f| f.raster_for(c, size_px))
     }
 
+    /// NFC-compose one base+marks cluster when the run's font covers
+    /// every char of the composed form; otherwise keep it decomposed so
+    /// already-covered chars still draw (design: a run composes because
+    /// SOME cluster needs it — clusters that don't are left alone).
+    fn composed_cluster(&self, cl: &str, i: usize, size_px: f32) -> String {
+        let comp = nfc_str(cl);
+        if comp != cl
+            && comp
+                .chars()
+                .all(|cc| self.fonts[i].advance_for(cc, size_px).is_some())
+        {
+            comp
+        } else {
+            cl.to_string()
+        }
+    }
+
+    /// Per-cluster composition of a compose-flagged run; also returns
+    /// each cluster's composed char count (callers map advances from
+    /// composed chars back onto the original chars).
+    fn compose_sub(&self, orig: &str, i: usize, size_px: f32) -> (String, Vec<usize>) {
+        let mut out = String::with_capacity(orig.len());
+        let mut lens = Vec::new();
+        let mut byte0 = 0usize;
+        let mut olen = 0usize;
+        for (b, c) in orig.char_indices() {
+            if is_combining(c) && olen > 0 {
+                olen += 1;
+                continue;
+            }
+            if olen > 0 {
+                let cl = self.composed_cluster(&orig[byte0..b], i, size_px);
+                lens.push(cl.chars().count());
+                out.push_str(&cl);
+            }
+            byte0 = b;
+            olen = 1;
+        }
+        if olen > 0 {
+            let cl = self.composed_cluster(&orig[byte0..], i, size_px);
+            lens.push(cl.chars().count());
+            out.push_str(&cl);
+        }
+        (out, lens)
+    }
+
     /// Shaped, positioned glyph run for `text`, itemized like Minikin:
     /// BiDi `visual_runs` first, then each bidi run split into maximal
     /// consecutive same-font sub-runs and shaped by its own font, so
@@ -342,7 +388,10 @@ impl FontSet {
         for (range, fi, rtl, compose) in self.itemize(text, size_px) {
             let owned;
             let sub: &str = if compose {
-                owned = nfc_str(&text[range]);
+                owned = match fi {
+                    Some(i) => self.compose_sub(&text[range], i, size_px).0,
+                    None => text[range].to_string(),
+                };
                 &owned
             } else {
                 &text[range]
@@ -527,12 +576,28 @@ impl FontSet {
         for (range, fi, _rtl, compose) in self.itemize(text, size_px) {
             let orig = &text[range.clone()];
             let owned;
-            let sub: &str = if compose {
-                owned = nfc_str(orig);
-                &owned
+            let sub: &str;
+            // Per-cluster composed lengths (one entry per orig cluster)
+            // when the run composes — the same calls shape_subrun's
+            // text went through.
+            let clens: Vec<usize>;
+            if compose {
+                match fi {
+                    Some(i) => {
+                        let c = self.compose_sub(orig, i, size_px);
+                        owned = c.0;
+                        clens = c.1;
+                    }
+                    None => {
+                        owned = orig.to_string();
+                        clens = Vec::new();
+                    }
+                }
+                sub = &owned;
             } else {
-                orig
-            };
+                sub = orig;
+                clens = Vec::new();
+            }
             // Advances per composed char first.
             let cchars: Vec<char> = sub.chars().collect();
             let mut comp_adv: Vec<Option<f32>> = vec![None; cchars.len()];
@@ -594,34 +659,24 @@ impl FontSet {
             // the cluster's first original char.
             let mut spans: Vec<(usize, usize, usize, usize)> = Vec::new();
             {
-                let mut byte0 = 0usize; // cluster start byte in `orig`
                 let mut start_ci = 0usize; // cluster start, orig chars
                 let mut olen = 0usize; // orig chars in the cluster
                 let mut cs = 0usize; // composed chars consumed
-                for (ci, (b, c)) in orig.char_indices().enumerate() {
+                for (ci, (_b, c)) in orig.char_indices().enumerate() {
                     if is_combining(c) && olen > 0 {
                         olen += 1;
                         continue;
                     }
                     if olen > 0 {
-                        let clen = if compose {
-                            nfc_str(&orig[byte0..b]).chars().count()
-                        } else {
-                            olen
-                        };
+                        let clen = clens.get(spans.len()).copied().unwrap_or(olen);
                         spans.push((start_ci, olen, cs, clen));
                         cs += clen;
                     }
-                    byte0 = b;
                     start_ci = ci;
                     olen = 1;
                 }
                 if olen > 0 {
-                    let clen = if compose {
-                        nfc_str(&orig[byte0..]).chars().count()
-                    } else {
-                        olen
-                    };
+                    let clen = clens.get(spans.len()).copied().unwrap_or(olen);
                     spans.push((start_ci, olen, cs, clen));
                 }
             }
@@ -920,6 +975,71 @@ mod tests {
             .map(|g| g.x_adv)
             .sum();
         assert!((drawn - 6.0).abs() < 0.01);
+    }
+
+    /// A compose-flagged run must compose per cluster: an earlier
+    /// cluster whose NFC result the font doesn't cover stays NFD, so
+    /// its covered chars still draw.
+    #[test]
+    fn compose_run_keeps_uncomposable_cluster_decomposed() {
+        struct Fake {
+            covered: &'static [char],
+        }
+        impl GlyphSource for Fake {
+            fn name(&self) -> &str {
+                "fake"
+            }
+            fn advance_for(&self, c: char, _s: f32) -> Option<f32> {
+                self.covered.contains(&c).then_some(5.0)
+            }
+            fn ascent(&self, _s: f32) -> f32 {
+                8.0
+            }
+            fn descent(&self, _s: f32) -> f32 {
+                2.0
+            }
+            fn shaped_glyphs(
+                &self,
+                text: &str,
+                _rtl: bool,
+                _s: f32,
+            ) -> Option<Vec<ShapedGlyph>> {
+                Some(
+                    text.chars()
+                        .map(|_| ShapedGlyph {
+                            bmp: GlyphBmp {
+                                xmin: 0,
+                                ymin: 0,
+                                w: 0,
+                                h: 0,
+                                cov: Vec::new(),
+                            },
+                            x_adv: 5.0,
+                            x_off: 0.0,
+                            y_off: 0.0,
+                        })
+                        .collect(),
+                )
+            }
+            fn can_shape_glyphs(&self) -> bool {
+                true
+            }
+            fn shaped_advances(&self, text: &str, _s: f32) -> Option<Vec<(usize, f32)>> {
+                Some(text.char_indices().map(|(b, _)| (b, 5.0)).collect())
+            }
+        }
+        let mut fs = FontSet::new();
+        // Covers 'n','e','é' — not 'ñ', not the marks.
+        fs.push(Box::new(Fake {
+            covered: &['n', 'e', '\u{E9}'],
+        }));
+        // "ñ"-composing cluster then "é"-composing cluster. The run
+        // composes for 'é'; the 'n'+tilde cluster stays decomposed, so
+        // 'n' and the tilde each get their own advance and 'n' still
+        // draws (2 glyphs were emitted, not one swallowed 'ñ').
+        let text = "n\u{303}e\u{301}";
+        assert_eq!(fs.char_advances(text, 16.0), vec![5.0, 5.0, 5.0, 0.0]);
+        assert_eq!(fs.shaped_run(text, 16.0).expect("run").len(), 3);
     }
 
     /// Decomposed Hangul jamos compose across what plain combining-mark
