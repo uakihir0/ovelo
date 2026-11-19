@@ -207,7 +207,12 @@ fn run_app(store: &InstallStore, package: &str) -> Result<(), OveloError> {
         )
         .with_detail(bad.join(", ")));
     }
-    let launcher = info.manifest.activities.first().cloned().unwrap_or_default();
+    let launcher = info
+        .manifest
+        .launcher_activity
+        .clone()
+        .or_else(|| info.manifest.activities.first().cloned())
+        .unwrap_or_default();
     println!("ready   {}", disp(&rec.app.package));
     println!("activity {}", disp(&launcher));
     println!("dexes   {} verified", dexes.len());
@@ -234,6 +239,7 @@ fn run_app(store: &InstallStore, package: &str) -> Result<(), OveloError> {
     // object bridge; a class missing from the DEX keeps the framework
     // model's behavior.
     let desc = format!("L{};", launcher.replace('.', "/"));
+    let desc_safe = disp(&desc);
     let vm = (|| -> Result<_, OveloError> {
         let (_cd, entries) = parse_central_directory(&bytes, &ZipLimits::default())?;
         let e = entries
@@ -245,7 +251,7 @@ fn run_app(store: &InstallStore, package: &str) -> Result<(), OveloError> {
     let mut guest = vm
         .and_then(|mut v| v.instantiate(&desc).map(|h| (v, h)))
         .map_err(|e| {
-            println!("guest    {desc} not dispatched: {}", e.cause());
+            println!("guest    {desc_safe} not dispatched: {}", e.cause());
         })
         .ok();
     for cb in callbacks {
