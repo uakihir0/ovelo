@@ -6,6 +6,7 @@
 
 use ovelo_error::{ErrorCategory, OveloError, Phase, Result};
 
+
 const EOCD_SIG: u32 = 0x0605_4b50;
 const EOCD_LEN: usize = 22;
 const EOCD_MAX_SEARCH: usize = 64 * 1024 + EOCD_LEN;
@@ -28,7 +29,7 @@ pub struct ZipLimits {
 }
 
 impl Default for ZipLimits {
-    fn default() -> Self {
+fn default() -> Self {
         Self {
             max_entries: 65_535,
             max_uncompressed_total: 4 * 1024 * 1024 * 1024,
@@ -255,8 +256,13 @@ pub fn read_entry(bytes: &[u8], entry: &CentralEntry) -> Result<Vec<u8>> {
 
     let out = match entry.method {
         0 => data.to_vec(),
-        8 => miniz_oxide::inflate::decompress_to_vec(data)
-            .map_err(|_| zip_err("zip.deflate.corrupt"))?,
+        8 => {
+            // Inflate into at most the declared size (hard-capped); a lying
+            // header must not let an entry expand beyond its CD size.
+            let cap = (entry.uncompressed_size as usize).min(MAX_INFLATE);
+            miniz_oxide::inflate::decompress_to_vec_with_limit(data, cap + 1)
+                .map_err(|_| zip_err("zip.deflate.corrupt"))?
+        }
         _ => return Err(zip_err("zip.method.unsupported")),
     };
     if out.len() as u64 != entry.uncompressed_size {
@@ -267,6 +273,9 @@ pub fn read_entry(bytes: &[u8], entry: &CentralEntry) -> Result<Vec<u8>> {
     }
     Ok(out)
 }
+
+/// Hard cap on inflated entry size (compressed-bomb guard).
+const MAX_INFLATE: usize = 1 << 30;
 
 /// Byte range of an entry's compressed data (for signature verification,
 /// which digests the raw archive, not decompressed contents).

@@ -309,7 +309,8 @@ pub fn parse_axml(b: &[u8]) -> Result<Vec<Element>> {
     if first.ty != RES_XML_TYPE {
         return Err(err("axml.not_xml"));
     }
-    let mut pos = first.next;
+    // RES_XML_TYPE's size spans the whole document; children follow its header.
+    let mut pos = first.header_size.max(8);
     let mut pool = StringPool::default();
     let mut res_map: Vec<u32> = Vec::new();
     let mut elements = Vec::new();
@@ -418,7 +419,9 @@ pub fn parse_axml(b: &[u8]) -> Result<Vec<Element>> {
 }
 
 fn decode_value(raw: u32, data_type: u8, data: u32, pool: &StringPool) -> Result<Value> {
-    if raw != 0xffff_ffff {
+    // The typed value is authoritative for non-string types; rawValue only
+    // substitutes when the attribute is (or stays) a string.
+    if matches!(data_type, 0 | TYPE_STRING) && raw != 0xffff_ffff {
         if let Some(s) = pool.get(raw) {
             return Ok(Value::Str(s.to_string()));
         }

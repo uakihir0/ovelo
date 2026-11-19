@@ -97,7 +97,11 @@ pub fn inspect_apk(bytes: &[u8]) -> Result<ApkInfo> {
 /// same signer fingerprint.
 pub fn install_apk(store: &InstallStore, bytes: &[u8]) -> Result<InstallRecord> {
     let signers = verify_v2(bytes)?;
-    let signer = &signers[0].cert_sha256;
+    // Canonical fingerprint covers *every* signer: an update signed by a
+    // strict subset of the original signer set must not pass `commit`.
+    let mut hashes: Vec<&str> = signers.iter().map(|s| s.cert_sha256.as_str()).collect();
+    hashes.sort_unstable();
+    let signer = &hashes.join("+");
     let info = inspect_apk(bytes)?;
     let app = AppId {
         package: info.manifest.package.clone(),
