@@ -54,11 +54,14 @@ impl ApplicationHandler for App {
             }
             WindowEvent::CursorMoved { position, .. } => {
                 self.cursor = (position.x, position.y);
-                if host
-                    .translator
-                    .pointer_move(0, position.x, position.y)
-                    .is_some()
-                {
+                // Every pressed button is an active pointer; moving any of
+                // them yields a Move event.
+                let moved = (0..4).any(|id| {
+                    host.translator
+                        .pointer_move(id, position.x, position.y)
+                        .is_some()
+                });
+                if moved {
                     if let Some(w) = &self.window {
                         w.request_redraw();
                     }
