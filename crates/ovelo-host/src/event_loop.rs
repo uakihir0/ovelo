@@ -30,6 +30,9 @@ fn to_sb(px: &[u8], out: &mut [u32]) {
     }
 }
 
+/// Per-beat driver hook type ([`run`] installs one).
+type VsyncHook = Box<dyn FnMut(&mut Presenter)>;
+
 /// One app window pumping a [`Presenter`] surface to the screen.
 pub struct HostWindow {
     title: String,
@@ -39,7 +42,7 @@ pub struct HostWindow {
     sb_ctx: Option<softbuffer::Context<Rc<Window>>>,
     sb_surf: Option<softbuffer::Surface<Rc<Window>, Rc<Window>>>,
     /// Per-beat driver hook (set by [`run`]).
-    vsync_hook: Option<Box<dyn FnMut(&mut Presenter)>>,
+    vsync_hook: Option<VsyncHook>,
 }
 
 impl HostWindow {
