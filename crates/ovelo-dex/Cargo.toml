@@ -5,6 +5,9 @@ version.workspace = true
 edition.workspace = true
 license.workspace = true
 
+[features]
+testkit = []
+
 [dependencies]
 ovelo-error = { path = "../ovelo-error" }
 

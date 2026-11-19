@@ -7,6 +7,8 @@
 
 mod insn;
 mod read;
+#[cfg(feature = "testkit")]
+pub mod testdex;
 
 pub use insn::{decode_all, Format, Insn};
 
@@ -323,6 +325,12 @@ impl DexFile {
     /// Method id item.
     pub fn method(&self, idx: u32) -> Result<&MethodId> {
         self.methods.get(idx as usize).ok_or_else(|| err("dex.method.idx"))
+    }
+
+    /// Number of entries in the `method_ids` table (defined + external
+    /// references) — the valid range for [`DexFile::method`].
+    pub fn method_ids_len(&self) -> usize {
+        self.methods.len()
     }
 
     /// Proto id item.

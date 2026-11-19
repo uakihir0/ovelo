@@ -9,5 +9,8 @@ license.workspace = true
 ovelo-dex = { path = "../ovelo-dex" }
 ovelo-error = { path = "../ovelo-error" }
 
+[dev-dependencies]
+ovelo-dex = { path = "../ovelo-dex", features = ["testkit"] }
+
 [lints]
 workspace = true

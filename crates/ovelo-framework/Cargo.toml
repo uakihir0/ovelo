@@ -6,10 +6,14 @@ edition.workspace = true
 license.workspace = true
 
 [dependencies]
+ovelo-dexrt = { path = "../ovelo-dexrt" }
 ovelo-error = { path = "../ovelo-error" }
 ovelo-ui = { path = "../ovelo-ui" }
 # Real SQLite semantics for the SQLiteDatabase subset; bundled builds on any host.
 rusqlite = { version = "0.32", features = ["bundled"] }
+
+[dev-dependencies]
+ovelo-dex = { path = "../ovelo-dex", features = ["testkit"] }
 
 [lints]
 workspace = true
