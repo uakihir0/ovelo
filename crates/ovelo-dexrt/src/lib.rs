@@ -177,14 +177,14 @@ impl Vm {
         }
     }
 
-    /// First method `name` on `class_desc` taking exactly `nparams`
-    /// declared parameters — overloads differ by arity for the lifecycle
-    /// bridge's purposes (proto-precise matching can layer on later).
+    /// First method `name` on `class_desc` whose params occupy exactly
+    /// `nslots` registers (J/D params take two) — args pack as a register
+    /// image, so a long/double param counts double.
     fn find_method_by_name(
         &self,
         class_desc: &str,
         name: &str,
-        nparams: usize,
+        nslots: usize,
     ) -> Result<Option<u32>> {
         for (i, def) in self.dex.class_defs().iter().enumerate() {
             let _ = i;
@@ -194,9 +194,16 @@ impl Vm {
             let cd = self.dex.class_data(def)?;
             for m in cd.direct_methods.iter().chain(cd.virtual_methods.iter()) {
                 let mid = self.dex.method(m.method_idx)?;
-                if self.dex.string(mid.name_idx)? == name
-                    && self.dex.proto_params(self.dex.proto(mid.proto_idx as u32)?)?.len() == nparams
-                {
+                if self.dex.string(mid.name_idx)? != name {
+                    continue;
+                }
+                let p = self.dex.proto(mid.proto_idx as u32)?;
+                let mut slots = 0usize;
+                for t in self.dex.proto_params(p)? {
+                    let d = self.dex.type_descriptor(t as u32)?;
+                    slots += if d.starts_with('J') || d.starts_with('D') { 2 } else { 1 };
+                }
+                if slots == nslots {
                     return Ok(Some(m.method_idx));
                 }
             }
