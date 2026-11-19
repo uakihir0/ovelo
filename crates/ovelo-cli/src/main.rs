@@ -294,6 +294,12 @@ fn run_app(store: &InstallStore, package: &str) -> Result<(), OveloError> {
     root.set_content_view(Box::new(col));
     ovelo_host::run(win, move |p| {
         if let Ok(w) = p.producer(sid) {
+            // Track window resizes: the buffer queue follows the new size
+            // and the root re-lays out on the next traversal.
+            let (bw, bh) = (w.queue().width() as i32, w.queue().height() as i32);
+            if (bw, bh) != (root.w, root.h) {
+                root.resize(bw, bh);
+            }
             let _ = root.perform_traversals(w);
         }
     })
