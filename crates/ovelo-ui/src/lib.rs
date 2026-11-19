@@ -10,11 +10,13 @@
 //! * [`text`] — BiDi + UAX#14 line breaking (kinsoku), wrap, ellipsis and
 //!   exact integer measurement.
 
+pub mod bufq;
 pub mod color;
 pub mod font;
 pub mod surface;
 pub mod text;
 
+pub use bufq::{ANativeWindow, BufferQueue, FrameId};
 pub use color::Color;
 pub use font::{FontSet, GlyphSource, TtfFont};
 pub use surface::{Rect, Surface};
