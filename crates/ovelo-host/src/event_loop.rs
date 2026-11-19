@@ -119,8 +119,11 @@ impl ApplicationHandler for HostWindow {
 /// only frame source once the loop owns the window).
 pub fn run(mut app: HostWindow, mut on_vsync: impl FnMut(&mut Presenter) + 'static) -> Result<()> {
     let el = EventLoop::new().map_err(|e| err("host.eventloop").with_detail(e.to_string()))?;
-    // The driver hook lives outside the handler so tests can compose it.
-    el.set_control_flow(winit::event_loop::ControlFlow::Poll);
+    // Wake at ~60Hz rather than Poll: Poll busy-loops even when the
+    // queue is empty; WaitUntil sleeps between beats like a vsync.
+    el.set_control_flow(winit::event_loop::ControlFlow::WaitUntil(
+        std::time::Instant::now() + std::time::Duration::from_millis(16),
+    ));
     app.vsync_hook = Some(Box::new(move |p| on_vsync(p)));
     el.run_app(&mut app)
         .map_err(|e| err("host.eventloop").with_detail(e.to_string()))
