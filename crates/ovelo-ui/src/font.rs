@@ -147,6 +147,9 @@ impl GlyphSource for TtfFont {
         Some(self.shape(text, size_px))
     }
     fn raster_for(&self, c: char, size_px: f32) -> Option<GlyphBmp> {
+        // fontdue falls back to .notdef for missing chars — check coverage
+        // first so FontSet::raster can continue down the fallback chain.
+        self.face().glyph_index(c)?;
         let (m, cov) = self.fd.as_ref()?.rasterize(c, size_px);
         Some(GlyphBmp {
             xmin: m.xmin,
