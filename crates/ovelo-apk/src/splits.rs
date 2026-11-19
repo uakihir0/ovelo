@@ -1,0 +1,353 @@
+//! APK split sets (design §03): a base APK plus `config.*` splits must
+//! share package / versionCode / signer; the device profile picks the
+//! matching ABI, density, and locale splits at install time. A split set
+//! missing its base, or a `configForSplit` reference to an absent split,
+//! is rejected before anything is committed.
+
+use crate::install::{InstallRecord, InstallStore};
+use crate::manifest::ManifestInfo;
+use ovelo_error::{ErrorCategory, OveloError, Phase, Result};
+
+fn err(cause: impl Into<String>) -> OveloError {
+    OveloError::new(ErrorCategory::PkgInvalid, Phase::Install, cause)
+}
+
+/// Host-side capabilities a config split is matched against.
+#[derive(Debug, Clone)]
+pub struct DeviceProfile {
+    /// Preferred ABI names, most preferred first.
+    pub abis: Vec<String>,
+    /// Screen density bucket (dpi) to match `config.*dpi` splits.
+    pub density: u32,
+    /// Preferred locale tags, most preferred first.
+    pub locales: Vec<String>,
+}
+
+impl Default for DeviceProfile {
+    fn default() -> Self {
+        Self {
+            abis: vec!["arm64-v8a".into(), "armeabi-v7a".into()],
+            density: 420,
+            locales: vec!["en".into()],
+        }
+    }
+}
+
+/// What one config split carries.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SplitKind {
+    /// The base APK (no `split` attribute).
+    Base,
+    /// `config.<abi>` native-library split.
+    Abi(String),
+    /// `config.<N>dpi` resource split.
+    Density(u32),
+    /// `config.<locale>` resource split.
+    Locale(String),
+    /// Any other named split (feature splits included).
+    Feature(String),
+}
+
+const DENSITY_BUCKETS: &[(&str, u32)] = &[
+    ("ldpi", 120),
+    ("mdpi", 160),
+    ("tvdpi", 213),
+    ("hdpi", 240),
+    ("xhdpi", 320),
+    ("xxhdpi", 480),
+    ("xxxhdpi", 640),
+];
+
+/// Classify a manifest `split` attribute; `None` (absent attr) is `Base`.
+pub fn split_kind(split: Option<&str>) -> SplitKind {
+    let Some(name) = split else {
+        return SplitKind::Base;
+    };
+    let Some(cfg) = name.strip_prefix("config.") else {
+        return SplitKind::Feature(name.to_string());
+    };
+    if let Some(d) = DENSITY_BUCKETS.iter().find(|(n, _)| *n == cfg) {
+        return SplitKind::Density(d.1);
+    }
+    // ABI names contain '-' ('arm64-v8a'); locale tags don't.
+    if cfg.contains('-') || cfg == "universal" {
+        return SplitKind::Abi(cfg.to_string());
+    }
+    SplitKind::Locale(cfg.to_string())
+}
+
+/// One validated member of a split set.
+#[derive(Debug, Clone)]
+pub struct SplitMember {
+    /// `split` attribute value (`""` for the base APK).
+    pub name: String,
+    /// Classified kind.
+    pub kind: SplitKind,
+    /// Stored content hash of this split APK.
+    pub sha256: String,
+    /// `configForSplit` target, when declared.
+    pub config_for: Option<String>,
+}
+
+/// A split APK before validation: its manifest + signer fingerprint +
+/// content hash (computed by the caller from the APK bytes).
+#[derive(Debug)]
+pub struct SplitInput {
+    /// File name for error detail.
+    pub file_name: String,
+    /// Parsed manifest.
+    pub manifest: ManifestInfo,
+    /// Canonical signer fingerprint (see `install_apk`).
+    pub signer: String,
+    /// Stored sha256 (already passed through `store_apk`).
+    pub sha256: String,
+}
+
+/// Validate a whole split set: one base, identical package/versionCode/
+/// signer, unique names, and every `configForSplit` resolved. Returns
+/// the members in input order on success.
+pub fn validate_split_set(inputs: &[SplitInput]) -> Result<Vec<SplitMember>> {
+    if inputs.is_empty() {
+        return Err(err("split.set.empty"));
+    }
+    let base_manifest = &inputs[0].manifest;
+    let mut seen = std::collections::HashSet::new();
+    let mut members = Vec::with_capacity(inputs.len());
+    let mut bases = 0usize;
+    for i in inputs {
+        let m = &i.manifest;
+        if m.package != base_manifest.package {
+            return Err(err("split.package.mismatch").with_detail(format!(
+                "{}: {} != {}",
+                i.file_name, m.package, base_manifest.package
+            )));
+        }
+        if m.version_code != base_manifest.version_code {
+            return Err(err("split.version.mismatch").with_detail(format!(
+                "{}: {} != {}",
+                i.file_name, m.version_code, base_manifest.version_code
+            )));
+        }
+        if i.signer != inputs[0].signer {
+            return Err(OveloError::new(
+                ErrorCategory::PkgSignature,
+                Phase::Install,
+                "split.signer.mismatch",
+            )
+            .with_detail(i.file_name.clone()));
+        }
+        let kind = split_kind(m.split.as_deref());
+        if kind == SplitKind::Base {
+            bases += 1;
+        }
+        let name = m.split.clone().unwrap_or_default();
+        if !seen.insert(name.clone()) {
+            return Err(err("split.duplicate").with_detail(name));
+        }
+        members.push(SplitMember {
+            name,
+            kind,
+            sha256: i.sha256.clone(),
+            config_for: m.config_for_split.clone(),
+        });
+    }
+    if bases != 1 {
+        return Err(err("split.base.count").with_detail(format!("{bases}")));
+    }
+    // configForSplit must point at a member of this set.
+    let names: std::collections::HashSet<&str> =
+        members.iter().map(|m| m.name.as_str()).collect();
+    for m in &members {
+        if let Some(t) = &m.config_for {
+            if !names.contains(t.as_str()) {
+                return Err(err("split.config_target.missing").with_detail(format!(
+                    "{} -> {t}",
+                    m.name
+                )));
+            }
+        }
+    }
+    Ok(members)
+}
+
+/// Pick the members to install for `profile`: the base always; for each
+/// config dimension the best-matching split (first in `abis`/`locales`
+/// order; nearest density bucket); feature splits pass through.
+pub fn resolve_splits<'m>(members: &'m [SplitMember], profile: &DeviceProfile) -> Vec<&'m SplitMember> {
+    let mut picked: Vec<&SplitMember> = Vec::new();
+    let mut abi: Option<&SplitMember> = None;
+    let mut density: Option<&SplitMember> = None;
+    let mut locales: Vec<&SplitMember> = Vec::new();
+    for m in members {
+        match &m.kind {
+            SplitKind::Base | SplitKind::Feature(_) => picked.push(m),
+            SplitKind::Abi(a) => {
+                let better = match abi {
+                    None => profile.abis.contains(a),
+                    Some(cur) => {
+                        let rank = |s: &SplitMember| {
+                            let SplitKind::Abi(n) = &s.kind else { return usize::MAX };
+                            profile.abis.iter().position(|p| p == n).unwrap_or(usize::MAX)
+                        };
+                        rank(m) < rank(cur)
+                    }
+                };
+                if better {
+                    abi = Some(m);
+                }
+            }
+            SplitKind::Density(d) => {
+                let better = match density {
+                    None => true,
+                    Some(cur) => {
+                        let SplitKind::Density(cd) = cur.kind else { unreachable!() };
+                        (d.abs_diff(profile.density), m.name.as_str())
+                            < (cd.abs_diff(profile.density), cur.name.as_str())
+                    }
+                };
+                if better {
+                    density = Some(m);
+                }
+            }
+            SplitKind::Locale(l) => {
+                if profile.locales.iter().any(|p| p == l) {
+                    locales.push(m);
+                }
+            }
+        }
+    }
+    picked.extend(abi);
+    picked.extend(density);
+    picked.extend(locales);
+    picked
+}
+
+/// Install a split set: validate it, resolve for `profile`, then commit
+/// the base record listing the stored member hashes. `inputs` are
+/// `(file_name, bytes)` pairs; every split must carry a v2 signature.
+pub fn install_split_set(
+    store: &InstallStore,
+    inputs: &[(&str, &[u8])],
+    profile: &DeviceProfile,
+) -> Result<InstallRecord> {
+    let mut members_in = Vec::with_capacity(inputs.len());
+    for (name, bytes) in inputs {
+        let signers = crate::sig::verify_v2(bytes)?;
+        let mut hashes: Vec<&str> = signers.iter().map(|s| s.cert_sha256.as_str()).collect();
+        hashes.sort_unstable();
+        let signer = hashes.join("+");
+        let info = crate::inspect_apk(bytes)?;
+        let sha = store.store_apk(bytes)?;
+        members_in.push(SplitInput {
+            file_name: (*name).to_string(),
+            manifest: info.manifest,
+            signer,
+            sha256: sha,
+        });
+    }
+    let members = validate_split_set(&members_in)?;
+    let picked = resolve_splits(&members, profile);
+    // Commit happens against the base member's record.
+    let base = members
+        .iter()
+        .find(|m| m.kind == SplitKind::Base)
+        .ok_or_else(|| err("split.base.count"))?;
+    let picked_splits: Vec<crate::install::StoredSplit> = picked
+        .iter()
+        .map(|m| crate::install::StoredSplit {
+            name: m.name.clone(),
+            sha256: m.sha256.clone(),
+        })
+        .collect();
+    let app = crate::install::AppId {
+        package: members_in[0].manifest.package.clone(),
+        signer: members_in[0].signer.clone(),
+    };
+    store.commit_splits(
+        &app,
+        members_in[0].manifest.version_code,
+        &base.sha256,
+        &members_in[0].signer,
+        &picked_splits,
+    )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn inp(name: &str, split: Option<&str>, pkg: &str, vc: i64, signer: &str) -> SplitInput {
+        SplitInput {
+            file_name: name.to_string(),
+            manifest: ManifestInfo {
+                package: pkg.into(),
+                version_code: vc,
+                split: split.map(|s| s.to_string()),
+                ..Default::default()
+            },
+            signer: signer.into(),
+            sha256: "ab".repeat(32),
+        }
+    }
+
+    #[test]
+    fn classifies_split_names() {
+        assert_eq!(split_kind(None), SplitKind::Base);
+        assert_eq!(split_kind(Some("config.arm64-v8a")), SplitKind::Abi("arm64-v8a".into()));
+        assert_eq!(split_kind(Some("config.xhdpi")), SplitKind::Density(320));
+        assert_eq!(split_kind(Some("config.ja")), SplitKind::Locale("ja".into()));
+        assert_eq!(split_kind(Some("feature_x")), SplitKind::Feature("feature_x".into()));
+    }
+
+    #[test]
+    fn accepts_valid_set() {
+        let set = vec![
+            inp("base.apk", None, "com.a", 1, "s"),
+            inp("abi.apk", Some("config.arm64-v8a"), "com.a", 1, "s"),
+            inp("en.apk", Some("config.en"), "com.a", 1, "s"),
+        ];
+        assert_eq!(validate_split_set(&set).unwrap().len(), 3);
+    }
+
+    #[test]
+    fn rejects_missing_base_and_mismatched_fields() {
+        assert!(validate_split_set(&[inp("a.apk", Some("config.en"), "com.a", 1, "s")]).is_err());
+        assert!(validate_split_set(&[
+            inp("b.apk", None, "com.a", 1, "s"),
+            inp("a.apk", Some("config.en"), "com.b", 1, "s"),
+        ]).is_err());
+        assert!(validate_split_set(&[
+            inp("b.apk", None, "com.a", 1, "s"),
+            inp("a.apk", Some("config.en"), "com.a", 2, "s"),
+        ]).is_err());
+        assert!(validate_split_set(&[
+            inp("b.apk", None, "com.a", 1, "s"),
+            inp("a.apk", Some("config.en"), "com.a", 1, "other"),
+        ]).is_err());
+        assert!(validate_split_set(&[
+            inp("b1.apk", None, "com.a", 1, "s"),
+            inp("b2.apk", None, "com.a", 1, "s"),
+        ]).is_err());
+    }
+
+    #[test]
+    fn resolves_best_config_for_profile() {
+        let set = vec![
+            inp("base.apk", None, "com.a", 1, "s"),
+            inp("arm.apk", Some("config.arm64-v8a"), "com.a", 1, "s"),
+            inp("x86.apk", Some("config.x86_64-linux"), "com.a", 1, "s"),
+            inp("hd.apk", Some("config.xhdpi"), "com.a", 1, "s"),
+            inp("en.apk", Some("config.en"), "com.a", 1, "s"),
+            inp("ja.apk", Some("config.ja"), "com.a", 1, "s"),
+        ];
+        let members = validate_split_set(&set).unwrap();
+        let picked = resolve_splits(&members, &DeviceProfile::default());
+        let names: Vec<&str> = picked.iter().map(|m| m.name.as_str()).collect();
+        assert!(names.contains(&""));
+        assert!(names.contains(&"config.arm64-v8a"));
+        assert!(names.contains(&"config.xhdpi"));
+        assert!(names.contains(&"config.en"));
+        assert!(!names.contains(&"config.x86_64-linux"));
+        assert!(!names.contains(&"config.ja"));
+    }
+}

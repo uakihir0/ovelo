@@ -469,6 +469,12 @@ pub struct ManifestInfo {
     pub providers: Vec<String>,
     /// Activity name with MAIN action + LAUNCHER category, if any.
     pub launcher_activity: Option<String>,
+    /// `split` attribute — `None` marks the base APK (§03 splits).
+    pub split: Option<String>,
+    /// `configForSplit` — the split this config split applies to.
+    pub config_for_split: Option<String>,
+    /// `isFeatureSplit` — a dynamic-feature split.
+    pub is_feature_split: bool,
 }
 
 /// Parse a binary manifest into `ManifestInfo`.
@@ -531,6 +537,32 @@ pub fn parse_manifest(b: &[u8]) -> Result<ManifestInfo> {
                             Value::Str(s) => Some(s.clone()),
                             _ => None,
                         });
+                    info.split = el
+                        .attrs
+                        .iter()
+                        .find(|a| a.name == "split")
+                        .and_then(|a| match &a.value {
+                            Value::Str(s) if !s.is_empty() => Some(s.clone()),
+                            _ => None,
+                        });
+                    info.config_for_split = el
+                        .attrs
+                        .iter()
+                        .find(|a| a.name == "configForSplit")
+                        .and_then(|a| match &a.value {
+                            Value::Str(s) if !s.is_empty() => Some(s.clone()),
+                            _ => None,
+                        });
+                    info.is_feature_split = el
+                        .attrs
+                        .iter()
+                        .find(|a| a.name == "isFeatureSplit")
+                        .and_then(|a| match &a.value {
+                            Value::Int(i) => Some(*i != 0),
+                            Value::Str(s) => Some(s == "true"),
+                            _ => None,
+                        })
+                        .unwrap_or(false);
                 }
             }
             "uses-sdk" => {

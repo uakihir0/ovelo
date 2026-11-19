@@ -9,12 +9,17 @@ pub mod arsc;
 pub mod install;
 pub mod manifest;
 pub mod sig;
+pub mod splits;
 pub mod zip;
 
 pub use arsc::{parse_arsc, ResourcePackage};
-pub use install::{AppId, InstallRecord, InstallStore};
+pub use install::{AppId, InstallRecord, InstallStore, StoredSplit};
 pub use manifest::{parse_manifest, Element, ManifestInfo, Value};
 pub use sig::{has_v2_signature, has_v3_signature, verify_v2, SignerInfo};
+pub use splits::{
+    install_split_set, resolve_splits, split_kind, validate_split_set, DeviceProfile,
+    SplitInput, SplitKind, SplitMember,
+};
 pub use zip::{parse_central_directory, read_entry, CentralEntry, ZipLimits};
 
 use ovelo_error::{ErrorCategory, OveloError, Phase, Result};

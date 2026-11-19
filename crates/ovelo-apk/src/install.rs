@@ -56,6 +56,15 @@ impl AppId {
     }
 }
 
+/// One stored split APK of an install (§03 splits).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StoredSplit {
+    /// `split` attribute (`""` for the base APK).
+    pub name: String,
+    /// Content hash of the stored split.
+    pub sha256: String,
+}
+
 /// Record describing one installed version.
 #[derive(Debug, Clone)]
 pub struct InstallRecord {
@@ -71,6 +80,8 @@ pub struct InstallRecord {
     pub derived_dir: PathBuf,
     /// Unix seconds when this version was committed.
     pub installed_at: u64,
+    /// Split APKs installed alongside the base (empty for single APKs).
+    pub splits: Vec<StoredSplit>,
 }
 
 /// On-disk install store.
@@ -125,6 +136,16 @@ impl InstallStore {
     /// already exists it must have the same signer; a different signer is a
     /// `PKG_SIGNATURE` rejection and the previous version stays active.
     pub fn commit(&self, app: &AppId, version_code: i64, apk_sha256: &str, signer: &str) -> Result<InstallRecord> {
+        self.commit_splits(app, version_code, apk_sha256, signer, &[])
+    }
+
+    /// `commit` with the resolved split set recorded alongside the base.
+    pub fn commit_splits(&self, app: &AppId, version_code: i64, apk_sha256: &str, signer: &str, splits: &[StoredSplit]) -> Result<InstallRecord> {
+        for s in splits {
+            if !self.root.join("apks").join(&s.sha256).exists() {
+                return Err(err("install.split.absent").with_detail(s.sha256.clone()));
+            }
+        }
         if app.signer != signer {
             return Err(OveloError::new(
                 ErrorCategory::PkgSignature,
@@ -151,6 +172,7 @@ impl InstallStore {
                 .duration_since(std::time::UNIX_EPOCH)
                 .map(|d| d.as_secs())
                 .unwrap_or(0),
+            splits: splits.to_vec(),
         };
         if !record.apk_path.exists() {
             return Err(err("install.apk.absent"));
@@ -182,6 +204,21 @@ impl InstallStore {
         std::fs::read(&record.apk_path).map_err(|e| io_err("read_apk", e))
     }
 
+    /// Read a stored split's bytes by name (`""` = the base APK).
+    pub fn split_bytes(&self, record: &InstallRecord, name: &str) -> Result<Vec<u8>> {
+        let sha = if name.is_empty() {
+            &record.apk_sha256
+        } else {
+            &record
+                .splits
+                .iter()
+                .find(|s| s.name == name)
+                .ok_or_else(|| err("install.split.missing").with_detail(name.to_string()))?
+                .sha256
+        };
+        std::fs::read(self.root.join("apks").join(sha)).map_err(|e| io_err("read_split", e))
+    }
+
     /// Full removal of an app's records (apk bytes stay — content-addressed,
     /// shared with other apps).
     pub fn remove(&self, app: &AppId) -> Result<()> {
@@ -206,10 +243,14 @@ impl InstallStore {
 
 fn render_record(r: &InstallRecord) -> String {
     // Simple key=value record; values are already validated/hex or decimal.
-    format!(
+    let mut out = format!(
         "package={}\nsigner={}\nversion_code={}\napk_sha256={}\ninstalled_at={}\n",
         r.app.package, r.app.signer, r.version_code, r.apk_sha256, r.installed_at
-    )
+    );
+    for s in &r.splits {
+        out.push_str(&format!("split={}@{}\n", s.name, s.sha256));
+    }
+    out
 }
 
 fn parse_record(text: &str, root: &Path) -> Result<InstallRecord> {
@@ -218,6 +259,7 @@ fn parse_record(text: &str, root: &Path) -> Result<InstallRecord> {
     let mut version_code = None;
     let mut apk_sha256 = None;
     let mut installed_at = 0;
+    let mut splits = Vec::new();
     for line in text.lines() {
         let Some((k, v)) = line.split_once('=') else {
             continue;
@@ -228,6 +270,14 @@ fn parse_record(text: &str, root: &Path) -> Result<InstallRecord> {
             "version_code" => version_code = v.parse().ok(),
             "apk_sha256" => apk_sha256 = Some(v.to_string()),
             "installed_at" => installed_at = v.parse().unwrap_or(0),
+            "split" => {
+                if let Some((name, sha)) = v.rsplit_once('@') {
+                    splits.push(StoredSplit {
+                        name: name.to_string(),
+                        sha256: sha.to_string(),
+                    });
+                }
+            }
             _ => {}
         }
     }
@@ -243,6 +293,7 @@ fn parse_record(text: &str, root: &Path) -> Result<InstallRecord> {
         apk_path: root.join("apks").join(&hash),
         derived_dir: root.join("derived").join(&hash),
         installed_at,
+        splits,
     })
 }
 
@@ -309,5 +360,67 @@ mod tests {
             NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed)));
         std::fs::create_dir_all(&d).unwrap();
         d
+    }
+}
+
+#[cfg(test)]
+mod split_tests {
+    use super::*;
+
+    fn sapp() -> AppId {
+        AppId {
+            package: "com.test.split".into(),
+            signer: "aa".repeat(32),
+        }
+    }
+
+    fn sdir() -> PathBuf {
+        static N: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let d = std::env::temp_dir().join(format!(
+            "ovelo-apk-split-{}-{}",
+            std::process::id(),
+            N.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+        ));
+        std::fs::create_dir_all(&d).unwrap();
+        d
+    }
+
+    #[test]
+    fn splits_round_trip_in_record() {
+        let dir = sdir();
+        let store = InstallStore::open(&dir).unwrap();
+        let base = store.store_apk(b"base").unwrap();
+        let abi = store.store_apk(b"abi").unwrap();
+        let rec = store
+            .commit_splits(
+                &sapp(),
+                1,
+                &base,
+                &"aa".repeat(32),
+                &[StoredSplit { name: "config.arm64-v8a".into(), sha256: abi }],
+            )
+            .unwrap();
+        let loaded = store.current(&sapp()).unwrap().unwrap();
+        assert_eq!(loaded.splits.len(), 1);
+        assert_eq!(store.split_bytes(&loaded, "").unwrap(), b"base");
+        assert_eq!(store.split_bytes(&loaded, "config.arm64-v8a").unwrap(), b"abi");
+        assert!(store.split_bytes(&loaded, "config.en").is_err());
+        drop(rec);
+    }
+
+    #[test]
+    fn commit_splits_rejects_unstored_split() {
+        let dir = sdir();
+        let store = InstallStore::open(&dir).unwrap();
+        let base = store.store_apk(b"base").unwrap();
+        assert!(store
+            .commit_splits(
+                &sapp(),
+                1,
+                &base,
+                &"aa".repeat(32),
+                &[StoredSplit { name: "config.en".into(), sha256: "cd".repeat(32) }],
+            )
+            .is_err());
     }
 }

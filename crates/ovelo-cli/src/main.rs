@@ -8,7 +8,7 @@ use std::process::ExitCode;
 
 use ovelo_apk::install::{AppId, InstallRecord, InstallStore};
 use ovelo_apk::zip::{parse_central_directory, read_entry, ZipLimits};
-use ovelo_apk::{inspect_apk, install_apk, ApkInfo};
+use ovelo_apk::{inspect_apk, install_split_set, ApkInfo, DeviceProfile};
 use ovelo_dex::DexFile;
 use ovelo_error::{ErrorCategory, OveloError, Phase};
 
@@ -22,9 +22,11 @@ fn default_store() -> Result<InstallStore, OveloError> {
     InstallStore::open(PathBuf::from(home).join(".ovelo").join("store"))
 }
 
+mod worker;
+
 enum Cmd {
     Inspect { apk: PathBuf, json: bool },
-    Install { apk: PathBuf, json: bool },
+    Install { apks: Vec<PathBuf>, json: bool },
     Run { app: String },
     Diagnose { apk: PathBuf, json: bool },
     Help,
@@ -49,7 +51,13 @@ fn parse_args(argv: &[String]) -> Result<Cmd, OveloError> {
             pos.push(a);
         }
     }
-    if sub != "help" && sub != "--help" && sub != "-h" && (pos.len() != 1 || unknown_flag) {
+    // `install` accepts a split set (base + config.* APKs); every other
+    // subcommand takes exactly one positional arg.
+    if sub != "help"
+        && sub != "--help"
+        && sub != "-h"
+        && (pos.is_empty() || unknown_flag || (sub != "install" && pos.len() != 1))
+    {
         return Err(err("cli.usage"));
     }
     let arg = pos.first().copied();
@@ -58,8 +66,8 @@ fn parse_args(argv: &[String]) -> Result<Cmd, OveloError> {
             apk: p.into(),
             json,
         }),
-        ("install", Some(p)) => Ok(Cmd::Install {
-            apk: p.into(),
+        ("install", Some(_)) => Ok(Cmd::Install {
+            apks: pos.iter().map(|p| PathBuf::from(*p)).collect(),
             json,
         }),
         ("run", Some(a)) => Ok(Cmd::Run { app: a.clone() }),
@@ -76,7 +84,8 @@ const USAGE: &str = "ovelo — Android app compatibility runtime for macOS
 
 USAGE:
     ovelo inspect  <apk> [--json]   manifest/features/ABIs/dex inventory
-    ovelo install  <apk> [--json]   verify signature + commit to the store
+    ovelo install  <apk> [splits.apk ...] [--json]
+                                  verify signature(s) + commit to the store
     ovelo run      <package>        launch the installed app
     ovelo diagnose <apk>  [--json]  full compatibility report
 ";
@@ -220,7 +229,7 @@ fn run_app(store: &InstallStore, package: &str) -> Result<(), OveloError> {
     // Launch pipeline: Context → Activity lifecycle (via dexrt when the
     // class is in the DEX) → Presenter → window.
     let data_dir = store.app_dir(&rec.app).join("data");
-    let _ctx = ovelo_framework::Context::new(rec.app.package.clone(), data_dir);
+    let _ctx = ovelo_framework::Context::new(rec.app.package.clone(), &data_dir);
     let mut activity = ovelo_framework::Activity::new();
     activity
         .launch()
@@ -240,16 +249,6 @@ fn run_app(store: &InstallStore, package: &str) -> Result<(), OveloError> {
     // model's behavior.
     let desc = format!("L{};", launcher.replace('.', "/"));
     let desc_safe = disp(&desc);
-    let vm = (|| -> Result<_, OveloError> {
-        let (_cd, entries) = parse_central_directory(&bytes, &ZipLimits::default())?;
-        let e = entries
-            .iter()
-            .find(|e| e.name == "classes.dex")
-            .ok_or_else(|| err("cli.dex.missing"))?;
-        let mut v = ovelo_dexrt::Vm::new(DexFile::open(read_entry(&bytes, e)?)?)?;
-        v.enable_aot();
-        Ok(v)
-    })();
     // Guest view bridge: guest view objects (`new TextView` etc.) bind to
     // host widgets hung off this root, and onClick listeners queue back
     // into the VM. Registered BEFORE instantiate so a constructor that
@@ -258,31 +257,61 @@ fn run_app(store: &InstallStore, package: &str) -> Result<(), OveloError> {
     fonts.load_dirs(&["/System/Library/Fonts", "/System/Library/Fonts/Supplemental"]);
     let fonts = std::rc::Rc::new(fonts);
     let ui = ovelo_framework::GuestUi::new(720, 1280, fonts);
-    let mut guest = vm
-        .and_then(|mut v| {
-            ovelo_framework::GuestUi::register(&ui, &mut v);
-            v.instantiate(&desc).map(|h| (v, h))
-        })
-        .map_err(|e| {
-            println!("guest    {desc_safe} not dispatched: {}", e.cause());
-        })
-        .ok();
-    for cb in callbacks {
-        let ran = match &mut guest {
-            Some((vm, this)) => {
-                let r = vm
-                    .call_virtual(*this, &cb, &[])
-                    .and_then(|v| match v {
-                        s @ Some(_) => Ok(s),
-                        None => vm.call_virtual(*this, &cb, &[ovelo_dexrt::V::Ref(0)]),
-                    })
-                    .inspect_err(|e| println!("callback {cb} crashed: {}", e.cause()));
-                matches!(r, Ok(Some(_)))
+    // P3 worker supervision: the whole guest dispatch (VM build → register
+    // → instantiate → lifecycle callbacks) runs under catch_unwind. A panic
+    // writes a crash report and bumps the generation; the worker restarts
+    // once, then stays down — a guest failure never propagates to the host.
+    let mut sup = worker::Supervisor::new(data_dir.join("diagnostics"));
+    let mut guest = loop {
+        let out = sup.supervise("guest-dispatch", || {
+            let vm = (|| -> Result<_, OveloError> {
+                let (_cd, entries) =
+                    parse_central_directory(&bytes, &ZipLimits::default())?;
+                let e = entries
+                    .iter()
+                    .find(|e| e.name == "classes.dex")
+                    .ok_or_else(|| err("cli.dex.missing"))?;
+                let mut v = ovelo_dexrt::Vm::new(DexFile::open(read_entry(&bytes, e)?)?)?;
+                v.enable_aot();
+                Ok(v)
+            })();
+            let mut g = vm
+                .and_then(|mut v| {
+                    ovelo_framework::GuestUi::register(&ui, &mut v);
+                    v.instantiate(&desc).map(|h| (v, h))
+                })
+                .map_err(|e| {
+                    println!("guest    {desc_safe} not dispatched: {}", e.cause());
+                })
+                .ok();
+            if let Some((vm, this)) = &mut g {
+                for cb in &callbacks {
+                    let r = vm
+                        .call_virtual(*this, cb, &[])
+                        .and_then(|v| match v {
+                            s @ Some(_) => Ok(s),
+                            None => vm.call_virtual(*this, cb, &[ovelo_dexrt::V::Ref(0)]),
+                        })
+                        .inspect_err(|e| println!("callback {cb} crashed: {}", e.cause()));
+                    let ran = matches!(r, Ok(Some(_)));
+                    println!("callback {} ({})", cb, if ran { "dex" } else { "framework" });
+                }
             }
-            None => false,
-        };
-        println!("callback {} ({})", cb, if ran { "dex" } else { "framework" });
-    }
+            g
+        });
+        match out {
+            worker::Outcome::Ok(g) => break g,
+            worker::Outcome::Crashed(path) => {
+                println!("crash    guest dispatch panicked -> {}", path.display());
+                if sup.restartable() {
+                    sup.note_restart();
+                    println!("restart  worker generation {}", sup.generation());
+                    continue;
+                }
+                break None;
+            }
+        }
+    };
     let mut presenter = ovelo_host::Presenter::new();
     let sid = presenter.attach(3, 720, 1280)?;
     let win = ovelo_host::HostWindow::new(&disp(&rec.app.package), sid, presenter);
@@ -342,12 +371,29 @@ fn run_app(store: &InstallStore, package: &str) -> Result<(), OveloError> {
         // pumped here so the VM is free to run guest code that mutates
         // the same views (RefCell re-entrancy avoided).
         let pending = ui2.borrow().drain_clicks();
+        let mut dead = false;
         if let Some((vm, _this)) = &mut guest {
             for (l, vh) in pending {
-                if let Err(e) = vm.call_virtual(l, "onClick", &[ovelo_dexrt::V::Ref(vh)]) {
-                    println!("onClick crashed: {}", e.cause());
+                match sup.supervise("onClick", || {
+                    vm.call_virtual(l, "onClick", &[ovelo_dexrt::V::Ref(vh)])
+                }) {
+                    worker::Outcome::Ok(Err(e)) => {
+                        println!("onClick crashed: {}", e.cause());
+                    }
+                    worker::Outcome::Ok(_) => {}
+                    worker::Outcome::Crashed(p) => {
+                        println!("onClick panic -> {}", p.display());
+                        dead = true;
+                        break;
+                    }
                 }
             }
+        }
+        // Panicked worker: drop its surface generation so no stale frame
+        // displays, and never dispatch into the dead VM again.
+        if dead {
+            w.presenter().stop_worker(sid);
+            guest = None;
         }
         let mut u = ui2.borrow_mut();
         if let Ok(prod) = w.presenter().producer(sid) {
@@ -374,14 +420,28 @@ fn cmd() -> Result<(), OveloError> {
             print_inspect(&info, json);
             Ok(())
         }
-        Cmd::Install { apk, json } => {
-            let bytes = read_apk(&apk)?;
+        Cmd::Install { apks, json } => {
             let store = default_store()?;
-            let rec = install_apk(&store, &bytes)?;
+            let mut inputs: Vec<(String, Vec<u8>)> = Vec::with_capacity(apks.len());
+            for p in &apks {
+                let name = p
+                    .file_name()
+                    .map(|n| n.to_string_lossy().into_owned())
+                    .unwrap_or_else(|| p.display().to_string());
+                inputs.push((name, read_apk(p)?));
+            }
+            let refs: Vec<(&str, &[u8])> = inputs
+                .iter()
+                .map(|(n, b)| (n.as_str(), b.as_slice()))
+                .collect();
+            let rec = install_split_set(&store, &refs, &DeviceProfile::default())?;
             if json {
                 println!(
-                    "{{\n  \"package\": {:?},\n  \"versionCode\": {},\n  \"sha256\": {:?}\n}}",
-                    rec.app.package, rec.version_code, rec.apk_sha256
+                    "{{\n  \"package\": {:?},\n  \"versionCode\": {},\n  \"sha256\": {:?},\n  \"splits\": {}\n}}",
+                    rec.app.package,
+                    rec.version_code,
+                    rec.apk_sha256,
+                    rec.splits.len()
                 );
             } else {
                 println!(
@@ -390,6 +450,9 @@ fn cmd() -> Result<(), OveloError> {
                     rec.version_code,
                     rec.apk_path.display()
                 );
+                for s in &rec.splits {
+                    println!("  split   {} -> {}", disp(&s.name), &s.sha256[..16]);
+                }
             }
             Ok(())
         }
