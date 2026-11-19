@@ -39,14 +39,20 @@ impl AppId {
             .chars()
             .map(|c| if c.is_ascii_alphanumeric() || c == '.' || c == '_' || c == '-' { c } else { '_' })
             .collect();
-        // Hash the fingerprint so multi-signer sets cannot collide in dirs.
-        use sha2::Digest;
-        let h: String = sha2::Sha256::digest(self.signer.as_bytes())
-            .iter()
-            .take(8)
-            .map(|b| format!("{b:02x}"))
-            .collect();
-        format!("{pkg}@{h}")
+        if self.signer.contains('+') {
+            // Multi-signer: hash so distinct signer sets cannot collide.
+            use sha2::Digest;
+            let h: String = sha2::Sha256::digest(self.signer.as_bytes())
+                .iter()
+                .take(8)
+                .map(|b| format!("{b:02x}"))
+                .collect();
+            format!("{pkg}@{h}")
+        } else {
+            // Legacy layout for single signers (must not change: existing
+            // installs are reachable only through this name).
+            format!("{pkg}@{}", &self.signer[..16.min(self.signer.len())])
+        }
     }
 }
 

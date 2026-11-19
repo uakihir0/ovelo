@@ -370,10 +370,12 @@ fn parse_package(
                         if p + hsz + i * 4 + 4 > p + csz {
                             return Err(err("arsc.entry.bounds"));
                         }
+                        // Sparse spec = u16 entryIdx | u16 entryOffset(in 4B units);
+                        // every listed record is present (no 0xffff sentinel).
                         let e = u32at(b, p + hsz + i * 4)?;
-                        let idx = (e >> 16) as usize;
-                        let off = ((e & 0xffff) * 4) as usize;
-                        Ok(if off == 0xffff * 4 { None } else { Some((idx, off)) })
+                        let idx = (e & 0xffff) as usize;
+                        let off = ((e >> 16) * 4) as usize;
+                        Ok(Some((idx, off)))
                     } else if flags & FLAG_OFFSET16 != 0 {
                         if p + hsz + i * 2 + 2 > p + csz {
                             return Err(err("arsc.entry.bounds"));
