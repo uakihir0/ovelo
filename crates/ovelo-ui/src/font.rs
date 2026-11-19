@@ -191,35 +191,59 @@ impl FontSet {
 
     /// Per-char advances for `text`: the primary font's shaped cluster
     /// advances where it covers the text (kerning/ligatures correct);
-    /// uncovered chars use per-glyph fallback. Ligature members after the
-    /// first keep `None` here and share their leading cluster's advance
-    /// only if the cluster maps to their byte offset; otherwise they fall
-    /// back to per-glyph metrics.
+    /// uncovered chars fall back per glyph. Glyphs sharing a cluster are
+    /// summed into the cluster's leading char and later members take 0 —
+    /// ligature members don't add a second width.
     pub fn char_advances(&self, text: &str, size_px: f32) -> Vec<f32> {
         let mut byte_to_ci = vec![usize::MAX; text.len() + 1];
-        for (ci, (b, _)) in text.char_indices().enumerate() {
-            byte_to_ci[b] = ci;
+        let chars: Vec<(usize, char)> = text.char_indices().collect();
+        for (ci, (b, _)) in chars.iter().enumerate() {
+            byte_to_ci[*b] = ci;
         }
-        let n = text.chars().count();
+        let n = chars.len();
         let mut out: Vec<Option<f32>> = vec![None; n];
         if let Some(f0) = self.fonts.first() {
-            if let Some(clusters) = f0.shaped_advances(text, size_px) {
-                for (byte, adv) in clusters {
-                    if let Some(&ci) = byte_to_ci.get(byte) {
-                        if ci < n {
-                            out[ci] = Some(adv);
+            if let Some(glyphs) = f0.shaped_advances(text, size_px) {
+                // Sum advances per cluster leader (combining-mark clusters
+                // emit several glyphs at the same cluster byte).
+                let mut leaders: Vec<usize> = Vec::new();
+                let mut sums: std::collections::HashMap<usize, f32> =
+                    std::collections::HashMap::new();
+                for (byte, adv) in glyphs {
+                    let ci = byte_to_ci.get(byte).copied().unwrap_or(usize::MAX);
+                    if ci >= n {
+                        continue;
+                    }
+                    if !sums.contains_key(&ci) {
+                        leaders.push(ci);
+                    }
+                    *sums.entry(ci).or_insert(0.0) += adv;
+                }
+                leaders.sort_unstable();
+                for (k, &ci) in leaders.iter().enumerate() {
+                    // Claim the cluster only when the font really covers the
+                    // leading char — a .notdef glyph means missing → fallback.
+                    if f0.advance_for(chars[ci].1, size_px).is_none() {
+                        continue;
+                    }
+                    let end = leaders.get(k + 1).copied().unwrap_or(n);
+                    out[ci] = Some(sums[&ci]);
+                    for m in ci + 1..end {
+                        if f0.advance_for(chars[m].1, size_px).is_some() {
+                            out[m] = Some(0.0);
                         }
                     }
                 }
             } else {
-                for (ci, (_, c)) in text.char_indices().enumerate() {
-                    out[ci] = f0.advance_for(c, size_px);
+                for (ci, (_, c)) in chars.iter().enumerate() {
+                    out[ci] = f0.advance_for(*c, size_px);
                 }
             }
         }
-        text.char_indices()
+        chars
+            .iter()
             .enumerate()
-            .map(|(ci, (_, c))| out[ci].unwrap_or_else(|| self.advance(c, size_px)))
+            .map(|(ci, &(_, c))| out[ci].unwrap_or_else(|| self.advance(c, size_px)))
             .collect()
     }
 

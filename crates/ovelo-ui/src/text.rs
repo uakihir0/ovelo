@@ -119,15 +119,10 @@ pub fn layout(
         if let Some(maxw) = max_width {
             if run_w > maxw as f32 && i > seg_start {
                 let seg_byte = ch_adv[seg_start].0;
-                let cur_byte = ch_adv[i].0;
-                let b = if last_break > seg_start
-                    && ch_adv[last_break].0 > seg_byte
-                    && ch_adv[last_break].0 < cur_byte
-                {
+                // Break at the current char boundary counts too: it splits
+                // the overflowing char onto the next line.
+                let b = if last_break > seg_start && last_break <= i {
                     last_break
-                } else if breakset.contains(&seg_byte) && seg_byte != 0 && i > seg_start {
-                    // break exactly at segment start makes no progress; skip
-                    usize::MAX
                 } else {
                     usize::MAX
                 };
@@ -135,7 +130,7 @@ pub fn layout(
                     push_line(&mut lines, text, &ch_adv, seg_start, b, para_rtl(seg_byte), false);
                     seg_start = b;
                     i = b;
-                    run_w = ch_adv[b].1;
+                    run_w = 0.0; // char b is re-examined below
                     continue;
                 }
                 // No break point in range: emit an ellipsized prefix that fits.
@@ -298,6 +293,14 @@ mod tests {
         let l3 = layout("\nab", st(), &fs(), None, false);
         assert_eq!(l3.lines.len(), 2); // leading empty line + "ab"
         assert_eq!(l3.lines[0].width, 0);
+        // Wrap at the overflowing char's own boundary.
+        let l4 = layout("ab c", st(), &fs(), Some(30), false);
+        assert_eq!(l4.lines.len(), 2);
+        assert_eq!(l4.lines[1].range.1 - l4.lines[1].range.0, 1); // "c"
+        // No double-count after wrapping: "cdef" (40px) fits in 45px.
+        let l5 = layout("ab cdef", st(), &fs(), Some(45), false);
+        assert_eq!(l5.lines.len(), 2);
+        assert!(!l5.lines[1].ellipsized);
     }
 
     #[test]
