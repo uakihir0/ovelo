@@ -10,11 +10,17 @@
 //! * [`text`] — BiDi + UAX#14 line breaking (kinsoku), wrap, ellipsis and
 //!   exact integer measurement.
 
+pub mod bufq;
 pub mod color;
+pub mod egl;
+pub mod vulkan;
 pub mod font;
 pub mod surface;
 pub mod text;
 
+pub use bufq::{ANativeWindow, BufferQueue, FrameId};
+pub use egl::{EglDisplay, EglConfig, CONFIG_RGBA8_ES2};
+pub use vulkan::{VkInstance, VkSurface, VkSwapchain};
 pub use color::Color;
 pub use font::{FontSet, GlyphSource, TtfFont};
 pub use surface::{Rect, Surface};
