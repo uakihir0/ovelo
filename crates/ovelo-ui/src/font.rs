@@ -29,12 +29,31 @@ pub trait GlyphSource {
     fn shaped_advances(&self, _text: &str, _size_px: f32) -> Option<Vec<(usize, f32)>> {
         None
     }
-    /// Raster coverage for `c`, or `None` when the font can't rasterize.
+    /// Raster coverage for `c`, or `None` when the font can't rasterize
+    /// or doesn't cover the char (triggers fallback).
     /// `ymin`/`ymax` follow fontdue convention: distance from the baseline
     /// to the bitmap's bottom edge (positive = below baseline).
     fn raster_for(&self, _c: char, _size_px: f32) -> Option<GlyphBmp> {
         None
     }
+    /// Shaped, positioned glyph run for `text` (BiDi direction, ligatures,
+    /// mark placement resolved by the shaper), or `None` when the font
+    /// can't shape/rasterize. Only called when the font covers every char.
+    fn shaped_glyphs(&self, _text: &str, _size_px: f32) -> Option<Vec<ShapedGlyph>> {
+        None
+    }
+}
+
+/// One glyph of a shaped run: coverage bitmap plus pen position data in px.
+pub struct ShapedGlyph {
+    /// Rasterized coverage (rasterize_indexed). `w`/`h` may be 0 (space, marks).
+    pub bmp: GlyphBmp,
+    /// Pen advance after this glyph.
+    pub x_adv: f32,
+    /// Offset from the pen origin.
+    pub x_off: f32,
+    /// Baseline lift (positive = above baseline).
+    pub y_off: f32,
 }
 
 /// A rasterized glyph: 8-bit coverage bitmap plus placement metrics.
@@ -159,6 +178,38 @@ impl GlyphSource for TtfFont {
             cov,
         })
     }
+    fn shaped_glyphs(&self, text: &str, size_px: f32) -> Option<Vec<ShapedGlyph>> {
+        let fd = self.fd.as_ref()?;
+        let upm = self.face().units_per_em() as f32;
+        let scale = size_px / upm;
+        let rb_face =
+            rustybuzz::Face::from_slice(&self.bytes, 0).expect("font parsed at registration");
+        let mut buf = rustybuzz::UnicodeBuffer::new();
+        buf.push_str(text);
+        buf.guess_segment_properties();
+        let glyph_buf = rustybuzz::shape(&rb_face, &[], buf);
+        let mut out = Vec::new();
+        for (info, pos) in glyph_buf
+            .glyph_infos()
+            .iter()
+            .zip(glyph_buf.glyph_positions())
+        {
+            let (m, cov) = fd.rasterize_indexed(info.glyph_id as u16, size_px);
+            out.push(ShapedGlyph {
+                bmp: GlyphBmp {
+                    xmin: m.xmin,
+                    ymin: m.ymin,
+                    w: m.width,
+                    h: m.height,
+                    cov,
+                },
+                x_adv: pos.x_advance as f32 * scale,
+                x_off: pos.x_offset as f32 * scale,
+                y_off: pos.y_offset as f32 * scale,
+            });
+        }
+        Some(out)
+    }
 }
 
 /// Ordered fallback font set. Lookup walks in registration order.
@@ -217,6 +268,18 @@ impl FontSet {
     /// Raster `c` via fallback order (first font with coverage wins).
     pub fn raster(&self, c: char, size_px: f32) -> Option<GlyphBmp> {
         self.fonts.iter().find_map(|f| f.raster_for(c, size_px))
+    }
+
+    /// Shaped, positioned glyph run for `text` from the first font that
+    /// covers every char (shaper resolves BiDi order, ligatures and mark
+    /// offsets). `None` when no single font covers the whole text —
+    /// callers then draw per char through [`FontSet::raster`].
+    pub fn shaped_run(&self, text: &str, size_px: f32) -> Option<Vec<ShapedGlyph>> {
+        self.fonts
+            .iter()
+            .map(|f| f.as_ref())
+            .find(|f| text.chars().all(|c| f.advance_for(c, size_px).is_some()))
+            .and_then(|f| f.shaped_glyphs(text, size_px))
     }
 
     /// Advance of `c` via fallback ordering; missing glyphs take the last
@@ -303,5 +366,27 @@ impl FontSet {
     /// Whether no fonts are registered.
     pub fn is_empty(&self) -> bool {
         self.fonts.is_empty()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn raster_skips_uncovered_chars_for_fallback() {
+        let mut fs = FontSet::new();
+        fs.push(Box::new(
+            TtfFont::from_bytes(include_bytes!("../tests/geneva.ttf"))
+                .expect("font parses"),
+        ));
+        // A PUA char Geneva doesn't cover: raster must return None so a
+        // later font in the chain can supply the glyph.
+        assert!(fs.raster('\u{E000}', 16.0).is_none());
+        assert!(fs.shaped_run("\u{E000}", 16.0).is_none());
+        assert!(fs.raster('A', 16.0).is_some());
+        let run = fs.shaped_run("AB", 16.0).expect("shaped");
+        assert_eq!(run.len(), 2);
+        assert!(run.iter().all(|g| g.bmp.w > 0));
     }
 }

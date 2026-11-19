@@ -122,12 +122,25 @@ impl<'a> Canvas<'a> {
         );
     }
 
-    /// `drawText` — run of text with the pen at `(x, baseline)`, using
-    /// the font set's fallback order. Glyphs missing everywhere skip
-    /// silently (`.notdef` shaping is a later layer).
+    /// `drawText` — run of text with the pen at `(x, baseline)`.
+    ///
+    /// When one font covers the whole text the shaper produces the run:
+    /// BiDi visual order, ligatures and mark offsets, matching the
+    /// shaped advances measure uses. Otherwise glyphs fall back per
+    /// char; glyphs missing everywhere skip silently (`.notdef`
+    /// rendering is a later layer).
     pub fn draw_text(&mut self, text: &str, x: i32, baseline: i32, p: Paint) {
-        let mut pen = x + self.dx;
+        let mut pen = (x + self.dx) as f32;
         let base = baseline + self.dy;
+        if let Some(run) = self.fonts.shaped_run(text, p.text_size) {
+            for g in run {
+                let gx = (pen + g.x_off).round() as i32 + g.bmp.xmin;
+                let gy = base - g.y_off.round() as i32 + g.bmp.ymin - g.bmp.h as i32;
+                self.blit_glyph(&g.bmp, gx, gy, p.color);
+                pen += g.x_adv;
+            }
+            return;
+        }
         for c in text.chars() {
             match self.fonts.raster(c, p.text_size) {
                 Some(g) => {
@@ -136,24 +149,28 @@ impl<'a> Canvas<'a> {
                         .font_for(c, p.text_size)
                         .map(|f| f.advance_for(c, p.text_size).unwrap_or(0.0))
                         .unwrap_or(g.w as f32);
-                    let gx = pen + g.xmin;
+                    let gx = pen.round() as i32 + g.xmin;
                     let gy = base + g.ymin - g.h as i32;
-                    for row in 0..g.h {
-                        for col in 0..g.w {
-                            let cov = g.cov[row * g.w + col];
-                            self.surf.blend_pixel(gx + col as i32, gy + row as i32, p.color, cov);
-                        }
-                    }
-                    pen += adv.round() as i32;
+                    self.blit_glyph(&g, gx, gy, p.color);
+                    pen += adv;
                 }
                 None => {
-                    pen += self.fonts.advance(c, p.text_size).round() as i32;
+                    pen += self.fonts.advance(c, p.text_size);
                 }
             }
         }
     }
-}
 
+    /// Coverage-blend one glyph bitmap with its top-left at `(gx, gy)`.
+    fn blit_glyph(&mut self, g: &crate::font::GlyphBmp, gx: i32, gy: i32, c: Color) {
+        for row in 0..g.h {
+            for col in 0..g.w {
+                let cov = g.cov[row * g.w + col];
+                self.surf.blend_pixel(gx + col as i32, gy + row as i32, c, cov);
+            }
+        }
+    }
+}
 
 #[cfg(test)]
 mod tests {
@@ -180,5 +197,9 @@ mod tests {
         // Translated+clipped draw only covered (10..12, 10..12).
         assert_eq!(c.surf.pixel(10, 10), Color::srgb(255, 0, 0));
         assert_eq!(c.surf.pixel(13, 13), Color::TRANSPARENT);
+        c.save();
+        c.restore();
+        c.draw_rect(Rect::new(0, 0, 1, 1), blue);
+        assert_eq!(c.surf.pixel(0, 0), Color::srgb(0, 0, 255));
     }
 }
