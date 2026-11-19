@@ -70,8 +70,9 @@ pub struct VkSurface {
 pub struct VkSwapchain {
     /// Format chosen at creation.
     pub format: String,
-    /// Presented frame ids, in order (the acquire fence source).
-    presented: Vec<FrameId>,
+    /// Last presented frame (the acquire fence source — history isn't kept,
+    /// a swapchain must not grow with every present).
+    last: Option<FrameId>,
 }
 
 impl VkSurface {
@@ -110,7 +111,7 @@ impl VkSurface {
         }
         Ok(VkSwapchain {
             format: format.to_string(),
-            presented: Vec::new(),
+            last: None,
         })
     }
 
@@ -124,7 +125,7 @@ impl VkSurface {
         if q.read(frame).is_none() && q.last_queued() < frame.frame {
             return Err(err("ui.vk.bad_frame"));
         }
-        sc.presented.push(frame);
+        sc.last = Some(frame);
         Ok(())
     }
 
