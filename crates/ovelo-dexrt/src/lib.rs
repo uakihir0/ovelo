@@ -768,14 +768,29 @@ impl Vm {
                 set!(regs[0], V::I32(a.cmp(&b) as i32));
             }
             0x32..=0x37 => {
-                let (a, b) = (Self::i32v(r(0)?)?, Self::i32v(r(1)?)?);
+                let (va, vb) = (r(0)?, r(1)?);
                 let t = match op {
-                    0x32 => a == b,
-                    0x33 => a != b,
-                    0x34 => a < b,
-                    0x35 => a >= b,
-                    0x36 => a > b,
-                    _ => a <= b,
+                    // if-eq/if-ne also compare references by identity.
+                    0x32 | 0x33 => {
+                        let eq = match (va, vb) {
+                            (V::Ref(a), V::Ref(b)) => a == b,
+                            _ => Self::i32v(va)? == Self::i32v(vb)?,
+                        };
+                        if op == 0x32 {
+                            eq
+                        } else {
+                            !eq
+                        }
+                    }
+                    _ => {
+                        let (a, b) = (Self::i32v(va)?, Self::i32v(vb)?);
+                        match op {
+                            0x34 => a < b,
+                            0x35 => a >= b,
+                            0x36 => a > b,
+                            _ => a <= b,
+                        }
+                    }
                 };
                 if t {
                     return Ok(Out::Next(
@@ -784,7 +799,12 @@ impl Vm {
                 }
             }
             0x38..=0x3d => {
-                let a = Self::i32v(r(0)?)?;
+                let va = r(0)?;
+                // if-eqz/if-nez also test references against null.
+                let a = match va {
+                    V::Ref(h) => h as i32,
+                    _ => Self::i32v(va)?,
+                };
                 let t = match op {
                     0x38 => a == 0,
                     0x39 => a != 0,
