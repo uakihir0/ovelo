@@ -204,6 +204,12 @@ pub fn validate_split_set(inputs: &[SplitInput]) -> Result<Vec<SplitMember>> {
     Ok(members)
 }
 
+/// Locale tags normalize to `lang-region` lowercase (`en-rUS`, `en_US`,
+/// `en-US` all collapse).
+fn norm_locale(l: &str) -> String {
+    l.replace('_', "-").replace("-r", "-").to_lowercase()
+}
+
 /// Pick the members to install for `profile`: the base always; for each
 /// config dimension the best-matching split (first in `abis`/`locales`
 /// order; nearest density bucket); feature splits pass through.
@@ -244,7 +250,13 @@ pub fn resolve_splits<'m>(members: &'m [SplitMember], profile: &DeviceProfile) -
                 }
             }
             SplitKind::Locale(l) => {
-                if profile.locales.iter().any(|p| p == l) {
+                let want = norm_locale(l);
+                if profile
+                    .locales
+                    .iter()
+                    .map(|p| norm_locale(p))
+                    .any(|p| p == want || p.starts_with(&format!("{want}-")))
+                {
                     locales.push(m);
                 }
             }
@@ -388,5 +400,25 @@ mod tests {
         assert!(names.contains(&"config.en"));
         assert!(!names.contains(&"config.x86_64-linux"));
         assert!(!names.contains(&"config.ja"));
+    }
+
+    #[test]
+    fn region_profile_matches_language_split() {
+        let set = vec![
+            inp("base.apk", None, "com.a", 1, "s"),
+            inp("en.apk", Some("config.en"), "com.a", 1, "s"),
+            inp("gb.apk", Some("config.en-rGB"), "com.a", 1, "s"),
+        ];
+        let members = validate_split_set(&set).unwrap();
+        let profile = DeviceProfile {
+            locales: vec!["en-US".into()],
+            ..Default::default()
+        };
+        let names: Vec<&str> = resolve_splits(&members, &profile)
+            .iter()
+            .map(|m| m.name.as_str())
+            .collect();
+        assert!(names.contains(&"config.en"));
+        assert!(!names.contains(&"config.en-rGB"));
     }
 }
