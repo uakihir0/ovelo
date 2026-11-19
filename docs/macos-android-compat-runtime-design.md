@@ -4,7 +4,7 @@ For Apple Silicon | Basic Design v0.1 | November 10, 2026
 
 Launch unmodified Android APKs from the Mac Dock and use them with their original layout, text, interactions, and game graphics intact. Without booting an Android guest OS or depending on a host JVM, we build a compatibility layer in Rust that connects app code to the Android APIs.
 
-## Design Premises
+### Design Premises
 
 | Category | Details |
 | --- | --- |
@@ -13,7 +13,7 @@ Launch unmodified Android APKs from the Mac Dock and use them with their origina
 | Execution strategy | A Rust DEX interpreter is used to verify compatibility, and the portion of code compiled to ARM64 via AOT is increased incrementally. Android ARM64 native libraries are handled as an independent workstream with a dedicated loader. |
 | First success criterion | With the same APK, pinned by signature and hash, Japanese line breaking, button hit testing, and redraw after a press match the reference Android. Whether the runtime can be distributed safely is judged at a separate gate. |
 
-## How to Read This Document
+### How to Read This Document
 
 | What you want to know | Relevant chapters |
 | --- | --- |
@@ -24,26 +24,22 @@ Launch unmodified Android APKs from the Mac Dock and use them with their origina
 
 This document is the design at the start of implementation. Any performance figures or support scope marked "target" or "candidate" do not represent measurements or compatibility certification of this runtime.
 
----
-
 ## 01 Prior Implementations and Adoption Decisions
 
 Even OSS projects that handle the same APKs differ in which layers we would want to reuse. Source reference, code incorporation, and runtime dependency are decided separately, and licenses are checked file by file before any code is incorporated.
 
 | Prior implementation | Where to read / track record | Position in this design |
 | --- | --- | --- |
-| Mac.apk | "How Mac.apk Works" and BUILDING. ARM64 ELF, Bionic compatibility layer, GLES/Vulkan, per-app Mac windows. DEX is converted to JVM bytecode. S01 S02 | Referenced for native ABI and GPU integration design. Core is AGPL-3.0. The JVM path falls outside our requirements. Code porting only after the license policy is decided. |
-| DROIDLESS | APK/DEX parsing, managed heap, invoking listeners of the original APK. Has verification records for a calculator and a notepad. UI uses AppKit controls. S03 S04 | Apache-2.0. Candidate for reusing the parser, DEX semantics, and verification procedures. The runtime core also contains a View model, so source boundaries must be checked and rendering dependencies cut out. |
-| Avo | A Rust VMM boots Android on Hypervisor.framework. Implements per-app .app bundles, LaunchServices registration, IME, input, and the display path. S05 | Used for Mac-side interaction design and comparative measurement. Core is Apache-2.0; engine/hvf is BSD-3-Clause. Guest booting and screen forwarding are not part of the product architecture. |
-| Lunaria | Dalvik interpreter and ARM32/64 JIT via Dynarmic, JNI and GLES bridging. Known case on Mac where generated frames don't match the actual window. S06 | Research implementation, primarily MPL-2.0. Referenced for JNI and per-title defect classification. Grounds for not passing tests on offscreen images alone. |
+| Mac.apk | "How Mac.apk Works" and BUILDING. ARM64 ELF, Bionic compatibility layer, GLES/Vulkan, per-app Mac windows. DEX is converted to JVM bytecode. [S01](https://github.com/kksimp/Mac.apk/wiki/How-Mac.apk-Works) [S02](https://github.com/kksimp/Mac.apk/blob/main/BUILDING.md) | Referenced for native ABI and GPU integration design. Core is AGPL-3.0. The JVM path falls outside our requirements. Code porting only after the license policy is decided. |
+| DROIDLESS | APK/DEX parsing, managed heap, invoking listeners of the original APK. Has verification records for a calculator and a notepad. UI uses AppKit controls. [S03](https://github.com/OthmaneBlial/droidless) [S04](https://github.com/OthmaneBlial/droidless/blob/main/docs/verification.md) | Apache-2.0. Candidate for reusing the parser, DEX semantics, and verification procedures. The runtime core also contains a View model, so source boundaries must be checked and rendering dependencies cut out. |
+| Avo | A Rust VMM boots Android on Hypervisor.framework. Implements per-app .app bundles, LaunchServices registration, IME, input, and the display path. [S05](https://github.com/nizwar/avo/blob/main/docs/architecture.md) | Used for Mac-side interaction design and comparative measurement. Core is Apache-2.0; engine/hvf is BSD-3-Clause. Guest booting and screen forwarding are not part of the product architecture. |
+| Lunaria | Dalvik interpreter and ARM32/64 JIT via Dynarmic, JNI and GLES bridging. Known case on Mac where generated frames don't match the actual window. [S06](https://github.com/yui0/lunaria) | Research implementation, primarily MPL-2.0. Referenced for JNI and per-title defect classification. Grounds for not passing tests on offscreen images alone. |
 
 ### Components Under Consideration
 
-AOSP framework, resources, and rendering implementation serve as the baseline for screen reproduction. Skia is a candidate for 2D rendering, ANGLE for OpenGL ES, and MoltenVK for connecting Vulkan to Metal. Rust handles API boundaries and ownership; existing C/C++ libraries are used through a narrow FFI. S07 S08 S09
+AOSP framework, resources, and rendering implementation serve as the baseline for screen reproduction. Skia is a candidate for 2D rendering, ANGLE for OpenGL ES, and MoltenVK for connecting Vulkan to Metal. Rust handles API boundaries and ownership; existing C/C++ libraries are used through a narrow FFI. [S07](https://android.googlesource.com/platform/frameworks/base/+/android-15.0.0_r1/) [S08](https://chromium.googlesource.com/angle/angle/) [S09](https://github.com/KhronosGroup/MoltenVK)
 
-Mac.apk's standalone dex2jvm can be referenced as a DEX→JVM comparison implementation. The product compiler candidate is DEX→custom IR→ARM64, with Cranelift and others evaluated for code generation. Cranelift does not provide Android APIs or DEX type rules. S10 S11
-
----
+Mac.apk's standalone dex2jvm can be referenced as a DEX→JVM comparison implementation. The product compiler candidate is DEX→custom IR→ARM64, with Cranelift and others evaluated for code generation. Cranelift does not provide Android APIs or DEX type rules. [S10](https://github.com/kksimp/dex2jvm) [S11](https://cranelift.dev/)
 
 ## 02 Process and Data Flow
 
@@ -74,11 +70,9 @@ The diagram shows the two representative rendering paths. DEX and ARM64 ELF can 
 
 When opened from the Dock, the host resolves the launch record and either brings the app's existing window to the front or spawns a worker. On quit, it requests a save, stops the worker within a deadline, and discards frames and permission handles. Even if a worker crashes, the management app provides diagnostics and restart.
 
----
-
 ## 03 APK Installation and Updates
 
-The unit of installation is managed not by "app name" but by the combination of Android package name and signer. If signature verification, input storage, or version switching fails, the currently running version is kept. S12
+The unit of installation is managed not by "app name" but by the combination of Android package name and signer. If signature verification, input storage, or version switching fails, the currently running version is kept. [S12](https://source.android.com/docs/security/features/apksigning)
 
 | Step | Processing and failure handling |
 | --- | --- |
@@ -90,17 +84,15 @@ The unit of installation is managed not by "app name" but by the combination of 
 
 ### Extending Supported Formats
 
-For base + config splits, package / versionCode / signer must match, and ABI, density, and language are resolved. Missing required splits are detected at install time. AAB is distinguished as a build input for distribution, and APKS as a set of APKs. XAPK/APKM, additional OBBs, and dynamic feature delivery are each handled individually at later gates. S13
+For base + config splits, package / versionCode / signer must match, and ABI, density, and language are resolved. Missing required splits are detected at install time. AAB is distinguished as a build input for distribution, and APKS as a set of APKs. XAPK/APKM, additional OBBs, and dynamic feature delivery are each handled individually at later gates. [S13](https://developer.android.com/guide/app-bundle/app-bundle-format)
 
 ### Updates and Data
 
 Originals, derived caches, persistent app data, and diagnostics are kept in separate areas. Cache keys include the APK/split hashes, AOSP resource version, and runtime / ABI / CPU backend versions. A failed update reverts the original reference. If the database has been migrated after the app launched, automatic code downgrade is avoided and rollback is only from a compatibility backup made beforehand. The UI distinguishes reinstall, clear data, and full removal.
 
----
-
 ## 04 Executing DEX and the Android Framework
 
-What Kotlin/Java apps put into an APK is DEX. The Rust runtime is responsible for DEX semantics, and AOT-compiled methods use the same object, exception, and calling conventions. Installing a JDK on the host is not a product runtime requirement. The development environment for building test APKs is treated separately. S10 S14
+What Kotlin/Java apps put into an APK is DEX. The Rust runtime is responsible for DEX semantics, and AOT-compiled methods use the same object, exception, and calling conventions. Installing a JDK on the host is not a product runtime requirement. The development environment for building test APKs is treated separately. [S10](https://github.com/kksimp/dex2jvm) [S14](https://source.android.com/docs/core/runtime/dex-format)
 
 | Function | Implementation order and required semantics |
 | --- | --- |
@@ -111,7 +103,7 @@ What Kotlin/Java apps put into an APK is DEX. The Rust runtime is responsible fo
 
 ### Where the Android Implementation Comes From
 
-The public SDK's android.jar is used for API type definitions. Runtime behavior is split between candidates where a pinned AOSP Java/Kotlin implementation is compiled to DEX at build time and bundled, and APIs implemented in Rust for host integration. For each target class, enumerate dependencies on native methods, hidden APIs, libcore, and system services. android.jar alone will not run a screen. S07 S14
+The public SDK's android.jar is used for API type definitions. Runtime behavior is split between candidates where a pinned AOSP Java/Kotlin implementation is compiled to DEX at build time and bundled, and APIs implemented in Rust for host integration. For each target class, enumerate dependencies on native methods, hidden APIs, libcore, and system services. android.jar alone will not run a screen. [S07](https://android.googlesource.com/platform/frameworks/base/+/android-15.0.0_r1/) [S14](https://source.android.com/docs/core/runtime/dex-format)
 
 Initially, only Activity, Context, Resources, Looper/Handler, and the call closure of selected widgets are passed through. Reflection, dynamic class loading, multiple processes, and parallel execution are made explicit at each phase. No stubs that unconditionally return success are provided; unimplemented class and method signatures and their first caller are recorded.
 
@@ -119,11 +111,9 @@ Initially, only Activity, Context, Resources, Looper/Handler, and the call closu
 
 Run the same input on the Android reference device, the Rust interpreter, and AOT in that order, and confirm that values, exception types, and side effects match. Artifacts that don't meet signing and executable-memory requirements are not loaded. Reference execution for development does not involve OS virtualization. In AOT-only profiles, uncompiled reachable methods are reported explicitly and launch or execution is stopped. The distribution scope is published per profile.
 
----
-
 ## 05 ARM64 Native Code
 
-The target is arm64-v8a ELF. Even on the same ARM64, Android and Darwin differ in variadic arguments, TLS, and system calls. Per-type ABI conversion is inserted for host calls. S15 S16 S17
+The target is arm64-v8a ELF. Even on the same ARM64, Android and Darwin differ in variadic arguments, TLS, and system calls. Per-type ABI conversion is inserted for host calls. [S15](https://developer.android.com/ndk/guides/abis) [S16](https://developer.apple.com/documentation/xcode/writing-arm64-code-for-apple-platforms) [S17](https://android.googlesource.com/platform/bionic/+/HEAD/docs/elf-tls.md)
 
 | Phase | Implementation and verification |
 | --- | --- |
@@ -133,58 +123,52 @@ The target is arm64-v8a ELF. Even on the same ARM64, Android and Darwin differ i
 
 ### Verifying Platform-Specific ABI
 
-The Android NDK reserves x18 for ShadowCallStack, while Apple reserves it for the platform. Mac.apk's approach requires an x18 entitlement and macOS 26.4 or later. The minimum OS version for this design is verified with distribution signing. S02 S15 S16
+The Android NDK reserves x18 for ShadowCallStack, while Apple reserves it for the platform. Mac.apk's approach requires an x18 entitlement and macOS 26.4 or later. The minimum OS version for this design is verified with distribution signing. [S02](https://github.com/kksimp/Mac.apk/blob/main/BUILDING.md) [S15](https://developer.android.com/ndk/guides/abis) [S16](https://developer.apple.com/documentation/xcode/writing-arm64-code-for-apple-platforms)
 
 ### Pass Criteria
 
-From a self-built NDK APK, call an addition function and a native→DEX callback, and record that the executing PC lies within the ELF code region and that results match the reference Android. Retest TLS on other threads, 4/16 KiB alignment, and rejection of unknown symbols. Libraries whose C++ exceptions cross the ABI boundary and libraries that issue Linux syscalls directly are recorded as unsupported until individually implemented. Code writing and execution are separated, and we confirm that writes to executable pages fail in the signed worker. S17 S18
-
----
+From a self-built NDK APK, call an addition function and a native→DEX callback, and record that the executing PC lies within the ELF code region and that results match the reference Android. Retest TLS on other threads, 4/16 KiB alignment, and rejection of unknown symbols. Libraries whose C++ exceptions cross the ABI boundary and libraries that issue Linux syscalls directly are recorded as unsupported until individually implemented. Code writing and execution are separated, and we confirm that writes to executable pages fail in the signed worker. [S17](https://android.googlesource.com/platform/bionic/+/HEAD/docs/elf-tls.md) [S18](https://developer.apple.com/documentation/security/hardened-runtime)
 
 ## 06 Reproducing Standard Android UI
 
-Use an Activity with Japanese TextView and Button. Adopt AOSP API 35's View measurement, layout, drawing, and click handling along with their dependent classes, and also run the app's onDraw and listeners in the DEX runtime. SDK stubs are used to check method types and arguments. S07
+Use an Activity with Japanese TextView and Button. Adopt AOSP API 35's View measurement, layout, drawing, and click handling along with their dependent classes, and also run the app's onDraw and listeners in the DEX runtime. SDK stubs are used to check method types and arguments. [S07](https://android.googlesource.com/platform/frameworks/base/+/android-15.0.0_r1/)
 
 ### From Layout to Pixels
 
 | Stage | Implementation and comparison points |
 | --- | --- |
-| Resources | Pass the APK and API 35 framework-res to AssetManager2. Resolve theme parents, attribute references, density, language, and night mode from resources.arsc and binary XML. Record resource IDs. S07 |
-| Text | Use the target version's fonts and fallback order, and Minikin text measurement. With mixed Japanese/English text, compare line-break positions, baselines, end ellipsizing, and right-to-left display. S23 S35 |
-| Drawing | The UI thread runs measure, layout, and draw. Initially draw to a Skia CPU surface at a fixed time; later, port HWUI display lists and RenderThread. GPU-specific effects are checked for conformance individually. S24 |
+| Resources | Pass the APK and API 35 framework-res to AssetManager2. Resolve theme parents, attribute references, density, language, and night mode from resources.arsc and binary XML. Record resource IDs. [S07](https://android.googlesource.com/platform/frameworks/base/+/android-15.0.0_r1/) |
+| Text | Use the target version's fonts and fallback order, and Minikin text measurement. With mixed Japanese/English text, compare line-break positions, baselines, end ellipsizing, and right-to-left display. [S23](https://android.googlesource.com/platform/frameworks/minikin/) [S35](https://source.android.com/docs/core/fonts/custom-font-fallback) |
+| Drawing | The UI thread runs measure, layout, and draw. Initially draw to a Skia CPU surface at a fixed time; later, port HWUI display lists and RenderThread. GPU-specific effects are checked for conformance individually. [S24](https://android.googlesource.com/platform/frameworks/base/+/main/libs/hwui/pipeline/skia/SkiaGpuPipeline.cpp) |
 
 ### Interaction and Scope
 
-Test press, cancel by sliding the finger off, and re-layout after text change. Pass Mac frame callbacks to Choreographer, and trace until an invalidated View is updated on the next frame. IME input is connected to InputConnection in Chapter 08. S07 S26
+Test press, cancel by sliding the finger off, and re-layout after text change. Pass Mac frame callbacks to Choreographer, and trace until an invalidated View is updated on the next frame. IME input is connected to InputConnection in Chapter 08. [S07](https://android.googlesource.com/platform/frameworks/base/+/android-15.0.0_r1/) [S26](https://developer.android.com/reference/android/view/inputmethod/InputConnection)
 
-For Compose, run the AndroidX inside the APK and verify drawing, the frame clock, and recomposition. WebView requires Chromium's provider and renderer process, so it is a dedicated compatibility workstream. S25
-
----
+For Compose, run the AndroidX inside the APK and verify drawing, the frame clock, and recomposition. WebView requires Chromium's provider and renderer process, so it is a dedicated compatibility workstream. [S25](https://chromium.googlesource.com/chromium/src/+/refs/heads/main/android_webview/docs/architecture.md)
 
 ## 07 Game Rendering and Surface Composition
 
-Native games are given an ANativeWindow corresponding to the Java Surface. Regular UI, game, and dialog surfaces are composited into a single Mac window. S22
+Native games are given an ANativeWindow corresponding to the Java Surface. Regular UI, game, and dialog surfaces are composited into a single Mac window. [S22](https://source.android.com/docs/core/graphics/architecture)
 
 | Rendering path | Host responsibilities |
 | --- | --- |
-| OpenGL ES | Create EGL configs, contexts, and window surfaces, using ANGLE's Metal backend. After eglSwapBuffers, hand off the frame with a completion fence. S08 |
-| Vulkan | Connect vkCreateAndroidSurfaceKHR to the host display surface and send to Metal via MoltenVK. Check requested formats, extensions, queues, and swapchains, and return the names of missing features. S09 |
+| OpenGL ES | Create EGL configs, contexts, and window surfaces, using ANGLE's Metal backend. After eglSwapBuffers, hand off the frame with a completion fence. [S08](https://chromium.googlesource.com/angle/angle/) |
+| Vulkan | Connect vkCreateAndroidSurfaceKHR to the host display surface and send to Metal via MoltenVK. Check requested formats, extensions, queues, and swapchains, and return the names of missing features. [S09](https://github.com/KhronosGroup/MoltenVK) |
 
 ### Color and Surface Lifetime
 
 If the screen appears dark, draw a linear gray gradient and a semi-transparent rectangle, then inspect in order the render target format, sRGB conversion, presentation surface color space, and premultiplied alpha. A linear value of 0.5 gray is about 188 in 8-bit sRGB. Use intermediate and final values to isolate missing or double-applied conversions.
 
-On resize, update the surface generation and stop displaying old frames. Display only after writes complete, and reuse buffers only after reads complete. For minimize, restore, and orientation changes, track Activity and Surface lifetimes separately and stop drawing on destroyed surfaces. S22
+On resize, update the surface generation and stop displaying old frames. Display only after writes complete, and reuse buffers only after reads complete. For minimize, restore, and orientation changes, track Activity and Surface lifetimes separately and stop drawing on destroyed surfaces. [S22](https://source.android.com/docs/core/graphics/architecture)
 
 ### On-Screen Pass Criteria
 
-Verify launch and restore with the NDK sample triangle, and overlay a button on the rotating cube in ApiDemos' SurfaceViewOverlay. Check stacking order, clipping, coordinate transforms, and tap delivery targets, and detect taps leaking through to the game below. Also capture the actual Mac window and detect black screens, color shifts, and stale frames. S27 S28
-
----
+Verify launch and restore with the NDK sample triangle, and overlay a button on the rotating cube in ApiDemos' SurfaceViewOverlay. Check stacking order, clipping, coordinate transforms, and tap delivery targets, and detect taps leaking through to the game below. Also capture the actual Mac window and detect black screens, color shifts, and stale frames. [S27](https://github.com/android/ndk-samples/tree/abb0d8ef36a5ee1be5cebc67025678f42970c393) [S28](https://android.googlesource.com/platform/development/+/refs/heads/main/samples/ApiDemos/)
 
 ## 08 Mac Interaction and Android Services
 
-Preserve the lifecycle and input semantics of the original APK. Start by limiting to a single Activity, translating Mac window events into Android state transitions. State owned by the OS is managed by the host, and worker state changes are sent to the UI thread's queue. S05 S26 S33
+Preserve the lifecycle and input semantics of the original APK. Start by limiting to a single Activity, translating Mac window events into Android state transitions. State owned by the OS is managed by the host, and worker state changes are sent to the UI thread's queue. [S05](https://github.com/nizwar/avo/blob/main/docs/architecture.md) [S26](https://developer.android.com/reference/android/view/inputmethod/InputConnection) [S33](https://source.android.com/docs/core/architecture/ipc/binder-overview)
 
 | User interaction | Implementation contract and tests |
 | --- | --- |
@@ -195,15 +179,13 @@ Preserve the lifecycle and input semantics of the original APK. Start by limitin
 
 ### Initial Service Compatibility Scope
 
-Implement Context, Activity/Window management, package information, private directories, and SharedPreferences first, followed by in-app processing for SQLite and ContentResolver. Catalog the call contracts that Binder clients require, and connect the needed ones to in-process adapters or privileged IPC. Do not assume a Binder driver or a running system_server. S33
+Implement Context, Activity/Window management, package information, private directories, and SharedPreferences first, followed by in-app processing for SQLite and ContentResolver. Catalog the call contracts that Binder clients require, and connect the needed ones to in-process adapters or privileged IPC. Do not assume a Binder driver or a running system_server. [S33](https://source.android.com/docs/core/architecture/ipc/binder-overview)
 
-Audio output is mapped in stages from AudioTrack / AAudio / OpenSL ES to Core Audio; camera, microphone, and location are provided after individual consent. Networking, TLS, WebView, external storage, notifications, and background execution are each independent support items. Hardware attestation, Play Integrity, Google Play Billing, DRM, and integration with external apps have separate prerequisites; when unsupported, Android's failure paths are taken. S21 S25
-
----
+Audio output is mapped in stages from AudioTrack / AAudio / OpenSL ES to Core Audio; camera, microphone, and location are provided after individual consent. Networking, TLS, WebView, external storage, notifications, and background execution are each independent support items. Hardware attestation, Play Integrity, Google Play Billing, DRM, and integration with external apps have separate prerequisites; when unsupported, Android's failure paths are taken. [S21](https://www.android.com/gms/) [S25](https://chromium.googlesource.com/chromium/src/+/refs/heads/main/android_webview/docs/architecture.md)
 
 ## 09 Isolation and Signed Distribution
 
-Assume malicious APKs, ARM64 libraries, and tampered caches. APK signatures are used to verify the publisher and contents. Host privileges are restricted, and isolation is measured before distribution. S12 S19
+Assume malicious APKs, ARM64 libraries, and tampered caches. APK signatures are used to verify the publisher and contents. Host privileges are restricted, and isolation is measured before distribution. [S12](https://source.android.com/docs/security/features/apksigning) [S19](https://developer.apple.com/documentation/security/app-sandbox)
 
 | Boundary | Implementation and tests |
 | --- | --- |
@@ -215,13 +197,11 @@ Assume malicious APKs, ARM64 libraries, and tampered caches. APK signatures are 
 
 From test native code, bypass the compatibility APIs and use host system calls to open a marker file of another APK and a private file in the home directory. Record that both are denied and that an allowed file succeeds. On failure, hold off on public installation of arbitrary APKs and limit to developers' test APKs.
 
-Enable Developer ID signing and Hardened Runtime. Executable-memory exceptions are attached only to the binaries that need them. For each release, check the final distribution's entitlements, notarization, first launch, and post-update signatures and isolation. S18 S19 S36
+Enable Developer ID signing and Hardened Runtime. Executable-memory exceptions are attached only to the binaries that need them. For each release, check the final distribution's entitlements, notarization, first launch, and post-update signatures and isolation. [S18](https://developer.apple.com/documentation/security/hardened-runtime) [S19](https://developer.apple.com/documentation/security/app-sandbox) [S36](https://developer.apple.com/documentation/security/notarizing-macos-software-before-distribution)
 
 ### Provenance of Distributed Artifacts
 
-Record the versions, licenses, and notice / source-offer obligations of bundled code, AOSP resources, and fonts in a bill of materials. Providing GMS requires a separate agreement with Google, so it is excluded from the initial distribution. S20 S21
-
----
+Record the versions, licenses, and notice / source-offer obligations of bundled code, AOSP resources, and fonts in a bill of materials. Providing GMS requires a separate agreement with Google, so it is excluded from the initial distribution. [S20](https://source.android.com/docs/setup/contribute/licenses) [S21](https://www.android.com/gms/)
 
 ## 10 Reference Apps for Verification
 
@@ -232,20 +212,19 @@ Initial acceptance uses a self-built single-Activity APK. Install the same signe
 | Target | Observations required to pass |
 | --- | --- |
 | Self-built XML / Canvas / Japanese APK | Place TextView, EditText, Button, and custom drawing on the same screen. Compare Japanese line breaks, taps inside and outside button bounds, and redraw after press. For the "にほん" → "日本" conversion, record the composing range, commit and cancel, and cursor position. Compare clipping and semi-transparent overlap in separate regions. |
-| Simple Calculator 1.0 / Notepad 1.0.0 | For the calculator, reproduce "7 + 5 = 12" with the original DEX listeners. For the notepad, one case consists of editing the title and body, then Back → quit → new process, until the same values are restored. These are the operations from DROIDLESS's published verification records; behavior on this runtime is unverified. S03 S04 |
-| AOSP ApiDemos | Select individual screens from Graphics and Views, pinning the sample name, input, and rendering result. Record launching the sample list and the pass/fail of each screen separately. S28 |
-| Google NDK samples | native-activity: initial window and color clear; hello-gl2: Java→JNI→GLES 2 triangle; hello-vulkan: Vulkan triangle and screen rotation. Save images of the actual window. S27 |
-| Now in Android | With the demoRelease build using static data, scroll the list and compare state after selecting a topic. Used for later-stage Compose testing. S29 |
-| Shadowverse: Worlds Beyond | Optional late-stage observation. Record launch, additional data download, title screen rendering, and actual gameplay separately. Official recommended environment is Android 14 or later with 8 GB+ RAM. Behavior on this runtime is unconfirmed. S30 |
+| Simple Calculator 1.0 / Notepad 1.0.0 | For the calculator, reproduce "7 + 5 = 12" with the original DEX listeners. For the notepad, one case consists of editing the title and body, then Back → quit → new process, until the same values are restored. These are the operations from DROIDLESS's published verification records; behavior on this runtime is unverified. [S03](https://github.com/OthmaneBlial/droidless) [S04](https://github.com/OthmaneBlial/droidless/blob/main/docs/verification.md) |
+| AOSP ApiDemos | Select individual screens from Graphics and Views, pinning the sample name, input, and rendering result. Record launching the sample list and the pass/fail of each screen separately. [S28](https://android.googlesource.com/platform/development/+/refs/heads/main/samples/ApiDemos/) |
+| Google NDK samples | native-activity: initial window and color clear; hello-gl2: Java→JNI→GLES 2 triangle; hello-vulkan: Vulkan triangle and screen rotation. Save images of the actual window. [S27](https://github.com/android/ndk-samples/tree/abb0d8ef36a5ee1be5cebc67025678f42970c393) |
+| Now in Android | With the demoRelease build using static data, scroll the list and compare state after selecting a topic. Used for later-stage Compose testing. [S29](https://github.com/android/nowinandroid/tree/2982e63cb691ad49cd009aab43dc206fee6699c2) |
+| Shadowverse: Worlds Beyond | Optional late-stage observation. Record launch, additional data download, title screen rendering, and actual gameplay separately. Official recommended environment is Android 14 or later with 8 GB+ RAM. Behavior on this runtime is unconfirmed. [S30](https://shadowverse-wb.com/ja/system-requirements/) |
 
 ### Handling Legacy APKs
 
-The calculator's public APK has only a v1 signature and does not meet the v2/v3 requirement for standard installation. When comparing legacy versions, verify the source and hash in an isolated test environment and record the corresponding Android version. Android 15 also restricts standard installation of apps with targetSdk below 24, so old real-world apps are compared on a dedicated reference device of the corresponding version. S37 Product acceptance uses a self-built v2/v3-signed APK that reproduces the same calculation and save operations.
+The calculator's public APK has only a v1 signature and does not meet the v2/v3 requirement for standard installation. When comparing legacy versions, verify the source and hash in an isolated test environment and record the corresponding Android version. Android 15 also restricts standard installation of apps with targetSdk below 24, so old real-world apps are compared on a dedicated reference device of the corresponding version. [S37](https://developer.android.com/about/versions/15/behavior-changes-all#minimum-target-api-level) Product acceptance uses a self-built v2/v3-signed APK that reproduces the same calculation and save operations.
 
-- Simple Calculator distributed APK SHA-256: `7c1adc93607c8511a3abd379f74765747d2ae72fb70c4ff5c471f13e94b98921` S31
-- Notepad distributed APK SHA-256: `2c35d3dc1d41d2c761b52785c591973886fb671a2cc2e7ab047ede89599db47f` S32
+Simple Calculator distributed APK SHA-256: `7c1adc93607c8511a3abd379f74765747d2ae72fb70c4ff5c471f13e94b98921` [S31](https://github.com/OthmaneBlial/droidless/blob/main/tools/fetch-simple-calculator.sh)
 
----
+Notepad distributed APK SHA-256: `2c35d3dc1d41d2c761b52785c591973886fb671a2cc2e7ab047ede89599db47f` [S32](https://github.com/OthmaneBlial/droidless/blob/main/tools/fetch-notepad.sh)
 
 ## 11 Differential Testing and Performance Budget
 
@@ -253,7 +232,7 @@ The unit of comparison changes from "app name" to "APK hash × execution environ
 
 ### Reproduction Conditions and Observation Method
 
-The baseline is a specific build of AOSP API 35. A pinned AVD serves as a reference that can be reproduced offline, and a physical Android device is used to check GPU, IME, and real input. The product depends on neither. On both ends, align locale=ja-JP, logical screen, density, font scale, theme, time, input sequence, and animation settings. For web and games, also record versions and server responses. S34
+The baseline is a specific build of AOSP API 35. A pinned AVD serves as a reference that can be reproduced offline, and a physical Android device is used to check GPU, IME, and real input. The product depends on neither. On both ends, align locale=ja-JP, logical screen, density, font scale, theme, time, input sequence, and animation settings. For web and games, also record versions and server responses. [S34](https://developer.android.com/training/testing/ui-tests/screenshot)
 
 | Gate | Judgment |
 | --- | --- |
@@ -266,8 +245,6 @@ The baseline is a specific build of AOSP API 35. A pinned AVD serves as a refere
 With a lightweight single-Activity fixture: from new process launch after install to interactive, p95 1.0 s; reshowing an existing worker, p95 250 ms. In a fixed 60 Hz scroll, the proportion of display intervals exceeding 20 ms should be 1% or less. Input→screen change targets p95 50 ms, with measurement points and screen refresh rate stated explicitly. All are provisional targets and are not applied uniformly to real-world apps.
 
 Install/AOT time, first launch, cached new launch, and resume are aggregated separately. Each is run 30+ times under the same power and thermal conditions, reporting p50/p95 and failure counts. Also record 5-minute idle CPU, combined worker + host memory, memory growth, GPU time, frame waits, and copy counts. For relative comparisons, align image quality, resolution, and hardware.
-
----
 
 ## 12 Implementation Order and Release Gates
 
@@ -284,13 +261,7 @@ Phases are not fixed to calendar dates; scope is expanded from paths that have p
 
 ### Three Deliverables at Kickoff
 
-1. Baseline data including configuration, APK digest, operation sequence, and expected images.
-2. A provisional CLI contract — `inspect` / `install` / `run` / `diagnose` — and an error format that identifies unimplemented APIs.
-3. A report that operates the same APK on Android and Mac and lays out differences, elapsed time, and failure reasons side by side.
-
-Paths that have not yet passed are restricted to test mode.
-
----
+① Baseline data including configuration, APK digest, operation sequence, and expected images. ② A provisional CLI contract — `inspect` / `install` / `run` / `diagnose` — and an error format that identifies unimplemented APIs. ③ A report that operates the same APK on Android and Mac and lays out differences, elapsed time, and failure reasons side by side. Paths that have not yet passed are restricted to test mode.
 
 ## 13 Open Issues and Operations
 
@@ -309,8 +280,6 @@ Each design assumption is paired with the observation that decides adoption and 
 Parser, DEX, and ABI tests run in regular CI; signing, GPU, display/IME run as jobs on Apple Silicon hardware; baseline images run as a pinned Android job. Lock the SDK/NDK, Rust, Xcode, AOSP, GPU dependencies, and APK sources. On changes, dependency licenses and the reason for baseline image changes are checked in the same review.
 
 Diagnostics include the runtime version, APK/split hashes, OS and GPU, profile, unsupported APIs, exceptions/symbols, last frame, and timeline. Content, typed text, credentials, and personal file names are not recorded by default. Images are attached only if the user chooses. Minimal reproduction scenarios go into the regression set, and the fixed version and retest results are kept in the compatibility ledger.
-
----
 
 ## 14 Compatibility Ledger and Diagnostic Specification
 
@@ -331,47 +300,45 @@ As an example, register "JP01 / text input / after commit," with "日本", the s
 
 On failure, return stable categories such as `PKG_SIGNATURE`, `DEX_UNSUPPORTED`, `ABI_SYMBOL`, `GPU_FEATURE`, `SERVICE_MISSING`, `POLICY_DENIED`, and `HOST_CRASH`. The CLI and GUI handle the same category, cause name, relevant phase, and reproduction steps; general users are shown the next available actions, and developers are shown the first point of failure.
 
----
-
 ## Sources and Implementation References 1
 
-- S01 Mac.apk execution design — boundaries of DEX conversion, ELF, Bionic, and GPU
-- S02 Mac.apk build requirements — ARM64 loader and macOS entitlements
-- S03 DROIDLESS — Rust APK/DEX execution and verified operations
-- S04 DROIDLESS verification records — native operation and replay tests of unmodified APKs
-- S05 Avo design — per-package Mac windows, IME, processes
-- S06 Lunaria — instruction execution, JNI, per-title support and rendering limitations
-- S07 AOSP frameworks/base — pinned Android 15 reference tag android-15.0.0_r1
-- S08 ANGLE — EGL / OpenGL ES backends
-- S09 MoltenVK — implementation and constraints of connecting Vulkan to Metal
-- S10 dex2jvm — Mac.apk's DEX→JVM bytecode converter
-- S11 Cranelift — candidate ARM64 code generation backend
-- S12 Android APK signature schemes — v1/v2/v3 signatures and protected scope
-- S13 Android App Bundle format — base/split and distribution bundles
-- S14 Dalvik executable format — DEX structure, types, and versions
-- S15 Android NDK ABIs — arm64-v8a and platform conventions
-- S16 Apple ARM64 calling conventions — x18, arguments, stack, and ABI differences
-- S17 Bionic ELF TLS — Android linker and thread-local storage
-- S18 Apple Hardened Runtime — signed processes and runtime protections
+- **S01** [Mac.apk execution design](https://github.com/kksimp/Mac.apk/wiki/How-Mac.apk-Works) — boundaries of DEX conversion, ELF, Bionic, and GPU
+- **S02** [Mac.apk build requirements](https://github.com/kksimp/Mac.apk/blob/main/BUILDING.md) — ARM64 loader and macOS entitlements
+- **S03** [DROIDLESS](https://github.com/OthmaneBlial/droidless) — Rust APK/DEX execution and verified operations
+- **S04** [DROIDLESS verification records](https://github.com/OthmaneBlial/droidless/blob/main/docs/verification.md) — native operation and replay tests of unmodified APKs
+- **S05** [Avo design](https://github.com/nizwar/avo/blob/main/docs/architecture.md) — per-package Mac windows, IME, processes
+- **S06** [Lunaria](https://github.com/yui0/lunaria) — instruction execution, JNI, per-title support and rendering limitations
+- **S07** [AOSP frameworks/base](https://android.googlesource.com/platform/frameworks/base/+/android-15.0.0_r1/) — pinned Android 15 reference tag android-15.0.0_r1
+- **S08** [ANGLE](https://chromium.googlesource.com/angle/angle/) — EGL / OpenGL ES backends
+- **S09** [MoltenVK](https://github.com/KhronosGroup/MoltenVK) — implementation and constraints of connecting Vulkan to Metal
+- **S10** [dex2jvm](https://github.com/kksimp/dex2jvm) — Mac.apk's DEX→JVM bytecode converter
+- **S11** [Cranelift](https://cranelift.dev/) — candidate ARM64 code generation backend
+- **S12** [Android APK signature schemes](https://source.android.com/docs/security/features/apksigning) — v1/v2/v3 signatures and protected scope
+- **S13** [Android App Bundle format](https://developer.android.com/guide/app-bundle/app-bundle-format) — base/split and distribution bundles
+- **S14** [Dalvik executable format](https://source.android.com/docs/core/runtime/dex-format) — DEX structure, types, and versions
+- **S15** [Android NDK ABIs](https://developer.android.com/ndk/guides/abis) — arm64-v8a and platform conventions
+- **S16** [Apple ARM64 calling conventions](https://developer.apple.com/documentation/xcode/writing-arm64-code-for-apple-platforms) — x18, arguments, stack, and ABI differences
+- **S17** [Bionic ELF TLS](https://android.googlesource.com/platform/bionic/+/HEAD/docs/elf-tls.md) — Android linker and thread-local storage
+- **S18** [Apple Hardened Runtime](https://developer.apple.com/documentation/security/hardened-runtime) — signed processes and runtime protections
 
 ## Sources and Implementation References 2
 
-- S19 Apple App Sandbox — entitlements, containers, access to host resources
-- S20 AOSP licenses — per-component license review
-- S21 Google Mobile Services — differences in provisioning terms from AOSP
-- S22 Android graphics architecture — Surface, BufferQueue, composition
-- S23 AOSP Minikin — source for text measurement and layout
-- S24 AOSP HWUI — Skia GPU pipeline implementation
-- S25 Chromium Android WebView — provider and renderer architecture
-- S26 Android InputConnection — contract for composing text, selection, commit and cancel
-- S27 Google NDK samples — pinned commit for native-activity / hello-gl2 / hello-vulkan
-- S28 AOSP ApiDemos — Graphics and Views samples for verification
-- S29 Now in Android — pinned commit for Compose demoRelease build
-- S30 Shadowverse: Worlds Beyond — official recommended environment for Japan
-- S31 Simple Calculator acquisition definition — public APK source, commit, expected SHA-256
-- S32 Notepad acquisition definition — public APK tag and expected SHA-256
-- S33 Android Binder design — inter-process service calls
-- S34 Android screenshot testing — visual diffs and handling of reference images
-- S35 Android font fallback — scripts, languages, and font configuration
-- S36 Apple notarization — signing and notarization of Mac distributions
-- S37 Android 15 behavior changes for all apps — installation restrictions for old targetSdk
+- **S19** [Apple App Sandbox](https://developer.apple.com/documentation/security/app-sandbox) — entitlements, containers, access to host resources
+- **S20** [AOSP licenses](https://source.android.com/docs/setup/contribute/licenses) — per-component license review
+- **S21** [Google Mobile Services](https://www.android.com/gms/) — differences in provisioning terms from AOSP
+- **S22** [Android graphics architecture](https://source.android.com/docs/core/graphics/architecture) — Surface, BufferQueue, composition
+- **S23** [AOSP Minikin](https://android.googlesource.com/platform/frameworks/minikin/) — source for text measurement and layout
+- **S24** [AOSP HWUI](https://android.googlesource.com/platform/frameworks/base/+/main/libs/hwui/pipeline/skia/SkiaGpuPipeline.cpp) — Skia GPU pipeline implementation
+- **S25** [Chromium Android WebView](https://chromium.googlesource.com/chromium/src/+/refs/heads/main/android_webview/docs/architecture.md) — provider and renderer architecture
+- **S26** [Android InputConnection](https://developer.android.com/reference/android/view/inputmethod/InputConnection) — contract for composing text, selection, commit and cancel
+- **S27** [Google NDK samples](https://github.com/android/ndk-samples/tree/abb0d8ef36a5ee1be5cebc67025678f42970c393) — pinned commit for native-activity / hello-gl2 / hello-vulkan
+- **S28** [AOSP ApiDemos](https://android.googlesource.com/platform/development/+/refs/heads/main/samples/ApiDemos/) — Graphics and Views samples for verification
+- **S29** [Now in Android](https://github.com/android/nowinandroid/tree/2982e63cb691ad49cd009aab43dc206fee6699c2) — pinned commit for the Compose demoRelease build
+- **S30** [Shadowverse: Worlds Beyond](https://shadowverse-wb.com/ja/system-requirements/) — official recommended environment for Japan
+- **S31** [Simple Calculator acquisition definition](https://github.com/OthmaneBlial/droidless/blob/main/tools/fetch-simple-calculator.sh) — public APK source, commit, expected SHA-256
+- **S32** [Notepad acquisition definition](https://github.com/OthmaneBlial/droidless/blob/main/tools/fetch-notepad.sh) — public APK tag and expected SHA-256
+- **S33** [Android Binder design](https://source.android.com/docs/core/architecture/ipc/binder-overview) — inter-process service calls
+- **S34** [Android screenshot testing](https://developer.android.com/training/testing/ui-tests/screenshot) — visual diffs and handling of reference images
+- **S35** [Android font fallback](https://source.android.com/docs/core/fonts/custom-font-fallback) — scripts, languages, and font configuration
+- **S36** [Apple notarization](https://developer.apple.com/documentation/security/notarizing-macos-software-before-distribution) — signing and notarization of Mac distributions
+- **S37** [Android 15 behavior changes for all apps](https://developer.android.com/about/versions/15/behavior-changes-all#minimum-target-api-level) — installation restrictions for old targetSdk
