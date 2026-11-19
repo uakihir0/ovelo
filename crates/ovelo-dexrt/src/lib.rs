@@ -332,12 +332,26 @@ impl Vm {
                 }
                 None => {
                     // Host framework class — no class_def; walk the
-                    // builtin hierarchy instead.
-                    let Ok(desc) = self.dex.type_descriptor(cur) else { break };
-                    let Some(sup_desc) = Self::framework_super(&desc) else { break };
-                    match self.dex.type_index_of(sup_desc) {
-                        Ok(Some(next)) => cur = next,
-                        _ => break,
+                    // builtin hierarchy by descriptor. Intermediate
+                    // classes may be absent from the DEX's type table
+                    // (e.g. CustomButton extends Button but never names
+                    // TextView), so keep going until `sup` or a dead end.
+                    let Ok(mut d) = self.dex.type_descriptor(cur) else { break };
+                    let sup_desc = self.dex.type_descriptor(sup).unwrap_or_default();
+                    loop {
+                        if d == sup_desc {
+                            return true;
+                        }
+                        let Some(next) = Self::framework_super(&d) else {
+                            return false;
+                        };
+                        match self.dex.type_index_of(next) {
+                            Ok(Some(next)) => {
+                                cur = next;
+                                break;
+                            }
+                            _ => d = next.to_string(),
+                        }
                     }
                 }
             }
@@ -1746,6 +1760,40 @@ mod tests {
         }
         let mut v = vm(b);
         assert_eq!(v.run("LT;", "len", &[]).unwrap(), Some(V::I32(5)));
+    }
+
+    #[test]
+    fn assignable_walks_missing_intermediate() {
+        // LCustomBtn subclasses Button, but the DEX never names the
+        // intermediate TextView — the framework chain must still reach
+        // View, so Button→View stays assignable.
+        let ext = |class: &'static str| C {
+            ext: true,
+            class,
+            sup: None,
+            ifaces: &[],
+            sfields: &[],
+            ifields: &[],
+            methods: vec![],
+        };
+        let (b, ix) = build(&[
+            ext("Landroid/view/View;"),
+            ext("Landroid/widget/Button;"),
+            C {
+                sup: Some("Landroid/widget/Button;"),
+                ..cls("LCustomBtn;", vec![])
+            },
+        ]);
+        let v = vm(b);
+        assert!(v.assignable(
+            ix.t("LCustomBtn;"),
+            ix.t("Landroid/view/View;")
+        ));
+        // …and an unrelated class is still rejected.
+        assert!(!v.assignable(
+            ix.t("Landroid/widget/Button;"),
+            ix.t("LCustomBtn;")
+        ));
     }
 
     #[test]
