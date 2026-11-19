@@ -7,9 +7,11 @@ license.workspace = true
 
 [dependencies]
 ovelo-error = { path = "../ovelo-error" }
+ovelo-ui = { path = "../ovelo-ui" }
 # winit: mature cross-platform window/input/IME; macOS-only features are used
 # but nothing here is gated, so the crate compiles on Linux CI too.
 winit = "0.30"
+softbuffer = "0.4"
 
 
 [lints]

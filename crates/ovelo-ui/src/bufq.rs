@@ -126,6 +126,16 @@ impl BufferQueue {
         Ok(self.slots.len() - 1)
     }
 
+    /// Current buffer width (latest `resize` wins).
+    pub fn width(&self) -> usize {
+        self.w
+    }
+
+    /// Current buffer height.
+    pub fn height(&self) -> usize {
+        self.h
+    }
+
     /// Current generation.
     pub fn generation(&self) -> u64 {
         self.generation
