@@ -147,7 +147,8 @@ impl Database {
         })
     }
 
-    /// `insert(table, values)` — returns the new rowid.
+    /// `insert(table, values)` — the new rowid, or -1 on failure like
+    /// `SQLiteDatabase.insert` (never the stale `last_insert_rowid`).
     pub fn insert(&self, table: &str, values: &[(&str, SqlValue)]) -> Result<i64, OveloError> {
         let cols: Vec<&str> = values.iter().map(|(c, _)| *c).collect();
         let sql = format!(
@@ -156,13 +157,13 @@ impl Database {
             cols.iter().map(|c| ident(c)).collect::<Result<Vec<_>, _>>()?.join(", "),
             cols.iter().map(|_| "?").collect::<Vec<_>>().join(", ")
         );
-        self.conn
-            .execute(
-                &sql,
-                params_from_iter(values.iter().map(|(_, v)| to_rv(v))),
-            )
-            .map_err(|e| err("framework.db.exec").with_detail(e.to_string()))?;
-        Ok(self.conn.last_insert_rowid())
+        match self.conn.execute(
+            &sql,
+            params_from_iter(values.iter().map(|(_, v)| to_rv(v))),
+        ) {
+            Ok(_) => Ok(self.conn.last_insert_rowid()),
+            Err(_) => Ok(-1),
+        }
     }
 
     /// `delete(table, where, args)` — rows deleted.
@@ -187,12 +188,14 @@ impl Database {
     }
 }
 
-fn ident(s: &str) -> Result<&str, OveloError> {
+/// Validated identifier, double-quoted for SQL — `order`, `select` and
+/// other keywords are legal table/column names once quoted.
+fn ident(s: &str) -> Result<String, OveloError> {
     if s.chars()
         .all(|c| c.is_ascii_alphanumeric() || c == '_')
         && !s.is_empty()
     {
-        Ok(s)
+        Ok(format!("\"{s}\""))
     } else {
         Err(err("framework.db.ident"))
     }
@@ -241,5 +244,24 @@ mod tests {
     fn rejects_bad_ident() {
         let db = Database::memory().unwrap();
         assert!(db.insert("a;b", &[]).is_err());
+    }
+
+    #[test]
+    fn keyword_identifiers_and_conflict_minus_one() {
+        let db = Database::memory().unwrap();
+        // `order`/`select` are SQLite keywords but legal names once quoted.
+        db.exec("CREATE TABLE \"order\" (\"select\" INTEGER PRIMARY KEY, v TEXT)")
+            .unwrap();
+        let id = db
+            .insert("order", &[("v", SqlValue::Text("a".into()))])
+            .unwrap();
+        assert_eq!(id, 1);
+        // A failed insert returns -1, not the stale last rowid.
+        db.exec("CREATE UNIQUE INDEX u ON \"order\"(v)").unwrap();
+        assert_eq!(
+            db.insert("order", &[("v", SqlValue::Text("a".into()))])
+                .unwrap(),
+            -1
+        );
     }
 }
