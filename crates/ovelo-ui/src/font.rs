@@ -622,21 +622,39 @@ impl FontSet {
                 .copied()
                 .unwrap_or(usize::MAX);
             for &(os, ol, cs, cl) in &spans {
-                let mut total = 0f32;
-                let mut any = false;
-                for v in comp_adv[cs..(cs + cl).min(comp_adv.len())]
-                    .iter()
-                    .flatten()
-                {
-                    total += v;
-                    any = true;
+                if !((base_ci + os) < n) {
+                    continue;
                 }
-                if any && base_ci < n {
-                    let g = base_ci + os;
-                    out[g] = Some(total);
-                    for m in 1..ol {
-                        if g + m < n {
-                            out[g + m] = Some(0.0);
+                let g = base_ci + os;
+                if cl == ol {
+                    // Nothing composed: orig and composed chars map
+                    // 1:1 — each member keeps its own advance (an
+                    // uncovered char falls through to the chain
+                    // fallback, matching what shape_subrun draws).
+                    for k in 0..ol {
+                        if g + k < n {
+                            out[g + k] = comp_adv.get(cs + k).copied().flatten();
+                        }
+                    }
+                } else {
+                    // Composed: the cluster's summed width lands on
+                    // the first orig char; absorbed members take 0.
+                    let mut total = 0f32;
+                    let mut any = false;
+                    let start = cs.min(comp_adv.len());
+                    for v in comp_adv[start..(cs + cl).min(comp_adv.len())]
+                        .iter()
+                        .flatten()
+                    {
+                        total += v;
+                        any = true;
+                    }
+                    if any {
+                        out[g] = Some(total);
+                        for m in 1..ol {
+                            if g + m < n {
+                                out[g + m] = Some(0.0);
+                            }
                         }
                     }
                 }
@@ -798,5 +816,41 @@ mod tests {
         assert_eq!(run.len(), 1);
         // Measured: the composed width lands on 'e', the mark takes 0.
         assert_eq!(fs.char_advances("e\u{301}", 16.0), vec![5.0, 0.0]);
+    }
+
+    /// A mark no font covers and that can't compose keeps its fallback
+    /// advance — shape_subrun's per-char path draws it at half em, so
+    /// measure must agree rather than zeroing it.
+    #[test]
+    fn uncovered_uncomposable_mark_keeps_fallback_width() {
+        struct Unshaped {
+            covered: &'static [char],
+        }
+        impl GlyphSource for Unshaped {
+            fn name(&self) -> &str {
+                "unshaped"
+            }
+            fn advance_for(&self, c: char, _s: f32) -> Option<f32> {
+                self.covered.contains(&c).then_some(5.0)
+            }
+            fn ascent(&self, _s: f32) -> f32 {
+                8.0
+            }
+            fn descent(&self, _s: f32) -> f32 {
+                2.0
+            }
+        }
+        let mut fs = FontSet::new();
+        fs.push(Box::new(Unshaped { covered: &['a'] }));
+        // 'a' + a mark nothing covers: mark keeps the half-em fallback
+        // advance that shape_subrun draws (8.0 at 16px).
+        assert_eq!(fs.char_advances("a\u{301}", 16.0), vec![5.0, 8.0]);
+        let drawn: f32 = fs
+            .shaped_run("a\u{301}", 16.0)
+            .expect("run")
+            .iter()
+            .map(|g| g.x_adv)
+            .sum();
+        assert!((drawn - 13.0).abs() < 0.01);
     }
 }
