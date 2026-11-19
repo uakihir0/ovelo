@@ -107,6 +107,67 @@ impl Vm {
         }
     }
 
+    /// Instantiate `class_desc`: allocates the instance and invokes its
+    /// `<init>` (a class without one gets `Object.<init>`'s no-op).
+    /// Returns the heap handle.
+    pub fn instantiate(&mut self, class_desc: &str) -> Result<u32> {
+        let ty = self
+            .dex
+            .type_index_of(class_desc)?
+            .ok_or_else(|| errd("dexrt.class.missing", class_desc.to_string()))?;
+        if self.def_of(ty).is_none() {
+            return Err(errd("dexrt.class.missing", class_desc.to_string()));
+        }
+        match self.ensure_init(ty) {
+            Ok(()) => {}
+            Err(E::Vm(e)) => return Err(e),
+            Err(E::Throw(r)) => {
+                let d = self.describe_throw(r);
+                return Err(errd("dexrt.exception.uncaught", d));
+            }
+        }
+        let h = self.heap.alloc(Obj::Instance {
+            class_idx: ty,
+            fields: HashMap::new(),
+        });
+        if let Some(midx) = self.find_method_by_name(class_desc, "<init>")? {
+            match self.invoke(midx, vec![V::Ref(h)], InvokeKind::Direct) {
+                Ok(_) => {}
+                Err(E::Vm(e)) => return Err(e),
+                Err(E::Throw(r)) => {
+                    let d = self.describe_throw(r);
+                    return Err(errd("dexrt.exception.uncaught", d));
+                }
+            }
+        }
+        Ok(h)
+    }
+
+    /// Invoke the virtual method `name` on `this`, with `args` after the
+    /// receiver. `Ok(None)` when the object's class doesn't declare it —
+    /// the platform base class (not in this DEX) provides the default.
+    pub fn call_virtual(&mut self, this: u32, name: &str, args: &[V]) -> Result<Option<V>> {
+        let ci = self
+            .heap
+            .class_of(this)
+            .ok_or_else(|| errd("dexrt.bad_this", name.to_string()))?;
+        let desc = self.dex.type_descriptor(ci)?;
+        let Some(midx) = self.find_method_by_name(&desc, name)? else {
+            return Ok(None);
+        };
+        let mut a = Vec::with_capacity(args.len() + 1);
+        a.push(V::Ref(this));
+        a.extend_from_slice(args);
+        match self.invoke(midx, a, InvokeKind::Virtual) {
+            Ok(v) => Ok(v),
+            Err(E::Vm(e)) => Err(e),
+            Err(E::Throw(r)) => {
+                let d = self.describe_throw(r);
+                Err(errd("dexrt.exception.uncaught", d))
+            }
+        }
+    }
+
     fn describe_throw(&self, h: u32) -> String {
         match self.heap.get(h) {
             Some(Obj::Throwable { descriptor, detail }) => {
