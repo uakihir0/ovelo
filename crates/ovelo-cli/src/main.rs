@@ -31,10 +31,18 @@ enum Cmd {
 }
 
 fn parse_args(argv: &[String]) -> Result<Cmd, OveloError> {
-    let mut it = argv.iter().skip(1);
-    let sub = it.next().map(|s| s.as_str()).unwrap_or("help");
+    let sub = argv.get(1).map(|s| s.as_str()).unwrap_or("help");
     let json = argv.iter().any(|a| a == "--json");
-    let arg = it.next();
+    let pos: Vec<&String> = argv
+        .iter()
+        .skip(2)
+        .filter(|a| !a.starts_with('-'))
+        .collect();
+    let unknown_flag = argv.iter().skip(2).any(|a| a.starts_with('-') && a != "--json");
+    if sub != "help" && sub != "--help" && sub != "-h" && (pos.len() != 1 || unknown_flag) {
+        return Err(err("cli.usage"));
+    }
+    let arg = pos.first().copied();
     match (sub, arg) {
         ("inspect", Some(p)) => Ok(Cmd::Inspect {
             apk: p.into(),
@@ -69,15 +77,38 @@ fn read_apk(p: &Path) -> Result<Vec<u8>, OveloError> {
     })
 }
 
+/// Escape control characters before printing untrusted APK fields to a
+/// terminal — a crafted versionName must not be able to inject escape
+/// sequences and alter what the user sees.
+fn disp(s: &str) -> String {
+    s.chars()
+        .map(|c| {
+            if c.is_control() {
+                format!("\\u{{{:x}}}", c as u32)
+            } else {
+                c.to_string()
+            }
+        })
+        .collect()
+}
+
+/// `{:?}`-formatted JSON for an `Option` (`null` or the value).
+fn jopt<T: std::fmt::Debug>(o: &Option<T>) -> String {
+    match o {
+        Some(v) => format!("{v:?}"),
+        None => "null".to_string(),
+    }
+}
+
 fn print_inspect(info: &ApkInfo, json: bool) {
     let m = &info.manifest;
     if json {
         println!("{{");
         println!("  \"package\": {:?},", m.package);
         println!("  \"versionCode\": {},", m.version_code);
-        println!("  \"versionName\": {:?},", m.version_name);
-        println!("  \"minSdk\": {:?},", m.min_sdk);
-        println!("  \"targetSdk\": {:?},", m.target_sdk);
+        println!("  \"versionName\": {},", jopt(&m.version_name));
+        println!("  \"minSdk\": {},", jopt(&m.min_sdk));
+        println!("  \"targetSdk\": {},", jopt(&m.target_sdk));
         println!("  \"activities\": {:?},", m.activities);
         println!("  \"features\": {:?},", m.features);
         println!("  \"permissions\": {:?},", m.permissions);
@@ -88,13 +119,13 @@ fn print_inspect(info: &ApkInfo, json: bool) {
         println!("  \"sha256\": {:?}", info.sha256);
         println!("}}");
     } else {
-        println!("package       {}", m.package);
-        println!("version       {} ({})", m.version_code, m.version_name.as_deref().unwrap_or("-"));
+        println!("package       {}", disp(&m.package));
+        println!("version       {} ({})", m.version_code, m.version_name.as_deref().map(disp).unwrap_or_else(|| "-".into()));
         println!("minSdk        {}", m.min_sdk.map(|v| v.to_string()).unwrap_or_else(|| "-".into()));
         println!("targetSdk     {}", m.target_sdk.map(|v| v.to_string()).unwrap_or_else(|| "-".into()));
-        println!("activities    {}", m.activities.join(", "));
-        println!("features      {}", m.features.join(", "));
-        println!("permissions   {}", m.permissions.join(", "));
+        println!("activities    {}", disp(&m.activities.join(", ")));
+        println!("features      {}", disp(&m.features.join(", ")));
+        println!("permissions   {}", disp(&m.permissions.join(", ")));
         println!("abis          {}", info.abis.join(", "));
         println!("dex           {}", info.dex_entries.join(", "));
         println!("resources     {}", if info.has_resources { "yes" } else { "no" });
@@ -167,8 +198,8 @@ fn run_app(store: &InstallStore, package: &str) -> Result<(), OveloError> {
         .with_detail(bad.join(", ")));
     }
     let launcher = info.manifest.activities.first().cloned().unwrap_or_default();
-    println!("ready   {}", rec.app.package);
-    println!("activity {}", launcher);
+    println!("ready   {}", disp(&rec.app.package));
+    println!("activity {}", disp(&launcher));
     println!("dexes   {} verified", dexes.len());
     // The host window + interpreter pipeline is the next milestone; report
     // rather than fake success.
@@ -231,7 +262,7 @@ fn cmd() -> Result<(), OveloError> {
                     info.sha256
                 );
             } else {
-                println!("diagnose {}", info.manifest.package);
+                println!("diagnose {}", disp(&info.manifest.package));
                 println!("  signature : {sig}");
                 println!("  abis      : {}", info.abis.join(", "));
                 for d in &dexes {
