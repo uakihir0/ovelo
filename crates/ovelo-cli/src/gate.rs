@@ -36,8 +36,9 @@ pub struct GateItem {
     pub verdict: Verdict,
 }
 
-/// Executables a distribution carries: the file itself, or every file
-/// under `Contents/MacOS` for an `.app`-style bundle. Bundled helpers
+/// Executables a distribution carries: the file itself, or every
+/// regular file under `Contents/MacOS` for an `.app`-style bundle
+/// (symlinks to shared libraries are not executables). Bundled helpers
 /// get the same signature/entitlement audit — a helper with looser
 /// permissions must not slip the gate (§10).
 fn binaries(path: &Path) -> Result<Vec<std::path::PathBuf>> {
@@ -46,10 +47,14 @@ fn binaries(path: &Path) -> Result<Vec<std::path::PathBuf>> {
     }
     let macos = path.join("Contents").join("MacOS");
     let mut bins: Vec<std::path::PathBuf> = if macos.is_dir() {
+        // file_type() does not follow symlinks: a `Contents/MacOS`
+        // entry pointing at a shared library is not an executable and
+        // cannot carry hardened-runtime flags — skip it.
         std::fs::read_dir(&macos)
             .map_err(|e| io_err("read_dir", e))?
-            .filter_map(|e| e.ok().map(|e| e.path()))
-            .filter(|p| p.is_file())
+            .filter_map(|e| e.ok())
+            .filter(|e| e.file_type().is_ok_and(|t| t.is_file()))
+            .map(|e| e.path())
             .collect()
     } else {
         Vec::new()
