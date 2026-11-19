@@ -118,6 +118,17 @@ mod tests {
         assert_eq!(c.package_name(), "com.example.app");
         assert_eq!(c.files_dir().to_str().unwrap(), "/data/com.example.app/files");
         let p = c.shared_prefs("main");
-        assert!(p.path().ends_with("shared_prefs/main.xml"));
+        assert!(p.lock().unwrap().path().ends_with("shared_prefs/main.xml"));
+    }
+
+    #[test]
+    fn prefs_shared_across_contexts() {
+        // Same file via two Context objects sees one store (AOSP singleton).
+        let mut c1 = Context::new("com.example.app", "/data/com.example.app");
+        let mut c2 = Context::new("com.example.app", "/data/com.example.app");
+        let p1 = c1.shared_prefs("shared-x");
+        let p2 = c2.shared_prefs("shared-x");
+        p1.lock().unwrap().put("k", PrefValue::Int(9));
+        assert_eq!(p2.lock().unwrap().get_int("k", 0), 9);
     }
 }

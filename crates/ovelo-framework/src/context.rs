@@ -1,10 +1,10 @@
 //! `android.content.Context`: package identity, private directories and
 //! preferences, the way the runtime presents them to app code.
 
-use std::collections::HashMap;
 use std::path::{Path, PathBuf};
+use std::sync::{Arc, Mutex};
 
-use crate::prefs::SharedPreferences;
+use crate::prefs::{self, SharedPreferences};
 
 /// A launched app's context: package-scoped directories and preference
 /// stores, mirroring `ContextImpl`'s conventions (data_dir/<pkg>/{files,
@@ -13,9 +13,6 @@ pub struct Context {
     package_name: String,
     /// `<data>/<pkg>` — the app's private sandbox root on disk.
     data_dir: PathBuf,
-    /// open preference stores by name (SharedPreferences are singletons
-    /// per name per app, like `ContextImpl.sSharedPrefsCache`).
-    prefs: HashMap<String, SharedPreferences>,
 }
 
 impl Context {
@@ -26,7 +23,6 @@ impl Context {
         Self {
             package_name: package_name.into(),
             data_dir: data_dir.into(),
-            prefs: HashMap::new(),
         }
     }
 
@@ -61,7 +57,9 @@ impl Context {
     /// `name` is confined to the preferences directory: characters outside
     /// `[A-Za-z0-9._-]` are replaced with `_` so a malicious name can never
     /// escape the app's private directory.
-    pub fn shared_prefs(&mut self, name: &str) -> &mut SharedPreferences {
+    /// Returns the process-wide shared store (matches AOSP's singleton
+    /// per file), so writes via one `Context` are visible to all others.
+    pub fn shared_prefs(&mut self, name: &str) -> Arc<Mutex<SharedPreferences>> {
         let safe: String = name
             .chars()
             .map(|c| {
@@ -76,8 +74,6 @@ impl Context {
             .data_dir
             .join("shared_prefs")
             .join(format!("{safe}.xml"));
-        self.prefs
-            .entry(name.to_string())
-            .or_insert_with(|| SharedPreferences::open(path))
+        prefs::shared(path)
     }
 }

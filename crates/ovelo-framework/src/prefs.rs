@@ -11,6 +11,7 @@
 
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
+use std::sync::{Arc, Mutex, OnceLock};
 
 use crate::err;
 use ovelo_error::OveloError;
@@ -186,6 +187,22 @@ impl SharedPreferences {
             err("framework.prefs.io").with_detail(e.to_string())
         })
     }
+}
+
+/// Process-wide store cache, like `ContextImpl.sSharedPrefsCache`: one live
+/// store per backing file, shared by every `Context` in the app.
+fn registry() -> &'static Mutex<HashMap<PathBuf, Arc<Mutex<SharedPreferences>>>> {
+    static R: OnceLock<Mutex<HashMap<PathBuf, Arc<Mutex<SharedPreferences>>>>> =
+        OnceLock::new();
+    R.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+/// Get (or lazily open) the shared store for `path`.
+pub fn shared(path: PathBuf) -> Arc<Mutex<SharedPreferences>> {
+    let mut r = registry().lock().unwrap_or_else(|e| e.into_inner());
+    r.entry(path.clone())
+        .or_insert_with(|| Arc::new(Mutex::new(SharedPreferences::open(path))))
+        .clone()
 }
 
 fn esc(s: &str) -> String {
