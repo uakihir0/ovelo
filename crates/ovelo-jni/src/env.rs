@@ -71,18 +71,18 @@ pub enum Slot {
     CallObjectMethod = 34,
     /// `CallBooleanMethod` — index 37.
     CallBooleanMethod = 37,
-    /// `CallIntMethod` — index 41.
-    CallIntMethod = 41,
-    /// `CallLongMethod` — index 42.
-    CallLongMethod = 42,
-    /// `CallVoidMethod` — index 49.
-    CallVoidMethod = 49,
+    /// `CallIntMethod` — index 49.
+    CallIntMethod = 49,
+    /// `CallLongMethod` — index 52.
+    CallLongMethod = 52,
+    /// `CallVoidMethod` — index 61.
+    CallVoidMethod = 61,
     /// `CallStaticObjectMethod` — index 114.
     CallStaticObjectMethod = 114,
-    /// `CallStaticIntMethod` — index 121.
-    CallStaticIntMethod = 121,
-    /// `CallStaticVoidMethod` — index 129.
-    CallStaticVoidMethod = 129,
+    /// `CallStaticIntMethod` — index 129.
+    CallStaticIntMethod = 129,
+    /// `CallStaticVoidMethod` — index 141.
+    CallStaticVoidMethod = 141,
     /// `NewStringUTF` — index 167.
     NewStringUTF = 167,
     /// `GetStringUTFChars` — index 169.
