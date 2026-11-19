@@ -143,11 +143,14 @@ impl SharedPreferences {
         self.map.clear();
     }
 
-    /// `Editor.commit()` — write through, return success.
+    /// `Editor.commit()` — write through, return success. On failure the
+    /// dirty flag is kept so a later `sync()` retries the write.
     pub fn commit(&mut self) -> Result<bool, OveloError> {
-        self.dirty = false;
         match self.write() {
-            Ok(()) => Ok(true),
+            Ok(()) => {
+                self.dirty = false;
+                Ok(true)
+            }
             Err(e) => Err(e),
         }
     }
@@ -172,7 +175,14 @@ impl SharedPreferences {
                 err("framework.prefs.io").with_detail(e.to_string())
             })?;
         }
-        std::fs::write(&self.path, write_map(&self.map)).map_err(|e| {
+        // Write to a sibling temp file and rename so a failed write never
+        // truncates the existing document (like AOSP's .bak handling).
+        let tmp = self.path.with_extension("xml.tmp");
+        std::fs::write(&tmp, write_map(&self.map)).map_err(|e| {
+            err("framework.prefs.io").with_detail(e.to_string())
+        })?;
+        std::fs::rename(&tmp, &self.path).map_err(|e| {
+            let _ = std::fs::remove_file(&tmp);
             err("framework.prefs.io").with_detail(e.to_string())
         })
     }
