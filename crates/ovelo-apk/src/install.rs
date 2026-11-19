@@ -27,7 +27,8 @@ fn io_err(op: &str, e: std::io::Error) -> OveloError {
 pub struct AppId {
     /// Android package name.
     pub package: String,
-    /// SHA-256 fingerprint (hex) of the signer certificate.
+    /// Canonical signer fingerprint: sorted SHA-256 cert hashes joined by `+`
+    /// (one element for single-signer APKs).
     pub signer: String,
 }
 
@@ -38,7 +39,14 @@ impl AppId {
             .chars()
             .map(|c| if c.is_ascii_alphanumeric() || c == '.' || c == '_' || c == '-' { c } else { '_' })
             .collect();
-        format!("{pkg}@{}", &self.signer[..16.min(self.signer.len())])
+        // Hash the fingerprint so multi-signer sets cannot collide in dirs.
+        use sha2::Digest;
+        let h: String = sha2::Sha256::digest(self.signer.as_bytes())
+            .iter()
+            .take(8)
+            .map(|b| format!("{b:02x}"))
+            .collect();
+        format!("{pkg}@{h}")
     }
 }
 
@@ -143,11 +151,23 @@ impl InstallStore {
         }
         let dir = self.app_dir(app);
         std::fs::create_dir_all(&dir).map_err(|e| io_err("mkdir_app", e))?;
-        let tmp = dir.join("current.tmp");
+        // Unique tmp name per call: concurrent commits must never share a path.
+        static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let tmp = dir.join(format!(
+            "current.tmp.{}.{}",
+            std::process::id(),
+            NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+        ));
         let cur = dir.join("current");
-        std::fs::write(&tmp, render_record(&record)).map_err(|e| io_err("write_record", e))?;
+        if let Err(e) = std::fs::write(&tmp, render_record(&record)) {
+            let _ = std::fs::remove_file(&tmp);
+            return Err(io_err("write_record", e));
+        }
         // Atomic switch of the active-version reference.
-        std::fs::rename(&tmp, &cur).map_err(|e| io_err("rename_record", e))?;
+        if let Err(e) = std::fs::rename(&tmp, &cur) {
+            let _ = std::fs::remove_file(&tmp);
+            return Err(io_err("rename_record", e));
+        }
         Ok(record)
     }
 

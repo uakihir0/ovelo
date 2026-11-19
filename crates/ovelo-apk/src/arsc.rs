@@ -101,10 +101,13 @@ fn read_utf8(b: &[u8], mut p: usize, end: usize) -> Result<String> {
     }
     let first = b[p];
     p += if first & 0x80 != 0 { 2 } else { 1 };
-    if p > end {
+    if p >= end {
         return Err(err("arsc.string.truncated"));
     }
     let len = if b[p] & 0x80 != 0 {
+        if p + 2 > end {
+            return Err(err("arsc.string.truncated"));
+        }
         let l = (((b[p] & 0x7f) as usize) << 8) | b[p + 1] as usize;
         p += 2;
         l
@@ -231,6 +234,7 @@ pub fn parse_arsc(b: &[u8]) -> Result<Vec<ResourcePackage>> {
 }
 
 fn config_name(b: &[u8], off: usize, size: usize) -> String {
+    let size = size.min(b.len().saturating_sub(off));
     // ResTable_config: imsi(4) locale(4) screenType(4) input(4) screenSize(4)
     // version(4) screenConfig(4) screenSizeDp(4) localeScript(4)...
     // Keep it pragmatic: locale bytes + density bucket.
@@ -285,6 +289,12 @@ fn config_name(b: &[u8], off: usize, size: usize) -> String {
     }
 }
 
+fn end_of_chunk(b: &[u8], pos: usize, chunk_size: usize) -> Result<usize> {
+    pos.checked_add(chunk_size)
+        .filter(|e| *e <= b.len())
+        .ok_or_else(|| err("arsc.chunk.bounds"))
+}
+
 fn parse_package(
     b: &[u8],
     pos: usize,
@@ -292,6 +302,10 @@ fn parse_package(
     chunk_size: usize,
     global: &StringPool,
 ) -> Result<ResourcePackage> {
+    // Fixed package header: chunk(8) + id(4) + name(256) + 4 x u32 offsets.
+    if header_size < 288 || pos + 288 > end_of_chunk(b, pos, chunk_size)? {
+        return Err(err("arsc.pkg.truncated"));
+    }
     let package_id = u32at(b, pos + 8)?;
     let name_bytes = &b[pos + 12..pos + 12 + 256];
     let name_units: Vec<u16> = name_bytes
@@ -341,9 +355,39 @@ fn parse_package(
                 spec_flags.insert(type_id, flags);
             }
             RES_TABLE_TYPE_TYPE => {
+                if p + 20 > end || csz < 20 {
+                    return Err(err("arsc.type.truncated"));
+                }
                 let type_id = b[p + 8];
+                let flags = b[p + 9];
                 let entry_count = u32at(b, p + 12)? as usize;
                 let entries_start = u32at(b, p + 16)? as usize;
+                const FLAG_SPARSE: u8 = 0x01;
+                const FLAG_OFFSET16: u8 = 0x02;
+                let entry_at = |i: usize| -> Result<Option<(usize, usize)>> {
+                    // Returns (entry_id, byte offset) or None for absent.
+                    if flags & FLAG_SPARSE != 0 {
+                        if p + hsz + i * 4 + 4 > p + csz {
+                            return Err(err("arsc.entry.bounds"));
+                        }
+                        let e = u32at(b, p + hsz + i * 4)?;
+                        let idx = (e >> 16) as usize;
+                        let off = ((e & 0xffff) * 4) as usize;
+                        Ok(if off == 0xffff * 4 { None } else { Some((idx, off)) })
+                    } else if flags & FLAG_OFFSET16 != 0 {
+                        if p + hsz + i * 2 + 2 > p + csz {
+                            return Err(err("arsc.entry.bounds"));
+                        }
+                        let e = u16at(b, p + hsz + i * 2)? as usize;
+                        Ok(if e == 0xffff { None } else { Some((i, e * 4)) })
+                    } else {
+                        if p + hsz + i * 4 + 4 > p + csz {
+                            return Err(err("arsc.entry.bounds"));
+                        }
+                        let rel = u32at(b, p + hsz + i * 4)? as usize;
+                        Ok(if rel == 0xffff_ffff { None } else { Some((i, rel)) })
+                    }
+                };
                 // ResTable_config sits inside the header right after the fixed
                 // fields; its first u32 is its own size.
                 let cfg_off = p + 20;
@@ -362,12 +406,11 @@ fn parse_package(
                 let flags = spec_flags.get(&type_id);
                 for entry_id in 0..entry_count {
                     // Entry offsets array starts right after the header.
-                    let rel = u32at(b, p + hsz + entry_id * 4)?;
-                    if rel == 0xffff_ffff {
+                    let Some((entry_id, rel)) = entry_at(entry_id)? else {
                         continue; // no entry in this config
-                    }
-                    let eoff = p + entries_start + rel as usize;
-                    if eoff + 8 > end {
+                    };
+                    let eoff = p + entries_start + rel;
+                    if eoff + 8 > p + csz {
                         return Err(err("arsc.entry.bounds"));
                     }
                     let _esize = u16at(b, eoff)? as usize;
