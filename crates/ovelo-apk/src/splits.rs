@@ -48,6 +48,17 @@ pub enum SplitKind {
     Feature(String),
 }
 
+/// ABI names as they appear in `config.*` split names (`config.x86`,
+/// `config.arm64-v8a`). `_` is accepted as a separator variant.
+const KNOWN_ABIS: &[&str] = &[
+    "armeabi",
+    "armeabi-v7a",
+    "arm64-v8a",
+    "x86",
+    "x86-64",
+    "riscv64",
+];
+
 const DENSITY_BUCKETS: &[(&str, u32)] = &[
     ("ldpi", 120),
     ("mdpi", 160),
@@ -69,9 +80,32 @@ pub fn split_kind(split: Option<&str>) -> SplitKind {
     if let Some(d) = DENSITY_BUCKETS.iter().find(|(n, _)| *n == cfg) {
         return SplitKind::Density(d.1);
     }
-    // ABI names contain '-' ('arm64-v8a'); locale tags don't.
-    if cfg.contains('-') || cfg == "universal" {
-        return SplitKind::Abi(cfg.to_string());
+    // Numeric densities ('420dpi') need no bucket entry.
+    if let Some(dpi) = cfg
+        .strip_suffix("dpi")
+        .and_then(|n| n.parse::<u32>().ok())
+    {
+        return SplitKind::Density(dpi);
+    }
+    // `_` is a separator variant (`config.arm64_v8a`).
+    let norm = cfg.replace('_', "-");
+    if KNOWN_ABIS.contains(&norm.as_str()) {
+        return SplitKind::Abi(norm);
+    }
+    // Locale qualifiers are `lang` or `lang-rREGION`.
+    if let Some((lang, region)) = norm.split_once("-r") {
+        if !lang.is_empty()
+            && !region.is_empty()
+            && lang.chars().all(|c| c.is_ascii_alphabetic())
+            && region.chars().all(|c| c.is_ascii_alphanumeric())
+        {
+            return SplitKind::Locale(cfg.to_string());
+        }
+    }
+    // Unknown hyphenated names default to ABI (locale regions are
+    // covered by `-r` above); bare words are locale tags.
+    if norm.contains('-') {
+        return SplitKind::Abi(norm);
     }
     SplitKind::Locale(cfg.to_string())
 }
@@ -296,6 +330,11 @@ mod tests {
         assert_eq!(split_kind(Some("config.arm64-v8a")), SplitKind::Abi("arm64-v8a".into()));
         assert_eq!(split_kind(Some("config.xhdpi")), SplitKind::Density(320));
         assert_eq!(split_kind(Some("config.ja")), SplitKind::Locale("ja".into()));
+        assert_eq!(split_kind(Some("config.x86")), SplitKind::Abi("x86".into()));
+        assert_eq!(split_kind(Some("config.x86_64")), SplitKind::Abi("x86-64".into()));
+        assert_eq!(split_kind(Some("config.arm64_v8a")), SplitKind::Abi("arm64-v8a".into()));
+        assert_eq!(split_kind(Some("config.420dpi")), SplitKind::Density(420));
+        assert_eq!(split_kind(Some("config.en-rUS")), SplitKind::Locale("en-rUS".into()));
         assert_eq!(split_kind(Some("feature_x")), SplitKind::Feature("feature_x".into()));
     }
 
