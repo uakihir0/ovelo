@@ -37,6 +37,8 @@ pub struct Canvas<'a> {
     fonts: &'a FontSet,
     dx: i32,
     dy: i32,
+    /// `save()` snapshots: (translate origin, clip depth).
+    saved: Vec<(i32, i32, usize)>,
 }
 
 impl<'a> Canvas<'a> {
@@ -57,14 +59,15 @@ impl<'a> Canvas<'a> {
             fonts,
             dx: 0,
             dy: 0,
+            saved: Vec::new(),
         }
     }
 
-    /// `save()` — push a pass-through clip level so a later
-    /// [`Canvas::restore`] pops back to the current clip.
+    /// `save()` — snapshot the translate origin and clip depth so a later
+    /// [`Canvas::restore`] returns here, however many `clip_rect`/
+    /// `translate` calls happened in between (Canvas.save/restoreToCount).
     pub fn save(&mut self) {
-        let full = Rect::new(0, 0, self.surf.width() as i32, self.surf.height() as i32);
-        self.surf.clip(full);
+        self.saved.push((self.dx, self.dy, self.surf.clip_depth()));
     }
 
     /// Intersect the clip with `r` (translated). Pop with [`Surface::pop_clip`].
@@ -72,9 +75,18 @@ impl<'a> Canvas<'a> {
         self.surf.clip(self.tr(r));
     }
 
-    /// Undo the last `clip_rect`.
+    /// Undo back to the last `save`: restores the translate origin and
+    /// drops every clip pushed since. Without a matching `save`, pops one
+    /// clip level (legacy `clip_rect` pairing).
     pub fn restore(&mut self) {
-        self.surf.pop_clip();
+        match self.saved.pop() {
+            Some((dx, dy, depth)) => {
+                self.dx = dx;
+                self.dy = dy;
+                self.surf.truncate_clips(depth);
+            }
+            None => self.surf.pop_clip(),
+        }
     }
 
     /// Shift the draw origin (`canvas.translate`).
@@ -139,5 +151,34 @@ impl<'a> Canvas<'a> {
                 }
             }
         }
+    }
+}
+
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn save_restore_round_trips_origin_and_clips() {
+        let mut s = Surface::new(32, 32).unwrap();
+        let fonts = FontSet::new();
+        let mut c = Canvas::new(&mut s, &fonts);
+        let red = Paint::color(Color::srgb(255, 0, 0));
+        let blue = Paint::color(Color::srgb(0, 0, 255));
+
+        c.save();
+        c.translate(10, 10);
+        c.clip_rect(Rect::new(0, 0, 4, 4));
+        c.clip_rect(Rect::new(0, 0, 2, 2));
+        c.draw_rect(Rect::new(0, 0, 4, 4), red);
+        c.restore();
+
+        // After restore: no residual translate, clip back to full surface.
+        c.draw_rect(Rect::new(30, 30, 2, 2), blue);
+        assert_eq!(c.surf.pixel(31, 31), Color::srgb(0, 0, 255));
+        // Translated+clipped draw only covered (10..12, 10..12).
+        assert_eq!(c.surf.pixel(10, 10), Color::srgb(255, 0, 0));
+        assert_eq!(c.surf.pixel(13, 13), Color::TRANSPARENT);
     }
 }

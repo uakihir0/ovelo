@@ -104,6 +104,16 @@ impl Surface {
         }
     }
 
+    /// Depth of the clip stack (base level = 1).
+    pub(crate) fn clip_depth(&self) -> usize {
+        self.clips.len()
+    }
+
+    /// Drop clip levels above `depth` (clamped to the base level).
+    pub(crate) fn truncate_clips(&mut self, depth: usize) {
+        self.clips.truncate(depth.max(1));
+    }
+
     /// Premultiplied source-over at (x,y) — the only blend Android widgets use.
     fn src_over(&mut self, x: i32, y: i32, src: Color) {
         if x < 0 || y < 0 || x >= self.w as i32 || y >= self.h as i32 {
