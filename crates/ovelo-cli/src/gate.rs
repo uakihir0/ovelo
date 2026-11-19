@@ -257,9 +257,12 @@ fn check_notarization(path: &Path) -> GateItem {
                     verdict: Verdict::Pass,
                 }
             } else if o.status.success() {
+                // spctl passing on a locally-trusted signature says
+                // nothing about notarization — only the Notarized
+                // Developer ID source counts for distribution.
                 GateItem {
                     name: "notarization",
-                    verdict: Verdict::Warn("signed but not notarized".into()),
+                    verdict: Verdict::Fail("signed but not notarized".into()),
                 }
             } else {
                 GateItem {
@@ -274,7 +277,8 @@ fn check_notarization(path: &Path) -> GateItem {
 /// `codesign -dv` stderr carries `flags=0x10000(runtime)` for hardened
 /// runtime builds.
 fn hardened_runtime(flags_line: &str) -> bool {
-    flags_line.contains("(runtime)")
+    // flags print like '0x10000(runtime)' or '0x10002(kill,runtime)'.
+    flags_line.contains("runtime")
 }
 
 /// Pull entitlement keys out of a `codesign --entitlements` plist body.
@@ -298,6 +302,7 @@ mod tests {
     #[test]
     fn parses_hardened_runtime_flag() {
         assert!(hardened_runtime("flags=0x10000(runtime)"));
+        assert!(hardened_runtime("flags=0x10002(kill,runtime)"));
         assert!(!hardened_runtime("flags=0x0(none)"));
         assert!(!hardened_runtime(""));
     }
