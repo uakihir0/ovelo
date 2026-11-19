@@ -38,6 +38,8 @@ pub struct HostWindow {
     window: Option<Rc<Window>>,
     sb_ctx: Option<softbuffer::Context<Rc<Window>>>,
     sb_surf: Option<softbuffer::Surface<Rc<Window>, Rc<Window>>>,
+    /// Per-beat driver hook (set by [`run`]).
+    vsync_hook: Option<Box<dyn FnMut(&mut Presenter)>>,
 }
 
 impl HostWindow {
@@ -50,6 +52,7 @@ impl HostWindow {
             window: None,
             sb_ctx: None,
             sb_surf: None,
+            vsync_hook: None,
         }
     }
 
@@ -87,6 +90,9 @@ impl ApplicationHandler for HostWindow {
     }
 
     fn about_to_wait(&mut self, _el: &ActiveEventLoop) {
+        if let Some(h) = &mut self.vsync_hook {
+            h(&mut self.presenter);
+        }
         let Ok(Some(presented)) = self.presenter.display(self.surface_id) else {
             return;
         };
@@ -105,8 +111,14 @@ impl ApplicationHandler for HostWindow {
 }
 
 /// Run the app window to completion (`EventLoop::run_app`).
-pub fn run(mut app: HostWindow) -> Result<()> {
+/// `on_vsync` runs each beat BEFORE display — the driver drains its
+/// frame/command channel into the presenter there (guest work is the
+/// only frame source once the loop owns the window).
+pub fn run(mut app: HostWindow, mut on_vsync: impl FnMut(&mut Presenter) + 'static) -> Result<()> {
     let el = EventLoop::new().map_err(|e| err("host.eventloop").with_detail(e.to_string()))?;
+    // The driver hook lives outside the handler so tests can compose it.
+    el.set_control_flow(winit::event_loop::ControlFlow::Poll);
+    app.vsync_hook = Some(Box::new(move |p| on_vsync(p)));
     el.run_app(&mut app)
         .map_err(|e| err("host.eventloop").with_detail(e.to_string()))
 }

@@ -76,6 +76,11 @@ impl SurfaceRegistry {
         0
     }
 
+    /// Whether the surface's worker is alive (layers gate on this too).
+    pub fn is_alive(&self, surface_id: u64) -> bool {
+        self.surfaces.get(&surface_id).map(|s| s.alive).unwrap_or(false)
+    }
+
     /// Worker stopped/died: its frames must never display again.
     pub fn stop_worker(&mut self, surface_id: u64) {
         if let Some(s) = self.surfaces.get_mut(&surface_id) {

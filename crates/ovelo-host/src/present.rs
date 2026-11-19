@@ -123,6 +123,11 @@ impl Presenter {
         let mut out = ovelo_ui::Surface::new(w, h)?;
         let mut any = false;
         for l in layers {
+            // A dead worker's layer contributes nothing — the registry gate
+            // covers the output surface, each layer must check its own.
+            if !self.registry.is_alive(l.surface_id) {
+                continue;
+            }
             let win = self
                 .windows
                 .get_mut(&l.surface_id)
