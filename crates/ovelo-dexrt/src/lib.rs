@@ -95,9 +95,70 @@ impl Vm {
     /// surfaces as `dexrt.exception.uncaught`.
     pub fn run(&mut self, class_desc: &str, name: &str, args: &[V]) -> Result<Option<V>> {
         let midx = self
-            .find_method_by_name(class_desc, name)?
+            .find_method_by_name(class_desc, name, args.len())?
             .ok_or_else(|| errd("dexrt.method.missing", format!("{class_desc}.{name}")))?;
         match self.invoke(midx, args.to_vec(), InvokeKind::Static) {
+            Ok(v) => Ok(v),
+            Err(E::Vm(e)) => Err(e),
+            Err(E::Throw(r)) => {
+                let d = self.describe_throw(r);
+                Err(errd("dexrt.exception.uncaught", d))
+            }
+        }
+    }
+
+    /// Instantiate `class_desc`: allocates the instance and invokes its
+    /// `<init>` (a class without one gets `Object.<init>`'s no-op).
+    /// Returns the heap handle.
+    pub fn instantiate(&mut self, class_desc: &str) -> Result<u32> {
+        let ty = self
+            .dex
+            .type_index_of(class_desc)?
+            .ok_or_else(|| errd("dexrt.class.missing", class_desc.to_string()))?;
+        if self.def_of(ty).is_none() {
+            return Err(errd("dexrt.class.missing", class_desc.to_string()));
+        }
+        match self.ensure_init(ty) {
+            Ok(()) => {}
+            Err(E::Vm(e)) => return Err(e),
+            Err(E::Throw(r)) => {
+                let d = self.describe_throw(r);
+                return Err(errd("dexrt.exception.uncaught", d));
+            }
+        }
+        let h = self.heap.alloc(Obj::Instance {
+            class_idx: ty,
+            fields: HashMap::new(),
+        });
+        if let Some(midx) = self.find_method_by_name(class_desc, "<init>", 0)? {
+            match self.invoke(midx, vec![V::Ref(h)], InvokeKind::Direct) {
+                Ok(_) => {}
+                Err(E::Vm(e)) => return Err(e),
+                Err(E::Throw(r)) => {
+                    let d = self.describe_throw(r);
+                    return Err(errd("dexrt.exception.uncaught", d));
+                }
+            }
+        }
+        Ok(h)
+    }
+
+    /// Invoke the virtual method `name` on `this`, with `args` after the
+    /// receiver. `Ok(None)` when the object's class doesn't declare it —
+    /// the platform base class (not in this DEX) provides the default.
+    pub fn call_virtual(&mut self, this: u32, name: &str, args: &[V]) -> Result<Option<V>> {
+        let ci = self
+            .heap
+            .class_of(this)
+            .ok_or_else(|| errd("dexrt.bad_this", name.to_string()))?;
+        let desc = self.dex.type_descriptor(ci)?;
+        let Some(midx) = self.find_method_by_name(&desc, name, args.len())? else {
+            return Ok(None);
+        };
+        let mut a = Vec::with_capacity(args.len() + 1);
+        a.push(V::Ref(this));
+        a.extend_from_slice(args);
+        match self.invoke(midx, a, InvokeKind::Virtual) {
             Ok(v) => Ok(v),
             Err(E::Vm(e)) => Err(e),
             Err(E::Throw(r)) => {
@@ -116,7 +177,15 @@ impl Vm {
         }
     }
 
-    fn find_method_by_name(&self, class_desc: &str, name: &str) -> Result<Option<u32>> {
+    /// First method `name` on `class_desc` whose params occupy exactly
+    /// `nslots` registers (J/D params take two) — args pack as a register
+    /// image, so a long/double param counts double.
+    fn find_method_by_name(
+        &self,
+        class_desc: &str,
+        name: &str,
+        nslots: usize,
+    ) -> Result<Option<u32>> {
         for (i, def) in self.dex.class_defs().iter().enumerate() {
             let _ = i;
             if self.dex.type_descriptor(def.class_idx)? != class_desc {
@@ -125,7 +194,16 @@ impl Vm {
             let cd = self.dex.class_data(def)?;
             for m in cd.direct_methods.iter().chain(cd.virtual_methods.iter()) {
                 let mid = self.dex.method(m.method_idx)?;
-                if self.dex.string(mid.name_idx)? == name {
+                if self.dex.string(mid.name_idx)? != name {
+                    continue;
+                }
+                let p = self.dex.proto(mid.proto_idx as u32)?;
+                let mut slots = 0usize;
+                for t in self.dex.proto_params(p)? {
+                    let d = self.dex.type_descriptor(t as u32)?;
+                    slots += if d.starts_with('J') || d.starts_with('D') { 2 } else { 1 };
+                }
+                if slots == nslots {
                     return Ok(Some(m.method_idx));
                 }
             }

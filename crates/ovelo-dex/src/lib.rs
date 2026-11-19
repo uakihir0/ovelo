@@ -305,6 +305,16 @@ impl DexFile {
         self.string(sidx)
     }
 
+    /// `type_ids` index for a descriptor (`Lfoo/Bar;`), if the DEX names it.
+    pub fn type_index_of(&self, desc: &str) -> Result<Option<u32>> {
+        for (i, &sidx) in self.type_ids.iter().enumerate() {
+            if self.string(sidx)? == desc {
+                return Ok(Some(i as u32));
+            }
+        }
+        Ok(None)
+    }
+
     /// Field id item.
     pub fn field(&self, idx: u32) -> Result<&FieldId> {
         self.fields.get(idx as usize).ok_or_else(|| err("dex.field.idx"))
