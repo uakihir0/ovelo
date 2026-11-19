@@ -207,18 +207,74 @@ fn run_app(store: &InstallStore, package: &str) -> Result<(), OveloError> {
         )
         .with_detail(bad.join(", ")));
     }
-    let launcher = info.manifest.activities.first().cloned().unwrap_or_default();
+    let launcher = info
+        .manifest
+        .launcher_activity
+        .clone()
+        .or_else(|| info.manifest.activities.first().cloned())
+        .unwrap_or_default();
     println!("ready   {}", disp(&rec.app.package));
     println!("activity {}", disp(&launcher));
     println!("dexes   {} verified", dexes.len());
-    // The host window + interpreter pipeline is the next milestone; report
-    // rather than fake success.
-    Err(OveloError::new(
-        ErrorCategory::ServiceMissing,
-        Phase::Service,
-        "cli.run.pipeline",
-    )
-    .with_detail("launch pipeline not wired yet"))
+
+    // Launch pipeline: Context → Activity lifecycle (via dexrt when the
+    // class is in the DEX) → Presenter → window.
+    let data_dir = store.app_dir(&rec.app).join("data");
+    let _ctx = ovelo_framework::Context::new(rec.app.package.clone(), data_dir);
+    let mut activity = ovelo_framework::Activity::new();
+    activity
+        .launch()
+        .map_err(|e| OveloError::new(ErrorCategory::ServiceMissing, Phase::Service, "cli.run.lifecycle").with_detail(e.to_string()))?;
+    let callbacks: Vec<String> = {
+        let mut v = Vec::new();
+        while let Some(cb) = activity.delivered() {
+            v.push(cb.to_string());
+        }
+        v
+    };
+
+    // dexrt dispatch: instantiate the launcher Activity's class, then run
+    // each queued lifecycle callback as a virtual call. Callbacks that
+    // take a Bundle get a null for now — real marshaling lands with the
+    // object bridge; a class missing from the DEX keeps the framework
+    // model's behavior.
+    let desc = format!("L{};", launcher.replace('.', "/"));
+    let desc_safe = disp(&desc);
+    let vm = (|| -> Result<_, OveloError> {
+        let (_cd, entries) = parse_central_directory(&bytes, &ZipLimits::default())?;
+        let e = entries
+            .iter()
+            .find(|e| e.name == "classes.dex")
+            .ok_or_else(|| err("cli.dex.missing"))?;
+        ovelo_dexrt::Vm::new(DexFile::open(read_entry(&bytes, e)?)?)
+    })();
+    let mut guest = vm
+        .and_then(|mut v| v.instantiate(&desc).map(|h| (v, h)))
+        .map_err(|e| {
+            println!("guest    {desc_safe} not dispatched: {}", e.cause());
+        })
+        .ok();
+    for cb in callbacks {
+        let ran = match &mut guest {
+            Some((vm, this)) => {
+                let r = vm
+                    .call_virtual(*this, &cb, &[])
+                    .and_then(|v| match v {
+                        s @ Some(_) => Ok(s),
+                        None => vm.call_virtual(*this, &cb, &[ovelo_dexrt::V::Ref(0)]),
+                    })
+                    .inspect_err(|e| println!("callback {cb} crashed: {}", e.cause()));
+                matches!(r, Ok(Some(_)))
+            }
+            None => false,
+        };
+        println!("callback {} ({})", cb, if ran { "dex" } else { "framework" });
+    }
+    let mut presenter = ovelo_host::Presenter::new();
+    let sid = presenter.attach(3, 720, 1280)?;
+    let win = ovelo_host::HostWindow::new(&disp(&rec.app.package), sid, presenter);
+    // The dexrt↔framework dispatch drains its queue through this hook.
+    ovelo_host::run(win, |_| {})
 }
 
 fn cmd() -> Result<(), OveloError> {

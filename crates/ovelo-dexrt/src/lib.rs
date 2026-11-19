@@ -151,8 +151,7 @@ impl Vm {
             .heap
             .class_of(this)
             .ok_or_else(|| errd("dexrt.bad_this", name.to_string()))?;
-        let desc = self.dex.type_descriptor(ci)?;
-        let Some(midx) = self.find_method_by_name(&desc, name, args.len())? else {
+        let Some(midx) = self.find_method_on_chain(ci, name, args.len())? else {
             return Ok(None);
         };
         let mut a = Vec::with_capacity(args.len() + 1);
@@ -175,6 +174,30 @@ impl Vm {
             }
             _ => format!("object #{h}"),
         }
+    }
+
+    /// `find_method_by_name` over the class's superclass chain — an
+    /// inherited callback (e.g. onCreate on a DEX parent) still runs.
+    fn find_method_on_chain(
+        &self,
+        mut class_idx: u32,
+        name: &str,
+        nslots: usize,
+    ) -> Result<Option<u32>> {
+        for _ in 0..64 {
+            let Some(def) = self.def_of(class_idx) else {
+                return Ok(None);
+            };
+            let desc = self.dex.type_descriptor(def.class_idx)?;
+            if let Some(m) = self.find_method_by_name(&desc, name, nslots)? {
+                return Ok(Some(m));
+            }
+            if def.superclass_idx == u32::MAX {
+                return Ok(None);
+            }
+            class_idx = def.superclass_idx;
+        }
+        Ok(None)
     }
 
     /// First method `name` on `class_desc` whose params occupy exactly
@@ -452,7 +475,29 @@ impl Vm {
                 }
                 Err(self.throw_builtin("Ljava/lang/NullPointerException;", "String.length"))
             }
-            _ => vm("dexrt.invoke.unresolved"),
+            _ => {
+                // A method whose class isn't in this DEX is a framework
+                // stub: the host models the base behavior, so return the
+                // proto's default (None for void) instead of failing —
+                // e.g. Activity.<init> or super.onCreate().
+                // Only constructors and void methods on non-DEX classes are
+                // host no-ops — a value-returning stub (Math.abs) answering
+                // with a default would let the app compute on a lie.
+                if self.def_of(mid.class_idx as u32).is_none() {
+                    let p = self.dex.proto(mid.proto_idx as u32).map_err(E::Vm)?;
+                    let ret = self
+                        .dex
+                        .type_descriptor(p.return_type_idx)
+                        .map_err(E::Vm)?;
+                    if ret == "V" {
+                        Ok(None)
+                    } else {
+                        vm("dexrt.invoke.unresolved")
+                    }
+                } else {
+                    vm("dexrt.invoke.unresolved")
+                }
+            }
         }
     }
 
