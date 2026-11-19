@@ -66,6 +66,7 @@ impl Handles {
     /// `DeleteGlobalRef`.
     pub fn delete_global(&mut self, h: u32) {
         if self.globals.remove(&h) {
+            self.forget_frame(h);
             self.free(h);
         }
     }
@@ -73,7 +74,16 @@ impl Handles {
     /// `DeleteLocalRef`.
     pub fn delete_local(&mut self, h: u32) {
         if h != NULL && !self.globals.contains(&h) {
+            self.forget_frame(h);
             self.free(h);
+        }
+    }
+
+    /// Drop `h` from every frame's record so `pop_frame` cannot free it
+    /// a second time.
+    fn forget_frame(&mut self, h: u32) {
+        for f in &mut self.frames {
+            f.retain(|&x| x != h);
         }
     }
 
