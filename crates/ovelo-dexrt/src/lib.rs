@@ -553,6 +553,8 @@ impl Vm {
     fn refv(v: V) -> Rt<u32> {
         match v {
             V::Ref(h) => Ok(h),
+            // `const/4 vx, 0` is how dex puts a null reference in a register.
+            V::I32(0) => Ok(0),
             _ => vm("dexrt.type"),
         }
     }
