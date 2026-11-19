@@ -8,12 +8,14 @@
 //! app callbacks with Android's ordering guarantees.
 
 pub mod activity;
+pub mod choreographer;
 pub mod context;
 pub mod looper;
 pub mod prefs;
 pub mod view;
 
 pub use activity::{Activity, ActivityError, Lifecycle};
+pub use choreographer::{CallbackType, Choreographer, FrameCallback};
 pub use context::Context;
 pub use looper::{Handler, Looper, Message, MessageQueue};
 pub use prefs::{PrefValue, SharedPreferences};
