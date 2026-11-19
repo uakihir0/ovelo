@@ -29,6 +29,26 @@ pub trait GlyphSource {
     fn shaped_advances(&self, _text: &str, _size_px: f32) -> Option<Vec<(usize, f32)>> {
         None
     }
+    /// Raster coverage for `c`, or `None` when the font can't rasterize.
+    /// `ymin`/`ymax` follow fontdue convention: distance from the baseline
+    /// to the bitmap's bottom edge (positive = below baseline).
+    fn raster_for(&self, _c: char, _size_px: f32) -> Option<GlyphBmp> {
+        None
+    }
+}
+
+/// A rasterized glyph: 8-bit coverage bitmap plus placement metrics.
+pub struct GlyphBmp {
+    /// Left edge offset from the pen origin (may be negative).
+    pub xmin: i32,
+    /// Bottom edge offset from the baseline (positive = below).
+    pub ymin: i32,
+    /// Bitmap width px.
+    pub w: usize,
+    /// Bitmap height px.
+    pub h: usize,
+    /// Row-major coverage, `w * h` bytes.
+    pub cov: Vec<u8>,
 }
 
 /// A TTF/OTF face kept as owned bytes; `ttf_parser::Face` is rebuilt per call
@@ -36,6 +56,8 @@ pub trait GlyphSource {
 pub struct TtfFont {
     bytes: Vec<u8>,
     name: String,
+    /// Rasterizer face (fontdue), built once at load.
+    fd: Option<fontdue::Font>,
 }
 
 impl TtfFont {
@@ -60,9 +82,18 @@ impl TtfFont {
             .find(|n| n.name_id == ttf_parser::name_id::FAMILY)
             .and_then(|n| n.to_string())
             .unwrap_or_else(|| "unnamed".into());
+        let fd = fontdue::Font::from_bytes(
+            bytes,
+            fontdue::FontSettings {
+                scale: 100.0,
+                ..fontdue::FontSettings::default()
+            },
+        )
+        .ok();
         Ok(Self {
             bytes: bytes.to_vec(),
             name,
+            fd,
         })
     }
 
@@ -114,6 +145,16 @@ impl GlyphSource for TtfFont {
     }
     fn shaped_advances(&self, text: &str, size_px: f32) -> Option<Vec<(usize, f32)>> {
         Some(self.shape(text, size_px))
+    }
+    fn raster_for(&self, c: char, size_px: f32) -> Option<GlyphBmp> {
+        let (m, cov) = self.fd.as_ref()?.rasterize(c, size_px);
+        Some(GlyphBmp {
+            xmin: m.xmin,
+            ymin: m.ymin,
+            w: m.width,
+            h: m.height,
+            cov,
+        })
     }
 }
 
@@ -168,6 +209,11 @@ impl FontSet {
             .iter()
             .map(|f| f.as_ref())
             .find(|f| f.advance_for(c, size_px).is_some())
+    }
+
+    /// Raster `c` via fallback order (first font with coverage wins).
+    pub fn raster(&self, c: char, size_px: f32) -> Option<GlyphBmp> {
+        self.fonts.iter().find_map(|f| f.raster_for(c, size_px))
     }
 
     /// Advance of `c` via fallback ordering; missing glyphs take the last

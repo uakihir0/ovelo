@@ -12,10 +12,12 @@ pub mod bundle;
 pub mod choreographer;
 pub mod context;
 pub mod looper;
+pub mod root;
 pub mod prefs;
 pub mod resolver;
 pub mod sqlite;
 pub mod view;
+pub mod widget;
 
 pub use activity::{Activity, ActivityError, Lifecycle};
 pub use bundle::{BValue, Bundle};
@@ -24,8 +26,10 @@ pub use context::Context;
 pub use looper::{Handler, Looper, Message, MessageQueue};
 pub use prefs::{PrefValue, SharedPreferences};
 pub use resolver::{ContentProvider, ContentResolver, ContentUri};
+pub use root::ViewRootImpl;
 pub use sqlite::{Cursor, Database, SqlValue};
 pub use view::{Length, MeasureSpec, Size, View, ViewGroup};
+pub use widget::{Button, Drawable, TextView};
 
 use ovelo_error::{ErrorCategory, OveloError, Phase};
 
@@ -102,22 +106,22 @@ mod tests {
     #[test]
     fn linear_group_measure_layout() {
         let mut g = ViewGroup::new(Length::MatchParent, Length::WrapContent);
-        g.children.push(View::new(
+        g.children.push(Box::new(View::new(
             Length::MatchParent,
             Length::WrapContent,
             Size { w: 10, h: 20 },
-        ));
-        g.children.push(View::new(
+        )));
+        g.children.push(Box::new(View::new(
             Length::Exact(50),
             Length::Exact(30),
             Size { w: 1, h: 1 },
-        ));
+        )));
         let s = g.measure(MeasureSpec::Exactly(100), MeasureSpec::AtMost(200));
         assert_eq!(s, Size { w: 100, h: 50 });
         g.layout(5, 7);
-        assert_eq!((g.children[0].left, g.children[0].top), (5, 7));
-        assert_eq!((g.children[1].left, g.children[1].top), (5, 27));
-        assert!(g.children[0].measured.w == 100);
+        assert_eq!(g.children[0].origin(), (5, 7));
+        assert_eq!(g.children[1].origin(), (5, 27));
+        assert!(g.children[0].measured().w == 100);
     }
 
     #[test]

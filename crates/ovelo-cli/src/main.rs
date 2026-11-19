@@ -273,8 +273,30 @@ fn run_app(store: &InstallStore, package: &str) -> Result<(), OveloError> {
     let mut presenter = ovelo_host::Presenter::new();
     let sid = presenter.attach(3, 720, 1280)?;
     let win = ovelo_host::HostWindow::new(&disp(&rec.app.package), sid, presenter);
-    // The dexrt↔framework dispatch drains its queue through this hook.
-    ovelo_host::run(win, |_| {})
+    // ViewRootImpl drives the tree: each vsync beat renders dirty views
+    // into the surface the presenter then displays.
+    let mut fonts = ovelo_ui::FontSet::new();
+    fonts.load_dirs(&["/System/Library/Fonts", "/System/Library/Fonts/Supplemental"]);
+    let fonts = std::rc::Rc::new(fonts);
+    let mut root = ovelo_framework::ViewRootImpl::new(720, 1280, fonts.clone());
+    let mut col = ovelo_framework::ViewGroup::new(
+        ovelo_framework::Length::MatchParent,
+        ovelo_framework::Length::WrapContent,
+    );
+    let mut title = ovelo_framework::TextView::new(
+        rec.app.package.clone(),
+        24.0,
+        ovelo_ui::Color::srgb(0x20, 0x20, 0x20),
+        fonts.clone(),
+    );
+    title.padding = 16;
+    col.children.push(Box::new(title));
+    root.set_content_view(Box::new(col));
+    ovelo_host::run(win, move |p| {
+        if let Ok(w) = p.producer(sid) {
+            let _ = root.perform_traversals(w);
+        }
+    })
 }
 
 fn cmd() -> Result<(), OveloError> {

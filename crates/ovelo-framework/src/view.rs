@@ -4,6 +4,9 @@
 //! UNSPECIFIED) and linear container propagation — enough for the host to run
 //! real layout arithmetic while app `onMeasure` overrides stay in DEX.
 
+use crate::widget::Drawable;
+use ovelo_ui::Color;
+
 /// A dimension from `LayoutParams`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Length {
@@ -65,6 +68,8 @@ pub struct View {
     pub left: i32,
     /// Laid-out rect (top).
     pub top: i32,
+    /// `setBackgroundColor` — drawn under `draw` when set.
+    pub background: Option<Color>,
     dirty: bool,
 }
 
@@ -78,6 +83,7 @@ impl View {
             measured: Size::default(),
             left: 0,
             top: 0,
+            background: None,
             dirty: true,
         }
     }
@@ -123,8 +129,8 @@ fn resolve(desired: i32, spec: MeasureSpec) -> i32 {
 pub struct ViewGroup {
     /// The group's own params and measured size.
     pub view: View,
-    /// Children in z-order.
-    pub children: Vec<View>,
+    /// Children in z-order (`addView`).
+    pub children: Vec<Box<dyn Drawable>>,
 }
 
 impl ViewGroup {
@@ -142,9 +148,10 @@ impl ViewGroup {
         let mut mw = 0;
         let mut mh = 0;
         for c in &mut self.children {
+            let (lp_w, lp_h) = c.lp();
             let cs = c.measure(
-                MeasureSpec::for_child(w, c.lp_w),
-                MeasureSpec::for_child(h, c.lp_h),
+                MeasureSpec::for_child(w, lp_w),
+                MeasureSpec::for_child(h, lp_h),
             );
             mw = mw.max(cs.w);
             mh += cs.h;
@@ -159,7 +166,7 @@ impl ViewGroup {
         let mut y = top;
         for c in &mut self.children {
             c.layout(left, y);
-            y += c.measured.h;
+            y += c.measured().h;
         }
     }
 }
