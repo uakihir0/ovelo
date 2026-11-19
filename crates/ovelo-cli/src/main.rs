@@ -572,16 +572,19 @@ fn cmd() -> Result<(), OveloError> {
                 .filter(|d| !d.ok)
                 .map(|d| format!("{}:{}", d.name, d.cause))
                 .collect();
-            let (result, detail) = if bad.is_empty() && info.signed_v2_or_v3 {
+            // A present-but-corrupt signature block is a fail: signing
+            // must *verify*, not just exist.
+            let signer = apk_signer(&bytes);
+            let (result, detail) = if bad.is_empty() && !signer.is_empty() {
                 ("pass", String::new())
             } else if bad.is_empty() {
-                ("fail", "unsigned".to_string())
+                ("fail", "unsigned-or-invalid-signature".to_string())
             } else {
                 ("fail", bad.join(", "))
             };
             ledger_record(
                 &info,
-                &apk_signer(&bytes),
+                &signer,
                 "inspect-only",
                 "diagnose",
                 result,
