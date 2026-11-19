@@ -36,9 +36,11 @@ pub struct GateItem {
     pub verdict: Verdict,
 }
 
-/// Executables a distribution carries: the file itself, or every
-/// regular file under `Contents/MacOS` for an `.app`-style bundle
-/// (symlinks to shared libraries are not executables). Bundled helpers
+/// Executables a distribution carries: the file itself, or every entry
+/// under `Contents/MacOS` that resolves to a Mach-O executable for an
+/// `.app`-style bundle. Symlinks to executables are followed (a helper
+/// launched via a link must still be audited); shared libraries are not
+/// executables and cannot carry hardened-runtime flags. Bundled helpers
 /// get the same signature/entitlement audit — a helper with looser
 /// permissions must not slip the gate (§10).
 fn binaries(path: &Path) -> Result<Vec<std::path::PathBuf>> {
@@ -47,14 +49,10 @@ fn binaries(path: &Path) -> Result<Vec<std::path::PathBuf>> {
     }
     let macos = path.join("Contents").join("MacOS");
     let mut bins: Vec<std::path::PathBuf> = if macos.is_dir() {
-        // file_type() does not follow symlinks: a `Contents/MacOS`
-        // entry pointing at a shared library is not an executable and
-        // cannot carry hardened-runtime flags — skip it.
         std::fs::read_dir(&macos)
             .map_err(|e| io_err("read_dir", e))?
-            .filter_map(|e| e.ok())
-            .filter(|e| e.file_type().is_ok_and(|t| t.is_file()))
-            .map(|e| e.path())
+            .filter_map(|e| e.ok().map(|e| e.path()))
+            .filter(|p| is_macho_executable(p))
             .collect()
     } else {
         Vec::new()
@@ -69,6 +67,55 @@ fn binaries(path: &Path) -> Result<Vec<std::path::PathBuf>> {
         .with_detail(path.display().to_string()));
     }
     Ok(bins)
+}
+
+/// True when `path` — following symlinks — is a Mach-O *executable*
+/// (`MH_EXECUTE`), thin or universal (the first fat slice decides).
+/// `MH_DYLIB`/`MH_BUNDLE` files and non-Mach-O entries are not gate
+/// subjects: they cannot carry hardened-runtime flags or entitlements.
+fn is_macho_executable(path: &Path) -> bool {
+    use std::io::{Read, Seek, SeekFrom};
+    const MH_EXECUTE: u32 = 0x2;
+
+    // filetype is the u32 at header offset 12; the magic determines the
+    // header's byte order (fat magic is always big-endian).
+    fn filetype_of(hdr: &[u8; 16]) -> u32 {
+        match u32::from_be_bytes(hdr[..4].try_into().unwrap()) {
+            0xfeedface | 0xfeedfacf => u32::from_be_bytes(hdr[12..16].try_into().unwrap()),
+            0xcefaedfe | 0xcffaedfe => u32::from_le_bytes(hdr[12..16].try_into().unwrap()),
+            _ => 0,
+        }
+    }
+
+    let Ok(mut f) = std::fs::File::open(path) else {
+        return false;
+    };
+    let mut hdr = [0u8; 16];
+    if f.read_exact(&mut hdr).is_err() {
+        return false;
+    }
+    match u32::from_be_bytes(hdr[..4].try_into().unwrap()) {
+        0xcafebabe | 0xcafebabf => {
+            // fat_arch: cputype, cpusubtype, then the slice offset —
+            // u32 (fat) or u64 (fat64) at byte 16.
+            let fat64 = hdr[..4] == [0xca, 0xfe, 0xba, 0xbf];
+            let mut off = [0u8; 8];
+            if f.read_exact(&mut off[..if fat64 { 8 } else { 4 }]).is_err() {
+                return false;
+            }
+            let slice = if fat64 {
+                u64::from_be_bytes(off)
+            } else {
+                u32::from_be_bytes(off[..4].try_into().unwrap()) as u64
+            };
+            if f.seek(SeekFrom::Start(slice)).is_err() {
+                return false;
+            }
+            let mut sub = [0u8; 16];
+            f.read_exact(&mut sub).is_ok() && filetype_of(&sub) == MH_EXECUTE
+        }
+        _ => filetype_of(&hdr) == MH_EXECUTE,
+    }
 }
 
 fn io_err(op: &str, e: std::io::Error) -> OveloError {
@@ -326,6 +373,42 @@ mod tests {
         assert!(!hardened_runtime(
             "Executable=/tmp/runtime-app/Foo\nCodeDirectory v=20500 flags=0x0(none)"
         ));
+    }
+
+    fn write_macho(path: &std::path::Path, filetype: u32) {
+        // thin arm64 Mach-O: magic CF FA ED FE (LE), filetype at offset 12
+        let mut hdr = [0u8; 16];
+        hdr[..4].copy_from_slice(&[0xcf, 0xfa, 0xed, 0xfe]);
+        hdr[12..16].copy_from_slice(&filetype.to_le_bytes());
+        std::fs::write(path, hdr).unwrap();
+    }
+
+    #[test]
+    fn audits_macho_executables_and_their_links() {
+        let dir = std::env::temp_dir().join(format!("ovelo-gate-{}", std::process::id()));
+        let macos = dir.join("App.app/Contents/MacOS");
+        std::fs::create_dir_all(&macos).unwrap();
+        let exe = macos.join("helper");
+        let dylib = dir.join("libreal.dylib");
+        write_macho(&exe, 0x2); // MH_EXECUTE
+        write_macho(&dylib, 0x6); // MH_DYLIB
+        let outside_exe = dir.join("outside-helper");
+        write_macho(&outside_exe, 0x2);
+        #[cfg(unix)]
+        {
+            std::os::unix::fs::symlink(&outside_exe, macos.join("helper-link")).unwrap();
+            std::os::unix::fs::symlink(&dylib, macos.join("libreal.dylib")).unwrap();
+        }
+        std::fs::write(macos.join("script.sh"), b"#!/bin/sh\n").unwrap();
+
+        let bins = binaries(&dir.join("App.app")).unwrap();
+        let names: Vec<String> = bins
+            .iter()
+            .map(|p| p.file_name().unwrap().to_string_lossy().into_owned())
+            .collect();
+        assert_eq!(names, ["helper", "helper-link"]);
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
