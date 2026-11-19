@@ -1437,6 +1437,7 @@ version = "0.1.0"
 dependencies = [
  "ovelo-apk",
  "ovelo-dex",
+ "ovelo-dexrt",
  "ovelo-error",
  "ovelo-framework",
  "ovelo-host",

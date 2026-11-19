@@ -9,6 +9,7 @@ license.workspace = true
 ovelo-apk = { path = "../ovelo-apk" }
 ovelo-dex = { path = "../ovelo-dex" }
 ovelo-error = { path = "../ovelo-error" }
+ovelo-dexrt = { path = "../ovelo-dexrt" }
 ovelo-framework = { path = "../ovelo-framework" }
 ovelo-host = { path = "../ovelo-host" }
 
