@@ -37,7 +37,7 @@ pub fn parse_sig(sig: &str) -> Result<JniSig, OveloError> {
     let mut i = 1;
     let mut args = Vec::new();
     while i < b.len() && b[i] != b')' {
-        let (t, next) = parse_type(b, i).ok_or_else(|| {
+        let (t, next) = parse_type(b, i, false).ok_or_else(|| {
             err("jni.sig.malformed").with_detail(sig)
         })?;
         args.push(t);
@@ -46,7 +46,7 @@ pub fn parse_sig(sig: &str) -> Result<JniSig, OveloError> {
     if i >= b.len() || b[i] != b')' {
         return Err(err("jni.sig.malformed").with_detail(sig));
     }
-    let (ret, end) = parse_type(b, i + 1).ok_or_else(|| {
+    let (ret, end) = parse_type(b, i + 1, true).ok_or_else(|| {
         err("jni.sig.malformed").with_detail(sig)
     })?;
     if end != b.len() {
@@ -55,17 +55,22 @@ pub fn parse_sig(sig: &str) -> Result<JniSig, OveloError> {
     Ok(JniSig { args, ret })
 }
 
-fn parse_type(b: &[u8], i: usize) -> Option<(String, usize)> {
+/// `allow_v`: `V` (void) is legal only as a return type.
+fn parse_type(b: &[u8], i: usize, allow_v: bool) -> Option<(String, usize)> {
     match *b.get(i)? {
-        c @ (b'Z' | b'B' | b'C' | b'S' | b'I' | b'J' | b'F' | b'D' | b'V') => {
+        b'V' if allow_v => Some(("V".to_string(), i + 1)),
+        c @ (b'Z' | b'B' | b'C' | b'S' | b'I' | b'J' | b'F' | b'D') => {
             Some(((c as char).to_string(), i + 1))
         }
         b'L' => {
             let end = i + 1 + b[i + 1..].iter().position(|&c| c == b';')?;
+            if end == i + 1 {
+                return None; // `L;` — empty class name
+            }
             Some((String::from_utf8_lossy(&b[i..=end]).into_owned(), end + 1))
         }
         b'[' => {
-            let (inner, next) = parse_type(b, i + 1)?;
+            let (inner, next) = parse_type(b, i + 1, false)?;
             Some((format!("[{inner}"), next))
         }
         _ => None,
