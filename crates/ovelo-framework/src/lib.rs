@@ -9,6 +9,7 @@
 
 pub mod activity;
 pub mod bundle;
+pub mod choreographer;
 pub mod context;
 pub mod looper;
 pub mod prefs;
@@ -18,6 +19,7 @@ pub mod view;
 
 pub use activity::{Activity, ActivityError, Lifecycle};
 pub use bundle::{BValue, Bundle};
+pub use choreographer::{CallbackType, Choreographer, FrameCallback};
 pub use context::Context;
 pub use looper::{Handler, Looper, Message, MessageQueue};
 pub use prefs::{PrefValue, SharedPreferences};
