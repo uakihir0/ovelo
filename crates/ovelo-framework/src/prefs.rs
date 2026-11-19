@@ -194,7 +194,9 @@ impl SharedPreferences {
         // The temp name carries this instance's id: two stores opened on
         // sibling paths (settings.xml vs settings.bak) would otherwise
         // share `settings.xml.tmp` and corrupt each other's writes.
-        let tmp = self.path.with_extension("xml.tmp");
+        let tmp = self
+            .path
+            .with_extension(format!("xml.tmp-{}", self.tmp_id));
         std::fs::write(&tmp, doc).map_err(|e| {
             err("framework.prefs.io").with_detail(e.to_string())
         })?;
