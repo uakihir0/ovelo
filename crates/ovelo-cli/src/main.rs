@@ -33,12 +33,19 @@ enum Cmd {
 fn parse_args(argv: &[String]) -> Result<Cmd, OveloError> {
     let sub = argv.get(1).map(|s| s.as_str()).unwrap_or("help");
     let json = argv.iter().any(|a| a == "--json");
-    let pos: Vec<&String> = argv
-        .iter()
-        .skip(2)
-        .filter(|a| !a.starts_with('-'))
-        .collect();
-    let unknown_flag = argv.iter().skip(2).any(|a| a.starts_with('-') && a != "--json");
+    // `--` ends option parsing so `-foo.apk` filenames still work.
+    let mut pos: Vec<&String> = Vec::new();
+    let mut seen_sep = false;
+    let mut unknown_flag = false;
+    for a in argv.iter().skip(2) {
+        if !seen_sep && a == "--" {
+            seen_sep = true;
+        } else if !seen_sep && a.starts_with('-') && a != "--json" {
+            unknown_flag = true;
+        } else if !a.starts_with('-') || seen_sep {
+            pos.push(a);
+        }
+    }
     if sub != "help" && sub != "--help" && sub != "-h" && (pos.len() != 1 || unknown_flag) {
         return Err(err("cli.usage"));
     }
@@ -321,6 +328,12 @@ mod tests {
         }
         assert!(parse_args(&v(&["ovelo", "bogus"])).is_err());
         assert!(parse_args(&v(&["ovelo", "inspect"])).is_err());
+        assert!(parse_args(&v(&["ovelo", "inspect", "-demo.apk"])).is_err());
+        match parse_args(&v(&["ovelo", "inspect", "--", "-demo.apk"])).unwrap() {
+            Cmd::Inspect { apk, .. } => assert_eq!(apk, PathBuf::from("-demo.apk")),
+            _ => panic!(),
+        }
+        assert!(parse_args(&v(&["ovelo", "inspect", "a.apk", "extra"])).is_err());
         matches!(parse_args(&v(&["ovelo"])).unwrap(), Cmd::Help);
     }
 }
