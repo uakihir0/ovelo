@@ -36,10 +36,15 @@ pub trait GlyphSource {
     fn raster_for(&self, _c: char, _size_px: f32) -> Option<GlyphBmp> {
         None
     }
-    /// Shaped, positioned glyph run for `text` (BiDi direction, ligatures,
-    /// mark placement resolved by the shaper), or `None` when the font
-    /// can't shape/rasterize. Only called when the font covers every char.
-    fn shaped_glyphs(&self, _text: &str, _size_px: f32) -> Option<Vec<ShapedGlyph>> {
+    /// Shaped, positioned glyph run for `text` in direction `rtl`
+    /// (ligatures, mark placement resolved by the shaper), or `None`
+    /// when the font can't shape/rasterize.
+    fn shaped_glyphs(
+        &self,
+        _text: &str,
+        _rtl: bool,
+        _size_px: f32,
+    ) -> Option<Vec<ShapedGlyph>> {
         None
     }
 }
@@ -178,7 +183,7 @@ impl GlyphSource for TtfFont {
             cov,
         })
     }
-    fn shaped_glyphs(&self, text: &str, size_px: f32) -> Option<Vec<ShapedGlyph>> {
+    fn shaped_glyphs(&self, text: &str, rtl: bool, size_px: f32) -> Option<Vec<ShapedGlyph>> {
         let fd = self.fd.as_ref()?;
         let upm = self.face().units_per_em() as f32;
         let scale = size_px / upm;
@@ -186,7 +191,11 @@ impl GlyphSource for TtfFont {
             rustybuzz::Face::from_slice(&self.bytes, 0).expect("font parsed at registration");
         let mut buf = rustybuzz::UnicodeBuffer::new();
         buf.push_str(text);
-        buf.guess_segment_properties();
+        buf.set_direction(if rtl {
+            rustybuzz::Direction::RightToLeft
+        } else {
+            rustybuzz::Direction::LeftToRight
+        });
         let glyph_buf = rustybuzz::shape(&rb_face, &[], buf);
         let mut out = Vec::new();
         for (info, pos) in glyph_buf
@@ -210,6 +219,19 @@ impl GlyphSource for TtfFont {
         }
         Some(out)
     }
+}
+
+/// Split `text` into visual-order bidi runs: `(byte range, is_rtl)`.
+fn bidi_runs(text: &str) -> Vec<(std::ops::Range<usize>, bool)> {
+    let info = unicode_bidi::BidiInfo::new(text, None);
+    let mut out = Vec::new();
+    for para in &info.paragraphs {
+        let (levels, runs) = info.visual_runs(para, para.range.clone());
+        for r in runs {
+            out.push((r.clone(), levels[r.start].is_rtl()));
+        }
+    }
+    out
 }
 
 /// Ordered fallback font set. Lookup walks in registration order.
@@ -270,16 +292,81 @@ impl FontSet {
         self.fonts.iter().find_map(|f| f.raster_for(c, size_px))
     }
 
-    /// Shaped, positioned glyph run for `text` from the first font that
-    /// covers every char (shaper resolves BiDi order, ligatures and mark
-    /// offsets). `None` when no single font covers the whole text —
-    /// callers then draw per char through [`FontSet::raster`].
+    /// Shaped, positioned glyph run for `text`, itemized like Minikin:
+    /// BiDi `visual_runs` first, then each bidi run split into maximal
+    /// consecutive same-font sub-runs and shaped by its own font, so
+    /// digits keep their order inside RTL text and each char draws in
+    /// the font [`FontSet::advance`] measures it with. Chars no font
+    /// covers take a half-em advance and no bitmap (`.notdef` rendering
+    /// is a later layer). `None` only when no fonts are registered.
     pub fn shaped_run(&self, text: &str, size_px: f32) -> Option<Vec<ShapedGlyph>> {
+        if self.fonts.is_empty() {
+            return None;
+        }
+        let mut out = Vec::new();
+        for (run, rtl) in bidi_runs(text) {
+            let sub = &text[run];
+            let mut start = 0usize;
+            let mut cur: Option<usize> = None;
+            let mut started = false;
+            for (b, c) in sub.char_indices() {
+                let fi = self.font_index_for(c, size_px);
+                if !started {
+                    cur = fi;
+                    started = true;
+                } else if fi != cur {
+                    self.shape_subrun(&sub[start..b], cur, rtl, size_px, &mut out);
+                    start = b;
+                    cur = fi;
+                }
+            }
+            if started {
+                self.shape_subrun(&sub[start..], cur, rtl, size_px, &mut out);
+            }
+        }
+        Some(out)
+    }
+
+    /// Index of the first font covering `c`, else `None`.
+    fn font_index_for(&self, c: char, size_px: f32) -> Option<usize> {
         self.fonts
             .iter()
-            .map(|f| f.as_ref())
-            .find(|f| text.chars().all(|c| f.advance_for(c, size_px).is_some()))
-            .and_then(|f| f.shaped_glyphs(text, size_px))
+            .position(|f| f.advance_for(c, size_px).is_some())
+    }
+
+    /// Shape `text` with font `fi` (or draw nothing-covered when `None`),
+    /// appending to `out`. `rtl` is the containing bidi run's direction.
+    fn shape_subrun(
+        &self,
+        text: &str,
+        fi: Option<usize>,
+        rtl: bool,
+        size_px: f32,
+        out: &mut Vec<ShapedGlyph>,
+    ) {
+        if let Some(i) = fi {
+            if let Some(gs) = self.fonts[i].shaped_glyphs(text, rtl, size_px) {
+                out.extend(gs);
+                return;
+            }
+        }
+        for c in text.chars() {
+            let bmp = fi
+                .and_then(|i| self.fonts[i].raster_for(c, size_px))
+                .unwrap_or(GlyphBmp {
+                    xmin: 0,
+                    ymin: 0,
+                    w: 0,
+                    h: 0,
+                    cov: Vec::new(),
+                });
+            out.push(ShapedGlyph {
+                bmp,
+                x_adv: self.advance(c, size_px),
+                x_off: 0.0,
+                y_off: 0.0,
+            });
+        }
     }
 
     /// Advance of `c` via fallback ordering; missing glyphs take the last
@@ -383,10 +470,18 @@ mod tests {
         // A PUA char Geneva doesn't cover: raster must return None so a
         // later font in the chain can supply the glyph.
         assert!(fs.raster('\u{E000}', 16.0).is_none());
-        assert!(fs.shaped_run("\u{E000}", 16.0).is_none());
         assert!(fs.raster('A', 16.0).is_some());
         let run = fs.shaped_run("AB", 16.0).expect("shaped");
         assert_eq!(run.len(), 2);
         assert!(run.iter().all(|g| g.bmp.w > 0));
+        // Uncovered char: advance-only empty glyph, not .notdef.
+        let run = fs.shaped_run("\u{E000}", 16.0).expect("shaped");
+        assert_eq!(run.len(), 1);
+        assert_eq!(run[0].bmp.w, 0);
+        assert!(run[0].x_adv > 0.0);
+        // Width drawn == width measured: summed advances match char_advances.
+        let drawn: f32 = run.iter().map(|g| g.x_adv).sum();
+        let measured: f32 = fs.char_advances("\u{E000}", 16.0).iter().sum();
+        assert!((drawn - measured).abs() < 0.01, "{drawn} vs {measured}");
     }
 }
