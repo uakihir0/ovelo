@@ -59,6 +59,19 @@ impl ViewRootImpl {
         self.content.as_ref().map(|v| v.is_dirty()).unwrap_or(false)
     }
 
+    /// `dispatchTouchEvent`: a press/release at surface px. Click
+    /// listeners fire on release (`tap`), matching Android's
+    /// `View.performClick` on ACTION_UP inside the view.
+    pub fn dispatch_touch(&mut self, down: bool, x: i32, y: i32) -> bool {
+        if down {
+            return true; // consumed; the tap resolves on release
+        }
+        self.content
+            .as_mut()
+            .map(|v| v.dispatch_tap(x, y))
+            .unwrap_or(false)
+    }
+
     /// One traversal: when dirty, dequeue a buffer, measure → layout →
     /// draw into it, and post it. `Ok(None)` when nothing changed —
     /// callers skip presentation bookkeeping on None.
@@ -148,6 +161,33 @@ mod tests {
         // Button bg covers its measured rect (padding adds ≥24 to a text run).
         let (r, _, _, _) = s.pixel(2, 12).straight();
         assert_eq!(r, 0xDD);
+    }
+
+    #[test]
+    fn tap_fires_click_listener_and_redraws() {
+        use std::cell::Cell;
+        let hits = std::rc::Rc::new(Cell::new(0u32));
+        let mut root = ViewRootImpl::new(200, 100, fonts());
+        let mut ok = Button::new("OK", 16.0, Color::srgb(0, 0, 0), root.fonts.clone());
+        let h2 = hits.clone();
+        ok.on_click = Some(Box::new(move || h2.set(h2.get() + 1)));
+        let mut col = crate::view::ViewGroup::new(
+            crate::view::Length::MatchParent,
+            crate::view::Length::WrapContent,
+        );
+        col.children.push(Box::new(ok));
+        root.set_content_view(Box::new(col));
+        let mut s = Surface::new(200, 100).unwrap();
+        root.draw_to(&mut s); // lays out at (0,0), button is ≥24px wide
+        assert!(!root.is_dirty());
+        // Tap inside the button → click fires, view dirty again.
+        assert!(root.dispatch_touch(true, 4, 4));
+        assert!(root.dispatch_touch(false, 4, 4));
+        assert_eq!(hits.get(), 1);
+        assert!(root.is_dirty());
+        // Tap outside → nothing.
+        assert!(!root.dispatch_touch(false, 199, 99));
+        assert_eq!(hits.get(), 1);
     }
 
     #[test]

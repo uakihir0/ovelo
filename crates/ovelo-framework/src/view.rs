@@ -70,6 +70,8 @@ pub struct View {
     pub top: i32,
     /// `setBackgroundColor` — drawn under `draw` when set.
     pub background: Option<Color>,
+    /// `setOnClickListener` — fired on tap inside the laid-out rect.
+    pub on_click: Option<Box<dyn FnMut()>>,
     dirty: bool,
 }
 
@@ -84,6 +86,7 @@ impl View {
             left: 0,
             top: 0,
             background: None,
+            on_click: None,
             dirty: true,
         }
     }

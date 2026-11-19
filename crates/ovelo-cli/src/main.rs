@@ -291,16 +291,44 @@ fn run_app(store: &InstallStore, package: &str) -> Result<(), OveloError> {
     );
     title.padding = 16;
     col.children.push(Box::new(title));
+    // Demo button exercises the tap path: click → label updates → dirty →
+    // the next traversal redraws.
+    let taps = std::rc::Rc::new(std::cell::Cell::new(0u32));
+    let mut ok = ovelo_framework::Button::new(
+        "Tap me",
+        18.0,
+        ovelo_ui::Color::srgb(0x30, 0x30, 0x30),
+        fonts.clone(),
+    );
+    let taps2 = taps.clone();
+    ok.on_click = Some(Box::new(move || {
+        taps2.set(taps2.get() + 1);
+    }));
+    col.children.push(Box::new(ok));
     root.set_content_view(Box::new(col));
-    ovelo_host::run(win, move |p| {
-        if let Ok(w) = p.producer(sid) {
+    ovelo_host::run(win, move |w| {
+        for ev in w.take_input() {
+            let Some(pt) = ev.pointers.get(ev.action_index) else {
+                continue;
+            };
+            match ev.action {
+                ovelo_host::MotionAction::Down => {
+                    root.dispatch_touch(true, pt.x as i32, pt.y as i32);
+                }
+                ovelo_host::MotionAction::Up => {
+                    root.dispatch_touch(false, pt.x as i32, pt.y as i32);
+                }
+                _ => {}
+            }
+        }
+        if let Ok(prod) = w.presenter().producer(sid) {
             // Track window resizes: the buffer queue follows the new size
             // and the root re-lays out on the next traversal.
-            let (bw, bh) = (w.queue().width() as i32, w.queue().height() as i32);
+            let (bw, bh) = (prod.queue().width() as i32, prod.queue().height() as i32);
             if (bw, bh) != (root.w, root.h) {
                 root.resize(bw, bh);
             }
-            let _ = root.perform_traversals(w);
+            let _ = root.perform_traversals(prod);
         }
     })
 }
