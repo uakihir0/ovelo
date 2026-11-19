@@ -311,19 +311,26 @@ fn parse_signers(v2_value: &[u8]) -> Result<Vec<Signer>> {
         let signatures = r.item()?;
         let public_key = r.item()?.to_vec();
 
-        // signatures: sequence of (u32 algId, u32 len, signature bytes) — the
-        // record itself carries no outer length prefix.
+        // signatures: sequence of length-prefixed records, each
+        // `u32 recLen || u32 algId || u32 sigLen || sig` — the record
+        // wraps `algId || lp(sig)`, so recLen = sigLen + 8.
         let mut sig_list = Vec::new();
         let mut sp = 0usize;
-        while sp + 8 <= signatures.len() {
-            let alg = u32::from_le_bytes(signatures[sp..sp + 4].try_into().unwrap());
-            let slen = u32::from_le_bytes(signatures[sp + 4..sp + 8].try_into().unwrap()) as usize;
-            sp += 8;
-            if sp + slen > signatures.len() {
+        while sp + 12 <= signatures.len() {
+            let rlen =
+                u32::from_le_bytes(signatures[sp..sp + 4].try_into().unwrap()) as usize;
+            if rlen < 8 || sp + 4 + rlen > signatures.len() {
                 return Err(sig_err("sig.record.truncated"));
             }
-            sig_list.push((alg, signatures[sp..sp + slen].to_vec()));
-            sp += slen;
+            let alg =
+                u32::from_le_bytes(signatures[sp + 4..sp + 8].try_into().unwrap());
+            let slen =
+                u32::from_le_bytes(signatures[sp + 8..sp + 12].try_into().unwrap()) as usize;
+            if slen + 8 != rlen {
+                return Err(sig_err("sig.record.len"));
+            }
+            sig_list.push((alg, signatures[sp + 12..sp + 4 + rlen].to_vec()));
+            sp += 4 + rlen;
         }
         if sp != signatures.len() {
             return Err(sig_err("sig.trailing"));
@@ -334,12 +341,24 @@ fn parse_signers(v2_value: &[u8]) -> Result<Vec<Signer>> {
         let digests_seq = sd.item()?;
         let certs_seq = sd.item()?;
         let _attrs = sd.item().unwrap_or(&[]);
-        // digests: sequence of (uint32 sigAlgId, length-prefixed digest).
+        // digests: sequence of length-prefixed records, each
+        // `u32 recLen || u32 sigAlgId || u32 digestLen || digest`
+        // (recLen = digestLen + 8).
         let mut digests = Vec::new();
         let mut dp = 0usize;
-        while dp + 8 <= digests_seq.len() {
-            let alg = u32::from_le_bytes(digests_seq[dp..dp + 4].try_into().unwrap());
-            let dlen = u32::from_le_bytes(digests_seq[dp + 4..dp + 8].try_into().unwrap()) as usize;
+        while dp + 12 <= digests_seq.len() {
+            let rlen =
+                u32::from_le_bytes(digests_seq[dp..dp + 4].try_into().unwrap()) as usize;
+            if rlen < 8 || dp + 4 + rlen > digests_seq.len() {
+                return Err(sig_err("sig.record.truncated"));
+            }
+            let alg =
+                u32::from_le_bytes(digests_seq[dp + 4..dp + 8].try_into().unwrap());
+            let dlen =
+                u32::from_le_bytes(digests_seq[dp + 8..dp + 12].try_into().unwrap()) as usize;
+            if dlen + 8 != rlen {
+                return Err(sig_err("sig.record.len"));
+            }
             let expected = match SigAlg::from_id(alg) {
                 Some(a) => match a.digest_alg() {
                     1 => 32,
@@ -351,12 +370,8 @@ fn parse_signers(v2_value: &[u8]) -> Result<Vec<Signer>> {
             if dlen != expected {
                 return Err(sig_err("sig.digest.len"));
             }
-            dp += 8;
-            if dp + dlen > digests_seq.len() {
-                return Err(sig_err("sig.record.truncated"));
-            }
-            digests.push((alg, digests_seq[dp..dp + dlen].to_vec()));
-            dp += dlen;
+            digests.push((alg, digests_seq[dp + 12..dp + 4 + rlen].to_vec()));
+            dp += 4 + rlen;
         }
         if dp != digests_seq.len() {
             return Err(sig_err("sig.trailing"));
@@ -579,10 +594,12 @@ mod tests {
         let block_start = cd.offset as usize;
         let digest = content_digest(&zip, &cd, block_start, 1).unwrap();
 
-        // digest record = u32 algId || length-prefixed digest.
-        let mut digest_rec = 0x0201u32.to_le_bytes().to_vec();
-        digest_rec.extend(&(digest.len() as u32).to_le_bytes());
-        digest_rec.extend(&digest);
+        // digest record = u32 recLen || u32 algId || u32 digestLen || digest.
+        let mut body = 0x0201u32.to_le_bytes().to_vec();
+        body.extend(&(digest.len() as u32).to_le_bytes());
+        body.extend(&digest);
+        let mut digest_rec = (body.len() as u32).to_le_bytes().to_vec();
+        digest_rec.extend(&body);
         let digests_seq = digest_rec.clone();
         let certs_seq = lp(&cert_der);
         let attrs_seq: Vec<u8> = Vec::new();
@@ -598,10 +615,12 @@ mod tests {
         let sk = SigningKey::from_pkcs8_der(&certified.key_pair.serialize_der()).unwrap();
         let sig: Signature = sk.sign(&signed_data);
         let sig_der = sig.to_der().as_bytes().to_vec();
-        // signature record = u32 algId || length-prefixed signature.
-        let mut sig_rec = 0x0201u32.to_le_bytes().to_vec();
-        sig_rec.extend(&(sig_der.len() as u32).to_le_bytes());
-        sig_rec.extend(&sig_der);
+        // signature record = u32 recLen || u32 algId || u32 sigLen || sig.
+        let mut body = 0x0201u32.to_le_bytes().to_vec();
+        body.extend(&(sig_der.len() as u32).to_le_bytes());
+        body.extend(&sig_der);
+        let mut sig_rec = (body.len() as u32).to_le_bytes().to_vec();
+        sig_rec.extend(&body);
 
         let signer = [lp(&signed_data), lp(&sig_rec), lp(&pubkey_der)].concat();
         let signers = lp(&lp(&signer));
