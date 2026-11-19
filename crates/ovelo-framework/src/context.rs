@@ -54,22 +54,24 @@ impl Context {
     /// `getSharedPreferences(name, mode)` — one live store per name.
     ///
     /// The first call loads (or creates on commit) `shared_prefs/<name>.xml`.
-    /// `name` is confined to the preferences directory: characters outside
-    /// `[A-Za-z0-9._-]` are replaced with `_` so a malicious name can never
-    /// escape the app's private directory.
+    /// `name` is confined to the preferences directory: names already in
+    /// `[A-Za-z0-9._-]` pass through, anything else is hex-encoded, so a
+    /// malicious name can never escape the app's private directory.
     /// Returns the process-wide shared store (matches AOSP's singleton
     /// per file), so writes via one `Context` are visible to all others.
     pub fn shared_prefs(&mut self, name: &str) -> Arc<Mutex<SharedPreferences>> {
-        let safe: String = name
-            .chars()
-            .map(|c| {
-                if c.is_ascii_alphanumeric() || c == '.' || c == '_' || c == '-' {
-                    c
-                } else {
-                    '_'
-                }
-            })
-            .collect();
+        // Valid names pass through unchanged (so files written before
+        // sanitisation are still found); anything else is hex-encoded —
+        // a lossless escape, so distinct names can never collide.
+        let valid = !name.is_empty()
+            && name
+                .chars()
+                .all(|c| c.is_ascii_alphanumeric() || c == '.' || c == '_' || c == '-');
+        let safe: String = if valid {
+            name.to_string()
+        } else {
+            name.bytes().map(|b| format!("{b:02x}")).collect()
+        };
         let path = self
             .data_dir
             .join("shared_prefs")
