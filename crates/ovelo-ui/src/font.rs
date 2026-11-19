@@ -372,6 +372,7 @@ impl FontSet {
             let mut segs: Vec<(std::ops::Range<usize>, Option<usize>, bool)> =
                 Vec::new();
             let mut start = 0usize;
+            let mut cluster_start = 0usize;
             let mut cur: Option<usize> = None;
             let mut started = false;
             let mut compose = false;
@@ -383,7 +384,10 @@ impl FontSet {
                     // (e.g. a precomposed form), keep it and compose at
                     // shape time so the accent lands on the base glyph
                     // rather than drawing as .notdef or splitting off to
-                    // another font without anchor context.
+                    // another font without anchor context. Only the tail
+                    // cluster (last base char + marks since) can affect
+                    // this mark's composition, so compose just that —
+                    // re-composing the whole segment is quadratic.
                     let covered_here = cur.is_some_and(|i| {
                         self.fonts[i].advance_for(c, size_px).is_some()
                     });
@@ -392,8 +396,8 @@ impl FontSet {
                     }
                     if cur.is_some_and(|i| {
                         let mut scratch =
-                            String::with_capacity(b - start + c.len_utf8());
-                        scratch.push_str(&sub[start..b]);
+                            String::with_capacity(b - cluster_start + c.len_utf8());
+                        scratch.push_str(&sub[cluster_start..b]);
                         scratch.push(c);
                         let comp = nfc_str(&scratch);
                         comp != scratch
@@ -410,6 +414,7 @@ impl FontSet {
                         continue;
                     }
                 }
+                cluster_start = b;
                 let fi = self.font_index_for(c, size_px);
                 if !started {
                     cur = fi;
