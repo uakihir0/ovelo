@@ -211,14 +211,23 @@ fn run_app(store: &InstallStore, package: &str) -> Result<(), OveloError> {
     println!("ready   {}", disp(&rec.app.package));
     println!("activity {}", disp(&launcher));
     println!("dexes   {} verified", dexes.len());
-    // The host window + interpreter pipeline is the next milestone; report
-    // rather than fake success.
-    Err(OveloError::new(
-        ErrorCategory::ServiceMissing,
-        Phase::Service,
-        "cli.run.pipeline",
-    )
-    .with_detail("launch pipeline not wired yet"))
+
+    // Launch pipeline: Context → Activity lifecycle → Presenter → window.
+    // The activity's DEX isn't dispatched yet (dexrt ↔ framework bridge is
+    // the next milestone) but the whole host path runs for real.
+    let data_dir = store.app_dir(&rec.app).join("data");
+    let _ctx = ovelo_framework::Context::new(rec.app.package.clone(), data_dir);
+    let mut activity = ovelo_framework::Activity::new();
+    activity
+        .launch()
+        .map_err(|e| OveloError::new(ErrorCategory::ServiceMissing, Phase::Service, "cli.run.lifecycle").with_detail(e.to_string()))?;
+    while let Some(cb) = activity.delivered() {
+        println!("callback {}", cb);
+    }
+    let mut presenter = ovelo_host::Presenter::new();
+    let sid = presenter.attach(3, 720, 1280)?;
+    let win = ovelo_host::HostWindow::new(&disp(&rec.app.package), sid, presenter);
+    ovelo_host::run(win)
 }
 
 fn cmd() -> Result<(), OveloError> {

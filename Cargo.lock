@@ -1438,6 +1438,8 @@ dependencies = [
  "ovelo-apk",
  "ovelo-dex",
  "ovelo-error",
+ "ovelo-framework",
+ "ovelo-host",
 ]
 
 [[package]]

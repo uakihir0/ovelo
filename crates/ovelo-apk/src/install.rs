@@ -197,7 +197,9 @@ impl InstallStore {
         &self.root
     }
 
-    fn app_dir(&self, app: &AppId) -> PathBuf {
+    /// The app's directory in the store (`apps/<pkg>@<signer>`): its
+    /// `data/` subtree is the runtime data dir.
+    pub fn app_dir(&self, app: &AppId) -> PathBuf {
         self.root.join("apps").join(app.dir_name())
     }
 }
