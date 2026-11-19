@@ -57,6 +57,8 @@ const KNOWN_ABIS: &[&str] = &[
     "x86",
     "x86-64",
     "riscv64",
+    // Fat split carrying every ABI — acts as the fallback candidate.
+    "universal",
 ];
 
 const DENSITY_BUCKETS: &[(&str, u32)] = &[
@@ -228,15 +230,19 @@ pub fn resolve_splits<'m>(members: &'m [SplitMember], profile: &DeviceProfile) -
         match &m.kind {
             SplitKind::Base | SplitKind::Feature(_) => picked.push(m),
             SplitKind::Abi(a) => {
+                // `universal` ranks after every listed ABI but still
+                // serves as the fallback when nothing specific matches.
+                let rank = |s: &SplitMember| {
+                    let SplitKind::Abi(n) = &s.kind else { return usize::MAX };
+                    profile
+                        .abis
+                        .iter()
+                        .position(|p| p == n)
+                        .unwrap_or(if n == "universal" { profile.abis.len() } else { usize::MAX })
+                };
                 let better = match abi {
-                    None => profile.abis.contains(a),
-                    Some(cur) => {
-                        let rank = |s: &SplitMember| {
-                            let SplitKind::Abi(n) = &s.kind else { return usize::MAX };
-                            profile.abis.iter().position(|p| p == n).unwrap_or(usize::MAX)
-                        };
-                        rank(m) < rank(cur)
-                    }
+                    None => rank(m) != usize::MAX,
+                    Some(cur) => rank(m) < rank(cur),
                 };
                 if better {
                     abi = Some(m);
@@ -427,5 +433,34 @@ mod tests {
             .collect();
         assert!(names.contains(&"config.en"));
         assert!(!names.contains(&"config.en-rGB"));
+    }
+
+    #[test]
+    fn universal_abi_is_the_fallback_candidate() {
+        let set = vec![
+            inp("base.apk", None, "com.a", 1, "s"),
+            inp("uni.apk", Some("config.universal"), "com.a", 1, "s"),
+        ];
+        let members = validate_split_set(&set).unwrap();
+        // Explicitly listed.
+        let p = DeviceProfile {
+            abis: vec!["universal".into()],
+            ..Default::default()
+        };
+        let names: Vec<&str> = resolve_splits(&members, &p)
+            .iter()
+            .map(|m| m.name.as_str())
+            .collect();
+        assert!(names.contains(&"config.universal"));
+        // Also picked when no specific ABI matches.
+        let p2 = DeviceProfile {
+            abis: vec!["mips".into()],
+            ..Default::default()
+        };
+        let names: Vec<&str> = resolve_splits(&members, &p2)
+            .iter()
+            .map(|m| m.name.as_str())
+            .collect();
+        assert!(names.contains(&"config.universal"));
     }
 }
