@@ -739,7 +739,11 @@ impl Vm {
                 let v = Self::i32v(r(0)?)?;
                 let toff = ins.target.ok_or_else(|| E::Vm(err("dexrt.branch")))? as usize;
                 let tgt = self.switch_target(&fr.table, toff, v, op == 0x2b)?;
-                return Ok(Out::Next(tgt.map(|t| t as usize).unwrap_or(next)));
+                // Payload targets are relative to the switch insn's offset.
+                return Ok(Out::Next(
+                    tgt.map(|t| (pc as i64 + t as i64) as usize)
+                        .unwrap_or(next),
+                ));
             }
             0x2d..=0x30 => {
                 let (a, b): (f64, f64) = if op >= 0x2f {
@@ -1889,5 +1893,33 @@ mod tests {
         }
         let mut v = vm(b);
         assert_eq!(v.run("LT;", "len", &[]).unwrap(), Some(V::I32(5)));
+    }
+
+    #[test]
+    fn packed_switch_jumps_to_case() {
+        // v0=1; packed-switch v0 -> case key 1 returns 20.
+        // Layout: [0] const/4 v0,1 ; [1..3] packed-switch +8 ;
+        // [4] case0: const/4 v1,10 ; [5] return v1 ;
+        // [6..8] case1: const/16 v1,20 ; return v1 ;
+        // [9..] payload: ident, size=2, first_key=0, targets rel. to switch
+        //       (case0 abs 4 -> +3, case1 abs 6 -> +5)
+        let c = cls(
+            "LT;",
+            vec![dir("f", 0, vec![
+                0x1012,                 // const/4 v0,1
+                0x002b, 0x0008, 0x0000, // packed-switch v0,+8 -> @9
+                0xa112,                 // const/4 v1,10
+                0x010f,                 // return v1
+                0x0113, 0x0014,         // const/16 v1,20
+                0x010f,                 // return v1
+                0x0100, 0x0002,         // payload: packed, size 2
+                0x0000, 0x0000,         // first_key = 0
+                0x0003, 0x0000,         // target[0] = +3 -> @4
+                0x0005, 0x0000,         // target[1] = +5 -> @6
+            ])],
+        );
+        let (b, _ix) = build(&[c]);
+        let mut v = vm(b);
+        assert_eq!(v.run("LT;", "f", &[]).unwrap(), Some(V::I32(20)));
     }
 }
