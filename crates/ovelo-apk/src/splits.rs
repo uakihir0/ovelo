@@ -102,8 +102,14 @@ pub fn split_kind(split: Option<&str>) -> SplitKind {
             return SplitKind::Locale(cfg.to_string());
         }
     }
-    // Unknown hyphenated names default to ABI (locale regions are
-    // covered by `-r` above); bare words are locale tags.
+    // Underscore/hyphen locales without the `r` prefix (`en_US`, `en-US`)
+    // still read as language tags: an all-alpha first segment wins.
+    if let Some(first) = norm.split('-').next() {
+        if norm.contains('-') && first.chars().all(|c| c.is_ascii_alphabetic()) {
+            return SplitKind::Locale(cfg.to_string());
+        }
+    }
+    // Remaining hyphenated names default to ABI; bare words are locales.
     if norm.contains('-') {
         return SplitKind::Abi(norm);
     }
@@ -347,6 +353,7 @@ mod tests {
         assert_eq!(split_kind(Some("config.arm64_v8a")), SplitKind::Abi("arm64-v8a".into()));
         assert_eq!(split_kind(Some("config.420dpi")), SplitKind::Density(420));
         assert_eq!(split_kind(Some("config.en-rUS")), SplitKind::Locale("en-rUS".into()));
+        assert_eq!(split_kind(Some("config.en_US")), SplitKind::Locale("en_US".into()));
         assert_eq!(split_kind(Some("feature_x")), SplitKind::Feature("feature_x".into()));
     }
 
