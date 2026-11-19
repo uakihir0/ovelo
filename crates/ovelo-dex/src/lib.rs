@@ -594,9 +594,6 @@ impl DexFile {
             .filter(|i| !i.is_payload())
             .map(|i| i.offset)
             .collect();
-        // All decoded block starts + the method-end sentinel: legal try edges.
-        let mut boundaries: HashSet<u32> = decoded.iter().map(|i| i.offset).collect();
-        boundaries.insert(insns_len); // end-of-method is a legal try boundary
 
         for i in &decoded {
             if i.is_payload() {
@@ -642,10 +639,11 @@ impl DexFile {
 
         for t in &code.tries {
             let end = t.start_addr + t.insn_count as u32;
+            // The try range is [start, end): only start must be an instruction
+            // boundary; end is exclusive and may fall mid-instruction.
             if t.insn_count == 0
                 || !exec_starts.contains(&t.start_addr)
                 || end > insns_len
-                || !boundaries.contains(&end)
             {
                 return Err(err("dex.try.bounds"));
             }
