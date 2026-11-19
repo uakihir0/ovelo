@@ -95,7 +95,7 @@ impl Vm {
     /// surfaces as `dexrt.exception.uncaught`.
     pub fn run(&mut self, class_desc: &str, name: &str, args: &[V]) -> Result<Option<V>> {
         let midx = self
-            .find_method_by_name(class_desc, name)?
+            .find_method_by_name(class_desc, name, args.len())?
             .ok_or_else(|| errd("dexrt.method.missing", format!("{class_desc}.{name}")))?;
         match self.invoke(midx, args.to_vec(), InvokeKind::Static) {
             Ok(v) => Ok(v),
@@ -130,7 +130,7 @@ impl Vm {
             class_idx: ty,
             fields: HashMap::new(),
         });
-        if let Some(midx) = self.find_method_by_name(class_desc, "<init>")? {
+        if let Some(midx) = self.find_method_by_name(class_desc, "<init>", 0)? {
             match self.invoke(midx, vec![V::Ref(h)], InvokeKind::Direct) {
                 Ok(_) => {}
                 Err(E::Vm(e)) => return Err(e),
@@ -152,7 +152,7 @@ impl Vm {
             .class_of(this)
             .ok_or_else(|| errd("dexrt.bad_this", name.to_string()))?;
         let desc = self.dex.type_descriptor(ci)?;
-        let Some(midx) = self.find_method_by_name(&desc, name)? else {
+        let Some(midx) = self.find_method_by_name(&desc, name, args.len())? else {
             return Ok(None);
         };
         let mut a = Vec::with_capacity(args.len() + 1);
@@ -177,7 +177,15 @@ impl Vm {
         }
     }
 
-    fn find_method_by_name(&self, class_desc: &str, name: &str) -> Result<Option<u32>> {
+    /// First method `name` on `class_desc` taking exactly `nparams`
+    /// declared parameters — overloads differ by arity for the lifecycle
+    /// bridge's purposes (proto-precise matching can layer on later).
+    fn find_method_by_name(
+        &self,
+        class_desc: &str,
+        name: &str,
+        nparams: usize,
+    ) -> Result<Option<u32>> {
         for (i, def) in self.dex.class_defs().iter().enumerate() {
             let _ = i;
             if self.dex.type_descriptor(def.class_idx)? != class_desc {
@@ -186,7 +194,9 @@ impl Vm {
             let cd = self.dex.class_data(def)?;
             for m in cd.direct_methods.iter().chain(cd.virtual_methods.iter()) {
                 let mid = self.dex.method(m.method_idx)?;
-                if self.dex.string(mid.name_idx)? == name {
+                if self.dex.string(mid.name_idx)? == name
+                    && self.dex.proto_params(self.dex.proto(mid.proto_idx as u32)?)?.len() == nparams
+                {
                     return Ok(Some(m.method_idx));
                 }
             }

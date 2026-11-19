@@ -83,11 +83,17 @@ impl Heap {
 
     /// Borrow an object by handle.
     pub fn get(&self, h: u32) -> Option<&Obj> {
+        if h == 0 {
+            return None; // null is not a heap slot
+        }
         self.objs.get(h as usize - 1).and_then(|o| o.as_ref())
     }
 
     /// Borrow mutably.
     pub fn get_mut(&mut self, h: u32) -> Option<&mut Obj> {
+        if h == 0 {
+            return None;
+        }
         self.objs
             .get_mut(h as usize - 1)
             .and_then(|o| o.as_mut())
