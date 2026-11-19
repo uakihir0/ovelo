@@ -24,6 +24,7 @@ mod frame;
 mod ime;
 mod input;
 mod launch;
+pub mod present;
 mod window;
 
 pub use frame::{ColorSpace, Frame, SurfaceRegistry};

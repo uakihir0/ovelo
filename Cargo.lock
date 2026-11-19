@@ -1321,6 +1321,7 @@ name = "ovelo-host"
 version = "0.1.0"
 dependencies = [
  "ovelo-error",
+ "ovelo-ui",
  "winit",
 ]
 
