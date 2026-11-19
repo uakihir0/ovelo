@@ -11,6 +11,8 @@ ttf-parser = "0.25"
 rustybuzz = "0.20"
 unicode-linebreak = "0.1"
 unicode-bidi = "0.3"
+unicode-normalization = "0.1"
+fontdue = "0.9.5"
 
 [lints]
 workspace = true

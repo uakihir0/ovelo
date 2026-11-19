@@ -273,8 +273,64 @@ fn run_app(store: &InstallStore, package: &str) -> Result<(), OveloError> {
     let mut presenter = ovelo_host::Presenter::new();
     let sid = presenter.attach(3, 720, 1280)?;
     let win = ovelo_host::HostWindow::new(&disp(&rec.app.package), sid, presenter);
-    // The dexrt↔framework dispatch drains its queue through this hook.
-    ovelo_host::run(win, |_| {})
+    // ViewRootImpl drives the tree: each vsync beat renders dirty views
+    // into the surface the presenter then displays.
+    let mut fonts = ovelo_ui::FontSet::new();
+    fonts.load_dirs(&["/System/Library/Fonts", "/System/Library/Fonts/Supplemental"]);
+    let fonts = std::rc::Rc::new(fonts);
+    let mut root = ovelo_framework::ViewRootImpl::new(720, 1280, fonts.clone());
+    let mut col = ovelo_framework::ViewGroup::new(
+        ovelo_framework::Length::MatchParent,
+        ovelo_framework::Length::WrapContent,
+    );
+    let mut title = ovelo_framework::TextView::new(
+        rec.app.package.clone(),
+        24.0,
+        ovelo_ui::Color::srgb(0x20, 0x20, 0x20),
+        fonts.clone(),
+    );
+    title.padding = 16;
+    col.children.push(Box::new(title));
+    // Demo button exercises the tap path: click → label updates → dirty →
+    // the next traversal redraws.
+    let taps = std::rc::Rc::new(std::cell::Cell::new(0u32));
+    let mut ok = ovelo_framework::Button::new(
+        "Tap me",
+        18.0,
+        ovelo_ui::Color::srgb(0x30, 0x30, 0x30),
+        fonts.clone(),
+    );
+    let taps2 = taps.clone();
+    ok.on_click = Some(Box::new(move || {
+        taps2.set(taps2.get() + 1);
+    }));
+    col.children.push(Box::new(ok));
+    root.set_content_view(Box::new(col));
+    ovelo_host::run(win, move |w| {
+        for ev in w.take_input() {
+            let Some(pt) = ev.pointers.get(ev.action_index) else {
+                continue;
+            };
+            match ev.action {
+                ovelo_host::MotionAction::Down => {
+                    root.dispatch_touch(true, pt.x as i32, pt.y as i32);
+                }
+                ovelo_host::MotionAction::Up => {
+                    root.dispatch_touch(false, pt.x as i32, pt.y as i32);
+                }
+                _ => {}
+            }
+        }
+        if let Ok(prod) = w.presenter().producer(sid) {
+            // Track window resizes: the buffer queue follows the new size
+            // and the root re-lays out on the next traversal.
+            let (bw, bh) = (prod.queue().width() as i32, prod.queue().height() as i32);
+            if (bw, bh) != (root.w, root.h) {
+                root.resize(bw, bh);
+            }
+            let _ = root.perform_traversals(prod);
+        }
+    })
 }
 
 fn cmd() -> Result<(), OveloError> {

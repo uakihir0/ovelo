@@ -10,12 +10,15 @@
 use std::num::NonZeroU32;
 use std::rc::Rc;
 
+use std::collections::VecDeque;
+
 use ovelo_error::{ErrorCategory, OveloError, Phase, Result};
 use winit::application::ApplicationHandler;
-use winit::event::WindowEvent;
+use winit::event::{ElementState, MouseButton, WindowEvent};
 use winit::event_loop::{ActiveEventLoop, EventLoop};
 use winit::window::{Window, WindowId};
 
+use crate::input::{MotionAction, MotionEvent, PointerState};
 use crate::present::Presenter;
 
 fn err(cause: &str) -> OveloError {
@@ -30,8 +33,9 @@ fn to_sb(px: &[u8], out: &mut [u32]) {
     }
 }
 
-/// Per-beat driver hook type ([`run`] installs one).
-type VsyncHook = Box<dyn FnMut(&mut Presenter)>;
+/// Per-beat driver hook type ([`run`] installs one): the whole window is
+/// passed so the driver can both feed the presenter and drain input.
+type VsyncHook = Box<dyn FnMut(&mut HostWindow)>;
 
 /// One app window pumping a [`Presenter`] surface to the screen.
 pub struct HostWindow {
@@ -43,6 +47,12 @@ pub struct HostWindow {
     sb_surf: Option<softbuffer::Surface<Rc<Window>, Rc<Window>>>,
     /// Per-beat driver hook (set by [`run`]).
     vsync_hook: Option<VsyncHook>,
+    /// Last cursor position (physical px, top-left origin).
+    cursor: (f64, f64),
+    /// Translated motion events waiting for the driver.
+    input_q: VecDeque<MotionEvent>,
+    /// Whether the primary pointer is currently down.
+    pointer_down: bool,
 }
 
 impl HostWindow {
@@ -56,12 +66,35 @@ impl HostWindow {
             sb_ctx: None,
             sb_surf: None,
             vsync_hook: None,
+            cursor: (0.0, 0.0),
+            input_q: VecDeque::new(),
+            pointer_down: false,
         }
     }
 
     /// The presenter (guest producer access for tests/drivers).
     pub fn presenter(&mut self) -> &mut Presenter {
         &mut self.presenter
+    }
+
+    /// Drain queued motion events (surface px, top-left origin).
+    pub fn take_input(&mut self) -> Vec<MotionEvent> {
+        self.input_q.drain(..).collect()
+    }
+
+    /// One-pointer motion event at `cursor`.
+    fn motion(&self, action: MotionAction) -> MotionEvent {
+        MotionEvent {
+            action,
+            pointers: vec![PointerState {
+                id: 0,
+                x: self.cursor.0 as f32,
+                y: self.cursor.1 as f32,
+                pressure: if self.pointer_down { 1.0 } else { 0.0 },
+            }],
+            action_index: 0,
+            scroll: (0.0, 0.0),
+        }
     }
 }
 
@@ -88,13 +121,34 @@ impl ApplicationHandler for HostWindow {
                 let _ = self.presenter.resize(self.surface_id, w, h);
                 self.window.as_ref().unwrap().request_redraw();
             }
+            WindowEvent::CursorMoved { position, .. } => {
+                self.cursor = (position.x, position.y);
+            }
+            WindowEvent::MouseInput {
+                state: ElementState::Pressed,
+                button: MouseButton::Left,
+                ..
+            } => {
+                self.pointer_down = true;
+                self.input_q.push_back(self.motion(MotionAction::Down));
+            }
+            WindowEvent::MouseInput {
+                state: ElementState::Released,
+                button: MouseButton::Left,
+                ..
+            } => {
+                // Clear first: a released pointer reports pressure 0.
+                self.pointer_down = false;
+                self.input_q.push_back(self.motion(MotionAction::Up));
+            }
             _ => {}
         }
     }
 
     fn about_to_wait(&mut self, _el: &ActiveEventLoop) {
-        if let Some(h) = &mut self.vsync_hook {
-            h(&mut self.presenter);
+        if let Some(mut h) = self.vsync_hook.take() {
+            h(self);
+            self.vsync_hook = Some(h);
         }
         let Ok(Some(presented)) = self.presenter.display(self.surface_id) else {
             return;
@@ -114,17 +168,17 @@ impl ApplicationHandler for HostWindow {
 }
 
 /// Run the app window to completion (`EventLoop::run_app`).
-/// `on_vsync` runs each beat BEFORE display — the driver drains its
-/// frame/command channel into the presenter there (guest work is the
-/// only frame source once the loop owns the window).
-pub fn run(mut app: HostWindow, mut on_vsync: impl FnMut(&mut Presenter) + 'static) -> Result<()> {
+/// `on_vsync` runs each beat BEFORE display with the whole window — the
+/// driver feeds `presenter()` and drains `take_input()` there (guest
+/// work is the only frame source once the loop owns the window).
+pub fn run(mut app: HostWindow, mut on_vsync: impl FnMut(&mut HostWindow) + 'static) -> Result<()> {
     let el = EventLoop::new().map_err(|e| err("host.eventloop").with_detail(e.to_string()))?;
     // Wake at ~60Hz rather than Poll: Poll busy-loops even when the
     // queue is empty; WaitUntil sleeps between beats like a vsync.
     el.set_control_flow(winit::event_loop::ControlFlow::WaitUntil(
         std::time::Instant::now() + std::time::Duration::from_millis(16),
     ));
-    app.vsync_hook = Some(Box::new(move |p| on_vsync(p)));
+    app.vsync_hook = Some(Box::new(move |w| on_vsync(w)));
     el.run_app(&mut app)
         .map_err(|e| err("host.eventloop").with_detail(e.to_string()))
 }

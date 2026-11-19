@@ -104,6 +104,16 @@ impl Surface {
         }
     }
 
+    /// Depth of the clip stack (base level = 1).
+    pub(crate) fn clip_depth(&self) -> usize {
+        self.clips.len()
+    }
+
+    /// Drop clip levels above `depth` (clamped to the base level).
+    pub(crate) fn truncate_clips(&mut self, depth: usize) {
+        self.clips.truncate(depth.max(1));
+    }
+
     /// Premultiplied source-over at (x,y) — the only blend Android widgets use.
     fn src_over(&mut self, x: i32, y: i32, src: Color) {
         if x < 0 || y < 0 || x >= self.w as i32 || y >= self.h as i32 {
@@ -225,6 +235,26 @@ impl Surface {
             }
         }
         Ok(())
+    }
+
+    /// Blend one coverage-weighted source pixel (`src-over`, premul space).
+    /// `cov` scales `c`'s alpha (0..=255).
+    pub(crate) fn blend_pixel(&mut self, x: i32, y: i32, c: Color, cov: u8) {
+        if !self.clips.last().unwrap().contains(x, y) || cov == 0 {
+            return;
+        }
+        let i = (y as usize * self.w + x as usize) * 4;
+        let sc = [c.r, c.g, c.b, c.a];
+        let sa = (sc[3] as u32 * cov as u32 + 127) / 255;
+        if sa == 0 {
+            return;
+        }
+        let d = &mut self.px[i..i + 4];
+        let inv = 255 - sa;
+        for (k, sv) in sc.iter().enumerate() {
+            let sv = (*sv as u32 * cov as u32 + 127) / 255;
+            d[k] = (sv + d[k] as u32 * inv / 255).min(255) as u8;
+        }
     }
 
     /// Read back one pixel (for tests/diagnostics).

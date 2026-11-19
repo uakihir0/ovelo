@@ -11,6 +11,7 @@ ovelo-dex = { path = "../ovelo-dex" }
 ovelo-error = { path = "../ovelo-error" }
 ovelo-dexrt = { path = "../ovelo-dexrt" }
 ovelo-framework = { path = "../ovelo-framework" }
+ovelo-ui = { path = "../ovelo-ui" }
 ovelo-host = { path = "../ovelo-host" }
 
 [lints]

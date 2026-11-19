@@ -11,6 +11,7 @@
 //!   exact integer measurement.
 
 pub mod bufq;
+pub mod canvas;
 pub mod color;
 pub mod egl;
 pub mod vulkan;
@@ -23,6 +24,7 @@ pub use egl::{EglDisplay, EglConfig, CONFIG_RGBA8_ES2};
 pub use vulkan::{VkInstance, VkSurface, VkSwapchain};
 pub use color::Color;
 pub use font::{FontSet, GlyphSource, TtfFont};
+pub use canvas::{Canvas, Paint};
 pub use surface::{Rect, Surface};
 pub use text::{layout, Line, TextLayout, TextStyle};
 
