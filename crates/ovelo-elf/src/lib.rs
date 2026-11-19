@@ -52,7 +52,14 @@ const DT_SYMENT: i64 = 11;
 const DT_INIT: i64 = 12;
 const DT_INIT_ARRAY: i64 = 25;
 const DT_INIT_ARRAYSZ: i64 = 27;
+const DT_PLTREL: i64 = 20;
+const DT_JMPREL: i64 = 23;
+const DT_PLTRELSZ: i64 = 2;
 const DT_RELACOUNT: i64 = 0x6fff_fff9;
+const DT_ANDROID_REL: i64 = 0x6000_000d;
+const DT_ANDROID_RELA: i64 = 0x6000_000f;
+const DT_ANDROID_RELSZ: i64 = 0x6000_000e;
+const DT_ANDROID_RELASZ: i64 = 0x6000_0010;
 const DT_RELR: i64 = 36;
 const DT_RELRSZ: i64 = 35;
 const DT_RELRENT: i64 = 37;
@@ -170,7 +177,7 @@ impl<'a> ElfFile<'a> {
                     if end > data.len() as u64 {
                         return Err(err("elf.load.bounds"));
                     }
-                    if ph.align > 1 && !ph.vaddr.is_multiple_of(ph.align) || !ph.offset.is_multiple_of(ph.align) {
+                    if ph.align > 1 && ph.vaddr % ph.align != ph.offset % ph.align {
                         return Err(err("elf.load.align"));
                     }
                     phdrs.push(ph);
@@ -199,6 +206,8 @@ impl<'a> ElfFile<'a> {
         let mut symtab = (0u64, 0u64);
         let mut rela = (0u64, 0u64, 24u64);
         let mut relr = (0u64, 0u64, 8u64);
+        let mut jmprel = (0u64, 0u64);
+        let mut pltrel_is_rela = true;
         let mut needed_off = Vec::new();
         let mut init_fn = 0u64;
         let mut init_array: Option<(u64, u64)> = None;
@@ -219,6 +228,9 @@ impl<'a> ElfFile<'a> {
                 DT_RELA => rela.0 = val,
                 DT_RELASZ => rela.1 = val,
                 DT_RELAENT => rela.2 = val,
+                DT_JMPREL => jmprel.0 = val,
+                DT_PLTRELSZ => jmprel.1 = val,
+                DT_PLTREL => pltrel_is_rela = val == DT_RELA as u64,
                 DT_RELR => relr.0 = val,
                 DT_RELRSZ => relr.1 = val,
                 DT_RELRENT => relr.2 = val,
@@ -284,6 +296,31 @@ impl<'a> ElfFile<'a> {
             let roff = v2o(rela.0, rela.1)?;
             for i in 0..(rela.1 / rela.2) as usize {
                 let p = roff + i * rela.2 as usize;
+                let offset = u64at(data, p)?;
+                let info = u64at(data, p + 8)?;
+                let addend = u64at(data, p + 16)? as i64;
+                relocs.push(Reloc::rela(offset, info, addend));
+            }
+        }
+        // Packed Android relocations are a different on-disk format; reject
+        // explicitly instead of silently dropping them.
+        for i in 0..n {
+            let tag = u64at(data, dbase + i * 16)? as i64;
+            if matches!(tag, DT_ANDROID_REL | DT_ANDROID_RELA | DT_ANDROID_RELSZ | DT_ANDROID_RELASZ) {
+                return Err(err("elf.reloc.packed"));
+            }
+        }
+        // PLT relocations live in DT_JMPREL (RELA format for AArch64).
+        if jmprel.0 != 0 || jmprel.1 != 0 {
+            if !pltrel_is_rela {
+                return Err(err("elf.pltrel.format"));
+            }
+            if !jmprel.1.is_multiple_of(24) {
+                return Err(err("elf.jmprel.size"));
+            }
+            let roff = v2o(jmprel.0, jmprel.1)?;
+            for i in 0..(jmprel.1 / 24) as usize {
+                let p = roff + i * 24;
                 let offset = u64at(data, p)?;
                 let info = u64at(data, p + 8)?;
                 let addend = u64at(data, p + 16)? as i64;
@@ -392,11 +429,35 @@ pub fn symbol_count(elf: &ElfFile<'_>, strtab_vaddr: u64) -> usize {
     if elf.symtab.0 == 0 || elf.symtab.1 == 0 {
         return 0;
     }
-    if strtab_vaddr > elf.symtab.0 {
-        ((strtab_vaddr - elf.symtab.0) / elf.symtab.1) as usize
+    let symtab_off = match elf
+        .phdrs
+        .iter()
+        .find(|p| {
+            p.p_type == PT_LOAD && elf.symtab.0 >= p.vaddr && elf.symtab.0 < p.vaddr + p.filesz
+        })
+        .map(|p| (p.offset + (elf.symtab.0 - p.vaddr)) as usize)
+    {
+        Some(o) => o,
+        None => return 0,
+    };
+    // The real symbol count comes from DT_HASH/DT_GNU_HASH; when the string
+    // table follows the symbol table (the usual layout) it bounds the count.
+    // Otherwise bound by the file end so unrelated sections are never
+    // scanned as symbols.
+    let bound = if strtab_vaddr > elf.symtab.0 {
+        elf.phdrs
+            .iter()
+            .find(|p| {
+                p.p_type == PT_LOAD
+                    && strtab_vaddr >= p.vaddr
+                    && strtab_vaddr < p.vaddr + p.filesz
+            })
+            .map(|p| (p.offset + (strtab_vaddr - p.vaddr)) as usize)
+            .unwrap_or(elf.data.len())
     } else {
-        usize::MAX / 2
-    }
+        elf.data.len()
+    };
+    bound.saturating_sub(symtab_off) / elf.symtab.1 as usize
 }
 
 /// A fully loaded shared object: parsed file, mapped image and load bias.
@@ -434,21 +495,33 @@ pub fn load_chain<'a>(
     let mut order: Vec<String> = Vec::new();
     let mut loaded: std::collections::HashMap<String, LoadedSo<'a>> =
         std::collections::HashMap::new();
+    let mut parsed: std::collections::HashMap<String, ElfFile<'a>> =
+        std::collections::HashMap::new();
+    let mut visiting: std::collections::HashSet<String> =
+        std::collections::HashSet::new();
     let mut stack = vec![soname.to_string()];
-    // DFS so dependencies load before their dependents.
+    // DFS so dependencies load before their dependents; `visiting` marks the
+    // in-progress path so cyclic DT_NEEDED graphs terminate (the cycle edge
+    // is treated as already-satisfied and load order within a cycle is
+    // unspecified).
     while let Some(name) = stack.last().cloned() {
         if loaded.contains_key(&name) {
             stack.pop();
             continue;
         }
-        let bytes = *provided
-            .get(&name)
-            .ok_or_else(|| errd("elf.needed", format!("{name} not provided")))?;
-        let elf = ElfFile::parse(bytes)?;
-        // Reject unknown relocations BEFORE mapping/initializers (§05).
-        for r in &elf.relocs {
-            r.kind()?;
+        if !parsed.contains_key(&name) {
+            let bytes = *provided
+                .get(&name)
+                .ok_or_else(|| errd("elf.needed", format!("{name} not provided")))?;
+            let elf = ElfFile::parse(bytes)?;
+            // Reject unknown relocations BEFORE mapping/initializers (§05).
+            for r in &elf.relocs {
+                r.kind()?;
+            }
+            parsed.insert(name.clone(), elf);
+            visiting.insert(name.clone());
         }
+        let elf = &parsed[&name];
         let mut missing: Vec<String> = Vec::new();
         for dep in &elf.needed {
             if provided.contains_key(dep) || loaded.contains_key(dep) {
@@ -465,16 +538,22 @@ pub fn load_chain<'a>(
         let pending: Vec<String> = elf
             .needed
             .iter()
-            .filter(|d| provided.contains_key(*d) && !loaded.contains_key(*d))
+            .filter(|d| {
+                provided.contains_key(*d)
+                    && !loaded.contains_key(*d)
+                    && !visiting.contains(*d)
+            })
             .cloned()
             .collect();
         if !pending.is_empty() {
             stack.extend(pending);
             continue;
         }
+        let elf = parsed.remove(&name).unwrap();
         let so = map_one(image, name.clone(), elf, next_base, &loaded)?;
         loaded.insert(name.clone(), so);
-        order.push(name);
+        order.push(name.clone());
+        visiting.remove(&name);
         stack.pop();
     }
     Ok(order.into_iter().map(|n| loaded.remove(&n).unwrap()).collect())
@@ -842,6 +921,49 @@ mod tests {
                 "slot +{off}"
             );
         }
+    }
+
+    #[test]
+    fn cyclic_needed_terminates() {
+        let (a, ..) = build(&Spec {
+            needed: vec!["b.so".into()],
+            ..Default::default()
+        });
+        let (b2, ..) = build(&Spec {
+            needed: vec!["a.so".into()],
+            ..Default::default()
+        });
+        let mut provided = std::collections::HashMap::new();
+        provided.insert("b.so".to_string(), b2.as_slice());
+        let mut img = Image::new();
+        let mut next = 0x4000_0000;
+        let sos = load_chain(&mut img, "a.so", &a, provided, &[], &mut next).unwrap();
+        assert_eq!(sos.len(), 2); // cycle tolerated, both load
+    }
+
+    #[test]
+    fn allowlisted_libc_import_resolves_to_shim() {
+        let spec_a = |slot: u64| Spec {
+            needed: vec!["libc.so".into()],
+            syms: vec![("memcpy".into(), 0)],
+            relas: vec![(slot, 1026, 1, 0)], // JUMP_SLOT memcpy
+            ..Default::default()
+        };
+        let (_t, slot0, _i) = build(&spec_a(0));
+        let (b, ..) = build(&spec_a(slot0));
+        let mut img = Image::new();
+        let mut next = 0x4000_0000;
+        let sos = load_chain(
+            &mut img,
+            "a.so",
+            &b,
+            Default::default(),
+            &["libc.so"],
+            &mut next,
+        )
+        .unwrap();
+        let v = img.read_u64(sos[0].bias + slot0).unwrap();
+        assert_eq!(v, bionic::shim_addr("memcpy").unwrap());
     }
 
     #[test]

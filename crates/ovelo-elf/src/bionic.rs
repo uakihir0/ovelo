@@ -29,6 +29,21 @@ use std::collections::HashMap;
 /// `TLS_SLOT_ERRNO` in Bionic's TLS array.
 pub const TLS_SLOT_ERRNO: u32 = 0;
 
+/// Synthetic shim function table: allowlisted `libc.so` imports resolve to
+/// these vaddrs until real trampolines exist (§05 phase 2).
+const SHIM_BASE: u64 = 0x7f00_0000_0000;
+const SHIM_FNS: &[&str] = &[
+    "memcpy", "memmove", "memset", "strlen", "strcmp", "__errno",
+];
+
+/// Shim entry address for an exported Bionic symbol, if implemented.
+pub fn shim_addr(name: &str) -> Option<u64> {
+    SHIM_FNS
+        .iter()
+        .position(|&f| f == name)
+        .map(|i| SHIM_BASE + i as u64 * 0x10)
+}
+
 /// Per-thread Bionic state owned by the shim.
 #[derive(Default)]
 pub struct Bionic {
@@ -119,6 +134,6 @@ impl Bionic {
     /// Unknown names return `None` so the caller can raise `AbiSymbol` for
     /// imports Bionic does not yet cover.
     pub fn provides(name: &str) -> bool {
-        matches!(name, "memcpy" | "memmove" | "memset" | "strlen" | "strcmp" | "__errno")
+        SHIM_FNS.contains(&name)
     }
 }

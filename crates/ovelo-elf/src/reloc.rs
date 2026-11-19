@@ -5,7 +5,7 @@
 //! RELATIVE). `R_AARCH64_NONE`/`COPY`/`ABS64`... — anything else is rejected
 //! with `AbiSymbol` before any initializer runs (design doc §05).
 
-use crate::{errd, ElfFile, Image, LoadedSo};
+use crate::{bionic, errd, ElfFile, Image, LoadedSo, PT_LOAD};
 use ovelo_error::Result;
 
 const R_NONE: u32 = 0;
@@ -88,6 +88,21 @@ impl Reloc {
         loaded: &std::collections::HashMap<String, LoadedSo<'_>>,
         exports: &std::collections::HashMap<String, u64>,
     ) -> Result<()> {
+        // The relocation destination must lie inside this object's own
+        // PT_LOAD segments — never another object's memory (and never
+        // unmapped space); `write_raw` bypasses page perms, so the check
+        // here is the only ownership guard.
+        let in_own = elf.phdrs.iter().any(|p| {
+            p.p_type == PT_LOAD
+                && self.offset >= p.vaddr
+                && self.offset + 8 <= p.vaddr + p.memsz
+        });
+        if !in_own {
+            return Err(errd(
+                "elf.reloc.bounds",
+                format!("offset {:#x}", self.offset),
+            ));
+        }
         let slot = bias + self.offset;
         match self.kind()? {
             RelocKind::None => Ok(()),
@@ -104,6 +119,7 @@ impl Reloc {
                     .get(&name)
                     .or_else(|| loaded.values().find_map(|s| s.exports.get(&name)))
                     .copied()
+                    .or_else(|| bionic::shim_addr(&name))
                     .ok_or_else(|| errd("elf.symbol.undefined", name.clone()))?;
                 let a = if self.kind()? == RelocKind::GlobDat {
                     self.addend as u64
