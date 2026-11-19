@@ -11,6 +11,7 @@
 
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
+use std::sync::atomic::Ordering;
 use std::sync::{Arc, Mutex, OnceLock};
 
 use crate::err;
@@ -46,7 +47,11 @@ pub struct SharedPreferences {
     map: HashMap<String, PrefValue>,
     /// Staged by `apply()`; written on the next `commit()`/`sync()`.
     dirty: bool,
+    /// Per-instance id making this store's temp file name unique.
+    tmp_id: u64,
 }
+
+static TMP_SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
 impl SharedPreferences {
     /// Open (or lazily create) the store at `path`.
@@ -63,6 +68,7 @@ impl SharedPreferences {
             path,
             map,
             dirty: false,
+            tmp_id: TMP_SEQ.fetch_add(1, Ordering::Relaxed),
         }
     }
 
@@ -176,10 +182,20 @@ impl SharedPreferences {
                 err("framework.prefs.io").with_detail(e.to_string())
             })?;
         }
+        if self.map.len() > MAX_PREFS_ENTRIES {
+            return Err(err("framework.prefs.too_large"));
+        }
+        let doc = write_map(&self.map);
+        if doc.len() as u64 > MAX_PREFS_FILE {
+            return Err(err("framework.prefs.too_large"));
+        }
         // Write to a sibling temp file and rename so a failed write never
         // truncates the existing document (like AOSP's .bak handling).
+        // The temp name carries this instance's id: two stores opened on
+        // sibling paths (settings.xml vs settings.bak) would otherwise
+        // share `settings.xml.tmp` and corrupt each other's writes.
         let tmp = self.path.with_extension("xml.tmp");
-        std::fs::write(&tmp, write_map(&self.map)).map_err(|e| {
+        std::fs::write(&tmp, doc).map_err(|e| {
             err("framework.prefs.io").with_detail(e.to_string())
         })?;
         std::fs::rename(&tmp, &self.path).map_err(|e| {
