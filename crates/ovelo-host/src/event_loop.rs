@@ -25,7 +25,7 @@ fn err(cause: &str) -> OveloError {
 /// Premultiplied RGBA8 → softbuffer's `u32` pixels (alpha dropped —
 /// the window surface is opaque).
 fn to_sb(px: &[u8], out: &mut [u32]) {
-    for (d, c) in out.iter_mut().zip(px.chunks_exact(4)) {
+    for (d, c) in out.iter_mut().zip(px.as_chunks::<4>().0) {
         *d = ((c[0] as u32) << 16) | ((c[1] as u32) << 8) | c[2] as u32;
     }
 }
