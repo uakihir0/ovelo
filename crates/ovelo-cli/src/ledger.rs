@@ -35,26 +35,42 @@ pub struct LedgerRecord {
 }
 
 impl LedgerRecord {
-    /// Serialize to one JSON line (escapes kept minimal — fields are
-    /// structured values, not free text).
+    /// Serialize to one JSON line.
     pub fn to_json(&self) -> String {
         format!(
-            "{{\"fixture_sha256\":{:?},\"package\":{:?},\"version_code\":{},\"target_sdk\":{},\"signer\":{:?},\"os\":{:?},\"backend\":{:?},\"scenario\":{:?},\"result\":{:?},\"detail\":{:?},\"runtime_version\":{:?}}}",
-            self.fixture_sha256,
-            self.package,
+            "{{\"fixture_sha256\":{},\"package\":{},\"version_code\":{},\"target_sdk\":{},\"signer\":{},\"os\":{},\"backend\":{},\"scenario\":{},\"result\":{},\"detail\":{},\"runtime_version\":{}}}",
+            jesc(&self.fixture_sha256),
+            jesc(&self.package),
             self.version_code,
             self.target_sdk
                 .map(|v| v.to_string())
                 .unwrap_or_else(|| "null".into()),
-            self.signer,
-            self.os,
-            self.backend,
-            self.scenario,
-            self.result,
-            self.detail,
-            self.runtime_version,
+            jesc(&self.signer),
+            jesc(&self.os),
+            jesc(&self.backend),
+            jesc(&self.scenario),
+            jesc(&self.result),
+            jesc(&self.detail),
+            jesc(&self.runtime_version),
         )
     }
+}
+
+/// JSON string escaping — Rust's `{:?}` emits `\u{1b}` which is not
+/// valid JSON (`\u001B`), so fields are escaped explicitly.
+fn jesc(s: &str) -> String {
+    let mut o = String::with_capacity(s.len() + 2);
+    o.push('"');
+    for c in s.chars() {
+        match c {
+            '"' => o.push_str("\\\""),
+            '\\' => o.push_str("\\\\"),
+            c if (c as u32) < 0x20 => o.push_str(&format!("\\u{:04x}", c as u32)),
+            c => o.push(c),
+        }
+    }
+    o.push('"');
+    o
 }
 
 /// Append-only ledger store under the install store root.
@@ -144,6 +160,15 @@ mod tests {
         assert_eq!(body.lines().count(), 2);
         assert!(body.contains("\"scenario\":\"diagnose\""));
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn escapes_control_chars_as_valid_json() {
+        let mut r = rec();
+        r.detail = "classes\u{1b}.dex:bad".into();
+        let line = r.to_json();
+        assert!(line.contains("\\u001b"));
+        assert!(!line.contains("\\u{1b}"));
     }
 
     #[test]
