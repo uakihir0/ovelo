@@ -1,0 +1,12 @@
+[package]
+name = "ovelo-dex"
+description = "DEX format parsing and structural verification"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+ovelo-error = { path = "../ovelo-error" }
+
+[lints]
+workspace = true

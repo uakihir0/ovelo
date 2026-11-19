@@ -1,0 +1,12 @@
+[package]
+name = "ovelo-apk"
+description = "APK/ZIP inspection, binary manifest, resources.arsc, APK Signature Scheme v2/v3, install records"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+ovelo-error = { path = "../ovelo-error" }
+
+[lints]
+workspace = true

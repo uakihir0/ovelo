@@ -1,0 +1,12 @@
+[package]
+name = "ovelo-framework"
+description = "Android API surface: Activity, Context, Resources, Looper, View"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+ovelo-error = { path = "../ovelo-error" }
+
+[lints]
+workspace = true

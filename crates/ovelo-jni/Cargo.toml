@@ -1,0 +1,12 @@
+[package]
+name = "ovelo-jni"
+description = "JNIEnv bridge between the DEX runtime and native libraries"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+ovelo-error = { path = "../ovelo-error" }
+
+[lints]
+workspace = true

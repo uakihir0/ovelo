@@ -1,0 +1,12 @@
+[package]
+name = "ovelo-dexrt"
+description = "DEX interpreter: heap, frames, exceptions, statics"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+ovelo-error = { path = "../ovelo-error" }
+
+[lints]
+workspace = true

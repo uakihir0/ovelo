@@ -1,0 +1,12 @@
+[package]
+name = "ovelo-ui"
+description = "Text layout (Minikin subset) and CPU raster surface"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+ovelo-error = { path = "../ovelo-error" }
+
+[lints]
+workspace = true

@@ -1,0 +1,27 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/ovelo-error",
+    "crates/ovelo-apk",
+    "crates/ovelo-dex",
+    "crates/ovelo-dexrt",
+    "crates/ovelo-elf",
+    "crates/ovelo-jni",
+    "crates/ovelo-ui",
+    "crates/ovelo-framework",
+    "crates/ovelo-host",
+    "crates/ovelo-cli",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+license = "Apache-2.0"
+repository = "https://github.com/uakihir0/ovelo"
+
+[workspace.lints.rust]
+unsafe_code = "warn"
+missing_docs = "warn"
+
+[workspace.lints.clippy]
+all = "warn"

@@ -1,0 +1,12 @@
+[package]
+name = "ovelo-host"
+description = "macOS host: windowing, Metal presentation, input and IME"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+ovelo-error = { path = "../ovelo-error" }
+
+[lints]
+workspace = true

@@ -1,0 +1,12 @@
+[package]
+name = "ovelo-elf"
+description = "ARM64 ELF loading model, relocations, Bionic shims"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+ovelo-error = { path = "../ovelo-error" }
+
+[lints]
+workspace = true

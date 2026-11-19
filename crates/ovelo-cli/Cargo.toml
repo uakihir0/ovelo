@@ -1,0 +1,12 @@
+[package]
+name = "ovelo-cli"
+description = "ovelo CLI: inspect / install / run / diagnose and compatibility ledger"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+ovelo-error = { path = "../ovelo-error" }
+
+[lints]
+workspace = true
