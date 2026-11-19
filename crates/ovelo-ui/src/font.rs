@@ -261,7 +261,12 @@ fn is_combining(c: char) -> bool {
         | 0x05C1..=0x05C2 | 0x0610..=0x061A | 0x064B..=0x065F | 0x0670
         | 0x06D6..=0x06ED | 0x0E31 | 0x0E34..=0x0E3A | 0x0E47..=0x0E4E
         | 0x1AB0..=0x1AFF | 0x1DC0..=0x1DFF | 0x200D
-        | 0x20D0..=0x20FF | 0x3099..=0x309A | 0xFE00..=0xFE0F | 0xFE20..=0xFE2F)
+        | 0x20D0..=0x20FF | 0x3099..=0x309A | 0xFE00..=0xFE0F | 0xFE20..=0xFE2F
+        // Hangul conjoining jamo vowels and final consonants (V/T) join
+        // the leading consonant's cluster so NFC can compose the
+        // syllable — treating them as separate clusters desyncs the
+        // composed/orig char-count mapping.
+        | 0x1160..=0x11FF | 0xD7B0..=0xD7FB)
 }
 
 /// Ordered fallback font set. Lookup walks in registration order.
@@ -852,5 +857,76 @@ mod tests {
             .map(|g| g.x_adv)
             .sum();
         assert!((drawn - 13.0).abs() < 0.01);
+    }
+
+    /// Decomposed Hangul jamos compose across what plain combining-mark
+    /// clustering treats as separate clusters — the composed text is
+    /// shorter than the per-cluster NFC lengths suggest. Jamos must
+    /// cluster together so the orig→composed mapping stays aligned.
+    #[test]
+    fn hangul_jamo_clusters_compose_without_panic() {
+        struct Fake {
+            covered: &'static [char],
+        }
+        impl GlyphSource for Fake {
+            fn name(&self) -> &str {
+                "fake"
+            }
+            fn advance_for(&self, c: char, _s: f32) -> Option<f32> {
+                self.covered.contains(&c).then_some(5.0)
+            }
+            fn ascent(&self, _s: f32) -> f32 {
+                8.0
+            }
+            fn descent(&self, _s: f32) -> f32 {
+                2.0
+            }
+            fn shaped_glyphs(
+                &self,
+                text: &str,
+                _rtl: bool,
+                _s: f32,
+            ) -> Option<Vec<ShapedGlyph>> {
+                Some(
+                    text.chars()
+                        .map(|_| ShapedGlyph {
+                            bmp: GlyphBmp {
+                                xmin: 0,
+                                ymin: 0,
+                                w: 0,
+                                h: 0,
+                                cov: Vec::new(),
+                            },
+                            x_adv: 5.0,
+                            x_off: 0.0,
+                            y_off: 0.0,
+                        })
+                        .collect(),
+                )
+            }
+            fn can_shape_glyphs(&self) -> bool {
+                true
+            }
+            fn shaped_advances(&self, text: &str, _s: f32) -> Option<Vec<(usize, f32)>> {
+                Some(text.char_indices().map(|(b, _)| (b, 5.0)).collect())
+            }
+        }
+        let mut fs = FontSet::new();
+        // Covers the jamos, the composed syllables, 'e' and 'é' but
+        // not the bare mark — so the run composes.
+        fs.push(Box::new(Fake {
+            covered: &[
+                '\u{1100}', '\u{1102}', '\u{1161}', '\u{AC00}', '\u{B098}', 'e', '\u{E9}',
+            ],
+        }));
+        let text = "\u{1100}\u{1161}\u{1102}\u{1161}e\u{301}"; // 가나é decomposed
+        // Jamo pairs and e+mark each compose to one covered char;
+        // the syllable width lands on each cluster's lead jamo.
+        assert_eq!(
+            fs.char_advances(text, 16.0),
+            vec![5.0, 0.0, 5.0, 0.0, 5.0, 0.0]
+        );
+        let run = fs.shaped_run(text, 16.0).expect("run");
+        assert_eq!(run.len(), 3);
     }
 }
