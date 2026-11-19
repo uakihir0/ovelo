@@ -32,17 +32,20 @@ enum Cmd {
 
 fn parse_args(argv: &[String]) -> Result<Cmd, OveloError> {
     let sub = argv.get(1).map(|s| s.as_str()).unwrap_or("help");
-    let json = argv.iter().any(|a| a == "--json");
-    // `--` ends option parsing so `-foo.apk` filenames still work.
+    // `--` ends option parsing so `-foo.apk` filenames still work —
+    // flags after it are positional args, not options.
+    let mut json = false;
     let mut pos: Vec<&String> = Vec::new();
     let mut seen_sep = false;
     let mut unknown_flag = false;
     for a in argv.iter().skip(2) {
         if !seen_sep && a == "--" {
             seen_sep = true;
-        } else if !seen_sep && a.starts_with('-') && a != "--json" {
+        } else if !seen_sep && a == "--json" {
+            json = true;
+        } else if !seen_sep && a.starts_with('-') {
             unknown_flag = true;
-        } else if !a.starts_with('-') || seen_sep {
+        } else {
             pos.push(a);
         }
     }
