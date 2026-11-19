@@ -234,6 +234,17 @@ fn bidi_runs(text: &str) -> Vec<(std::ops::Range<usize>, bool)> {
     out
 }
 
+/// Mark/ZWJ chars that must stay in their base char's font run (the
+/// common combining blocks — enough for cluster-joined shaping).
+fn is_combining(c: char) -> bool {
+    matches!(c as u32,
+        0x0300..=0x036F | 0x0483..=0x0489 | 0x0591..=0x05BD | 0x05BF
+        | 0x05C1..=0x05C2 | 0x0610..=0x061A | 0x064B..=0x065F | 0x0670
+        | 0x06D6..=0x06ED | 0x0E31 | 0x0E34..=0x0E3A | 0x0E47..=0x0E4E
+        | 0x1AB0..=0x1AFF | 0x1DC0..=0x1DFF | 0x200D
+        | 0x20D0..=0x20FF | 0x3099..=0x309A | 0xFE00..=0xFE0F | 0xFE20..=0xFE2F)
+}
+
 /// Ordered fallback font set. Lookup walks in registration order.
 #[derive(Default)]
 pub struct FontSet {
@@ -304,27 +315,57 @@ impl FontSet {
             return None;
         }
         let mut out = Vec::new();
+        for (range, fi, rtl) in self.itemize(text, size_px) {
+            self.shape_subrun(&text[range], fi, rtl, size_px, &mut out);
+        }
+        Some(out)
+    }
+
+    /// Itemize `text` Minikin-style: bidi visual runs, each split into
+    /// maximal consecutive same-font sub-runs emitted in visual order
+    /// (reversed inside RTL runs). Combining marks stay with their base
+    /// char's font run so they keep anchor context. Returns
+    /// `(byte range in text, font index, rtl)` per sub-run.
+    fn itemize(
+        &self,
+        text: &str,
+        size_px: f32,
+    ) -> Vec<(std::ops::Range<usize>, Option<usize>, bool)> {
+        let mut out = Vec::new();
         for (run, rtl) in bidi_runs(text) {
+            let base = run.start;
             let sub = &text[run];
+            let mut segs: Vec<(std::ops::Range<usize>, Option<usize>)> = Vec::new();
             let mut start = 0usize;
             let mut cur: Option<usize> = None;
             let mut started = false;
             for (b, c) in sub.char_indices() {
+                if is_combining(c) && started {
+                    // Combining mark joins the current run regardless of
+                    // its own coverage (keeps the anchor for shaping).
+                    continue;
+                }
                 let fi = self.font_index_for(c, size_px);
                 if !started {
                     cur = fi;
                     started = true;
                 } else if fi != cur {
-                    self.shape_subrun(&sub[start..b], cur, rtl, size_px, &mut out);
+                    segs.push((start..b, cur));
                     start = b;
                     cur = fi;
                 }
             }
             if started {
-                self.shape_subrun(&sub[start..], cur, rtl, size_px, &mut out);
+                segs.push((start..sub.len(), cur));
+            }
+            if rtl {
+                segs.reverse();
+            }
+            for (r, fi) in segs {
+                out.push((base + r.start..base + r.end, fi, rtl));
             }
         }
-        Some(out)
+        out
     }
 
     /// Index of the first font covering `c`, else `None`.
@@ -351,8 +392,10 @@ impl FontSet {
             }
         }
         for c in text.chars() {
-            let bmp = fi
-                .and_then(|i| self.fonts[i].raster_for(c, size_px))
+            // Walk the whole fallback chain: the run's font may cover the
+            // char but be unable to rasterize (or shape) it.
+            let bmp = self
+                .raster(c, size_px)
                 .unwrap_or(GlyphBmp {
                     xmin: 0,
                     ymin: 0,
@@ -388,11 +431,11 @@ impl FontSet {
         (a, d)
     }
 
-    /// Per-char advances for `text`: the primary font's shaped cluster
-    /// advances where it covers the text (kerning/ligatures correct);
-    /// uncovered chars fall back per glyph. Glyphs sharing a cluster are
-    /// summed into the cluster's leading char and later members take 0 —
-    /// ligature members don't add a second width.
+    /// Per-char advances for `text`, itemized the same way
+    /// [`FontSet::shaped_run`] draws it: each bidi/font sub-run is shaped
+    /// by its own font, cluster advances land on the cluster's leading
+    /// char, other members take 0, and uncovered chars fall back per
+    /// glyph — so measured width equals drawn width.
     pub fn char_advances(&self, text: &str, size_px: f32) -> Vec<f32> {
         let mut byte_to_ci = vec![usize::MAX; text.len() + 1];
         let chars: Vec<(usize, char)> = text.char_indices().collect();
@@ -401,41 +444,48 @@ impl FontSet {
         }
         let n = chars.len();
         let mut out: Vec<Option<f32>> = vec![None; n];
-        if let Some(f0) = self.fonts.first() {
-            if let Some(glyphs) = f0.shaped_advances(text, size_px) {
-                // Sum advances per cluster leader (combining-mark clusters
-                // emit several glyphs at the same cluster byte).
-                let mut leaders: Vec<usize> = Vec::new();
-                let mut sums: std::collections::HashMap<usize, f32> =
-                    std::collections::HashMap::new();
-                for (byte, adv) in glyphs {
-                    let ci = byte_to_ci.get(byte).copied().unwrap_or(usize::MAX);
-                    if ci >= n {
-                        continue;
+        for (range, fi, _rtl) in self.itemize(text, size_px) {
+            let sub = &text[range.clone()];
+            let Some(i) = fi else { continue };
+            match self.fonts[i].shaped_advances(sub, size_px) {
+                Some(glyphs) => {
+                    let mut leaders: Vec<usize> = Vec::new();
+                    let mut sums: std::collections::HashMap<usize, f32> =
+                        std::collections::HashMap::new();
+                    for (byte, adv) in glyphs {
+                        let ci = byte_to_ci
+                            .get(range.start + byte)
+                            .copied()
+                            .unwrap_or(usize::MAX);
+                        if ci >= n {
+                            continue;
+                        }
+                        if !sums.contains_key(&ci) {
+                            leaders.push(ci);
+                        }
+                        *sums.entry(ci).or_insert(0.0) += adv;
                     }
-                    if !sums.contains_key(&ci) {
-                        leaders.push(ci);
-                    }
-                    *sums.entry(ci).or_insert(0.0) += adv;
-                }
-                leaders.sort_unstable();
-                for (k, &ci) in leaders.iter().enumerate() {
-                    // Claim the cluster only when the font really covers the
-                    // leading char — a .notdef glyph means missing → fallback.
-                    if f0.advance_for(chars[ci].1, size_px).is_none() {
-                        continue;
-                    }
-                    let end = leaders.get(k + 1).copied().unwrap_or(n);
-                    out[ci] = Some(sums[&ci]);
-                    for m in ci + 1..end {
-                        if f0.advance_for(chars[m].1, size_px).is_some() {
-                            out[m] = Some(0.0);
+                    leaders.sort_unstable();
+                    for (k, &ci) in leaders.iter().enumerate() {
+                        out[ci] = Some(sums[&ci]);
+                        let end = leaders
+                            .get(k + 1)
+                            .copied()
+                            .unwrap_or_else(|| byte_to_ci[range.end].min(n));
+                        for m in ci + 1..end {
+                            if self.fonts[i].advance_for(chars[m].1, size_px).is_some() {
+                                out[m] = Some(0.0);
+                            }
                         }
                     }
                 }
-            } else {
-                for (ci, (_, c)) in chars.iter().enumerate() {
-                    out[ci] = f0.advance_for(*c, size_px);
+                None => {
+                    for (b, c) in sub.char_indices() {
+                        let ci = byte_to_ci[range.start + b];
+                        if ci < n {
+                            out[ci] = self.fonts[i].advance_for(c, size_px);
+                        }
+                    }
                 }
             }
         }
