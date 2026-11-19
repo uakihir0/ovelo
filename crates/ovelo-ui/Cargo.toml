@@ -7,6 +7,10 @@ license.workspace = true
 
 [dependencies]
 ovelo-error = { path = "../ovelo-error" }
+ttf-parser = "0.25"
+rustybuzz = "0.20"
+unicode-linebreak = "0.1"
+unicode-bidi = "0.3"
 
 [lints]
 workspace = true
