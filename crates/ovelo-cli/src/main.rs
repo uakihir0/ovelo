@@ -17,11 +17,64 @@ fn err(cause: &str) -> OveloError {
 }
 
 /// The default install store root: `~/.ovelo/store`.
-fn default_store() -> Result<InstallStore, OveloError> {
+fn store_root() -> Result<PathBuf, OveloError> {
     let home = std::env::var_os("HOME").ok_or_else(|| err("cli.home.missing"))?;
-    InstallStore::open(PathBuf::from(home).join(".ovelo").join("store"))
+    Ok(PathBuf::from(home).join(".ovelo").join("store"))
 }
 
+fn default_store() -> Result<InstallStore, OveloError> {
+    InstallStore::open(store_root()?)
+}
+
+/// Canonical signer fingerprint for `bytes`, or `""` when unsigned
+/// (mirrors `install_apk`'s multi-signer join).
+fn apk_signer(bytes: &[u8]) -> String {
+    match ovelo_apk::verify_v2(bytes) {
+        Ok(signers) => {
+            let mut h: Vec<&str> = signers.iter().map(|s| s.cert_sha256.as_str()).collect();
+            h.sort_unstable();
+            h.join("+")
+        }
+        Err(_) => String::new(),
+    }
+}
+
+/// Append a ledger row for `info` under the default store (§14).
+fn ledger_record(
+    info: &ApkInfo,
+    signer: &str,
+    backend: &str,
+    scenario: &str,
+    result: &str,
+    detail: &str,
+    announce: bool,
+) {
+    let rec = ledger::LedgerRecord {
+        fixture_sha256: info.sha256.clone(),
+        package: info.manifest.package.clone(),
+        version_code: info.manifest.version_code,
+        target_sdk: info.manifest.target_sdk,
+        signer: signer.to_string(),
+        os: ledger::host_os(),
+        backend: backend.to_string(),
+        scenario: scenario.to_string(),
+        result: result.to_string(),
+        detail: detail.to_string(),
+        runtime_version: env!("CARGO_PKG_VERSION").to_string(),
+    };
+    match store_root().map(|r| ledger::Ledger::at(&r)).and_then(|l| {
+        l.record(&rec).map_err(|e| {
+            eprintln!("ovelo: ledger write failed: {e}");
+            e
+        })
+    }) {
+        Ok(p) if announce => println!("ledger    {}", p.display()),
+        _ => {}
+    }
+}
+
+mod gate;
+mod ledger;
 mod worker;
 
 enum Cmd {
@@ -29,6 +82,7 @@ enum Cmd {
     Install { apks: Vec<PathBuf>, json: bool },
     Run { app: String },
     Diagnose { apk: PathBuf, json: bool },
+    Gate { path: PathBuf },
     Help,
 }
 
@@ -75,6 +129,7 @@ fn parse_args(argv: &[String]) -> Result<Cmd, OveloError> {
             apk: p.into(),
             json,
         }),
+        ("gate", Some(p)) => Ok(Cmd::Gate { path: p.into() }),
         ("help", _) | ("--help", _) | ("-h", _) => Ok(Cmd::Help),
         _ => Err(err("cli.usage")),
     }
@@ -87,7 +142,8 @@ USAGE:
     ovelo install  <apk> [splits.apk ...] [--json]
                                   verify signature(s) + commit to the store
     ovelo run      <package>        launch the installed app
-    ovelo diagnose <apk>  [--json]  full compatibility report
+    ovelo diagnose <apk>  [--json]  compatibility report (+ ledger record)
+    ovelo gate     <binary|.app>    distribution gate: sign/entitlements/notarization
 ";
 
 fn read_apk(p: &Path) -> Result<Vec<u8>, OveloError> {
@@ -462,6 +518,23 @@ fn cmd() -> Result<(), OveloError> {
             Ok(())
         }
         Cmd::Run { app } => run_app(&default_store()?, &app),
+        Cmd::Gate { path } => {
+            let items = gate::evaluate(&path)?;
+            for i in &items {
+                let v = match &i.verdict {
+                    gate::Verdict::Pass => "pass".to_string(),
+                    gate::Verdict::Warn(w) => format!("warn: {w}"),
+                    gate::Verdict::Fail(f) => format!("FAIL: {f}"),
+                    gate::Verdict::Skip(s) => format!("skip: {s}"),
+                };
+                println!("gate    {:<14} {v}", i.name);
+            }
+            if gate::passed(&items) {
+                Ok(())
+            } else {
+                Err(OveloError::new(ErrorCategory::PkgInvalid, Phase::Install, "gate.failed"))
+            }
+        }
         Cmd::Diagnose { apk, json } => {
             let bytes = read_apk(&apk)?;
             let info = inspect_apk(&bytes)?;
@@ -492,6 +565,32 @@ fn cmd() -> Result<(), OveloError> {
                     );
                 }
             }
+            // §14: every diagnose appends a ledger record — pass only for
+            // this (apk sha, scenario, runtime) combination.
+            let bad: Vec<String> = dexes
+                .iter()
+                .filter(|d| !d.ok)
+                .map(|d| format!("{}:{}", d.name, d.cause))
+                .collect();
+            // A present-but-corrupt signature block is a fail: signing
+            // must *verify*, not just exist.
+            let signer = apk_signer(&bytes);
+            let (result, detail) = if bad.is_empty() && !signer.is_empty() {
+                ("pass", String::new())
+            } else if bad.is_empty() {
+                ("fail", "unsigned-or-invalid-signature".to_string())
+            } else {
+                ("fail", bad.join(", "))
+            };
+            ledger_record(
+                &info,
+                &signer,
+                "inspect-only",
+                "diagnose",
+                result,
+                &detail,
+                !json,
+            );
             Ok(())
         }
     }
