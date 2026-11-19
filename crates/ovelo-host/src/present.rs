@@ -223,7 +223,7 @@ mod tests {
             .unwrap()
             .unwrap();
         // top layer's red pixel landed at (1,1) of the 4x4 output.
-        assert_eq!(pr.frame.buffer[(1 * 4 + 1) * 4], 200);
+        assert_eq!(pr.frame.buffer[(4 + 1) * 4], 200);
     }
 
     #[test]
