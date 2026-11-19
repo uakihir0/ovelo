@@ -76,8 +76,20 @@ pub fn int_typed(d: &str) -> bool {
 /// Compiled-code cache. Owns the JIT module that backs the code pages.
 pub struct Aot {
     fns: HashMap<u32, AotFn>,
-    /// Kept alive: dropping unmaps the compiled code.
-    _module: JITModule,
+    /// Kept alive: function pointers point into its code pages.
+    /// `Option` so `Drop` can `free_memory` (a consuming call).
+    module: Option<JITModule>,
+}
+
+impl Drop for Aot {
+    fn drop(&mut self) {
+        if let Some(m) = self.module.take() {
+            #[allow(unsafe_code)]
+            unsafe {
+                m.free_memory();
+            }
+        }
+    }
 }
 
 impl Aot {
@@ -92,7 +104,7 @@ impl Aot {
         let jb = JITBuilder::with_isa(isa, cranelift_module::default_libcall_names());
         Some(Self {
             fns: HashMap::new(),
-            _module: JITModule::new(jb),
+            module: Some(JITModule::new(jb)),
         })
     }
 
@@ -102,13 +114,14 @@ impl Aot {
         if self.fns.contains_key(&midx) {
             return;
         }
-        let cfg = self._module.isa().frontend_config();
-        let mut ctx = self._module.make_context();
+        let module = self.module.as_mut().expect("jit module");
+        let cfg = module.isa().frontend_config();
+        let mut ctx = module.make_context();
         let mut fbcx = FunctionBuilderContext::new();
         let Some(func) = build_function(midx, code, &mut fbcx, cfg) else {
             return;
         };
-        let Ok(fid) = self._module.declare_function(
+        let Ok(fid) = module.declare_function(
             &format!("dex_m{midx}"),
             Linkage::Export,
             &func.signature,
@@ -116,14 +129,14 @@ impl Aot {
             return;
         };
         ctx.func = func;
-        if self._module.define_function(fid, &mut ctx).is_err() {
+        if module.define_function(fid, &mut ctx).is_err() {
             return;
         }
-        self._module.clear_context(&mut ctx);
-        if self._module.finalize_definitions().is_err() {
+        module.clear_context(&mut ctx);
+        if module.finalize_definitions().is_err() {
             return;
         }
-        let ptr = self._module.get_finalized_function(fid);
+        let ptr = module.get_finalized_function(fid);
         if !ptr.is_null() {
             self.fns.insert(
                 midx,
