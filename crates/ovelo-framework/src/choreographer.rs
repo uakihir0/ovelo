@@ -75,9 +75,6 @@ impl Choreographer {
     /// the tick wait for the next one; delayed callbacks count down.
     pub fn tick(&mut self, vsync_nanos: u64) -> Vec<(FrameCallback, u64)> {
         self.ticks += 1;
-        if self.pending.is_empty() {
-            self.frames_skipped += 1;
-        }
         self.last_vsync = vsync_nanos;
         let mut due: Vec<FrameCallback> = Vec::new();
         let mut keep: VecDeque<FrameCallback> = VecDeque::new();
@@ -93,6 +90,11 @@ impl Choreographer {
             }
         }
         self.pending = keep;
+        if due.is_empty() {
+            self.frames_skipped += 1; // consecutive vsyncs with no work
+        } else {
+            self.frames_skipped = 0;
+        }
         due.sort_by_key(|c| c.kind);
         due.into_iter().map(|c| (c, vsync_nanos)).collect()
     }
