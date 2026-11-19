@@ -61,11 +61,13 @@ impl Activity {
         self.saved_state.as_ref()
     }
 
-    /// `onSaveInstanceState` — the framework records the callback and the
-    /// driver writes the app's state into `out`.
-    pub fn save_instance_state(&mut self, out: crate::bundle::Bundle) {
+    /// `onSaveInstanceState` — the framework records the callback and hands
+    /// the app the `Bundle` it writes its state into; what the app writes
+    /// stays in `saved_state` for the next `onCreate`/`onRestoreInstanceState`.
+    pub fn save_instance_state(&mut self) -> &mut crate::bundle::Bundle {
         self.pending.push("onSaveInstanceState");
-        self.saved_state = Some(out);
+        self.saved_state = Some(crate::bundle::Bundle::new());
+        self.saved_state.as_mut().unwrap()
     }
 
     /// Current lifecycle state.
