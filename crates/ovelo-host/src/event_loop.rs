@@ -137,8 +137,9 @@ impl ApplicationHandler for HostWindow {
                 button: MouseButton::Left,
                 ..
             } => {
-                self.input_q.push_back(self.motion(MotionAction::Up));
+                // Clear first: a released pointer reports pressure 0.
                 self.pointer_down = false;
+                self.input_q.push_back(self.motion(MotionAction::Up));
             }
             _ => {}
         }
