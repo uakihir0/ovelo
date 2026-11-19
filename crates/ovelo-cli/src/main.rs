@@ -246,7 +246,9 @@ fn run_app(store: &InstallStore, package: &str) -> Result<(), OveloError> {
             .iter()
             .find(|e| e.name == "classes.dex")
             .ok_or_else(|| err("cli.dex.missing"))?;
-        ovelo_dexrt::Vm::new(DexFile::open(read_entry(&bytes, e)?)?)
+        let mut v = ovelo_dexrt::Vm::new(DexFile::open(read_entry(&bytes, e)?)?)?;
+        v.enable_aot();
+        Ok(v)
     })();
     // Guest view bridge: guest view objects (`new TextView` etc.) bind to
     // host widgets hung off this root, and onClick listeners queue back
