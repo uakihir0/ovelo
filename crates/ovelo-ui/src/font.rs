@@ -341,9 +341,16 @@ impl FontSet {
             let mut started = false;
             for (b, c) in sub.char_indices() {
                 if is_combining(c) && started {
-                    // Combining mark joins the current run regardless of
-                    // its own coverage (keeps the anchor for shaping).
-                    continue;
+                    // A mark joins the run only when the current font
+                    // covers it — or nothing does. A mark another font
+                    // covers splits off: shaped in the base font it
+                    // would rasterize as .notdef instead of its glyph.
+                    let covered_here = cur.is_some_and(|i| {
+                        self.fonts[i].advance_for(c, size_px).is_some()
+                    });
+                    if covered_here || self.font_index_for(c, size_px).is_none() {
+                        continue;
+                    }
                 }
                 let fi = self.font_index_for(c, size_px);
                 if !started {
@@ -391,7 +398,29 @@ impl FontSet {
                 return;
             }
         }
-        for c in text.chars() {
+        // Per-char fallback: borrow the font's shaped advances when it
+        // can shape but not rasterize, so drawn width still equals
+        // measured width (char_advances uses the same source).
+        let shaped: Vec<f32> = match fi
+            .and_then(|i| self.fonts[i].shaped_advances(text, size_px))
+        {
+            Some(glyphs) => {
+                let mut adv = vec![0.0f32; text.chars().count()];
+                let mut byte_to_ci = vec![usize::MAX; text.len() + 1];
+                for (ci, (b, _)) in text.char_indices().enumerate() {
+                    byte_to_ci[b] = ci;
+                }
+                for (byte, a) in glyphs {
+                    let ci = byte_to_ci.get(byte).copied().unwrap_or(usize::MAX);
+                    if ci < adv.len() {
+                        adv[ci] += a;
+                    }
+                }
+                adv
+            }
+            None => Vec::new(),
+        };
+        for (ci, c) in text.chars().enumerate() {
             // Walk the whole fallback chain: the run's font may cover the
             // char but be unable to rasterize (or shape) it.
             let bmp = self
@@ -403,9 +432,19 @@ impl FontSet {
                     h: 0,
                     cov: Vec::new(),
                 });
+            // Cluster leaders carry the summed advance; members the font
+            // covers take 0; a char the shaper dropped takes the per-char
+            // advance (what char_advances measures for it).
+            let x_adv = match shaped.get(ci).copied() {
+                Some(a) if a > 0.0 => a,
+                Some(_) if fi.is_some_and(|i| {
+                    self.fonts[i].advance_for(c, size_px).is_some()
+                }) => 0.0,
+                _ => self.advance(c, size_px),
+            };
             out.push(ShapedGlyph {
                 bmp,
-                x_adv: self.advance(c, size_px),
+                x_adv,
                 x_off: 0.0,
                 y_off: 0.0,
             });
