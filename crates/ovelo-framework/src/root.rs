@@ -59,16 +59,15 @@ impl ViewRootImpl {
         self.content.as_ref().map(|v| v.is_dirty()).unwrap_or(false)
     }
 
-    /// `dispatchTouchEvent`: a press/release at surface px. Click
-    /// listeners fire on release (`tap`), matching Android's
-    /// `View.performClick` on ACTION_UP inside the view.
+    /// `dispatchTouchEvent`: a press/release at surface px. The down
+    /// presses the clickable view under it and the up releases that same
+    /// view, firing `onClick` only when the release lands inside it —
+    /// matching Android's pressed-state model (`performClick` on
+    /// ACTION_UP), so dragging onto a button never clicks it.
     pub fn dispatch_touch(&mut self, down: bool, x: i32, y: i32) -> bool {
-        if down {
-            return true; // consumed; the tap resolves on release
-        }
         self.content
             .as_mut()
-            .map(|v| v.dispatch_tap(x, y))
+            .map(|v| v.dispatch_touch(down, x, y))
             .unwrap_or(false)
     }
 
@@ -185,7 +184,15 @@ mod tests {
         assert!(root.dispatch_touch(false, 4, 4));
         assert_eq!(hits.get(), 1);
         assert!(root.is_dirty());
-        // Tap outside → nothing.
+        // Press outside, drag onto the button, release → no click.
+        assert!(!root.dispatch_touch(true, 199, 99));
+        assert!(!root.dispatch_touch(false, 4, 4));
+        assert_eq!(hits.get(), 1);
+        // Press inside, release outside → no click, but the press was
+        // consumed and cleared (a later up is not double-consumed).
+        assert!(root.dispatch_touch(true, 4, 4));
+        assert!(root.dispatch_touch(false, 199, 99));
+        assert_eq!(hits.get(), 1);
         assert!(!root.dispatch_touch(false, 199, 99));
         assert_eq!(hits.get(), 1);
     }

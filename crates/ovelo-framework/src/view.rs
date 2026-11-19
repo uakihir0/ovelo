@@ -72,6 +72,9 @@ pub struct View {
     pub background: Option<Color>,
     /// `setOnClickListener` — fired on tap inside the laid-out rect.
     pub on_click: Option<Box<dyn FnMut()>>,
+    /// Pressed while the pointer that went down on this view is still
+    /// down; a click only fires when the release also lands inside.
+    pub pressed: bool,
     dirty: bool,
 }
 
@@ -87,6 +90,7 @@ impl View {
             top: 0,
             background: None,
             on_click: None,
+            pressed: false,
             dirty: true,
         }
     }
@@ -134,6 +138,9 @@ pub struct ViewGroup {
     pub view: View,
     /// Children in z-order (`addView`).
     pub children: Vec<Box<dyn Drawable>>,
+    /// Child that consumed the current pointer-down (for routing the
+    /// release back to the same pressed view).
+    pub pressed_child: Option<usize>,
 }
 
 impl ViewGroup {
@@ -142,6 +149,7 @@ impl ViewGroup {
         Self {
             view: View::new(lp_w, lp_h, Size::default()),
             children: Vec::new(),
+            pressed_child: None,
         }
     }
 

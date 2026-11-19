@@ -29,32 +29,54 @@ pub trait Drawable {
     fn origin(&self) -> (i32, i32);
     /// Requested layout params (for the parent's `for_child` spec).
     fn lp(&self) -> (Length, Length);
-    /// `dispatchTouchEvent` (tap): the point is in surface px; a view
-    /// inside whose rect AND with a click listener fires it and
-    /// returns true. Containers forward to children topmost-first.
-    fn dispatch_tap(&mut self, x: i32, y: i32) -> bool {
-        let _ = (x, y);
+    /// `dispatchTouchEvent` (tap): `down` presses the topmost clickable
+    /// view under the point, `!down` releases it — a click only fires
+    /// when press and release land on the same view (Android's
+    /// `performClick` on ACTION_UP inside a pressed view).
+    fn dispatch_touch(&mut self, down: bool, x: i32, y: i32) -> bool {
+        let _ = (down, x, y);
         false
     }
 }
 
-/// Fire `view.on_click` when `(x,y)` is inside the view's laid-out rect.
-fn tap_hit(view: &mut View, x: i32, y: i32) -> bool {
+/// Whether `(x,y)` is inside the view's laid-out rect.
+fn inside(view: &View, x: i32, y: i32) -> bool {
     let s = view.measured;
-    if x < view.left || x >= view.left + s.w || y < view.top || y >= view.top + s.h {
-        return false;
-    }
-    if let Some(f) = &mut view.on_click {
-        f();
-        view.invalidate();
+    x >= view.left && x < view.left + s.w && y >= view.top && y < view.top + s.h
+}
+
+/// ACTION_DOWN: mark the view pressed when it is clickable and hit.
+fn press_hit(view: &mut View, x: i32, y: i32) -> bool {
+    if inside(view, x, y) && view.on_click.is_some() {
+        view.pressed = true;
         return true;
     }
     false
 }
 
+/// ACTION_UP: a pressed view consumes the release; the click fires
+/// only when the release lands inside the same view.
+fn release_hit(view: &mut View, x: i32, y: i32) -> bool {
+    if !view.pressed {
+        return false;
+    }
+    view.pressed = false;
+    if inside(view, x, y) {
+        if let Some(f) = &mut view.on_click {
+            f();
+        }
+        view.invalidate();
+    }
+    true
+}
+
 impl Drawable for View {
-    fn dispatch_tap(&mut self, x: i32, y: i32) -> bool {
-        tap_hit(self, x, y)
+    fn dispatch_touch(&mut self, down: bool, x: i32, y: i32) -> bool {
+        if down {
+            press_hit(self, x, y)
+        } else {
+            release_hit(self, x, y)
+        }
     }
     fn measure(&mut self, w: MeasureSpec, h: MeasureSpec) -> Size {
         self.measure(w, h)
@@ -86,14 +108,24 @@ impl Drawable for View {
 }
 
 impl Drawable for ViewGroup {
-    fn dispatch_tap(&mut self, x: i32, y: i32) -> bool {
-        // Topmost first: later-drawn children get the first shot.
-        for ch in self.children.iter_mut().rev() {
-            if ch.dispatch_tap(x, y) {
-                return true;
+    fn dispatch_touch(&mut self, down: bool, x: i32, y: i32) -> bool {
+        if down {
+            // Topmost first: later-drawn children get the first shot.
+            for (i, ch) in self.children.iter_mut().enumerate().rev() {
+                if ch.dispatch_touch(true, x, y) {
+                    self.pressed_child = Some(i);
+                    return true;
+                }
             }
+            press_hit(&mut self.view, x, y)
+        } else {
+            if let Some(i) = self.pressed_child.take() {
+                if let Some(ch) = self.children.get_mut(i) {
+                    return ch.dispatch_touch(false, x, y);
+                }
+            }
+            release_hit(&mut self.view, x, y)
         }
-        tap_hit(&mut self.view, x, y)
     }
     fn measure(&mut self, w: MeasureSpec, h: MeasureSpec) -> Size {
         self.measure(w, h)
@@ -187,8 +219,12 @@ impl TextView {
 }
 
 impl Drawable for TextView {
-    fn dispatch_tap(&mut self, x: i32, y: i32) -> bool {
-        tap_hit(&mut self.view, x, y)
+    fn dispatch_touch(&mut self, down: bool, x: i32, y: i32) -> bool {
+        if down {
+            press_hit(&mut self.view, x, y)
+        } else {
+            release_hit(&mut self.view, x, y)
+        }
     }
     fn measure(&mut self, w: MeasureSpec, h: MeasureSpec) -> Size {
         let cap = match w {
@@ -276,20 +312,30 @@ impl Button {
 }
 
 impl Drawable for Button {
-    fn dispatch_tap(&mut self, x: i32, y: i32) -> bool {
-        if tap_hit(&mut self.tv.view, x, y) {
-            return true;
-        }
-        let s = self.tv.view.measured;
-        let (l, t) = (self.tv.view.left, self.tv.view.top);
-        if x >= l && x < l + s.w && y >= t && y < t + s.h {
-            if let Some(f) = &mut self.on_click {
-                f();
-                self.tv.invalidate();
+    fn dispatch_touch(&mut self, down: bool, x: i32, y: i32) -> bool {
+        if down {
+            if inside(&self.tv.view, x, y)
+                && (self.tv.view.on_click.is_some() || self.on_click.is_some())
+            {
+                self.tv.view.pressed = true;
                 return true;
             }
+            false
+        } else {
+            if !self.tv.view.pressed {
+                return false;
+            }
+            self.tv.view.pressed = false;
+            if inside(&self.tv.view, x, y) {
+                if let Some(f) = &mut self.tv.view.on_click {
+                    f();
+                } else if let Some(f) = &mut self.on_click {
+                    f();
+                }
+                self.tv.invalidate();
+            }
+            true
         }
-        false
     }
     fn measure(&mut self, w: MeasureSpec, h: MeasureSpec) -> Size {
         self.tv.measure(w, h)
