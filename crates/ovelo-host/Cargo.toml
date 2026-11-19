@@ -7,6 +7,14 @@ license.workspace = true
 
 [dependencies]
 ovelo-error = { path = "../ovelo-error" }
+# winit: mature cross-platform window/input/IME; macOS-only features are used
+# but nothing here is gated, so the crate compiles on Linux CI too.
+winit = "0.30"
+
 
 [lints]
 workspace = true
+
+[[example]]
+name = "host_window"
+path = "examples/host_window.rs"

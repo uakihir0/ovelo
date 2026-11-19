@@ -6,6 +6,7 @@ edition.workspace = true
 license.workspace = true
 
 [dependencies]
+ovelo-dex = { path = "../ovelo-dex" }
 ovelo-error = { path = "../ovelo-error" }
 
 [lints]

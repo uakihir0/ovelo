@@ -10,3 +10,7 @@ ovelo-error = { path = "../ovelo-error" }
 
 [lints]
 workspace = true
+
+[[bin]]
+name = "ovelo"
+path = "src/main.rs"
