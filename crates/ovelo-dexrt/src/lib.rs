@@ -7,9 +7,13 @@
 //! monitors are no-ops on one thread. Unimplemented opcodes stop with
 //! `DexUnsupported` — never silently.
 
+mod aot;
 mod value;
 
+pub use aot::Aot;
 pub use value::{Heap, Obj, V};
+
+use aot::{AotFn, TRAP_DIV_ZERO, TRAP_REM_ZERO};
 
 use ovelo_dex::{decode_all, ClassData, ClassDef, DexFile, EncodedMethod, Insn, TryItem};
 use ovelo_error::{ErrorCategory, OveloError, Phase, Result};
@@ -76,6 +80,8 @@ pub struct Vm {
     /// through a subclass descriptor. Only a reference whose class is
     /// the owner or a subclass of it may resolve — see `host_named`.
     hosts_named: HashMap<(String, String), Vec<(u32, HostCall)>>,
+    /// AOT-compiled method bodies (`None` until `enable_aot`).
+    aot: Option<Aot>,
 }
 
 impl Vm {
@@ -99,6 +105,7 @@ impl Vm {
             defs,
             hosts: HashMap::new(),
             hosts_named: HashMap::new(),
+            aot: None,
         })
     }
 
@@ -151,6 +158,60 @@ impl Vm {
     /// Heap borrow.
     pub fn heap(&self) -> &Heap {
         &self.heap
+    }
+
+    /// AOT-compile every eligible method to host code (design AOT:
+    /// integer/branch methods first; everything else keeps running on
+    /// the interpreter). Returns how many methods were compiled.
+    pub fn enable_aot(&mut self) -> usize {
+        let Some(mut aot) = Aot::new() else {
+            return 0;
+        };
+        let mids: Vec<u32> = self.defined.keys().copied().collect();
+        for midx in mids {
+            if !self.sig_int_typed(midx) {
+                continue;
+            }
+            let em = &self.defined[&midx].1;
+            let Ok(Some(code)) = self.dex.code_item(em.code_off) else {
+                continue;
+            };
+            aot.compile(midx, &code);
+        }
+        let n = aot.len();
+        self.aot = Some(aot);
+        n
+    }
+
+    /// How many methods were AOT-compiled (`enable_aot` return).
+    pub fn aot_len(&self) -> usize {
+        self.aot.as_ref().map_or(0, |a| a.len())
+    }
+
+    /// Signature gate for AOT: every param and the return must be
+    /// integer-typed so the i64-slot ABI matches `V`.
+    fn sig_int_typed(&self, midx: u32) -> bool {
+        let Ok(mid) = self.dex.method(midx) else {
+            return false;
+        };
+        let Ok(p) = self.dex.proto(mid.proto_idx as u32) else {
+            return false;
+        };
+        let Ok(ret) = self.dex.type_descriptor(p.return_type_idx) else {
+            return false;
+        };
+        if !aot::int_typed(&ret) {
+            return false;
+        }
+        let Ok(params) = self.dex.proto_params(p) else {
+            return false;
+        };
+        params.iter().all(|t| {
+            self.dex
+                .type_descriptor(*t as u32)
+                .map(|d| aot::int_typed(&d))
+                .unwrap_or(false)
+        })
     }
 
     /// Entry point: invoke `<class>.<method>(args)` as a static call.
@@ -684,7 +745,70 @@ impl Vm {
         if matches!(kind, InvokeKind::Static) {
             self.ensure_init(loc.class_idx)?;
         }
+        if let Some(f) = self
+            .aot
+            .as_ref()
+            .and_then(|a| a.get(loc.em.method_idx))
+        {
+            return self.run_native(f, loc.em.method_idx, loc.em.code_off, args);
+        }
         self.exec(loc, args)
+    }
+
+    /// Run a compiled method under the shared register/ABI contract
+    /// (see `aot` module docs). A `TRAP_DIV_ZERO` flag becomes the same
+    /// `ArithmeticException` the interpreter raises.
+    fn run_native(&mut self, f: AotFn, midx: u32, code_off: u32, args: Vec<V>) -> Rt<Option<V>> {
+        let code = self
+            .dex
+            .code_item(code_off)
+            .map_err(E::Vm)?
+            .ok_or_else(|| E::Vm(err("dexrt.method.no_code")))?;
+        let nregs = code.registers_size as usize;
+        let start = nregs.saturating_sub(code.ins_size as usize);
+        let mut regs = vec![0i64; nregs];
+        for (i, a) in args.iter().enumerate() {
+            if start + i >= nregs {
+                break;
+            }
+            regs[start + i] = match a {
+                V::I32(v) => *v as i64,
+                V::I64(v) => *v,
+                V::F32(v) => v.to_bits() as i64,
+                V::F64(v) => v.to_bits() as i64,
+                V::Ref(h) => *h as i64,
+            };
+        }
+        let mut trap: u8 = 0;
+        #[allow(unsafe_code)]
+        let ret = unsafe { f(regs.as_mut_ptr(), &mut trap) };
+        match trap {
+            TRAP_DIV_ZERO => {
+                return Err(self.throw_builtin(
+                    "Ljava/lang/ArithmeticException;",
+                    "divide by zero",
+                ));
+            }
+            TRAP_REM_ZERO => {
+                return Err(self.throw_builtin(
+                    "Ljava/lang/ArithmeticException;",
+                    "rem by zero",
+                ));
+            }
+            _ => {}
+        }
+        let ret_desc = self
+            .dex
+            .method(midx)
+            .ok()
+            .and_then(|m| self.dex.proto(m.proto_idx as u32).ok().map(|p| p.return_type_idx))
+            .and_then(|t| self.dex.type_descriptor(t).ok())
+            .unwrap_or_else(|| "V".into());
+        Ok(match ret_desc.as_str() {
+            "V" => None,
+            "J" => Some(V::I64(ret)),
+            _ => Some(V::I32(ret as i32)),
+        })
     }
 
     /// Execute one frame to return or throw.
@@ -1822,5 +1946,169 @@ mod tests {
         let (b, _ix) = build(&[c]);
         let mut v = vm(b);
         assert_eq!(v.run("LT;", "f", &[]).unwrap(), Some(V::I32(20)));
+    }
+
+    // AOT: values and exception behavior must match the interpreter
+    // (design: run Android ref → interpreter → AOT, results identical).
+
+    #[test]
+    fn aot_branch_and_loop_match_interp() {
+        // select(a,b) = a>=b ? a : b — one conditional branch.
+        //   [0..1] if-ge v0,v1,+3 ; [2] move v0,v1 ; [3] return v0
+        let select = M {
+            name: "select",
+            ret: "I",
+            params: &["I", "I"],
+            is_virtual: false,
+            regs: 2,
+            ins: 2,
+            outs: 0,
+            insns: vec![
+                0x1035, 0x0003, // if-ge v0,v1,+3
+                0x1001, // move v0,v1
+                0x000f, // return v0
+            ],
+            tries: vec![],
+            lits: &[],
+        };
+        // sum(n) = 0+1+..+n-1 — backward-branch loop.
+        //   [0] sum=0 [1] i=0 [2..3] if-ge i,n,+6
+        //   [4] sum+=i [5..6] i+=1 [7] goto -5 [8] return sum
+        let sum = M {
+            name: "sum",
+            ret: "I",
+            params: &["I"],
+            is_virtual: false,
+            regs: 4,
+            ins: 1,
+            outs: 0,
+            insns: vec![
+                0x0012, // const/4 v0,0
+                0x0112, // const/4 v1,0
+                0x3135, 0x0006, // if-ge v1,v3,+6
+                0x10b0, // add-int/2addr v0,v1
+                0x01d8, 0x0101, // add-int/lit8 v1,v1,+1
+                0xfb28, // goto -5
+                0x000f, // return v0
+            ],
+            tries: vec![],
+            lits: &[],
+        };
+        let (b, _ix) = build(&[cls("LT;", vec![select, sum])]);
+        let mut v = vm(b);
+        let interp_sel = v.run("LT;", "select", &[V::I32(3), V::I32(9)]).unwrap();
+        let interp_sum = v.run("LT;", "sum", &[V::I32(5)]).unwrap();
+        assert_eq!(interp_sel, Some(V::I32(9)));
+        assert_eq!(interp_sum, Some(V::I32(10)));
+
+        assert!(v.enable_aot() >= 2);
+        assert_eq!(
+            v.run("LT;", "select", &[V::I32(3), V::I32(9)]).unwrap(),
+            interp_sel
+        );
+        assert_eq!(
+            v.run("LT;", "select", &[V::I32(9), V::I32(3)]).unwrap(),
+            Some(V::I32(9))
+        );
+        assert_eq!(v.run("LT;", "sum", &[V::I32(5)]).unwrap(), interp_sum);
+        assert_eq!(v.run("LT;", "sum", &[V::I32(0)]).unwrap(), Some(V::I32(0)));
+        assert_eq!(
+            v.run("LT;", "sum", &[V::I32(100)]).unwrap(),
+            Some(V::I32(4950))
+        );
+    }
+
+    #[test]
+    fn aot_div_by_zero_throws_like_interp() {
+        // f() = 5/0 — uncaught div by zero in both engines.
+        let m = M {
+            name: "f",
+            ret: "I",
+            params: &[],
+            is_virtual: false,
+            regs: 2,
+            ins: 0,
+            outs: 0,
+            insns: vec![
+                0x5012, // const/4 v0,5
+                0x0112, // const/4 v1,0
+                0x0093, 0x0100, // div-int v0,v0,v1
+                0x000f, // return v0
+            ],
+            tries: vec![],
+            lits: &[],
+        };
+        let (b, _ix) = build(&[cls("LT;", vec![m])]);
+        let mut v = vm(b);
+        let interp_err = v.run("LT;", "f", &[]).unwrap_err().to_string();
+        assert!(interp_err.contains("ArithmeticException"));
+
+        assert_eq!(v.enable_aot(), 1);
+        let aot_err = v.run("LT;", "f", &[]).unwrap_err().to_string();
+        assert_eq!(aot_err, interp_err);
+    }
+
+    #[test]
+    fn aot_int_min_div_neg_one_wraps() {
+        // i32::MIN / -1 and i32::MIN % -1 must wrap like the interpreter
+        // (MIN and 0), not trap the host process.
+        let div = M {
+            name: "d",
+            ret: "I",
+            params: &["I", "I"],
+            is_virtual: false,
+            regs: 2,
+            ins: 2,
+            outs: 0,
+            insns: vec![0x0093, 0x0100, 0x000f], // div-int v0,v0,v1
+            tries: vec![],
+            lits: &[],
+        };
+        let rem = M {
+            name: "r",
+            ret: "I",
+            params: &["I", "I"],
+            is_virtual: false,
+            regs: 2,
+            ins: 2,
+            outs: 0,
+            insns: vec![0x0094, 0x0100, 0x000f], // rem-int v0,v0,v1
+            tries: vec![],
+            lits: &[],
+        };
+        let (b, _ix) = build(&[cls("LT;", vec![div, rem])]);
+        let mut v = vm(b);
+        let args = &[V::I32(i32::MIN), V::I32(-1)];
+        let interp_d = v.run("LT;", "d", args).unwrap();
+        let interp_r = v.run("LT;", "r", args).unwrap();
+        assert_eq!(v.enable_aot(), 2);
+        assert_eq!(v.run("LT;", "d", args).unwrap(), interp_d);
+        assert_eq!(v.run("LT;", "r", args).unwrap(), interp_r);
+        // rem-by-zero keeps the interpreter's distinct message.
+        let interp_e = v
+            .run("LT;", "r", &[V::I32(1), V::I32(0)])
+            .unwrap_err()
+            .to_string();
+        assert!(interp_e.contains("rem by zero"));
+    }
+
+    #[test]
+    fn aot_rejected_methods_stay_interpreted() {
+        // try/catch (non-empty tries) is outside the compile whitelist:
+        // enable_aot must leave it to the interpreter, which still runs
+        // the handler.
+        let mut m = dir("f", 0, vec![
+            0x0012, // const/4 v0,0
+            0x0093, 0x0000, // div-int v0,v0,v0
+            0x000f, // return v0
+            0x020d, // move-exception v2
+            0xf112, // const/4 v1,-1
+            0x010f, // return v1
+        ]);
+        m.tries = vec![(1, 2, vec![], Some(4))];
+        let (b, _ix) = build(&[cls("LT;", vec![m])]);
+        let mut v = vm(b);
+        assert_eq!(v.enable_aot(), 0);
+        assert_eq!(v.run("LT;", "f", &[]).unwrap(), Some(V::I32(-1)));
     }
 }
