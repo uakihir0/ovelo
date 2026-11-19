@@ -275,10 +275,20 @@ fn check_notarization(path: &Path) -> GateItem {
 }
 
 /// `codesign -dv` stderr carries `flags=0x10000(runtime)` for hardened
-/// runtime builds.
-fn hardened_runtime(flags_line: &str) -> bool {
-    // flags print like '0x10000(runtime)' or '0x10002(kill,runtime)'.
-    flags_line.contains("runtime")
+/// runtime builds — on a `CodeDirectory` line, so match the flag list
+/// itself: an `Executable=` path containing "runtime" is not a flag.
+fn hardened_runtime(dv_output: &str) -> bool {
+    dv_output.lines().any(|line| {
+        let Some(pos) = line.find("flags=") else {
+            return false;
+        };
+        let rest = line[pos + "flags=".len()..]
+            .trim_start_matches(|c: char| c.is_ascii_hexdigit() || c == 'x');
+        let Some(inner) = rest.strip_prefix('(').and_then(|r| r.split(')').next()) else {
+            return false;
+        };
+        inner.split(',').any(|f| f.trim() == "runtime")
+    })
 }
 
 /// Pull entitlement keys out of a `codesign --entitlements` plist body.
@@ -303,8 +313,14 @@ mod tests {
     fn parses_hardened_runtime_flag() {
         assert!(hardened_runtime("flags=0x10000(runtime)"));
         assert!(hardened_runtime("flags=0x10002(kill,runtime)"));
+        assert!(hardened_runtime(
+            "CodeDirectory v=20500 size=123 flags=0x10002(kill,runtime) hashes=4"
+        ));
         assert!(!hardened_runtime("flags=0x0(none)"));
         assert!(!hardened_runtime(""));
+        assert!(!hardened_runtime(
+            "Executable=/tmp/runtime-app/Foo\nCodeDirectory v=20500 flags=0x0(none)"
+        ));
     }
 
     #[test]
