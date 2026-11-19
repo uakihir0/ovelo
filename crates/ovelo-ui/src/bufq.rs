@@ -98,6 +98,34 @@ impl BufferQueue {
         })
     }
 
+    /// Slot count (swapchain image count).
+    pub fn len(&self) -> usize {
+        self.slots.len()
+    }
+
+    /// Whether the queue has no slots.
+    pub fn is_empty(&self) -> bool {
+        self.slots.is_empty()
+    }
+
+    /// Grow by one slot at the current geometry (vkCreateSwapchain with
+    /// more `minImageCount` than the queue holds). Fails past MAX_SLOTS.
+    pub fn add_slot(&mut self) -> Result<usize, OveloError> {
+        if self.destroyed {
+            return Err(err("ui.surface.destroyed"));
+        }
+        if self.slots.len() >= MAX_SLOTS {
+            return Err(err("ui.bufq.slots"));
+        }
+        self.slots.push(Entry {
+            state: Slot::Free,
+            buf: Surface::new(self.w, self.h)?,
+            generation: self.generation,
+            frame: 0,
+        });
+        Ok(self.slots.len() - 1)
+    }
+
     /// Current generation.
     pub fn generation(&self) -> u64 {
         self.generation
@@ -269,6 +297,11 @@ impl ANativeWindow {
             queue,
             held: None,
         }
+    }
+
+    /// The underlying queue, read-only (consumer latch/read).
+    pub fn queue(&self) -> &BufferQueue {
+        &self.queue
     }
 
     /// The underlying queue (consumer side uses it too).

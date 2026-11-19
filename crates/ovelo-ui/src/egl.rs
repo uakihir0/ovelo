@@ -175,6 +175,30 @@ impl EglDisplay {
         s.window.lock()
     }
 
+    /// Host side: latch the newest posted frame for display.
+    /// Without this the producer's queue is unreachable and fills up.
+    pub fn acquire(&mut self, surface: u64) -> Option<FrameId> {
+        self.surfaces.get_mut(&surface)?.window.queue_mut().acquire()
+    }
+
+    /// Host side: the latched frame's pixels.
+    pub fn frame_pixels(
+        &self,
+        surface: u64,
+        frame: FrameId,
+    ) -> Option<&crate::surface::Surface> {
+        self.surfaces.get(&surface)?.window.queue().read(frame)
+    }
+
+    /// Host side: display done — the buffer recycles to the producer.
+    pub fn release(&mut self, surface: u64, frame: FrameId) -> Result<(), OveloError> {
+        let s = self
+            .surfaces
+            .get_mut(&surface)
+            .ok_or_else(|| err("ui.egl.bad_surface"))?;
+        s.window.queue_mut().release(frame)
+    }
+
     /// `eglDestroySurface`.
     pub fn destroy_surface(&mut self, surface: u64) -> Result<(), OveloError> {
         let s = self
@@ -262,5 +286,10 @@ mod tests {
         buf.clear(crate::color::Color::from_srgb8(128, 128, 128, 255));
         let f = d.swap_buffers(s).unwrap();
         assert_eq!(f.generation, 0);
+        // Host latches the posted frame, reads it, releases the buffer.
+        let latched = d.acquire(s).unwrap();
+        assert_eq!(latched, f);
+        assert!(d.frame_pixels(s, latched).is_some());
+        d.release(s, latched).unwrap();
     }
 }
