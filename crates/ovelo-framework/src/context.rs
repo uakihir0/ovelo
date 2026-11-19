@@ -40,21 +40,42 @@ impl Context {
         &self.data_dir
     }
 
-    /// `getFilesDir()` — `<data>/files`.
+    /// `getFilesDir()` — `<data>/files`, created on demand like the
+    /// platform's `ensurePrivateDirExists`.
     pub fn files_dir(&self) -> PathBuf {
-        self.data_dir.join("files")
+        let d = self.data_dir.join("files");
+        let _ = std::fs::create_dir_all(&d);
+        d
     }
 
-    /// `getCacheDir()` — `<data>/cache`.
+    /// `getCacheDir()` — `<data>/cache`, created on demand.
     pub fn cache_dir(&self) -> PathBuf {
-        self.data_dir.join("cache")
+        let d = self.data_dir.join("cache");
+        let _ = std::fs::create_dir_all(&d);
+        d
     }
 
     /// `getSharedPreferences(name, mode)` — one live store per name.
     ///
     /// The first call loads (or creates on commit) `shared_prefs/<name>.xml`.
+    /// `name` is confined to the preferences directory: characters outside
+    /// `[A-Za-z0-9._-]` are replaced with `_` so a malicious name can never
+    /// escape the app's private directory.
     pub fn shared_prefs(&mut self, name: &str) -> &mut SharedPreferences {
-        let path = self.data_dir.join("shared_prefs").join(format!("{name}.xml"));
+        let safe: String = name
+            .chars()
+            .map(|c| {
+                if c.is_ascii_alphanumeric() || c == '.' || c == '_' || c == '-' {
+                    c
+                } else {
+                    '_'
+                }
+            })
+            .collect();
+        let path = self
+            .data_dir
+            .join("shared_prefs")
+            .join(format!("{safe}.xml"));
         self.prefs
             .entry(name.to_string())
             .or_insert_with(|| SharedPreferences::open(path))
