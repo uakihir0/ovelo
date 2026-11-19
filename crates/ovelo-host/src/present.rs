@@ -200,7 +200,6 @@ mod tests {
     }
 
     #[test]
-    #[test]
     fn layers_compose_in_order() {
         let mut p = Presenter::new();
         let out = p.attach(2, 4, 4).unwrap();
@@ -227,6 +226,7 @@ mod tests {
         assert_eq!(pr.frame.buffer[(1 * 4 + 1) * 4], 200);
     }
 
+    #[test]
     fn dead_worker_shows_nothing() {
         let mut p = Presenter::new();
         let s = p.attach(2, 4, 4).unwrap();
