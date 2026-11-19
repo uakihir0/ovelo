@@ -1,0 +1,778 @@
+//! Guest view bridge — maps DEX-side framework objects (`new Button`,
+//! `setText`, `setOnClickListener`, `setContentView`) onto host view
+//! objects so a guest `Activity` drives a real window's view tree.
+//!
+//! Object model: `new Landroid/widget/Button;` allocates a guest heap
+//! instance; its `<init>` is a host stub that binds the heap handle to a
+//! concrete [`GuestView`]. Methods resolve per-handle through
+//! [`GuestUi::views`]. `setOnClickListener` does NOT call into the VM —
+//! that would re-enter the interpreter mid-dispatch; it enqueues
+//! `(listener, view)` handles the driver pumps via
+//! [`GuestUi::drain_clicks`] after touch dispatch returns.
+
+use crate::root::ViewRootImpl;
+use crate::view::{Length, MeasureSpec, Size, View, ViewGroup};
+use crate::widget::{Button, Drawable, TextView};
+use ovelo_dexrt::{HostCall, Vm, V};
+use ovelo_error::Result;
+use ovelo_ui::{Color, FontSet};
+use std::cell::RefCell;
+use std::collections::{HashMap, VecDeque};
+use std::rc::Rc;
+
+/// Click queue: `(listener handle, view handle)` awaiting
+/// `OnClickListener.onClick(view)` dispatch on the VM.
+pub type ClickQueue = Rc<RefCell<VecDeque<(u32, u32)>>>;
+
+/// A host view object bound to a guest heap handle.
+pub enum GuestView {
+    /// `android.view.View`.
+    Plain(View),
+    /// `android.widget.TextView`.
+    Text(TextView),
+    /// `android.widget.Button`.
+    Btn(Button),
+    /// `android.view.ViewGroup` / `android.widget.LinearLayout`
+    /// (vertical).
+    Group(ViewGroup),
+}
+
+impl GuestView {
+    /// The `View` part shared by every widget.
+    fn view_mut(&mut self) -> &mut View {
+        match self {
+            GuestView::Plain(v) => v,
+            GuestView::Text(t) => &mut t.view,
+            GuestView::Btn(b) => &mut b.tv.view,
+            GuestView::Group(g) => &mut g.view,
+        }
+    }
+    /// The `TextView` part, when the widget has text.
+    fn text_mut(&mut self) -> Option<&mut TextView> {
+        match self {
+            GuestView::Text(t) => Some(t),
+            GuestView::Btn(b) => Some(&mut b.tv),
+            _ => None,
+        }
+    }
+}
+
+impl Drawable for GuestView {
+    fn measure(&mut self, w: MeasureSpec, h: MeasureSpec) -> Size {
+        match self {
+            GuestView::Plain(v) => v.measure(w, h),
+            GuestView::Text(t) => t.measure(w, h),
+            GuestView::Btn(b) => b.measure(w, h),
+            GuestView::Group(g) => g.measure(w, h),
+        }
+    }
+    fn layout(&mut self, left: i32, top: i32) {
+        match self {
+            GuestView::Plain(v) => v.layout(left, top),
+            GuestView::Text(t) => t.layout(left, top),
+            GuestView::Btn(b) => b.layout(left, top),
+            GuestView::Group(g) => g.layout(left, top),
+        }
+    }
+    fn draw(&mut self, c: &mut ovelo_ui::Canvas) {
+        match self {
+            GuestView::Plain(v) => v.draw(c),
+            GuestView::Text(t) => t.draw(c),
+            GuestView::Btn(b) => b.draw(c),
+            GuestView::Group(g) => g.draw(c),
+        }
+    }
+    fn invalidate(&mut self) {
+        match self {
+            GuestView::Plain(v) => v.invalidate(),
+            GuestView::Text(t) => t.invalidate(),
+            GuestView::Btn(b) => b.invalidate(),
+            GuestView::Group(g) => g.invalidate(),
+        }
+    }
+    fn is_dirty(&self) -> bool {
+        match self {
+            GuestView::Plain(v) => v.is_dirty(),
+            GuestView::Text(t) => t.is_dirty(),
+            GuestView::Btn(b) => b.is_dirty(),
+            GuestView::Group(g) => g.is_dirty(),
+        }
+    }
+    fn measured(&self) -> Size {
+        match self {
+            GuestView::Plain(v) => v.measured,
+            GuestView::Text(t) => t.measured(),
+            GuestView::Btn(b) => b.measured(),
+            GuestView::Group(g) => g.measured(),
+        }
+    }
+    fn origin(&self) -> (i32, i32) {
+        match self {
+            GuestView::Plain(v) => v.origin(),
+            GuestView::Text(t) => t.origin(),
+            GuestView::Btn(b) => b.origin(),
+            GuestView::Group(g) => g.origin(),
+        }
+    }
+    fn lp(&self) -> (Length, Length) {
+        match self {
+            GuestView::Plain(v) => v.lp(),
+            GuestView::Text(t) => t.lp(),
+            GuestView::Btn(b) => b.lp(),
+            GuestView::Group(g) => g.lp(),
+        }
+    }
+    fn dispatch_touch(&mut self, down: bool, x: i32, y: i32) -> bool {
+        match self {
+            GuestView::Plain(v) => v.dispatch_touch(down, x, y),
+            GuestView::Text(t) => t.dispatch_touch(down, x, y),
+            GuestView::Btn(b) => b.dispatch_touch(down, x, y),
+            GuestView::Group(g) => g.dispatch_touch(down, x, y),
+        }
+    }
+}
+
+/// Shared handle to a guest view — lets `addView`/`setContentView`
+/// attach an object the guest can still mutate through the bridge.
+pub struct SharedView(pub Rc<RefCell<GuestView>>);
+
+macro_rules! shared_delegate {
+    ($($m:ident($($a:ident : $t:ty),*) -> $r:ty),* $(,)?) => {$(
+        fn $m(&mut self, $($a: $t),*) -> $r {
+            self.0.borrow_mut().$m($($a),*)
+        }
+    )*};
+}
+
+impl Drawable for SharedView {
+    shared_delegate!(
+        measure(w: MeasureSpec, h: MeasureSpec) -> Size,
+        layout(left: i32, top: i32) -> (),
+        invalidate() -> (),
+        dispatch_touch(down: bool, x: i32, y: i32) -> bool,
+    );
+    fn draw(&mut self, c: &mut ovelo_ui::Canvas) {
+        self.0.borrow_mut().draw(c);
+    }
+    fn is_dirty(&self) -> bool {
+        self.0.borrow().is_dirty()
+    }
+    fn measured(&self) -> Size {
+        self.0.borrow().measured()
+    }
+    fn origin(&self) -> (i32, i32) {
+        self.0.borrow().origin()
+    }
+    fn lp(&self) -> (Length, Length) {
+        self.0.borrow().lp()
+    }
+}
+
+/// Host-side state for guest UI: the view-object map plus the
+/// [`ViewRootImpl`] the content view hangs off.
+pub struct GuestUi {
+    /// Window root (`perform_traversals`/`dispatch_touch` driver).
+    pub root: ViewRootImpl,
+    /// Guest heap handle → bound host view.
+    views: HashMap<u32, Rc<RefCell<GuestView>>>,
+    /// Fonts for text widgets (and for host-built fallback trees).
+    pub fonts: Rc<FontSet>,
+    /// Deferred onClick dispatches.
+    clicks: ClickQueue,
+}
+
+fn argb(c: i32) -> Color {
+    Color::from_srgb8(
+        (c >> 16) as u8,
+        (c >> 8) as u8,
+        c as u8,
+        (c >> 24) as u8,
+    )
+}
+
+fn ref_arg(args: &[V], i: usize) -> Result<u32> {
+    match args.get(i) {
+        Some(V::Ref(h)) if *h != 0 => Ok(*h),
+        _ => Err(crate::err("guest.arg.null")),
+    }
+}
+
+impl GuestUi {
+    /// New bridge: empty view map, root at `(w, h)` sharing `fonts`.
+    pub fn new(w: i32, h: i32, fonts: Rc<FontSet>) -> Rc<RefCell<Self>> {
+        Rc::new(RefCell::new(Self {
+            root: ViewRootImpl::new(w, h, fonts.clone()),
+            views: HashMap::new(),
+            fonts,
+            clicks: Rc::new(RefCell::new(VecDeque::new())),
+        }))
+    }
+
+    /// `(listener, view)` pairs queued by click listeners — pump them
+    /// through `Vm::call_virtual(l, "onClick", &[Ref(v)])` after touch
+    /// dispatch (not inside it, which would re-enter the VM).
+    pub fn drain_clicks(&self) -> Vec<(u32, u32)> {
+        self.clicks.borrow_mut().drain(..).collect()
+    }
+
+    /// The host view bound to a guest heap handle.
+    pub fn view(&self, h: u32) -> Option<Rc<RefCell<GuestView>>> {
+        self.views.get(&h).cloned()
+    }
+
+    /// Register every bridged framework method on `vm`. Unreferenced
+    /// methods simply don't register (the app never calls them).
+    pub fn register(ui: &Rc<RefCell<Self>>, vm: &mut Vm) {
+        // ---- constructors -------------------------------------------------
+        Self::ctor(ui, vm, "Landroid/view/View;", |_ui| {
+            GuestView::Plain(View::new(
+                Length::WrapContent,
+                Length::WrapContent,
+                Size::default(),
+            ))
+        });
+        Self::ctor(ui, vm, "Landroid/widget/TextView;", |ui| {
+            GuestView::Text(TextView::new(
+                "",
+                16.0,
+                Color::srgb(0x20, 0x20, 0x20),
+                ui.fonts.clone(),
+            ))
+        });
+        Self::ctor(ui, vm, "Landroid/widget/Button;", |ui| {
+            GuestView::Btn(Button::new(
+                "",
+                16.0,
+                Color::srgb(0x20, 0x20, 0x20),
+                ui.fonts.clone(),
+            ))
+        });
+        for cls in ["Landroid/view/ViewGroup;", "Landroid/widget/LinearLayout;"] {
+            Self::ctor(ui, vm, cls, |_ui| {
+                GuestView::Group(ViewGroup::new(Length::MatchParent, Length::WrapContent))
+            });
+        }
+
+        // ---- ViewGroup.addView -------------------------------------------
+        for cls in ["Landroid/view/ViewGroup;", "Landroid/widget/LinearLayout;"] {
+            Self::on(ui, vm, cls, "addView", "(Landroid/view/View;)V", |ui, _vm, a| {
+                let this = ref_arg(a, 0)?;
+                let child = ref_arg(a, 1)?;
+                let cv = ui
+                    .views
+                    .get(&child)
+                    .cloned()
+                    .ok_or_else(|| crate::err("guest.addView.unknown"))?;
+                match ui.views.get(&this).cloned() {
+                    Some(rc) => {
+                        let mut g = rc.borrow_mut();
+                        match &mut *g {
+                            GuestView::Group(gr) => {
+                                gr.children.push(Box::new(SharedView(cv)));
+                                gr.view.invalidate();
+                                Ok(None)
+                            }
+                            _ => Err(crate::err("guest.addView.not_group")),
+                        }
+                    }
+                    None => Err(crate::err("guest.addView.unmapped")),
+                }
+            });
+        }
+
+        // ---- Activity.setContentView -------------------------------------
+        Self::on(
+            ui,
+            vm,
+            "Landroid/app/Activity;",
+            "setContentView",
+            "(Landroid/view/View;)V",
+            |ui, _vm, a| {
+                let v = ref_arg(a, 1)?;
+                let cv = ui
+                    .views
+                    .get(&v)
+                    .cloned()
+                    .ok_or_else(|| crate::err("guest.setContentView.unknown"))?;
+                ui.root.set_content_view(Box::new(SharedView(cv)));
+                Ok(None)
+            },
+        );
+
+        // ---- shared View setters ------------------------------------------
+        for cls in [
+            "Landroid/view/View;",
+            "Landroid/view/ViewGroup;",
+            "Landroid/widget/TextView;",
+            "Landroid/widget/Button;",
+            "Landroid/widget/LinearLayout;",
+        ] {
+            Self::on(ui, vm, cls, "setBackgroundColor", "(I)V", |ui, _vm, a| {
+                let this = ref_arg(a, 0)?;
+                let color = match a.get(1) {
+                    Some(V::I32(c)) => argb(*c),
+                    _ => return Err(crate::err("guest.arg.type")),
+                };
+                let rc = ui
+                    .views
+                    .get(&this)
+                    .cloned()
+                    .ok_or_else(|| crate::err("guest.view.unmapped"))?;
+                rc.borrow_mut().view_mut().background = Some(color);
+                rc.borrow_mut().view_mut().invalidate();
+                Ok(None)
+            });
+            Self::on(
+                ui,
+                vm,
+                cls,
+                "setOnClickListener",
+                "(Landroid/view/View$OnClickListener;)V",
+                |ui, _vm, a| {
+                    let this = ref_arg(a, 0)?;
+                    // A null listener clears the click handler.
+                    let listener = match a.get(1) {
+                        Some(V::Ref(h)) => *h,
+                        _ => return Err(crate::err("guest.arg.type")),
+                    };
+                    let q = ui.clicks.clone();
+                    let rc = ui
+                        .views
+                        .get(&this)
+                        .cloned()
+                        .ok_or_else(|| crate::err("guest.view.unmapped"))?;
+                    rc.borrow_mut().view_mut().on_click = if listener == 0 {
+                        None
+                    } else {
+                        Some(Box::new(move || {
+                            q.borrow_mut().push_back((listener, this));
+                        }))
+                    };
+                    Ok(None)
+                },
+            );
+        }
+
+        // ---- TextView setters ---------------------------------------------
+        for cls in ["Landroid/widget/TextView;", "Landroid/widget/Button;"] {
+            Self::on(
+                ui,
+                vm,
+                cls,
+                "setText",
+                "(Ljava/lang/CharSequence;)V",
+                |ui, vm, a| {
+                    let this = ref_arg(a, 0)?;
+                    let text = match a.get(1) {
+                        Some(V::Ref(h)) => vm.heap().str_val(*h).unwrap_or("").to_string(),
+                        _ => return Err(crate::err("guest.arg.type")),
+                    };
+                    let rc = ui
+                        .views
+                        .get(&this)
+                        .cloned()
+                        .ok_or_else(|| crate::err("guest.view.unmapped"))?;
+                    let mut g = rc.borrow_mut();
+                    let tv = g
+                        .text_mut()
+                        .ok_or_else(|| crate::err("guest.setText.not_text"))?;
+                    tv.set_text(text);
+                    Ok(None)
+                },
+            );
+            Self::on(ui, vm, cls, "setTextSize", "(F)V", |ui, _vm, a| {
+                let this = ref_arg(a, 0)?;
+                // A float literal arrives as V::I32 (const loads the
+                // bit pattern); a computed float is V::F32.
+                let size = match a.get(1) {
+                    Some(V::F32(s)) => *s,
+                    Some(V::I32(b)) => f32::from_bits(*b as u32),
+                    _ => return Err(crate::err("guest.arg.type")),
+                };
+                let rc = ui
+                    .views
+                    .get(&this)
+                    .cloned()
+                    .ok_or_else(|| crate::err("guest.view.unmapped"))?;
+                let mut g = rc.borrow_mut();
+                let tv = g
+                    .text_mut()
+                    .ok_or_else(|| crate::err("guest.setTextSize.not_text"))?;
+                tv.text_size = size;
+                tv.set_text(tv.text.clone());
+                Ok(None)
+            });
+            Self::on(ui, vm, cls, "setTextColor", "(I)V", |ui, _vm, a| {
+                let this = ref_arg(a, 0)?;
+                let color = match a.get(1) {
+                    Some(V::I32(c)) => argb(*c),
+                    _ => return Err(crate::err("guest.arg.type")),
+                };
+                let rc = ui
+                    .views
+                    .get(&this)
+                    .cloned()
+                    .ok_or_else(|| crate::err("guest.view.unmapped"))?;
+                let mut g = rc.borrow_mut();
+                let tv = g
+                    .text_mut()
+                    .ok_or_else(|| crate::err("guest.setTextColor.not_text"))?;
+                tv.color = color;
+                tv.invalidate();
+                Ok(None)
+            });
+        }
+    }
+
+    /// `<init>` host stub: bind the receiver handle to a fresh view of
+    /// the constructor's widget kind — unless the handle is already
+    /// bound (a subclass `super.<init>` must not downgrade it).
+    fn ctor(
+        ui: &Rc<RefCell<Self>>,
+        vm: &mut Vm,
+        class: &str,
+        make: impl Fn(&GuestUi) -> GuestView + 'static,
+    ) {
+        let ui2 = ui.clone();
+        let _ = vm.register_host(
+            class,
+            "<init>",
+            "(Landroid/content/Context;)V",
+            Rc::new(RefCell::new(move |_vm: &mut Vm, a: &[V]| -> Result<Option<V>> {
+                let this = ref_arg(a, 0)?;
+                let mut g = ui2.borrow_mut();
+                if !g.views.contains_key(&this) {
+                    let gv = make(&g);
+                    g.views.insert(this, Rc::new(RefCell::new(gv)));
+                }
+                Ok(None)
+            })) as HostCall,
+        );
+    }
+
+    /// Register `class.name(proto)` to a `&mut GuestUi`-taking handler.
+    fn on(
+        ui: &Rc<RefCell<Self>>,
+        vm: &mut Vm,
+        class: &str,
+        name: &str,
+        proto: &str,
+        mut f: impl FnMut(&mut GuestUi, &mut Vm, &[V]) -> Result<Option<V>> + 'static,
+    ) {
+        let ui2 = ui.clone();
+        let class2 = class.to_string();
+        let name2 = name.to_string();
+        let _ = vm.register_host(
+            class,
+            name,
+            proto,
+            Rc::new(RefCell::new(move |vm2: &mut Vm, a: &[V]| {
+                let mut g = ui2.borrow_mut();
+                f(&mut g, vm2, a).map_err(|e| e.with_detail(format!("{class2}.{name2}")))
+            })) as HostCall,
+        );
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use ovelo_dex::testdex::{build, C, M};
+
+    fn cls(name: &'static str, methods: Vec<M>) -> C {
+        C {
+            ext: false,
+            class: name,
+            sup: None,
+            ifaces: &[],
+            sfields: &[],
+            ifields: &[],
+            methods,
+        }
+    }
+    /// A framework-stub class: contributes method_ids/types, no class_def.
+    fn ext(name: &'static str, methods: Vec<M>) -> C {
+        C {
+            ext: true,
+            ..cls(name, methods)
+        }
+    }
+    fn virt(name: &'static str, params: &'static [&'static str], insns: Vec<u16>) -> M {
+        M {
+            name,
+            ret: "V",
+            params,
+            is_virtual: true,
+            regs: 6,
+            ins: 0,
+            outs: 2,
+            insns,
+            tries: vec![],
+            lits: &[],
+        }
+    }
+    fn dir(name: &'static str, params: &'static [&'static str], insns: Vec<u16>) -> M {
+        M {
+            is_virtual: false,
+            ..virt(name, params, insns)
+        }
+    }
+    fn fonts() -> Rc<FontSet> {
+        let mut fs = FontSet::new();
+        fs.push(Box::new(
+            ovelo_ui::TtfFont::from_bytes(include_bytes!("../tests/geneva.ttf"))
+                .expect("font parses"),
+        ));
+        Rc::new(fs)
+    }
+
+    /// Patch every placeholder u16 `from` with `to` (sentinel-based — no
+    /// positional guessing like the dexrt tests).
+    fn patch(b: &mut [u8], from: u16, to: u16) {
+        for i in (0..b.len() - 1).step_by(2) {
+            if u16::from_le_bytes([b[i], b[i + 1]]) == from {
+                b[i..i + 2].copy_from_slice(&to.to_le_bytes());
+            }
+        }
+    }
+
+    // invoke-virtual {vC..vG},m: [0x6e|count<<12|G<<8, midx, F|E<<4|D<<8|C]
+    // — C is the first arg reg, then D,E,F nibbles.
+    // Sentinels: type 0xEExx, method 0xEDxx, string 0xE5xx.
+    const T_BTN: u16 = 0xEE01;
+    const T_LN: u16 = 0xEE02;
+    const M_BINIT: u16 = 0xED01;
+    const M_OINIT: u16 = 0xED02;
+    const M_BTEXT: u16 = 0xED03;
+    const M_BCLICK: u16 = 0xED04;
+    const M_ACV: u16 = 0xED05;
+    const M_TTEXT: u16 = 0xED06;
+    const M_BSIZE: u16 = 0xED07;
+    const M_SCV2: u16 = 0xED08;
+    const M_DINIT: u16 = 0xED09;
+    const M_DCV: u16 = 0xED0A;
+    const T_VIEW: u16 = 0xEE03;
+    const T_DLG: u16 = 0xEE04;
+    const S_HELLO: u16 = 0xE501;
+    const S_CLICKED: u16 = 0xE502;
+
+    /// DEX: guest `LAct` Activity builds a Button in onCreate; `LL`
+    /// implements OnClickListener and calls `view.setText("Clicked")`.
+    fn guest_dex() -> Vec<u8> {
+        let stubs = vec![
+            ext("Landroid/content/Context;", vec![]),
+            ext("Landroid/view/View;", vec![]),
+            ext("Landroid/view/View$OnClickListener;", vec![]),
+            ext("Ljava/lang/CharSequence;", vec![]),
+            ext(
+                "Ljava/lang/Object;",
+                vec![dir("<init>", &[], vec![0x000e])],
+            ),
+            ext(
+                "Landroid/app/Activity;",
+                vec![virt(
+                    "setContentView",
+                    &["Landroid/view/View;"],
+                    vec![0x000e],
+                )],
+            ),
+            // A subclass descriptor naming the method — the DEX may
+            // reference setContentView through it instead of Activity.
+            ext(
+                "LSubAct;",
+                vec![virt(
+                    "setContentView",
+                    &["Landroid/view/View;"],
+                    vec![0x000e],
+                )],
+            ),
+            // An UNRELATED class with the same name+sig — its call must
+            // not reach Activity's host stub.
+            ext(
+                "Landroid/app/Dialog;",
+                vec![
+                    dir("<init>", &["Landroid/content/Context;"], vec![0x000e]),
+                    virt(
+                        "setContentView",
+                        &["Landroid/view/View;"],
+                        vec![0x000e],
+                    ),
+                ],
+            ),
+            ext(
+                "Landroid/widget/TextView;",
+                vec![
+                    dir("<init>", &["Landroid/content/Context;"], vec![0x000e]),
+                    virt("setText", &["Ljava/lang/CharSequence;"], vec![0x000e]),
+                    virt("setTextSize", &["F"], vec![0x000e]),
+                ],
+            ),
+            ext(
+                "Landroid/widget/Button;",
+                vec![
+                    dir("<init>", &["Landroid/content/Context;"], vec![0x000e]),
+                    virt("setText", &["Ljava/lang/CharSequence;"], vec![0x000e]),
+                    virt("setTextSize", &["F"], vec![0x000e]),
+                    virt(
+                        "setOnClickListener",
+                        &["Landroid/view/View$OnClickListener;"],
+                        vec![0x000e],
+                    ),
+                ],
+            ),
+        ];
+        // LL.onClick(View): this=v2, view=v3. setText(v3,"Clicked").
+        let listener = C {
+            ifaces: &["Landroid/view/View$OnClickListener;"],
+            ..cls(
+                "LL;",
+                vec![M {
+                    name: "onClick",
+                    lits: &["Clicked"],
+                    ins: 2,
+                    regs: 4,
+                    ..virt(
+                        "onClick",
+                        &["Landroid/view/View;"],
+                        vec![
+                            0x001a, S_CLICKED,       // const-string v0,"Clicked"
+                            0x206e, M_TTEXT, 0x0003, // invoke-virtual {v3,v0} TextView.setText
+                            0x000e,
+                        ],
+                    )
+                }],
+            )
+        };
+        // LSubAct subclasses Activity — so a setContentView reference
+        // via it is a legit subclass ref (unlike Dialog's).
+        let sub_act = C {
+            sup: Some("Landroid/app/Activity;"),
+            ..cls("LSubAct;", vec![])
+        };
+        // LAct.onCreate(Bundle): this=v4, savedState=v5.
+        let act = C {
+            sup: Some("Landroid/app/Activity;"),
+            ..cls(
+                "LAct;",
+                vec![M {
+                    name: "onCreate",
+                    lits: &["Hello"],
+                    ins: 2,
+                    regs: 6,
+                    ..virt(
+                        "onCreate",
+                        &["Landroid/os/Bundle;"],
+                        vec![
+                            0x0022, T_BTN,              // new-instance v0,Button
+                            0x2070, M_BINIT, 0x0040,    // invoke-direct {v0,v4} Button.<init>
+                            0x001f, T_VIEW,             // check-cast v0,View (Button IS-A View)
+                            0x0314, 0x0000, 0x41A0,     // const v3,#0x41A00000 (20f as I32)
+                            0x206e, M_BSIZE, 0x0030,    // invoke-virtual {v0,v3} Button.setTextSize
+                            0x0122, T_LN,               // new-instance v1,LL
+                            0x1070, M_OINIT, 0x0001,    // invoke-direct {v1} Object.<init>
+                            0x021a, S_HELLO,            // const-string v2,"Hello"
+                            0x206e, M_BTEXT, 0x0020,    // invoke-virtual {v0,v2} Button.setText
+                            0x206e, M_BCLICK, 0x0010,   // invoke-virtual {v0,v1} Button.setOnClickListener
+                            0x206e, M_BCLICK, 0x0050,   // invoke-virtual {v0,v5} — null clears it
+                            0x206e, M_BCLICK, 0x0010,   // re-set the listener
+                            0x0322, T_DLG,              // new-instance v3,Dialog
+                            0x2070, M_DINIT, 0x0043,    // invoke-direct {v3,v4} Dialog.<init>
+                            // Dialog.setContentView must NOT reach Activity's stub
+                            // (v1 is a listener, not a view — a wrong dispatch errors).
+                            0x206e, M_DCV, 0x0013,
+                            0x206e, M_SCV2, 0x0004,     // invoke-virtual {v4,v0} LSubAct.setContentView
+                            0x000e,
+                        ],
+                    )
+                }],
+            )
+        };
+        let mut classes = stubs;
+        classes.push(listener);
+        classes.push(sub_act);
+        classes.push(act);
+        let (mut b, ix) = build(&classes);
+        patch(&mut b, T_BTN, ix.t("Landroid/widget/Button;") as u16);
+        patch(&mut b, T_LN, ix.t("LL;") as u16);
+        patch(&mut b, M_BINIT, ix.m("Landroid/widget/Button;", "<init>") as u16);
+        patch(&mut b, M_OINIT, ix.m("Ljava/lang/Object;", "<init>") as u16);
+        patch(&mut b, M_BTEXT, ix.m("Landroid/widget/Button;", "setText") as u16);
+        patch(&mut b, M_BCLICK, ix.m("Landroid/widget/Button;", "setOnClickListener") as u16);
+        patch(&mut b, M_ACV, ix.m("Landroid/app/Activity;", "setContentView") as u16);
+        patch(&mut b, M_TTEXT, ix.m("Landroid/widget/TextView;", "setText") as u16);
+        patch(&mut b, M_BSIZE, ix.m("Landroid/widget/Button;", "setTextSize") as u16);
+        patch(&mut b, M_SCV2, ix.m("LSubAct;", "setContentView") as u16);
+        patch(&mut b, M_DINIT, ix.m("Landroid/app/Dialog;", "<init>") as u16);
+        patch(&mut b, M_DCV, ix.m("Landroid/app/Dialog;", "setContentView") as u16);
+        patch(&mut b, T_VIEW, ix.t("Landroid/view/View;") as u16);
+        patch(&mut b, T_DLG, ix.t("Landroid/app/Dialog;") as u16);
+        patch(&mut b, S_HELLO, ix.s_idx("Hello") as u16);
+        patch(&mut b, S_CLICKED, ix.s_idx("Clicked") as u16);
+        b
+    }
+
+    #[test]
+    fn guest_builds_view_and_click_roundtrips() {
+        let ui = GuestUi::new(200, 100, fonts());
+        let mut vm = Vm::new(ovelo_dex::DexFile::open(guest_dex()).unwrap()).unwrap();
+        GuestUi::register(&ui, &mut vm);
+        let act = vm.instantiate("LAct;").expect("LAct instantiates");
+        vm.call_virtual(act, "onCreate", &[V::Ref(0)])
+            .expect("onCreate runs");
+
+        // The guest Button is the content view and renders text.
+        {
+            let mut s = ovelo_ui::Surface::new(200, 100).unwrap();
+            ui.borrow_mut().root.draw_to(&mut s);
+            let (r, _, _, _) = s.pixel(2, 12).straight();
+            assert_eq!(r, 0xDD, "button bg drawn"); // Button.bg default
+        }
+        // Tap it: down+up inside → one (listener, view) click queued.
+        {
+            let mut u = ui.borrow_mut();
+            assert!(u.root.dispatch_touch(true, 5, 5));
+            assert!(u.root.dispatch_touch(false, 5, 5));
+            let pending = u.drain_clicks();
+            assert_eq!(pending.len(), 1);
+            let (listener, view) = pending[0];
+            drop(u);
+            // Pump: guest onClick → setText("Clicked") on the Button.
+            vm.call_virtual(listener, "onClick", &[V::Ref(view)])
+                .expect("onClick runs");
+        }
+        let u = ui.borrow();
+        // Find the bound Button handle via the queue's view arg replay:
+        // any bound view that is a Btn must now hold "Clicked".
+        let mut found = false;
+        for h in 0..16u32 {
+            if let Some(rc) = u.view(h) {
+                if let GuestView::Btn(b) = &*rc.borrow() {
+                    assert_eq!(b.tv.text, "Clicked");
+                    found = true;
+                }
+            }
+        }
+        assert!(found, "button handle bound");
+    }
+
+    #[test]
+    fn resetting_a_clean_view_still_draws() {
+        let ui = GuestUi::new(64, 64, fonts());
+        let rc = Rc::new(RefCell::new(GuestView::Plain(crate::view::View::new(
+            Length::WrapContent,
+            Length::WrapContent,
+            Size { w: 4, h: 4 },
+        ))));
+        {
+            let mut u = ui.borrow_mut();
+            u.root
+                .set_content_view(Box::new(SharedView(rc.clone())));
+            let mut s = ovelo_ui::Surface::new(64, 64).unwrap();
+            u.root.draw_to(&mut s);
+            assert!(!u.root.is_dirty());
+            // Re-attach the same (clean) view — must redraw.
+            u.root.set_content_view(Box::new(SharedView(rc)));
+            assert!(u.root.is_dirty());
+        }
+    }
+}
