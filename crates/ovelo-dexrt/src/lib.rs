@@ -190,6 +190,23 @@ impl Vm {
                 "Ljava/lang/Throwable;",
                 "Ljava/lang/Object;",
             ],
+            "Ljava/lang/NoClassDefFoundError;" => &[
+                "Ljava/lang/LinkageError;",
+                "Ljava/lang/Error;",
+                "Ljava/lang/Throwable;",
+                "Ljava/lang/Object;",
+            ],
+            "Ljava/lang/ExceptionInInitializerError;" => &[
+                "Ljava/lang/LinkageError;",
+                "Ljava/lang/Error;",
+                "Ljava/lang/Throwable;",
+                "Ljava/lang/Object;",
+            ],
+            "Ljava/lang/LinkageError;" => &[
+                "Ljava/lang/Error;",
+                "Ljava/lang/Throwable;",
+                "Ljava/lang/Object;",
+            ],
             "Ljava/lang/Exception;" | "Ljava/lang/Error;" => &[
                 "Ljava/lang/Throwable;",
                 "Ljava/lang/Object;",
