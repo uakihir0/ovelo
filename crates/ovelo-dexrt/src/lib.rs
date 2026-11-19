@@ -13,7 +13,7 @@ mod value;
 pub use aot::Aot;
 pub use value::{Heap, Obj, V};
 
-use aot::{AotFn, TRAP_DIV_ZERO};
+use aot::{AotFn, TRAP_DIV_ZERO, TRAP_REM_ZERO};
 
 use ovelo_dex::{decode_all, ClassData, ClassDef, DexFile, EncodedMethod, Insn, TryItem};
 use ovelo_error::{ErrorCategory, OveloError, Phase, Result};
@@ -782,11 +782,20 @@ impl Vm {
         let mut trap: u8 = 0;
         #[allow(unsafe_code)]
         let ret = unsafe { f(regs.as_mut_ptr(), &mut trap) };
-        if trap == TRAP_DIV_ZERO {
-            return Err(self.throw_builtin(
-                "Ljava/lang/ArithmeticException;",
-                "divide by zero",
-            ));
+        match trap {
+            TRAP_DIV_ZERO => {
+                return Err(self.throw_builtin(
+                    "Ljava/lang/ArithmeticException;",
+                    "divide by zero",
+                ));
+            }
+            TRAP_REM_ZERO => {
+                return Err(self.throw_builtin(
+                    "Ljava/lang/ArithmeticException;",
+                    "rem by zero",
+                ));
+            }
+            _ => {}
         }
         let ret_desc = self
             .dex
@@ -2037,6 +2046,50 @@ mod tests {
         assert_eq!(v.enable_aot(), 1);
         let aot_err = v.run("LT;", "f", &[]).unwrap_err().to_string();
         assert_eq!(aot_err, interp_err);
+    }
+
+    #[test]
+    fn aot_int_min_div_neg_one_wraps() {
+        // i32::MIN / -1 and i32::MIN % -1 must wrap like the interpreter
+        // (MIN and 0), not trap the host process.
+        let div = M {
+            name: "d",
+            ret: "I",
+            params: &["I", "I"],
+            is_virtual: false,
+            regs: 2,
+            ins: 2,
+            outs: 0,
+            insns: vec![0x0093, 0x0100, 0x000f], // div-int v0,v0,v1
+            tries: vec![],
+            lits: &[],
+        };
+        let rem = M {
+            name: "r",
+            ret: "I",
+            params: &["I", "I"],
+            is_virtual: false,
+            regs: 2,
+            ins: 2,
+            outs: 0,
+            insns: vec![0x0094, 0x0100, 0x000f], // rem-int v0,v0,v1
+            tries: vec![],
+            lits: &[],
+        };
+        let (b, _ix) = build(&[cls("LT;", vec![div, rem])]);
+        let mut v = vm(b);
+        let args = &[V::I32(i32::MIN), V::I32(-1)];
+        let interp_d = v.run("LT;", "d", args).unwrap();
+        let interp_r = v.run("LT;", "r", args).unwrap();
+        assert_eq!(v.enable_aot(), 2);
+        assert_eq!(v.run("LT;", "d", args).unwrap(), interp_d);
+        assert_eq!(v.run("LT;", "r", args).unwrap(), interp_r);
+        // rem-by-zero keeps the interpreter's distinct message.
+        let interp_e = v
+            .run("LT;", "r", &[V::I32(1), V::I32(0)])
+            .unwrap_err()
+            .to_string();
+        assert!(interp_e.contains("rem by zero"));
     }
 
     #[test]

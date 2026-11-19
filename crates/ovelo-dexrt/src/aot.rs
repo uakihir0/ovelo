@@ -33,16 +33,17 @@ use std::collections::HashMap;
 /// Compiled method: `(regs, trap) -> i64`.
 pub type AotFn = unsafe extern "C" fn(*mut i64, *mut u8) -> i64;
 
-/// Trap code stored through `trap` for a div/rem by zero.
+/// Trap codes stored through `trap` for div/rem by zero.
 pub const TRAP_DIV_ZERO: u8 = 1;
+
+/// `rem` by zero — the interpreter distinguishes the messages.
+pub const TRAP_REM_ZERO: u8 = 2;
 
 /// Opcodes the compiler supports (see module docs).
 fn whitelisted(op: u8) -> bool {
     match op {
         // nop, move/move-wide/move-object (+/from16, /16)
         0x00..=0x09 => true,
-        // move-result*, move-exception (harmless in leaf code)
-        0x0a..=0x0d => true,
         // return-void / return / return-wide
         0x0e..=0x10 => true,
         // const*/4..const-wide/high16 (no strings/classes)
@@ -174,11 +175,9 @@ fn build_function(
     let mut func = Function::with_name_signature(UserFuncName::user(0, midx), sig);
     let mut b = FunctionBuilder::new(&mut func, fbcx);
     let nregs = code.registers_size as usize;
-    // vars[nregs] = `res` (move-result), vars[nregs+1] = `exc`.
-    let vars: Vec<Variable> = (0..nregs + 2)
+    let vars: Vec<Variable> = (0..nregs)
         .map(|_| b.declare_var(types::I64))
         .collect();
-    let (res_v, exc_v) = (vars[nregs], vars[nregs + 1]);
 
     // One IR block per instruction offset (payloads excluded below).
     let mut blocks = HashMap::new();
@@ -203,9 +202,6 @@ fn build_function(
         };
         b.def_var(*var, v);
     }
-    let z = b.ins().iconst(types::I64, 0);
-    b.def_var(res_v, z);
-    b.def_var(exc_v, z);
 
     for (i, ins) in table.iter().enumerate() {
         if ins.is_payload() || !whitelisted(ins.opcode) {
@@ -216,7 +212,7 @@ fn build_function(
             b.switch_to_block(blocks[&ins.offset]);
         }
         let next = table.get(i + 1).map(|t| blocks[&t.offset]);
-        if !emit(&mut b, ins, &vars, &blocks, res_v, exc_v, flag_ptr, next) {
+        if !emit(&mut b, ins, &vars, &blocks, flag_ptr, next) {
             return None;
         }
         if let Some(n) = next {
@@ -249,8 +245,6 @@ fn emit(
     ins: &Insn,
     vars: &[Variable],
     blocks: &HashMap<u32, Block>,
-    res_v: Variable,
-    exc_v: Variable,
     flag_ptr: Value,
     next: Option<Block>,
 ) -> bool {
@@ -260,14 +254,6 @@ fn emit(
         0x00 => {}
         0x01..=0x09 => {
             let v = r(b, ins.regs[1] as usize);
-            b.def_var(vars[ins.regs[0] as usize], v);
-        }
-        0x0a..=0x0c => {
-            let v = b.use_var(res_v);
-            b.def_var(vars[ins.regs[0] as usize], v);
-        }
-        0x0d => {
-            let v = b.use_var(exc_v);
             b.def_var(vars[ins.regs[0] as usize], v);
         }
         0x0e => {
@@ -430,20 +416,36 @@ fn emit(
 }
 
 /// Guard `divisor != 0`; on zero, store the trap code and return.
-fn zero_guard(b: &mut FunctionBuilder, divisor: Value, flag_ptr: Value) {
+fn zero_guard(b: &mut FunctionBuilder, divisor: Value, flag_ptr: Value, code: u8) {
     let trap = b.create_block();
     let cont = b.create_block();
     b.set_cold_block(trap);
     let zero = b.ins().icmp_imm_s(IntCC::Equal, divisor, 0);
     b.ins().brif(zero, trap, &[], cont, &[]);
     b.switch_to_block(trap);
-    let one = b.ins().iconst(types::I64, TRAP_DIV_ZERO as i64);
+    let one = b.ins().iconst(types::I64, code as i64);
     b.ins().istore8(MemFlagsData::trusted(), one, flag_ptr, 0);
     let z = b.ins().iconst(types::I64, 0);
     b.ins().return_(&[z]);
     b.seal_block(trap);
     b.switch_to_block(cont);
     b.seal_block(cont);
+}
+
+/// Keep `sdiv`/`srem` off the INT_MIN / -1 case (a real CPU trap, not a
+/// guest exception). The interpreter wraps: MIN/-1 = MIN, MIN%-1 = 0 —
+/// the same results a divisor of 1 gives, so we substitute 1.
+fn safe_divisor(b: &mut FunctionBuilder, a: Value, c: Value) -> Value {
+    let ty = b.func.dfg.value_type(c);
+    let min = b
+        .ins()
+        .iconst(ty, if ty == types::I64 { i64::MIN } else { i32::MIN as i64 });
+    let neg1 = b.ins().iconst(ty, -1);
+    let one = b.ins().iconst(ty, 1);
+    let is_min = b.ins().icmp(IntCC::Equal, a, min);
+    let is_neg1 = b.ins().icmp(IntCC::Equal, c, neg1);
+    let ovf = b.ins().band(is_min, is_neg1);
+    b.ins().select(ovf, one, c)
 }
 
 /// Emit a reg-reg int/long binop (opcodes 0x90..=0xa5 space).
@@ -473,11 +475,13 @@ fn emit_binop(
         1 => b.ins().isub(a, c),
         2 => b.ins().imul(a, c),
         3 => {
-            zero_guard(b, c, flag_ptr);
+            zero_guard(b, c, flag_ptr, TRAP_DIV_ZERO);
+            let c = safe_divisor(b, a, c);
             b.ins().sdiv(a, c)
         }
         4 => {
-            zero_guard(b, c, flag_ptr);
+            zero_guard(b, c, flag_ptr, TRAP_REM_ZERO);
+            let c = safe_divisor(b, a, c);
             b.ins().srem(a, c)
         }
         5 => b.ins().band(a, c),
@@ -519,11 +523,13 @@ fn emit_lit_binop(
         0xd1 | 0xd9 => b.ins().isub(c, a),
         0xd2 | 0xda => b.ins().imul(a, c),
         0xd3 | 0xdb => {
-            zero_guard(b, c, flag_ptr);
+            zero_guard(b, c, flag_ptr, TRAP_DIV_ZERO);
+            let c = safe_divisor(b, a, c);
             b.ins().sdiv(a, c)
         }
         0xd4 | 0xdc => {
-            zero_guard(b, c, flag_ptr);
+            zero_guard(b, c, flag_ptr, TRAP_REM_ZERO);
+            let c = safe_divisor(b, a, c);
             b.ins().srem(a, c)
         }
         0xd5 | 0xdd => b.ins().band(a, c),
