@@ -9,6 +9,8 @@ use ovelo_error::OveloError;
 use crate::err;
 use crate::prefs::{self, SharedPreferences};
 
+static TMP_SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
 /// A launched app's context: package-scoped directories and preference
 /// stores, mirroring `ContextImpl`'s conventions (data_dir/<pkg>/{files,
 /// cache, shared_prefs}).
@@ -78,7 +80,12 @@ impl Context {
             std::fs::create_dir_all(d)
                 .map_err(|e| err("framework.state.io").with_detail(e.to_string()))?;
         }
-        let tmp = p.with_extension("ovb.tmp");
+        // Unique tmp per save — concurrent saves must not share the
+        // staging file or one writer can corrupt the other's published file.
+        let tmp = p.with_extension(format!(
+            "ovb.tmp-{}",
+            TMP_SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+        ));
         std::fs::write(&tmp, b.to_bytes())
             .map_err(|e| err("framework.state.io").with_detail(e.to_string()))?;
         std::fs::rename(&tmp, &p).map_err(|e| {
