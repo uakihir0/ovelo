@@ -15,6 +15,7 @@ struct App {
     host: Option<HostApp>,
     window: Option<Window>,
     cmd: bool,
+    cursor: (f64, f64),
 }
 
 impl ApplicationHandler for App {
@@ -52,6 +53,7 @@ impl ApplicationHandler for App {
                 println!("ime: {:?}", ovelo_host::map_ime_event(&i));
             }
             WindowEvent::CursorMoved { position, .. } => {
+                self.cursor = (position.x, position.y);
                 if host
                     .translator
                     .pointer_move(0, position.x, position.y)
@@ -69,7 +71,18 @@ impl ApplicationHandler for App {
                     MouseButton::Middle => 2,
                     _ => 3,
                 };
-                let _ = (state, id); // cursor position arrives via CursorMoved
+                let (x, y) = self.cursor;
+                match state {
+                    ElementState::Pressed => {
+                        let ev = host.translator.pointer_down(id, x, y);
+                        println!("pointer: {:?}", ev.action);
+                    }
+                    ElementState::Released => {
+                        if let Some(ev) = host.translator.pointer_up(id, x, y) {
+                            println!("pointer: {:?}", ev.action);
+                        }
+                    }
+                }
             }
             WindowEvent::MouseWheel { delta, .. } => {
                 let (dx, dy) = match delta {
@@ -89,6 +102,7 @@ fn main() {
         host: None,
         window: None,
         cmd: false,
+        cursor: (0.0, 0.0),
     };
     el.run_app(&mut app).expect("run");
 }

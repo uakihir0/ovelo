@@ -89,13 +89,20 @@ pub struct BundleFile {
     pub executable: bool,
 }
 
+/// Shell single-quote: `'` inside single quotes cannot appear, so close the
+/// quote, emit an escaped `'`, and reopen (`'\''`). This blocks `$()`,
+/// backticks, word splitting and globbing — only `'` needs handling.
+fn sh_quote(s: &str) -> String {
+    format!("'{}'", s.replace('\'', "'\\''"))
+}
+
 /// Launcher stub: execs `ovelo run <apk>` so the bundle works from Finder,
 /// Spotlight and `open` without extra wrapping.
 fn launcher_stub(r: &LaunchRecord) -> String {
     format!(
-        "#!/bin/sh\nexec ovelo run --apk \"{}\" --package \"{}\"\n",
-        r.apk_path.replace('"', "\\\""),
-        r.package.replace('"', "\\\""),
+        "#!/bin/sh\nexec ovelo run --apk {} --package {}\n",
+        sh_quote(&r.apk_path),
+        sh_quote(&r.package),
     )
 }
 

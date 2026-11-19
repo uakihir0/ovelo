@@ -107,7 +107,7 @@ impl SurfaceRegistry {
         if !frame.complete() {
             return Err(err("host.frame.incomplete"));
         }
-        if frame.generation < s.generation {
+        if frame.generation != s.generation {
             return Err(err("host.frame.stale"));
         }
         // TODO(Gpu): hand `frame` to the CAMetalLayer drawable pipeline

@@ -68,10 +68,12 @@ impl HostApp {
     /// Resize: keep translator geometry and surface generation in sync —
     /// in-flight frames for the old size become stale (§02).
     pub fn resize(&mut self, surface_id: u64, surface_px: (u32, u32)) -> Result<u64> {
+        // Bump first: on an unknown surface nothing else may change.
+        let gen = self.registry.bump_generation(surface_id)?;
         self.surface_px = surface_px;
         self.translator
             .resize((surface_px.0 as f64, surface_px.1 as f64), (0.0, 0.0));
-        self.registry.bump_generation(surface_id)
+        Ok(gen)
     }
 
 }

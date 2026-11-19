@@ -1250,6 +1250,7 @@ dependencies = [
 name = "ovelo-dexrt"
 version = "0.1.0"
 dependencies = [
+ "ovelo-dex",
  "ovelo-error",
 ]
 
