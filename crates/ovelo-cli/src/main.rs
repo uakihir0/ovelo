@@ -257,10 +257,7 @@ fn run_app(store: &InstallStore, package: &str) -> Result<(), OveloError> {
                         s @ Some(_) => Ok(s),
                         None => vm.call_virtual(*this, &cb, &[ovelo_dexrt::V::Ref(0)]),
                     })
-                    .map_err(|e| {
-                        println!("callback {cb} crashed: {}", e.cause());
-                        e
-                    });
+                    .inspect_err(|e| println!("callback {cb} crashed: {}", e.cause()));
                 matches!(r, Ok(Some(_)))
             }
             None => false,
