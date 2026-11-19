@@ -47,6 +47,14 @@ pub trait GlyphSource {
     ) -> Option<Vec<ShapedGlyph>> {
         None
     }
+    /// Whether [`GlyphSource::shaped_glyphs`] can produce a run — lets
+    /// callers pick between the shaped path and per-char fallback
+    /// without rasterizing to find out. The default probes
+    /// `shaped_glyphs` once; implementations with a cheaper test should
+    /// override.
+    fn can_shape_glyphs(&self) -> bool {
+        self.shaped_glyphs("", false, 1.0).is_some()
+    }
 }
 
 /// One glyph of a shaped run: coverage bitmap plus pen position data in px.
@@ -218,6 +226,10 @@ impl GlyphSource for TtfFont {
             });
         }
         Some(out)
+    }
+
+    fn can_shape_glyphs(&self) -> bool {
+        self.fd.is_some()
     }
 }
 
@@ -393,34 +405,19 @@ impl FontSet {
         out: &mut Vec<ShapedGlyph>,
     ) {
         if let Some(i) = fi {
-            if let Some(gs) = self.fonts[i].shaped_glyphs(text, rtl, size_px) {
-                out.extend(gs);
-                return;
+            if self.fonts[i].can_shape_glyphs() {
+                if let Some(gs) = self.fonts[i].shaped_glyphs(text, rtl, size_px) {
+                    out.extend(gs);
+                    return;
+                }
             }
         }
-        // Per-char fallback: borrow the font's shaped advances when it
-        // can shape but not rasterize, so drawn width still equals
-        // measured width (char_advances uses the same source).
-        let shaped: Vec<f32> = match fi
-            .and_then(|i| self.fonts[i].shaped_advances(text, size_px))
-        {
-            Some(glyphs) => {
-                let mut adv = vec![0.0f32; text.chars().count()];
-                let mut byte_to_ci = vec![usize::MAX; text.len() + 1];
-                for (ci, (b, _)) in text.char_indices().enumerate() {
-                    byte_to_ci[b] = ci;
-                }
-                for (byte, a) in glyphs {
-                    let ci = byte_to_ci.get(byte).copied().unwrap_or(usize::MAX);
-                    if ci < adv.len() {
-                        adv[ci] += a;
-                    }
-                }
-                adv
-            }
-            None => Vec::new(),
-        };
-        for (ci, c) in text.chars().enumerate() {
+        // Per-char fallback: draw each char's own bitmap at its own
+        // advance. Shaped cluster advances are NOT usable here — the
+        // per-char bitmaps are not the shaped glyphs, so a ligature's
+        // member drawn at the leader's summed width would overlap the
+        // next glyph. char_advances measures the same per-char widths.
+        for c in text.chars() {
             // Walk the whole fallback chain: the run's font may cover the
             // char but be unable to rasterize (or shape) it.
             let bmp = self
@@ -432,19 +429,9 @@ impl FontSet {
                     h: 0,
                     cov: Vec::new(),
                 });
-            // Cluster leaders carry the summed advance; members the font
-            // covers take 0; a char the shaper dropped takes the per-char
-            // advance (what char_advances measures for it).
-            let x_adv = match shaped.get(ci).copied() {
-                Some(a) if a > 0.0 => a,
-                Some(_) if fi.is_some_and(|i| {
-                    self.fonts[i].advance_for(c, size_px).is_some()
-                }) => 0.0,
-                _ => self.advance(c, size_px),
-            };
             out.push(ShapedGlyph {
                 bmp,
-                x_adv,
+                x_adv: self.advance(c, size_px),
                 x_off: 0.0,
                 y_off: 0.0,
             });
@@ -473,8 +460,9 @@ impl FontSet {
     /// Per-char advances for `text`, itemized the same way
     /// [`FontSet::shaped_run`] draws it: each bidi/font sub-run is shaped
     /// by its own font, cluster advances land on the cluster's leading
-    /// char, other members take 0, and uncovered chars fall back per
-    /// glyph — so measured width equals drawn width.
+    /// char, other members take 0, and a font that can't produce shaped
+    /// glyphs falls back to per-char advances (what shape_subrun draws)
+    /// — so measured width equals drawn width.
     pub fn char_advances(&self, text: &str, size_px: f32) -> Vec<f32> {
         let mut byte_to_ci = vec![usize::MAX; text.len() + 1];
         let chars: Vec<(usize, char)> = text.char_indices().collect();
@@ -486,7 +474,13 @@ impl FontSet {
         for (range, fi, _rtl) in self.itemize(text, size_px) {
             let sub = &text[range.clone()];
             let Some(i) = fi else { continue };
-            match self.fonts[i].shaped_advances(sub, size_px) {
+            // Shape only when the font can also draw the shaped run;
+            // shape_subrun's per-char fallback measures advance_for.
+            match if self.fonts[i].can_shape_glyphs() {
+                self.fonts[i].shaped_advances(sub, size_px)
+            } else {
+                None
+            } {
                 Some(glyphs) => {
                     let mut leaders: Vec<usize> = Vec::new();
                     let mut sums: std::collections::HashMap<usize, f32> =
@@ -571,6 +565,46 @@ mod tests {
         // Width drawn == width measured: summed advances match char_advances.
         let drawn: f32 = run.iter().map(|g| g.x_adv).sum();
         let measured: f32 = fs.char_advances("\u{E000}", 16.0).iter().sum();
+        assert!((drawn - measured).abs() < 0.01, "{drawn} vs {measured}");
+    }
+
+    /// A font that reports shaped (ligature) advances but cannot
+    /// rasterize shaped glyphs must draw each char's own bitmap at its
+    /// own advance — applying the ligature's summed width to the leader
+    /// parks the member's bitmap on top of the next glyph.
+    #[test]
+    fn unrasterizable_shaper_falls_back_to_perchar_advances() {
+        struct ShapeOnly;
+        impl GlyphSource for ShapeOnly {
+            fn name(&self) -> &str {
+                "shape-only"
+            }
+            fn advance_for(&self, c: char, _size_px: f32) -> Option<f32> {
+                matches!(c, 'f' | 'i').then_some(4.0)
+            }
+            fn ascent(&self, _s: f32) -> f32 {
+                8.0
+            }
+            fn descent(&self, _s: f32) -> f32 {
+                2.0
+            }
+            fn shaped_advances(&self, _t: &str, _s: f32) -> Option<Vec<(usize, f32)>> {
+                // "fi" ligature: whole 7px on the cluster leader.
+                Some(vec![(0, 7.0)])
+            }
+        }
+        let mut fs = FontSet::new();
+        fs.push(Box::new(ShapeOnly));
+        fs.push(Box::new(
+            TtfFont::from_bytes(include_bytes!("../tests/geneva.ttf"))
+                .expect("font parses"),
+        ));
+        let run = fs.shaped_run("fi", 16.0).expect("run");
+        assert_eq!(run.len(), 2);
+        assert_eq!(run[0].x_adv, 4.0);
+        assert_eq!(run[1].x_adv, 4.0);
+        let drawn: f32 = run.iter().map(|g| g.x_adv).sum();
+        let measured: f32 = fs.char_advances("fi", 16.0).iter().sum();
         assert!((drawn - measured).abs() < 0.01, "{drawn} vs {measured}");
     }
 }
