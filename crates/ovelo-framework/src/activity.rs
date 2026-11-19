@@ -34,6 +34,9 @@ pub struct Activity {
     state: Lifecycle,
     /// Callbacks the driver must invoke, oldest first.
     pending: Vec<&'static str>,
+    /// State surviving process death (`onSaveInstanceState`'s Bundle);
+    /// present when the activity is launched with a previous state.
+    saved_state: Option<crate::bundle::Bundle>,
 }
 
 impl Activity {
@@ -42,7 +45,27 @@ impl Activity {
         Self {
             state: Lifecycle::PreCreated,
             pending: Vec::new(),
+            saved_state: None,
         }
+    }
+
+    /// Attach a state bundle saved by a previous process instance — set
+    /// before `launch()`; `onCreate` then receives it and
+    /// `onRestoreInstanceState` is emitted after `onStart`.
+    pub fn set_saved_state(&mut self, b: crate::bundle::Bundle) {
+        self.saved_state = Some(b);
+    }
+
+    /// The bundle passed to `onCreate`, if any.
+    pub fn saved_state(&self) -> Option<&crate::bundle::Bundle> {
+        self.saved_state.as_ref()
+    }
+
+    /// `onSaveInstanceState` — the framework records the callback and the
+    /// driver writes the app's state into `out`.
+    pub fn save_instance_state(&mut self, out: crate::bundle::Bundle) {
+        self.pending.push("onSaveInstanceState");
+        self.saved_state = Some(out);
     }
 
     /// Current lifecycle state.
@@ -69,7 +92,16 @@ impl Activity {
     pub fn launch(&mut self) -> Result<(), ActivityError> {
         match self.state {
             Lifecycle::PreCreated => {
-                self.pending.extend(["onCreate", "onStart", "onResume"]);
+                if self.saved_state.is_some() {
+                    self.pending.extend([
+                        "onCreate",
+                        "onStart",
+                        "onRestoreInstanceState",
+                        "onResume",
+                    ]);
+                } else {
+                    self.pending.extend(["onCreate", "onStart", "onResume"]);
+                }
                 self.state = Lifecycle::Resumed;
                 Ok(())
             }

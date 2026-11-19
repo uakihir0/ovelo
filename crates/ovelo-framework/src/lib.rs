@@ -8,15 +8,21 @@
 //! app callbacks with Android's ordering guarantees.
 
 pub mod activity;
+pub mod bundle;
 pub mod context;
 pub mod looper;
 pub mod prefs;
+pub mod resolver;
+pub mod sqlite;
 pub mod view;
 
 pub use activity::{Activity, ActivityError, Lifecycle};
+pub use bundle::{BValue, Bundle};
 pub use context::Context;
 pub use looper::{Handler, Looper, Message, MessageQueue};
 pub use prefs::{PrefValue, SharedPreferences};
+pub use resolver::{ContentProvider, ContentResolver, ContentUri};
+pub use sqlite::{Cursor, Database, SqlValue};
 pub use view::{Length, MeasureSpec, Size, View, ViewGroup};
 
 use ovelo_error::{ErrorCategory, OveloError, Phase};

@@ -4,6 +4,9 @@
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
+use ovelo_error::OveloError;
+
+use crate::err;
 use crate::prefs::{self, SharedPreferences};
 
 /// A launched app's context: package-scoped directories and preference
@@ -49,6 +52,51 @@ impl Context {
         let d = self.data_dir.join("cache");
         let _ = std::fs::create_dir_all(&d);
         d
+    }
+
+    /// `openOrCreateDatabase(name)` — SQLite file under `databases/`.
+    pub fn database(&self, name: &str) -> Result<crate::sqlite::Database, OveloError> {
+        if !name
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || c == '.' || c == '_' || c == '-')
+            || name.is_empty()
+        {
+            return Err(err("framework.db.name").with_detail(name));
+        }
+        crate::sqlite::Database::open(&self.data_dir.join("databases").join(format!("{name}.db")))
+    }
+
+    /// Instance-state file (`onSaveInstanceState` survives process death).
+    fn state_path(&self) -> PathBuf {
+        self.data_dir.join("state").join("instance_state.ovb")
+    }
+
+    /// Persist `onSaveInstanceState`'s bundle (atomic write).
+    pub fn save_instance_state(&self, b: &crate::bundle::Bundle) -> Result<(), OveloError> {
+        let p = self.state_path();
+        if let Some(d) = p.parent() {
+            std::fs::create_dir_all(d)
+                .map_err(|e| err("framework.state.io").with_detail(e.to_string()))?;
+        }
+        let tmp = p.with_extension("ovb.tmp");
+        std::fs::write(&tmp, b.to_bytes())
+            .map_err(|e| err("framework.state.io").with_detail(e.to_string()))?;
+        std::fs::rename(&tmp, &p).map_err(|e| {
+            let _ = std::fs::remove_file(&tmp);
+            err("framework.state.io").with_detail(e.to_string())
+        })
+    }
+
+    /// The bundle from the last `save_instance_state`, if any.
+    /// A corrupt file is ignored — a fresh launch beats a crash loop.
+    pub fn load_instance_state(&self) -> Option<crate::bundle::Bundle> {
+        let raw = std::fs::read(self.state_path()).ok()?;
+        crate::bundle::Bundle::from_bytes(&raw).ok()
+    }
+
+    /// Drop saved instance state (fresh install / wipe).
+    pub fn clear_instance_state(&self) {
+        let _ = std::fs::remove_file(self.state_path());
     }
 
     /// `getSharedPreferences(name, mode)` — one live store per name.
