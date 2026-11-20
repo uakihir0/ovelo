@@ -1737,6 +1737,7 @@ dependencies = [
  "ovelo-dex",
  "ovelo-error",
  "rusqlite",
+ "unicode-normalization",
 ]
 
 [[package]]
