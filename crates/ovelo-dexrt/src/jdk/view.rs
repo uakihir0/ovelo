@@ -126,10 +126,14 @@ pub struct DexViewInfo {
 pub(crate) fn activity_content(vm: &Vm, activity: u32) -> Option<u32> {
     match pseudo_get(vm, activity, P_CONTENT) {
         Some(V::Ref(h)) if h != 0 => Some(h),
-        // Appcompat installs content dex-side — the last view attached
-        // under android.R.id.content is the real content root.
-        _ if vm.content_view != 0 => Some(vm.content_view),
-        _ => None,
+        // Appcompat installs content dex-side — the view attached
+        // under android.R.id.content while this activity ran is the
+        // real content root (owner 0 = pre-activity inflations).
+        _ => vm
+            .content_views
+            .get(&activity)
+            .or_else(|| vm.content_views.get(&0))
+            .copied(),
     }
 }
 
@@ -504,9 +508,10 @@ pub(crate) fn call(
                 this
             };
             let mut hit = find_in_tree(vm, root, id).unwrap_or(0);
-            if hit == 0 {
-                // The receiver's subtree missed — appcompat content lives
-                // in its own decor tree, so retry across inflated roots.
+            if hit == 0 && class == WINDOW {
+                // Window searches span trees: appcompat content lives
+                // in its own decor tree, so retry across inflated roots
+                // (plain View.findViewById stays inside its own tree).
                 for i in (0..vm.view_roots.len()).rev() {
                     let r = vm.view_roots[i];
                     if r == root {
@@ -1528,6 +1533,22 @@ pub(crate) fn attach(vm: &mut Vm, parent: u32, child: V) {
     if parent == 0 {
         return;
     }
+    // Attaching an ancestor under its own descendant makes a cycle —
+    // recursive walks (find_in_tree, materialize) would never end.
+    // Appcompat's decor layouts contain an android.R.id.content frame,
+    // so a tree can legitimately meet itself here; refuse the link.
+    if let V::Ref(ch) = child {
+        let mut cur = parent;
+        for _ in 0..64 {
+            if cur == ch {
+                return;
+            }
+            match pseudo_get(vm, cur, P_PARENT) {
+                Some(V::Ref(p)) if p != 0 => cur = p,
+                _ => break,
+            }
+        }
+    }
     if let Some(a) = children_arr(vm, parent) {
         if let Some(Obj::Array { data, .. }) = vm.heap.get_mut(a) {
             data.push(child);
@@ -1538,10 +1559,11 @@ pub(crate) fn attach(vm: &mut Vm, parent: u32, child: V) {
         pseudo_set(vm, ch, P_PARENT, V::Ref(parent));
         // App content lands under the `android.R.id.content` frame —
         // whether via our Window.setContentView or appcompat's dex-side
-        // ensureSubDecor — so remember it as the activity's content and
-        // the enclosing tree as the window's real decor.
+        // ensureSubDecor — so remember it as the running activity's
+        // content and the enclosing tree as its window's real decor.
         if view_id(vm, parent) == ANDROID_ID_CONTENT {
-            vm.content_view = ch;
+            let owner = vm.cur_activity;
+            vm.content_views.insert(owner, ch);
             let mut top = parent;
             let mut hops = 0;
             while let Some(V::Ref(p)) = pseudo_get(vm, top, P_PARENT) {
@@ -1551,7 +1573,7 @@ pub(crate) fn attach(vm: &mut Vm, parent: u32, child: V) {
                 top = p;
                 hops += 1;
             }
-            vm.decor_root = top;
+            vm.decor_roots.insert(owner, top);
         }
     }
 }
@@ -1578,7 +1600,13 @@ fn detach(vm: &mut Vm, parent: u32, child: V) {
 
 /// Depth-first search for a view whose `android:id` equals `id`.
 pub(crate) fn find_in_tree(vm: &Vm, root: u32, id: i32) -> Option<u32> {
-    if root == 0 {
+    find_in_tree_at(vm, root, id, 0)
+}
+
+/// Depth-bounded DFS — `attach` refuses cycles, but a defensive bound
+/// keeps a malformed tree from recursing forever.
+fn find_in_tree_at(vm: &Vm, root: u32, id: i32, depth: u32) -> Option<u32> {
+    if root == 0 || depth > 128 {
         return None;
     }
     if view_id(vm, root) == id {
@@ -1586,7 +1614,7 @@ pub(crate) fn find_in_tree(vm: &Vm, root: u32, id: i32) -> Option<u32> {
     }
     for c in children(vm, root) {
         if let V::Ref(ch) = c {
-            if let Some(f) = find_in_tree(vm, ch, id) {
+            if let Some(f) = find_in_tree_at(vm, ch, id, depth + 1) {
                 return Some(f);
             }
         }
@@ -1629,11 +1657,17 @@ pub(crate) fn decor_of(vm: &mut Vm, window: u32) -> Option<u32> {
     if window == 0 {
         return None;
     }
-    // Appcompat builds its own decor tree dex-side — prefer it over the
-    // synthetic one so Window.findViewById sees the real content.
-    if vm.decor_root != 0 {
-        pseudo_set(vm, window, P_DECOR, V::Ref(vm.decor_root));
-        return Some(vm.decor_root);
+    // Appcompat builds its own decor tree dex-side — prefer it over
+    // the synthetic one so Window.findViewById sees the real content.
+    // The window's owning activity (P_TARGET, set at window_of) picks
+    // which activity's decor applies.
+    let owner = match pseudo_get(vm, window, P_TARGET) {
+        Some(V::Ref(a)) => a,
+        _ => 0,
+    };
+    if let Some(&d) = vm.decor_roots.get(&owner) {
+        pseudo_set(vm, window, P_DECOR, V::Ref(d));
+        return Some(d);
     }
     if let Some(V::Ref(d)) = pseudo_get(vm, window, P_DECOR) {
         return Some(d);

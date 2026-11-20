@@ -147,6 +147,11 @@ pub struct Vm {
     /// Interned main-thread object — `Thread.currentThread()` and
     /// `Looper.getThread()` must compare equal (androidx checks `==`).
     pub(crate) main_thread_h: u32,
+    /// Thread handle `Thread.currentThread()` returns right now — the
+    /// worker handle while an executor job runs, main otherwise.
+    pub(crate) cur_thread: u32,
+    /// The background thread object (see `worker_thread`).
+    pub(crate) worker_thread_h: u32,
     /// Interned main `Looper` — `Looper.myLooper()` and
     /// `Handler.getLooper()` must return the same handle.
     pub(crate) main_looper_h: u32,
@@ -170,12 +175,16 @@ pub struct Vm {
     /// them when the receiver's own subtree misses (appcompat decor is
     /// built dex-side, outside our synthetic window decor).
     pub(crate) view_roots: Vec<u32>,
-    /// The view attached under `android.R.id.content` — the app's real
-    /// content root no matter which path installed it.
-    pub(crate) content_view: u32,
-    /// Root of the tree that owns the content frame — appcompat's real
-    /// decor when it built one, else the synthetic window decor.
-    pub(crate) decor_root: u32,
+    /// Activity currently being dispatched — owns any content/decor
+    /// roots attached while it runs, so a second activity's trees
+    /// never leak into the first's lookups.
+    pub(crate) cur_activity: u32,
+    /// The view attached under `android.R.id.content` per activity —
+    /// the app's real content root no matter which path installed it.
+    pub(crate) content_views: HashMap<u32, u32>,
+    /// Root of the tree that owns each activity's content frame —
+    /// appcompat's real decor when it built one dex-side.
+    pub(crate) decor_roots: HashMap<u32, u32>,
     /// Installed-APK resource index for `LayoutInflater.inflate` — `None`
     /// degrades inflation to bare placeholder views.
     pub apk_res: Option<res::ApkResources>,
@@ -205,6 +214,7 @@ pub const NORMAL_PERMISSIONS: &[&str] = &[
     "android.permission.ACCESS_WIFI_STATE",
     "android.permission.CHANGE_NETWORK_STATE",
     "android.permission.CHANGE_WIFI_STATE",
+    "android.permission.CHANGE_WIFI_MULTICAST_STATE",
     "android.permission.VIBRATE",
     "android.permission.WAKE_LOCK",
     "android.permission.RECEIVE_BOOT_COMPLETED",
@@ -215,6 +225,7 @@ pub const NORMAL_PERMISSIONS: &[&str] = &[
     "android.permission.USE_EXACT_ALARM",
     "android.permission.REORDER_TASKS",
     "android.permission.SET_WALLPAPER",
+    "android.permission.SET_WALLPAPER_HINTS",
     "android.permission.EXPAND_STATUS_BAR",
     "android.permission.MODIFY_AUDIO_SETTINGS",
     "android.permission.NFC",
@@ -251,6 +262,8 @@ impl Vm {
             throw_sites: HashMap::new(),
             stub_trace: Vec::new(),
             main_thread_h: 0,
+            cur_thread: 0,
+            worker_thread_h: 0,
             main_looper_h: 0,
             app_h: 0,
             unsafe_offsets: HashMap::new(),
@@ -259,8 +272,9 @@ impl Vm {
             trace_throw: std::env::var_os("OVELO_TRACE_THROW").is_some(),
             trace_call: std::env::var("OVELO_TRACE_CALL").ok(),
             view_roots: Vec::new(),
-            content_view: 0,
-            decor_root: 0,
+            cur_activity: 0,
+            content_views: HashMap::new(),
+            decor_roots: HashMap::new(),
             apk_res: None,
             theme_id: 0,
             pending_activity: None,
@@ -650,6 +664,15 @@ impl Vm {
             class_idx: self.canon(ty),
             fields: HashMap::new(),
         });
+        // A real guest Application subclass IS the app object —
+        // `getApplication[Context]` must hand it back so onCreate state
+        // and custom methods are reachable. Overrides the interned
+        // placeholder `app_object` may have minted earlier.
+        if let Some(app_ty) = self.type_index_of("Landroid/app/Application;") {
+            if self.assignable(ty, app_ty) {
+                self.app_h = h;
+            }
+        }
         if let Some(midx) = self.find_method_by_name(class_desc, "<init>", 0)? {
             match self.invoke(midx, vec![V::Ref(h)], InvokeKind::Direct) {
                 Ok(_) => {}
@@ -841,9 +864,16 @@ impl Vm {
         self.classes.entry(k).or_default().statics.insert(f, v);
     }
 
-    /// Invoke the virtual method `name` on `this`, with `args` after the
-    /// receiver. `Ok(None)` when the object's class doesn't declare it —
-    /// the platform base class (not in this DEX) provides the default.
+    /// Mark which activity's code is dispatching — content/decor roots
+    /// attached while it runs are recorded under it.
+    pub fn set_activity(&mut self, activity: u32) {
+        self.cur_activity = activity;
+    }
+
+    /// Invoke `name` on the object at `this` — resolves the method on
+    /// its class chain by name and arg count. `Ok(None)` when the
+    /// object's class doesn't declare it — the platform base class
+    /// (not in this DEX) provides the default.
     pub fn call_virtual(&mut self, this: u32, name: &str, args: &[V]) -> Result<Option<V>> {
         let ci = self
             .heap

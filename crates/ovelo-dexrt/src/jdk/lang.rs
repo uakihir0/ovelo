@@ -1418,7 +1418,11 @@ fn classloader_call(vm: &mut Vm, name: &str, args: &[V]) -> Option<Option<V>> {
 
 fn thread_call(vm: &mut Vm, name: &str, _sig: &str, args: &[V]) -> Rt<Option<Option<V>>> {
     Ok(match name {
-        "currentThread" => Some(Some(main_thread(vm))),
+        "currentThread" => Some(Some(if vm.cur_thread != 0 {
+            V::Ref(vm.cur_thread)
+        } else {
+            main_thread(vm)
+        })),
         "getId" => Some(Some(V::I64(1))),
         "getName" => {
             let n = s(vm, match args[0] { V::Ref(h) => h, _ => 0 })

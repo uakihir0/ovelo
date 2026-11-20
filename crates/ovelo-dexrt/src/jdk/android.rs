@@ -1261,6 +1261,15 @@ fn context_call(
             "Ljava/io/File;",
             HostState::Path("/data/local/ovelo/cache".into()),
         ))),
+        "getDatabasePath" => {
+            let name = sv(vm, args.get(1).copied().unwrap_or(V::Ref(0)))
+                .unwrap_or_else(|| "db".to_string());
+            Some(Some(host(
+                vm,
+                "Ljava/io/File;",
+                HostState::Path(format!("/data/local/ovelo/databases/{name}")),
+            )))
+        }
         "getExternalFilesDir" | "getExternalCacheDir" | "getObbDir"
         | "getCodeCacheDir" | "getDataDir" | "getNoBackupFilesDir"
         | "getExternalMediaDir" => {
@@ -1300,7 +1309,6 @@ fn context_call(
         "deleteFile" | "deleteDatabase" | "deleteSharedPreferences" => {
             Some(Some(V::I32(0)))
         }
-        "getDatabasePath" => Some(Some(V::Ref(0))),
         "moveDatabaseFrom" | "moveSharedPreferencesFrom" => Some(Some(V::I32(0))),
         "startActivity" | "startActivities" | "startActivityForResult"
         | "startActivityFromChild" | "startActivityFromFragment"
@@ -2234,6 +2242,7 @@ fn handler_call(vm: &mut Vm, name: &str, args: &[V]) -> Rt<Option<Option<V>>> {
             if let Some(V::Ref(r)) = args.get(1).copied().or_else(|| {
                 args.get(1).copied()
             }) {
+                // Handler posts land on the main looper — same thread.
                 let _ = vm.call_virtual(r, "run", &[]);
             }
             Some(Some(V::I32(1)))
@@ -2268,7 +2277,9 @@ fn looper_call(vm: &mut Vm, name: &str, _args: &[V]) -> Rt<Option<Option<V>>> {
         "getMainLooper" | "myLooper" => Some(Some(main_looper(vm))),
         "prepare" | "prepareMainLooper" => Some(None),
         "loop" | "quit" | "quitSafely" => Some(None),
-        "isCurrentThread" => Some(Some(V::I32(1))),
+        "isCurrentThread" => Some(Some(V::I32(
+            (vm.cur_thread == 0 || vm.cur_thread == vm.main_thread_h) as i32,
+        ))),
         "getThread" => Some(Some(main_thread(vm))),
         "getQueue" => Some(Some(host(
             vm,

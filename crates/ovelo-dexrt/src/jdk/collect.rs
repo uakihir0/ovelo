@@ -191,13 +191,15 @@ pub(crate) fn call(
         match name {
             "execute" => {
                 if let V::Ref(r) = args[1] {
-                    let _ = vm.call_virtual(r, "run", &[]);
+                    // Executor jobs run on a background thread — Room/
+                    // WorkManager assert they are not on the main one.
+                    let _ = run_on_worker(vm, r);
                 }
                 Some(None)
             }
             "submit" => {
                 if let V::Ref(r) = args[1] {
-                    let _ = vm.call_virtual(r, "run", &[]);
+                    let _ = run_on_worker(vm, r);
                 }
                 Some(Some(host(vm, "Ljava/util/concurrent/Future;", HostState::Empty)))
             }

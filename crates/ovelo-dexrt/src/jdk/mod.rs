@@ -135,6 +135,35 @@ pub(crate) fn main_looper(vm: &mut Vm) -> V {
     V::Ref(vm.main_looper_h)
 }
 
+/// A background thread handle — distinct from `main_thread` so
+/// `assertNotMainThread`-style checks pass inside executor work.
+pub(crate) fn worker_thread(vm: &mut Vm) -> V {
+    if vm.worker_thread_h == 0 {
+        let V::Ref(h) = host(vm, "Ljava/lang/Thread;", HostState::StrBuf("worker".into()))
+        else {
+            unreachable!()
+        };
+        vm.worker_thread_h = h;
+    }
+    V::Ref(vm.worker_thread_h)
+}
+
+/// Run a `Runnable` on the virtual worker thread — executor jobs
+/// (Room, WorkManager, kotlinx dispatchers) assert they are NOT on
+/// the main thread, so `Thread.currentThread()` must differ while
+/// they execute. Nested calls restore the previous context.
+pub(crate) fn run_on_worker(
+    vm: &mut Vm,
+    r: u32,
+) -> std::result::Result<Option<V>, ovelo_error::OveloError> {
+    let prev = vm.cur_thread;
+    worker_thread(vm);
+    vm.cur_thread = vm.worker_thread_h;
+    let v = vm.call_virtual(r, "run", &[]);
+    vm.cur_thread = prev;
+    v
+}
+
 /// The one `Application` — `Context.getApplication[Context]` callers
 /// `check-cast` the result (e.g. Glide's `RequestManagerRetriever`),
 /// so it must be Application-typed, not the Activity receiver.

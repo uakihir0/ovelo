@@ -647,6 +647,9 @@ fn run_activity_cbs(
     this: u32,
     callbacks: &[String],
 ) {
+    // Content/decor roots attach under the running activity — keep
+    // each activity's trees scoped to itself for lookups and render.
+    vm.set_activity(this);
     for cb in callbacks {
         if vm.is_finishing(this) {
             break;
