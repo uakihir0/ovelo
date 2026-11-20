@@ -165,6 +165,10 @@ pub struct ResourceEntry {
     pub public: bool,
     /// Simple value (None for complex/map entries).
     pub value: Option<EntryValue>,
+    /// Parent resource id for complex entries (style parents; 0 if none).
+    pub parent: u32,
+    /// Item map for complex entries (style attribute values).
+    pub items: Vec<(u32, EntryValue)>,
     /// Config description (e.g. "default", "ja", "xxhdpi").
     pub config: String,
 }
@@ -419,6 +423,8 @@ fn parse_package(
                     let eflags = u16at(b, eoff + 2)?;
                     let key_idx = u32at(b, eoff + 4)?;
                     let key = key_strings.get(key_idx).unwrap_or("?").to_string();
+                    let mut parent = 0u32;
+                    let mut items: Vec<(u32, EntryValue)> = Vec::new();
                     let value = if eflags & ENTRY_FLAG_COMPLEX == 0 {
                         if eoff + 8 + 8 > end {
                             return Err(err("arsc.value.bounds"));
@@ -436,6 +442,35 @@ fn parse_package(
                             string,
                         })
                     } else {
+                        // ResTable_entry complex form: parent + count +
+                        // count ResTable_map_entry{name, Res_value}.
+                        if eoff + 16 > end {
+                            return Err(err("arsc.value.bounds"));
+                        }
+                        parent = u32at(b, eoff + 8)?;
+                        let count = u32at(b, eoff + 12)? as usize;
+                        if eoff + 16 + count * 12 > end {
+                            return Err(err("arsc.value.bounds"));
+                        }
+                        for i in 0..count {
+                            let m = eoff + 16 + i * 12;
+                            let item_key = u32at(b, m)?;
+                            let data_type = b[m + 4 + 3];
+                            let data = u32at(b, m + 8)?;
+                            let string = if data_type == 0x03 {
+                                global.get(data).map(|s| s.to_string())
+                            } else {
+                                None
+                            };
+                            items.push((
+                                item_key,
+                                EntryValue {
+                                    data_type,
+                                    data,
+                                    string,
+                                },
+                            ));
+                        }
                         None
                     };
                     let public = flags
@@ -454,6 +489,8 @@ fn parse_package(
                                     | entry_id as u32,
                                 public,
                                 value: value.clone(),
+                                parent,
+                                items: items.clone(),
                                 config: config.clone(),
                             })
                         })
@@ -468,6 +505,8 @@ fn parse_package(
                                         | entry_id as u32,
                                     public,
                                     value,
+                                    parent,
+                                    items,
                                     config: config.clone(),
                                 }],
                             })

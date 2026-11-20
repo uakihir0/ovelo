@@ -11,7 +11,9 @@ pub(crate) fn call(
     sig: &str,
     args: &[V],
 ) -> Rt<Option<Option<V>>> {
-    Ok(if class == STRING {
+    Ok(if class == STRING || class == "Ljava/lang/CharSequence;" {
+        // `CharSequence` is the interface `String` implements — its
+        // methods answer on the receiver's string value the same way.
         string_call(vm, name, sig, args)
     } else if desc_is_a(class, "Ljava/lang/AbstractStringBuilder;") {
         strbuf(vm, name, sig, args)?
@@ -31,6 +33,8 @@ pub(crate) fn call(
         || class.ends_with("ClassLoader;")
     {
         classloader_call(vm, name, args)
+    } else if class == "Ljava/lang/Package;" {
+        package_call(vm, name, sig, args)
     } else if desc_is_a(class, "Ljava/lang/Thread;") {
         thread_call(vm, name, sig, args)?
     } else if class.ends_with("ThreadLocal;") {
@@ -1218,45 +1222,68 @@ fn class_call(vm: &mut Vm, name: &str, _sig: &str, args: &[V]) -> Rt<Option<Opti
             if !d.starts_with('L') && !d.starts_with('[') {
                 d = format!("L{};", d.replace('.', "/"));
             }
+            let in_dex = vm.type_index_of(&d).is_some();
+            // Classes the runtime stubs without a dex def (JDK + Android
+            // framework + kotlin stdlib shims) still resolve; a name with
+            // no dex def and no host shim is genuinely absent, and a real
+            // ClassNotFoundException is what guests expect when probing
+            // optional dependencies (GMS, generated lifecycle adapters).
+            let host_known = d.starts_with('[')
+                || [
+                    "Ljava/", "Ljavax/", "Lsun/", "Lcom/sun/", "Landroid/", "Lkotlin/",
+                    "Lkotlinx/", "Lorg/json/", "Lorg/xmlpull/", "Lorg/apache/",
+                ]
+                .iter()
+                .any(|p| d.starts_with(p));
+            if !in_dex && !host_known {
+                return Err(vm.throw_builtin("Ljava/lang/ClassNotFoundException;", &d));
+            }
             Some(Some(class_obj(vm, d)))
         }
         "getName" | "getCanonicalName" | "getTypeName" => {
-            let d = s(vm, match args[0] { V::Ref(h) => h, _ => 0 })
+            let d = class_desc_of(vm, match args[0] { V::Ref(h) => h, _ => 0 })
                 .unwrap_or_else(|| class_of(vm, args[0]));
             Some(Some(jstr(vm, &dotted(&d))))
         }
         "getSimpleName" => {
-            let d = s(vm, match args[0] { V::Ref(h) => h, _ => 0 })
+            let d = class_desc_of(vm, match args[0] { V::Ref(h) => h, _ => 0 })
                 .unwrap_or_else(|| class_of(vm, args[0]));
             let base = dotted(&d);
             let short = base.rsplit(['.', '$']).next().unwrap_or(&base).to_string();
             Some(Some(jstr(vm, &short)))
         }
         "getPackageName" | "getPackage" => {
-            let d = s(vm, match args[0] { V::Ref(h) => h, _ => 0 }).unwrap_or_default();
+            let d = class_desc_of(vm, match args[0] { V::Ref(h) => h, _ => 0 }).unwrap_or_default();
             let base = dotted(&d);
             let pkg = base.rsplit_once('.').map(|(p, _)| p).unwrap_or("");
             if name == "getPackageName" {
                 Some(Some(jstr(vm, pkg)))
             } else {
-                Some(Some(V::Ref(0)))
+                Some(Some(host(
+                    vm,
+                    "Ljava/lang/Package;",
+                    HostState::StrBuf(pkg.into()),
+                )))
             }
         }
         "isInterface" | "isPrimitive" | "isEnum" | "isAnnotation" | "isSynthetic"
         | "isAnonymousClass" | "isLocalClass" | "isMemberClass" | "isSealed"
         | "isRecord" | "isHidden" | "isAnnotationPresent" => Some(Some(V::I32(0))),
         "isArray" => {
-            let d = s(vm, match args[0] { V::Ref(h) => h, _ => 0 }).unwrap_or_default();
+            let d = class_desc_of(vm, match args[0] { V::Ref(h) => h, _ => 0 }).unwrap_or_default();
             Some(Some(V::I32(d.starts_with('[') as i32)))
         }
         "isInstance" => {
-            let want = s(vm, match args[0] { V::Ref(h) => h, _ => 0 }).unwrap_or_default();
+            let want = class_desc_of(vm, match args[0] { V::Ref(h) => h, _ => 0 })
+                .unwrap_or_default();
             let got = class_of(vm, args[1]);
             Some(Some(V::I32(desc_is_a(&got, &want) as i32)))
         }
         "isAssignableFrom" => {
-            let a = s(vm, match args[0] { V::Ref(h) => h, _ => 0 }).unwrap_or_default();
-            let b = s(vm, match args[1] { V::Ref(h) => h, _ => 0 }).unwrap_or_default();
+            let a = class_desc_of(vm, match args[0] { V::Ref(h) => h, _ => 0 })
+                .unwrap_or_default();
+            let b = class_desc_of(vm, match args[1] { V::Ref(h) => h, _ => 0 })
+                .unwrap_or_default();
             Some(Some(V::I32(desc_is_a(&b, &a) as i32)))
         }
         "getSuperclass" => {
@@ -1342,7 +1369,7 @@ fn class_call(vm: &mut Vm, name: &str, _sig: &str, args: &[V]) -> Rt<Option<Opti
         | "getGenericSuperclass" | "getAnnotation" | "getDeclaredAnnotation"
         | "describeConstable" | "getModifiers0" => Some(Some(V::Ref(0))),
         "getModifiers" => Some(Some(V::I32(1))),
-        "cast" | "asSubclass" => Some(Some(args[0])),
+        "cast" | "asSubclass" => Some(Some(args.get(1).copied().unwrap_or(args[0]))),
         "desiredAssertionStatus" => Some(Some(V::I32(0))),
         "arrayType" | "componentType" => Some(Some(V::Ref(0))),
         "toString" => {
@@ -1454,33 +1481,80 @@ fn thread_call(vm: &mut Vm, name: &str, _sig: &str, args: &[V]) -> Rt<Option<Opt
     })
 }
 
+fn package_call(vm: &mut Vm, name: &str, sig: &str, args: &[V]) -> Option<Option<V>> {
+    match name {
+        "getName" | "getImplementationTitle" | "getSpecificationTitle"
+        | "getImplementationVendor" | "getSpecificationVendor"
+        | "getImplementationVersion" | "getSpecificationVersion" => {
+            let t = s(vm, match args[0] { V::Ref(h) => h, _ => 0 }).unwrap_or_default();
+            Some(Some(jstr(vm, &t)))
+        }
+        _ => Some(Some(stub_ret(vm, sig))),
+    }
+}
+
 fn threadlocal_call(vm: &mut Vm, name: &str, args: &[V]) -> Option<Option<V>> {
     match name {
-        "get" => Some(Some(match args[0] {
-            V::Ref(h) => slot_of(vm, h).unwrap_or(V::Ref(0)),
-            _ => V::Ref(0),
-        })),
+        "get" => {
+            let V::Ref(h) = args[0] else {
+                return Some(Some(V::Ref(0)));
+            };
+            let cur = slot_of(vm, h)
+                .or_else(|| pseudo_get(vm, h, P_TARGET))
+                .unwrap_or(V::Ref(0));
+            if !matches!(cur, V::Ref(0) | V::I32(0)) {
+                return Some(Some(cur));
+            }
+            // First access: `initialValue` is virtual so a dex-defined
+            // subclass (desugared ThreadLocalRandom's `u`) supplies it;
+            // `withInitial` locals call their stored supplier instead.
+            let init = match pseudo_get(vm, h, P_DATA) {
+                Some(V::Ref(sup)) if sup != 0 => vm
+                    .call_virtual(sup, "get", &[])
+                    .ok()
+                    .flatten()
+                    .unwrap_or(V::Ref(0)),
+                _ => vm
+                    .call_virtual(h, "initialValue", &[])
+                    .ok()
+                    .flatten()
+                    .unwrap_or(V::Ref(0)),
+            };
+            if let Some(Obj::Host {
+                state: HostState::Slot(s),
+                ..
+            }) = vm.heap.get_mut(h)
+            {
+                *s = init;
+            } else {
+                // Dex-defined ThreadLocal subclass: cache on a pseudo field
+                // so repeated get() returns the same value.
+                pseudo_set(vm, h, P_TARGET, init);
+            }
+            Some(Some(init))
+        }
         "set" | "remove" => {
             if let V::Ref(h) = args[0] {
+                let v = if name == "set" { args[1] } else { V::Ref(0) };
                 if let Some(Obj::Host {
                     state: HostState::Slot(s),
                     ..
                 }) = vm.heap.get_mut(h)
                 {
-                    *s = if name == "set" {
-                        args[1]
-                    } else {
-                        V::Ref(0)
-                    };
+                    *s = v;
+                } else {
+                    pseudo_set(vm, h, P_TARGET, v);
                 }
             }
             Some(None)
         }
-        "withInitial" => Some(Some(host(
-            vm,
-            "Ljava/lang/ThreadLocal;",
-            HostState::Slot(V::Ref(0)),
-        ))),
+        "withInitial" => {
+            let hv = host(vm, "Ljava/lang/ThreadLocal;", HostState::Slot(V::Ref(0)));
+            if let V::Ref(h) = hv {
+                pseudo_set(vm, h, P_DATA, args.get(1).copied().unwrap_or(V::Ref(0)));
+            }
+            Some(Some(hv))
+        }
         "initialValue" => Some(Some(V::Ref(0))),
         _ => None,
     }
@@ -1494,11 +1568,36 @@ fn throwable_call(vm: &mut Vm, name: &str, _sig: &str, args: &[V]) -> Rt<Option<
         return Ok(None);
     };
     Ok(match name {
-        "getMessage" | "getLocalizedMessage" => {
-            Some(Some(slot_of(vm, h).unwrap_or(V::Ref(0))))
+        "<init>" => {
+            // Throwable(msg) / Throwable(cause) / Throwable(msg, cause):
+            // host classes have no dex <init> — store the args on pseudo
+            // fields so getMessage/getCause and crash reporting see them.
+            for &a in args.iter().skip(1) {
+                match a {
+                    V::Ref(fh) if fh != 0 => match vm.heap.get(fh) {
+                        Some(Obj::Str(_)) => {
+                            pseudo_set(vm, h, P_DATA, a);
+                            field_set(vm, h, THROWABLE, "detailMessage", a);
+                        }
+                        _ => {
+                            field_set(vm, h, THROWABLE, "cause", a);
+                            pseudo_set(vm, h, P_TARGET, a);
+                        }
+                    },
+                    _ => {}
+                }
+            }
+            Some(None)
         }
+        "getMessage" | "getLocalizedMessage" => Some(Some(
+            slot_of(vm, h)
+                .or_else(|| pseudo_get(vm, h, P_DATA))
+                .or_else(|| field_get(vm, h, THROWABLE, "detailMessage"))
+                .unwrap_or(V::Ref(0)),
+        )),
         "getCause" => Some(Some(
-            field_get(vm, h, THROWABLE, "cause")
+            pseudo_get(vm, h, P_TARGET)
+                .or_else(|| field_get(vm, h, THROWABLE, "cause"))
                 .or_else(|| field_get(vm, h, "Ljava/lang/Exception;", "cause"))
                 .unwrap_or(V::Ref(0)),
         )),
@@ -1528,28 +1627,46 @@ fn throwable_call(vm: &mut Vm, name: &str, _sig: &str, args: &[V]) -> Rt<Option<
 /// `SomeEnum.values()` — the constants are the class's static fields
 /// of its own type, already initialized by `<clinit>` into `statics`.
 fn enum_values(vm: &mut Vm, class: &str) -> V {
+    let vals = enum_value_list(vm, class);
+    arr(vm, class, vals)
+}
+
+/// The enum constants of `class` in declaration order.
+pub(crate) fn enum_value_list(vm: &mut Vm, class: &str) -> Vec<V> {
     let mut vals = Vec::new();
-    for cd in vm.dex.class_defs() {
-        if vm.dex.type_descriptor(cd.class_idx).ok().as_deref() != Some(class) {
-            continue;
-        }
-        let Ok(data) = vm.dex.class_data(cd) else { continue };
-        for ef in &data.static_fields {
-            let is_const = vm
-                .dex
-                .field(ef.field_idx)
-                .ok()
-                .and_then(|f| vm.dex.type_descriptor(f.type_idx as u32).ok())
-                .as_deref()
-                == Some(class);
-            if is_const {
-                if let Some(v) = vm.static_of(cd.class_idx, ef.field_idx) {
-                    vals.push(v);
+    for (di, d) in vm.all_dexes().iter().enumerate() {
+        for cd in d.class_defs() {
+            if d.type_descriptor(cd.class_idx).ok().as_deref() != Some(class) {
+                continue;
+            }
+            let Ok(data) = d.class_data(cd) else { continue };
+            for ef in &data.static_fields {
+                let is_const = d
+                    .field(ef.field_idx)
+                    .ok()
+                    .and_then(|f| d.type_descriptor(f.type_idx as u32).ok())
+                    .as_deref()
+                    == Some(class);
+                if is_const {
+                    if let Some(v) = vm.static_of(
+                        crate::gx(di, cd.class_idx),
+                        crate::gx(di, ef.field_idx),
+                    ) {
+                        vals.push(v);
+                    }
                 }
             }
         }
     }
-    arr(vm, class, vals)
+    vals
+}
+
+/// An enum constant's `ordinal()` as stored by `Enum.<init>`.
+pub(crate) fn enum_ordinal(vm: &Vm, v: V) -> i32 {
+    match v {
+        V::Ref(h) => i32v(pseudo_get(vm, h, P_FLAGS).unwrap_or(V::I32(0))),
+        _ => 0,
+    }
 }
 
 fn enum_call(vm: &mut Vm, class: &str, name: &str, args: &[V]) -> Rt<Option<Option<V>>> {
@@ -1641,6 +1758,27 @@ fn reflect_call(
         .and_then(|v| sv(vm, v))
         .unwrap_or_default();
     Ok(match name {
+        _ if class == "Ljava/lang/reflect/Modifier;" => {
+            // Static `Modifier.isX(int)` predicates over the
+            // java.lang.reflect modifier bit set.
+            let m = i64v(args.first().copied().unwrap_or(V::I32(0))) as u32;
+            let bit = match name {
+                "isPublic" => 0x0001,
+                "isPrivate" => 0x0002,
+                "isProtected" => 0x0004,
+                "isStatic" => 0x0008,
+                "isFinal" => 0x0010,
+                "isSynchronized" => 0x0020,
+                "isVolatile" => 0x0040,
+                "isTransient" => 0x0080,
+                "isNative" => 0x0100,
+                "isInterface" => 0x0200,
+                "isAbstract" => 0x0400,
+                "isStrict" => 0x0800,
+                _ => return Ok(None),
+            };
+            Some(Some(V::I32(if m & bit != 0 { 1 } else { 0 })))
+        }
         "getName" => Some(Some(jstr(vm, &member))),
         "getDeclaringClass" => Some(Some(class_obj(vm, owner))),
         "getModifiers" => Some(Some(V::I32(1))),
@@ -1690,12 +1828,22 @@ fn reflect_call(
             }
         }
         "newInstance" if class.contains("Constructor") => {
-            match vm.instantiate(&owner) {
+            // args: [ctor_mirror, argv_array] — run the `<init>` the
+            // caller supplies (PreferenceInflater's (Context, attrs)),
+            // not a default-ctor guess.
+            let argv: Vec<V> = match args.get(1) {
+                Some(V::Ref(a)) => match vm.heap.get(*a) {
+                    Some(Obj::Array { data, .. }) => data.clone(),
+                    _ => vec![],
+                },
+                _ => vec![],
+            };
+            match vm.instantiate_with(&owner, &argv) {
                 Ok(nh) => Some(Some(V::Ref(nh))),
-                Err(_) => {
+                Err(e) => {
                     let t = vm.throw_builtin(
                         "Ljava/lang/InstantiationException;",
-                        &owner,
+                        &format!("{owner}: {e}"),
                     );
                     return Err(t);
                 }
@@ -1703,9 +1851,9 @@ fn reflect_call(
         }
         _ if class.contains("Field") => {
             let fid = vm
-                .dex
                 .field_index_of(&owner, &member)
-                .unwrap_or(P_DATA);
+                .map(|g| vm.canon_field(g))
+                .unwrap_or(P_DATA as u64);
             match name {
                 "get" | "getInt" | "getLong" | "getBoolean" | "getByte"
                 | "getShort" | "getChar" | "getFloat" | "getDouble" => {
@@ -1813,21 +1961,29 @@ fn unsafe_key(args: &[V]) -> Option<(u32, i64)> {
 const UNSAFE_STATIC_BASE: &str = "Lsun/misc/Unsafe$StaticBase;";
 
 fn unsafe_read(vm: &mut Vm, obj: u32, off: i64) -> V {
+    // Array-element ops (arrayBaseOffset=0, scale=1 ⇒ off == index).
+    if let Some(Obj::Array { data, .. }) = vm.heap.get(obj) {
+        return data.get(off as usize).copied().unwrap_or(V::Ref(0));
+    }
     if off < UNSAFE_TOKEN_BASE {
         // Static base: the offset indexes the owning class's statics.
         if let Some(Obj::Host { desc, .. }) = vm.heap.get(obj) {
             if desc == UNSAFE_STATIC_BASE {
                 let owner = pseudo_get(vm, obj, P_DATA)
-                    .map(|v| i32v(v) as u32)
-                    .unwrap_or(u32::MAX);
+                    .map(|v| match v {
+                        V::I64(x) => x as u64,
+                        V::I32(x) => x as u64,
+                        _ => crate::GX_NONE,
+                    })
+                    .unwrap_or(crate::GX_NONE);
                 return vm
-                    .static_read(owner, off as u32)
+                    .static_read(owner, off as u64)
                     .unwrap_or(V::I32(0));
             }
         }
         return match vm.heap.get(obj) {
             Some(Obj::Instance { fields, .. }) | Some(Obj::Host { fields, .. }) => {
-                fields.get(&(off as u32)).copied().unwrap_or(V::I32(0))
+                fields.get(&(off as u64)).copied().unwrap_or(V::I32(0))
             }
             _ => V::I32(0),
         };
@@ -1839,18 +1995,31 @@ fn unsafe_read(vm: &mut Vm, obj: u32, off: i64) -> V {
 }
 
 fn unsafe_write(vm: &mut Vm, obj: u32, off: i64, v: V) {
+    // Array-element ops (arrayBaseOffset=0, scale=1 ⇒ off == index).
+    if let Some(Obj::Array { .. }) = vm.heap.get(obj) {
+        if let Some(Obj::Array { data, .. }) = vm.heap.get_mut(obj) {
+            if (off as usize) < data.len() {
+                data[off as usize] = v;
+            }
+        }
+        return;
+    }
     if off < UNSAFE_TOKEN_BASE {
         if let Some(Obj::Host { desc, .. }) = vm.heap.get(obj) {
             if desc == UNSAFE_STATIC_BASE {
                 let owner = pseudo_get(vm, obj, P_DATA)
-                    .map(|v| i32v(v) as u32)
-                    .unwrap_or(u32::MAX);
-                vm.static_write(owner, off as u32, v);
+                    .map(|v| match v {
+                        V::I64(x) => x as u64,
+                        V::I32(x) => x as u64,
+                        _ => crate::GX_NONE,
+                    })
+                    .unwrap_or(crate::GX_NONE);
+                vm.static_write(owner, off as u64, v);
                 return;
             }
         }
         if let Some(f) = fields_mut(vm, obj) {
-            f.insert(off as u32, v);
+            f.insert(off as u64, v);
         }
         return;
     }
@@ -1870,7 +2039,8 @@ fn unsafe_call(vm: &mut Vm, name: &str, args: &[V]) -> Rt<Option<Option<V>>> {
         "objectFieldOffset" | "staticFieldOffset" => {
             // Same field, same offset — resolve the mirror's owner+name to
             // the real field id so reads share storage with `iget`/`iput`.
-            let h = match args.first() {
+            // args[0] is the Unsafe receiver; args[1] is the Field mirror.
+            let h = match args.get(1) {
                 Some(V::Ref(h)) => *h,
                 _ => 0,
             };
@@ -1879,13 +2049,15 @@ fn unsafe_call(vm: &mut Vm, name: &str, args: &[V]) -> Rt<Option<Option<V>>> {
                 .and_then(|v| sv(vm, v))
                 .unwrap_or_default();
             let off = vm
-                .dex
                 .field_index_of(&owner, &member)
-                .map(|f| f as i64)
+                .map(|f| vm.canon_field(f) as i64)
                 .unwrap_or_else(|| {
                     vm.unsafe_next_offset += 1;
                     UNSAFE_TOKEN_BASE + vm.unsafe_next_offset
                 });
+            if std::env::var("OVELO_TRACE_FIELD").is_ok() {
+                eprintln!("[ftrace] {name} {owner}.{member} -> {off:#x}");
+            }
             Some(V::I64(off))
         }
         "staticFieldBase" => {
@@ -1898,15 +2070,10 @@ fn unsafe_call(vm: &mut Vm, name: &str, args: &[V]) -> Rt<Option<Option<V>>> {
             let owner = pseudo_get(vm, h, P_COMPONENT)
                 .and_then(|v| sv(vm, v))
                 .unwrap_or_default();
-            let owner_idx = vm
-                .dex
-                .type_index_of(&owner)
-                .ok()
-                .flatten()
-                .unwrap_or(u32::MAX);
+            let owner_idx = vm.type_index_of(&owner).unwrap_or(crate::GX_NONE);
             let base = V::Ref(vm.alloc_host(UNSAFE_STATIC_BASE, HostState::Empty));
             if let V::Ref(bh) = base {
-                pseudo_set(vm, bh, P_DATA, V::I32(owner_idx as i32));
+                pseudo_set(vm, bh, P_DATA, V::I64(owner_idx as i64));
             }
             Some(base)
         }
@@ -1927,6 +2094,9 @@ fn unsafe_call(vm: &mut Vm, name: &str, args: &[V]) -> Rt<Option<Option<V>>> {
         "getObject" | "getObjectVolatile" | "getAndSetObject" => {
             let (o, k) = unsafe_key(args).unwrap_or((0, 0));
             let old = unsafe_read(vm, o, k);
+            if std::env::var("OVELO_TRACE_FIELD").is_ok() {
+                eprintln!("[ftrace] {name} obj={o} off={k:#x} -> {old:?}");
+            }
             let old = if matches!(old, V::I32(0) | V::I64(0)) {
                 V::Ref(0)
             } else {
@@ -2020,7 +2190,7 @@ fn unsafe_call(vm: &mut Vm, name: &str, args: &[V]) -> Rt<Option<Option<V>>> {
                 _ => 0,
             })
             .unwrap_or_default();
-            let idx = vm.dex.type_index_of(&d).ok().flatten();
+            let idx = vm.type_index_of(&d);
             Some(V::I32(match idx {
                 Some(i) => !vm.class_initialized(i) as i32,
                 None => 0,
@@ -2032,7 +2202,7 @@ fn unsafe_call(vm: &mut Vm, name: &str, args: &[V]) -> Rt<Option<Option<V>>> {
                 _ => 0,
             })
             .unwrap_or_default();
-            if let Some(i) = vm.dex.type_index_of(&d).ok().flatten() {
+            if let Some(i) = vm.type_index_of(&d) {
                 vm.ensure_class_init(i)?;
             }
             None

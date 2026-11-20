@@ -32,17 +32,17 @@ impl V {
     }
 }
 
-/// A heap object. `Instance` fields are keyed by `field_idx` (per the DEX
-/// field table), not by slot — field order differences across classes can't
-/// alias.
+/// A heap object. `Instance` fields are keyed by global `field_idx`
+/// (`(dex_i << 32) | local_idx`), not by slot — field order differences
+/// across classes can't alias, and multi-dex indexes can't collide.
 #[derive(Debug)]
 pub enum Obj {
     /// Class instance.
     Instance {
-        /// `type_idx` of the class.
-        class_idx: u32,
-        /// `field_idx` → value.
-        fields: HashMap<u32, V>,
+        /// Global `type_idx` of the class.
+        class_idx: u64,
+        /// Global `field_idx` → value.
+        fields: HashMap<u64, V>,
     },
     /// Array (primitive or reference — elements keep their own type).
     Array {
@@ -55,8 +55,8 @@ pub enum Obj {
     Str(String),
     /// `java.lang.Class` mirror for `const-class`.
     Class {
-        /// `type_idx` the literal names.
-        type_idx: u32,
+        /// Global `type_idx` the literal names.
+        type_idx: u64,
     },
     /// Throwable object (thrown by VM builtins or guest `throw`).
     Throwable {
@@ -71,14 +71,14 @@ pub enum Obj {
     /// through iget); `state` is the builtin payload the class's methods
     /// operate on (StringBuilder buffer, collection contents, …).
     Host {
-        /// `type_idx` of the referenced class — `u32::MAX` when the
-        /// descriptor isn't in this DEX's type table (builtin-created
+        /// Global `type_idx` of the referenced class — `u64::MAX` when the
+        /// descriptor isn't in any loaded DEX's type table (builtin-created
         /// objects); `desc` always names the class.
-        class_idx: u32,
+        class_idx: u64,
         /// Class descriptor (e.g. `Ljava/util/ArrayList;`).
         desc: String,
-        /// `field_idx` → value, same keying as `Instance`.
-        fields: HashMap<u32, V>,
+        /// Global `field_idx` → value, same keying as `Instance`.
+        fields: HashMap<u64, V>,
         /// Builtin state chosen by the class descriptor.
         state: HostState,
     },
@@ -106,6 +106,51 @@ pub enum HostState {
     Path(String),
     /// A regex pattern string (`java.util.regex.Pattern`).
     Regex(String),
+    /// An `XmlResourceParser`: binary-XML elements plus a precomputed
+    /// pull-parser event stream and the cursor into it.
+    Xml {
+        /// Document elements in document order (start-elements only).
+        elements: std::rc::Rc<Vec<ovelo_apk::manifest::Element>>,
+        /// Pull-parser events; element indices refer into `elements`.
+        events: Vec<XmlEvent>,
+        /// Cursor: index of the current event in `events`.
+        pos: usize,
+    },
+}
+
+/// One `XmlPullParser` event inside an [`HostState::Xml`] stream.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum XmlEvent {
+    /// `XmlPullParser.START_DOCUMENT`.
+    StartDocument,
+    /// `XmlPullParser.START_TAG` for element at the given index.
+    Start(usize),
+    /// `XmlPullParser.END_TAG` for element at the given index.
+    End(usize),
+    /// `XmlPullParser.END_DOCUMENT`.
+    EndDocument,
+}
+
+/// Build the pull-parser event stream for flat start-elements:
+/// `START_DOCUMENT`, per-element `START_TAG`/`END_TAG` reconstructed
+/// from recorded depths, then `END_DOCUMENT`.
+pub fn xml_events(elements: &[ovelo_apk::manifest::Element]) -> Vec<XmlEvent> {
+    let mut events = vec![XmlEvent::StartDocument];
+    let mut stack: Vec<usize> = Vec::new();
+    for (i, el) in elements.iter().enumerate() {
+        while stack.len() > el.depth {
+            if let Some(open) = stack.pop() {
+                events.push(XmlEvent::End(open));
+            }
+        }
+        events.push(XmlEvent::Start(i));
+        stack.push(i);
+    }
+    while let Some(open) = stack.pop() {
+        events.push(XmlEvent::End(open));
+    }
+    events.push(XmlEvent::EndDocument);
+    events
 }
 
 /// Object heap with string interning.
@@ -158,9 +203,9 @@ impl Heap {
         }
     }
 
-    /// Class type index of a handle (`Instance`/`Host`/`Throwable` report
-    /// their class descriptor index where applicable).
-    pub fn class_of(&self, h: u32) -> Option<u32> {
+    /// Global class type index of a handle (`Instance`/`Host`/`Throwable`
+    /// report their class descriptor index where applicable).
+    pub fn class_of(&self, h: u32) -> Option<u64> {
         match self.get(h)? {
             Obj::Instance { class_idx, .. } | Obj::Host { class_idx, .. } => Some(*class_idx),
             _ => None,

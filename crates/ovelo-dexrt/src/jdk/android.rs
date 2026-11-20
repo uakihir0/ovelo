@@ -122,6 +122,25 @@ pub(crate) fn call(
         || class.ends_with("Resources;")
     {
         resources_call(vm, name, args)?
+    } else if class == "Landroid/util/Xml;" {
+        match name {
+            // The parser IS its own AttributeSet — hand back the same
+            // handle so attribute reads follow the cursor.
+            "asAttributeSet" => {
+                Some(Some(args.first().copied().unwrap_or(V::Ref(0))))
+            }
+            "newPullParser" => Some(Some(host(
+                vm,
+                "Landroid/content/res/XmlResourceParser;",
+                HostState::Empty,
+            ))),
+            _ => None,
+        }
+    } else if class == "Landroid/content/res/XmlResourceParser;"
+        || class == "Lorg/xmlpull/v1/XmlPullParser;"
+        || class == "Lorg/xmlpull/v1/XmlPullParserException;"
+    {
+        xml::pull_call(vm, class, name, sig, args)?
     } else if class == "Landroid/util/DisplayMetrics;"
         || class == "Landroid/content/res/Configuration;"
         || class == "Landroid/content/res/TypedArray;"
@@ -129,6 +148,7 @@ pub(crate) fn call(
         || class == "Landroid/content/res/ColorStateList;"
         || class == "Landroid/content/res/AssetManager;"
         || class == "Landroid/content/res/Resources$Theme;"
+        || class == "Landroid/os/LocaleList;"
     {
         res_misc(vm, class, name, args)?
     } else if class == "Landroid/os/Handler;" || class.ends_with("Handler;") {
@@ -331,8 +351,101 @@ pub(crate) fn call(
         || class == "Landroid/util/AttributeSet;"
     {
         graphics_call(vm, class, name, args)?
+    } else if class == "Landroid/view/ViewConfiguration;"
+        || class == "Landroid/view/Gravity;"
+    {
+        viewconfig_call(vm, class, name, args)?
+    } else if view::is_viewish(vm, class, args) {
+        view::call(vm, class, name, sig, args)?
     } else {
         return Ok(None);
+    })
+}
+
+/// `(receiver, styleable index)` for TypedArray accessors — args[0] is
+/// `this`, args[1] the int index.
+fn ta_index(vm: &Vm, args: &[V]) -> Option<(u32, usize)> {
+    let _ = vm;
+    let h = match args.first() {
+        Some(V::Ref(h)) => *h,
+        _ => return None,
+    };
+    Some((h, i64v(args.get(1).copied().unwrap_or(V::I32(0))) as usize))
+}
+
+// ---------------------------------------------------------------------
+// ViewConfiguration / Gravity
+
+fn viewconfig_call(
+    vm: &mut Vm,
+    class: &str,
+    name: &str,
+    args: &[V],
+) -> Rt<Option<Option<V>>> {
+    Ok(match (class, name) {
+        // int getAbsoluteGravity(int gravity, int layoutDirection):
+        // resolves START/END bits against the direction (AOSP semantics).
+        ("Landroid/view/Gravity;", "getAbsoluteGravity") => {
+            let mut result = i64v(args.first().copied().unwrap_or(V::I32(0))) as i32;
+            let dir = i64v(args.get(1).copied().unwrap_or(V::I32(0))) as i32;
+            const RELATIVE_LAYOUT_DIRECTION: i32 = 0x0080_0000;
+            const START: i32 = 0x0080_0003;
+            const END: i32 = 0x0080_0005;
+            const LEFT: i32 = 0x0000_0003;
+            const RIGHT: i32 = 0x0000_0005;
+            if result > 0 && (result & RELATIVE_LAYOUT_DIRECTION) == RELATIVE_LAYOUT_DIRECTION
+            {
+                result &= !RELATIVE_LAYOUT_DIRECTION;
+                if dir == 1 {
+                    // RTL: START→RIGHT, END→LEFT
+                    if (result & START) == START {
+                        result = (result & !START) | RIGHT;
+                    } else if (result & END) == END {
+                        result = (result & !END) | LEFT;
+                    }
+                } else {
+                    if (result & START) == START {
+                        result = (result & !START) | LEFT;
+                    } else if (result & END) == END {
+                        result = (result & !END) | RIGHT;
+                    }
+                }
+            }
+            Some(Some(V::I32(result)))
+        }
+        ("Landroid/view/Gravity;", "isVertical" | "isHorizontal") => {
+            Some(Some(V::I32(0)))
+        }
+        ("Landroid/view/Gravity;", _) => Some(None),
+        ("Landroid/view/ViewConfiguration;", "get") => Some(Some(host(
+            vm,
+            "Landroid/view/ViewConfiguration;",
+            HostState::Empty,
+        ))),
+        ("Landroid/view/ViewConfiguration;", _) => {
+            let n: i32 = match name {
+                "getScaledTouchSlop" | "getScaledPagingTouchSlop" => 16,
+                "getScaledMinimumFlingVelocity" => 50,
+                "getScaledMaximumFlingVelocity" => 8000,
+                "getScaledEdgeSlop" | "getFadingEdgeLength" => 12,
+                "getScaledOverscrollDistance" => 0,
+                "getScaledOverflingDistance" => 6,
+                "getScaledMinScalingSpan" => 27,
+                "getLongPressTimeout" | "getKeyRepeatTimeout" => 500,
+                "getTapTimeout" => 180,
+                "getDoubleTapTimeout" => 300,
+                "getKeyRepeatDelay" => 50,
+                "getPressedStateDuration" => 125,
+                "getScrollBarFadeDuration" | "getScrollDefaultDelay" => 300,
+                _ => 0,
+            };
+            if name == "getScaledScrollFactor" {
+                Some(Some(V::F32(0.0)))
+            } else {
+                Some(Some(V::I32(n)))
+            }
+        }
+        _ => None,
     })
 }
 
@@ -963,11 +1076,7 @@ fn context_call(
             "Landroid/content/ContentResolver;",
             HostState::Empty,
         ))),
-        "getMainLooper" | "getLooper" => Some(Some(host(
-            vm,
-            "Landroid/os/Looper;",
-            HostState::Empty,
-        ))),
+        "getMainLooper" | "getLooper" => Some(Some(main_looper(vm))),
         "getMainExecutor" | "getMainHandler" => Some(Some(host(
             vm,
             "Landroid/os/Handler;",
@@ -978,6 +1087,9 @@ fn context_call(
             "Landroid/content/res/Resources;",
             HostState::Empty,
         ))),
+        "obtainStyledAttributes" | "obtainAttributes" => {
+            Some(Some(view::typed_array(vm, args)))
+        }
         "getTheme" => Some(Some(host(
             vm,
             "Landroid/content/res/Resources$Theme;",
@@ -1047,7 +1159,11 @@ fn context_call(
                 Some("wallpaper") => "Landroid/app/WallpaperManager;",
                 _ => "Ljava/lang/Object;",
             };
-            Some(Some(host(vm, desc, HostState::Empty)))
+            if desc == "Landroid/view/LayoutInflater;" {
+                Some(Some(view::inflater(vm, args.first().copied())))
+            } else {
+                Some(Some(host(vm, desc, HostState::Empty)))
+            }
         }
         "getSystemServiceName" => {
             Some(Some(jstr(vm, "java.lang.Object")))
@@ -1158,7 +1274,7 @@ fn context_call(
             "Landroid/content/Intent;",
             HostState::Map(vec![]),
         ))),
-        "setIntent" | "setContentView" | "addContentView" | "requestWindowFeature"
+        "setIntent" | "requestWindowFeature"
         | "setTitle" | "setTitleColor" | "setVisible" | "setResult"
         | "setRequestedOrientation" | "setTaskDescription"
         | "registerActivityLifecycleCallbacks"
@@ -1184,10 +1300,40 @@ fn context_call(
         | "startLockTask" | "stopLockTask" | "requestFullscreenMode"
         | "reportFullyDrawn" | "dismissKeyboardShortcutsHelper"
         | "dismissKeyguard" | "onProvideKeyboardShortcuts" => Some(None),
-        "findViewById" => Some(Some(V::Ref(0))),
+        // Activity.findViewById searches the decor tree under the content
+        // view set by setContentView; miss → null like real Android.
+        "findViewById" => {
+            let act = match args.first() {
+                Some(V::Ref(h)) => *h,
+                _ => 0,
+            };
+            let id = i32v(args.get(1).copied().unwrap_or(V::I32(0)));
+            let hit = view::content_root(vm, act)
+                .and_then(|root| view::find_in_tree(vm, root, id))
+                .unwrap_or(0);
+            Some(Some(V::Ref(hit)))
+        }
+        "setContentView" | "addContentView" => {
+            let act = match args.first() {
+                Some(V::Ref(h)) => *h,
+                _ => 0,
+            };
+            view::set_content_view(vm, act, args.get(1).copied().unwrap_or(V::Ref(0)));
+            Some(None)
+        }
         "setContentView_Int" => Some(None),
-        "getWindow" | "getWindowManager" | "getActionBar" | "getFragmentManager"
-        | "getLoaderManager" | "getMenuInflater" | "getLayoutInflater"
+        "getWindow" => {
+            let act = match args.first() {
+                Some(V::Ref(h)) => *h,
+                _ => 0,
+            };
+            Some(Some(V::Ref(view::window_of(vm, act).unwrap_or(0))))
+        }
+        "getLayoutInflater" | "getMenuInflater" => {
+            Some(Some(view::inflater(vm, args.first().copied())))
+        }
+        "getWindowManager" | "getActionBar" | "getFragmentManager"
+        | "getLoaderManager"
         | "getMediaController" | "getSearchEvent" | "getCallingActivity"
         | "getCallingPackage" | "getReferrer" | "getTaskId" | "getMaxNumPictureInPictureActions"
         | "getParentActivityIntent" | "getLocalClassName" | "getComponentName"
@@ -1195,7 +1341,7 @@ fn context_call(
         | "getCurrentFocus" | "getLastNonConfigurationInstance"
         | "onRetainNonConfigurationInstance" | "isTaskRoot"
         | "isFinishing" | "isDestroyed" | "isChangingConfigurations"
-        | "isInMultiWindowMode" | "isInPictureInPictureMode"
+        | "isInMultiWindowMode" | "isInPictureInPictureMode" | "isChild"
         | "isImmersive" | "isLaunchedFromBubble" | "isLocalVoiceInteractionSupported"
         | "hasWindowFocus" | "moveTaskToBack" | "finish" | "finishAffinity"
         | "finishActivity" | "finishActivityFromChild" | "finishAfterTransition"
@@ -1205,7 +1351,7 @@ fn context_call(
             match name {
                 "getTaskId" => Some(Some(V::I32(1))),
                 "isTaskRoot" | "hasWindowFocus" | "isInMultiWindowMode"
-                | "isInPictureInPictureMode" | "isImmersive"
+                | "isInPictureInPictureMode" | "isImmersive" | "isChild"
                 | "isLaunchedFromBubble" | "isLocalVoiceInteractionSupported"
                 | "isFinishing" | "isDestroyed" | "isChangingConfigurations" => {
                     Some(Some(V::I32(
@@ -1294,15 +1440,15 @@ fn pm_call(vm: &mut Vm, name: &str, _args: &[V]) -> Rt<Option<Option<V>>> {
             let pkg = vm.guest_package.clone().unwrap_or_else(|| "app".into());
             let pv = jstr(vm, &pkg);
             pseudo_set(vm, h, P_ACTION, pv);
-            if let Some(fidx) = vm.dex.field_index_of(
-                "Landroid/content/pm/PackageInfo;",
-                "packageName",
-            ) {
+            if let Some(fidx) = vm
+                .field_index_of("Landroid/content/pm/PackageInfo;", "packageName")
+                .map(|g| vm.canon_field(g))
+            {
                 pseudo_set(vm, h, fidx, pv);
             }
             if let Some(fidx) = vm
-                .dex
                 .field_index_of("Landroid/content/pm/PackageInfo;", "versionCode")
+                .map(|g| vm.canon_field(g))
             {
                 pseudo_set(vm, h, fidx, V::I32(1));
             }
@@ -1346,6 +1492,26 @@ fn pm_call(vm: &mut Vm, name: &str, _args: &[V]) -> Rt<Option<Option<V>>> {
         | "updateInstantAppCookie" | "clearInstantAppCookie" | "getModuleInfo"
         | "getInstallReason" | "getInstallSourceInfo" => {
             match name {
+                "getActivityInfo" => Some(Some(host(
+                    vm,
+                    "Landroid/content/pm/ActivityInfo;",
+                    HostState::Empty,
+                ))),
+                "getServiceInfo" => Some(Some(host(
+                    vm,
+                    "Landroid/content/pm/ServiceInfo;",
+                    HostState::Empty,
+                ))),
+                "getReceiverInfo" => Some(Some(host(
+                    vm,
+                    "Landroid/content/pm/ActivityInfo;",
+                    HostState::Empty,
+                ))),
+                "getProviderInfo" => Some(Some(host(
+                    vm,
+                    "Landroid/content/pm/ProviderInfo;",
+                    HostState::Empty,
+                ))),
                 "getInstallerPackageName" | "getLaunchIntentForPackage"
                 | "getLeanbackLaunchIntentForPackage" | "getDrawable"
                 | "getActivityIcon" | "getApplicationIcon"
@@ -1400,30 +1566,60 @@ fn pm_call(vm: &mut Vm, name: &str, _args: &[V]) -> Rt<Option<Option<V>>> {
 }
 
 fn resources_call(vm: &mut Vm, name: &str, args: &[V]) -> Rt<Option<Option<V>>> {
+    let res_id = || -> u32 { i64v(args.get(1).copied().unwrap_or(V::I32(0))) as u32 };
     Ok(match name {
-        "getString" => Some(Some(jstr(vm, ""))),
-        "getText" => Some(Some(jstr(vm, ""))),
+        "getString" | "getText" => Some(Some(match vm.apk_res.as_ref().and_then(|r| {
+            r.string_of(res_id()).map(|s| s.to_string())
+        }) {
+            Some(s) => jstr(vm, &s),
+            None => jstr(vm, ""),
+        })),
         "getQuantityString" | "getQuantityText" => {
             Some(Some(args.get(2).copied().unwrap_or(jstr(vm, ""))))
         }
         "getStringArray" | "getTextArray" => Some(Some(arr(vm, STRING, vec![]))),
         "getIntArray" => Some(Some(arr(vm, "I", vec![]))),
-        "getBoolean" => Some(Some(V::I32(0))),
-        "getInteger" | "getColor" | "getDimension" | "getDimensionPixelSize"
-        | "getDimensionPixelOffset" | "getLayout" | "getIdentifier"
-        | "obtainTypedArray" | "obtainAttributes" | "getDrawable"
+        "getBoolean" | "getInteger" | "getColor" => Some(Some(V::I32(
+            vm.apk_res
+                .as_ref()
+                .and_then(|r| r.entry_value(res_id()))
+                .map(|v| v.data as i32)
+                .unwrap_or(0),
+        ))),
+        "getDimension" | "getFraction" => Some(Some(V::F32(
+            vm.apk_res
+                .as_ref()
+                .and_then(|r| r.dimen(res_id()))
+                .unwrap_or(0.0),
+        ))),
+        "getDimensionPixelSize" | "getDimensionPixelOffset" => Some(Some(V::I32(
+            vm.apk_res
+                .as_ref()
+                .and_then(|r| r.dimen(res_id()))
+                .map(|f| f as i32)
+                .unwrap_or(0),
+        ))),
+        "getIdentifier" => {
+            // (name, defType, defPackage): look the entry up by name —
+            // needed for getIdentifier("drawer_layout", "id", pkg).
+            let name_s = args.get(1).and_then(|a| sv(vm, *a)).unwrap_or_default();
+            let hit = vm
+                .apk_res
+                .as_ref()
+                .and_then(|r| r.id_named(&name_s))
+                .unwrap_or(0);
+            Some(Some(V::I32(hit as i32)))
+        }
+        "getLayout" | "obtainTypedArray" | "obtainAttributes" | "getDrawable"
         | "getDrawableForDensity" | "getColorStateList" | "getFont"
         | "getXml" | "getRawResource" | "openRawResource"
         | "openRawResourceFd" | "getValue" | "getValueForDensity"
         | "getResourceName" | "getResourcePackageName"
         | "getResourceTypeName" | "getResourceEntryName" | "getDisplayMetrics"
         | "getConfiguration" | "getAssets" | "getSystem" | "newTheme"
-        | "getFraction" | "getMovie" => {
+        | "getMovie" => {
             match name {
-                "getInteger" | "getColor" | "getDimensionPixelSize"
-                | "getDimensionPixelOffset" | "getIdentifier"
-                | "getLayout" => Some(Some(V::I32(0))),
-                "getDimension" | "getFraction" => Some(Some(V::F32(0.0))),
+                "getLayout" => Some(Some(V::I32(0))),
                 "getDisplayMetrics" => Some(Some(host(
                     vm,
                     "Landroid/util/DisplayMetrics;",
@@ -1453,6 +1649,10 @@ fn resources_call(vm: &mut Vm, name: &str, args: &[V]) -> Rt<Option<Option<V>>> 
                 | "getResourceTypeName" | "getResourceEntryName" => {
                     Some(Some(jstr(vm, "")))
                 }
+                "getXml" => Some(Some(xml::parser_of(
+                    vm,
+                    i64v(args.get(1).copied().unwrap_or(V::I32(0))) as u32,
+                ))),
                 _ => Some(Some(V::Ref(0))),
             }
         }
@@ -1464,43 +1664,181 @@ fn resources_call(vm: &mut Vm, name: &str, args: &[V]) -> Rt<Option<Option<V>>> 
     })
 }
 
+/// Fill a TypedValue host's guest-visible fields (`type`, `string`,
+/// `data`, `resourceId`) from a resolved TypedArray value — the write
+/// goes through the dex field index so `iget` reads it back.
+fn fill_typed_value(vm: &mut Vm, tv: V, v: V) {
+    let V::Ref(h) = tv else {
+        return;
+    };
+    // A @string/ reference resolves eagerly — preference defaults and
+    // titles read `.string`; other refs keep type/resourceId/data.
+    let (ty, string, data, res_id) = match v {
+        V::I32(id) if (id as u32) >> 24 == 0x7f || (id as u32) >> 24 == 0x01 => {
+            match vm
+                .apk_res
+                .as_ref()
+                .and_then(|r| r.string_of(id as u32).map(|s| s.to_string()))
+            {
+                Some(s) => (0x03, jstr(vm, &s), id, id as u32),
+                None => (0x01, V::Ref(0), id, id as u32),
+            }
+        }
+        V::I32(i) => (0x10, V::Ref(0), i, 0),
+        V::I64(i) => (0x10, V::Ref(0), i as i32, 0),
+        V::F32(f) => (0x04, V::Ref(0), f.to_bits() as i32, 0),
+        V::F64(f) => (0x04, V::Ref(0), (f as f32).to_bits() as i32, 0),
+        s @ V::Ref(_) => (0x03, s, 0, 0),
+    };
+    for (name, val) in [
+        ("type", V::I32(ty)),
+        ("string", string),
+        ("data", V::I32(data)),
+        ("resourceId", V::I32(res_id as i32)),
+    ] {
+        if let Some(f) = vm
+            .field_index_of("Landroid/util/TypedValue;", name)
+            .map(|g| vm.canon_field(g))
+        {
+            if let Some(m) = fields_mut(vm, h) {
+                m.insert(f, val);
+            }
+        }
+    }
+}
+
 fn res_misc(vm: &mut Vm, class: &str, name: &str, args: &[V]) -> Rt<Option<Option<V>>> {
     Ok(match (class, name) {
         ("Landroid/util/DisplayMetrics;", "scaledDensity") => Some(Some(V::F32(2.0))),
         ("Landroid/util/DisplayMetrics;", _) => None,
         ("Landroid/content/res/TypedArray;", "getString" | "getText") => {
-            Some(Some(V::Ref(0)))
+            let found = ta_index(vm, args).and_then(|(h, i)| view::ta_lookup(vm, h, i));
+            // A string attr may hold a @string/ reference — resolve it.
+            let found = match found {
+                Some(V::I32(id)) if (id as u32) >> 24 == 0x7f => vm
+                    .apk_res
+                    .as_ref()
+                    .and_then(|r| r.string_of(id as u32).map(|s| s.to_string()))
+                    .map(|s| jstr(vm, &s)),
+                other => other,
+            };
+            Some(Some(
+                found
+                    .filter(|v| matches!(v, V::Ref(h) if *h != 0))
+                    .unwrap_or_else(|| args.get(2).copied().unwrap_or(V::Ref(0))),
+            ))
         }
         ("Landroid/content/res/TypedArray;", "getInt" | "getColor"
         | "getBoolean" | "getInteger" | "getResourceId" | "getDimensionPixelSize"
         | "getDimensionPixelOffset" | "getLayoutDimension") => {
-            Some(Some(args.get(2).copied().unwrap_or(V::I32(0))))
+            let def = args.get(2).copied().unwrap_or(V::I32(0));
+            let found = ta_index(vm, args)
+                .and_then(|(h, i)| view::ta_lookup(vm, h, i))
+                .map(|v| match v {
+                    V::I32(_) | V::I64(_) => V::I32(i64v(v) as i32),
+                    V::F32(f) => V::I32(f as i32),
+                    other => other,
+                })
+                .filter(|v| matches!(v, V::I32(_)));
+            Some(Some(found.unwrap_or(def)))
         }
         ("Landroid/content/res/TypedArray;", "getFloat" | "getDimension") => {
-            Some(Some(args.get(2).copied().unwrap_or(V::F32(0.0))))
+            let def = args.get(2).copied().unwrap_or(V::F32(0.0));
+            let found = ta_index(vm, args)
+                .and_then(|(h, i)| view::ta_lookup(vm, h, i))
+                .map(|v| match v {
+                    // A @dimen/ reference resolves to its decoded px value.
+                    V::I32(id) if (id as u32) >> 24 == 0x7f => V::F32(
+                        vm.apk_res
+                            .as_ref()
+                            .and_then(|r| r.dimen(id as u32))
+                            .unwrap_or(id as f32),
+                    ),
+                    other => V::F32(f64v(other) as f32),
+                });
+            Some(Some(found.unwrap_or(def)))
         }
-        ("Landroid/content/res/TypedArray;", "getTextArray") => {
-            Some(Some(V::Ref(0)))
+        ("Landroid/content/res/TypedArray;", "getTextArray" | "getIntArray") => {
+            // An @array/ reference decodes through the arsc item map.
+            let items = ta_index(vm, args)
+                .and_then(|(h, i)| view::ta_lookup(vm, h, i))
+                .and_then(|v| match v {
+                    V::I32(id) if (id as u32) >> 24 == 0x7f => Some(id as u32),
+                    _ => None,
+                })
+                .and_then(|id| {
+                    vm.apk_res
+                        .as_ref()
+                        .map(|r| r.array_items(id))
+                })
+                .unwrap_or_default();
+            if items.is_empty() {
+                return Ok(Some(Some(V::Ref(0))));
+            }
+            let vals: Vec<V> = if name == "getTextArray" {
+                items
+                    .iter()
+                    .map(|v| match v.string.as_deref() {
+                        Some(s) => jstr(vm, s),
+                        None => jstr(vm, &v.data.to_string()),
+                    })
+                    .collect()
+            } else {
+                items.iter().map(|v| V::I32(v.data as i32)).collect()
+            };
+            Some(Some(arr(vm, OBJ, vals)))
         }
         ("Landroid/content/res/TypedArray;", "getDrawable" | "getFont"
         | "getColorStateList") => Some(Some(V::Ref(0))),
         ("Landroid/content/res/TypedArray;", "hasValue" | "hasValueOrEmpty") => {
-            Some(Some(V::I32(0)))
+            let yes = ta_index(vm, args).is_some_and(|(h, i)| {
+                if view::ta_lookup(vm, h, i).is_some() {
+                    return true;
+                }
+                // Theme-scoped arrays (no AttributeSet) answer true for
+                // every in-range index — material's ThemeEnforcement
+                // (`hasValue(colorPrimary)`) needs that to accept the
+                // (stubbed) theme.
+                let set = pseudo_get(vm, h, view::P_TA_SET);
+                !matches!(set, Some(V::Ref(s)) if s != 0)
+            });
+            Some(Some(V::I32(yes as i32)))
         }
         ("Landroid/content/res/TypedArray;", "length" | "getIndexCount") => {
+            let n = match args.first() {
+                Some(V::Ref(h)) => view::ta_attrs(vm, *h).len() as i32,
+                _ => 0,
+            };
+            Some(Some(V::I32(n)))
+        }
+        ("Landroid/content/res/TypedArray;", "getIndex") => {
+            let v = ta_index(vm, args)
+                .and_then(|(h, i)| view::ta_attrs(vm, h).get(i).copied())
+                .unwrap_or(0);
+            Some(Some(V::I32(v)))
+        }
+        ("Landroid/content/res/TypedArray;", "getType") => {
             Some(Some(V::I32(0)))
         }
-        ("Landroid/content/res/TypedArray;", "getIndex" | "getType") => {
-            Some(Some(V::I32(0)))
+        ("Landroid/content/res/TypedArray;", "getValue" | "peekValue") => {
+            // getValue(index, TypedValue) fills the caller's TypedValue
+            // in place and answers bool; peekValue answers a fresh one.
+            let found = ta_index(vm, args).and_then(|(h, i)| view::ta_lookup(vm, h, i));
+            let Some(v) = found else {
+                return Ok(Some(Some(V::I32(0))));
+            };
+            if name == "peekValue" {
+                let t = host(vm, "Landroid/util/TypedValue;", HostState::Empty);
+                fill_typed_value(vm, t, v);
+                return Ok(Some(Some(t)));
+            }
+            if let Some(tv) = args.get(2).copied() {
+                fill_typed_value(vm, tv, v);
+            }
+            Some(Some(V::I32(1)))
         }
         ("Landroid/content/res/TypedArray;", "recycle" | "extractThemeAttrs"
-        | "getChangingConfigurations" | "getValue" | "peekValue") => {
-            if name == "peekValue" || name == "getValue" {
-                Some(Some(V::I32(0)))
-            } else {
-                Some(None)
-            }
-        }
+        | "getChangingConfigurations") => Some(None),
         ("Landroid/util/TypedValue;", "applyDimension" | "complexToDimension"
         | "complexToDimensionPixelSize" | "complexToDimensionPixelOffset"
         | "complexToFloat" | "complexToFraction") => {
@@ -1531,14 +1869,24 @@ fn res_misc(vm: &mut Vm, class: &str, name: &str, args: &[V]) -> Rt<Option<Optio
         }
         ("Landroid/content/res/AssetManager;", "close" | "addAssetPath"
         | "isUpToDate" | "getLocales" | "getConfigurations") => {
-            if name == "addAssetPath" {
-                Some(Some(V::I32(0)))
-            } else {
-                Some(None)
+            match name {
+                "addAssetPath" => Some(Some(V::I32(0))),
+                "isUpToDate" => Some(Some(V::I32(1))),
+                "getLocales" => Some(Some(host(
+                    vm,
+                    "Landroid/os/LocaleList;",
+                    HostState::Empty,
+                ))),
+                "getConfigurations" => Some(Some(arr(
+                    vm,
+                    "Landroid/content/res/Configuration;",
+                    vec![],
+                ))),
+                _ => Some(None),
             }
         }
         ("Landroid/content/res/Resources$Theme;", "obtainStyledAttributes") => {
-            Some(Some(host(vm, "Landroid/content/res/TypedArray;", HostState::Empty)))
+            Some(Some(view::typed_array(vm, args)))
         }
         ("Landroid/content/res/Resources$Theme;", "applyStyle" | "setTo"
         | "resolveAttribute" | "rebase" | "dump" | "getKey" | "newTheme") => {
@@ -1554,12 +1902,39 @@ fn res_misc(vm: &mut Vm, class: &str, name: &str, args: &[V]) -> Rt<Option<Optio
         | "describeContents" | "writeToParcel" | "getLayoutDirection"
         | "isScreenWideColorGamut" | "isScreenHdr" | "isScreenRound"
         | "getLocales" | "getGrammaticalGender") => {
-            if name.starts_with("is") || name == "getLayoutDirection" || name == "diff" {
-                Some(Some(V::I32(0)))
-            } else {
-                Some(None)
+            match name {
+                "getLocales" => Some(Some(host(
+                    vm,
+                    "Landroid/os/LocaleList;",
+                    HostState::Empty,
+                ))),
+                _ if name.starts_with("is")
+                    || name == "getLayoutDirection"
+                    || name == "diff"
+                    || name == "getGrammaticalGender" =>
+                {
+                    Some(Some(V::I32(0)))
+                }
+                _ => Some(None),
             }
         }
+        ("Landroid/os/LocaleList;", _) => match name {
+            "get" | "getFirstMatch" => Some(Some(host(
+                vm,
+                "Ljava/util/Locale;",
+                HostState::StrBuf("en-US".into()),
+            ))),
+            "size" => Some(Some(V::I32(1))),
+            "isEmpty" => Some(Some(V::I32(0))),
+            "indexOf" => Some(Some(V::I32(0))),
+            "getDefault" | "getAdjustedDefault" | "setDefault" => Some(Some(host(
+                vm,
+                "Landroid/os/LocaleList;",
+                HostState::Empty,
+            ))),
+            "toString" | "toLanguageTags" => Some(Some(jstr(vm, "en-US"))),
+            _ => Some(None),
+        },
         _ => None,
     })
 }
@@ -1600,7 +1975,7 @@ fn handler_call(vm: &mut Vm, name: &str, args: &[V]) -> Rt<Option<Option<V>>> {
             "Landroid/os/Message;",
             HostState::Empty,
         ))),
-        "getLooper" => Some(Some(host(vm, "Landroid/os/Looper;", HostState::Empty))),
+        "getLooper" => Some(Some(main_looper(vm))),
         "getMessageName" | "getTraceName" => Some(Some(jstr(vm, ""))),
         "createAsync" => Some(Some(args[0])),
         _ => None,
@@ -1609,9 +1984,8 @@ fn handler_call(vm: &mut Vm, name: &str, args: &[V]) -> Rt<Option<Option<V>>> {
 
 fn looper_call(vm: &mut Vm, name: &str, _args: &[V]) -> Rt<Option<Option<V>>> {
     Ok(match name {
-        "getMainLooper" | "myLooper" | "prepare" | "prepareMainLooper" => {
-            Some(Some(host(vm, "Landroid/os/Looper;", HostState::Empty)))
-        }
+        "getMainLooper" | "myLooper" => Some(Some(main_looper(vm))),
+        "prepare" | "prepareMainLooper" => Some(None),
         "loop" | "quit" | "quitSafely" => Some(None),
         "isCurrentThread" => Some(Some(V::I32(1))),
         "getThread" => Some(Some(main_thread(vm))),
@@ -1790,6 +2164,17 @@ fn graphics_call(
         | "getPositionDescription" | "getIdAttribute"
         | "getIdAttributeResourceValue" | "getClassAttribute"
         | "getStyleAttribute" | "getAttributeUnsignedIntValue") => {
+            // An XmlResourceParser receiver IS an AttributeSet too —
+            // reads follow its cursor, not this generic stub.
+            if let Some(V::Ref(h)) = args.first() {
+                if let Some(Obj::Host {
+                    state: HostState::Xml { .. },
+                    ..
+                }) = vm.heap.get(*h)
+                {
+                    return xml::pull_call(vm, class, name, "()V", args);
+                }
+            }
             if name.contains("Count") || name.contains("Resource")
                 || name.contains("Int") || name == "getStyleAttribute"
                 || name == "getIdAttributeResourceValue"
@@ -1811,12 +2196,14 @@ fn graphics_call(
         (_, "createBitmap" | "createScaledBitmap" | "decodeResource"
         | "decodeFile" | "decodeStream" | "decodeByteArray" | "decodeFileDescriptor"
         | "inflate" | "getDrawable" | "obtain" | "obtainStyledAttributes") => {
-            if name == "inflate" || name == "obtainStyledAttributes" {
+            if name == "inflate" {
                 Some(Some(host(
                     vm,
                     "Landroid/content/res/TypedArray;",
                     HostState::Empty,
                 )))
+            } else if name == "obtainStyledAttributes" {
+                Some(Some(view::typed_array(vm, args)))
             } else {
                 Some(Some(host(vm, class, HostState::Empty)))
             }

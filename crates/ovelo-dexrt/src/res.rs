@@ -1,0 +1,260 @@
+//! APK resources for the runtime.
+//!
+//! `resources.arsc` maps a numeric resource id (`0xPPTTEEEE`) to a file
+//! inside the APK — `LayoutInflater.inflate` uses the `layout` entries to
+//! load real binary XML, and the `id` entries resolve `@+id/name`
+//! references found in that XML.
+
+use std::collections::HashMap;
+
+use ovelo_apk::arsc::{parse_arsc, EntryValue};
+use ovelo_apk::manifest::{parse_axml, Element};
+use ovelo_apk::zip::{parse_central_directory, read_entry, CentralEntry, ZipLimits};
+
+use crate::res_attrs::framework_attr_name;
+
+/// A style resource: parent style id plus its attribute items.
+#[derive(Default)]
+struct StyleDef {
+    parent: u32,
+    items: HashMap<u32, EntryValue>,
+}
+
+/// Resource index of the installed APK. Built once per `Vm` from the APK
+/// bytes; lookups never touch the filesystem.
+pub struct ApkResources {
+    bytes: Vec<u8>,
+    entries: Vec<CentralEntry>,
+    /// res_id → zip path (`res/layout/…`) for `layout` entries.
+    layout_paths: HashMap<u32, String>,
+    /// res_id → zip path for every file-backed entry (`xml`, `menu`,
+    /// `drawable`, …), for `Resources.getXml` and `AssetManager`.
+    file_paths: HashMap<u32, String>,
+    /// res_id → entry key name (any type) for `getResourceEntryName`.
+    entry_names: HashMap<u32, String>,
+    /// `id`-type entry name → res_id, for `@+id/name` / `@id/name`.
+    id_by_name: HashMap<String, u32>,
+    /// res_id → simple value (default config preferred).
+    entry_values: HashMap<u32, EntryValue>,
+    /// style res_id → parent + items, for theme attribute resolution.
+    styles: HashMap<u32, StyleDef>,
+}
+
+impl ApkResources {
+    /// Build the index from raw APK bytes. Malformed/missing `resources.arsc`
+    /// yields an index that simply resolves nothing (inflation degrades to
+    /// placeholder views instead of failing the run).
+    pub fn open(bytes: Vec<u8>) -> Option<Self> {
+        let (_cd, entries) = parse_central_directory(&bytes, &ZipLimits::default()).ok()?;
+        let mut res = Self {
+            bytes,
+            entries,
+            layout_paths: HashMap::new(),
+            file_paths: HashMap::new(),
+            entry_names: HashMap::new(),
+            id_by_name: HashMap::new(),
+            entry_values: HashMap::new(),
+            styles: HashMap::new(),
+        };
+        let arsc = res.read("resources.arsc")?;
+        for pkg in parse_arsc(&arsc).ok()? {
+            for t in &pkg.types {
+                for e in &t.entries {
+                    res.entry_names.entry(e.res_id).or_insert_with(|| e.key.clone());
+                    if let Some(v) = &e.value {
+                        if e.config == "default" {
+                            res.entry_values.insert(e.res_id, v.clone());
+                        } else {
+                            res.entry_values.entry(e.res_id).or_insert_with(|| v.clone());
+                        }
+                    }
+                    // A complex (style) entry: either a parent or items
+                    // marks it — a `<style name="X" parent="Y"/>` with no
+                    // items still has to sit in the chain.
+                    if e.parent != 0 || !e.items.is_empty() {
+                        let s = res.styles.entry(e.res_id).or_default();
+                        if e.config == "default" || (s.parent == 0 && s.items.is_empty()) {
+                            s.parent = e.parent;
+                            s.items = e.items.iter().cloned().collect();
+                        }
+                    }
+                    // Any entry whose value is a `res/` file path —
+                    // layout/xml/menu/drawable/… — is reachable by id for
+                    // `Resources.getXml`/`getLayout` and friends.
+                    if let Some(path) = e.value.as_ref().and_then(|v| v.string.as_ref()) {
+                        if path.starts_with("res/") {
+                            if e.config == "default" {
+                                res.file_paths.insert(e.res_id, path.clone());
+                            } else {
+                                res.file_paths
+                                    .entry(e.res_id)
+                                    .or_insert_with(|| path.clone());
+                            }
+                        }
+                    }
+                    match t.name.as_str() {
+                        "layout" => {
+                            if let Some(path) = e.value.as_ref().and_then(|v| v.string.as_ref()) {
+                                // Prefer the default config bucket; otherwise
+                                // first seen wins (real config matching is a
+                                // later milestone).
+                                if e.config == "default" {
+                                    res.layout_paths.insert(e.res_id, path.clone());
+                                } else {
+                                    res.layout_paths
+                                        .entry(e.res_id)
+                                        .or_insert_with(|| path.clone());
+                                }
+                            }
+                        }
+                        "id" => {
+                            res.id_by_name.entry(e.key.clone()).or_insert(e.res_id);
+                        }
+                        _ => {}
+                    }
+                }
+            }
+        }
+        Some(res)
+    }
+
+    /// `layout` res_id → path inside the APK.
+    pub fn layout_path(&self, res_id: u32) -> Option<&str> {
+        self.layout_paths.get(&res_id).map(|s| s.as_str())
+    }
+
+    /// Any file-backed res_id (`xml`, `menu`, `drawable`, …) → path
+    /// inside the APK.
+    pub fn file_path(&self, res_id: u32) -> Option<&str> {
+        self.file_paths.get(&res_id).map(|s| s.as_str())
+    }
+
+    /// Parse a file-backed resource's binary XML into flat
+    /// start-elements (depth-sorted); `None` when it isn't binary XML.
+    pub fn document(&self, res_id: u32) -> Option<Vec<Element>> {
+        let xml = self.read(self.file_path(res_id)?)?;
+        parse_axml(&xml).ok()
+    }
+
+    /// Named `id` resource → res_id.
+    pub fn id_named(&self, name: &str) -> Option<u32> {
+        self.id_by_name.get(name).copied()
+    }
+
+    /// res_id → entry key name.
+    pub fn entry_name(&self, res_id: u32) -> Option<&str> {
+        self.entry_names.get(&res_id).map(|s| s.as_str())
+    }
+
+    /// res_id → entry key name, falling back to the framework attr table
+    /// for `android:` ids (0x0101xxxx) that the app's arsc doesn't carry.
+    pub fn attr_name(&self, res_id: u32) -> Option<&str> {
+        self.entry_name(res_id).or_else(|| framework_attr_name(res_id))
+    }
+
+    /// res_id → the entry's typed value (default config).
+    pub fn entry_value(&self, res_id: u32) -> Option<&EntryValue> {
+        self.entry_values.get(&res_id)
+    }
+
+    /// res_id → its string value when the entry is `TYPE_STRING`.
+    pub fn string_of(&self, res_id: u32) -> Option<&str> {
+        self.entry_value(res_id).and_then(|v| {
+            if v.data_type == 0x03 {
+                v.string.as_deref()
+            } else {
+                None
+            }
+        })
+    }
+
+    /// `attr_id` inside `style_id` or any style in its parent chain —
+    /// the theme-resolution walk `obtainStyledAttributes` performs.
+    /// A style whose parent isn't a complex entry stops the walk rather
+    /// than dropping everything found so far.
+    pub fn style_item(&self, style_id: u32, attr_id: u32) -> Option<&EntryValue> {
+        let mut cur = style_id;
+        for _ in 0..32 {
+            let s = self.styles.get(&cur)?;
+            if let Some(v) = s.items.get(&attr_id) {
+                return Some(v);
+            }
+            match s.parent {
+                0 => return None,
+                p => cur = p,
+            }
+        }
+        None
+    }
+
+    /// Parent style res_id, for debugging resolution chains.
+    pub fn style_parent(&self, style_id: u32) -> Option<u32> {
+        self.styles.get(&style_id).map(|s| s.parent)
+    }
+
+    /// A complex entry's item values in document order — `<array>` and
+    /// `<string-array>` elements for `getTextArray`/`getIntArray`.
+    pub fn array_items(&self, res_id: u32) -> Vec<EntryValue> {
+        self.styles
+            .get(&res_id)
+            .map(|s| s.items.values().cloned().collect())
+            .unwrap_or_default()
+    }
+
+    /// All attr ids a style (not its parents) carries — debugging aid.
+    pub fn style_attrs(&self, style_id: u32) -> Vec<(u32, EntryValue)> {
+        self.styles
+            .get(&style_id)
+            .map(|s| s.items.iter().map(|(k, v)| (*k, v.clone())).collect())
+            .unwrap_or_default()
+    }
+
+    /// res_id → decoded `TYPE_DIMENSION`/`TYPE_FRACTION` value scaled to
+    /// px (density 2.0, matching the `scaledDensity` stub), or plain
+    /// numeric data for int/float values.
+    pub fn dimen(&self, res_id: u32) -> Option<f32> {
+        let v = self.entry_value(res_id)?;
+        Some(typed_px(v))
+    }
+
+    /// Read a file out of the APK zip by its stored path.
+    pub fn read(&self, path: &str) -> Option<Vec<u8>> {
+        let e = self.entries.iter().find(|e| e.name == path)?;
+        read_entry(&self.bytes, e).ok()
+    }
+
+    /// Parse a layout's binary XML into flat start-elements (depth-sorted).
+    pub fn layout_elements(&self, res_id: u32) -> Option<Vec<Element>> {
+        let xml = self.read(self.layout_path(res_id)?)?;
+        parse_axml(&xml).ok()
+    }
+}
+
+/// AOSP `Res_value::complexToFloat`.
+fn complex_to_float(data: u32) -> f32 {
+    const RADIX_MULTS: [f32; 4] = [0.00390625, 3.051_758e-5, 1.192_093e-7, 4.656_613e-10];
+    (data & 0xffff_ff00) as i32 as f32 * RADIX_MULTS[((data >> 4) & 0x3) as usize]
+}
+
+/// A `Res_value` as px-ish float: dimensions/fractions decode through
+/// `complexToFloat` scaled by unit (density 2.0), ints/floats cast.
+pub fn typed_px(v: &EntryValue) -> f32 {
+    const DENSITY: f32 = 2.0;
+    match v.data_type {
+        0x05 => {
+            // TYPE_DIMENSION: px=1, dip/sp=density, pt/in/mm scaled.
+            let scale = match v.data & 0xf {
+                0 => 1.0,
+                1 | 2 => DENSITY,
+                3 => DENSITY / 72.0,
+                4 => DENSITY,
+                5 => DENSITY / 25.4,
+                _ => 1.0,
+            };
+            complex_to_float(v.data) * scale
+        }
+        0x06 => complex_to_float(v.data) * 100.0, // TYPE_FRACTION → %
+        0x04 => f32::from_bits(v.data),
+        _ => v.data as i32 as f32,
+    }
+}

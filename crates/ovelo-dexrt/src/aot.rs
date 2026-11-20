@@ -75,7 +75,7 @@ pub fn int_typed(d: &str) -> bool {
 
 /// Compiled-code cache. Owns the JIT module that backs the code pages.
 pub struct Aot {
-    fns: HashMap<u32, AotFn>,
+    fns: HashMap<u64, AotFn>,
     /// Kept alive: function pointers point into its code pages.
     /// `Option` so `Drop` can `free_memory` (a consuming call).
     module: Option<JITModule>,
@@ -110,7 +110,7 @@ impl Aot {
 
     /// Compile `midx` when its code is whitelisted. Eligibility of the
     /// signature is the caller's job (`int_typed` on params + return).
-    pub fn compile(&mut self, midx: u32, code: &CodeItem) {
+    pub fn compile(&mut self, midx: u64, code: &CodeItem) {
         if self.fns.contains_key(&midx) {
             return;
         }
@@ -149,7 +149,7 @@ impl Aot {
     }
 
     /// Compiled code for a (resolved) method id, if any.
-    pub fn get(&self, midx: u32) -> Option<AotFn> {
+    pub fn get(&self, midx: u64) -> Option<AotFn> {
         self.fns.get(&midx).copied()
     }
 
@@ -166,7 +166,7 @@ impl Aot {
 
 /// IR-build one method. `None` = stay on the interpreter.
 fn build_function(
-    midx: u32,
+    midx: u64,
     code: &CodeItem,
     fbcx: &mut FunctionBuilderContext,
     cfg: TargetFrontendConfig,
@@ -185,7 +185,7 @@ fn build_function(
     sig.params.push(AbiParam::new(types::I64)); // trap
     sig.returns.push(AbiParam::new(types::I64));
 
-    let mut func = Function::with_name_signature(UserFuncName::user(0, midx), sig);
+    let mut func = Function::with_name_signature(UserFuncName::user(0, midx as u32), sig);
     let mut b = FunctionBuilder::new(&mut func, fbcx);
     let nregs = code.registers_size as usize;
     let vars: Vec<Variable> = (0..nregs)

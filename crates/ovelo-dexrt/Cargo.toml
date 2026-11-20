@@ -11,6 +11,7 @@ cranelift-frontend = "0.137"
 cranelift-jit = "0.137"
 cranelift-module = "0.137"
 cranelift-native = "0.137"
+ovelo-apk = { path = "../ovelo-apk" }
 ovelo-dex = { path = "../ovelo-dex" }
 ovelo-error = { path = "../ovelo-error" }
 

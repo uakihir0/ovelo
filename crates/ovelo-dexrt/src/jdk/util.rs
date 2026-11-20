@@ -144,6 +144,11 @@ pub(crate) fn call(
                     Some(Some(V::I32(1)))
                 } else if matches!(name, "newCondition") {
                     Some(Some(host(vm, "Ljava/util/concurrent/locks/Condition;", HostState::Empty)))
+                } else if matches!(name, "readLock" | "writeLock") {
+                    // ReentrantReadWriteLock.readLock()/writeLock() return
+                    // the Lock views — a no-op Lock host object keeps
+                    // `lock.lock(); …; lock.unlock()` chains flowing.
+                    Some(Some(host(vm, "Ljava/util/concurrent/locks/Lock;", HostState::Empty)))
                 } else {
                     Some(None)
                 }

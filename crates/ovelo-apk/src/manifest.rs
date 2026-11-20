@@ -475,6 +475,18 @@ pub struct ManifestInfo {
     pub config_for_split: Option<String>,
     /// `isFeatureSplit` — a dynamic-feature split.
     pub is_feature_split: bool,
+    /// `application/@android:name` — the custom Application class.
+    pub application_class: Option<String>,
+    /// `application/@android:theme` resource id.
+    pub theme: Option<u32>,
+    /// `activity/@android:theme` resource ids by qualified activity name.
+    pub activity_themes: std::collections::HashMap<String, u32>,
+    /// androidx.startup initializers: `meta-data` names under the
+    /// `androidx.startup.InitializationProvider` whose value is
+    /// `androidx.startup` (e.g. `androidx.work.WorkManagerInitializer`).
+    /// Android runs each Initializer's `create(context)` before
+    /// `Application.onCreate`.
+    pub startup_initializers: Vec<String>,
 }
 
 /// Parse a binary manifest into `ManifestInfo`.
@@ -486,6 +498,10 @@ pub fn parse_manifest(b: &[u8]) -> Result<ManifestInfo> {
     let mut filter_main = false;
     let mut filter_launcher = false;
     let mut in_filter = false;
+    // Name of the provider element currently open, if any — meta-data
+    // children of androidx.startup.InitializationProvider declare the
+    // app's Initializer classes.
+    let mut cur_provider: Option<String> = None;
 
     // We only have start-elements with depths; reconstruct the tree path by
     // consuming elements in document order, maintaining a stack via depth.
@@ -505,6 +521,9 @@ pub fn parse_manifest(b: &[u8]) -> Result<ManifestInfo> {
                 in_filter = false;
                 filter_main = false;
                 filter_launcher = false;
+            }
+            if popped == "provider" {
+                cur_provider = None;
             }
         }
 
@@ -565,6 +584,15 @@ pub fn parse_manifest(b: &[u8]) -> Result<ManifestInfo> {
                         .unwrap_or(false);
                 }
             }
+            "application" => {
+                info.application_class = el
+                    .android_str("name")
+                    .map(|n| qualify(&info.package, n));
+                info.theme = match el.android("theme") {
+                    Some(Value::Reference(r)) => Some(*r),
+                    _ => None,
+                };
+            }
             "uses-sdk" => {
                 info.min_sdk = el.android_int("minSdkVersion");
                 info.target_sdk = el.android_int("targetSdkVersion");
@@ -588,11 +616,14 @@ pub fn parse_manifest(b: &[u8]) -> Result<ManifestInfo> {
                         if el.name == "activity-alias" {
                             el.android_str("targetActivity")
                                 .map(|t| qualify(&info.package, t))
-                                .unwrap_or(q)
+                                .unwrap_or_else(|| q.clone())
                         } else {
-                            q
+                            q.clone()
                         },
                     );
+                    if let Some(Value::Reference(t)) = el.android("theme") {
+                        info.activity_themes.insert(q, *t);
+                    }
                 }
             }
             "service" => {
@@ -607,7 +638,18 @@ pub fn parse_manifest(b: &[u8]) -> Result<ManifestInfo> {
             }
             "provider" => {
                 if let Some(n) = el.android_str("name") {
-                    info.providers.push(qualify(&info.package, n));
+                    let q = qualify(&info.package, n);
+                    info.providers.push(q.clone());
+                    cur_provider = Some(q);
+                }
+            }
+            "meta-data"
+                if cur_provider.as_deref()
+                    == Some("androidx.startup.InitializationProvider")
+                    && el.android_str("value") == Some("androidx.startup") =>
+            {
+                if let Some(n) = el.android_str("name") {
+                    info.startup_initializers.push(n.to_string());
                 }
             }
             "intent-filter" => {

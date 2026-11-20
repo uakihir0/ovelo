@@ -11,6 +11,8 @@ mod io;
 mod lang;
 mod time;
 mod util;
+pub(crate) mod view;
+pub(crate) mod xml;
 
 use crate::value::{HostState, Obj, V};
 use crate::{Rt, Vm};
@@ -119,6 +121,20 @@ pub(crate) fn main_thread(vm: &mut Vm) -> V {
     V::Ref(vm.main_thread_h)
 }
 
+/// The one main looper — androidx compares
+/// `Looper.myLooper() == hostHandler.getLooper()` by identity, so every
+/// source must hand back the same handle.
+pub(crate) fn main_looper(vm: &mut Vm) -> V {
+    if vm.main_looper_h == 0 {
+        let V::Ref(h) = host(vm, "Landroid/os/Looper;", HostState::Empty)
+        else {
+            unreachable!()
+        };
+        vm.main_looper_h = h;
+    }
+    V::Ref(vm.main_looper_h)
+}
+
 /// Default return for an uncovered method, by its signature —
 /// object/array types get a typed placeholder (never null, so chained
 /// framework calls keep flowing), String gets "", primitives 0.
@@ -144,7 +160,7 @@ pub(crate) fn class_obj(vm: &mut Vm, desc: String) -> V {
 /// form: `Obj::Class` (`SomeType.class` literal) or a `class_obj` Host.
 pub(crate) fn class_desc_of(vm: &Vm, h: u32) -> Option<String> {
     match vm.heap.get(h) {
-        Some(Obj::Class { type_idx }) => vm.dex.type_descriptor(*type_idx).ok(),
+        Some(Obj::Class { type_idx }) => vm.type_desc_of(*type_idx).ok(),
         _ => s(vm, h),
     }
 }
@@ -207,8 +223,7 @@ pub(crate) fn v_to_s(vm: &mut Vm, v: V) -> String {
             }
             Some(Obj::Class { type_idx }) => {
                 let d = vm
-                    .dex
-                    .type_descriptor(*type_idx)
+                    .type_desc_of(*type_idx)
                     .unwrap_or_else(|_| "?".into());
                 format!("class {}", d.trim_start_matches('L').trim_end_matches(';'))
             }
@@ -244,6 +259,18 @@ pub(crate) fn value_eq(vm: &Vm, a: V, b: V) -> bool {
             }
             match (vm.heap.get(x), vm.heap.get(y)) {
                 (Some(Obj::Str(p)), Some(Obj::Str(q))) => p == q,
+                // Class mirrors are singletons per class in the JVM —
+                // compare by type index so `set.contains(Foo.class)`
+                // holds across separate const-class literals.
+                (Some(Obj::Class { type_idx: a }), Some(Obj::Class { type_idx: b })) => {
+                    // Same descriptor may index differently per dex —
+                    // compare resolved descriptors, not raw indices.
+                    a == b
+                        || match (vm.type_desc_of(*a), vm.type_desc_of(*b)) {
+                            (Ok(sa), Ok(sb)) => sa == sb,
+                            _ => false,
+                        }
+                }
                 _ => false,
             }
         }
@@ -264,7 +291,7 @@ pub(crate) fn dotted(desc: &str) -> String {
 pub(crate) fn fields_mut(
     vm: &mut Vm,
     h: u32,
-) -> Option<&mut HashMap<u32, V>> {
+) -> Option<&mut HashMap<u64, V>> {
     match vm.heap.get_mut(h) {
         Some(Obj::Instance { fields, .. }) | Some(Obj::Host { fields, .. }) => {
             Some(fields)
@@ -274,7 +301,7 @@ pub(crate) fn fields_mut(
 }
 
 pub(crate) fn field_get(vm: &Vm, h: u32, owner: &str, name: &str) -> Option<V> {
-    let idx = vm.dex.field_index_of(owner, name)?;
+    let idx = vm.field_index_of(owner, name).map(|g| vm.canon_field(g))?;
     match vm.heap.get(h) {
         Some(Obj::Instance { fields, .. }) | Some(Obj::Host { fields, .. }) => {
             fields.get(&idx).copied()
@@ -284,25 +311,25 @@ pub(crate) fn field_get(vm: &Vm, h: u32, owner: &str, name: &str) -> Option<V> {
 }
 
 pub(crate) fn field_set(vm: &mut Vm, h: u32, owner: &str, name: &str, v: V) {
-    if let Some(idx) = vm.dex.field_index_of(owner, name) {
+    if let Some(idx) = vm.field_index_of(owner, name).map(|g| vm.canon_field(g)) {
         if let Some(f) = fields_mut(vm, h) {
             f.insert(idx, v);
         }
     }
 }
 
-pub(crate) fn pseudo_get(vm: &Vm, h: u32, key: u32) -> Option<V> {
+pub(crate) fn pseudo_get(vm: &Vm, h: u32, key: impl Into<u64>) -> Option<V> {
     match vm.heap.get(h) {
         Some(Obj::Instance { fields, .. }) | Some(Obj::Host { fields, .. }) => {
-            fields.get(&key).copied()
+            fields.get(&key.into()).copied()
         }
         _ => None,
     }
 }
 
-pub(crate) fn pseudo_set(vm: &mut Vm, h: u32, key: u32, v: V) {
+pub(crate) fn pseudo_set(vm: &mut Vm, h: u32, key: impl Into<u64>, v: V) {
     if let Some(f) = fields_mut(vm, h) {
-        f.insert(key, v);
+        f.insert(key.into(), v);
     }
 }
 
@@ -429,8 +456,7 @@ pub(crate) fn class_of(vm: &Vm, v: V) -> String {
     match v {
         V::Ref(h) => match vm.heap.get(h) {
             Some(Obj::Instance { class_idx, .. }) => vm
-                .dex
-                .type_descriptor(*class_idx)
+                .type_desc_of(*class_idx)
                 .unwrap_or_else(|_| OBJ.into()),
             Some(Obj::Host { desc, .. }) => desc.clone(),
             Some(Obj::Str(_)) => STRING.into(),
@@ -457,6 +483,14 @@ pub(crate) fn call(
     sig: &str,
     args: &[V],
 ) -> Rt<Option<Option<V>>> {
+    // Desugared `j$.*` mirrors `java.*` — dispatch on the canonical name.
+    let canon;
+    let class = if class.starts_with("Lj$/") {
+        canon = class.replacen("Lj$/", "Ljava/", 1);
+        &canon
+    } else {
+        class
+    };
     if let Some(r) = universal(vm, class, name, sig, args)? {
         return Ok(Some(r));
     }
@@ -523,7 +557,10 @@ fn universal(
 
 /// Static field on a host-provided class (`Build.VERSION.SDK_INT`,
 /// `StandardCharsets.UTF_8`, `Boolean.TRUE`, `Color.BLACK`, …).
-pub(crate) fn sfield(vm: &mut Vm, owner: &str, name: &str) -> Option<V> {
+/// `ftype` is the field's declared type — a self-typed field
+/// (`TimeUnit.SECONDS: Ljava/util/concurrent/TimeUnit;`) is an enum
+/// constant and gets a stable host object carrying its name.
+pub(crate) fn sfield(vm: &mut Vm, owner: &str, name: &str, ftype: &str) -> Option<V> {
     let v: V = match (owner, name) {
         ("Ljava/lang/Integer;", "MAX_VALUE") => V::I32(i32::MAX),
         ("Ljava/lang/Integer;", "MIN_VALUE") => V::I32(i32::MIN),
@@ -609,6 +646,27 @@ pub(crate) fn sfield(vm: &mut Vm, owner: &str, name: &str) -> Option<V> {
         }
         ("Ljava/util/Locale;", "ROOT") => {
             return Some(host(vm, "Ljava/util/Locale;", HostState::StrBuf("".into())))
+        }
+        ("Ljava/util/Collections;", "EMPTY_LIST") => {
+            return Some(host(
+                vm,
+                "Ljava/util/Collections$EmptyList;",
+                HostState::List(Vec::new()),
+            ))
+        }
+        ("Ljava/util/Collections;", "EMPTY_SET") => {
+            return Some(host(
+                vm,
+                "Ljava/util/Collections$EmptySet;",
+                HostState::List(Vec::new()),
+            ))
+        }
+        ("Ljava/util/Collections;", "EMPTY_MAP") => {
+            return Some(host(
+                vm,
+                "Ljava/util/Collections$EmptyMap;",
+                HostState::Map(Vec::new()),
+            ))
         }
         ("Ljava/util/regex/Pattern;", "CASE_INSENSITIVE") => V::I32(2),
         ("Ljava/util/regex/Pattern;", "MULTILINE") => V::I32(8),
@@ -737,6 +795,19 @@ pub(crate) fn sfield(vm: &mut Vm, owner: &str, name: &str) -> Option<V> {
         }
         ("Lorg/json/JSONObject;", "NULL") => {
             return Some(host(vm, "Lorg/json/JSONObject$Null;", HostState::Empty))
+        }
+        _ if ftype == owner => {
+            // Self-typed constant on a host class: an enum constant
+            // (TimeUnit.SECONDS, TimeUnit.MILLISECONDS, …). The pseudo
+            // fields give name()/ordinal() something to read; the
+            // caller caches it into the class statics so reference
+            // equality (`unit == TimeUnit.SECONDS`) holds.
+            let h = host(vm, owner, HostState::Empty);
+            if let V::Ref(hh) = h {
+                let n = jstr(vm, name);
+                pseudo_set(vm, hh, P_DATA, n);
+            }
+            return Some(h);
         }
         _ => return None,
     };
@@ -1619,9 +1690,16 @@ pub(crate) fn host_supers(d: &str) -> &'static [&'static str] {
         // ----- android.content.res
         "Landroid/content/res/Resources;" | "Landroid/content/res/AssetManager;"
         | "Landroid/content/res/Configuration;" | "Landroid/content/res/TypedArray;"
-        | "Landroid/content/res/Resources$Theme;" | "Landroid/content/res/XmlResourceParser;"
+        | "Landroid/content/res/Resources$Theme;"
         | "Landroid/content/res/ColorStateList;" | "Landroid/content/res/AssetFileDescriptor;"
         => &[OBJ],
+        "Landroid/content/res/XmlResourceParser;" => &[
+            "Lorg/xmlpull/v1/XmlPullParser;",
+            "Landroid/util/AttributeSet;",
+            "Ljava/lang/AutoCloseable;",
+            "Ljava/io/Closeable;",
+            OBJ,
+        ],
         "Landroid/content/res/Resources$NotFoundException;" => {
             &["Ljava/lang/Exception;", THROWABLE, OBJ]
         }

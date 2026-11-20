@@ -271,7 +271,26 @@ fn disas(apk: &[u8], class: &str, method: Option<&str>) -> Result<(), OveloError
                     continue;
                 }
             }
-            println!("{class}.{name} [{e_name}]", e_name = e.name);
+            let proto = dex
+                .proto(mid.proto_idx as u32)
+                .and_then(|p| {
+                    let ps = dex
+                        .proto_params(p)?
+                        .iter()
+                        .filter_map(|&t| dex.type_descriptor(t as u32).ok())
+                        .collect::<Vec<_>>()
+                        .join("");
+                    let ret = dex
+                        .type_descriptor(p.return_type_idx)
+                        .unwrap_or_else(|_| "?".into());
+                    Ok(format!("({ps}){ret}"))
+                })
+                .unwrap_or_else(|_| "(?)".into());
+            println!(
+                "{class}.{name}{proto} [#{midx} {e_name}]",
+                midx = em.method_idx,
+                e_name = e.name
+            );
             let Some(code) = dex.code_item(em.code_off)? else {
                 continue;
             };
@@ -356,6 +375,151 @@ fn find_record(store: &InstallStore, package: &str) -> Result<InstallRecord, Ove
     Err(err("cli.app.not_installed").with_detail(package))
 }
 
+/// Host overrides on dex-defined library methods that can't run in the
+/// runtime — appcompat's vector-drawable inflation, whose full path
+/// needs a working XmlResourceParser + Drawable backend we don't have
+/// yet. `getDrawable` answers a placeholder so menu/icon inflation
+/// keeps going.
+fn register_compat_shims(v: &mut ovelo_dexrt::Vm, initializers: &[String]) {
+    use ovelo_dexrt::{HostState, Obj, V};
+    use std::cell::RefCell;
+    use std::collections::HashMap;
+    use std::rc::Rc;
+
+    let drawable = |vm: &mut ovelo_dexrt::Vm| -> V {
+        V::Ref(vm.heap.alloc(Obj::Host {
+            class_idx: u64::MAX,
+            desc: "Landroid/graphics/drawable/Drawable;".to_string(),
+            fields: HashMap::new(),
+            state: HostState::Empty,
+        }))
+    };
+    for (class, name, sig) in [
+        (
+            "Landroidx/appcompat/widget/ResourceManagerInternal;",
+            "getDrawable",
+            "(Landroid/content/Context;I)Landroid/graphics/drawable/Drawable;",
+        ),
+        (
+            "Landroidx/appcompat/widget/ResourceManagerInternal;",
+            "getDrawable",
+            "(Landroid/content/Context;IZ)Landroid/graphics/drawable/Drawable;",
+        ),
+        (
+            "Landroidx/appcompat/content/res/AppCompatResources;",
+            "getDrawable",
+            "(Landroid/content/Context;I)Landroid/graphics/drawable/Drawable;",
+        ),
+        (
+            "Landroidx/appcompat/widget/TintTypedArray;",
+            "getDrawable",
+            "(I)Landroid/graphics/drawable/Drawable;",
+        ),
+        (
+            "Landroidx/appcompat/widget/TintTypedArray;",
+            "getDrawableIfKnown",
+            "(I)Landroid/graphics/drawable/Drawable;",
+        ),
+    ] {
+        let _ = v.register_host(
+            class,
+            name,
+            sig,
+            Rc::new(RefCell::new(move |vm: &mut ovelo_dexrt::Vm, _a: &[V]| {
+                Ok(Some(drawable(vm)))
+            })) as ovelo_dexrt::HostCall,
+        );
+    }
+    // androidx.startup: `initializeComponent` enforces that the
+    // initializer was discovered via manifest meta-data — our runtime
+    // runs discovered initializers itself (see startup_initializers),
+    // so the check is satisfied by construction; make it a no-op.
+    for sig in [
+        "(Ljava/lang/Class;)Ljava/lang/Object;",
+        "(Ljava/lang/Class;Ljava/util/Set;)Ljava/lang/Object;",
+    ] {
+        let _ = v.register_host(
+            "Landroidx/startup/AppInitializer;",
+            "initializeComponent",
+            sig,
+            Rc::new(RefCell::new(|vm: &mut ovelo_dexrt::Vm, a: &[V]| {
+                // Answer the component instance the caller expects:
+                // instantiate the class named by the Class argument.
+                let desc = match a.get(1).copied() {
+                    Some(V::Ref(h)) => vm.class_descriptor_of(h),
+                    _ => None,
+                };
+                if let Some(d) = desc {
+                    if let Ok(ih) = vm.instantiate(&d) {
+                        return Ok(Some(V::Ref(ih)));
+                    }
+                }
+                Ok(Some(V::Ref(0)))
+            })) as ovelo_dexrt::HostCall,
+        );
+    }
+    // `AppInitializer.getInstance(context).mDiscovered` holds the
+    // Class mirrors of manifest-discovered initializers — lazily
+    // invoked initializers (ProcessLifecycleInitializer) check
+    // membership before initializing.
+    let discovered: Vec<String> = initializers
+        .iter()
+        .map(|i| format!("L{};", i.replace('.', "/")))
+        .collect();
+    let _ = v.register_host(
+        "Landroidx/startup/AppInitializer;",
+        "getInstance",
+        "(Landroid/content/Context;)Landroidx/startup/AppInitializer;",
+        Rc::new(RefCell::new(move |vm: &mut ovelo_dexrt::Vm, a: &[V]| {
+            let set = discovered
+                .iter()
+                .map(|d| V::Ref(vm.class_handle(d)))
+                .collect::<Vec<_>>();
+            let hs = V::Ref(vm.heap.alloc(Obj::Host {
+                class_idx: u64::MAX,
+                desc: "Ljava/util/HashSet;".to_string(),
+                fields: HashMap::new(),
+                state: HostState::List(set),
+            }));
+            let ai = V::Ref(vm.heap.alloc(Obj::Host {
+                class_idx: u64::MAX,
+                desc: "Landroidx/startup/AppInitializer;".to_string(),
+                fields: HashMap::new(),
+                state: HostState::Empty,
+            }));
+            if let V::Ref(h) = ai {
+                vm.set_object_field(
+                    h,
+                    "Landroidx/startup/AppInitializer;",
+                    "mDiscovered",
+                    hs,
+                );
+                // `doInitialize(class, set)` reads mContext for the
+                // initializer's create() argument.
+                vm.set_object_field(
+                    h,
+                    "Landroidx/startup/AppInitializer;",
+                    "mContext",
+                    a.first().copied().unwrap_or(V::Ref(0)),
+                );
+                let init = V::Ref(vm.heap.alloc(Obj::Host {
+                    class_idx: u64::MAX,
+                    desc: "Ljava/util/HashMap;".to_string(),
+                    fields: HashMap::new(),
+                    state: HostState::Map(vec![]),
+                }));
+                vm.set_object_field(
+                    h,
+                    "Landroidx/startup/AppInitializer;",
+                    "mInitialized",
+                    init,
+                );
+            }
+            Ok(Some(ai))
+        })) as ovelo_dexrt::HostCall,
+    );
+}
+
 fn run_app(store: &InstallStore, package: &str) -> Result<(), OveloError> {
     let rec = find_record(store, package)?;
     let bytes = store.apk_bytes(&rec)?;
@@ -426,9 +590,10 @@ fn run_app(store: &InstallStore, package: &str) -> Result<(), OveloError> {
             let vm = (|| -> Result<_, OveloError> {
                 let (_cd, entries) =
                     parse_central_directory(&bytes, &ZipLimits::default())?;
-                // Multi-dex: until the Vm merges dexes, run on the dex
-                // that defines the launcher Activity — fdroid puts it in
-                // classes2.dex, so a fixed `classes.dex` can't dispatch it.
+                // Multi-dex: the Vm merges every classes*.dex into one
+                // index space — a method defined in classes2.dex resolves
+                // from an invoke in classes.dex. Put the launcher-defining
+                // dex first so its refs become canonical identities.
                 let mut dex_files: Vec<DexFile> = Vec::new();
                 for e in entries
                     .iter()
@@ -452,13 +617,52 @@ fn run_app(store: &InstallStore, package: &str) -> Result<(), OveloError> {
                     })
                     .unwrap_or(0);
                 let mut v = ovelo_dexrt::Vm::new(dex_files.swap_remove(pos))?;
+                for d in dex_files {
+                    v.add_dex(d)?;
+                }
                 v.guest_root = data_dir.join("files");
+                v.apk_res = ovelo_dexrt::res::ApkResources::open(bytes.clone());
+                v.theme_id = info
+                    .manifest
+                    .activity_themes
+                    .get(&launcher)
+                    .copied()
+                    .or(info.manifest.theme)
+                    .unwrap_or(0);
                 v.enable_aot();
+                register_compat_shims(&mut v, &info.manifest.startup_initializers);
                 Ok(v)
             })();
             let mut g = vm
                 .and_then(|mut v| {
                     ovelo_framework::GuestUi::register(&ui, &mut v);
+                    // Android startup order: ContentProviders attach and
+                    // androidx.startup initializers run *before*
+                    // Application.onCreate — WorkManager.initialize and
+                    // friends are expected inside an Initializer's create().
+                    if let Some(app) = &info.manifest.application_class {
+                        let ad = format!("L{};", app.replace('.', "/"));
+                        if let Ok(ah) = v.instantiate(&ad) {
+                            for init in &info.manifest.startup_initializers {
+                                let id = format!("L{};", init.replace('.', "/"));
+                                match v.instantiate(&id) {
+                                    Ok(ih) => {
+                                        if let Err(e) =
+                                            v.call_virtual(ih, "create", &[ovelo_dexrt::V::Ref(ah)])
+                                        {
+                                            println!("initializer {init} create failed: {e}");
+                                        }
+                                    }
+                                    Err(e) => {
+                                        println!("initializer {init} not instantiated: {e}")
+                                    }
+                                }
+                            }
+                            if let Err(e) = v.call_virtual(ah, "onCreate", &[]) {
+                                println!("application {app} onCreate failed: {e}");
+                            }
+                        }
+                    }
                     v.instantiate(&desc).map(|h| (v, h))
                 })
                 .map_err(|e| {

@@ -310,8 +310,10 @@ impl DexFile {
     /// `type_ids` index for a descriptor (`Lfoo/Bar;`), if the DEX names it.
     pub fn type_index_of(&self, desc: &str) -> Result<Option<u32>> {
         for (i, &sidx) in self.type_ids.iter().enumerate() {
-            if self.string(sidx)? == desc {
-                return Ok(Some(i as u32));
+            if let Ok(s) = self.string(sidx) {
+                if s == desc {
+                    return Ok(Some(i as u32));
+                }
             }
         }
         Ok(None)
@@ -349,6 +351,12 @@ impl DexFile {
     /// references) — the valid range for [`DexFile::method`].
     pub fn method_ids_len(&self) -> usize {
         self.methods.len()
+    }
+
+    /// Number of entries in the `string_ids` table — the valid range for
+    /// [`DexFile::string`].
+    pub fn strings_len(&self) -> usize {
+        self.string_ids.len()
     }
 
     /// Proto id item.

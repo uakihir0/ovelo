@@ -34,6 +34,31 @@ pub(crate) fn call(
         json_obj(vm, name, args)
     } else if class == "Lorg/json/JSONArray;" {
         json_arr(vm, name, args)
+    } else if class == "Ljavax/net/ssl/TrustManagerFactory;" {
+        match name {
+            // OkHttp's Platform requires exactly one default trust
+            // manager — answer a single X509TrustManager placeholder.
+            "getTrustManagers" => {
+                let tm = host(vm, "Ljavax/net/ssl/X509TrustManager;", HostState::Empty);
+                Some(Some(arr(vm, "Ljavax/net/ssl/TrustManager;", vec![tm])))
+            }
+            "getDefaultAlgorithm" => Some(Some(jstr(vm, "PKIX"))),
+            _ => Some(Some(stub_ret(vm, sig))),
+        }
+    } else if class == "Ljavax/net/ssl/X509TrustManager;"
+        || class == "Ljavax/net/ssl/TrustManager;"
+        || class == "Ljavax/net/ssl/SSLSocketFactory;"
+        || class == "Ljavax/net/ssl/SSLContext;"
+    {
+        match name {
+            "getAcceptedIssuers" => Some(Some(arr(vm, "Ljava/security/cert/X509Certificate;", vec![]))),
+            "init" | "checkClientTrusted" | "checkServerTrusted" => Some(None),
+            "getSocketFactory" | "getDefault" => {
+                Some(Some(host(vm, "Ljavax/net/ssl/SSLSocketFactory;", HostState::Empty)))
+            }
+            "getInstance" => Some(Some(host(vm, class, HostState::Empty))),
+            _ => Some(Some(stub_ret(vm, sig))),
+        }
     } else if class == "Ljava/net/URLEncoder;" || class == "Ljava/net/URLDecoder;" {
         url_codec(vm, name, args)
     } else if class == "Ljava/net/URL;" || class == "Ljava/net/URI;" {

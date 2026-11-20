@@ -255,14 +255,16 @@ impl GuestUi {
 
         // ---- ViewGroup.addView -------------------------------------------
         for cls in ["Landroid/view/ViewGroup;", "Landroid/widget/LinearLayout;"] {
-            Self::on(ui, vm, cls, "addView", "(Landroid/view/View;)V", |ui, _vm, a| {
+            Self::on(ui, vm, cls, "addView", "(Landroid/view/View;)V", |ui, vm, a| {
                 let this = ref_arg(a, 0)?;
                 let child = ref_arg(a, 1)?;
-                let cv = ui
-                    .views
-                    .get(&child)
-                    .cloned()
-                    .ok_or_else(|| crate::err("guest.addView.unknown"))?;
+                // Dex-inflated views (real Instances or view-tree stubs)
+                // aren't GuestViews — attach them in the VM's view tree
+                // instead of failing.
+                let Some(cv) = ui.views.get(&child).cloned() else {
+                    vm.view_tree_add(this, child);
+                    return Ok(None);
+                };
                 match ui.views.get(&this).cloned() {
                     Some(rc) => {
                         let mut g = rc.borrow_mut();
@@ -272,10 +274,17 @@ impl GuestUi {
                                 gr.view.invalidate();
                                 Ok(None)
                             }
-                            _ => Err(crate::err("guest.addView.not_group")),
+                            _ => {
+                                drop(g);
+                                vm.view_tree_add(this, child);
+                                Ok(None)
+                            }
                         }
                     }
-                    None => Err(crate::err("guest.addView.unmapped")),
+                    None => {
+                        vm.view_tree_add(this, child);
+                        Ok(None)
+                    }
                 }
             });
         }
@@ -287,14 +296,16 @@ impl GuestUi {
             "Landroid/app/Activity;",
             "setContentView",
             "(Landroid/view/View;)V",
-            |ui, _vm, a| {
+            |ui, vm, a| {
                 let v = ref_arg(a, 1)?;
-                let cv = ui
-                    .views
-                    .get(&v)
-                    .cloned()
-                    .ok_or_else(|| crate::err("guest.setContentView.unknown"))?;
-                ui.root.set_content_view(Box::new(SharedView(cv)));
+                match ui.views.get(&v).cloned() {
+                    Some(cv) => {
+                        ui.root.set_content_view(Box::new(SharedView(cv)));
+                    }
+                    None => {
+                        vm.view_set_content(ref_arg(a, 0)?, v);
+                    }
+                }
                 Ok(None)
             },
         );
@@ -313,11 +324,10 @@ impl GuestUi {
                     Some(V::I32(c)) => argb(*c),
                     _ => return Err(crate::err("guest.arg.type")),
                 };
-                let rc = ui
-                    .views
-                    .get(&this)
-                    .cloned()
-                    .ok_or_else(|| crate::err("guest.view.unmapped"))?;
+                let Some(rc) = ui.views.get(&this).cloned() else {
+                    // Not a GuestView (dex-inflated) — setters no-op.
+                    return Ok(None);
+                };
                 rc.borrow_mut().view_mut().background = Some(color);
                 rc.borrow_mut().view_mut().invalidate();
                 Ok(None)
@@ -336,11 +346,10 @@ impl GuestUi {
                         _ => return Err(crate::err("guest.arg.type")),
                     };
                     let q = ui.clicks.clone();
-                    let rc = ui
-                        .views
-                        .get(&this)
-                        .cloned()
-                        .ok_or_else(|| crate::err("guest.view.unmapped"))?;
+                    let Some(rc) = ui.views.get(&this).cloned() else {
+                    // Not a GuestView (dex-inflated) — setters no-op.
+                    return Ok(None);
+                };
                     rc.borrow_mut().view_mut().on_click = if listener == 0 {
                         None
                     } else {
@@ -367,11 +376,10 @@ impl GuestUi {
                         Some(V::Ref(h)) => vm.heap().str_val(*h).unwrap_or("").to_string(),
                         _ => return Err(crate::err("guest.arg.type")),
                     };
-                    let rc = ui
-                        .views
-                        .get(&this)
-                        .cloned()
-                        .ok_or_else(|| crate::err("guest.view.unmapped"))?;
+                    let Some(rc) = ui.views.get(&this).cloned() else {
+                    // Not a GuestView (dex-inflated) — setters no-op.
+                    return Ok(None);
+                };
                     let mut g = rc.borrow_mut();
                     let tv = g
                         .text_mut()
@@ -389,11 +397,10 @@ impl GuestUi {
                     Some(V::I32(b)) => f32::from_bits(*b as u32),
                     _ => return Err(crate::err("guest.arg.type")),
                 };
-                let rc = ui
-                    .views
-                    .get(&this)
-                    .cloned()
-                    .ok_or_else(|| crate::err("guest.view.unmapped"))?;
+                let Some(rc) = ui.views.get(&this).cloned() else {
+                    // Not a GuestView (dex-inflated) — setters no-op.
+                    return Ok(None);
+                };
                 let mut g = rc.borrow_mut();
                 let tv = g
                     .text_mut()
@@ -408,11 +415,10 @@ impl GuestUi {
                     Some(V::I32(c)) => argb(*c),
                     _ => return Err(crate::err("guest.arg.type")),
                 };
-                let rc = ui
-                    .views
-                    .get(&this)
-                    .cloned()
-                    .ok_or_else(|| crate::err("guest.view.unmapped"))?;
+                let Some(rc) = ui.views.get(&this).cloned() else {
+                    // Not a GuestView (dex-inflated) — setters no-op.
+                    return Ok(None);
+                };
                 let mut g = rc.borrow_mut();
                 let tv = g
                     .text_mut()

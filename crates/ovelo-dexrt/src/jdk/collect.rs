@@ -20,6 +20,7 @@ const LIST_CLASSES: &[&str] = &[
     "Ljava/util/AbstractQueue;",
     "Ljava/util/AbstractCollection;",
     "Ljava/util/HashSet;",
+    "Ljava/util/EnumSet;",
     "Ljava/util/LinkedHashSet;",
     "Ljava/util/TreeSet;",
     "Ljava/util/AbstractSet;",
@@ -56,6 +57,7 @@ const MAP_CLASSES: &[&str] = &[
     "Ljava/util/Properties;",
     "Ljava/util/WeakHashMap;",
     "Ljava/util/IdentityHashMap;",
+    "Ljava/util/EnumMap;",
     "Ljava/util/concurrent/ConcurrentHashMap;",
     "Ljava/util/AbstractMap;",
     "Landroid/util/ArrayMap;",
@@ -226,6 +228,8 @@ pub(crate) fn call(
             }
             _ => None,
         }
+    } else if class == "Ljava/util/EnumSet;" {
+        enum_set_call(vm, name, sig, args)?
     } else if is_list(class) {
         list_call(vm, name, sig, args)?
     } else if is_map(class) {
@@ -234,6 +238,91 @@ pub(crate) fn call(
         iter_call(vm, name, args)?
     } else {
         return Ok(None);
+    })
+}
+
+// ---------------------------------------------------------------------
+// EnumSet — list-backed; static factories can't fall through to
+// `list_call` (no receiver), so they build the set here.
+
+fn enum_set_call(vm: &mut Vm, name: &str, sig: &str, args: &[V]) -> Rt<Option<Option<V>>> {
+    fn class_desc_of_enum(vm: &Vm, v: V) -> Option<String> {
+        let V::Ref(h) = v else { return None };
+        let ci = vm.heap.class_of(h)?;
+        vm.type_desc_of(ci).ok()
+    }
+    fn class_desc_of_class(vm: &Vm, v: V) -> Option<String> {
+        let V::Ref(h) = v else { return None };
+        match vm.heap.get(h) {
+            Some(Obj::Class { type_idx }) => vm.type_desc_of(*type_idx).ok(),
+            _ => None,
+        }
+    }
+    Ok(match name {
+        "of" | "noneOf" => Some(Some(host(
+            vm,
+            "Ljava/util/EnumSet;",
+            HostState::List(if name == "of" { args.to_vec() } else { Vec::new() }),
+        ))),
+        "allOf" => {
+            let vals = class_desc_of_class(vm, args.first().copied().unwrap_or(V::Ref(0)))
+                .map(|d| lang::enum_value_list(vm, &d))
+                .unwrap_or_default();
+            Some(Some(host(vm, "Ljava/util/EnumSet;", HostState::List(vals))))
+        }
+        "range" => {
+            let from = lang::enum_ordinal(vm, args.first().copied().unwrap_or(V::Ref(0)));
+            let to = lang::enum_ordinal(vm, args.get(1).copied().unwrap_or(V::Ref(0)));
+            let vals = class_desc_of_enum(vm, args.first().copied().unwrap_or(V::Ref(0)))
+                .map(|d| {
+                    lang::enum_value_list(vm, &d)
+                        .into_iter()
+                        .filter(|v| {
+                            let o = lang::enum_ordinal(vm, *v);
+                            o >= from && o <= to
+                        })
+                        .collect()
+                })
+                .unwrap_or_default();
+            Some(Some(host(vm, "Ljava/util/EnumSet;", HostState::List(vals))))
+        }
+        "copyOf" => {
+            let src: Vec<V> = match args.first().copied().unwrap_or(V::Ref(0)) {
+                V::Ref(sh) => match vm.heap.get(sh) {
+                    Some(Obj::Host {
+                        state: HostState::List(l),
+                        ..
+                    }) => l.clone(),
+                    Some(Obj::Array { data, .. }) => data.clone(),
+                    _ => vec![],
+                },
+                _ => vec![],
+            };
+            Some(Some(host(vm, "Ljava/util/EnumSet;", HostState::List(src))))
+        }
+        "complementOf" => {
+            let existing: Vec<V> = match args.first().copied().unwrap_or(V::Ref(0)) {
+                V::Ref(sh) => match vm.heap.get(sh) {
+                    Some(Obj::Host {
+                        state: HostState::List(l),
+                        ..
+                    }) => l.clone(),
+                    _ => vec![],
+                },
+                _ => vec![],
+            };
+            let desc = existing.first().and_then(|v| class_desc_of_enum(vm, *v));
+            let mut vals = Vec::new();
+            if let Some(d) = desc {
+                for v in lang::enum_value_list(vm, &d) {
+                    if !existing.iter().any(|e| value_eq(vm, *e, v)) {
+                        vals.push(v);
+                    }
+                }
+            }
+            Some(Some(host(vm, "Ljava/util/EnumSet;", HostState::List(vals))))
+        }
+        _ => return list_call(vm, name, sig, args),
     })
 }
 
@@ -488,6 +577,13 @@ fn map_call(vm: &mut Vm, name: &str, sig: &str, args: &[V]) -> Rt<Option<Option<
             let prev = map_put(vm, h, args[1], args[2]);
             Some(Some(prev.unwrap_or(V::Ref(0))))
         }
+        "putIfAbsent" => {
+            let prev = map_get(vm, h, args[1]);
+            if prev.is_none() {
+                map_put(vm, h, args[1], args[2]);
+            }
+            Some(Some(prev.unwrap_or(V::Ref(0))))
+        }
         "putAll" => {
             if let V::Ref(sh) = args[1] {
                 let pairs: Vec<(V, V)> = match vm.heap.get(sh) {
@@ -545,7 +641,20 @@ fn map_call(vm: &mut Vm, name: &str, sig: &str, args: &[V]) -> Rt<Option<Option<
         | "getParcelableArray" | "getCharSequenceArray" | "getClassLoader" => {
             Some(Some(
                 map_get(vm, h, args[1])
-                    .or_else(|| args.get(2).copied())
+                    .or_else(|| match args.get(2) {
+                        // `getParcelable(key, Class)` and friends take a type
+                        // token as the last arg, not a default value — a miss
+                        // must yield null, not the Class object itself.
+                        Some(V::Ref(dh))
+                            if matches!(
+                                vm.heap.get(*dh),
+                                Some(Obj::Class { .. })
+                            ) =>
+                        {
+                            None
+                        }
+                        other => other.copied(),
+                    })
                     .unwrap_or(V::Ref(0)),
             ))
         }
@@ -600,8 +709,7 @@ fn map_call(vm: &mut Vm, name: &str, sig: &str, args: &[V]) -> Rt<Option<Option<
             };
             Some(Some(host(vm, desc, HostState::List(out))))
         }
-        "compute" | "computeIfAbsent" | "computeIfPresent" | "merge"
-        | "putIfAbsent" => {
+        "compute" | "computeIfAbsent" | "computeIfPresent" | "merge" => {
             let cur = map_get(vm, h, args[1]);
             match name {
                 "putIfAbsent" => {
@@ -693,6 +801,22 @@ fn iter_call(vm: &mut Vm, name: &str, args: &[V]) -> Rt<Option<Option<V>>> {
         return Ok(None);
     };
     Ok(match name {
+        "<init>" => {
+            // SimpleEntry/SimpleImmutableEntry(key, value) — the
+            // desugarer builds these for Map.entry/ofEntries. The key
+            // goes to P_COMPONENT (or the Slot when the object already
+            // carries one), the value to P_DATA.
+            if let Some(Obj::Host {
+                state: HostState::Slot(v),
+                ..
+            }) = vm.heap.get_mut(h)
+            {
+                *v = args.get(1).copied().unwrap_or(V::Ref(0));
+            }
+            pseudo_set(vm, h, P_COMPONENT, args.get(1).copied().unwrap_or(V::Ref(0)));
+            pseudo_set(vm, h, P_DATA, args.get(2).copied().unwrap_or(V::Ref(0)));
+            Some(None)
+        }
         "hasNext" | "hasMoreElements" => {
             let n = match vm.heap.get(h) {
                 Some(Obj::Host {
@@ -743,7 +867,11 @@ fn iter_call(vm: &mut Vm, name: &str, args: &[V]) -> Rt<Option<Option<V>>> {
         "hasPrevious" => Some(Some(V::I32(0))),
         "previous" | "nextIndex" | "previousIndex" => Some(Some(V::I32(0))),
         "remove" | "set" | "add" | "forEachRemaining" => Some(None),
-        "getKey" => Some(Some(slot_of(vm, h).unwrap_or(V::Ref(0)))),
+        "getKey" => Some(Some(
+            slot_of(vm, h)
+                .or_else(|| pseudo_get(vm, h, P_COMPONENT))
+                .unwrap_or(V::Ref(0)),
+        )),
         "getValue" => Some(Some(pseudo_get(vm, h, P_DATA).unwrap_or(V::Ref(0)))),
         "setValue" => {
             let old = pseudo_get(vm, h, P_DATA).unwrap_or(V::Ref(0));
@@ -1461,7 +1589,7 @@ fn atomic_call(vm: &mut Vm, class: &str, name: &str, args: &[V]) -> Option<Optio
                 1
             };
             let long = class.contains("Long") || matches!(cur, V::I64(_));
-            let nv = i64v(cur) + delta;
+            let nv = i64v(cur).wrapping_add(delta);
             let next = if long { V::I64(nv) } else { V::I32(nv as i32) };
             if let Some(Obj::Host {
                 state: HostState::Slot(v),
@@ -1538,8 +1666,9 @@ fn fieldupdater_call(vm: &mut Vm, name: &str, args: &[V]) -> Rt<Option<Option<V>
             let owner = class_of(vm, args[1]);
             let fid = fname
                 .as_deref()
-                .and_then(|n| vm.dex.field_index_of(&owner, n))
-                .unwrap_or(P_DATA);
+                .and_then(|n| vm.field_index_of(&owner, n))
+                .map(|g| vm.canon_field(g))
+                .unwrap_or(P_DATA as u64);
             match name {
                 "get" => {
                     let v = match vm.heap.get(obj) {
