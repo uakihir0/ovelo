@@ -1517,9 +1517,25 @@ impl Vm {
                     })
                 );
                 if h != 0 && !opaque_stub && !self.is_instance(h, ins.idx.unwrap_or(0)) {
+                    let have = match self.heap.get(h) {
+                        Some(Obj::Array { elem, .. }) => format!("[{elem}"),
+                        Some(Obj::Host { desc, .. }) => desc.clone(),
+                        Some(Obj::Throwable { descriptor, .. }) => descriptor.clone(),
+                        Some(Obj::Str(_)) => "Ljava/lang/String;".to_string(),
+                        Some(Obj::Class { .. }) => "Ljava/lang/Class;".to_string(),
+                        Some(Obj::Instance { class_idx, .. }) => self
+                            .dex
+                            .type_descriptor(*class_idx)
+                            .unwrap_or_else(|_| "?".to_string()),
+                        _ => "?".to_string(),
+                    };
+                    let want = self
+                        .dex
+                        .type_descriptor(ins.idx.unwrap_or(0))
+                        .unwrap_or_else(|_| "?".to_string());
                     return Err(self.throw_builtin(
                         "Ljava/lang/ClassCastException;",
-                        "check-cast",
+                        &format!("check-cast {have} -> {want}"),
                     ));
                 }
             }
