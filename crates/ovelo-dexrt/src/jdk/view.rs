@@ -328,6 +328,38 @@ pub(crate) fn call(
         "getMenuInflater" | "getSupportMenuInflater" => {
             Some(Some(host(vm, "Landroid/view/MenuInflater;", HostState::Empty)))
         }
+        // Static View/ViewGroup.getChildMeasureSpec(parentSpec,
+        // padding, childDimension) — AOSP packing rules.
+        "getChildMeasureSpec" => {
+            const MODE_MASK: i32 = 0x3 << 30;
+            const EXACTLY: i32 = 1 << 30;
+            const AT_MOST: i32 = 2 << 30;
+            let spec = i32v(args.first().copied().unwrap_or(V::I32(0)));
+            let padding = i32v(args.get(1).copied().unwrap_or(V::I32(0)));
+            let child_dim = i32v(args.get(2).copied().unwrap_or(V::I32(0)));
+            let size = (spec & !MODE_MASK) - padding;
+            let size = if size < 0 { 0 } else { size };
+            let (mode, out) = match spec & MODE_MASK {
+                m if m == EXACTLY => match child_dim {
+                    d if d >= 0 => (EXACTLY, d),
+                    -2 => (AT_MOST, size), // WRAP_CONTENT
+                    _ => (EXACTLY, size),  // MATCH_PARENT (-1) / unspecified
+                },
+                m if m == AT_MOST => match child_dim {
+                    d if d >= 0 => (EXACTLY, d),
+                    -2 => (AT_MOST, size),
+                    _ => (AT_MOST, size),
+                },
+                _ => (
+                    0,
+                    match child_dim {
+                        d if d >= 0 => d,
+                        _ => 0,
+                    },
+                ),
+            };
+            Some(Some(V::I32((out & !MODE_MASK) | (mode & MODE_MASK))))
+        }
         "getMenu" => Some(Some(menu_of(vm, this))),
         // Toolbar.inflateMenu(int) / NavigationView.inflateMenu(int).
         "inflateMenu" => {

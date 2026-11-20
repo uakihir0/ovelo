@@ -486,6 +486,23 @@ impl Vm {
         jdk::class_of(self, V::Ref(h))
     }
 
+    /// Debug: the superclass chain of `desc`, used by view debugging.
+    pub fn dbg_super_chain(&self, desc: &str) -> Vec<String> {
+        let mut out = Vec::new();
+        let mut cur = desc.to_string();
+        for _ in 0..16 {
+            let Some(s) = self.super_desc(&cur) else {
+                break;
+            };
+            if s == cur {
+                break;
+            }
+            out.push(s.clone());
+            cur = s;
+        }
+        out
+    }
+
     /// True when `h` is (a subclass of) a `java.util.Collection` guest
     /// object — wrappers around a host collection whose elements are
     /// copied out by `list_snapshot`.

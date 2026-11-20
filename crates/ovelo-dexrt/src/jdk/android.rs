@@ -416,6 +416,8 @@ pub(crate) fn call(
         || class == "Landroid/util/AttributeSet;"
     {
         graphics_call(vm, class, name, args)?
+    } else if class == "Landroid/view/View$MeasureSpec;" {
+        measurespec_call(vm, name, args)
     } else if class == "Landroid/view/ViewConfiguration;"
         || class == "Landroid/view/Gravity;"
     {
@@ -512,6 +514,38 @@ fn viewconfig_call(
         }
         _ => None,
     })
+}
+
+// ---------------------------------------------------------------------
+// View.MeasureSpec — a 32-bit int packing a 2-bit mode in the top two
+// bits: UNSPECIFIED=0, EXACTLY=1<<30, AT_MOST=2<<30 (negative i32).
+// androidx containers check the mode in onMeasure (e.g. PagerTabStrip
+// throws "Must measure with an exact width" when the width mode isn't
+// EXACTLY), so the generic 0-returning stub breaks real layouts.
+
+fn measurespec_call(vm: &mut Vm, name: &str, args: &[V]) -> Option<Option<V>> {
+    const MODE_MASK: i32 = 0x3 << 30;
+    const EXACTLY: i32 = 1 << 30;
+    // All methods are static; args[0] is the spec int (or the size for
+    // makeMeasureSpec) — there is no receiver.
+    let spec = i32v(args.first().copied().unwrap_or(V::I32(0)));
+    Some(Some(match name {
+        "getMode" => V::I32(spec & MODE_MASK),
+        "getSize" => V::I32(spec & !MODE_MASK),
+        "makeMeasureSpec" | "makeMeasureSpecStatic" => {
+            let mode = i32v(args.get(1).copied().unwrap_or(V::I32(0)));
+            V::I32((spec & !MODE_MASK) | (mode & MODE_MASK))
+        }
+        "toString" => {
+            let label = match spec & MODE_MASK {
+                0 => "UNSPECIFIED",
+                m if m == EXACTLY => "EXACTLY",
+                _ => "AT_MOST",
+            };
+            jstr(vm, &format!("MeasureSpec: {} {}", label, spec & !MODE_MASK))
+        }
+        _ => return None,
+    }))
 }
 
 // ---------------------------------------------------------------------

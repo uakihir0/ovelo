@@ -698,13 +698,16 @@ impl GuestUi {
     }
 }
 
-/// Drive the dex `onMeasure`/`onLayout` of adapter-backed containers
-/// (`ViewPager`, `RecyclerView`, …) whose `populate()`/layout is only
-/// reached from those callbacks — no host caller invokes them, so
-/// without this the container renders empty (the adapter is never
-/// asked for its pages). Runs OUTSIDE the `GuestUi` borrow: the guest
-/// code it dispatches re-enters bridged view methods that borrow the
-/// same RefCell.
+/// Drive the dex `onMeasure`/`onLayout` of every guest view group —
+/// real Android runs these on the whole tree during layout, and
+/// adapter containers (`ViewPager`, `RecyclerView`, …) only create
+/// their child pages from inside them (`ViewPager.onMeasure` calls
+/// `populate()`). No host caller invokes these methods, so without
+/// this pass the containers render empty (the adapter is never asked
+/// for its pages). Obfuscation renames the androidx classes, so
+/// ancestry checks can't spot them — run it on every group instead.
+/// Runs OUTSIDE the `GuestUi` borrow: the guest code it dispatches
+/// re-enters bridged view methods that borrow the same RefCell.
 ///
 /// `frame` is a render-cycle counter — the pass runs every 30th frame
 /// to bound interpreter work. `populate()` is idempotent on existing
@@ -717,13 +720,6 @@ pub fn drive_dex_layout_pass(vm: &mut Vm, activity: u32, frame: u32) {
     let Some(root) = vm.activity_content(activity) else {
         return;
     };
-    const ADAPTER: &[&str] = &[
-        // Real simple names — extends_named matches exact segments, so
-        // "SwipeRefresh" would miss SwipeRefreshLayout, and ViewPager2
-        // is not a ViewPager subclass.
-        "ViewPager", "ViewPager2", "RecyclerView", "ListView", "GridView",
-        "AdapterView", "DrawerLayout", "SwipeRefreshLayout",
-    ];
     // MeasureSpec mode EXACTLY (mode << 30) — containers like
     // DrawerLayout throw unless both specs are EXACTLY, so
     // UNSPECIFIED/0 would leave them unmeasured forever.
@@ -735,9 +731,7 @@ pub fn drive_dex_layout_pass(vm: &mut Vm, activity: u32, frame: u32) {
         let Some(info) = vm.dex_view(h) else {
             return;
         };
-        // Ancestry, not name substring: subclasses like `MainPager
-        // extends ViewPager` need the inherited onMeasure/onLayout too.
-        if ADAPTER.iter().any(|k| vm.extends_named(&info.desc, k)) {
+        if info.is_group {
             if let Err(e) = vm.call_virtual(
                 h,
                 "onMeasure",
@@ -755,6 +749,53 @@ pub fn drive_dex_layout_pass(vm: &mut Vm, activity: u32, frame: u32) {
                 if std::env::var_os("OVELO_VIEWDBG").is_some() {
                     eprintln!("[viewdbg] onLayout {} err {e}", info.desc);
                 }
+            }
+            if std::env::var_os("OVELO_VIEWDBG").is_some()
+                && info.desc.contains("ViewPager")
+            {
+                let fields: Vec<String> = match vm.heap().get(h) {
+                    Some(ovelo_dexrt::Obj::Instance { fields, .. })
+                    | Some(ovelo_dexrt::Obj::Host { fields, .. }) => fields
+                        .values()
+                        .filter_map(|v| match v {
+                            V::Ref(x) if *x != 0 => {
+                                let mut s = format!("h{x}:{}", vm.dbg_class_of(*x));
+                                // One level deeper: the adapter's own
+                                // ref fields + host list lengths.
+                                if let Some(ovelo_dexrt::Obj::Instance {
+                                    fields: f2, ..
+                                }) = vm.heap().get(*x)
+                                {
+                                    let inner: Vec<String> = f2
+                                        .values()
+                                        .filter_map(|v2| match v2 {
+                                            V::Ref(y) if *y != 0 => {
+                                                let mut t = format!(
+                                                    "h{y}:{}",
+                                                    vm.dbg_class_of(*y)
+                                                );
+                                                if let Some(ovelo_dexrt::Obj::Host {
+                                                    state: ovelo_dexrt::HostState::List(l),
+                                                    ..
+                                                }) = vm.heap().get(*y)
+                                                {
+                                                    t.push_str(&format!("(len={})", l.len()));
+                                                }
+                                                Some(t)
+                                            }
+                                            _ => None,
+                                        })
+                                        .collect();
+                                    s.push_str(&format!("->{inner:?}"));
+                                }
+                                Some(s)
+                            }
+                            _ => None,
+                        })
+                        .collect(),
+                    _ => Vec::new(),
+                };
+                eprintln!("[viewdbg] pager {h} ref-fields: {fields:?}");
             }
         }
         // Re-snapshot: the layout pass may have attached children.
