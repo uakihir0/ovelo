@@ -233,6 +233,7 @@ fn make_dex_view(vm: &Vm, info: &ovelo_dexrt::DexViewInfo, fonts: &Rc<FontSet>) 
         // match_parent sibling offscreen and renders a blank window.
         const STACK: &[&str] = &[
             "LinearLayout",
+            "LinearLayoutCompat",
             "TabLayout",
             "RecyclerView",
             "ListView",

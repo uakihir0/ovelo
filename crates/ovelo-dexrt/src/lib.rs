@@ -493,9 +493,13 @@ impl Vm {
         let Some(Obj::Instance { class_idx, .. }) = self.heap.get(h) else {
             return false;
         };
+        // No `java.util.Collection` in the dex type pool at all → the
+        // app never names the interface, so a guest object can still be
+        // a collection wrapper. Be permissive there; the backing-field
+        // search is the real test.
         self.type_index_of("Ljava/util/Collection;")
             .map(|t| self.assignable(*class_idx, t))
-            .unwrap_or(false)
+            .unwrap_or(true)
     }
 
     /// A `java.lang.Class` mirror handle for `desc` (`Ljava/lang/Foo;`).

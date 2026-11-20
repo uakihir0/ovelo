@@ -640,11 +640,18 @@ pub(crate) fn call(
                         _ => 0,
                     };
                     for i in 0..n {
-                        let _ = vm.call_virtual(
+                        if let Err(e) = vm.call_virtual(
                             ad,
                             "instantiateItem",
                             &[V::Ref(this), V::I32(i)],
-                        );
+                        ) {
+                            if std::env::var_os("OVELO_VIEWDBG").is_some() {
+                                eprintln!("[viewdbg] instantiateItem {i} err {e:?}");
+                            }
+                        }
+                    }
+                    if std::env::var_os("OVELO_VIEWDBG").is_some() {
+                        eprintln!("[viewdbg] setAdapter {class} adapter={ad} count={n}");
                     }
                 }
             }
