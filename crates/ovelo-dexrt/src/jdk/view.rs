@@ -606,6 +606,30 @@ pub(crate) fn call(
             Some(None)
         }
         "bringChildToFront" => Some(None),
+        // ---------- ViewPager ----------
+        "setAdapter" if class.contains("ViewPager") => {
+            // Drive the PagerAdapter the way populate() would: count,
+            // then instantiateItem per page — androidx attaches each
+            // page view to the container itself, so they flow through
+            // our addView arm into the rendered tree.
+            if let Some(V::Ref(ad)) = args.get(1).copied() {
+                if ad != 0 {
+                    pseudo_set(vm, this, P_TARGET, V::Ref(ad));
+                    let n = match vm.call_virtual(ad, "getCount", &[]) {
+                        Ok(Some(V::I32(n))) => n.clamp(0, 8),
+                        _ => 0,
+                    };
+                    for i in 0..n {
+                        let _ = vm.call_virtual(
+                            ad,
+                            "instantiateItem",
+                            &[V::Ref(this), V::I32(i)],
+                        );
+                    }
+                }
+            }
+            Some(None)
+        }
         "getParent" => Some(Some(pseudo_get(vm, this, P_PARENT).unwrap_or(V::Ref(0)))),
         "getRootView" => {
             let mut cur = this;
@@ -731,7 +755,7 @@ pub(crate) fn call(
         | "setInputType" | "setImeOptions" | "setCompoundDrawables" | "setError"
         | "setMovementMethod" | "setMarqueeRepeatLimit" | "setFilters" | "setEnabled_true"
         | "setCheckMarkDrawable" | "setChecked" | "setOnCheckedChangeListener"
-        | "setProgress" | "setMax" | "setIndeterminate" | "setAdapter" | "setOnItemClickListener"
+        | "setProgress" | "setMax" | "setIndeterminate" | "setOnItemClickListener"
         | "setOnItemSelectedListener" | "setOnScrollListener" | "setOnRefreshListener"
         | "setRefreshing" | "setLayoutManager" | "setClipToOutline" | "setOutlineProvider"
         | "setAccessibilityDelegate" | "setAutofillHints" | "setScreenReaderFocusable"
