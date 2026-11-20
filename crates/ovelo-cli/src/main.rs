@@ -828,6 +828,21 @@ fn run_app(store: &InstallStore, package: &str) -> Result<(), OveloError> {
                     v.add_dex(d)?;
                 }
                 v.guest_root = data_dir.join("files");
+                // Seed shared external storage once so file managers
+                // have something to list (safe: only fills what's absent).
+                let ext = &v.external_root;
+                for d in ["Documents", "Download", "Pictures"] {
+                    let _ = std::fs::create_dir_all(ext.join(d));
+                }
+                for (f, body) in [
+                    ("readme.md", "ovelo guest storage\n"),
+                    ("Documents/notes.txt", "hello from ovelo\n"),
+                ] {
+                    let p = ext.join(f);
+                    if !p.exists() {
+                        let _ = std::fs::write(p, body);
+                    }
+                }
                 v.apk_res = ovelo_dexrt::res::ApkResources::open(bytes.clone());
                 v.theme_id = info
                     .manifest

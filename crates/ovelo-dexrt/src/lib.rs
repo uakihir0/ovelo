@@ -134,6 +134,9 @@ pub struct Vm {
     /// Guest-visible filesystem root: `java.io.File` paths resolve
     /// under this directory, never onto the host fs directly.
     pub guest_root: std::path::PathBuf,
+    /// Root `/storage/emulated/0` (and its `/sdcard` aliases) maps to —
+    /// shared external storage, distinct from the app-private guest_root.
+    pub external_root: std::path::PathBuf,
     /// Live interpreter call depth — unbounded guest or builtin
     /// recursion would overflow the native stack; cap it instead.
     depth: u32,
@@ -300,6 +303,11 @@ impl Vm {
             aot: None,
             guest_package: None,
             guest_root: std::env::temp_dir().join("ovelo-guest"),
+            external_root: std::env::temp_dir()
+                .join("ovelo-guest")
+                .join("storage")
+                .join("emulated")
+                .join("0"),
             depth: 0,
             stack: Vec::new(),
             throw_sites: HashMap::new(),

@@ -185,8 +185,29 @@ fn stream_call(vm: &mut Vm, name: &str, args: &[V]) -> Option<Option<V>> {
 /// guest paths and `..` can never escape the sandbox: root/prefix
 /// components are dropped and `..` above the root is discarded.
 pub(crate) fn fspath(vm: &Vm, guest: &str) -> std::path::PathBuf {
+    // External-storage aliases resolve against external_root — shared
+    // media the app-private guest_root has no business holding.
+    for pre in [
+        "/storage/emulated/0",
+        "/storage/self/primary",
+        "/mnt/sdcard",
+        "/sdcard",
+    ] {
+        if guest == pre {
+            return vm.external_root.clone();
+        }
+        if let Some(rest) = guest.strip_prefix(&format!("{pre}/")) {
+            return under(&vm.external_root, rest);
+        }
+    }
+    under(&vm.guest_root, guest)
+}
+
+/// Sanitized join: `..` can't climb above `root`, absolute/CurDir parts
+/// are ignored. Used for both guest_root and external_root mappings.
+fn under(root: &std::path::Path, guest: &str) -> std::path::PathBuf {
     use std::path::Component as C;
-    let mut out = vm.guest_root.clone();
+    let mut out = root.to_path_buf();
     let mut depth = 0usize;
     for c in std::path::Path::new(guest).components() {
         match c {
@@ -307,6 +328,9 @@ fn file_call(vm: &mut Vm, name: &str, args: &[V]) -> Option<Option<V>> {
                         .collect()
                 })
                 .unwrap_or_default();
+            if std::env::var_os("OVELO_VIEWDBG").is_some() {
+                eprintln!("[viewdbg] {name} {path} -> {} ({} entries)", std_path.display(), names.len());
+            }
             if name == "list" {
                 let vs: Vec<V> = names.iter().map(|n| jstr(vm, n)).collect();
                 Some(arr(vm, STRING, vs))
