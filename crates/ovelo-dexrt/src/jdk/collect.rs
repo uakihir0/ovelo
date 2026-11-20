@@ -297,13 +297,12 @@ fn enum_set_call(vm: &mut Vm, name: &str, sig: &str, args: &[V]) -> Rt<Option<Op
         }
         "copyOf" => {
             let src: Vec<V> = match args.first().copied().unwrap_or(V::Ref(0)) {
-                V::Ref(sh) => match vm.heap.get(sh) {
-                    Some(Obj::Host {
-                        state: HostState::List(l),
-                        ..
-                    }) => l.clone(),
-                    Some(Obj::Array { data, .. }) => data.clone(),
-                    _ => vec![],
+                V::Ref(sh) => match list_ref(vm, sh) {
+                    Some(l) => l.clone(),
+                    None => match vm.heap.get(sh) {
+                        Some(Obj::Array { data, .. }) => data.clone(),
+                        _ => vec![],
+                    },
                 },
                 _ => vec![],
             };
@@ -311,13 +310,7 @@ fn enum_set_call(vm: &mut Vm, name: &str, sig: &str, args: &[V]) -> Rt<Option<Op
         }
         "complementOf" => {
             let existing: Vec<V> = match args.first().copied().unwrap_or(V::Ref(0)) {
-                V::Ref(sh) => match vm.heap.get(sh) {
-                    Some(Obj::Host {
-                        state: HostState::List(l),
-                        ..
-                    }) => l.clone(),
-                    _ => vec![],
-                },
+                V::Ref(sh) => list_ref(vm, sh).cloned().unwrap_or_default(),
                 _ => vec![],
             };
             let desc = existing.first().and_then(|v| class_desc_of_enum(vm, *v));
@@ -348,13 +341,12 @@ fn list_call(vm: &mut Vm, name: &str, sig: &str, args: &[V]) -> Rt<Option<Option
             // elements — the ctor otherwise lands as a no-op stub and
             // silently empties the copy.
             if let Some(V::Ref(sh)) = args.get(1).copied() {
-                let src: Vec<V> = match vm.heap.get(sh) {
-                    Some(Obj::Host {
-                        state: HostState::List(l),
-                        ..
-                    }) => l.clone(),
-                    Some(Obj::Array { data, .. }) => data.clone(),
-                    _ => vec![],
+                let src: Vec<V> = match list_ref(vm, sh) {
+                    Some(l) => l.clone(),
+                    None => match vm.heap.get(sh) {
+                        Some(Obj::Array { data, .. }) => data.clone(),
+                        _ => vec![],
+                    },
                 };
                 if let Some(l) = list_mut(vm, h) {
                     *l = src;
@@ -376,13 +368,12 @@ fn list_call(vm: &mut Vm, name: &str, sig: &str, args: &[V]) -> Rt<Option<Option
         }
         "addAll" => {
             let src: Vec<V> = match args.last().copied().unwrap_or(V::Ref(0)) {
-                V::Ref(sh) => match vm.heap.get(sh) {
-                    Some(Obj::Host {
-                        state: HostState::List(l),
-                        ..
-                    }) => l.clone(),
-                    Some(Obj::Array { data, .. }) => data.clone(),
-                    _ => vec![],
+                V::Ref(sh) => match list_ref(vm, sh) {
+                    Some(l) => l.clone(),
+                    None => match vm.heap.get(sh) {
+                        Some(Obj::Array { data, .. }) => data.clone(),
+                        _ => vec![],
+                    },
                 },
                 _ => vec![],
             };
