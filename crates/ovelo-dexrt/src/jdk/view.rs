@@ -1727,11 +1727,32 @@ pub(crate) fn attach(vm: &mut Vm, parent: u32, child: V) {
             // Only register when this content frame belongs to the
             // running activity's own window — a Dialog's window has a
             // content frame too, and its content must not replace the
-            // activity's recorded view/decor.
+            // activity's recorded view/decor. AppCompat's subDecor can
+            // nest its own id/content frame below the window's, so a
+            // frame counts when the activity's content frame is an
+            // ancestor (or the frame itself).
             let own_frame = owner == 0
                 || window_of(vm, owner)
                     .and_then(|w| content_frame_of(vm, w))
-                    == Some(parent);
+                    .map(|root| {
+                        let mut cur = Some(parent);
+                        let mut hops = 0;
+                        while let Some(p) = cur {
+                            if p == root {
+                                return true;
+                            }
+                            hops += 1;
+                            if hops > 64 {
+                                return false;
+                            }
+                            cur = match pseudo_get(vm, p, P_PARENT) {
+                                Some(V::Ref(x)) if x != 0 => Some(x),
+                                _ => None,
+                            };
+                        }
+                        false
+                    })
+                    .unwrap_or(false);
             if own_frame {
                 vm.content_views.insert(owner, ch);
                 let mut top = parent;
