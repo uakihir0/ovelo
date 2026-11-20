@@ -164,6 +164,21 @@ pub(crate) fn run_on_worker(
     v
 }
 
+/// Run a `Runnable` on the main thread — a `Handler` bound to the main
+/// looper delivers its callbacks there even when `post` is called from
+/// inside executor work (LiveData/RecyclerView rely on this).
+pub(crate) fn run_on_main(
+    vm: &mut Vm,
+    r: u32,
+) -> std::result::Result<Option<V>, ovelo_error::OveloError> {
+    let prev = vm.cur_thread;
+    main_thread(vm);
+    vm.cur_thread = vm.main_thread_h;
+    let v = vm.call_virtual(r, "run", &[]);
+    vm.cur_thread = prev;
+    v
+}
+
 /// The one `Application` — `Context.getApplication[Context]` callers
 /// `check-cast` the result (e.g. Glide's `RequestManagerRetriever`),
 /// so it must be Application-typed, not the Activity receiver.

@@ -1736,6 +1736,7 @@ dependencies = [
  "ovelo-apk",
  "ovelo-dex",
  "ovelo-error",
+ "rusqlite",
 ]
 
 [[package]]

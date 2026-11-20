@@ -2242,8 +2242,9 @@ fn handler_call(vm: &mut Vm, name: &str, args: &[V]) -> Rt<Option<Option<V>>> {
             if let Some(V::Ref(r)) = args.get(1).copied().or_else(|| {
                 args.get(1).copied()
             }) {
-                // Handler posts land on the main looper — same thread.
-                let _ = vm.call_virtual(r, "run", &[]);
+                // Handler posts land on the main looper thread — even
+                // when posted from inside executor work.
+                let _ = run_on_main(vm, r);
             }
             Some(Some(V::I32(1)))
         }
@@ -2274,7 +2275,16 @@ fn handler_call(vm: &mut Vm, name: &str, args: &[V]) -> Rt<Option<Option<V>>> {
 
 fn looper_call(vm: &mut Vm, name: &str, _args: &[V]) -> Rt<Option<Option<V>>> {
     Ok(match name {
-        "getMainLooper" | "myLooper" => Some(Some(main_looper(vm))),
+        "getMainLooper" => Some(Some(main_looper(vm))),
+        "myLooper" => {
+            // A background thread has no looper unless it prepared one —
+            // Looper.myLooper()==getMainLooper() must be false on workers.
+            if vm.cur_thread != 0 && vm.cur_thread != vm.main_thread_h {
+                Some(Some(V::Ref(0)))
+            } else {
+                Some(Some(main_looper(vm)))
+            }
+        }
         "prepare" | "prepareMainLooper" => Some(None),
         "loop" | "quit" | "quitSafely" => Some(None),
         "isCurrentThread" => Some(Some(V::I32(
