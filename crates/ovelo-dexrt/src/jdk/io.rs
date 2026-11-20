@@ -910,6 +910,47 @@ fn json_arr(vm: &mut Vm, name: &str, args: &[V]) -> Option<Option<V>> {
         _ => return None,
     };
     match name {
+        "<init>" => {
+            // JSONArray(String) parses the source; JSONArray(Collection)
+            // copies elements. Both land in the object's List state.
+            match args.get(1).copied() {
+                Some(v) if !matches!(v, V::Ref(0)) => {
+                    if let Some(src) = sv(vm, v) {
+                        let b: Vec<char> = src.chars().collect();
+                        let mut i = 0;
+                        if let Some(V::Ref(parsed)) = json_value(vm, &b, &mut i, 0) {
+                            let elems = match vm.heap.get(parsed) {
+                                Some(Obj::Host {
+                                    state: HostState::List(l),
+                                    ..
+                                }) => l.clone(),
+                                _ => vec![],
+                            };
+                            if let Some(l) = list_mut(vm, h) {
+                                *l = elems;
+                            }
+                        }
+                    } else {
+                        let rh = match v {
+                            V::Ref(r) => r,
+                            _ => 0,
+                        };
+                        let elems = match vm.heap.get(rh) {
+                            Some(Obj::Host {
+                                state: HostState::List(l),
+                                ..
+                            }) => l.clone(),
+                            _ => vec![],
+                        };
+                        if let Some(l) = list_mut(vm, h) {
+                            *l = elems;
+                        }
+                    }
+                }
+                _ => {}
+            }
+            None
+        }
         "put" => {
             if let Some(l) = list_mut(vm, h) {
                 l.push(args.get(1).copied().unwrap_or(V::Ref(0)));
