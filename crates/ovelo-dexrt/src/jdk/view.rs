@@ -31,6 +31,12 @@ const P_DECOR: u32 = u32::MAX - 16;
 const P_LISTENER: u32 = u32::MAX - 17;
 const P_CONTEXT: u32 = u32::MAX - 18;
 const P_VIS: u32 = u32::MAX - 19;
+/// Pseudo key: a view's lazily-minted `Menu` (Toolbar.getMenu() etc.).
+const P_MENU: u32 = u32::MAX - 20;
+/// Pseudo key: a MenuItem's `android:id`.
+const P_MENU_ID: u32 = u32::MAX - 21;
+/// Pseudo key: a MenuItem's visible flag.
+const P_MENU_VIS: u32 = u32::MAX - 22;
 
 // TypedArray backing — below the `tag_key` band (which bottoms out at
 // ~u32::MAX - 0x10014).
@@ -72,6 +78,12 @@ pub(crate) fn is_viewish(vm: &Vm, class: &str, args: &[V]) -> bool {
             | "Landroid/view/Window;"
             | "Landroid/view/LayoutInflater;"
             | "Landroid/view/MenuInflater;"
+            | "Landroid/view/Menu;"
+            | "Landroid/view/SubMenu;"
+            | "Landroid/view/MenuItem;"
+            | "Landroidx/appcompat/view/SupportMenuInflater;"
+            | "Landroidx/appcompat/view/menu/MenuBuilder;"
+            | "Landroidx/appcompat/view/menu/MenuItemImpl;"
     ) || desc_is_a(class, VIEW)
         || class.ends_with("$DecorView;")
     {
@@ -96,6 +108,13 @@ pub(crate) fn call(
     };
     Ok(match name {
         // ---------- inflation ----------
+        "inflate" if class.contains("MenuInflater") => {
+            // MenuInflater.inflate(menuRes, Menu)
+            if let Some(V::Ref(mh)) = args.get(2).copied() {
+                menu_inflate(vm, args.get(1).copied(), mh);
+            }
+            Some(None)
+        }
         "inflate" => Some(Some(inflate_call(vm, args))),
         "from" if class == INFLATER || class == "Landroid/view/LayoutInflater$Factory2;" => {
             Some(Some(inflater(vm, args.first().copied())))
@@ -115,6 +134,78 @@ pub(crate) fn call(
             Some(Some(make_view_named(vm, &name, attrs, V::Ref(0))))
         }
         "cloneInContext" => Some(Some(inflater(vm, args.get(1).copied()))),
+        // ---------- menu ----------
+        "getMenuInflater" | "getSupportMenuInflater" => {
+            Some(Some(host(vm, "Landroid/view/MenuInflater;", HostState::Empty)))
+        }
+        "getMenu" => Some(Some(menu_of(vm, this))),
+        // Toolbar.inflateMenu(int) / NavigationView.inflateMenu(int).
+        "inflateMenu" => {
+            let m = menu_of(vm, this);
+            if let V::Ref(mh) = m {
+                menu_inflate(vm, args.get(1).copied(), mh);
+            }
+            Some(Some(V::Ref(0)))
+        }
+        "findItem" => Some(Some(menu_find(vm, this, args.get(1).copied()))),
+        "add" | "addSubMenu" if is_menuish(vm, this) => {
+            // add(group, itemId, order, title) — the id is the second arg.
+            Some(Some(menu_item(vm, this, i64v(args.get(2).copied().unwrap_or(V::I32(0))) as i32)))
+        }
+        "size" if is_menuish(vm, this) => {
+            Some(Some(V::I32(menu_items(vm, this).len() as i32)))
+        }
+        "getItem" if is_menuish(vm, this) => {
+            let i = i64v(args.get(1).copied().unwrap_or(V::I32(0))) as usize;
+            let items = menu_items(vm, this);
+            Some(Some(items.get(i).copied().unwrap_or(V::Ref(0))))
+        }
+        "clear" | "removeGroup" | "removeItem" if is_menuish(vm, this) => {
+            if name == "clear" {
+                if let Some(Obj::Host {
+                    state: HostState::Map(items),
+                    ..
+                }) = vm.heap.get_mut(this)
+                {
+                    items.clear();
+                }
+            }
+            Some(None)
+        }
+        "setVisible" | "setEnabled" | "setChecked" | "setCheckable"
+        | "setTitle" | "setIcon" | "setShowAsAction" | "setShowAsActionFlags"
+        | "setActionView" | "setIntent" | "setAlphabeticShortcut"
+        | "setNumericShortcut" | "setTooltipText" | "setContentDescription"
+            if is_menuitem(vm, this) =>
+        {
+            let key = if name == "setVisible" { P_MENU_VIS } else { P_TAG };
+            pseudo_set(vm, this, key, args.get(1).copied().unwrap_or(V::Ref(0)));
+            Some(Some(V::Ref(this)))
+        }
+        "setOnMenuItemClickListener" | "setOnActionExpandListener"
+            if is_menuitem(vm, this) =>
+        {
+            pseudo_set(vm, this, P_LISTENER, args.get(1).copied().unwrap_or(V::Ref(0)));
+            Some(Some(V::I32(1)))
+        }
+        "getItemId" | "getGroupId" if is_menuitem(vm, this) => {
+            Some(Some(pseudo_get(vm, this, P_MENU_ID).unwrap_or(V::I32(0))))
+        }
+        "isVisible" | "isEnabled" | "isChecked" | "isCheckable"
+            if is_menuitem(vm, this) =>
+        {
+            let v = pseudo_get(vm, this, P_MENU_VIS).unwrap_or(V::I32(1));
+            Some(Some(V::I32(i64v(v) as i32)))
+        }
+        "getTitle" | "getTitleCondensed" if is_menuitem(vm, this) => {
+            Some(Some(pseudo_get(vm, this, P_TEXT).unwrap_or_else(|| jstr(vm, ""))))
+        }
+        "hasSubMenu" | "isActionViewExpanded" | "expandActionView"
+        | "collapseActionView"
+            if is_menuitem(vm, this) =>
+        {
+            Some(Some(V::I32(0)))
+        }
         "getContext" if class == INFLATER || is_marked(vm, this) => Some(Some(
             pseudo_get(vm, this, P_CONTEXT).unwrap_or_else(|| stub_ctx(vm)),
         )),
@@ -1177,6 +1268,94 @@ pub(crate) const ANDROID_ID_CONTENT: i32 = 0x0102_0002;
 pub(crate) fn content_frame_of(vm: &mut Vm, window: u32) -> Option<u32> {
     let d = decor_of(vm, window)?;
     find_in_tree(vm, d, ANDROID_ID_CONTENT)
+}
+
+// ---------------------------------------------------------------------
+// Menu model — `Toolbar.getMenu()`/`MenuInflater.inflate` populate a
+// HostState::Map of itemId → MenuItem; `findItem` returns a stable
+// handle per id (minted lazily, so callers never see a null receiver).
+
+fn is_menuish(vm: &Vm, h: u32) -> bool {
+    matches!(pseudo_get(vm, h, P_MENU), Some(V::I32(1)))
+}
+
+fn is_menuitem(vm: &Vm, h: u32) -> bool {
+    pseudo_get(vm, h, P_MENU_VIS).is_some() && !is_menuish(vm, h)
+}
+
+fn menu_of(vm: &mut Vm, view_h: u32) -> V {
+    if let Some(v @ V::Ref(h)) = pseudo_get(vm, view_h, P_MENU) {
+        if h != 0 {
+            return v;
+        }
+    }
+    let m = host(vm, "Landroid/view/Menu;", HostState::Map(vec![]));
+    if let V::Ref(mh) = m {
+        pseudo_set(vm, mh, P_MENU, V::I32(1));
+    }
+    pseudo_set(vm, view_h, P_MENU, m);
+    m
+}
+
+/// Find-or-create the MenuItem for `id` on `menu_h`. AOSP returns null
+/// for missing ids; a compat stub keeps the guest running instead.
+fn menu_item(vm: &mut Vm, menu_h: u32, id: i32) -> V {
+    if let Some(Obj::Host {
+        state: HostState::Map(items),
+        ..
+    }) = vm.heap.get(menu_h)
+    {
+        if let Some((_, v)) = items
+            .iter()
+            .find(|(k, _)| matches!(k, V::I32(k) if *k == id))
+        {
+            return *v;
+        }
+    }
+    let it = host(vm, "Landroid/view/MenuItem;", HostState::Empty);
+    if let V::Ref(ih) = it {
+        pseudo_set(vm, ih, P_MENU_ID, V::I32(id));
+        pseudo_set(vm, ih, P_MENU_VIS, V::I32(1));
+        if let Some(Obj::Host {
+            state: HostState::Map(items),
+            ..
+        }) = vm.heap.get_mut(menu_h)
+        {
+            items.push((V::I32(id), it));
+        }
+    }
+    it
+}
+
+fn menu_find(vm: &mut Vm, menu_h: u32, id_v: Option<V>) -> V {
+    menu_item(vm, menu_h, i64v(id_v.unwrap_or(V::I32(0))) as i32)
+}
+
+fn menu_items(vm: &Vm, menu_h: u32) -> Vec<V> {
+    match vm.heap.get(menu_h) {
+        Some(Obj::Host {
+            state: HostState::Map(items),
+            ..
+        }) => items.iter().map(|(_, v)| *v).collect(),
+        _ => vec![],
+    }
+}
+
+/// `MenuInflater.inflate(menuRes, Menu)` — parse the res/menu xml and
+/// register each `<item android:id>` on the menu.
+fn menu_inflate(vm: &mut Vm, res_v: Option<V>, menu_h: u32) {
+    let Some(V::I32(id)) = res_v else { return };
+    let Some(doc) = vm.apk_res.as_ref().and_then(|r| r.document(id as u32)) else {
+        return;
+    };
+    for el in &doc {
+        if el.name != "item" {
+            continue;
+        }
+        if let Some(V::I32(item_id)) = el.android("id").map(|v| attr_v(vm, v)) {
+            menu_item(vm, menu_h, item_id);
+        }
+    }
 }
 
 /// `Activity.setContentView(int|View)`: inflate (if an id) and attach the
