@@ -955,6 +955,7 @@ fn run_app(store: &InstallStore, package: &str) -> Result<(), OveloError> {
         ui.borrow_mut().root.set_content_view(Box::new(col));
     }
     let ui2 = ui.clone();
+    let mut dex_frame = 0u32;
     ovelo_host::run(win, move |w| {
         {
             let mut u = ui2.borrow_mut();
@@ -1019,6 +1020,10 @@ fn run_app(store: &InstallStore, package: &str) -> Result<(), OveloError> {
         // Apps that inflate layout xml (setContentView(res)) live in the
         // VM's dex view tree — materialize it into drawable host views.
         if let Some((vm, this)) = &mut guest {
+            dex_frame = dex_frame.wrapping_add(1);
+            // Run adapter containers' layout pass OUTSIDE the ui borrow —
+            // guest code re-enters bridged view methods.
+            ovelo_framework::drive_dex_layout_pass(vm, *this, dex_frame);
             ui2.borrow_mut().refresh_dex_tree(vm, *this);
         }
         let mut u = ui2.borrow_mut();

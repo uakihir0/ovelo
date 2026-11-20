@@ -529,7 +529,7 @@ impl GuestUi {
     /// bridged `new` calls. Per-view objects persist across calls so
     /// pressed state and listener closures survive rebuilds. Skipped
     /// once the guest bound a real `GuestView` as its content view.
-    pub fn refresh_dex_tree(&mut self, vm: &Vm, activity: u32) -> bool {
+    pub fn refresh_dex_tree(&mut self, vm: &mut Vm, activity: u32) -> bool {
         if self.guest_content_set {
             return false;
         }
@@ -566,8 +566,14 @@ impl GuestUi {
         true
     }
 
-    fn materialize_dex(&mut self, vm: &Vm, h: u32) -> Option<Rc<RefCell<GuestView>>> {
+    fn materialize_dex(&mut self, vm: &mut Vm, h: u32) -> Option<Rc<RefCell<GuestView>>> {
         let info = vm.dex_view(h)?;
+        if std::env::var_os("OVELO_VIEWDBG").is_some() {
+            eprintln!(
+                "[viewdbg] node {} h{h} vis={} kids={} text={:?}",
+                info.desc, info.visible as u8, info.children.len(), info.text
+            );
+        }
         if !info.visible {
             return None;
         }
@@ -664,6 +670,53 @@ impl GuestUi {
             })) as HostCall,
         );
     }
+}
+
+/// Drive the dex `onMeasure`/`onLayout` of adapter-backed containers
+/// (`ViewPager`, `RecyclerView`, …) whose `populate()`/layout is only
+/// reached from those callbacks — no host caller invokes them, so
+/// without this the container renders empty (the adapter is never
+/// asked for its pages). Runs OUTSIDE the `GuestUi` borrow: the guest
+/// code it dispatches re-enters bridged view methods that borrow the
+/// same RefCell.
+///
+/// `frame` is a render-cycle counter — the pass runs every 30th frame
+/// to bound interpreter work. `populate()` is idempotent on existing
+/// pages, and adapters filling asynchronously get picked up on later
+/// passes.
+pub fn drive_dex_layout_pass(vm: &mut Vm, activity: u32, frame: u32) {
+    if !frame.is_multiple_of(30) {
+        return;
+    }
+    let Some(root) = vm.activity_content(activity) else {
+        return;
+    };
+    const ADAPTER: &[&str] = &[
+        "ViewPager", "RecyclerView", "ListView", "GridView", "AdapterView",
+        "DrawerLayout", "SwipeRefresh",
+    ];
+    fn walk(vm: &mut Vm, h: u32, depth: u32) {
+        if depth > 64 {
+            return;
+        }
+        let Some(info) = vm.dex_view(h) else {
+            return;
+        };
+        if ADAPTER.iter().any(|k| info.desc.contains(k)) {
+            let _ = vm.call_virtual(h, "onMeasure", &[V::I32(0), V::I32(0)]);
+            let _ = vm.call_virtual(
+                h,
+                "onLayout",
+                &[V::I32(0), V::I32(0), V::I32(0), V::I32(1080), V::I32(1920)],
+            );
+        }
+        // Re-snapshot: the layout pass may have attached children.
+        let kids = vm.dex_view(h).map(|i| i.children).unwrap_or_default();
+        for ch in kids {
+            walk(vm, ch, depth + 1);
+        }
+    }
+    walk(vm, root, 0);
 }
 
 #[cfg(test)]

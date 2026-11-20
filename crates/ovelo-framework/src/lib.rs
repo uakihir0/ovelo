@@ -24,7 +24,7 @@ pub use activity::{Activity, ActivityError, Lifecycle};
 pub use bundle::{BValue, Bundle};
 pub use choreographer::{CallbackType, Choreographer, FrameCallback};
 pub use context::Context;
-pub use guest::{ClickQueue, GuestUi, GuestView, SharedView};
+pub use guest::{drive_dex_layout_pass, ClickQueue, GuestUi, GuestView, SharedView};
 pub use looper::{Handler, Looper, Message, MessageQueue};
 pub use prefs::{PrefValue, SharedPreferences};
 pub use resolver::{ContentProvider, ContentResolver, ContentUri};
