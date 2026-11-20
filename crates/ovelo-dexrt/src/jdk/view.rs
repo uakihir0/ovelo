@@ -210,6 +210,9 @@ pub struct DexViewInfo {
     pub visible: bool,
     /// OnClick listener handle (0 = none).
     pub listener: u32,
+    /// Dex-assigned frame `(l, t, r, b)` relative to the parent, once
+    /// `layout`/`setFrame` ran (None before first layout pass).
+    pub frame: Option<(i32, i32, i32, i32)>,
     /// Child view handles, in z-order.
     pub children: Vec<u32>,
 }
@@ -379,6 +382,17 @@ pub(crate) fn dex_view_info(vm: &Vm, h: u32) -> Option<DexViewInfo> {
         })
         .collect();
     let is_group = pseudo_get(vm, h, P_IS_GROUP).is_some() || !kids.is_empty();
+    let frame = match (
+        pseudo_get(vm, h, P_LEFT),
+        pseudo_get(vm, h, P_TOP),
+        pseudo_get(vm, h, P_RIGHT),
+        pseudo_get(vm, h, P_BOTTOM),
+    ) {
+        (Some(V::I32(l)), Some(V::I32(t)), Some(V::I32(r)), Some(V::I32(b))) => {
+            Some((l, t, r, b))
+        }
+        _ => None,
+    };
     Some(DexViewInfo {
         desc,
         is_group,
@@ -390,6 +404,7 @@ pub(crate) fn dex_view_info(vm: &Vm, h: u32) -> Option<DexViewInfo> {
         lp_h,
         visible,
         listener,
+        frame,
         children: kids,
     })
 }
@@ -1033,28 +1048,34 @@ pub(crate) fn call(
             // setMeasuredDimension (which many custom views do).
             pseudo_set(vm, this, P_MEAS_W, V::I32(spec_size(args.get(1).copied())));
             pseudo_set(vm, this, P_MEAS_H, V::I32(spec_size(args.get(2).copied())));
-            let _ = vm.call_virtual(
+            // Guest exceptions must reach the guest's try/catch —
+            // swallowing them leaves the caller believing the measure
+            // succeeded with half-updated state.
+            let _ = vm.call_virtual_rt(
                 this,
                 "onMeasure",
                 &[
                     args.get(1).copied().unwrap_or(V::I32(0)),
                     args.get(2).copied().unwrap_or(V::I32(0)),
                 ],
-            );
+            )?;
             Some(None)
         }
         "setMeasuredDimension" => {
-            pseudo_set(vm, this, P_MEAS_W, args.get(1).copied().unwrap_or(V::I32(0)));
-            pseudo_set(vm, this, P_MEAS_H, args.get(2).copied().unwrap_or(V::I32(0)));
+            // AOSP masks the stored dims to MEASURED_SIZE_MASK
+            // (0x00FF_FFFF); the state bits ride the AndState variant.
+            pseudo_set(vm, this, P_MEAS_W, V::I32(vint(args.get(1)) & 0x00FF_FFFF));
+            pseudo_set(vm, this, P_MEAS_H, V::I32(vint(args.get(2)) & 0x00FF_FFFF));
             Some(None)
         }
         "layout" => {
             let (l, t, r, b) = (vint(args.get(1)), vint(args.get(2)), vint(args.get(3)), vint(args.get(4)));
             let changed = frame_set(vm, this, l, t, r, b);
-            if let Err(e) = vm.call_virtual(this, "onLayout", &[V::I32(changed as i32), V::I32(l), V::I32(t), V::I32(r), V::I32(b)]) {
+            if let Err(e) = vm.call_virtual_rt(this, "onLayout", &[V::I32(changed as i32), V::I32(l), V::I32(t), V::I32(r), V::I32(b)]) {
                 if std::env::var_os("OVELO_VIEWDBG").is_some() {
-                    eprintln!("[viewdbg] onLayout h{this} err {e}");
+                    eprintln!("[viewdbg] onLayout h{this} failed");
                 }
+                return Err(e);
             }
             Some(None)
         }
@@ -1086,11 +1107,10 @@ pub(crate) fn call(
         "getHeight" => Some(Some(V::I32(
             pint(vm, this, P_BOTTOM).saturating_sub(pint(vm, this, P_TOP)),
         ))),
-        "getMeasuredWidth" => Some(Some(V::I32(pint(vm, this, P_MEAS_W)))),
-        "getMeasuredHeight" => Some(Some(V::I32(pint(vm, this, P_MEAS_H)))),
-        "getMeasuredWidthAndState" | "getMeasuredHeightAndState" => {
-            Some(Some(V::I32(0)))
-        }
+        "getMeasuredWidth" => Some(Some(V::I32(pint(vm, this, P_MEAS_W) & 0x00FF_FFFF))),
+        "getMeasuredHeight" => Some(Some(V::I32(pint(vm, this, P_MEAS_H) & 0x00FF_FFFF))),
+        "getMeasuredWidthAndState" => Some(Some(V::I32(pint(vm, this, P_MEAS_W)))),
+        "getMeasuredHeightAndState" => Some(Some(V::I32(pint(vm, this, P_MEAS_H)))),
         "getPaddingLeft" | "getPaddingTop" | "getPaddingRight" | "getPaddingBottom"
         | "getPaddingStart" | "getPaddingEnd" | "getMinimumWidth" | "getMinimumHeight"
         | "getScrollX" | "getScrollY" => Some(Some(V::I32(0))),

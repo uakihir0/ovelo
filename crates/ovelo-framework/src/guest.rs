@@ -168,6 +168,53 @@ impl Drawable for SharedView {
     }
 }
 
+/// Wraps a materialized child whose dex `layout`/`setFrame` assigned a
+/// real rect: the parent's `layout` positions it at the dex-computed
+/// offset instead of the host stacking/overlay heuristic, and its
+/// reported size is the dex frame.
+struct AbsView {
+    inner: SharedView,
+    /// Dex frame relative to the parent `(l, t, r, b)`.
+    rect: (i32, i32, i32, i32),
+}
+
+impl Drawable for AbsView {
+    fn measure(&mut self, w: MeasureSpec, h: MeasureSpec) -> Size {
+        let _ = self.inner.measure(w, h);
+        Size {
+            w: self.rect.2 - self.rect.0,
+            h: self.rect.3 - self.rect.1,
+        }
+    }
+    fn layout(&mut self, left: i32, top: i32) {
+        self.inner.layout(left + self.rect.0, top + self.rect.1);
+    }
+    fn draw(&mut self, c: &mut ovelo_ui::Canvas) {
+        self.inner.draw(c);
+    }
+    fn invalidate(&mut self) {
+        self.inner.invalidate();
+    }
+    fn is_dirty(&self) -> bool {
+        self.inner.is_dirty()
+    }
+    fn measured(&self) -> Size {
+        Size {
+            w: self.rect.2 - self.rect.0,
+            h: self.rect.3 - self.rect.1,
+        }
+    }
+    fn origin(&self) -> (i32, i32) {
+        self.inner.origin()
+    }
+    fn lp(&self) -> (Length, Length) {
+        self.inner.lp()
+    }
+    fn dispatch_touch(&mut self, down: bool, x: i32, y: i32) -> bool {
+        self.inner.dispatch_touch(down, x, y)
+    }
+}
+
 /// Host-side state for guest UI: the view-object map plus the
 /// [`ViewRootImpl`] the content view hangs off.
 pub struct GuestUi {
@@ -625,7 +672,17 @@ impl GuestUi {
             for ch in &info.children {
                 if let Some(crc) = self.materialize_dex(vm, *ch) {
                     kid_handles.push(*ch);
-                    kids.push(Box::new(SharedView(crc)));
+                    // Dex frames are relative to the parent — position
+                    // the child exactly where its `setFrame` put it.
+                    let view: Box<dyn Drawable> = match vm.dex_view(*ch).and_then(|i| i.frame)
+                    {
+                        Some(rect) => Box::new(AbsView {
+                            inner: SharedView(crc),
+                            rect,
+                        }),
+                        None => Box::new(SharedView(crc)),
+                    };
+                    kids.push(view);
                 }
             }
             // A removed/hidden child leaves stale pixels without an
