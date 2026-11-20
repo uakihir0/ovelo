@@ -1368,7 +1368,12 @@ fn class_call(vm: &mut Vm, name: &str, _sig: &str, args: &[V]) -> Rt<Option<Opti
                 );
                 return Err(t);
             }
-            if midx.is_none() {
+            if midx.is_none() && vm.is_dex_class(&owner) {
+                // Dex-defined class: signature lookup is authoritative —
+                // NoSuchMethodException is the real Java answer. Host
+                // classes (String, View, …) have no dex defs to match
+                // against, so fall through to a mirror without P_CTOR:
+                // newInstance then uses instantiate_with.
                 let t = vm.throw_builtin(
                     "Ljava/lang/NoSuchMethodException;",
                     &format!("{owner}.<init>({})", params.join(",")),

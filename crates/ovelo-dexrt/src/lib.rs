@@ -1389,6 +1389,13 @@ impl Vm {
         Ok(None)
     }
 
+    /// Whether `desc` names a class defined by a loaded dex — host
+    /// classes (`Ljava/lang/String;`, `Landroid/view/View;`, …) have
+    /// no def, so signature-based lookups can't apply to them.
+    pub(crate) fn is_dex_class(&self, class_desc: &str) -> bool {
+        self.defs.contains_key(class_desc)
+    }
+
     /// `<init>` on `class_desc` whose declared parameter descriptors
     /// equal `params` exactly — what `Class.getConstructor(sig)`
     /// resolves by signature rather than slot count.
