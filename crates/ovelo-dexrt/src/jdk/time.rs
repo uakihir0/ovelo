@@ -135,7 +135,14 @@ fn date_call(vm: &mut Vm, name: &str, args: &[V]) -> Rt<Option<Option<V>>> {
                     |i: usize| args.get(i).map(|v| i64v(*v)).unwrap_or(0);
                 let v = match args.len() {
                     0 | 1 => now_ms(),
-                    2 => g(1),
+                    // Date(String) parses; Date(long) and Date(Date)
+                    // take the millis.
+                    2 => match args[1] {
+                        V::Ref(r) => s(vm, r)
+                            .map(|t| parse_date(&t))
+                            .unwrap_or_else(|| millis_of(vm, args[1])),
+                        _ => g(1),
+                    },
                     _ => {
                         days_from_civil(g(1) + 1900, g(2) + 1, g(3))
                             * 86_400_000
@@ -226,10 +233,17 @@ fn cal_call(vm: &mut Vm, name: &str, sig: &str, args: &[V]) -> Rt<Option<Option<
     let ms = millis_of(vm, args[0]);
     Ok(match name {
         "<init>" => {
-            // GregorianCalendar() -> now; (y,m,d[,h,mi[,s]]) -> civil.
+            // GregorianCalendar() / (TimeZone) / (Locale) /
+            // (TimeZone, Locale) -> now; (y,m,d[,h,mi[,s]]) -> civil.
+            // The object-arg overloads must not land in the civil
+            // branch — i64v(ref) is 0, which would pin the calendar at
+            // year 0.
             let g =
                 |i: usize| args.get(i).map(|v| i64v(*v)).unwrap_or(0);
-            let v = if args.len() > 1 {
+            let numeric_args = args
+                .get(1)
+                .is_some_and(|v| matches!(v, V::I32(_) | V::I64(_)));
+            let v = if numeric_args {
                 days_from_civil(g(1), g(2) + 1, g(3)) * 86_400_000
                     + g(4) * 3_600_000
                     + g(5) * 60_000
