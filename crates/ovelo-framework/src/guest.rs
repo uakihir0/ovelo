@@ -182,6 +182,9 @@ pub struct GuestUi {
     /// Dex-view-tree handles → materialized host view. Persistent so
     /// per-view state (pressed, listeners) survives frame rebuilds.
     dex_views: HashMap<u32, Rc<RefCell<GuestView>>>,
+    /// Last materialized child-handle list per parent — a changed set
+    /// (removal, hide) must dirty the group or stale pixels persist.
+    dex_kids: HashMap<u32, Vec<u32>>,
     /// The dex view-tree content root last materialized.
     dex_root: u32,
     /// The host view currently mounted as content — remount only when
@@ -287,6 +290,7 @@ impl GuestUi {
             fonts,
             clicks: Rc::new(RefCell::new(VecDeque::new())),
             dex_views: HashMap::new(),
+            dex_kids: HashMap::new(),
             dex_root: 0,
             dex_mounted: None,
             guest_content_set: false,
@@ -585,10 +589,19 @@ impl GuestUi {
         update_dex_view(&mut g, &info);
         if let GuestView::Group(gr) = &mut *g {
             let mut kids: Vec<Box<dyn Drawable>> = Vec::new();
+            let mut kid_handles: Vec<u32> = Vec::new();
             for ch in &info.children {
                 if let Some(crc) = self.materialize_dex(vm, *ch) {
+                    kid_handles.push(*ch);
                     kids.push(Box::new(SharedView(crc)));
                 }
+            }
+            // A removed/hidden child leaves stale pixels without an
+            // invalidation — the swap below only re-renders when the
+            // child set actually changed.
+            if self.dex_kids.get(&h) != Some(&kid_handles) {
+                self.dex_kids.insert(h, kid_handles);
+                gr.invalidate();
             }
             gr.children = kids;
         }
