@@ -2162,6 +2162,7 @@ fn fill_typed_value_ev(
     vm: &mut Vm,
     tv: V,
     ev: &ovelo_apk::arsc::EntryValue,
+    res_id: u32,
 ) {
     let V::Ref(h) = tv else {
         return;
@@ -2177,7 +2178,7 @@ fn fill_typed_value_ev(
     let res_id = if ev.data_type == 0x01 {
         ev.data as i32
     } else {
-        0
+        res_id as i32
     };
     for (name, val) in [
         ("type", V::I32(ev.data_type as i32)),
@@ -2449,10 +2450,14 @@ fn res_misc(vm: &mut Vm, class: &str, name: &str, args: &[V]) -> Rt<Option<Optio
                 Some(mut ev) => {
                     // resolveRefs=true resolves a @ref to the target's
                     // own type/value (e.g. a @color yields a color int).
+                    // resourceId keeps pointing at the resource the
+                    // final value came from (AOSP getResourceValue).
+                    let mut res_id = 0;
                     for _ in 0..8 {
                         if !resolve_refs || ev.data_type != 0x01 {
                             break;
                         }
+                        res_id = ev.data;
                         match vm
                             .apk_res
                             .as_ref()
@@ -2463,7 +2468,7 @@ fn res_misc(vm: &mut Vm, class: &str, name: &str, args: &[V]) -> Rt<Option<Optio
                         }
                     }
                     if let Some(tv) = args.get(2).copied() {
-                        fill_typed_value_ev(vm, tv, &ev);
+                        fill_typed_value_ev(vm, tv, &ev, res_id);
                     }
                     Some(Some(V::I32(1)))
                 }
