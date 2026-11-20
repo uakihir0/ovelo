@@ -2347,9 +2347,136 @@ fn graphics_call(
         ("Landroid/graphics/Color;", "colorToHSV" | "valueOf" | "luminance") => {
             Some(Some(V::I32(0)))
         }
-        ("Landroid/graphics/Rect;", n) => {
-            let _ = n;
-            Some(Some(V::I32(0)))
+        ("Landroid/graphics/Rect;", "set" | "offset" | "offsetTo"
+        | "contains" | "width" | "height" | "isEmpty" | "centerX"
+        | "centerY" | "exactCenterX" | "exactCenterY" | "equals"
+        | "setEmpty" | "<init>") => {
+            let h = match args.first() {
+                Some(V::Ref(h)) => *h,
+                _ => 0,
+            };
+            let (l, t, r, b) = rect_edges(vm, h);
+            Some(match name {
+                "set" | "<init>" => {
+                    // set(l,t,r,b) or <init>(l,t,r,b) / <init>() /
+                    // <init>(Rect) — read four trailing ints when given.
+                    let vals: Vec<i32> = args[1..]
+                        .iter()
+                        .filter(|a| matches!(a, V::I32(_)))
+                        .map(|a| i32v(*a))
+                        .collect();
+                    if vals.len() == 4 {
+                        rect_write(vm, h, vals[0], vals[1], vals[2], vals[3]);
+                    } else {
+                        rect_write(vm, h, 0, 0, 0, 0);
+                    }
+                    Some(V::Ref(0))
+                }
+                "setEmpty" => {
+                    rect_write(vm, h, 0, 0, 0, 0);
+                    Some(V::Ref(0))
+                }
+                "offset" => {
+                    rect_write(
+                        vm,
+                        h,
+                        l + i32v(args.get(1).copied().unwrap_or(V::I32(0))),
+                        t + i32v(args.get(1).copied().unwrap_or(V::I32(0))),
+                        r + i32v(args.get(1).copied().unwrap_or(V::I32(0))),
+                        b + i32v(args.get(1).copied().unwrap_or(V::I32(0))),
+                    );
+                    Some(V::Ref(0))
+                }
+                "offsetTo" => {
+                    let nl = i32v(args.get(1).copied().unwrap_or(V::I32(0)));
+                    let nt = i32v(args.get(2).copied().unwrap_or(V::I32(0)));
+                    rect_write(vm, h, nl, nt, r - l + nl, b - t + nt);
+                    Some(V::Ref(0))
+                }
+                "width" => Some(V::I32(r - l)),
+                "height" => Some(V::I32(b - t)),
+                "isEmpty" => Some(V::I32((l >= r || t >= b) as i32)),
+                "centerX" => Some(V::I32((l + r) >> 1)),
+                "centerY" => Some(V::I32((t + b) >> 1)),
+                "exactCenterX" => Some(V::F32((l + r) as f32 * 0.5)),
+                "exactCenterY" => Some(V::F32((t + b) as f32 * 0.5)),
+                "contains" => {
+                    let x = i32v(args.get(1).copied().unwrap_or(V::I32(0)));
+                    let y = i32v(args.get(2).copied().unwrap_or(V::I32(0)));
+                    Some(V::I32((l < r && t < b && x >= l && x < r && y >= t && y < b) as i32))
+                }
+                "equals" => {
+                    let that = args.get(1).copied().unwrap_or(V::Ref(0));
+                    let (l2, t2, r2, b2) = match that {
+                        V::Ref(h2) => rect_edges(vm, h2),
+                        _ => (0, 0, 0, 0),
+                    };
+                    Some(V::I32((l == l2 && t == t2 && r == r2 && b == b2) as i32))
+                }
+                _ => Some(V::Ref(0)),
+            })
+        }
+        // Drawable bounds: a cached Rect mirroring setBounds writes —
+        // TabLayout's indicator path reads `drawable.getBounds().left`.
+        (c, "getBounds" | "copyBounds" | "setBounds" | "mutate"
+        | "getIntrinsicWidth" | "getIntrinsicHeight" | "invalidateSelf"
+        | "setAlpha" | "setColorFilter" | "getOpacity" | "setVisible")
+            if c.ends_with("Drawable;") =>
+        {
+            let V::Ref(h) = args.first().copied().unwrap_or(V::Ref(0)) else {
+                return Ok(Some(None));
+            };
+            match name {
+                "getBounds" => Some(Some(bounds_rect(vm, h))),
+                "copyBounds" => {
+                    if let Some(&V::Ref(dst)) = args.get(1) {
+                        let (l, t, r, b) =
+                            rect_edges(vm, bounds_h(vm, h).unwrap_or(0));
+                        rect_write(vm, dst, l, t, r, b);
+                    }
+                    Some(None)
+                }
+                "setBounds" => {
+                    // (l,t,r,b) or (Rect)
+                    let ints: Vec<i32> = args[1..]
+                        .iter()
+                        .filter(|a| matches!(a, V::I32(_)))
+                        .map(|a| i32v(*a))
+                        .collect();
+                    let (l, t, r, b) = if ints.len() == 4 {
+                        (ints[0], ints[1], ints[2], ints[3])
+                    } else {
+                        args.get(1)
+                            .and_then(|a| {
+                                if let V::Ref(rh) = a {
+                                    Some(rect_edges(vm, *rh))
+                                } else {
+                                    None
+                                }
+                            })
+                            .unwrap_or((0, 0, 0, 0))
+                    };
+                    let rh = bounds_h(vm, h);
+                    if let Some(rh) = rh {
+                        rect_write(vm, rh, l, t, r, b);
+                    }
+                    Some(None)
+                }
+                "mutate" => Some(Some(V::Ref(h))),
+                "getIntrinsicWidth" => {
+                    let (l, _, r, _) =
+                        rect_edges(vm, bounds_h(vm, h).unwrap_or(0));
+                    Some(Some(V::I32(r - l)))
+                }
+                "getIntrinsicHeight" => {
+                    let (_, t, _, b) =
+                        rect_edges(vm, bounds_h(vm, h).unwrap_or(0));
+                    Some(Some(V::I32(b - t)))
+                }
+                "getOpacity" => Some(Some(V::I32(-3))), // TRANSLUCENT
+                "setVisible" => Some(Some(V::I32(0))),
+                _ => Some(None),
+            }
         }
         ("Landroid/graphics/RectF;", n) => {
             let _ = n;
@@ -2419,4 +2546,43 @@ fn graphics_call(
         }
         _ => None,
     })
+}
+
+// ---------------------------------------------------------------------
+// Rect / Drawable bounds helpers
+
+/// `Rect`'s four edges as stored pseudo ints (all zero when unset).
+fn rect_edges(vm: &Vm, h: u32) -> (i32, i32, i32, i32) {
+    (
+        i32v(pseudo_get(vm, h, P_RECT_L).unwrap_or(V::I32(0))),
+        i32v(pseudo_get(vm, h, P_RECT_T).unwrap_or(V::I32(0))),
+        i32v(pseudo_get(vm, h, P_RECT_R).unwrap_or(V::I32(0))),
+        i32v(pseudo_get(vm, h, P_RECT_B).unwrap_or(V::I32(0))),
+    )
+}
+
+fn rect_write(vm: &mut Vm, h: u32, l: i32, t: i32, r: i32, b: i32) {
+    pseudo_set(vm, h, P_RECT_L, V::I32(l));
+    pseudo_set(vm, h, P_RECT_T, V::I32(t));
+    pseudo_set(vm, h, P_RECT_R, V::I32(r));
+    pseudo_set(vm, h, P_RECT_B, V::I32(b));
+}
+
+/// The drawable's cached bounds Rect handle (None until created).
+fn bounds_h(vm: &Vm, h: u32) -> Option<u32> {
+    match pseudo_get(vm, h, P_BOUNDS) {
+        Some(V::Ref(rh)) => Some(rh),
+        _ => None,
+    }
+}
+
+/// `getBounds()`: lazily create and cache a `Rect` on the drawable so
+/// later `setBounds` writes land in the same object the guest reads.
+fn bounds_rect(vm: &mut Vm, h: u32) -> V {
+    if let Some(rh) = bounds_h(vm, h) {
+        return V::Ref(rh);
+    }
+    let rh = host(vm, "Landroid/graphics/Rect;", HostState::Empty);
+    pseudo_set(vm, h, P_BOUNDS, rh);
+    rh
 }

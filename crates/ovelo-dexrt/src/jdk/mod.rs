@@ -31,6 +31,13 @@ pub(crate) const P_FLAGS: u32 = u32::MAX - 3;
 pub(crate) const P_COMPONENT: u32 = u32::MAX - 4;
 pub(crate) const P_TARGET: u32 = u32::MAX - 5;
 pub(crate) const P_EDIT_PARENT: u32 = u32::MAX - 6;
+// Rect pseudo-fields (left/top/right/bottom ints) + a Drawable's
+// cached bounds Rect handle.
+pub(crate) const P_RECT_L: u32 = u32::MAX - 7;
+pub(crate) const P_RECT_T: u32 = u32::MAX - 8;
+pub(crate) const P_RECT_R: u32 = u32::MAX - 9;
+pub(crate) const P_RECT_B: u32 = u32::MAX - 10;
+pub(crate) const P_BOUNDS: u32 = u32::MAX - 11;
 
 pub(crate) fn now_ms() -> i64 {
     std::time::SystemTime::now()
@@ -935,7 +942,7 @@ fn context_service_name(n: &str) -> &'static str {
 /// Named field of a host object read on `iget` miss — defaults for
 /// fields the guest reads before writing (`PackageInfo.versionCode`,
 /// `DisplayMetrics.density`, `Point.x`…).
-pub(crate) fn ifield(_vm: &Vm, _h: u32, owner: &str, name: &str) -> Option<V> {
+pub(crate) fn ifield(vm: &Vm, h: u32, owner: &str, name: &str) -> Option<V> {
     match (owner, name) {
         ("Landroid/util/DisplayMetrics;", "density") => Some(V::F32(2.0)),
         ("Landroid/util/DisplayMetrics;", "densityDpi") => Some(V::I32(320)),
@@ -954,9 +961,22 @@ pub(crate) fn ifield(_vm: &Vm, _h: u32, owner: &str, name: &str) -> Option<V> {
         ("Landroid/content/pm/ApplicationInfo;", "flags") => Some(V::I32(0)),
         ("Landroid/os/Message;", "what" | "arg1" | "arg2") => Some(V::I32(0)),
         ("Landroid/graphics/Point;", "x" | "y")
-        | ("Landroid/graphics/Rect;", "left" | "top" | "right" | "bottom")
         | ("Landroid/graphics/RectF;", "left" | "top" | "right" | "bottom")
         | ("Landroid/graphics/PointF;", "x" | "y") => Some(V::I32(0)),
+        // Rect edges are real stored ints (set/setBounds/offset write
+        // them as pseudo fields) so drawable bounds round-trip.
+        ("Landroid/graphics/Rect;", "left") => {
+            Some(pseudo_get(vm, h, P_RECT_L).unwrap_or(V::I32(0)))
+        }
+        ("Landroid/graphics/Rect;", "top") => {
+            Some(pseudo_get(vm, h, P_RECT_T).unwrap_or(V::I32(0)))
+        }
+        ("Landroid/graphics/Rect;", "right") => {
+            Some(pseudo_get(vm, h, P_RECT_R).unwrap_or(V::I32(0)))
+        }
+        ("Landroid/graphics/Rect;", "bottom") => {
+            Some(pseudo_get(vm, h, P_RECT_B).unwrap_or(V::I32(0)))
+        }
         ("Landroid/util/TypedValue;", "type" | "data" | "resourceId" | "density") => {
             Some(V::I32(0))
         }
