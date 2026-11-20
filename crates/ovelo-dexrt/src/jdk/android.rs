@@ -1219,7 +1219,27 @@ fn context_call(
         }
         "getDatabasePath" => Some(Some(V::Ref(0))),
         "moveDatabaseFrom" | "moveSharedPreferencesFrom" => Some(Some(V::I32(0))),
-        "startActivity" | "startActivities" | "startService" | "stopService"
+        "startActivity" | "startActivities" | "startActivityForResult"
+        | "startActivityFromChild" | "startActivityFromFragment"
+        | "startActivityIfNeeded" | "startNextMatchingActivity" => {
+            // Component-targeted intents become a pending launch the
+            // runner drains into a real second-Activity dispatch.
+            if let Some(V::Ref(ih)) = args.get(1).copied() {
+                if let Some(c) = pseudo_get(vm, ih, P_COMPONENT) {
+                    let desc = match c {
+                        V::Ref(ch) if ch != 0 => vm
+                            .class_descriptor_of(ch)
+                            .or_else(|| sv(vm, V::Ref(ch))),
+                        _ => None,
+                    };
+                    if let Some(d) = desc {
+                        vm.pending_activity = Some(d);
+                    }
+                }
+            }
+            Some(Some(V::I32(0)))
+        }
+        "startService" | "stopService"
         | "bindService" | "unbindService" | "sendBroadcast"
         | "sendOrderedBroadcast" | "sendStickyBroadcast" | "registerReceiver"
         | "unregisterReceiver" | "startInstrumentation" | "startIntentSender"
@@ -1284,9 +1304,7 @@ fn context_call(
         | "closeContextMenu" | "registerForContextMenu"
         | "unregisterForContextMenu" | "showDialog" | "dismissDialog"
         | "removeDialog" | "managedQuery" | "requestPermissions"
-        | "requestDragAndDropPermissions" | "startActivityForResult"
-        | "startActivityFromChild" | "startActivityFromFragment"
-        | "startActivityIfNeeded" | "startNextMatchingActivity"
+        | "requestDragAndDropPermissions"
         | "startLocalVoiceInteraction" | "stopLocalVoiceInteraction"
         | "startSearch" | "triggerSearch" | "takeKeyEvents"
         | "overridePendingTransition" | "requestShowKeyboardShortcuts"
@@ -1350,19 +1368,32 @@ fn context_call(
         | "navigateUpToFromChild" | "shouldUpRecreateTask" => {
             match name {
                 "getTaskId" => Some(Some(V::I32(1))),
+                "isFinishing" => Some(Some(V::I32(
+                    match args[0] {
+                        V::Ref(h) => view::is_finishing(vm, h) as i32,
+                        _ => 0,
+                    },
+                ))),
                 "isTaskRoot" | "hasWindowFocus" | "isInMultiWindowMode"
                 | "isInPictureInPictureMode" | "isImmersive" | "isChild"
                 | "isLaunchedFromBubble" | "isLocalVoiceInteractionSupported"
-                | "isFinishing" | "isDestroyed" | "isChangingConfigurations" => {
+                | "isDestroyed" | "isChangingConfigurations" => {
                     Some(Some(V::I32(
                         matches!(name, "isTaskRoot" | "hasWindowFocus") as i32,
                     )))
                 }
                 "finish" | "finishAffinity" | "finishActivity"
                 | "finishActivityFromChild" | "finishAfterTransition"
-                | "finishAndRemoveTask" | "finishFromChild" | "onBackPressed"
-                | "onUserInteraction" | "onPostResume" | "onRetainNonConfigurationInstance"
-                | "moveTaskToBack" => Some(None),
+                | "finishAndRemoveTask" | "finishFromChild" => {
+                    if let V::Ref(h) = args[0] {
+                        pseudo_set(vm, h, view::P_FINISHED, V::I32(1));
+                    }
+                    Some(None)
+                }
+                "onBackPressed" | "onUserInteraction" | "onPostResume"
+                | "onRetainNonConfigurationInstance" | "moveTaskToBack" => {
+                    Some(None)
+                }
                 "navigateUpTo" | "navigateUpToFromChild" | "shouldUpRecreateTask"
                 | "startActivityIfNeeded" | "startNextMatchingActivity" => {
                     Some(Some(V::I32(0)))
@@ -1610,8 +1641,22 @@ fn resources_call(vm: &mut Vm, name: &str, args: &[V]) -> Rt<Option<Option<V>>> 
                 .unwrap_or(0);
             Some(Some(V::I32(hit as i32)))
         }
-        "getLayout" | "obtainTypedArray" | "obtainAttributes" | "getDrawable"
-        | "getDrawableForDensity" | "getColorStateList" | "getFont"
+        "getDrawable" | "getDrawableForDensity" => Some(Some(host(
+            vm,
+            "Landroid/graphics/drawable/Drawable;",
+            HostState::Empty,
+        ))),
+        "getColorStateList" => Some(Some(host(
+            vm,
+            "Landroid/content/res/ColorStateList;",
+            HostState::Empty,
+        ))),
+        "getFont" => Some(Some(host(
+            vm,
+            "Landroid/graphics/Typeface;",
+            HostState::Empty,
+        ))),
+        "getLayout" | "obtainTypedArray" | "obtainAttributes"
         | "getXml" | "getRawResource" | "openRawResource"
         | "openRawResourceFd" | "getValue" | "getValueForDensity"
         | "getResourceName" | "getResourcePackageName"

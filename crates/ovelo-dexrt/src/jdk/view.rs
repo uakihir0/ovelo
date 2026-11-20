@@ -50,6 +50,9 @@ const P_MENU_CKABLE: u32 = 0xFFFD_FFF2;
 const P_SUBMENU_ITEM: u32 = 0xFFFD_FFF1;
 /// Pseudo key: on a MenuItem, the SubMenu it opens.
 const P_ITEM_SUBMENU: u32 = 0xFFFD_FFF0;
+/// Pseudo key: `Activity.finish()` was called — later lifecycle
+/// callbacks must be skipped.
+pub(crate) const P_FINISHED: u32 = 0xFFFD_FFEF;
 
 // TypedArray backing — below the `tag_key` band (which bottoms out at
 // ~u32::MAX - 0x10014).
@@ -1395,7 +1398,12 @@ fn is_menuitem(vm: &Vm, h: u32) -> bool {
     pseudo_get(vm, h, P_MENU_VIS).is_some()
 }
 
-fn menu_of(vm: &mut Vm, view_h: u32) -> V {
+/// Whether the guest finished this Activity (`finish()` and family).
+pub(crate) fn is_finishing(vm: &Vm, h: u32) -> bool {
+    pseudo_get(vm, h, P_FINISHED) == Some(V::I32(1))
+}
+
+pub(crate) fn menu_of(vm: &mut Vm, view_h: u32) -> V {
     if let Some(v @ V::Ref(h)) = pseudo_get(vm, view_h, P_MENU) {
         if h != 0 {
             return v;

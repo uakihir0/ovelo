@@ -162,6 +162,9 @@ pub struct Vm {
     /// The Activity/theme res id (`android:theme` from the manifest) that
     /// theme-scoped `obtainStyledAttributes` resolves attributes against.
     pub theme_id: u32,
+    /// An Activity class the guest asked to start (`startActivity` with a
+    /// component Intent) — the runner drains this and launches it.
+    pub pending_activity: Option<String>,
     /// canonical class_idx → `java.lang.Class` mirror handle — Class
     /// objects are singletons (`Foo.class == x.getClass()`).
     class_mirrors: HashMap<GIdx, u32>,
@@ -202,6 +205,7 @@ impl Vm {
             trace_field: std::env::var("OVELO_TRACE_FIELD").ok(),
             apk_res: None,
             theme_id: 0,
+            pending_activity: None,
             class_mirrors: HashMap::new(),
         };
         v.add_dex(dex)?;
@@ -775,6 +779,19 @@ impl Vm {
     /// model (fallback for content the guest bridge doesn't map).
     pub fn view_set_content(&mut self, activity: u32, content: u32) {
         jdk::view::set_content_view(self, activity, V::Ref(content));
+    }
+
+    /// The options `Menu` attached to an Activity — the runner hands it
+    /// to `onCreateOptionsMenu`/`onPrepareOptionsMenu` so guest menu
+    /// code lands on the same store `getMenu`/`findItem` reach.
+    pub fn menu_for(&mut self, activity: u32) -> V {
+        jdk::view::menu_of(self, activity)
+    }
+
+    /// Whether the guest called `finish()` on this Activity — remaining
+    /// lifecycle callbacks (onStart/onResume/…) should be skipped.
+    pub fn is_finishing(&self, activity: u32) -> bool {
+        jdk::view::is_finishing(self, activity)
     }
 
     fn describe_throw(&self, h: u32) -> String {

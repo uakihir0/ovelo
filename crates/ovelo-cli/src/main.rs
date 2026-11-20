@@ -436,6 +436,52 @@ fn register_compat_shims(
             })) as ovelo_dexrt::HostCall,
         );
     }
+    // kotlinx-coroutines: `Dispatchers.getMain()` discovers the Android
+    // main dispatcher through ServiceLoader (empty here) and throws
+    // "Module with the Main dispatcher is missing". Hand out a host
+    // dispatcher — coroutine dispatch calls on it resolve to stubs and
+    // silently no-op until a real main-loop pump exists.
+    for (class, name, sig) in [
+        (
+            "Lkotlinx/coroutines/Dispatchers;",
+            "getMain",
+            "()Lkotlinx/coroutines/MainCoroutineDispatcher;",
+        ),
+        (
+            "Lkotlinx/coroutines/Dispatchers;",
+            "getDefault",
+            "()Lkotlinx/coroutines/CoroutineDispatcher;",
+        ),
+        (
+            "Lkotlinx/coroutines/Dispatchers;",
+            "getIO",
+            "()Lkotlinx/coroutines/CoroutineDispatcher;",
+        ),
+        (
+            "Lkotlinx/coroutines/Dispatchers;",
+            "getUnconfined",
+            "()Lkotlinx/coroutines/CoroutineDispatcher;",
+        ),
+        (
+            "Lkotlinx/coroutines/internal/MainDispatcherLoader;",
+            "loadMainDispatcher",
+            "()Lkotlinx/coroutines/MainCoroutineDispatcher;",
+        ),
+    ] {
+        let _ = v.register_host(
+            class,
+            name,
+            sig,
+            Rc::new(RefCell::new(move |vm: &mut ovelo_dexrt::Vm, _a: &[V]| {
+                Ok(Some(V::Ref(vm.heap.alloc(Obj::Host {
+                    class_idx: u64::MAX,
+                    desc: "Lkotlinx/coroutines/MainCoroutineDispatcher;".to_string(),
+                    fields: HashMap::new(),
+                    state: HostState::Empty,
+                }))))
+            })) as ovelo_dexrt::HostCall,
+        );
+    }
     // androidx.startup: `initializeComponent` enforces that the
     // initializer was discovered via manifest meta-data — our runtime
     // runs discovered initializers itself (see startup_initializers),
@@ -542,6 +588,35 @@ fn register_compat_shims(
             Ok(Some(ai))
         })) as ovelo_dexrt::HostCall,
     );
+}
+
+/// Deliver the queued lifecycle callbacks to a guest Activity:
+/// `finish()` stops the sequence, and the options menu is prepared
+/// before `onResume` the way AOSP lazily creates it on first use.
+fn run_activity_cbs(
+    vm: &mut ovelo_dexrt::Vm,
+    this: u32,
+    callbacks: &[String],
+) {
+    for cb in callbacks {
+        if vm.is_finishing(this) {
+            break;
+        }
+        if cb == "onResume" {
+            let menu = vm.menu_for(this);
+            let _ = vm.call_virtual(this, "onCreateOptionsMenu", &[menu]);
+            let _ = vm.call_virtual(this, "onPrepareOptionsMenu", &[menu]);
+        }
+        let r = vm
+            .call_virtual(this, cb, &[])
+            .and_then(|v| match v {
+                s @ Some(_) => Ok(s),
+                None => vm.call_virtual(this, cb, &[ovelo_dexrt::V::Ref(0)]),
+            })
+            .inspect_err(|e| println!("callback {cb} crashed: {e}"));
+        let ran = matches!(r, Ok(Some(_)));
+        println!("callback {} ({})", cb, if ran { "dex" } else { "framework" });
+    }
 }
 
 /// AOSP `AppInitializer.doInitialize`: an initializer's `dependencies()`
@@ -759,16 +834,25 @@ fn run_app(store: &InstallStore, package: &str) -> Result<(), OveloError> {
                 })
                 .ok();
             if let Some((vm, this)) = &mut g {
-                for cb in &callbacks {
-                    let r = vm
-                        .call_virtual(*this, cb, &[])
-                        .and_then(|v| match v {
-                            s @ Some(_) => Ok(s),
-                            None => vm.call_virtual(*this, cb, &[ovelo_dexrt::V::Ref(0)]),
-                        })
-                        .inspect_err(|e| println!("callback {cb} crashed: {e}"));
-                    let ran = matches!(r, Ok(Some(_)));
-                    println!("callback {} ({})", cb, if ran { "dex" } else { "framework" });
+                run_activity_cbs(vm, *this, &callbacks);
+                // `startActivity` during a callback records the target —
+                // launch it on the same VM/window (single-task model:
+                // the new Activity replaces the finished one).
+                for _ in 0..4 {
+                    let Some(next) = vm.pending_activity.take() else {
+                        break;
+                    };
+                    match vm.instantiate(&next) {
+                        Ok(h2) => {
+                            println!("activity {} (started)", disp(&next));
+                            *this = h2;
+                            run_activity_cbs(vm, *this, &callbacks);
+                        }
+                        Err(e) => {
+                            println!("activity {} not launched: {e}", disp(&next));
+                            break;
+                        }
+                    }
                 }
             }
             (g, ui)
