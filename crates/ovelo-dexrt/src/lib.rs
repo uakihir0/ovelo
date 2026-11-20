@@ -2977,7 +2977,24 @@ impl Vm {
                         }
                         v
                     }
-                    None => self.field_default(f).unwrap_or(V::I32(0)),
+                    None => {
+                        // A static on a guest class carries its
+                        // initializer in the dex `static_values` array —
+                        // that's where every `R.*` constant lives.
+                        let v = self
+                            .encoded_static(owner, f)
+                            .unwrap_or_else(|| {
+                                self.field_default(f).unwrap_or(V::I32(0))
+                            });
+                        if matches!(v, V::Ref(h) if h != 0) {
+                            self.classes
+                                .entry(owner)
+                                .or_default()
+                                .statics
+                                .insert(f, v);
+                        }
+                        v
+                    }
                 };
                 set!(regs[0], v);
             }
@@ -3115,6 +3132,56 @@ impl Vm {
         let f = d.field(gl(field_idx)).ok()?;
         let desc = d.type_descriptor(f.type_idx as u32).ok()?;
         Some(V::default_for(&desc))
+    }
+
+    /// A static field's `static_values` initial value (the constants
+    /// `R.*` classes carry) mapped to a V, or `None` when the field
+    /// has no encoded value or one we can't materialize.
+    fn encoded_static(&mut self, owner: GIdx, field: GIdx) -> Option<V> {
+        let (cg, def) = self.def_loc_of(owner)?;
+        // The encoded array lives in the dex that DEFINES the class;
+        // the canonical field index only addresses it there.
+        if gd(field) != gd(cg) {
+            return None;
+        }
+        let v = self
+            .dex_of(cg)?
+            .static_value(def, gl(field))
+            .ok()
+            .flatten()?;
+        use ovelo_dex::EncodedValue as EV;
+        match v {
+            EV::Byte(x) => Some(V::I32(x as i32)),
+            EV::Short(x) => Some(V::I32(x as i32)),
+            EV::Char(x) => Some(V::I32(x as i32)),
+            EV::Int(x) => Some(V::I32(x)),
+            EV::Bool(b) => Some(V::I32(b as i32)),
+            EV::Long(x) => Some(V::I64(x)),
+            EV::Float(x) => Some(V::F32(x)),
+            EV::Double(x) => Some(V::F64(x)),
+            EV::String(i) => {
+                let s = self.dex_of(cg)?.string(i).ok()?;
+                Some(jdk::jstr(self, &s))
+            }
+            EV::Type(i) => Some(V::Ref(self.class_mirror(gx(gd(cg), i)))),
+            EV::Array(items) => {
+                let vals: Vec<V> = items
+                    .iter()
+                    .map(|it| match it {
+                        EV::Int(x) => V::I32(*x),
+                        EV::Long(x) => V::I64(*x),
+                        EV::Bool(b) => V::I32(*b as i32),
+                        _ => V::Ref(0),
+                    })
+                    .collect();
+                let h = self.heap.alloc(Obj::Array {
+                    elem: "Ljava/lang/Object;".to_string(),
+                    data: vals,
+                });
+                Some(V::Ref(h))
+            }
+            _ => None,
+        }
     }
 
     fn aget(&mut self, h: u32, i: i32) -> Rt<V> {

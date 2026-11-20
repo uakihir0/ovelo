@@ -414,6 +414,29 @@ impl DexFile {
         })
     }
 
+    /// Initial value of a static field, from the class's
+    /// `static_values` encoded array (indexed by the field's position
+    /// in `static_fields`). `None` when the class carries no block,
+    /// the field isn't static here, or the slot is `VALUE_NULL`.
+    pub fn static_value(&self, def: &ClassDef, field_idx: u32) -> Result<Option<EncodedValue>> {
+        if def.static_values_off == 0 {
+            return Ok(None);
+        }
+        let data = self.class_data(def)?;
+        let Some(pos) = data.static_fields.iter().position(|f| f.field_idx == field_idx) else {
+            return Ok(None);
+        };
+        let mut r = R::at(&self.bytes, def.static_values_off as usize);
+        let n = r.uleb128()? as usize;
+        for i in 0..n {
+            let v = read_encoded_value(&mut r)?;
+            if i == pos {
+                return Ok(Some(v));
+            }
+        }
+        Ok(None)
+    }
+
     /// Decode a `code_item` at `code_off` (0 → no code).
     pub fn code_item(&self, code_off: u32) -> Result<Option<CodeItem>> {
         if code_off == 0 {
@@ -816,6 +839,112 @@ fn dedup(v: impl IntoIterator<Item = u32>, cause: &str) -> Result<()> {
         }
     }
     Ok(())
+}
+
+/// One decoded `encoded_value` (e.g. a static field's initial value).
+#[derive(Debug, Clone)]
+pub enum EncodedValue {
+    /// `VALUE_BYTE`.
+    Byte(i8),
+    /// `VALUE_SHORT`.
+    Short(i16),
+    /// `VALUE_CHAR`.
+    Char(u16),
+    /// `VALUE_INT`.
+    Int(i32),
+    /// `VALUE_LONG`.
+    Long(i64),
+    /// `VALUE_FLOAT`.
+    Float(f32),
+    /// `VALUE_DOUBLE`.
+    Double(f64),
+    /// `VALUE_STRING` — string_ids index.
+    String(u32),
+    /// `VALUE_TYPE` — type_ids index.
+    Type(u32),
+    /// `VALUE_FIELD` — field_ids index.
+    Field(u32),
+    /// `VALUE_METHOD` — method_ids index.
+    Method(u32),
+    /// `VALUE_ENUM` — field_ids index of the enum constant.
+    Enum(u32),
+    /// `VALUE_METHOD_TYPE` — proto_ids index.
+    MethodType(u32),
+    /// `VALUE_METHOD_HANDLE` — method_handles index.
+    MethodHandle(u32),
+    /// `VALUE_ARRAY`.
+    Array(Vec<EncodedValue>),
+    /// `VALUE_ANNOTATION` (contents skipped).
+    Annotation,
+    /// `VALUE_NULL`.
+    Null,
+    /// `VALUE_BOOLEAN`.
+    Bool(bool),
+}
+
+fn read_sized_uint(r: &mut R, n: usize) -> Result<u64> {
+    let mut v = 0u64;
+    for i in 0..n {
+        v |= (r.u8()? as u64) << (8 * i);
+    }
+    Ok(v)
+}
+
+fn read_sized_sint(r: &mut R, n: usize) -> Result<i64> {
+    let v = read_sized_uint(r, n)?;
+    // Sign-extend from the top bit of the last byte.
+    let shift = 64 - 8 * n;
+    Ok(((v << shift) as i64) >> shift)
+}
+
+fn read_encoded_value(r: &mut R) -> Result<EncodedValue> {
+    let b = r.u8()?;
+    let (ty, arg) = (b & 0x1f, (b >> 5) as usize);
+    let n = arg + 1;
+    Ok(match ty {
+        0x00 => EncodedValue::Byte(read_sized_sint(r, n)? as i8),
+        0x02 => EncodedValue::Short(read_sized_sint(r, n)? as i16),
+        0x03 => EncodedValue::Char(read_sized_uint(r, n)? as u16),
+        0x04 => EncodedValue::Int(read_sized_sint(r, n)? as i32),
+        0x06 => EncodedValue::Long(read_sized_sint(r, n)?),
+        // Float/double payloads are right-aligned: `arg+1` significant
+        // bytes followed by zeros to the full width.
+        0x10 => EncodedValue::Float(f32::from_bits(
+            (read_sized_uint(r, n)? << ((4 - n) * 8)) as u32,
+        )),
+        0x11 => EncodedValue::Double(f64::from_bits(
+            read_sized_uint(r, n)? << ((8 - n) * 8),
+        )),
+        0x15 => EncodedValue::MethodType(read_sized_uint(r, n)? as u32),
+        0x16 => EncodedValue::MethodHandle(read_sized_uint(r, n)? as u32),
+        0x17 => EncodedValue::String(read_sized_uint(r, n)? as u32),
+        0x18 => EncodedValue::Type(read_sized_uint(r, n)? as u32),
+        0x19 => EncodedValue::Field(read_sized_uint(r, n)? as u32),
+        0x1a => EncodedValue::Method(read_sized_uint(r, n)? as u32),
+        0x1b => EncodedValue::Enum(read_sized_uint(r, n)? as u32),
+        0x1c => {
+            let size = r.uleb128()? as usize;
+            let mut items = Vec::with_capacity(size.min(1 << 16));
+            for _ in 0..size {
+                items.push(read_encoded_value(r)?);
+            }
+            EncodedValue::Array(items)
+        }
+        0x1d => {
+            // encoded_annotation: type_idx, size, then size ×
+            // (name_idx uleb + encoded_value).
+            let _ty = r.uleb128()?;
+            let size = r.uleb128()? as usize;
+            for _ in 0..size.min(1 << 16) {
+                let _name = r.uleb128()?;
+                let _ = read_encoded_value(r)?;
+            }
+            EncodedValue::Annotation
+        }
+        0x1e => EncodedValue::Null,
+        0x1f => EncodedValue::Bool(arg != 0),
+        _ => return Err(err("dex.encoded_value.type")),
+    })
 }
 
 fn read_encoded_fields(r: &mut R, count: usize) -> Result<Vec<EncodedField>> {

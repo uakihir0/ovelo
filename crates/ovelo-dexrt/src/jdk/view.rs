@@ -32,6 +32,13 @@ const P_DECOR: u32 = u32::MAX - 16;
 const P_LISTENER: u32 = u32::MAX - 17;
 const P_CONTEXT: u32 = u32::MAX - 18;
 const P_VIS: u32 = u32::MAX - 19;
+/// Pseudo key: root element was `<merge>` — splice children on attach.
+const P_MERGE: u32 = u32::MAX - 21;
+/// Pseudo keys: drawables given to `setIndeterminateDrawable` /
+/// `setProgressDrawable` — ProgressBar getters must hand them back (not
+/// a zero-init stub) or their dex fields read null downstream.
+const P_IND_DRAW: u32 = u32::MAX - 22;
+const P_PROG_DRAW: u32 = u32::MAX - 23;
 /// Pseudo key: a view's lazily-minted `Menu` (Toolbar.getMenu() etc.) /
 /// the menuish marker on the Menu itself (`I32(1)`).
 const P_MENU: u32 = 0xFFFD_FFF8;
@@ -815,6 +822,11 @@ pub(crate) fn call(
         | "setMovementMethod" | "setMarqueeRepeatLimit" | "setFilters" | "setEnabled_true"
         | "setCheckMarkDrawable" | "setChecked" | "setOnCheckedChangeListener"
         | "setProgress" | "setMax" | "setIndeterminate" | "setOnItemClickListener"
+        | "setMinWidth" | "setMinHeight" | "setMaxWidth" | "setMaxHeight"
+        | "setIndeterminateDrawableTiled" | "setSecondaryProgress" | "setMin"
+        | "setInterpolator" | "setIndeterminateTintList" | "setProgressTintList"
+        | "setProgressTintMode" | "setProgressBackgroundTintList"
+        | "setProgressBackgroundTintMode" | "setSecondaryProgressTintList"
         | "setOnItemSelectedListener" | "setOnScrollListener" | "setOnRefreshListener"
         | "setRefreshing" | "setLayoutManager" | "setClipToOutline" | "setOutlineProvider"
         | "setAccessibilityDelegate" | "setAutofillHints" | "setScreenReaderFocusable"
@@ -854,6 +866,28 @@ pub(crate) fn call(
                 }
             }
             Some(None)
+        }
+        "setIndeterminateDrawable" | "setProgressDrawable" => {
+            let d = args.get(1).copied().unwrap_or(V::Ref(0));
+            let key = if name == "setIndeterminateDrawable" {
+                P_IND_DRAW
+            } else {
+                P_PROG_DRAW
+            };
+            pseudo_set(vm, this, key, d);
+            Some(None)
+        }
+        "getIndeterminateDrawable" | "getProgressDrawable" => {
+            let key = if name == "getIndeterminateDrawable" {
+                P_IND_DRAW
+            } else {
+                P_PROG_DRAW
+            };
+            Some(Some(
+                pseudo_get(vm, this, key)
+                    .filter(|v| matches!(v, V::Ref(r) if *r != 0))
+                    .unwrap_or_else(|| stub_ret(vm, sig)),
+            ))
         }
         // On real Android the Activity is the Window.Callback; the
         // window stores its owner on P_TARGET (set by window_of).
@@ -909,6 +943,9 @@ pub(crate) fn inflater(vm: &mut Vm, ctx: Option<V>) -> V {
 }
 
 fn inflate_call(vm: &mut Vm, args: &[V]) -> V {
+    if std::env::var_os("OVELO_VIEWDBG").is_some() {
+        eprintln!("[viewdbg] inflate_call args={args:?}");
+    }
     // inflate(int, ViewGroup, bool) — the parser-taking overloads aren't
     // modeled yet and degrade to a bare view.
     let ctx = args
@@ -923,10 +960,28 @@ fn inflate_call(vm: &mut Vm, args: &[V]) -> V {
         _ => empty_view(vm),
     };
     let root = args.get(2).copied().unwrap_or(V::Ref(0));
-    let attach_to = args.get(3).map(|v| i32v(*v) != 0).unwrap_or(false);
+    // inflate(res, root) == inflate(res, root, root != null).
+    let attach_to = args
+        .get(3)
+        .map(|v| i32v(*v) != 0)
+        .unwrap_or(matches!(root, V::Ref(r) if r != 0));
     if let V::Ref(r) = root {
         if r != 0 && attach_to {
-            attach(vm, r, inflated);
+            // `<merge>` contributes no view of its own — splice its
+            // children directly under the supplied root so the binding
+            // finds them on `findChildViewById(root, …)`.
+            let kids = match inflated {
+                V::Ref(h)
+                    if matches!(pseudo_get(vm, h, P_MERGE), Some(V::I32(1))) =>
+                {
+                    children(vm, h)
+                }
+                V::Ref(h) => vec![V::Ref(h)],
+                _ => vec![],
+            };
+            for k in kids {
+                attach(vm, r, k);
+            }
             return root;
         }
     }
@@ -1197,30 +1252,72 @@ pub(crate) fn ta_lookup(vm: &mut Vm, h: u32, index: usize) -> Option<V> {
         }
     }
     let res = vm.apk_res.as_ref()?;
+    // A style hit may itself be `?attr/x` (TYPE_ATTRIBUTE) — chase it
+    // through the theme chain so `indicatorColor=?attr/colorPrimary`
+    // lands on the real value.
+    macro_rules! style_hit {
+        ($ev:expr) => {{
+            let mut ev = $ev.clone();
+            for _ in 0..8 {
+                if ev.data_type != 0x02 {
+                    break;
+                }
+                match res.style_item(vm.theme_id, ev.data) {
+                    Some(next) => ev = next.clone(),
+                    None => break,
+                }
+            }
+            if ev.data_type != 0x02 {
+                return Some(entry_v(vm, &ev));
+            }
+        }};
+    }
     // 2) Explicit style (obtainStyledAttributes(resId, attrs)).
     if let Some(V::I32(s)) = pseudo_get(vm, h, P_TA_STYLE) {
-        if let Some(ev) = res.style_item(s as u32, attr_id).cloned() {
-            return Some(entry_v(vm, &ev));
+        if let Some(ev) = res.style_item(s as u32, attr_id) {
+            style_hit!(ev);
         }
     }
     // 3) defStyleAttr: an attr whose theme value is a style reference.
     if let Some(V::I32(a)) = pseudo_get(vm, h, P_TA_DEF_ATTR) {
         if let Some(style_ref) = res.style_item(vm.theme_id, a as u32).map(|ev| ev.data) {
-            if let Some(ev) = res.style_item(style_ref, attr_id).cloned() {
-                return Some(entry_v(vm, &ev));
+            if let Some(ev) = res.style_item(style_ref, attr_id) {
+                style_hit!(ev);
             }
         }
     }
     // 4) defStyleRes: an explicit style resource.
     if let Some(V::I32(r)) = pseudo_get(vm, h, P_TA_DEF_RES) {
-        if let Some(ev) = res.style_item(r as u32, attr_id).cloned() {
-            return Some(entry_v(vm, &ev));
+        if let Some(ev) = res.style_item(r as u32, attr_id) {
+            style_hit!(ev);
         }
     }
     // 5) The Activity theme (manifest `android:theme`).
-    res.style_item(vm.theme_id, attr_id)
-        .cloned()
-        .map(|ev| entry_v(vm, &ev))
+    if let Some(ev) = res.style_item(vm.theme_id, attr_id) {
+        style_hit!(ev);
+    }
+    None
+}
+
+/// `Theme.resolveAttribute` backing: look `attr_id` up in the Activity
+/// theme (parents walked by `style_item`), chasing `?attr/`
+/// indirections, and convert to the caller-visible value.
+pub(crate) fn theme_attr_value(vm: &mut Vm, attr_id: u32) -> Option<V> {
+    let res = vm.apk_res.as_ref()?;
+    let mut ev = res.style_item(vm.theme_id, attr_id)?.clone();
+    for _ in 0..8 {
+        if ev.data_type != 0x02 {
+            break;
+        }
+        match res.style_item(vm.theme_id, ev.data) {
+            Some(next) => ev = next.clone(),
+            None => break,
+        }
+    }
+    if ev.data_type == 0x02 {
+        return None;
+    }
+    Some(entry_v(vm, &ev))
 }
 
 /// Instantiate a dex-defined view class and run its best-matching
@@ -1462,6 +1559,7 @@ fn build_tree(vm: &mut Vm, elems: &[Element], ctx: V) -> V {
         eprintln!("[viewdbg] expanded: {}", tags.join(", "));
     }
     let mut stack: Vec<(usize, u32)> = Vec::new();
+    let mut made: Vec<u32> = Vec::new();
     let mut root = 0u32;
     for el in &expanded {
         // `<view class="x"/>` encodes the class in an attribute.
@@ -1481,7 +1579,11 @@ fn build_tree(vm: &mut Vm, elems: &[Element], ctx: V) -> V {
         let V::Ref(h) = v else {
             continue;
         };
+        made.push(h);
         pseudo_set(vm, h, P_ATTRS, attrs);
+        if el.name == "merge" {
+            pseudo_set(vm, h, P_MERGE, V::I32(1));
+        }
         if let Some(id) = el_id(vm, el) {
             pseudo_set(vm, h, P_VIEW_ID, V::I32(id));
         }
@@ -1509,6 +1611,14 @@ fn build_tree(vm: &mut Vm, elems: &[Element], ctx: V) -> V {
             None => root = h,
         }
         stack.push((el.depth, h));
+    }
+    // LayoutInflater finishes by calling `onFinishInflate()` on every
+    // constructed view, children first — fossify's fragments bind their
+    // `innerBinding` there.
+    for h in made.iter().rev() {
+        if let Some(Obj::Instance { .. }) = vm.heap.get(*h) {
+            let _ = vm.call_virtual(*h, "onFinishInflate", &[]);
+        }
     }
     if root == 0 {
         empty_view(vm)
@@ -1694,6 +1804,28 @@ pub(crate) fn window_of(vm: &mut Vm, activity: u32) -> Option<u32> {
     pseudo_set(vm, w, P_CONTEXT, V::Ref(activity));
     pseudo_set(vm, activity, P_WINDOW, V::Ref(w));
     Some(w)
+}
+
+/// Dialog backing: the dialog's `Window` (same mechanism as an
+/// Activity's) with the dialog installed as `Window.Callback` — real
+/// `Dialog.<init>` does `mWindow.setCallback(this)`, and androidx
+/// dialogs throw "Window callback may not be null" without it.
+pub(crate) fn dialog_window(vm: &mut Vm, dialog: u32) -> Option<u32> {
+    let w = window_of(vm, dialog)?;
+    if pseudo_get(vm, w, P_LISTENER).is_none() {
+        pseudo_set(vm, w, P_LISTENER, V::Ref(dialog));
+    }
+    Some(w)
+}
+
+/// Remember the `Context` a `Dialog.<init>` was called with.
+pub(crate) fn set_dialog_ctx(vm: &mut Vm, dialog: u32, ctx: V) {
+    pseudo_set(vm, dialog, P_CONTEXT, ctx);
+}
+
+/// The stored dialog `Context` (0 when the ctor didn't supply one).
+pub(crate) fn dialog_ctx(vm: &mut Vm, dialog: u32) -> V {
+    pseudo_get(vm, dialog, P_CONTEXT).unwrap_or(V::Ref(0))
 }
 
 /// The Window's decor view (a ViewGroup), created once. The decor

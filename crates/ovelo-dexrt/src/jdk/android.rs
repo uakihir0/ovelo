@@ -129,6 +129,8 @@ pub(crate) fn call(
         || class == "Landroid/content/SharedPreferences$Editor;"
     {
         prefs_call(vm, name, args)?
+    } else if desc_is_a(class, "Landroid/app/Dialog;") {
+        dialog_call(vm, name, args)?
     } else if desc_is_a(class, "Landroid/content/Context;")
         || class.ends_with("Context;")
         || class.ends_with("Activity;")
@@ -1014,6 +1016,73 @@ fn intent_call(vm: &mut Vm, name: &str, sig: &str, args: &[V]) -> Rt<Option<Opti
     })
 }
 
+/// `android.app.Dialog` (and `AlertDialog`) — a real Dialog ctor mints
+/// its own `Window` and installs itself as `Window.Callback`; without
+/// that androidx dialogs throw "Window callback may not be null" and
+/// `getWindow()` returns nothing usable.
+fn dialog_call(vm: &mut Vm, name: &str, args: &[V]) -> Rt<Option<Option<V>>> {
+    Ok(Some(match name {
+        "<init>" => {
+            if let Some(V::Ref(this)) = args.first().copied() {
+                view::dialog_window(vm, this);
+                // Dialog(Context[, int themeResId]) — remember the ctx.
+                let ctx = args.get(1).copied().unwrap_or(V::Ref(0));
+                view::set_dialog_ctx(vm, this, ctx);
+            }
+            None
+        }
+        "getWindow" => {
+            let w = args
+                .first()
+                .and_then(|a| match a {
+                    V::Ref(h) => view::dialog_window(vm, *h),
+                    _ => None,
+                })
+                .unwrap_or(0);
+            Some(V::Ref(w))
+        }
+        "getContext" => Some(
+            args.first()
+                .map(|a| match a {
+                    V::Ref(h) => view::dialog_ctx(vm, *h),
+                    _ => V::Ref(0),
+                })
+                .unwrap_or(V::Ref(0)),
+        ),
+        "setContentView" => {
+            if let Some(V::Ref(this)) = args.first().copied() {
+                view::set_content_view(vm, this, args.get(1).copied().unwrap_or(V::Ref(0)));
+            }
+            None
+        }
+        "findViewById" => {
+            let this = match args.first() {
+                Some(V::Ref(h)) => *h,
+                _ => 0,
+            };
+            let id = i32v(args.get(1).copied().unwrap_or(V::I32(0)));
+            let hit = view::content_root(vm, this)
+                .and_then(|root| view::find_in_tree(vm, root, id))
+                .unwrap_or(0);
+            Some(V::Ref(hit))
+        }
+        "isShowing" | "isCancelable" => Some(V::I32(1)),
+        "show" | "dismiss" | "cancel" | "hide" | "create" | "onCreate"
+        | "onStart" | "onStop" | "onAttachedToWindow" | "onDetachedFromWindow"
+        | "setTitle" | "setCancelable" | "setCanceledOnTouchOutside"
+        | "setOnCancelListener" | "setOnDismissListener" | "setOnShowListener"
+        | "setOnKeyListener" | "setOwnerActivity" | "setVolumeControlStream"
+        | "setFeatureDrawableResource" | "setFeatureDrawable"
+        | "requestWindowFeature" | "addContentView" | "dismissWithBehaviour"
+        | "takeKeyEvents" | "onWindowAttributesChanged"
+        | "onWindowFocusChanged" | "onRestoreInstanceState"
+        | "setActionBar" | "setOnActionModeStarted" | "setOnActionModeFinished" => {
+            None
+        }
+        _ => return Ok(None),
+    }))
+}
+
 fn component_call(vm: &mut Vm, name: &str, args: &[V]) -> Rt<Option<Option<V>>> {
     Ok(match name {
         "getPackageName" | "getClassName" | "getShortClassName" | "toString"
@@ -1817,8 +1886,74 @@ fn resources_call(vm: &mut Vm, name: &str, args: &[V]) -> Rt<Option<Option<V>>> 
         "getQuantityString" | "getQuantityText" => {
             Some(Some(args.get(2).copied().unwrap_or(jstr(vm, ""))))
         }
-        "getStringArray" | "getTextArray" => Some(Some(arr(vm, STRING, vec![]))),
-        "getIntArray" => Some(Some(arr(vm, "I", vec![]))),
+        "getStringArray" | "getTextArray" => {
+            let items = vm
+                .apk_res
+                .as_ref()
+                .map(|r| r.array_items(res_id()))
+                .unwrap_or_default();
+            let vals: Vec<V> = items
+                .iter()
+                .map(|it| match it.data_type {
+                    0x03 => it
+                        .string
+                        .as_deref()
+                        .map(|s| jstr(vm, s))
+                        .unwrap_or(V::Ref(0)),
+                    0x01 => {
+                        let s = vm
+                            .apk_res
+                            .as_ref()
+                            .and_then(|r| r.string_of(it.data))
+                            .map(|s| s.to_string());
+                        s.map(|s| jstr(vm, &s)).unwrap_or(V::Ref(0))
+                    }
+                    _ => V::Ref(0),
+                })
+                .collect();
+            Some(Some(arr(vm, STRING, vals)))
+        }
+        "getIntArray" => {
+            if std::env::var("OVELO_VIEWDBG").is_ok() {
+                let rid = res_id();
+                let n = vm
+                    .apk_res
+                    .as_ref()
+                    .map(|r| r.array_items(rid).len())
+                    .unwrap_or(0);
+                let name = vm
+                    .apk_res
+                    .as_ref()
+                    .and_then(|r| r.resource_name(rid))
+                    .unwrap_or_default();
+                eprintln!("[viewdbg] getIntArray rid={rid:#x} name={name:?} items={n}");
+            }
+            let vals: Vec<V> = vm
+                .apk_res
+                .as_ref()
+                .map(|r| {
+                    let items = r.array_items(res_id());
+                    if items.is_empty() {
+                        // A plain value resource loads as a 1-element TypedArray.
+                        return r
+                            .entry_value(res_id())
+                            .map(|e| vec![V::I32(e.data as i32)])
+                            .unwrap_or_default();
+                    }
+                    items
+                        .iter()
+                        .map(|it| match it.data_type {
+                            0x01 => r
+                                .entry_value(it.data)
+                                .map(|e| V::I32(e.data as i32))
+                                .unwrap_or(V::I32(0)),
+                            _ => V::I32(it.data as i32),
+                        })
+                        .collect()
+                })
+                .unwrap_or_default();
+            Some(Some(arr(vm, "I", vals)))
+        }
         "getBoolean" | "getInteger" | "getColor" => Some(Some(V::I32(
             vm.apk_res
                 .as_ref()
@@ -1917,9 +2052,49 @@ fn resources_call(vm: &mut Vm, name: &str, args: &[V]) -> Rt<Option<Option<V>>> 
                     "Landroid/content/res/TypedArray;",
                     HostState::Empty,
                 ))),
-                "getResourceName" | "getResourcePackageName"
-                | "getResourceTypeName" | "getResourceEntryName" => {
-                    Some(Some(jstr(vm, "")))
+                "getResourceName" => Some(Some(match vm
+                    .apk_res
+                    .as_ref()
+                    .and_then(|r| {
+                        r.resource_name(i64v(args.get(1).copied().unwrap_or(V::I32(0))) as u32)
+                    }) {
+                    Some(n) => jstr(vm, &n),
+                    None => jstr(vm, ""),
+                })),
+                "getResourceEntryName" => {
+                    let n = vm
+                        .apk_res
+                        .as_ref()
+                        .and_then(|r| {
+                            r.entry_name(
+                                i64v(args.get(1).copied().unwrap_or(V::I32(0))) as u32,
+                            )
+                        })
+                        .map(str::to_string);
+                    if std::env::var_os("OVELO_VIEWDBG").is_some() {
+                        eprintln!("[viewdbg] getResourceEntryName({:?}) -> {n:?}", args.get(1));
+                    }
+                    Some(Some(jstr(vm, n.as_deref().unwrap_or(""))))
+                }
+                "getResourceTypeName" => {
+                    let n = vm
+                        .apk_res
+                        .as_ref()
+                        .and_then(|r| {
+                            r.type_name(
+                                i64v(args.get(1).copied().unwrap_or(V::I32(0))) as u32,
+                            )
+                        })
+                        .map(str::to_string);
+                    Some(Some(jstr(vm, n.as_deref().unwrap_or(""))))
+                }
+                "getResourcePackageName" => {
+                    let n = vm
+                        .apk_res
+                        .as_ref()
+                        .and_then(|r| r.package_name())
+                        .map(str::to_string);
+                    Some(Some(jstr(vm, n.as_deref().unwrap_or(""))))
                 }
                 "getXml" => Some(Some(xml::parser_of(
                     vm,
@@ -2223,14 +2398,22 @@ fn res_misc(vm: &mut Vm, class: &str, name: &str, args: &[V]) -> Rt<Option<Optio
         ("Landroid/content/res/Resources$Theme;", "obtainStyledAttributes") => {
             Some(Some(view::typed_array(vm, args)))
         }
-        ("Landroid/content/res/Resources$Theme;", "applyStyle" | "setTo"
-        | "resolveAttribute" | "rebase" | "dump" | "getKey" | "newTheme") => {
-            if name == "resolveAttribute" || name == "getKey" {
-                Some(Some(V::I32(0)))
-            } else {
-                Some(None)
+        ("Landroid/content/res/Resources$Theme;", "resolveAttribute") => {
+            // resolveAttribute(attrResId, TypedValue out, resolveRefs):
+            // fill the TypedValue from the theme and answer bool.
+            let attr = i64v(args.get(1).copied().unwrap_or(V::I32(0))) as u32;
+            match view::theme_attr_value(vm, attr) {
+                Some(v) => {
+                    if let Some(tv) = args.get(2).copied() {
+                        fill_typed_value(vm, tv, v);
+                    }
+                    Some(Some(V::I32(1)))
+                }
+                None => Some(Some(V::I32(0))),
             }
         }
+        ("Landroid/content/res/Resources$Theme;", "applyStyle" | "setTo"
+        | "rebase" | "dump" | "getKey" | "newTheme") => Some(None),
         ("Landroid/content/res/Configuration;", "setTo" | "updateFrom"
         | "diff" | "isLayoutSizeAtLeast" | "setLayoutDirection"
         | "setLocale" | "setLocales" | "readFromProto" | "writeToProto"

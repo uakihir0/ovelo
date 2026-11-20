@@ -36,6 +36,10 @@ pub struct ApkResources {
     entry_names: HashMap<u32, String>,
     /// `id`-type entry name → res_id, for `@+id/name` / `@id/name`.
     id_by_name: HashMap<String, u32>,
+    /// res_id → type name (`id`, `layout`, …) for `getResourceTypeName`.
+    type_names: HashMap<u32, String>,
+    /// Package name of the app resource package (for `getResourceName`).
+    package_name: String,
     /// res_id → simple value (default config preferred).
     entry_values: HashMap<u32, EntryValue>,
     /// style res_id → parent + items, for theme attribute resolution.
@@ -55,13 +59,21 @@ impl ApkResources {
             file_paths: HashMap::new(),
             entry_names: HashMap::new(),
             id_by_name: HashMap::new(),
+            type_names: HashMap::new(),
+            package_name: String::new(),
             entry_values: HashMap::new(),
             styles: HashMap::new(),
         };
         let arsc = res.read("resources.arsc")?;
         for pkg in parse_arsc(&arsc).ok()? {
+            if pkg.package_id & 0xff == 0x7f {
+                res.package_name = pkg.name.clone();
+            }
             for t in &pkg.types {
                 for e in &t.entries {
+                    res.type_names
+                        .entry(e.res_id)
+                        .or_insert_with(|| t.name.clone());
                     res.entry_names.entry(e.res_id).or_insert_with(|| e.key.clone());
                     if let Some(v) = &e.value {
                         if e.config == "default" {
@@ -146,6 +158,29 @@ impl ApkResources {
     /// res_id → entry key name.
     pub fn entry_name(&self, res_id: u32) -> Option<&str> {
         self.entry_names.get(&res_id).map(|s| s.as_str())
+    }
+
+    /// The app resource package's name, when known.
+    pub fn package_name(&self) -> Option<&str> {
+        (!self.package_name.is_empty()).then_some(self.package_name.as_str())
+    }
+
+    /// res_id → type name (`id`, `layout`, …).
+    pub fn type_name(&self, res_id: u32) -> Option<&str> {
+        self.type_names.get(&res_id).map(|s| s.as_str())
+    }
+
+    /// Fully-qualified `pkg:type/name` for `Resources.getResourceName`;
+    /// falls back to the bare entry name when the type is unknown.
+    pub fn resource_name(&self, res_id: u32) -> Option<String> {
+        let name = self.entry_name(res_id)?;
+        let ty = self.type_name(res_id).unwrap_or("");
+        let pkg = if self.package_name.is_empty() {
+            "app"
+        } else {
+            &self.package_name
+        };
+        Some(format!("{pkg}:{ty}/{name}"))
     }
 
     /// res_id → entry key name, falling back to the framework attr table
