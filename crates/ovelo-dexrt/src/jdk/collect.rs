@@ -191,15 +191,15 @@ pub(crate) fn call(
         match name {
             "execute" => {
                 if let V::Ref(r) = args[1] {
-                    // Executor jobs run on a background thread — Room/
-                    // WorkManager assert they are not on the main one.
-                    let _ = run_on_worker(vm, r);
+                    // Executor jobs are async — defer to the work queue
+                    // (they run on a worker thread at the next drain).
+                    vm.pending_runnables.push_back((r, false));
                 }
                 Some(None)
             }
             "submit" => {
                 if let V::Ref(r) = args[1] {
-                    let _ = run_on_worker(vm, r);
+                    vm.pending_runnables.push_back((r, false));
                 }
                 Some(Some(host(vm, "Ljava/util/concurrent/Future;", HostState::Empty)))
             }
@@ -221,6 +221,12 @@ pub(crate) fn call(
             "get" | "call" => Some(Some(V::Ref(0))),
             "isDone" | "isCancelled" => Some(Some(V::I32(1))),
             "cancel" => Some(Some(V::I32(1))),
+            "park" | "parkNanos" | "parkUntil" => {
+                // LockSupport.park* — same preempt-and-requeue contract
+                // as Unsafe.park (coroutine schedulers park their
+                // workers here when no task is ready).
+                return Err(crate::E::Vm(crate::err("ovelo.park")));
+            }
             "offer" | "add" | "put" | "take" | "poll" | "remove" => {
                 if matches!(name, "add" | "offer") {
                     list_call(vm, name, sig, args)?

@@ -366,7 +366,7 @@ pub(crate) fn call(
         || class.ends_with("Cursor;")
         || class.starts_with("Landroid/database/")
     {
-        cursor_call(vm, name, args)?
+        super::db::db_call(vm, name, args)?
     } else if class.starts_with("Landroid/provider/") {
         match name {
             "getString" | "getInt" | "getLong" | "getFloat" => {
@@ -1301,11 +1301,14 @@ fn context_call(
             "Ljava/io/FileOutputStream;",
             HostState::Empty,
         ))),
-        "openOrCreateDatabase" => Some(Some(host(
-            vm,
-            "Landroid/database/sqlite/SQLiteDatabase;",
-            HostState::Empty,
-        ))),
+        "openOrCreateDatabase" => {
+            let n = args
+                .iter()
+                .skip(1)
+                .find_map(|a| sv(vm, *a))
+                .unwrap_or_default();
+            Some(Some(super::db::open_or_create(vm, &n)?))
+        }
         "deleteFile" | "deleteDatabase" | "deleteSharedPreferences" => {
             Some(Some(V::I32(0)))
         }
@@ -2239,12 +2242,10 @@ fn handler_call(vm: &mut Vm, name: &str, args: &[V]) -> Rt<Option<Option<V>>> {
         | "sendEmptyMessage" | "sendEmptyMessageDelayed"
         | "sendEmptyMessageAtTime" | "postWithDeliveryResult"
         | "postAsIdle" | "executeOrSendMessage" | "sendToTarget" => {
-            if let Some(V::Ref(r)) = args.get(1).copied().or_else(|| {
-                args.get(1).copied()
-            }) {
-                // Handler posts land on the main looper thread — even
-                // when posted from inside executor work.
-                let _ = run_on_main(vm, r);
+            if let Some(V::Ref(r)) = args.get(1).copied() {
+                // Handler posts land on the main looper — deferred so a
+                // re-posting callback can't spin inside its own frame.
+                vm.pending_runnables.push_back((r, true));
             }
             Some(Some(V::I32(1)))
         }
@@ -2297,104 +2298,6 @@ fn looper_call(vm: &mut Vm, name: &str, _args: &[V]) -> Rt<Option<Option<V>>> {
             HostState::Empty,
         ))),
         "setMessageLogging" | "dump" => Some(None),
-        _ => None,
-    })
-}
-
-// ---------------------------------------------------------------------
-// Cursor / database — in-memory rows via Map of column→value lists
-
-fn cursor_call(vm: &mut Vm, name: &str, args: &[V]) -> Rt<Option<Option<V>>> {
-    let V::Ref(_h) = args.first().copied().unwrap_or(V::Ref(0)) else {
-        return Ok(None);
-    };
-    Ok(match name {
-        "getCount" => Some(Some(V::I32(0))),
-        "getPosition" => Some(Some(V::I32(-1))),
-        "moveToFirst" | "moveToNext" | "moveToLast" | "moveToPrevious"
-        | "moveToPosition" | "move" | "isFirst" | "isLast" | "isBeforeFirst"
-        | "isAfterLast" => {
-            Some(Some(V::I32(
-                matches!(name, "isBeforeFirst" | "isAfterLast") as i32,
-            )))
-        }
-        "getColumnIndex" | "getColumnIndexOrThrow" => Some(Some(V::I32(-1))),
-        "getColumnName" => Some(Some(jstr(vm, ""))),
-        "getColumnNames" => Some(Some(arr(vm, STRING, vec![]))),
-        "getColumnCount" => Some(Some(V::I32(0))),
-        "getString" | "getBlob" | "getInt" | "getLong" | "getShort"
-        | "getFloat" | "getDouble" | "getType" | "isNull" | "getExtras" => {
-            if name.starts_with("is") || name == "getType" {
-                Some(Some(V::I32(0)))
-            } else if name == "getExtras" {
-                Some(Some(V::Ref(0)))
-            } else {
-                Some(Some(V::I64(0)))
-            }
-        }
-        "close" | "deactivate" | "requery" | "registerContentObserver"
-        | "unregisterContentObserver" | "registerDataSetObserver"
-        | "unregisterDataSetObserver" | "setNotificationUri"
-        | "getNotificationUri" | "getWantsAllOnMoveCalls"
-        | "setExtras" | "respond" => {
-            if name == "requery" {
-                Some(Some(V::I32(0)))
-            } else if name == "getNotificationUri" || name == "respond" {
-                Some(Some(V::Ref(0)))
-            } else if name == "getWantsAllOnMoveCalls" {
-                Some(Some(V::I32(0)))
-            } else {
-                Some(None)
-            }
-        }
-        "copyStringToBuffer" => Some(None),
-        // SQLiteDatabase/SQLiteOpenHelper methods
-        "execSQL" | "beginTransaction" | "endTransaction"
-        | "setTransactionSuccessful" | "inTransaction" | "isOpen" | "open"
-        | "compileStatement" | "insert" | "insertOrThrow" | "replace"
-        | "replaceOrThrow" | "update" | "updateWithOnConflict" | "delete"
-        | "query" | "queryWithFactory" | "rawQuery"
-        | "rawQueryWithFactory" | "insertWithOnConflict" | "getVersion"
-        | "setVersion" | "getMaximumSize" | "setMaximumSize"
-        | "getPageSize" | "setPageSize" | "getPath" | "isReadOnly"
-        | "isDbLockedByCurrentThread" | "isDbLockedByOtherThreads"
-        | "yieldIfContendedSafely" | "setForeignKeyConstraintsEnabled"
-        | "enableWriteAheadLogging" | "disableWriteAheadLogging"
-        | "isWriteAheadLoggingEnabled" | "getAttachedDbs"
-        | "isDatabaseIntegrityOk" | "onCreate" | "onUpgrade"
-        | "onDowngrade" | "onOpen" | "onConfigure" | "getWritableDatabase"
-        | "getReadableDatabase" | "getDatabaseName" | "setIdleConnectionTimeout"
-        | "acquireReference" | "releaseReference" | "close0" => {
-            if matches!(
-                name,
-                "insert" | "insertOrThrow" | "replace" | "replaceOrThrow"
-                    | "insertWithOnConflict" | "update" | "updateWithOnConflict"
-                    | "delete" | "getVersion" | "getPageSize"
-            ) {
-                Some(Some(V::I64(0)))
-            } else if matches!(name, "query" | "queryWithFactory" | "rawQuery"
-                | "rawQueryWithFactory" | "compileStatement")
-            {
-                Some(Some(host(vm, "Landroid/database/Cursor;", HostState::Empty)))
-            } else if matches!(name, "isOpen" | "isReadOnly" | "inTransaction"
-                | "isDbLockedByCurrentThread" | "isDbLockedByOtherThreads"
-                | "yieldIfContendedSafely" | "isWriteAheadLoggingEnabled"
-                | "isDatabaseIntegrityOk" | "enableWriteAheadLogging")
-            {
-                Some(Some(V::I32(
-                    matches!(name, "isOpen" | "yieldIfContendedSafely"
-                        | "isDatabaseIntegrityOk") as i32,
-                )))
-            } else if name == "getWritableDatabase" || name == "getReadableDatabase" {
-                Some(Some(args[0]))
-            } else if matches!(name, "getPath" | "getDatabaseName") {
-                Some(Some(jstr(vm, "")))
-            } else if name == "getAttachedDbs" || name == "getMaximumSize" {
-                Some(Some(V::Ref(0)))
-            } else {
-                Some(None)
-            }
-        }
         _ => None,
     })
 }

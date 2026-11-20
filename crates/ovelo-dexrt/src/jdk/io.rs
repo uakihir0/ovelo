@@ -184,7 +184,7 @@ fn stream_call(vm: &mut Vm, name: &str, args: &[V]) -> Option<Option<V>> {
 /// Guest-visible path -> host path under `vm.guest_root`. Absolute
 /// guest paths and `..` can never escape the sandbox: root/prefix
 /// components are dropped and `..` above the root is discarded.
-fn fspath(vm: &Vm, guest: &str) -> std::path::PathBuf {
+pub(crate) fn fspath(vm: &Vm, guest: &str) -> std::path::PathBuf {
     use std::path::Component as C;
     let mut out = vm.guest_root.clone();
     let mut depth = 0usize;

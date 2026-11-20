@@ -1465,12 +1465,30 @@ fn thread_call(vm: &mut Vm, name: &str, _sig: &str, args: &[V]) -> Rt<Option<Opt
         "getUncaughtExceptionHandler" | "getDefaultUncaughtExceptionHandler" => {
             Some(Some(V::Ref(0)))
         }
+        "<init>" => {
+            // Thread(Runnable[, name]) / Thread(group, Runnable, …):
+            // remember the first Runnable-ish arg so `start` can run it.
+            if let V::Ref(h) = args[0] {
+                if let Some(&t) = args[1..].iter().find(|a| {
+                    matches!(a, V::Ref(rh) if *rh != 0
+                        && s(vm, *rh).is_none()
+                        && !matches!(vm.heap.get(*rh), Some(Obj::Host { desc, .. })
+                            if desc.contains("ThreadGroup")))
+                }) {
+                    pseudo_set(vm, h, P_TARGET, t);
+                }
+            }
+            Some(None)
+        }
         "start" => {
-            // Inline the Runnable — single-looper threading model.
+            // A started Thread is async: enqueue the Runnable for the
+            // next drain point rather than running it inline — inline
+            // execution deadlocks guests whose tasks reschedule work
+            // (coroutine dispatchers, self-perpetuating handlers).
             if let V::Ref(h) = args[0] {
                 let t = pseudo_get(vm, h, P_TARGET).unwrap_or(V::Ref(h));
                 if let V::Ref(r) = t {
-                    let _ = vm.call_virtual(r, "run", &[]);
+                    vm.pending_runnables.push_back((r, false));
                 }
             }
             Some(None)
@@ -2221,7 +2239,13 @@ fn unsafe_call(vm: &mut Vm, name: &str, args: &[V]) -> Rt<Option<Option<V>>> {
                 }
             });
         }
-        "loadFence" | "storeFence" | "fullFence" | "park" | "unpark"
+        "park" => {
+            // Parked = preempted: unwind the runnable and requeue it at
+            // the back of the work queue (see `drain_runnables`) so a
+            // parked worker yields instead of spinning at full speed.
+            return Err(crate::E::Vm(crate::err("ovelo.park")));
+        }
+        "loadFence" | "storeFence" | "fullFence" | "unpark"
         | "monitorEnter" | "monitorExit" => None,
         _ => return Ok(None),
     };

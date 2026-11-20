@@ -7,6 +7,7 @@
 
 mod android;
 mod collect;
+pub(crate) mod db;
 mod io;
 mod lang;
 mod time;

@@ -188,9 +188,32 @@ pub struct Vm {
     /// Installed-APK resource index for `LayoutInflater.inflate` — `None`
     /// degrades inflation to bare placeholder views.
     pub apk_res: Option<res::ApkResources>,
+    /// Guest SQLite connections by database name
+    /// (`android.database.sqlite` — see `jdk::db`).
+    pub(crate) dbs: HashMap<String, std::rc::Rc<std::cell::RefCell<jdk::db::Db>>>,
+    /// Database name -> its `SQLiteDatabase` object handle.
+    pub(crate) db_handles: HashMap<String, u32>,
+    /// Object handle (db or statement) -> database name it talks to.
+    pub(crate) obj_db: HashMap<u32, String>,
     /// The Activity/theme res id (`android:theme` from the manifest) that
     /// theme-scoped `obtainStyledAttributes` resolves attributes against.
     pub theme_id: u32,
+    /// Total interpreter steps across all `run()` calls — `OVELO_STALLDBG`
+    /// uses it to distinguish a still-running guest from a host-side loop.
+    pub total_steps: u64,
+    /// `(owner_descriptor, field_name)` → global field idx — memoized
+    /// because `DexFile::field_index_of` re-decodes every field's
+    /// strings and updater-style guests (`AtomicReferenceFieldUpdater`,
+    /// `Unsafe`) issue thousands of lookups.
+    field_idx_cache: std::cell::RefCell<HashMap<(String, String), Option<GIdx>>>,
+    /// Deferred async work — `(runnable, on_main)`. `Thread.start`,
+    /// `Executor.execute`/`submit` and `Handler.post*` enqueue here
+    /// instead of running inline (AOSP is async; inline execution
+    /// deadlocks on self-rescheduling executors). Drained at the
+    /// outermost `call_virtual` boundary.
+    pub pending_runnables: std::collections::VecDeque<(u32, bool)>,
+    /// Reentrancy guard for `drain_runnables`.
+    pub(crate) draining: bool,
     /// Activity a guest `startActivity` asked to launch — (class
     /// descriptor, the Intent the caller passed). The runner drains
     /// it into a real second-Activity dispatch.
@@ -276,8 +299,15 @@ impl Vm {
             content_views: HashMap::new(),
             decor_roots: HashMap::new(),
             apk_res: None,
+            dbs: HashMap::new(),
+            db_handles: HashMap::new(),
+            obj_db: HashMap::new(),
             theme_id: 0,
+            total_steps: 0,
             pending_activity: None,
+            pending_runnables: std::collections::VecDeque::new(),
+            draining: false,
+            field_idx_cache: std::cell::RefCell::new(HashMap::new()),
             class_mirrors: HashMap::new(),
             granted_permissions: std::collections::HashSet::new(),
         };
@@ -300,6 +330,8 @@ impl Vm {
     /// A class defined in a later dex resolves from invokes in earlier
     /// ones — same semantics as ART's unified class path.
     pub fn add_dex(&mut self, dex: DexFile) -> Result<()> {
+        // A new dex can resolve names previous lookups missed.
+        self.field_idx_cache.borrow_mut().clear();
         let di = self.dexes.len();
         for (class_idx, em) in dex.methods()? {
             self.defined
@@ -396,13 +428,21 @@ impl Vm {
     }
 
     /// `field_idx` lookup across every loaded dex (global result).
+    /// Memoized — dex field tables don't change after `add_dex`.
     pub(crate) fn field_index_of(&self, owner: &str, name: &str) -> Option<GIdx> {
+        let key = (owner.to_string(), name.to_string());
+        if let Some(hit) = self.field_idx_cache.borrow().get(&key) {
+            return *hit;
+        }
+        let mut out = None;
         for (di, d) in self.dexes.iter().enumerate() {
             if let Some(i) = d.field_index_of(owner, name) {
-                return Some(gx(di, i));
+                out = Some(gx(di, i));
+                break;
             }
         }
-        None
+        self.field_idx_cache.borrow_mut().insert(key, out);
+        out
     }
 
     /// Descriptor for a global `type_idx`.
@@ -885,14 +925,48 @@ impl Vm {
         let mut a = Vec::with_capacity(args.len() + 1);
         a.push(V::Ref(this));
         a.extend_from_slice(args);
-        match self.invoke(midx, a, InvokeKind::Virtual) {
+        let out = match self.invoke(midx, a, InvokeKind::Virtual) {
             Ok(v) => Ok(v),
             Err(E::Vm(e)) => Err(e),
             Err(E::Throw(r)) => {
                 let d = self.describe_throw(r);
                 Err(errd("dexrt.exception.uncaught", d))
             }
+        };
+        if self.depth == 0 {
+            self.drain_runnables(500);
         }
+        out
+    }
+
+    /// Run enqueued async work FIFO — `Thread.start`/`Executor.execute`
+    /// jobs on a worker thread, `Handler.post*` on the main one.
+    /// Reentrant-safe; `max` bounds total runnables per drain so a
+    /// self-rescheduling queue can't wedge the caller forever.
+    pub fn drain_runnables(&mut self, max: usize) {
+        if self.draining {
+            return;
+        }
+        self.draining = true;
+        for _ in 0..max {
+            let Some((r, on_main)) = self.pending_runnables.pop_front() else {
+                break;
+            };
+            let out = if on_main {
+                jdk::run_on_main(self, r)
+            } else {
+                jdk::run_on_worker(self, r)
+            };
+            if let Err(e) = out {
+                // A parked worker yields its slot and reschedules —
+                // the runnable re-enters `run()` on a later drain and
+                // re-scans its own work queue (coroutine schedulers).
+                if e.cause() == "ovelo.park" {
+                    self.pending_runnables.push_back((r, on_main));
+                }
+            }
+        }
+        self.draining = false;
     }
 
     /// Attach `child` under `parent` in the inflated-view tree — used
@@ -2062,9 +2136,24 @@ impl Vm {
         let mut pc: usize = 0;
         // Instruction budget — a guest (or stub-driven) loop that never
         // terminates must fail loudly, not hang the host process.
+        let stalldbg = std::env::var_os("OVELO_STALLDBG").is_some();
         let mut steps: u64 = 0;
         loop {
             steps += 1;
+            if stalldbg && steps.is_multiple_of(5_000_000) {
+                eprintln!(
+                    "[stall] {} +{pc:04x} steps={steps}",
+                    self.describe_method(fr.loc.midx)
+                );
+            }
+            self.total_steps += 1;
+            if stalldbg && self.total_steps.is_multiple_of(1_000_000) {
+                eprintln!(
+                    "[stall-total] {} +{pc:04x} total={}",
+                    self.describe_method(fr.loc.midx),
+                    self.total_steps
+                );
+            }
             if steps > 20_000_000 {
                 return Err(self.throw_builtin(
                     "Ljava/lang/InternalError;",

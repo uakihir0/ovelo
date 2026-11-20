@@ -99,20 +99,16 @@ fn attr_s(v: &Value) -> Option<String> {
     }
 }
 
-/// Current element's attribute map as `(name, value)` pairs —
-/// also used by `ta_lookup` when the parser plays `AttributeSet`.
-pub(crate) fn cur_attrs(vm: &mut Vm, h: u32) -> Vec<(String, V)> {
-    let Some((els, ev)) = cur(vm, h) else {
-        return Vec::new();
-    };
-    let Some(el) = cur_el(&els, ev) else {
-        return Vec::new();
-    };
+/// Value of the attribute `name` on the element the cursor sits on,
+/// converting only that one value — used by `ta_lookup` so a styleable
+/// read doesn't materialize the whole attribute list per index.
+pub(crate) fn cur_attr_value(vm: &mut Vm, h: u32, name: &str) -> Option<V> {
+    let (els, ev) = cur(vm, h)?;
+    let el = cur_el(&els, ev)?;
     el.attrs
         .iter()
-        .map(|a| (a.name.clone(), a.value.clone()))
-        .map(|(n, v)| (n, view::attr_v(vm, &v)))
-        .collect()
+        .find(|a| a.name == name)
+        .map(|a| view::attr_v(vm, &a.value))
 }
 
 pub(crate) fn pull_call(

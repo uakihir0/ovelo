@@ -508,6 +508,21 @@ pub(crate) fn call(
                 this
             };
             let mut hit = find_in_tree(vm, root, id).unwrap_or(0);
+            if hit == 0 && class != WINDOW {
+                // View-binding lookups sometimes run on a child of the
+                // real root (obfuscated `j(root, id)` callers seen
+                // passing an inner view): retry from the tree's top.
+                let mut top = this;
+                for _ in 0..64 {
+                    match pseudo_get(vm, top, P_PARENT) {
+                        Some(V::Ref(p)) if p != 0 && p != top => top = p,
+                        _ => break,
+                    }
+                }
+                if top != this {
+                    hit = find_in_tree(vm, top, id).unwrap_or(0);
+                }
+            }
             if hit == 0 && class == WINDOW {
                 // Window searches span trees: appcompat content lives
                 // in its own decor tree, so retry across inflated roots
@@ -1109,32 +1124,20 @@ pub(crate) fn ta_lookup(vm: &mut Vm, h: u32, index: usize) -> Option<V> {
                 .and_then(|r| r.attr_name(attr_id).map(|s| s.to_string()))
         );
     }
-    // An XmlResourceParser doubles as AttributeSet: snapshot the
-    // element its cursor sits on first — reading values interns
-    // strings, which borrows `vm` mutably.
-    let parser_attrs: Vec<(String, V)> = match pseudo_get(vm, h, P_TA_SET) {
-        Some(V::Ref(set_h))
-            if matches!(
-                vm.heap.get(set_h),
-                Some(Obj::Host {
-                    state: HostState::Xml { .. },
-                    ..
-                })
-            ) =>
-        {
-            xml::cur_attrs(vm, set_h)
-        }
-        _ => Vec::new(),
-    };
-    let res = vm.apk_res.as_ref()?;
     // 1) Explicit AttributeSet: match by entry name (app attrs and
-    //    framework attrs share the local-name space).
-    if let Some(name) = res.attr_name(attr_id).map(|s| s.to_string()) {
-        if let Some(v) = parser_attrs
-            .iter()
-            .find_map(|(n, v)| (*n == name).then_some(*v))
-        {
-            return Some(v);
+    //    framework attrs share the local-name space). An
+    //    XmlResourceParser doubles as AttributeSet — query the single
+    //    attr by name instead of materializing the whole list.
+    let name = vm
+        .apk_res
+        .as_ref()?
+        .attr_name(attr_id)
+        .map(|s| s.to_string());
+    if let Some(name) = name {
+        if let Some(V::Ref(set_h)) = pseudo_get(vm, h, P_TA_SET) {
+            if let Some(v) = xml::cur_attr_value(vm, set_h, &name) {
+                return Some(v);
+            }
         }
         if let Some(V::Ref(set_h)) = pseudo_get(vm, h, P_TA_SET) {
             if let Some(Obj::Host {
@@ -1154,6 +1157,7 @@ pub(crate) fn ta_lookup(vm: &mut Vm, h: u32, index: usize) -> Option<V> {
             }
         }
     }
+    let res = vm.apk_res.as_ref()?;
     // 2) Explicit style (obtainStyledAttributes(resId, attrs)).
     if let Some(V::I32(s)) = pseudo_get(vm, h, P_TA_STYLE) {
         if let Some(ev) = res.style_item(s as u32, attr_id).cloned() {
@@ -1431,7 +1435,11 @@ fn build_tree(vm: &mut Vm, elems: &[Element], ctx: V) -> V {
             el.name.clone()
         };
         let attrs = attrset_of(vm, el);
-        let V::Ref(h) = make_view_named(vm, &name, attrs, ctx) else {
+        let v = make_view_named(vm, &name, attrs, ctx);
+        if std::env::var_os("OVELO_VIEWDBG").is_some() {
+            eprintln!("[viewdbg] elem d{} {} -> {v:?}", el.depth, el.name);
+        }
+        let V::Ref(h) = v else {
             continue;
         };
         pseudo_set(vm, h, P_ATTRS, attrs);
