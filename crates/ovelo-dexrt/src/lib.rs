@@ -1463,7 +1463,8 @@ impl Vm {
             | "Ljava/lang/IndexOutOfBoundsException;"
             | "Ljava/lang/ArithmeticException;"
             | "Ljava/lang/ClassCastException;"
-            | "Ljava/lang/NegativeArraySizeException;" => &[
+            | "Ljava/lang/NegativeArraySizeException;"
+            | "Ljava/util/NoSuchElementException;" => &[
                 "Ljava/lang/RuntimeException;",
                 "Ljava/lang/Exception;",
                 "Ljava/lang/Throwable;",

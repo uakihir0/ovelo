@@ -479,34 +479,67 @@ fn list_call(vm: &mut Vm, name: &str, sig: &str, args: &[V]) -> Rt<Option<Option
                 Some(Some(V::I32((before != keep.iter().filter(|k| **k).count()) as i32)))
             }
         }
-        "get" | "element" | "getFirst" | "getLast" | "peek" | "peekFirst"
-        | "peekLast" => {
+        "get" => {
+            let l = match list_ref(vm, h) {
+                Some(l) => l,
+                None => return Ok(None),
+            };
+            let i = i32v(args[1]) as usize;
+            match l.get(i) {
+                // Java throws, it does not return null — guests catch
+                // IndexOutOfBoundsException where a null would NPE
+                // later (NewPipe Tab.getTabName on the default tab
+                // list).
+                Some(v) => Some(Some(*v)),
+                None => {
+                    return Err(vm.throw_builtin(
+                        "Ljava/lang/IndexOutOfBoundsException;",
+                        &format!("List.get({i}) on size {}", l.len()),
+                    ));
+                }
+            }
+        }
+        "element" | "getFirst" | "getLast" => {
+            let l = match list_ref(vm, h) {
+                Some(l) => l,
+                None => return Ok(None),
+            };
+            let v = if name == "getLast" { l.last() } else { l.first() };
+            match v {
+                Some(v) => Some(Some(*v)),
+                None => {
+                    return Err(vm.throw_builtin(
+                        "Ljava/util/NoSuchElementException;",
+                        name,
+                    ));
+                }
+            }
+        }
+        "peek" | "peekFirst" | "peekLast" => {
             let l = match list_ref(vm, h) {
                 Some(l) => l,
                 None => return Ok(None),
             };
             let v = match name {
-                "getFirst" | "element" | "peek" | "peekFirst" => {
-                    l.first().copied().unwrap_or(V::Ref(0))
-                }
-                "getLast" | "peekLast" => {
-                    l.last().copied().unwrap_or(V::Ref(0))
-                }
-                _ => l.get(i32v(args[1]) as usize).copied().unwrap_or(V::Ref(0)),
+                "peekLast" => l.last().copied().unwrap_or(V::Ref(0)),
+                _ => l.first().copied().unwrap_or(V::Ref(0)),
             };
             Some(Some(v))
         }
         "set" => {
+            let n = list_ref(vm, h).map(|l| l.len()).unwrap_or(0);
+            let i = i32v(args[1]) as usize;
+            if i >= n {
+                return Err(vm.throw_builtin(
+                    "Ljava/lang/IndexOutOfBoundsException;",
+                    &format!("List.set({i}) on size {n}"),
+                ));
+            }
             let l = match list_mut(vm, h) {
                 Some(l) => l,
                 None => return Ok(None),
             };
-            let i = i32v(args[1]) as usize;
-            Some(Some(if i < l.len() {
-                std::mem::replace(&mut l[i], args[2])
-            } else {
-                V::Ref(0)
-            }))
+            Some(Some(std::mem::replace(&mut l[i], args[2])))
         }
         "size" => {
             let n = list_ref(vm, h).map(|l| l.len()).unwrap_or(0);
