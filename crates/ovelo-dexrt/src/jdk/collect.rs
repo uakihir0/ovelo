@@ -193,13 +193,13 @@ pub(crate) fn call(
                 if let V::Ref(r) = args[1] {
                     // Executor jobs are async — defer to the work queue
                     // (they run on a worker thread at the next drain).
-                    vm.pending_runnables.push_back((r, false));
+                    vm.enqueue_runnable(r, false);
                 }
                 Some(None)
             }
             "submit" => {
                 if let V::Ref(r) = args[1] {
-                    vm.pending_runnables.push_back((r, false));
+                    vm.enqueue_runnable(r, false);
                 }
                 Some(Some(host(vm, "Ljava/util/concurrent/Future;", HostState::Empty)))
             }

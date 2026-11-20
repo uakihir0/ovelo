@@ -1532,7 +1532,7 @@ fn thread_call(vm: &mut Vm, name: &str, _sig: &str, args: &[V]) -> Rt<Option<Opt
             if let V::Ref(h) = args[0] {
                 let t = pseudo_get(vm, h, P_TARGET).unwrap_or(V::Ref(h));
                 if let V::Ref(r) = t {
-                    vm.pending_runnables.push_back((r, false));
+                    vm.enqueue_runnable(r, false);
                 }
             }
             Some(None)

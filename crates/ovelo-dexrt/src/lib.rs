@@ -220,8 +220,14 @@ pub struct Vm {
     /// Runnables that re-parked inside a drain — when the queue holds
     /// only these, draining them again just makes two waiting workers
     /// hand the slot back and forth until the instruction budget
-    /// kills one (and its task is lost).
+    /// kills one (and its task is lost). Cleared whenever fresh work
+    /// is enqueued — it may target those workers' internal queues.
     reparked: std::collections::HashSet<u32>,
+    /// Consecutive `park_drain` calls that drained only re-parked
+    /// workers — bounded so mutual waiters yield to the outer drain
+    /// (which re-runs them with a fresh budget) instead of spinning
+    /// inside one `run()` until the budget kills the task.
+    park_spins: u32,
     /// Activity a guest `startActivity` asked to launch — (class
     /// descriptor, the Intent the caller passed). The runner drains
     /// it into a real second-Activity dispatch.
@@ -317,6 +323,7 @@ impl Vm {
             draining: false,
             park_depth: 0,
             reparked: std::collections::HashSet::new(),
+            park_spins: 0,
             field_idx_cache: std::cell::RefCell::new(HashMap::new()),
             class_mirrors: HashMap::new(),
             granted_permissions: std::collections::HashSet::new(),
@@ -1008,15 +1015,22 @@ impl Vm {
         if self.pending_runnables.is_empty() || self.park_depth >= 8 {
             return Err(E::Vm(err("ovelo.park")));
         }
-        // Every queued runnable already re-parked once — draining them
-        // makes no progress (two waiting workers requeueing each
-        // other), so yield instead of burning the budget in a spin.
+        // Every queued runnable already re-parked — draining them
+        // makes no progress when two waiting workers just requeue each
+        // other. Allow a few retries (fresh work may have reached a
+        // reparked worker's internal queue), then yield to the outer
+        // drain instead of burning this run()'s whole budget spinning.
         if !self
             .pending_runnables
             .iter()
             .any(|(r, _)| !self.reparked.contains(r))
         {
-            return Err(E::Vm(err("ovelo.park")));
+            self.park_spins += 1;
+            if self.park_spins > 4 {
+                return Err(E::Vm(err("ovelo.park")));
+            }
+        } else {
+            self.park_spins = 0;
         }
         self.park_depth += 1;
         let was = self.draining;
@@ -1025,6 +1039,16 @@ impl Vm {
         self.draining = was;
         self.park_depth -= 1;
         Ok(())
+    }
+
+    /// Enqueue a runnable (`Thread.start`/`Executor.execute`/
+    /// `Handler.post*`). Fresh work may target a re-parked worker's
+    /// internal queue, so all `reparked` tags are cleared — a waiting
+    /// parker must retry those workers rather than assume they are
+    /// still idle.
+    pub(crate) fn enqueue_runnable(&mut self, r: u32, on_main: bool) {
+        self.reparked.clear();
+        self.pending_runnables.push_back((r, on_main));
     }
 
     /// Run enqueued async work FIFO — `Thread.start`/`Executor.execute`
@@ -1065,6 +1089,7 @@ impl Vm {
                 }
                 _ => {
                     self.reparked.remove(&r);
+                    self.park_spins = 0;
                 }
             }
         }

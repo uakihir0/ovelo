@@ -2245,7 +2245,7 @@ fn handler_call(vm: &mut Vm, name: &str, args: &[V]) -> Rt<Option<Option<V>>> {
             if let Some(V::Ref(r)) = args.get(1).copied() {
                 // Handler posts land on the main looper — deferred so a
                 // re-posting callback can't spin inside its own frame.
-                vm.pending_runnables.push_back((r, true));
+                vm.enqueue_runnable(r, true);
             }
             Some(Some(V::I32(1)))
         }
