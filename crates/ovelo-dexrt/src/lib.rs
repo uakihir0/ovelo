@@ -1138,6 +1138,12 @@ impl Vm {
             .unwrap_or_else(|_| format!("method@{midx}"))
     }
 
+    /// Live call stack as `Lcls;.name(sig)ret` strings, newest frame
+    /// last — jdk shims read it to build guest stack traces.
+    pub(crate) fn describe_stack(&self) -> Vec<String> {
+        self.stack.iter().map(|&m| self.describe_method(m)).collect()
+    }
+
     /// `Lcls;.name` for a field ref — error details identify the field.
     fn describe_field(&self, fidx: GIdx) -> String {
         let fmt = || -> Result<String> {

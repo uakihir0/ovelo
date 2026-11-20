@@ -1452,7 +1452,41 @@ fn thread_call(vm: &mut Vm, name: &str, _sig: &str, args: &[V]) -> Rt<Option<Opt
             "Ljava/lang/Thread$State;",
             HostState::StrBuf("RUNNABLE".into()),
         ))),
-        "getStackTrace" | "getAllStackTraces" => Some(Some(arr(
+        "getStackTrace" => {
+            // Real frames — kotlin's Intrinsics.checkNotNullParameter
+            // walks this array to sanitize its NPE, so an empty array
+            // turns every guest NPE into an aget AIOOBE.
+            let frames: Vec<V> = vm
+                .describe_stack()
+                .into_iter()
+                .rev()
+                .map(|d| {
+                    // "Lpkg/Cls;.name(sig)ret" -> (pkg.Cls, name)
+                    let (cn, mn) = d
+                        .strip_prefix('L')
+                        .and_then(|r| r.split_once(";."))
+                        .map(|(c, r)| {
+                            (
+                                c.replace('/', "."),
+                                r.split('(').next().unwrap_or("").to_string(),
+                            )
+                        })
+                        .unwrap_or((d.clone(), String::new()));
+                    let v = host(
+                        vm,
+                        "Ljava/lang/StackTraceElement;",
+                        HostState::StrBuf(cn),
+                    );
+                    if let V::Ref(h) = v {
+                        let m = jstr(vm, &mn);
+                        pseudo_set(vm, h, P_COMPONENT, m);
+                    }
+                    v
+                })
+                .collect();
+            Some(Some(arr(vm, "Ljava/lang/StackTraceElement;", frames)))
+        }
+        "getAllStackTraces" => Some(Some(arr(
             vm,
             "Ljava/lang/StackTraceElement;",
             vec![],
@@ -1462,7 +1496,7 @@ fn thread_call(vm: &mut Vm, name: &str, _sig: &str, args: &[V]) -> Rt<Option<Opt
             "Ljava/lang/ClassLoader;",
             HostState::Empty,
         ))),
-        "getUncaughtExceptionHandler" | "getDefaultUncaughtExceptionHandler" => {
+        "getUncaughtExceptionHandler" => {
             // A null handler turns a worker's death report into an NPE
             // that masks the real exception — hand back a placeholder;
             // its uncaughtException dispatch is a builtin no-op.
@@ -1472,6 +1506,9 @@ fn thread_call(vm: &mut Vm, name: &str, _sig: &str, args: &[V]) -> Rt<Option<Opt
                 HostState::Empty,
             )))
         }
+        // AOSP contract: null until a default handler is installed —
+        // callers branch on the null to pick their own reporting path.
+        "getDefaultUncaughtExceptionHandler" => Some(Some(V::Ref(0))),
         "<init>" => {
             // Thread(Runnable[, name]) / Thread(group, Runnable, …):
             // remember the first Runnable-ish arg so `start` can run it.
@@ -1759,9 +1796,23 @@ fn enum_call(vm: &mut Vm, class: &str, name: &str, args: &[V]) -> Rt<Option<Opti
 }
 
 fn stacktrace_call(vm: &mut Vm, name: &str, args: &[V]) -> Option<Option<V>> {
-    let _ = args;
+    let h = match args.first() {
+        Some(&V::Ref(h)) => h,
+        _ => 0,
+    };
     match name {
-        "getClassName" | "getMethodName" | "getFileName" => Some(Some(jstr(vm, ""))),
+        "getClassName" => Some(Some(
+            s(vm, h)
+                .map(|n| jstr(vm, &n))
+                .unwrap_or(V::Ref(0)),
+        )),
+        "getMethodName" => Some(Some(
+            pseudo_get(vm, h, P_COMPONENT)
+                .and_then(|v| sv(vm, v))
+                .map(|n| jstr(vm, &n))
+                .unwrap_or(V::Ref(0)),
+        )),
+        "getFileName" => Some(Some(jstr(vm, ""))),
         "getLineNumber" | "getModuleVersion" => Some(Some(V::I32(0))),
         "isNativeMethod" => Some(Some(V::I32(0))),
         _ => Some(Some(V::Ref(0))),

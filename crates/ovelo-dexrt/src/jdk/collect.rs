@@ -1696,12 +1696,24 @@ fn fieldupdater_call(vm: &mut Vm, name: &str, args: &[V]) -> Rt<Option<Option<V>
             let owner = class_of(vm, args[1]);
             // Unresolved updaters must not share one pseudo-slot — a
             // Long updater's I32 write would be read back by a Ref
-            // updater aliasing the same key (dexrt.type at iget).
+            // updater aliasing the same key (dexrt.type at iget). Key
+            // the fallback by field name so two updaters for the same
+            // unresolved field still see each other's writes.
             let fid = fname
                 .as_deref()
                 .and_then(|n| vm.field_index_of(&owner, n))
                 .map(|g| vm.canon_field(g))
-                .unwrap_or_else(|| (u64::from(P_DATA) << 32) | u64::from(up));
+                .unwrap_or_else(|| {
+                    let key = match &fname {
+                        Some(n) => {
+                            let mut h = std::collections::hash_map::DefaultHasher::new();
+                            std::hash::Hash::hash(n, &mut h);
+                            std::hash::Hasher::finish(&h) as u32
+                        }
+                        None => up,
+                    };
+                    (u64::from(P_DATA) << 32) | u64::from(key)
+                });
             match name {
                 "get" => {
                     let v = match vm.heap.get(obj) {

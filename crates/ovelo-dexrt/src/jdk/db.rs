@@ -149,13 +149,18 @@ fn sql_err(vm: &mut Vm, e: impl std::fmt::Display) -> E {
 
 /// End the outermost transaction level. A failed COMMIT (deferred
 /// FK violation, …) leaves the SQLite transaction open, so roll it
-/// back — otherwise every later beginTransaction fails too.
-fn commit_or_rollback(conn: &mut rusqlite::Connection, ok: bool) {
-    if conn
-        .execute_batch(if ok { "COMMIT" } else { "ROLLBACK" })
-        .is_err()
-    {
-        let _ = conn.execute_batch("ROLLBACK");
+/// back — otherwise every later beginTransaction fails too — and
+/// still report the error so callers don't treat it as committed.
+fn commit_or_rollback(
+    conn: &mut rusqlite::Connection,
+    ok: bool,
+) -> rusqlite::Result<()> {
+    match conn.execute_batch(if ok { "COMMIT" } else { "ROLLBACK" }) {
+        Err(e) => {
+            let _ = conn.execute_batch("ROLLBACK");
+            Err(e)
+        }
+        r => r,
     }
 }
 
@@ -481,8 +486,11 @@ fn sqlite_call(
                         let _ = d.tx_stack.pop();
                         if let Some(top) = d.tx_stack.last_mut() {
                             *top &= ok;
-                        } else {
-                            commit_or_rollback(&mut d.conn, ok);
+                        } else if let Err(e) = commit_or_rollback(&mut d.conn, ok) {
+                            // A failed migration COMMIT must surface —
+                            // stamping user_version over a rolled-back
+                            // schema would skip the migration forever.
+                            return Err(sql_err(vm, e));
                         }
                     }
                     match res {
@@ -552,15 +560,8 @@ fn sqlite_call(
                 }
             } else {
                 let commit = ok && !d.tx_failed;
-                d.conn
-                    .execute_batch(if commit { "COMMIT" } else { "ROLLBACK" })
-                    .map_err(|e| {
-                        // A failed COMMIT (deferred FK violation, …)
-                        // leaves the SQLite transaction open — close it
-                        // or every later beginTransaction fails too.
-                        let _ = d.conn.execute_batch("ROLLBACK");
-                        sql_err(vm, e)
-                    })?;
+                commit_or_rollback(&mut d.conn, commit)
+                    .map_err(|e| sql_err(vm, e))?;
                 d.tx_failed = false;
             }
             Some(None)
