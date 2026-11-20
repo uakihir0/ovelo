@@ -1715,7 +1715,13 @@ fn fieldupdater_call(vm: &mut Vm, name: &str, args: &[V]) -> Rt<Option<Option<V>
                         }
                         _ => V::Ref(0),
                     };
-                    let ok = value_eq(vm, cur, args[2]);
+                    // Guest `null` arrives as `I32(0)` (const/4) while an
+                    // unset slot holds `Ref(0)` — both count as null, or
+                    // CAS on a null-expected slot spins forever (kotlinx
+                    // LockFreeTaskQueue.addLast relies on this).
+                    let nullish = |v: V| matches!(v, V::I32(0) | V::Ref(0));
+                    let ok = (nullish(cur) && nullish(args[2]))
+                        || value_eq(vm, cur, args[2]);
                     if ok {
                         if let Some(f) = fields_mut(vm, obj) {
                             f.insert(fid, args[3]);

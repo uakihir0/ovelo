@@ -948,6 +948,7 @@ impl Vm {
             return;
         }
         self.draining = true;
+        let dbg = std::env::var_os("OVELO_DRAINDBG").is_some();
         for _ in 0..max {
             let Some((r, on_main)) = self.pending_runnables.pop_front() else {
                 break;
@@ -957,6 +958,15 @@ impl Vm {
             } else {
                 jdk::run_on_worker(self, r)
             };
+            if dbg {
+                match &out {
+                    Ok(_) => eprintln!("[drain] ran h={r} main={on_main}"),
+                    Err(e) => eprintln!(
+                        "[drain] h={r} main={on_main} err={}",
+                        e.cause()
+                    ),
+                }
+            }
             if let Err(e) = out {
                 // A parked worker yields its slot and reschedules —
                 // the runnable re-enters `run()` on a later drain and
