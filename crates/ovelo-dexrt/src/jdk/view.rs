@@ -718,12 +718,40 @@ pub(crate) fn call(
         "addView" | "addViewInLayout" | "attachViewToParent" | "attachViewToParentInLayout"
         | "addFocusables" | "addChildrenForAccessibility" => {
             if let Some(&child @ V::Ref(_)) = args.get(1) {
-                // addView(v,i)/attachViewToParent(v,i,lp) carry an index —
-                // inserting at the end misorders children the container
-                // then indexes (getChildAt, indexOfChild).
-                let idx = match args.get(2) {
-                    Some(V::I32(i)) if *i >= 0 => Some(*i as usize),
-                    _ => None,
+                // Positional overloads (addView(v,i), attachViewToParent
+                // (v,i,lp), addViewInLayout(v,i,lp)) carry a child index;
+                // addView(v,w,h)'s ints are dimensions, not a position.
+                // Exactly one int param ⇒ positional.
+                let params = sig
+                    .split('(')
+                    .nth(1)
+                    .and_then(|p| p.split(')').next())
+                    .unwrap_or("");
+                let mut ints = 0usize;
+                let mut it = params.bytes().peekable();
+                while let Some(b) = it.next() {
+                    match b {
+                        b'L' | b'[' => {
+                            // Object/array types swallow their name.
+                            if b == b'L' {
+                                for c in it.by_ref() {
+                                    if c == b';' {
+                                        break;
+                                    }
+                                }
+                            }
+                        }
+                        b'I' => ints += 1,
+                        _ => {}
+                    }
+                }
+                let idx = if ints == 1 {
+                    match args.get(2) {
+                        Some(V::I32(i)) if *i >= 0 => Some(*i as usize),
+                        _ => None,
+                    }
+                } else {
+                    None
                 };
                 attach_at(vm, this, child, idx);
             }
