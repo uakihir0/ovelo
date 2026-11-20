@@ -31,6 +31,10 @@ pub(crate) struct Db {
     /// Per-level success flags — one bool per open `beginTransaction`,
     /// so a nested `endTransaction` can never commit the outer level.
     pub tx_stack: Vec<bool>,
+    /// A nested level ended without `setTransactionSuccessful` — the
+    /// whole transaction is doomed; the outermost end rolls back even
+    /// if the outer level is later marked successful.
+    pub tx_failed: bool,
 }
 
 fn db_dir(vm: &Vm) -> std::path::PathBuf {
@@ -84,6 +88,7 @@ fn conn_for(vm: &mut Vm, name: &str) -> Result<Rc<RefCell<Db>>, E> {
     let d = Rc::new(RefCell::new(Db {
         conn,
         tx_stack: Vec::new(),
+        tx_failed: false,
     }));
     vm.dbs.insert(name, d.clone());
     Ok(d)
@@ -435,12 +440,50 @@ fn sqlite_call(
                     } else {
                         ("onDowngrade", vec![out, V::I32(cur), V::I32(want)])
                     };
-                    vm.call_virtual(this, hook, &cb_args).map_err(E::Vm)?;
+                    // The whole migration runs in one transaction — a
+                    // failed callback rolls back its partial schema.
                     if let Ok(db) = conn_of(vm, this) {
-                        let _ = db
-                            .borrow()
-                            .conn
-                            .execute_batch(&format!("PRAGMA user_version={want}"));
+                        let mut d = db.borrow_mut();
+                        if d.tx_stack.is_empty() {
+                            let _ = d.conn.execute_batch("BEGIN");
+                        }
+                        d.tx_stack.push(true);
+                    }
+                    let res = vm.call_virtual_rt(this, hook, &cb_args);
+                    let ok = res.is_ok();
+                    if let Ok(db) = conn_of(vm, this) {
+                        let mut d = db.borrow_mut();
+                        let _ = d.tx_stack.pop();
+                        if let Some(top) = d.tx_stack.last_mut() {
+                            *top &= ok;
+                        } else {
+                            let _ = d.conn.execute_batch(if ok {
+                                "COMMIT"
+                            } else {
+                                "ROLLBACK"
+                            });
+                        }
+                    }
+                    match res {
+                        // A helper without the callback can't perform
+                        // the migration — fail like AOSP instead of
+                        // stamping a version the schema doesn't match.
+                        Ok(Some(_)) => {
+                            if let Ok(db) = conn_of(vm, this) {
+                                let _ = db.borrow().conn.execute_batch(
+                                    &format!("PRAGMA user_version={want}"),
+                                );
+                            }
+                        }
+                        Ok(None) => {
+                            return Err(sql_err(
+                                vm,
+                                format!(
+                                    "helper provides no {hook}; cannot migrate {n} {cur}->{want}"
+                                ),
+                            ));
+                        }
+                        Err(e) => return Err(e),
                     }
                 }
             }
@@ -480,12 +523,18 @@ fn sqlite_call(
             };
             if let Some(top) = d.tx_stack.last_mut() {
                 // Fold this level into the parent — an unmarked inner
-                // transaction poisons the outer one's outcome.
+                // transaction poisons the outer one's outcome, and a
+                // later setTransactionSuccessful can't undo that.
                 *top &= ok;
+                if !ok {
+                    d.tx_failed = true;
+                }
             } else {
+                let commit = ok && !d.tx_failed;
                 d.conn
-                    .execute_batch(if ok { "COMMIT" } else { "ROLLBACK" })
+                    .execute_batch(if commit { "COMMIT" } else { "ROLLBACK" })
                     .map_err(|e| sql_err(vm, e))?;
+                d.tx_failed = false;
             }
             Some(None)
         }
@@ -636,7 +685,7 @@ fn sqlite_call(
         "isOpen" => Some(Some(V::I32(1))),
         "close" => {
             if let Some(n) = db_name_of(vm, this) {
-                vm.dbs.remove(&n);
+                vm.dbs.remove(&safe_name(&n));
             }
             Some(None)
         }

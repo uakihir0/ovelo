@@ -939,6 +939,33 @@ impl Vm {
         out
     }
 
+    /// `call_virtual` for dispatch that happens INSIDE guest code
+    /// (builtin callbacks like `SQLiteOpenHelper.onCreate`): a guest
+    /// throw propagates as `E::Throw` so the app's own catch/finally
+    /// sees it, instead of becoming a fatal VM error.
+    pub(crate) fn call_virtual_rt(
+        &mut self,
+        this: u32,
+        name: &str,
+        args: &[V],
+    ) -> Rt<Option<V>> {
+        let ci = self
+            .heap
+            .class_of(this)
+            .ok_or_else(|| E::Vm(errd("dexrt.bad_this", name.to_string())))?;
+        let Some(midx) = self.find_method_on_chain(ci, name, args.len()).map_err(E::Vm)? else {
+            return Ok(None);
+        };
+        let mut a = Vec::with_capacity(args.len() + 1);
+        a.push(V::Ref(this));
+        a.extend_from_slice(args);
+        let out = self.invoke(midx, a, InvokeKind::Virtual);
+        if self.depth == 0 {
+            self.drain_runnables(500);
+        }
+        out
+    }
+
     /// Run enqueued async work FIFO — `Thread.start`/`Executor.execute`
     /// jobs on a worker thread, `Handler.post*` on the main one.
     /// Reentrant-safe; `max` bounds total runnables per drain so a
