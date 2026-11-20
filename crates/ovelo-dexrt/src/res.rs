@@ -159,15 +159,20 @@ impl ApkResources {
         self.entry_values.get(&res_id)
     }
 
-    /// res_id → its string value when the entry is `TYPE_STRING`.
+    /// res_id → its string value when the entry is `TYPE_STRING`,
+    /// chasing `TYPE_REFERENCE` aliases (a string may point at another
+    /// string entry — `Resources.getString` on the alias returns it).
     pub fn string_of(&self, res_id: u32) -> Option<&str> {
-        self.entry_value(res_id).and_then(|v| {
-            if v.data_type == 0x03 {
-                v.string.as_deref()
-            } else {
-                None
+        let mut cur = res_id;
+        for _ in 0..8 {
+            let v = self.entry_value(cur)?;
+            match v.data_type {
+                0x03 => return v.string.as_deref(),
+                0x01 => cur = v.data,
+                _ => return None,
             }
-        })
+        }
+        None
     }
 
     /// `attr_id` inside `style_id` or any style in its parent chain —

@@ -1446,6 +1446,9 @@ fn menu_sub_add(vm: &mut Vm, menu_h: u32, group: i32, id: i32) -> V {
     if let V::Ref(sh) = sub {
         pseudo_set(vm, sh, P_MENU, V::I32(1));
         pseudo_set(vm, sh, P_SUBMENU_ITEM, item);
+        // Mutators (`setIcon` etc.) chain — a SubMenu is item-like for
+        // `sub.setIcon(...).add(...)` to keep the same receiver.
+        pseudo_set(vm, sh, P_MENU_VIS, V::I32(1));
     }
     if let V::Ref(ih) = item {
         pseudo_set(vm, ih, P_ITEM_SUBMENU, sub);
