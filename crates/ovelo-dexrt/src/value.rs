@@ -65,6 +65,47 @@ pub enum Obj {
         /// Diagnostic detail (message).
         detail: String,
     },
+    /// Host-provided class (framework/JDK): the class isn't defined in
+    /// the DEX, so all behavior comes from builtins. `fields` keeps
+    /// guest-visible field values (e.g. `PackageInfo.versionCode` read
+    /// through iget); `state` is the builtin payload the class's methods
+    /// operate on (StringBuilder buffer, collection contents, …).
+    Host {
+        /// `type_idx` of the referenced class — `u32::MAX` when the
+        /// descriptor isn't in this DEX's type table (builtin-created
+        /// objects); `desc` always names the class.
+        class_idx: u32,
+        /// Class descriptor (e.g. `Ljava/util/ArrayList;`).
+        desc: String,
+        /// `field_idx` → value, same keying as `Instance`.
+        fields: HashMap<u32, V>,
+        /// Builtin state chosen by the class descriptor.
+        state: HostState,
+    },
+}
+
+/// Builtin payload of a [`Obj::Host`]. Objects whose class needs no
+/// internal state carry `Empty` — methods then key off the descriptor.
+#[derive(Debug)]
+pub enum HostState {
+    /// No payload (Intent, managers, stub services).
+    Empty,
+    /// `StringBuilder`/`StringBuffer` buffer.
+    StrBuf(String),
+    /// Ordered elements: `ArrayList`/`LinkedList`/`*Deque`/`*Set`.
+    List(Vec<V>),
+    /// Insertion-ordered entries: `HashMap`/`LinkedHashMap`/`Hashtable`.
+    Map(Vec<(V, V)>),
+    /// Iterator over a snapshot taken at `iterator()` time.
+    Iter(std::rc::Rc<Vec<V>>, usize),
+    /// Epoch milliseconds (`Date`/`Calendar`/`Instant`-like).
+    Millis(i64),
+    /// One mutable slot (`Atomic*` holders, boxed primitives).
+    Slot(V),
+    /// A filesystem path (`java.io.File`).
+    Path(String),
+    /// A regex pattern string (`java.util.regex.Pattern`).
+    Regex(String),
 }
 
 /// Object heap with string interning.
@@ -117,11 +158,11 @@ impl Heap {
         }
     }
 
-    /// Class type index of a handle (`Instance`/`Throwable` report their
-    /// class descriptor index where applicable).
+    /// Class type index of a handle (`Instance`/`Host`/`Throwable` report
+    /// their class descriptor index where applicable).
     pub fn class_of(&self, h: u32) -> Option<u32> {
         match self.get(h)? {
-            Obj::Instance { class_idx, .. } => Some(*class_idx),
+            Obj::Instance { class_idx, .. } | Obj::Host { class_idx, .. } => Some(*class_idx),
             _ => None,
         }
     }
