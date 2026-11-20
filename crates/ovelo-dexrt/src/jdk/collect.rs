@@ -334,6 +334,25 @@ fn list_call(vm: &mut Vm, name: &str, sig: &str, args: &[V]) -> Rt<Option<Option
         return Ok(None);
     };
     Ok(match name {
+        "<init>" => {
+            // List(Collection c): seed the new list with the source's
+            // elements — the ctor otherwise lands as a no-op stub and
+            // silently empties the copy.
+            if let Some(V::Ref(sh)) = args.get(1).copied() {
+                let src: Vec<V> = match vm.heap.get(sh) {
+                    Some(Obj::Host {
+                        state: HostState::List(l),
+                        ..
+                    }) => l.clone(),
+                    Some(Obj::Array { data, .. }) => data.clone(),
+                    _ => vec![],
+                };
+                if let Some(l) = list_mut(vm, h) {
+                    *l = src;
+                }
+            }
+            Some(None)
+        }
         "add" => {
             let l = match list_mut(vm, h) {
                 Some(l) => l,

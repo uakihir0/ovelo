@@ -340,9 +340,11 @@ impl GuestUi {
                 "(Landroid/view/View$OnClickListener;)V",
                 |ui, _vm, a| {
                     let this = ref_arg(a, 0)?;
-                    // A null listener clears the click handler.
+                    // A null listener clears the click handler; a
+                    // const/4'd null can arrive as I32(0).
                     let listener = match a.get(1) {
                         Some(V::Ref(h)) => *h,
+                        Some(V::I32(0)) => 0,
                         _ => return Err(crate::err("guest.arg.type")),
                     };
                     let q = ui.clicks.clone();
@@ -374,6 +376,7 @@ impl GuestUi {
                     let this = ref_arg(a, 0)?;
                     let text = match a.get(1) {
                         Some(V::Ref(h)) => vm.heap().str_val(*h).unwrap_or("").to_string(),
+                        Some(V::I32(0)) => String::new(),
                         _ => return Err(crate::err("guest.arg.type")),
                     };
                     let Some(rc) = ui.views.get(&this).cloned() else {

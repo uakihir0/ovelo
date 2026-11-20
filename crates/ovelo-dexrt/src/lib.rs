@@ -1640,63 +1640,7 @@ impl Vm {
                 // host no-ops — a value-returning stub (Math.abs) answering
                 // with a default would let the app compute on a lie.
                 if self.def_of(gx(gd(midx), mid.class_idx as u32)).is_none() {
-                    let ret = ret_desc.clone();
-                    let trace = self.describe_method(midx);
-                    if self.stub_trace.len() >= 32 {
-                        self.stub_trace.remove(0);
-                    }
-                    self.stub_trace.push(trace);
-                    // Throwable.<init>(message): keep the message on the
-                    // host object so describe_throw can report *why*.
-                    if name == "<init>"
-                        && (class.ends_with("Exception;")
-                            || class.ends_with("Error;")
-                            || class.ends_with("Throwable;"))
-                    {
-                        if let (V::Ref(this), Some(&msg)) =
-                            (args.first().copied().unwrap_or(V::Ref(0)), args.get(1))
-                        {
-                            jdk::pseudo_set(self, this, jdk::P_DATA, msg);
-                        }
-                    }
-                    match ret.as_str() {
-                        "V" => Ok(None),
-                        // Object/array returns get a typed placeholder so
-                        // chained framework calls cascade (`getLogger(x)
-                        // .info(y)`); methods on it hit this same stub
-                        // path. Strings come back empty — a placeholder
-                        // would break the String builtins.
-                        "Ljava/lang/String;" => {
-                            Ok(Some(V::Ref(self.heap.intern_str(""))))
-                        }
-                        r if r.starts_with('[') => {
-                            // Array return: must be a real Obj::Array or
-                            // array-length/a*get on the value type-checks.
-                            let h = self.heap.alloc(Obj::Array {
-                                elem: r[1..].to_string(),
-                                data: Vec::new(),
-                            });
-                            Ok(Some(V::Ref(h)))
-                        }
-                        r if r.starts_with('L') => {
-                            let desc = r.to_string();
-                            let ci = self.type_index_of(&desc).unwrap_or(GX_NONE);
-                            let h = self.heap.alloc(Obj::Host {
-                                class_idx: ci,
-                                desc,
-                                fields: HashMap::new(),
-                                state: HostState::Empty,
-                            });
-                            Ok(Some(V::Ref(h)))
-                        }
-                        // Primitive returns answer a typed zero — service
-                        // getters like `areNotificationsEnabled()` read as
-                        // "not enabled", which is honest here.
-                        "J" => Ok(Some(V::I64(0))),
-                        "F" => Ok(Some(V::F32(0.0))),
-                        "D" => Ok(Some(V::F64(0.0))),
-                        _ => Ok(Some(V::I32(0))),
-                    }
+                    self.stub_placeholder(midx, &ret_desc, &name, &class, args)
                 } else {
                     vm("dexrt.invoke.unresolved").map_err(|e| match e {
                         E::Vm(v) => E::Vm(v.with_detail(self.describe_method(midx))),
@@ -1704,6 +1648,75 @@ impl Vm {
                     })
                 }
             }
+        }
+    }
+
+    /// Placeholder return for a call that cannot produce a real result —
+    /// an unresolved non-dex method or a bodiless declaration (native /
+    /// external / abstract decl invoked statically). Same rules either
+    /// way: void → None, refs get a typed host/array placeholder,
+    /// primitives a typed zero.
+    fn stub_placeholder(
+        &mut self,
+        midx: GIdx,
+        ret: &str,
+        name: &str,
+        class: &str,
+        args: &[V],
+    ) -> Rt<Option<V>> {
+        let trace = self.describe_method(midx);
+        if self.stub_trace.len() >= 32 {
+            self.stub_trace.remove(0);
+        }
+        self.stub_trace.push(trace);
+        // Throwable.<init>(message): keep the message on the
+        // host object so describe_throw can report *why*.
+        if name == "<init>"
+            && (class.ends_with("Exception;")
+                || class.ends_with("Error;")
+                || class.ends_with("Throwable;"))
+        {
+            if let (V::Ref(this), Some(&msg)) =
+                (args.first().copied().unwrap_or(V::Ref(0)), args.get(1))
+            {
+                jdk::pseudo_set(self, this, jdk::P_DATA, msg);
+            }
+        }
+        match ret {
+            "V" => Ok(None),
+            // Object/array returns get a typed placeholder so
+            // chained framework calls cascade (`getLogger(x)
+            // .info(y)`); methods on it hit this same stub
+            // path. Strings come back empty — a placeholder
+            // would break the String builtins.
+            "Ljava/lang/String;" => Ok(Some(V::Ref(self.heap.intern_str("")))),
+            r if r.starts_with('[') => {
+                // Array return: must be a real Obj::Array or
+                // array-length/a*get on the value type-checks.
+                let h = self.heap.alloc(Obj::Array {
+                    elem: r[1..].to_string(),
+                    data: Vec::new(),
+                });
+                Ok(Some(V::Ref(h)))
+            }
+            r if r.starts_with('L') => {
+                let desc = r.to_string();
+                let ci = self.type_index_of(&desc).unwrap_or(GX_NONE);
+                let h = self.heap.alloc(Obj::Host {
+                    class_idx: ci,
+                    desc,
+                    fields: HashMap::new(),
+                    state: HostState::Empty,
+                });
+                Ok(Some(V::Ref(h)))
+            }
+            // Primitive returns answer a typed zero — service
+            // getters like `areNotificationsEnabled()` read as
+            // "not enabled", which is honest here.
+            "J" => Ok(Some(V::I64(0))),
+            "F" => Ok(Some(V::F32(0.0))),
+            "D" => Ok(Some(V::F64(0.0))),
+            _ => Ok(Some(V::I32(0))),
         }
     }
 
@@ -1763,7 +1776,30 @@ impl Vm {
             return g(self, &args).map_err(E::Vm);
         }
         if loc.em.code_off == 0 {
-            return vm("dexrt.method.no_code");
+            // Bodiless declaration (native / external / abstract decl):
+            // jdk shims may still answer it; otherwise a typed
+            // placeholder keeps a compat run moving — real JNI bridging
+            // arrives with the native stack.
+            let (class, name, sig, ret_desc) = {
+                let d = self
+                    .dex_of(loc.midx)
+                    .ok_or_else(|| E::Vm(err("dexrt.dex.idx")))?;
+                let mid = *d.method(gl(midx)).map_err(E::Vm)?;
+                (
+                    d.type_descriptor(mid.class_idx as u32).map_err(E::Vm)?,
+                    d.string(mid.name_idx).map_err(E::Vm)?,
+                    proto_sig(d, mid.proto_idx as u32).map_err(E::Vm)?,
+                    d.proto(mid.proto_idx as u32)
+                        .and_then(|p| d.type_descriptor(p.return_type_idx))
+                        .map_err(E::Vm)?,
+                )
+            };
+            let args =
+                self.compact_args(loc.midx, &args, !matches!(kind, InvokeKind::Static));
+            if let Some(r) = jdk::call(self, &class, &name, &sig, &args)? {
+                return Ok(r);
+            }
+            return self.stub_placeholder(loc.midx, &ret_desc, &name, &class, &args);
         }
         if matches!(kind, InvokeKind::Static) {
             self.ensure_init(loc.class_idx)?;

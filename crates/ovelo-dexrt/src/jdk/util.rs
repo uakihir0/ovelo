@@ -42,6 +42,31 @@ pub(crate) fn call(
             })),
             _ => None,
         }
+    } else if class == "Ljava/util/ResourceBundle;"
+        || class == "Ljava/util/PropertyResourceBundle;"
+        || class == "Ljava/util/ListResourceBundle;"
+    {
+        match name {
+            "getBundle" => Some(Some(host(vm, "Ljava/util/ResourceBundle;", HostState::Empty))),
+            // No .properties loading yet — answer the key itself so
+            // localized UI text degrades to identifiers instead of a
+            // MissingResourceException aborting the call path.
+            "getString" => {
+                let k = args
+                    .iter()
+                    .find_map(|a| sv(vm, *a))
+                    .unwrap_or_default();
+                Some(Some(jstr(vm, &k)))
+            }
+            "getStringArray" => Some(Some(arr(vm, "Ljava/lang/String;", vec![]))),
+            "getKeys" | "keySet" | "containsKey" => Some(match name {
+                "containsKey" => Some(V::I32(0)),
+                "keySet" => Some(host(vm, "Ljava/util/Set;", HostState::List(vec![]))),
+                _ => Some(host(vm, "Ljava/util/Enumeration;", HostState::Empty)),
+            }),
+            "getObject" => Some(Some(V::Ref(0))),
+            _ => None,
+        }
     } else if class == "Ljava/util/Currency;" {
         match name {
             "getInstance" => Some(Some(host(

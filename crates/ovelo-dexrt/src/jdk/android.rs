@@ -1653,11 +1653,24 @@ fn resources_call(vm: &mut Vm, name: &str, args: &[V]) -> Rt<Option<Option<V>>> 
                 .unwrap_or(0);
             Some(Some(V::I32(hit as i32)))
         }
-        "getDrawable" | "getDrawableForDensity" => Some(Some(host(
-            vm,
-            "Landroid/graphics/drawable/Drawable;",
-            HostState::Empty,
-        ))),
+        "getDrawable" | "getDrawableForDensity" => {
+            // AppCompat's ResourceManagerInternal rejects a framework-
+            // returned drawable that isn't the app's own
+            // VectorDrawableCompat ("configure your build for
+            // VectorDrawableCompat"). When the APK bundles androidx
+            // vectordrawable, hand back a guest instance so the
+            // instanceof check passes; otherwise a host drawable.
+            let d = [
+                "Landroidx/vectordrawable/graphics/drawable/VectorDrawableCompat;",
+                "Landroid/support/graphics/drawable/VectorDrawableCompat;",
+            ]
+            .iter()
+            .find_map(|c| vm.instantiate(c).ok().map(V::Ref))
+            .unwrap_or_else(|| {
+                host(vm, "Landroid/graphics/drawable/Drawable;", HostState::Empty)
+            });
+            Some(Some(d))
+        }
         "getColorStateList" => Some(Some(host(
             vm,
             "Landroid/content/res/ColorStateList;",

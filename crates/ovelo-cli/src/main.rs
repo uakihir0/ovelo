@@ -605,11 +605,14 @@ fn drain_pending_activity(
             break;
         };
         // Resolve the target's own theme before instantiation — theme-
-        // scoped obtainStyledAttributes reads vm.theme_id.
+        // scoped obtainStyledAttributes reads vm.theme_id. Restore it
+        // when the launch fails: the previous Activity keeps running
+        // under its own theme.
         let qualified = next
             .trim_start_matches('L')
             .trim_end_matches(';')
             .replace('/', ".");
+        let prev_theme = vm.theme_id;
         vm.theme_id = manifest
             .activity_themes
             .get(&qualified)
@@ -625,6 +628,7 @@ fn drain_pending_activity(
             }
             Err(e) => {
                 println!("activity {} not launched: {e}", disp(&next));
+                vm.theme_id = prev_theme;
                 break;
             }
         }
@@ -645,8 +649,11 @@ fn run_activity_cbs(
         }
         if cb == "onResume" {
             let menu = vm.menu_for(this);
-            let _ = vm.call_virtual(this, "onCreateOptionsMenu", &[menu]);
-            let _ = vm.call_virtual(this, "onPrepareOptionsMenu", &[menu]);
+            for menu_cb in ["onCreateOptionsMenu", "onPrepareOptionsMenu"] {
+                vm.call_virtual(this, menu_cb, &[menu])
+                    .inspect_err(|e| println!("callback {menu_cb} crashed: {e}"))
+                    .ok();
+            }
         }
         let r = vm
             .call_virtual(this, cb, &[])
@@ -976,9 +983,19 @@ fn run_app(store: &InstallStore, package: &str) -> Result<(), OveloError> {
                 }
             }
             // A click handler may call startActivity — launch the target
-            // the same way the initial-lifecycle drain does.
-            if !dead {
-                drain_pending_activity(vm, this, &callbacks, &info.manifest);
+            // the same way the initial-lifecycle drain does. The drain
+            // runs guest code (ctor + lifecycle), so it stays under
+            // supervision like every other guest dispatch.
+            if !dead && vm.pending_activity.is_some() {
+                match sup.supervise("activity-start", || {
+                    drain_pending_activity(vm, this, &callbacks, &info.manifest);
+                }) {
+                    worker::Outcome::Ok(_) => {}
+                    worker::Outcome::Crashed(p) => {
+                        println!("activity-start panic -> {}", p.display());
+                        dead = true;
+                    }
+                }
             }
         }
         // Panicked worker: drop its surface generation so no stale frame
