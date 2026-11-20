@@ -223,7 +223,7 @@ fn dex_len(l: i32) -> Length {
     }
 }
 
-fn make_dex_view(info: &ovelo_dexrt::DexViewInfo, fonts: &Rc<FontSet>) -> GuestView {
+fn make_dex_view(vm: &Vm, info: &ovelo_dexrt::DexViewInfo, fonts: &Rc<FontSet>) -> GuestView {
     let lp = (dex_len(info.lp_w), dex_len(info.lp_h));
     let dark = Color::srgb(0x20, 0x20, 0x20);
     if info.is_group {
@@ -231,7 +231,23 @@ fn make_dex_view(info: &ovelo_dexrt::DexViewInfo, fonts: &Rc<FontSet>) -> GuestV
         // DrawerLayout, ConstraintLayout, decor frames…) lay children
         // on top of each other — stacking them vertically pushes every
         // match_parent sibling offscreen and renders a blank window.
-        let g = if info.desc.contains("LinearLayout") || info.desc.contains("TabLayout") {
+        const STACK: &[&str] = &[
+            "LinearLayout",
+            "TabLayout",
+            "RecyclerView",
+            "ListView",
+            "GridView",
+            "AdapterView",
+            "ScrollView",
+            "MenuView",
+            "Toolbar",
+            "RadioGroup",
+            "TableLayout",
+        ];
+        // Ancestry, not name substring — a custom `MyLayout extends
+        // LinearLayout` stacks its children even when its own name
+        // doesn't say so.
+        let g = if STACK.iter().any(|s| vm.extends_named(&info.desc, s)) {
             ViewGroup::new(lp.0, lp.1)
         } else {
             ViewGroup::overlay(lp.0, lp.1)
@@ -595,7 +611,7 @@ impl GuestUi {
             None => self
                 .dex_views
                 .entry(h)
-                .or_insert_with(|| Rc::new(RefCell::new(make_dex_view(&info, &fonts))))
+                .or_insert_with(|| Rc::new(RefCell::new(make_dex_view(vm, &info, &fonts))))
                 .clone(),
         };
         let mut g = rc.borrow_mut();
@@ -721,16 +737,24 @@ pub fn drive_dex_layout_pass(vm: &mut Vm, activity: u32, frame: u32) {
         // Ancestry, not name substring: subclasses like `MainPager
         // extends ViewPager` need the inherited onMeasure/onLayout too.
         if ADAPTER.iter().any(|k| vm.extends_named(&info.desc, k)) {
-            let _ = vm.call_virtual(
+            if let Err(e) = vm.call_virtual(
                 h,
                 "onMeasure",
                 &[V::I32(MS_EXACTLY | 1080), V::I32(MS_EXACTLY | 1920)],
-            );
-            let _ = vm.call_virtual(
+            ) {
+                if std::env::var_os("OVELO_VIEWDBG").is_some() {
+                    eprintln!("[viewdbg] onMeasure {} err {e}", info.desc);
+                }
+            }
+            if let Err(e) = vm.call_virtual(
                 h,
                 "onLayout",
                 &[V::I32(0), V::I32(0), V::I32(0), V::I32(1080), V::I32(1920)],
-            );
+            ) {
+                if std::env::var_os("OVELO_VIEWDBG").is_some() {
+                    eprintln!("[viewdbg] onLayout {} err {e}", info.desc);
+                }
+            }
         }
         // Re-snapshot: the layout pass may have attached children.
         let kids = vm.dex_view(h).map(|i| i.children).unwrap_or_default();

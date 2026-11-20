@@ -460,15 +460,15 @@ pub(crate) fn list_snapshot(vm: &Vm, h: u32) -> Option<Vec<V>> {
     }
 }
 
-/// The `HostState::List` or `Obj::Array` a guest List implementation
-/// delegates to, or None. Verified `instanceof List` so arbitrary
-/// guest objects holding collection fields are not misread; direct
-/// backing fields are preferred over nested delegates, and the depth
-/// budget ends reference cycles. A `SubList` collapses to its
-/// parent — slightly wrong (offset/size lost) but strictly better
-/// than empty.
+/// The `HostState::List` or `Obj::Array` a guest Collection
+/// implementation delegates to, or None. Verified `instanceof
+/// Collection` so arbitrary guest objects holding collection fields
+/// are not misread; direct backing fields are preferred over nested
+/// delegates, and the depth budget ends reference cycles. A `SubList`
+/// collapses to its parent — slightly wrong (offset/size lost) but
+/// strictly better than empty.
 fn guest_list_backing(vm: &Vm, h: u32, depth: u8) -> Option<u32> {
-    if depth == 0 || !vm.is_guest_list(h) {
+    if depth == 0 || !vm.is_guest_collection(h) {
         return None;
     }
     let Some(Obj::Instance { fields, .. }) = vm.heap.get(h) else {

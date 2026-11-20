@@ -486,12 +486,14 @@ impl Vm {
         jdk::class_of(self, V::Ref(h))
     }
 
-    /// True when `h` is (a subclass of) a `java.util.List` guest object.
-    pub(crate) fn is_guest_list(&self, h: u32) -> bool {
+    /// True when `h` is (a subclass of) a `java.util.Collection` guest
+    /// object — wrappers around a host collection whose elements are
+    /// copied out by `list_snapshot`.
+    pub(crate) fn is_guest_collection(&self, h: u32) -> bool {
         let Some(Obj::Instance { class_idx, .. }) = self.heap.get(h) else {
             return false;
         };
-        self.type_index_of("Ljava/util/List;")
+        self.type_index_of("Ljava/util/Collection;")
             .map(|t| self.assignable(*class_idx, t))
             .unwrap_or(false)
     }
@@ -1416,7 +1418,8 @@ impl Vm {
                         break;
                     };
                     loop {
-                        if d == sup_desc {
+                        if d == sup_desc || jdk::host_supers(&d).iter().any(|s| *s == sup_desc)
+                        {
                             return true;
                         }
                         let Some(next) = Self::framework_super(&d) else {
