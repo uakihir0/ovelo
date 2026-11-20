@@ -94,6 +94,11 @@ pub struct Vm {
     depth: u32,
     /// Method refs of live frames, for recursion diagnosis.
     stack: Vec<u32>,
+    /// handle → guest method that `athrow`ed it (for uncaught reports).
+    throw_sites: HashMap<u32, String>,
+    /// Last framework stub calls (callee only), for uncaught reports —
+    /// a crash usually follows a stub that returned a placeholder.
+    stub_trace: Vec<String>,
 }
 
 impl Vm {
@@ -122,6 +127,8 @@ impl Vm {
             guest_root: std::env::temp_dir().join("ovelo-guest"),
             depth: 0,
             stack: Vec::new(),
+            throw_sites: HashMap::new(),
+            stub_trace: Vec::new(),
         })
     }
 
@@ -308,18 +315,33 @@ impl Vm {
     }
 
     fn describe_throw(&self, h: u32) -> String {
-        match self.heap.get(h) {
+        let site = self
+            .throw_sites
+            .get(&h)
+            .map(|s| format!(" thrown in {s}"))
+            .unwrap_or_default();
+        let mut base = match self.heap.get(h) {
             Some(Obj::Throwable { descriptor, detail }) => {
                 format!("{descriptor}: {detail}")
             }
-            Some(Obj::Instance { class_idx, .. }) => self
-                .dex
-                .type_descriptor(*class_idx)
-                .map(|d| format!("guest throwable {d} (#{h})"))
-                .unwrap_or_else(|_| format!("object #{h}")),
-            Some(Obj::Host { desc, .. }) => format!("host throwable {desc} (#{h})"),
+            Some(Obj::Instance { class_idx, .. }) => {
+                let base = self
+                    .dex
+                    .type_descriptor(*class_idx)
+                    .unwrap_or_else(|_| format!("object #{h}"));
+                format!("guest throwable {base}{site}")
+            }
+            Some(Obj::Host { desc, .. }) => format!("host throwable {desc}{site}"),
             _ => format!("object #{h}"),
+        };
+        // The stub tail explains most guest crashes: the app read a
+        // placeholder where the real framework hands back data.
+        if !self.stub_trace.is_empty() {
+            let n = self.stub_trace.len();
+            let tail = &self.stub_trace[n.saturating_sub(16)..];
+            base.push_str(&format!("; stubs: {}", tail.join(", ")));
         }
+        base
     }
 
     /// `Lcls;.name(params)ret` for error details — an unresolved call
@@ -953,6 +975,11 @@ impl Vm {
                 // with a default would let the app compute on a lie.
                 if self.def_of(mid.class_idx as u32).is_none() {
                     let ret = ret_desc.clone();
+                    let trace = self.describe_method(midx);
+                    if self.stub_trace.len() >= 32 {
+                        self.stub_trace.remove(0);
+                    }
+                    self.stub_trace.push(trace);
                     match ret.as_str() {
                         "V" => Ok(None),
                         // Object/array returns get a typed placeholder so
@@ -1464,6 +1491,8 @@ impl Vm {
                         "throw null",
                     ));
                 }
+                let site = self.describe_method(fr.loc.em.method_idx);
+                self.throw_sites.insert(h, site);
                 return Err(E::Throw(h));
             }
             // ---- branches ----
