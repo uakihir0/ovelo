@@ -204,8 +204,8 @@ impl GlyphSource for TtfFont {
         let fd = self.fd.as_ref()?;
         let upm = self.face().units_per_em() as f32;
         let scale = size_px / upm;
-        let rb_face =
-            rustybuzz::Face::from_slice(&self.bytes, 0).expect("font parsed at registration");
+        let rb_face = rustybuzz::Face::from_slice(&self.bytes, self.index)
+            .expect("font parsed at registration");
         let mut buf = rustybuzz::UnicodeBuffer::new();
         buf.push_str(text);
         buf.set_direction(if rtl {

@@ -275,6 +275,20 @@ fn verify_signature_bytes(
             key.verify(signed_data, &sig)
                 .map_err(|_| sig_err("sig.verify.failed"))
         }
+        SigAlg::EcdsaSha512 => {
+            use p384::ecdsa::{Signature, VerifyingKey};
+            let key = VerifyingKey::from_public_key_der(public_key_der)
+                .map_err(|_| sig_err("sig.key.ec"))?;
+            let sig = Signature::from_der(signature)
+                .map_err(|_| sig_err("sig.signature.malformed"))?;
+            // ECDSA-with-SHA-512: the verifier hashes with the key's
+            // paired digest (sha384 for p384), but the APK signature
+            // scheme signs a SHA-512 digest — verify the pre-hashed
+            // message via the PrehashVerifier.
+            use p384::ecdsa::signature::hazmat::PrehashVerifier;
+            key.verify_prehash(&sha512(signed_data), &sig)
+                .map_err(|_| sig_err("sig.verify.failed"))
+        }
         _ => Err(sig_err("sig.alg.unsupported")),
     }
 }
@@ -359,13 +373,17 @@ fn parse_signers(v2_value: &[u8]) -> Result<Vec<Signer>> {
             if dlen + 8 != rlen {
                 return Err(sig_err("sig.record.len"));
             }
-            let expected = match SigAlg::from_id(alg) {
-                Some(a) => match a.digest_alg() {
-                    1 => 32,
-                    2 => 64,
-                    _ => return Err(sig_err("sig.digest_alg.unsupported")),
-                },
-                None => return Err(sig_err("sig.alg.unsupported")),
+            // Digest records exist for every alg the signer used — AOSP
+            // ignores algs it doesn't support as long as the alg chosen
+            // for verification has one, so skip unknown ids.
+            let Some(a) = SigAlg::from_id(alg) else {
+                dp += 4 + rlen;
+                continue;
+            };
+            let expected = match a.digest_alg() {
+                1 => 32,
+                2 => 64,
+                _ => return Err(sig_err("sig.digest_alg.unsupported")),
             };
             if dlen != expected {
                 return Err(sig_err("sig.digest.len"));
