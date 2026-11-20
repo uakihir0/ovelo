@@ -44,6 +44,12 @@ const P_MENU_EN: u32 = 0xFFFD_FFF5;
 const P_MENU_CHK: u32 = 0xFFFD_FFF4;
 /// Pseudo key: a MenuItem's group id.
 const P_MENU_GROUP: u32 = 0xFFFD_FFF3;
+/// Pseudo key: a MenuItem's checkable flag (distinct from enabled).
+const P_MENU_CKABLE: u32 = 0xFFFD_FFF2;
+/// Pseudo key: on a SubMenu, the MenuItem representing it in the parent.
+const P_SUBMENU_ITEM: u32 = 0xFFFD_FFF1;
+/// Pseudo key: on a MenuItem, the SubMenu it opens.
+const P_ITEM_SUBMENU: u32 = 0xFFFD_FFF0;
 
 // TypedArray backing — below the `tag_key` band (which bottoms out at
 // ~u32::MAX - 0x10014).
@@ -156,33 +162,64 @@ pub(crate) fn call(
         }
         "findItem" => Some(Some(menu_find(vm, this, args.get(1).copied()))),
         "add" | "addSubMenu" if is_menuish(vm, this) => {
-            // add(groupId, itemId, order, title) — duplicate ids are
-            // legal in AOSP, so add always appends; findItem walks the
-            // list for the first match.
-            let group = i64v(args.get(1).copied().unwrap_or(V::I32(0))) as i32;
-            let id = i64v(args.get(2).copied().unwrap_or(V::I32(0))) as i32;
-            if name == "addSubMenu" {
-                Some(Some(menu_sub_add(vm, this, group, id)))
+            // Two arities: add(title|titleRes) and
+            // add(groupId, itemId, order, title|titleRes). Duplicate
+            // ids are legal in AOSP, so add always appends; findItem
+            // walks the list for the first match.
+            let (group, id, title) = if args.len() >= 5 {
+                (
+                    i64v(args[1]) as i32,
+                    i64v(args[2]) as i32,
+                    args.get(4).copied(),
+                )
             } else {
-                Some(Some(menu_item_add(vm, this, group, id)))
+                (0, 0, args.get(1).copied())
+            };
+            let it = if name == "addSubMenu" {
+                menu_sub_add(vm, this, group, id)
+            } else {
+                menu_item_add(vm, this, group, id)
+            };
+            if let (Some(t), V::Ref(ih)) = (title, it) {
+                let t = menu_title(vm, t);
+                // Title lives on the representing item (the SubMenu's
+                // header item for addSubMenu).
+                let ih = match pseudo_get(vm, ih, P_SUBMENU_ITEM) {
+                    Some(V::Ref(h)) => h,
+                    _ => ih,
+                };
+                pseudo_set(vm, ih, P_TEXT, t);
             }
+            Some(Some(it))
         }
         "size" if is_menuish(vm, this) => {
             Some(Some(V::I32(menu_items(vm, this).len() as i32)))
         }
         "getItem" if is_menuish(vm, this) => {
-            let i = i64v(args.get(1).copied().unwrap_or(V::I32(0))) as usize;
-            let items = menu_items(vm, this);
-            Some(Some(items.get(i).copied().unwrap_or(V::Ref(0))))
+            if args.len() > 1 {
+                let i = i64v(args[1]) as usize;
+                let items = menu_items(vm, this);
+                Some(Some(items.get(i).copied().unwrap_or(V::Ref(0))))
+            } else {
+                // SubMenu.getItem() — the item representing it in the
+                // parent menu.
+                Some(Some(
+                    pseudo_get(vm, this, P_SUBMENU_ITEM).unwrap_or(V::Ref(0)),
+                ))
+            }
         }
         "clear" | "removeGroup" | "removeItem" if is_menuish(vm, this) => {
             let keep: Vec<(V, V)> = match name {
                 "clear" => Vec::new(),
                 "removeItem" => {
+                    // AOSP removes only the first matching item.
                     let id = i64v(args.get(1).copied().unwrap_or(V::I32(0))) as i32;
-                    menu_items_paired(vm, this)
+                    let mut items = menu_items_paired(vm, this);
+                    if let Some(pos) = items.iter().position(|(k, _)| *k == id) {
+                        items.remove(pos);
+                    }
+                    items
                         .into_iter()
-                        .filter(|(k, _)| *k != id)
                         .map(|(k, v)| (V::I32(k), v))
                         .collect()
                 }
@@ -215,12 +252,15 @@ pub(crate) fn call(
         {
             let key = match name {
                 "setVisible" => P_MENU_VIS,
-                "setEnabled" | "setCheckable" => P_MENU_EN,
+                "setEnabled" => P_MENU_EN,
+                "setCheckable" => P_MENU_CKABLE,
                 "setChecked" => P_MENU_CHK,
                 "setTitle" | "setTitleCondensed" => P_TEXT,
                 _ => P_TAG,
             };
-            pseudo_set(vm, this, key, args.get(1).copied().unwrap_or(V::Ref(0)));
+            let v = args.get(1).copied().unwrap_or(V::Ref(0));
+            let v = if key == P_TEXT { menu_title(vm, v) } else { v };
+            pseudo_set(vm, this, key, v);
             // AOSP item mutators return the item for chaining.
             Some(Some(V::Ref(this)))
         }
@@ -239,19 +279,39 @@ pub(crate) fn call(
         "isVisible" | "isEnabled" | "isChecked" | "isCheckable"
             if is_menuitem(vm, this) =>
         {
-            let key = match name {
-                "isEnabled" | "isCheckable" => P_MENU_EN,
-                "isChecked" => P_MENU_CHK,
-                _ => P_MENU_VIS,
+            let (key, default) = match name {
+                "isEnabled" => (P_MENU_EN, 1),
+                "isCheckable" => (P_MENU_CKABLE, 1),
+                "isChecked" => (P_MENU_CHK, 0),
+                _ => (P_MENU_VIS, 1),
             };
-            let v = pseudo_get(vm, this, key).unwrap_or(V::I32(1));
+            let v = pseudo_get(vm, this, key).unwrap_or(V::I32(default));
             Some(Some(V::I32(i64v(v) as i32)))
         }
         "getTitle" | "getTitleCondensed" if is_menuitem(vm, this) => {
-            Some(Some(pseudo_get(vm, this, P_TEXT).unwrap_or_else(|| jstr(vm, ""))))
+            let v = pseudo_get(vm, this, P_TEXT).unwrap_or(V::Ref(0));
+            let v = if matches!(v, V::I32(_)) {
+                menu_title(vm, v)
+            } else {
+                v
+            };
+            Some(Some(if matches!(v, V::Ref(0)) {
+                jstr(vm, "")
+            } else {
+                v
+            }))
         }
-        "hasSubMenu" | "isActionViewExpanded" | "expandActionView"
-        | "collapseActionView"
+        "hasSubMenu" if is_menuitem(vm, this) => Some(Some(V::I32(
+            if pseudo_get(vm, this, P_ITEM_SUBMENU).is_some() {
+                1
+            } else {
+                0
+            },
+        ))),
+        "getSubMenu" if is_menuitem(vm, this) => Some(Some(
+            pseudo_get(vm, this, P_ITEM_SUBMENU).unwrap_or(V::Ref(0)),
+        )),
+        "isActionViewExpanded" | "expandActionView" | "collapseActionView"
             if is_menuitem(vm, this) =>
         {
             Some(Some(V::I32(0)))
@@ -1377,19 +1437,20 @@ fn menu_item_add(vm: &mut Vm, menu_h: u32, group: i32, id: i32) -> V {
 }
 
 /// `addSubMenu` returns a SubMenu — itself a menu container, so nested
-/// `add` calls register on it.
+/// `add` calls register on it. The parent list holds the MenuItem that
+/// opens it; the two are cross-linked so `SubMenu.getItem()` and
+/// `MenuItem.getSubMenu()` resolve each other.
 fn menu_sub_add(vm: &mut Vm, menu_h: u32, group: i32, id: i32) -> V {
-    let sub = menu_item_new(
-        vm,
-        "Landroid/view/SubMenu;",
-        HostState::Map(vec![]),
-        group,
-        id,
-    );
+    let item = menu_item_new(vm, "Landroid/view/MenuItem;", HostState::Empty, group, id);
+    let sub = host(vm, "Landroid/view/SubMenu;", HostState::Map(vec![]));
     if let V::Ref(sh) = sub {
         pseudo_set(vm, sh, P_MENU, V::I32(1));
+        pseudo_set(vm, sh, P_SUBMENU_ITEM, item);
     }
-    menu_push(vm, menu_h, id, sub);
+    if let V::Ref(ih) = item {
+        pseudo_set(vm, ih, P_ITEM_SUBMENU, sub);
+    }
+    menu_push(vm, menu_h, id, item);
     sub
 }
 
@@ -1413,13 +1474,36 @@ fn menu_items(vm: &Vm, menu_h: u32) -> Vec<V> {
         .collect()
 }
 
+/// Depth-first search: `findItem` reaches into submenus too (items
+/// carry `P_ITEM_SUBMENU`; a submenu may also sit in the list itself).
+fn menu_search(vm: &Vm, menu_h: u32, id: i32, depth: u8) -> Option<V> {
+    if depth > 8 {
+        return None;
+    }
+    for (k, v) in menu_items_paired(vm, menu_h) {
+        if k == id {
+            return Some(v);
+        }
+        if let V::Ref(ih) = v {
+            let sub = match pseudo_get(vm, ih, P_ITEM_SUBMENU) {
+                Some(V::Ref(sh)) => Some(sh),
+                _ if is_menuish(vm, ih) => Some(ih),
+                _ => None,
+            };
+            if let Some(sh) = sub {
+                if let hit @ Some(_) = menu_search(vm, sh, id, depth + 1) {
+                    return hit;
+                }
+            }
+        }
+    }
+    None
+}
+
 /// Find-or-create: `findItem` for a missing id mints a stub (AOSP's
 /// null would NPE most guests on the next chained call).
 fn menu_item(vm: &mut Vm, menu_h: u32, id: i32) -> V {
-    if let Some((_, v)) = menu_items_paired(vm, menu_h)
-        .into_iter()
-        .find(|(k, _)| *k == id)
-    {
+    if let Some(v) = menu_search(vm, menu_h, id, 0) {
         return v;
     }
     menu_item_add(vm, menu_h, 0, id)
@@ -1427,6 +1511,22 @@ fn menu_item(vm: &mut Vm, menu_h: u32, id: i32) -> V {
 
 fn menu_find(vm: &mut Vm, menu_h: u32, id_v: Option<V>) -> V {
     menu_item(vm, menu_h, i64v(id_v.unwrap_or(V::I32(0))) as i32)
+}
+
+/// `setTitle(int resId)` stores a resource id; resolve it to the real
+/// string so `getTitle()` hands the guest a CharSequence.
+fn menu_title(vm: &mut Vm, v: V) -> V {
+    if let V::I32(id) = v {
+        if let Some(s) = vm
+            .apk_res
+            .as_ref()
+            .and_then(|r| r.string_of(id as u32))
+        {
+            let s = s.to_string();
+            return jstr(vm, &s);
+        }
+    }
+    v
 }
 
 /// `MenuInflater.inflate(menuRes, Menu)` — parse the res/menu xml and
