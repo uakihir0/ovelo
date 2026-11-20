@@ -14,6 +14,7 @@ mod res_attrs;
 mod value;
 
 pub use aot::Aot;
+pub use jdk::view::DexViewInfo;
 pub use value::{Heap, HostState, Obj, V};
 
 use aot::{AotFn, TRAP_DIV_ZERO, TRAP_REM_ZERO};
@@ -817,6 +818,17 @@ impl Vm {
     /// model (fallback for content the guest bridge doesn't map).
     pub fn view_set_content(&mut self, activity: u32, content: u32) {
         jdk::view::set_content_view(self, activity, V::Ref(content));
+    }
+
+    /// The handle `activity` last set as its content view, if any.
+    pub fn activity_content(&self, activity: u32) -> Option<u32> {
+        jdk::view::activity_content(self, activity)
+    }
+
+    /// Snapshot one node of the dex view tree for host rendering —
+    /// text, colors, layout params, visibility, listener, children.
+    pub fn dex_view(&self, h: u32) -> Option<jdk::view::DexViewInfo> {
+        jdk::view::dex_view_info(self, h)
     }
 
     /// The options `Menu` attached to an Activity — the runner hands it

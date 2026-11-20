@@ -90,6 +90,166 @@ pub(crate) fn content_root(vm: &mut Vm, h: u32) -> Option<u32> {
     }
 }
 
+/// What a host renderer needs from one node of the dex view tree —
+/// a snapshot so the framework crate can materialize real `Drawable`s
+/// without touching pseudo-field internals.
+#[derive(Debug, Clone)]
+pub struct DexViewInfo {
+    /// Class descriptor of the view object (`Landroid/widget/TextView;`,
+    /// a dex subclass like `Landroidx/appcompat/widget/AppCompatTextView;`,
+    /// or a host stub class).
+    pub desc: String,
+    /// The node accepts children (`P_IS_GROUP` or children present).
+    pub is_group: bool,
+    /// Text (`setText`/`android:text`/`hint`), resolved to a string.
+    pub text: Option<String>,
+    /// `android:textSize` in px, when set.
+    pub text_size: Option<f32>,
+    /// `android:textColor` / `setTextColor` as ARGB, when set.
+    pub text_color: Option<i32>,
+    /// `android:background` / `setBackgroundColor` as ARGB when it is a
+    /// plain color (references resolve through the arsc table).
+    pub bg_color: Option<i32>,
+    /// Requested width: -1 match_parent, -2 wrap_content, else px.
+    pub lp_w: i32,
+    /// Requested height.
+    pub lp_h: i32,
+    /// `View.VISIBLE` (invisible/gone nodes are skipped by the caller).
+    pub visible: bool,
+    /// OnClick listener handle (0 = none).
+    pub listener: u32,
+    /// Child view handles, in z-order.
+    pub children: Vec<u32>,
+}
+
+/// The activity's content view handle (what `setContentView` attached).
+pub(crate) fn activity_content(vm: &Vm, activity: u32) -> Option<u32> {
+    match pseudo_get(vm, activity, P_CONTENT) {
+        Some(V::Ref(h)) if h != 0 => Some(h),
+        _ => None,
+    }
+}
+
+fn attr_map(vm: &Vm, h: u32) -> Option<&Vec<(V, V)>> {
+    match pseudo_get(vm, h, P_ATTRS) {
+        Some(V::Ref(a)) => match vm.heap.get(a) {
+            Some(Obj::Host {
+                state: HostState::Map(m),
+                ..
+            }) => Some(m),
+            _ => None,
+        },
+        _ => None,
+    }
+}
+
+fn attr_find(vm: &Vm, h: u32, name: &str) -> Option<V> {
+    for (k, v) in attr_map(vm, h)? {
+        if let V::Ref(kh) = k {
+            if vm.heap.str_val(*kh) == Some(name) {
+                return Some(*v);
+            }
+        }
+    }
+    None
+}
+
+/// Resolve an ARGB color from an int literal or a color resource ref.
+fn color_v(vm: &Vm, v: V) -> Option<i32> {
+    match v {
+        V::I32(c) if c < 0 => Some(c),
+        V::I32(id) if id > 0 => vm
+            .apk_res
+            .as_ref()
+            .and_then(|r| r.entry_value(id as u32))
+            .map(|e| e.data as i32),
+        _ => None,
+    }
+}
+
+/// A layout length: `-1`/`MATCH_PARENT`, `-2`/`WRAP_CONTENT`, px otherwise.
+fn len_v(vm: &Vm, v: V) -> i32 {
+    match v {
+        V::I32(i) if i <= 0 => i.max(-2),
+        V::I32(id) => vm
+            .apk_res
+            .as_ref()
+            .and_then(|r| r.dimen(id as u32))
+            .map(|d| d as i32)
+            .unwrap_or(-2),
+        V::F32(f) => f as i32,
+        _ => -2,
+    }
+}
+
+/// Snapshot a dex view-tree node for host-side rendering.
+pub(crate) fn dex_view_info(vm: &Vm, h: u32) -> Option<DexViewInfo> {
+    if h == 0 || pseudo_get(vm, h, P_IS_VIEW).is_none() {
+        return None;
+    }
+    let desc = class_of(vm, V::Ref(h));
+    // Text: a setText'd jstr first (a live value wins over the xml attr),
+    // then the inflated `text`/`hint` attributes. A Reference resolves
+    // through the arsc string table.
+    let text = match pseudo_get(vm, h, P_TEXT) {
+        Some(V::Ref(th)) if th != 0 => vm.heap.str_val(th).map(|s| s.to_string()),
+        Some(V::I32(id)) if id > 0 => vm
+            .apk_res
+            .as_ref()
+            .and_then(|r| r.string_of(id as u32))
+            .map(|s| s.to_string()),
+        _ => None,
+    }
+    .or_else(|| {
+        attr_find(vm, h, "text")
+            .or_else(|| attr_find(vm, h, "hint"))
+            .and_then(|v| match v {
+                V::Ref(th) => vm.heap.str_val(th).map(|s| s.to_string()),
+                V::I32(id) if id > 0 => vm
+                    .apk_res
+                    .as_ref()
+                    .and_then(|r| r.string_of(id as u32))
+                    .map(|s| s.to_string()),
+                _ => None,
+            })
+    });
+    let text_size = attr_find(vm, h, "textSize").and_then(|v| match v {
+        V::F32(f) => Some(f),
+        V::I32(id) if id > 0 => vm.apk_res.as_ref().and_then(|r| r.dimen(id as u32)),
+        _ => None,
+    });
+    let text_color = attr_find(vm, h, "textColor").and_then(|v| color_v(vm, v));
+    let bg_color = attr_find(vm, h, "background").and_then(|v| color_v(vm, v));
+    let lp_w = attr_find(vm, h, "layout_width").map(|v| len_v(vm, v)).unwrap_or(-1);
+    let lp_h = attr_find(vm, h, "layout_height").map(|v| len_v(vm, v)).unwrap_or(-2);
+    let visible = !matches!(pseudo_get(vm, h, P_VIS), Some(V::I32(4) | V::I32(8)));
+    let listener = match pseudo_get(vm, h, P_LISTENER) {
+        Some(V::Ref(l)) => l,
+        _ => 0,
+    };
+    let kids: Vec<u32> = children(vm, h)
+        .iter()
+        .filter_map(|c| match c {
+            V::Ref(ch) if *ch != 0 => Some(*ch),
+            _ => None,
+        })
+        .collect();
+    let is_group = pseudo_get(vm, h, P_IS_GROUP).is_some() || !kids.is_empty();
+    Some(DexViewInfo {
+        desc,
+        is_group,
+        text,
+        text_size,
+        text_color,
+        bg_color,
+        lp_w,
+        lp_h,
+        visible,
+        listener,
+        children: kids,
+    })
+}
+
 /// Whether `class`'s methods route here. Any class may produce a view
 /// receiver (dex views resolve inherited methods to `Landroid/view/View;`),
 /// so the receiver's pseudo markers decide for unknown classes.

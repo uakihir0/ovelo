@@ -910,6 +910,7 @@ fn run_app(store: &InstallStore, package: &str) -> Result<(), OveloError> {
             }
         }
     };
+    println!("dispatch done — opening window");
     let mut presenter = ovelo_host::Presenter::new();
     let sid = presenter.attach(3, 720, 1280)?;
     let win = ovelo_host::HostWindow::new(&disp(&rec.app.package), sid, presenter);
@@ -1007,6 +1008,11 @@ fn run_app(store: &InstallStore, package: &str) -> Result<(), OveloError> {
         if dead {
             w.presenter().stop_worker(sid);
             guest = None;
+        }
+        // Apps that inflate layout xml (setContentView(res)) live in the
+        // VM's dex view tree — materialize it into drawable host views.
+        if let Some((vm, this)) = &mut guest {
+            ui2.borrow_mut().refresh_dex_tree(vm, *this);
         }
         let mut u = ui2.borrow_mut();
         if let Ok(prod) = w.presenter().producer(sid) {

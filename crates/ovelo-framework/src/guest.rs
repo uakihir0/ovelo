@@ -179,6 +179,14 @@ pub struct GuestUi {
     pub fonts: Rc<FontSet>,
     /// Deferred onClick dispatches.
     clicks: ClickQueue,
+    /// Dex-view-tree handles → materialized host view. Persistent so
+    /// per-view state (pressed, listeners) survives frame rebuilds.
+    dex_views: HashMap<u32, Rc<RefCell<GuestView>>>,
+    /// The dex view-tree content root last materialized.
+    dex_root: u32,
+    /// True once the guest set a real `GuestView` content view — the
+    /// dex-tree renderer must not clobber it.
+    guest_content_set: bool,
 }
 
 fn argb(c: i32) -> Color {
@@ -197,6 +205,54 @@ fn ref_arg(args: &[V], i: usize) -> Result<u32> {
     }
 }
 
+// ---------------------------------------------------------------------
+// Dex view-tree materialization — real apps inflate layout xml into the
+// VM's view-tree model; these turn each node into a drawable host view.
+
+fn dex_len(l: i32) -> Length {
+    match l {
+        -1 => Length::MatchParent,
+        -2 => Length::WrapContent,
+        px => Length::Exact(px),
+    }
+}
+
+fn make_dex_view(info: &ovelo_dexrt::DexViewInfo, fonts: &Rc<FontSet>) -> GuestView {
+    let lp = (dex_len(info.lp_w), dex_len(info.lp_h));
+    let dark = Color::srgb(0x20, 0x20, 0x20);
+    if info.is_group {
+        GuestView::Group(ViewGroup::new(lp.0, lp.1))
+    } else if info.desc.contains("Button") {
+        GuestView::Btn(Button::new("", 16.0, dark, fonts.clone()))
+    } else if info.desc.contains("TextView")
+        || info.desc.contains("EditText")
+        || info.text.is_some()
+    {
+        GuestView::Text(TextView::new("", 16.0, dark, fonts.clone()))
+    } else {
+        GuestView::Plain(View::new(lp.0, lp.1, Size::default()))
+    }
+}
+
+fn update_dex_view(g: &mut GuestView, info: &ovelo_dexrt::DexViewInfo) {
+    let v = g.view_mut();
+    let (w, h) = (dex_len(info.lp_w), dex_len(info.lp_h));
+    v.lp_w = w;
+    v.lp_h = h;
+    v.background = info.bg_color.map(argb);
+    if let Some(tv) = g.text_mut() {
+        if let Some(t) = &info.text {
+            tv.set_text(t.clone());
+        }
+        if let Some(s) = info.text_size {
+            tv.text_size = s;
+        }
+        if let Some(c) = info.text_color {
+            tv.color = argb(c);
+        }
+    }
+}
+
 impl GuestUi {
     /// New bridge: empty view map, root at `(w, h)` sharing `fonts`.
     pub fn new(w: i32, h: i32, fonts: Rc<FontSet>) -> Rc<RefCell<Self>> {
@@ -205,6 +261,9 @@ impl GuestUi {
             views: HashMap::new(),
             fonts,
             clicks: Rc::new(RefCell::new(VecDeque::new())),
+            dex_views: HashMap::new(),
+            dex_root: 0,
+            guest_content_set: false,
         }))
     }
 
@@ -300,6 +359,7 @@ impl GuestUi {
                 let v = ref_arg(a, 1)?;
                 match ui.views.get(&v).cloned() {
                     Some(cv) => {
+                        ui.guest_content_set = true;
                         ui.root.set_content_view(Box::new(SharedView(cv)));
                     }
                     None => {
@@ -431,6 +491,64 @@ impl GuestUi {
                 Ok(None)
             });
         }
+    }
+
+    /// Materialize the Activity's dex view tree (from `setContentView(res)`
+    /// inflation) into real host views and hang it under the root — the
+    /// renderer for apps that build UI from layout xml rather than
+    /// bridged `new` calls. Per-view objects persist across calls so
+    /// pressed state and listener closures survive rebuilds. Skipped
+    /// once the guest bound a real `GuestView` as its content view.
+    pub fn refresh_dex_tree(&mut self, vm: &Vm, activity: u32) -> bool {
+        if self.guest_content_set {
+            return false;
+        }
+        let Some(root) = vm.activity_content(activity) else {
+            return false;
+        };
+        let Some(rc) = self.materialize_dex(vm, root) else {
+            return false;
+        };
+        if root != self.dex_root {
+            self.dex_root = root;
+        }
+        self.root.set_content_view(Box::new(SharedView(rc)));
+        true
+    }
+
+    fn materialize_dex(&mut self, vm: &Vm, h: u32) -> Option<Rc<RefCell<GuestView>>> {
+        let info = vm.dex_view(h)?;
+        if !info.visible {
+            return None;
+        }
+        let fonts = self.fonts.clone();
+        let rc = self
+            .dex_views
+            .entry(h)
+            .or_insert_with(|| Rc::new(RefCell::new(make_dex_view(&info, &fonts))))
+            .clone();
+        let mut g = rc.borrow_mut();
+        // `g` borrows the view object while `self.materialize_dex`
+        // recurses into children — different cells, no aliasing.
+        update_dex_view(&mut g, &info);
+        if let GuestView::Group(gr) = &mut *g {
+            let mut kids: Vec<Box<dyn Drawable>> = Vec::new();
+            for ch in &info.children {
+                if let Some(crc) = self.materialize_dex(vm, *ch) {
+                    kids.push(Box::new(SharedView(crc)));
+                }
+            }
+            gr.children = kids;
+        }
+        if info.listener != 0 {
+            let listener = info.listener;
+            let q = self.clicks.clone();
+            g.view_mut().on_click = Some(Box::new(move || {
+                q.borrow_mut().push_back((listener, h));
+            }));
+        }
+        drop(g);
+        Some(rc)
     }
 
     /// `<init>` host stub: bind the receiver handle to a fresh view of
