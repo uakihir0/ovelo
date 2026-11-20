@@ -1111,8 +1111,22 @@ fn context_call(
         }
         "getText" => Some(Some(jstr(vm, ""))),
         "getColor" => Some(Some(V::I32(0xFF000000u32 as i32))),
-        "getDrawable" => Some(Some(V::Ref(0))),
-        "getColorStateList" => Some(Some(V::Ref(0))),
+        "getDrawable" => Some(Some(
+            [
+                "Landroidx/vectordrawable/graphics/drawable/VectorDrawableCompat;",
+                "Landroid/support/graphics/drawable/VectorDrawableCompat;",
+            ]
+            .iter()
+            .find_map(|c| vm.instantiate(c).ok().map(V::Ref))
+            .unwrap_or_else(|| {
+                host(vm, "Landroid/graphics/drawable/Drawable;", HostState::Empty)
+            }),
+        )),
+        "getColorStateList" => Some(Some(host(
+            vm,
+            "Landroid/content/res/ColorStateList;",
+            HostState::Empty,
+        ))),
         "getSystemService" => {
             // Hand out a typed placeholder per service name so calls on
             // it resolve (void stubs) and instanceof/cast work; real

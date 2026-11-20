@@ -789,6 +789,15 @@ impl Vm {
         jdk::view::menu_of(self, activity)
     }
 
+    /// Route the androidx `MenuBuilder`/`SubMenuBuilder` and
+    /// `MenuInflater.inflate` surface through the host menu model —
+    /// they ship in the APK as dex classes, so without overrides their
+    /// methods run guest code against fields the host never populated
+    /// (`findItem` returning null, `size` 0).
+    pub fn register_menu_overrides(&mut self) {
+        jdk::view::register_menu_overrides(self);
+    }
+
     /// Whether the guest called `finish()` on this Activity — remaining
     /// lifecycle callbacks (onStart/onResume/…) should be skipped.
     pub fn is_finishing(&self, activity: u32) -> bool {

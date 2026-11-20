@@ -7,6 +7,7 @@
 //! `findChildViewById` walk real structure instead of nulls.
 
 use super::*;
+use crate::HostCall;
 use ovelo_apk::manifest::{Attribute, Element, Value};
 
 const VIEW: &str = "Landroid/view/View;";
@@ -46,6 +47,11 @@ const P_MENU_CHK: u32 = 0xFFFD_FFF4;
 const P_MENU_GROUP: u32 = 0xFFFD_FFF3;
 /// Pseudo key: a MenuItem's checkable flag (distinct from enabled).
 const P_MENU_CKABLE: u32 = 0xFFFD_FFF2;
+
+/// Backing store key on a dex menu object (`Obj::Instance` — e.g.
+/// androidx `MenuBuilder`): the item list lives on a lazily-minted host
+/// `HostState::Map`, referenced here, so every menu op shares it.
+const P_MENU_STORE: u32 = 0xFFFD_FFED;
 /// Pseudo key: on a SubMenu, the MenuItem representing it in the parent.
 const P_SUBMENU_ITEM: u32 = 0xFFFD_FFF1;
 /// Pseudo key: on a MenuItem, the SubMenu it opens.
@@ -1438,10 +1444,13 @@ fn menu_item_new(vm: &mut Vm, desc: &str, state: HostState, group: i32, id: i32)
 }
 
 fn menu_push(vm: &mut Vm, menu_h: u32, id: i32, it: V) {
+    let Some(h) = menu_store(vm, menu_h) else {
+        return;
+    };
     if let Some(Obj::Host {
         state: HostState::Map(items),
         ..
-    }) = vm.heap.get_mut(menu_h)
+    }) = vm.heap.get_mut(h)
     {
         items.push((V::I32(id), it));
     }
@@ -1475,8 +1484,48 @@ fn menu_sub_add(vm: &mut Vm, menu_h: u32, group: i32, id: i32) -> V {
     sub
 }
 
+/// The object holding a menu's item list: a host `Menu` is its own
+/// store; a dex `MenuBuilder`/`SubMenuBuilder` gets a backing
+/// `HostState::Map` remembered under `P_MENU_STORE`.
+fn menu_store_of(vm: &Vm, h: u32) -> Option<u32> {
+    match vm.heap.get(h) {
+        Some(Obj::Host {
+            state: HostState::Map(_),
+            ..
+        }) => Some(h),
+        Some(Obj::Instance { .. }) => match pseudo_get(vm, h, P_MENU_STORE) {
+            Some(V::Ref(s)) if s != 0 => Some(s),
+            _ => None,
+        },
+        _ => None,
+    }
+}
+
+/// `menu_store_of`, minting the backing store for a dex menu on first
+/// use and marking the instance menu-ish.
+fn menu_store(vm: &mut Vm, h: u32) -> Option<u32> {
+    if let s @ Some(_) = menu_store_of(vm, h) {
+        return s;
+    }
+    if !matches!(vm.heap.get(h), Some(Obj::Instance { .. })) {
+        return None;
+    }
+    let m = host(vm, "Landroid/view/Menu;", HostState::Map(vec![]));
+    if let V::Ref(mh) = m {
+        pseudo_set(vm, mh, P_MENU, V::I32(1));
+        pseudo_set(vm, h, P_MENU, V::I32(1));
+        pseudo_set(vm, h, P_MENU_STORE, V::Ref(mh));
+        Some(mh)
+    } else {
+        None
+    }
+}
+
 fn menu_items_paired(vm: &Vm, menu_h: u32) -> Vec<(i32, V)> {
-    match vm.heap.get(menu_h) {
+    let Some(h) = menu_store_of(vm, menu_h) else {
+        return vec![];
+    };
+    match vm.heap.get(h) {
         Some(Obj::Host {
             state: HostState::Map(items),
             ..
@@ -1530,7 +1579,10 @@ fn menu_item(vm: &mut Vm, menu_h: u32, id: i32) -> V {
     menu_item_add(vm, menu_h, 0, id)
 }
 
-fn menu_find(vm: &mut Vm, menu_h: u32, id_v: Option<V>) -> V {
+pub(crate) fn menu_find(vm: &mut Vm, menu_h: u32, id_v: Option<V>) -> V {
+    if menu_store(vm, menu_h).is_none() {
+        return V::Ref(0);
+    }
     menu_item(vm, menu_h, i64v(id_v.unwrap_or(V::I32(0))) as i32)
 }
 
@@ -1552,11 +1604,14 @@ fn menu_title(vm: &mut Vm, v: V) -> V {
 
 /// `MenuInflater.inflate(menuRes, Menu)` — parse the res/menu xml and
 /// register each `<item android:id>` on the menu.
-fn menu_inflate(vm: &mut Vm, res_v: Option<V>, menu_h: u32) {
+pub(crate) fn menu_inflate(vm: &mut Vm, res_v: Option<V>, menu_h: u32) {
     let Some(V::I32(id)) = res_v else { return };
     let Some(doc) = vm.apk_res.as_ref().and_then(|r| r.document(id as u32)) else {
         return;
     };
+    if menu_store(vm, menu_h).is_none() {
+        return;
+    }
     for el in &doc {
         if el.name != "item" {
             continue;
@@ -1583,5 +1638,200 @@ pub(crate) fn set_content_view(vm: &mut Vm, activity: u32, content: V) {
         if let Some(cf) = content_frame_of(vm, w) {
             attach(vm, cf, cv);
         }
+    }
+}
+
+// ---------------------------------------------------------------------
+// androidx menu overrides — `MenuBuilder`/`SubMenuBuilder` ship in the
+// APK as dex classes, so their Menu surface runs guest code unless
+// overridden. Routing it through the host menu model keeps
+// NavigationView/Toolbar menus populated and `findItem` non-null.
+
+fn ov_recv(a: &[V]) -> u32 {
+    match a.first() {
+        Some(V::Ref(h)) => *h,
+        _ => 0,
+    }
+}
+
+fn ov_find_item(vm: &mut Vm, a: &[V]) -> ovelo_error::Result<Option<V>> {
+    let h = ov_recv(a);
+    Ok(Some(menu_find(vm, h, a.get(1).copied())))
+}
+
+fn ov_menu_add(vm: &mut Vm, a: &[V]) -> ovelo_error::Result<Option<V>> {
+    // add(title|resId) or add(group, id, order, title|resId).
+    let h = ov_recv(a);
+    let (group, id, title) = if a.len() >= 5 {
+        (
+            i64v(a[1]) as i32,
+            i64v(a[2]) as i32,
+            a.get(4).copied().unwrap_or(V::Ref(0)),
+        )
+    } else {
+        (0, 0, a.get(1).copied().unwrap_or(V::Ref(0)))
+    };
+    let it = menu_item_add(vm, h, group, id);
+    if let V::Ref(ih) = it {
+        let t = menu_title(vm, title);
+        pseudo_set(vm, ih, P_TEXT, t);
+    }
+    Ok(Some(it))
+}
+
+fn ov_menu_add_sub(vm: &mut Vm, a: &[V]) -> ovelo_error::Result<Option<V>> {
+    let h = ov_recv(a);
+    let (group, id, title) = if a.len() >= 5 {
+        (
+            i64v(a[1]) as i32,
+            i64v(a[2]) as i32,
+            a.get(4).copied().unwrap_or(V::Ref(0)),
+        )
+    } else {
+        (0, 0, a.get(1).copied().unwrap_or(V::Ref(0)))
+    };
+    let it = menu_sub_add(vm, h, group, id);
+    if let V::Ref(ih) = it {
+        // Title belongs to the header item, mirroring the `addSubMenu`
+        // arm in `call`.
+        let t = menu_title(vm, title);
+        let target = match pseudo_get(vm, ih, P_SUBMENU_ITEM) {
+            Some(V::Ref(th)) => th,
+            _ => ih,
+        };
+        pseudo_set(vm, target, P_TEXT, t);
+    }
+    Ok(Some(it))
+}
+
+fn ov_menu_size(vm: &mut Vm, a: &[V]) -> ovelo_error::Result<Option<V>> {
+    let h = ov_recv(a);
+    Ok(Some(V::I32(menu_items(vm, h).len() as i32)))
+}
+
+fn ov_menu_get_item(vm: &mut Vm, a: &[V]) -> ovelo_error::Result<Option<V>> {
+    let h = ov_recv(a);
+    let i = i64v(a.get(1).copied().unwrap_or(V::I32(0))) as usize;
+    Ok(Some(
+        menu_items(vm, h).get(i).copied().unwrap_or(V::Ref(0)),
+    ))
+}
+
+fn ov_menu_clear(vm: &mut Vm, a: &[V]) -> ovelo_error::Result<Option<V>> {
+    let h = ov_recv(a);
+    if let Some(store) = menu_store(vm, h) {
+        if let Some(Obj::Host {
+            state: HostState::Map(items),
+            ..
+        }) = vm.heap.get_mut(store)
+        {
+            items.clear();
+        }
+    }
+    Ok(None)
+}
+
+fn ov_menu_remove_item(vm: &mut Vm, a: &[V]) -> ovelo_error::Result<Option<V>> {
+    let h = ov_recv(a);
+    let id = i64v(a.get(1).copied().unwrap_or(V::I32(0))) as i32;
+    if let Some(store) = menu_store(vm, h) {
+        if let Some(Obj::Host {
+            state: HostState::Map(items),
+            ..
+        }) = vm.heap.get_mut(store)
+        {
+            if let Some(pos) = items
+                .iter()
+                .position(|(k, _)| i64v(*k) as i32 == id)
+            {
+                items.remove(pos);
+            }
+        }
+    }
+    Ok(None)
+}
+
+fn ov_menu_remove_group(vm: &mut Vm, a: &[V]) -> ovelo_error::Result<Option<V>> {
+    let h = ov_recv(a);
+    let gid = i64v(a.get(1).copied().unwrap_or(V::I32(0))) as i32;
+    let keep: Vec<(V, V)> = menu_items_paired(vm, h)
+        .into_iter()
+        .filter(|(_, v)| {
+            !matches!(v, V::Ref(ih) if pseudo_get(vm, *ih, P_MENU_GROUP) == Some(V::I32(gid)))
+        })
+        .map(|(k, v)| (V::I32(k), v))
+        .collect();
+    if let Some(store) = menu_store(vm, h) {
+        if let Some(Obj::Host {
+            state: HostState::Map(items),
+            ..
+        }) = vm.heap.get_mut(store)
+        {
+            *items = keep;
+        }
+    }
+    Ok(None)
+}
+
+fn ov_menu_inflate(vm: &mut Vm, a: &[V]) -> ovelo_error::Result<Option<V>> {
+    if let Some(V::Ref(mh)) = a.get(2).copied() {
+        menu_inflate(vm, a.get(1).copied(), mh);
+    }
+    Ok(None)
+}
+
+fn ov_nop(_vm: &mut Vm, _a: &[V]) -> ovelo_error::Result<Option<V>> {
+    Ok(None)
+}
+
+fn ov_false(_vm: &mut Vm, _a: &[V]) -> ovelo_error::Result<Option<V>> {
+    Ok(Some(V::I32(0)))
+}
+
+/// Register `Menu`/`SubMenu`/`MenuInflater` surface overrides so dex
+/// androidx menu classes share the host menu model.
+pub(crate) fn register_menu_overrides(vm: &mut Vm) {
+    use std::cell::RefCell;
+    use std::rc::Rc;
+    let mk = |f: fn(&mut Vm, &[V]) -> ovelo_error::Result<Option<V>>| -> HostCall {
+        Rc::new(RefCell::new(f))
+    };
+    let item_ret = "Landroid/view/MenuItem;";
+    let sub_ret = "Landroid/view/SubMenu;";
+    for class in [
+        "Landroidx/appcompat/view/menu/MenuBuilder;",
+        "Landroidx/appcompat/view/menu/SubMenuBuilder;",
+    ] {
+        let _ = vm.register_host(class, "findItem", &format!("(I){item_ret}"), mk(ov_find_item));
+        let _ = vm.register_host(class, "size", "()I", mk(ov_menu_size));
+        let _ = vm.register_host(class, "getItem", &format!("(I){item_ret}"), mk(ov_menu_get_item));
+        let _ = vm.register_host(class, "clear", "()V", mk(ov_menu_clear));
+        let _ = vm.register_host(class, "clearHeader", "()V", mk(ov_nop));
+        let _ = vm.register_host(class, "removeItem", "(I)V", mk(ov_menu_remove_item));
+        let _ = vm.register_host(class, "removeGroup", "(I)V", mk(ov_menu_remove_group));
+        let _ = vm.register_host(class, "setQwertyMode", "(Z)V", mk(ov_nop));
+        let _ = vm.register_host(class, "isQwertyMode", "()Z", mk(ov_false));
+        for proto in [
+            format!("(IIILjava/lang/CharSequence;){item_ret}"),
+            format!("(IIII){item_ret}"),
+            format!("(I){item_ret}"),
+            format!("(Ljava/lang/CharSequence;){item_ret}"),
+        ] {
+            let _ = vm.register_host(class, "add", &proto, mk(ov_menu_add));
+        }
+        for proto in [
+            format!("(IIILjava/lang/CharSequence;){sub_ret}"),
+            format!("(IIII){sub_ret}"),
+            format!("(I){sub_ret}"),
+            format!("(Ljava/lang/CharSequence;){sub_ret}"),
+        ] {
+            let _ = vm.register_host(class, "addSubMenu", &proto, mk(ov_menu_add_sub));
+        }
+    }
+    for class in [
+        "Landroid/view/MenuInflater;",
+        "Landroidx/appcompat/view/SupportMenuInflater;",
+    ] {
+        let _ = vm.register_host(class, "inflate", "(ILandroid/view/Menu;)V", mk(ov_menu_inflate));
     }
 }

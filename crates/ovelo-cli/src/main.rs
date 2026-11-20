@@ -392,6 +392,10 @@ fn register_compat_shims(
     use std::collections::HashMap;
     use std::rc::Rc;
 
+    // androidx menus (MenuBuilder/SubMenuBuilder/MenuInflater) share
+    // the host menu model — see Vm::register_menu_overrides.
+    v.register_menu_overrides();
+
     let drawable = |vm: &mut ovelo_dexrt::Vm| -> V {
         V::Ref(vm.heap.alloc(Obj::Host {
             class_idx: u64::MAX,
