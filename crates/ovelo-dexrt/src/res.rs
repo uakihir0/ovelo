@@ -99,17 +99,26 @@ impl ApkResources {
                     if t.name == "plurals" && !e.items.is_empty() {
                         let slot = res.plurals.entry(e.res_id).or_default();
                         if slot.is_empty() || e.config == "default" {
+                            // Plural item keys are the reserved
+                            // attr ids 0x01000004..0x01000009
+                            // (ResTable_map ATTR_other/zero/…), not
+                            // key-pool indices — a `key_strings.get`
+                            // on those yields nothing.
+                            const QTY_IDS: &[&str] =
+                                &["other", "zero", "one", "two", "few", "many"];
                             *slot = e
                                 .items
                                 .iter()
                                 .map(|(k, v)| {
-                                    (
+                                    let key = if (0x01000004..=0x01000009).contains(k) {
+                                        QTY_IDS[(*k - 0x01000004) as usize].to_string()
+                                    } else {
                                         pkg.key_strings
                                             .get(*k as usize)
                                             .cloned()
-                                            .unwrap_or_default(),
-                                        v.clone(),
-                                    )
+                                            .unwrap_or_default()
+                                    };
+                                    (key, v.clone())
                                 })
                                 .collect();
                         }
@@ -256,18 +265,13 @@ impl ApkResources {
         self.styles.get(&style_id).map(|s| s.parent)
     }
 
-    /// `<plurals>` entry → the item for `quantity` (AOSP buckets with
-    /// "other" as the always-required fallback).
+    /// `<plurals>` entry → the item for `quantity`. CLDR plural rules
+    /// are locale-dependent — with no locale model the default is
+    /// English (`one` when exactly 1, else `other`); "other" is the
+    /// always-required fallback.
     pub fn plural_string(&self, res_id: u32, quantity: i64) -> Option<&EntryValue> {
         let items = self.plurals.get(&res_id)?;
-        let want = match quantity {
-            0 => "zero",
-            1 => "one",
-            2 => "two",
-            3..=10 => "few",
-            11..=99 => "many",
-            _ => "other",
-        };
+        let want = if quantity == 1 { "one" } else { "other" };
         items
             .iter()
             .find(|(k, _)| k == want)
