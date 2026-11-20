@@ -1723,8 +1723,16 @@ fn fieldupdater_call(vm: &mut Vm, name: &str, args: &[V]) -> Rt<Option<Option<V>
                     let ok = (nullish(cur) && nullish(args[2]))
                         || value_eq(vm, cur, args[2]);
                     if ok {
+                        // Widen numeric writes to the stored width — a
+                        // `const/4` new value on a `J` field must stay I64.
+                        let nv = match (cur, args[3]) {
+                            (V::I64(_), V::I32(i)) => V::I64(i as i64),
+                            (V::I32(_), V::I64(i)) => V::I32(i as i32),
+                            (_, V::I32(i)) if num_wide(vm, fid) => V::I64(i as i64),
+                            (_, v) => v,
+                        };
                         if let Some(f) = fields_mut(vm, obj) {
-                            f.insert(fid, args[3]);
+                            f.insert(fid, nv);
                         }
                     }
                     Some(Some(V::I32(ok as i32)))
@@ -1740,17 +1748,26 @@ fn fieldupdater_call(vm: &mut Vm, name: &str, args: &[V]) -> Rt<Option<Option<V>
                         }
                         _ => V::Ref(0),
                     };
+                    // Keep the stored width: an AtomicLongFieldUpdater
+                    // must not shrink a `J` field to I32 or a later
+                    // iget-wide throws (kotlinx scheduler workers).
+                    let wide = num_wide(vm, fid);
+                    let num_add = |cur: V, d: i64| match cur {
+                        V::I64(i) => V::I64(i + d),
+                        V::I32(i) => V::I32((i as i64 + d) as i32),
+                        _ if wide => V::I64(d),
+                        _ => V::I32(d as i32),
+                    };
+                    let coerce = |cur: V, v: V| match (cur, v) {
+                        (V::I64(_), V::I32(i)) => V::I64(i as i64),
+                        (V::I32(_), V::I64(i)) => V::I32(i as i32),
+                        (_, v) => v,
+                    };
                     let nv = match name {
-                        "getAndSet" => args[2],
-                        "incrementAndGet" | "getAndIncrement" => {
-                            V::I32(i32v(cur) + 1)
-                        }
-                        "decrementAndGet" | "getAndDecrement" => {
-                            V::I32(i32v(cur) - 1)
-                        }
-                        "addAndGet" | "getAndAdd" => {
-                            V::I64(i64v(cur) + i64v(args[2]))
-                        }
+                        "getAndSet" => coerce(cur, args[2]),
+                        "incrementAndGet" | "getAndIncrement" => num_add(cur, 1),
+                        "decrementAndGet" | "getAndDecrement" => num_add(cur, -1),
+                        "addAndGet" | "getAndAdd" => num_add(cur, i64v(args[2])),
                         _ => cur,
                     };
                     if let Some(f) = fields_mut(vm, obj) {
@@ -1759,8 +1776,22 @@ fn fieldupdater_call(vm: &mut Vm, name: &str, args: &[V]) -> Rt<Option<Option<V>
                     Some(Some(if name.starts_with("getAnd") { cur } else { nv }))
                 }
                 _ => {
+                    // `set`/`lazySet` — coerce to the stored width as in CAS.
+                    let cur = match vm.heap.get(obj) {
+                        Some(Obj::Instance { fields, .. })
+                        | Some(Obj::Host { fields, .. }) => {
+                            fields.get(&fid).copied().unwrap_or(V::Ref(0))
+                        }
+                        _ => V::Ref(0),
+                    };
+                    let nv = match (cur, args[2]) {
+                        (V::I64(_), V::I32(i)) => V::I64(i as i64),
+                        (V::I32(_), V::I64(i)) => V::I32(i as i32),
+                        (_, V::I32(i)) if num_wide(vm, fid) => V::I64(i as i64),
+                        (_, v) => v,
+                    };
                     if let Some(f) = fields_mut(vm, obj) {
-                        f.insert(fid, args[2]);
+                        f.insert(fid, nv);
                     }
                     Some(None)
                 }
@@ -1768,6 +1799,19 @@ fn fieldupdater_call(vm: &mut Vm, name: &str, args: &[V]) -> Rt<Option<Option<V>
         }
         _ => None,
     })
+}
+
+/// Whether the resolved dex field is declared `J`/`D` — used to pick
+/// the stored width for numeric writes on never-initialized fields.
+fn num_wide(vm: &Vm, fid: u64) -> bool {
+    vm.dex_of(fid)
+        .and_then(|d| {
+            d.field(crate::gl(fid))
+                .ok()
+                .and_then(|f| d.type_descriptor(f.type_idx as u32).ok())
+        })
+        .map(|t| t == "J" || t == "D")
+        .unwrap_or(false)
 }
 
 // ---------------------------------------------------------------------

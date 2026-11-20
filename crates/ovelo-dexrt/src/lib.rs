@@ -962,8 +962,8 @@ impl Vm {
                 match &out {
                     Ok(_) => eprintln!("[drain] ran h={r} main={on_main}"),
                     Err(e) => eprintln!(
-                        "[drain] h={r} main={on_main} err={}",
-                        e.cause()
+                        "[drain] h={r} main={on_main} err={:?}",
+                        e
                     ),
                 }
             }
