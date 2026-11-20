@@ -692,8 +692,11 @@ pub fn drive_dex_layout_pass(vm: &mut Vm, activity: u32, frame: u32) {
         return;
     };
     const ADAPTER: &[&str] = &[
-        "ViewPager", "RecyclerView", "ListView", "GridView", "AdapterView",
-        "DrawerLayout", "SwipeRefresh",
+        // Real simple names — extends_named matches exact segments, so
+        // "SwipeRefresh" would miss SwipeRefreshLayout, and ViewPager2
+        // is not a ViewPager subclass.
+        "ViewPager", "ViewPager2", "RecyclerView", "ListView", "GridView",
+        "AdapterView", "DrawerLayout", "SwipeRefreshLayout",
     ];
     // MeasureSpec mode EXACTLY (mode << 30) — containers like
     // DrawerLayout throw unless both specs are EXACTLY, so
