@@ -686,6 +686,9 @@ fn universal(
             Some(Some(class_obj(vm, d)))
         }
         "clone" => Some(Some(args[0])),
+        // kotlinx MainCoroutineDispatcher.getImmediate() returns the
+        // dispatcher itself.
+        "getImmediate" => Some(Some(args[0])),
         "notify" | "notifyAll" | "wait" | "finalize" => Some(None),
         "compareTo" if args.len() == 2 && !desc_is_a(class, "Ljava/lang/Enum;") => {
             // Generic compareTo: boxed numbers and strings only;

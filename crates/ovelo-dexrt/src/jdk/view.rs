@@ -350,13 +350,13 @@ pub(crate) fn call(
                     -2 => (AT_MOST, size),
                     _ => (AT_MOST, size),
                 },
-                _ => (
-                    0,
-                    match child_dim {
-                        d if d >= 0 => d,
-                        _ => 0,
-                    },
-                ),
+                // UNSPECIFIED: a fixed child dimension still measures
+                // EXACTLY (AOSP); MATCH_PARENT/WRAP_CONTENT measure at
+                // UNSPECIFIED size 0 (sUseZeroUnspecifiedMeasureSpec).
+                _ => match child_dim {
+                    d if d >= 0 => (EXACTLY, d),
+                    _ => (0, 0),
+                },
             };
             Some(Some(V::I32((out & !MODE_MASK) | (mode & MODE_MASK))))
         }
