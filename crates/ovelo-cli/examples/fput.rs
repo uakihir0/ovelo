@@ -1,3 +1,5 @@
+//! Field-usage probe: dump instructions referencing a named field.
+
 use ovelo_apk::zip::{parse_central_directory, read_entry};
 use ovelo_dex::*;
 fn main() {
