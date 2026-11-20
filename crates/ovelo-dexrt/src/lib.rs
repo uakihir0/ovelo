@@ -170,6 +170,12 @@ pub struct Vm {
     /// them when the receiver's own subtree misses (appcompat decor is
     /// built dex-side, outside our synthetic window decor).
     pub(crate) view_roots: Vec<u32>,
+    /// The view attached under `android.R.id.content` — the app's real
+    /// content root no matter which path installed it.
+    pub(crate) content_view: u32,
+    /// Root of the tree that owns the content frame — appcompat's real
+    /// decor when it built one, else the synthetic window decor.
+    pub(crate) decor_root: u32,
     /// Installed-APK resource index for `LayoutInflater.inflate` — `None`
     /// degrades inflation to bare placeholder views.
     pub apk_res: Option<res::ApkResources>,
@@ -253,6 +259,8 @@ impl Vm {
             trace_throw: std::env::var_os("OVELO_TRACE_THROW").is_some(),
             trace_call: std::env::var("OVELO_TRACE_CALL").ok(),
             view_roots: Vec::new(),
+            content_view: 0,
+            decor_root: 0,
             apk_res: None,
             theme_id: 0,
             pending_activity: None,

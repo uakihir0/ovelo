@@ -126,6 +126,9 @@ pub struct DexViewInfo {
 pub(crate) fn activity_content(vm: &Vm, activity: u32) -> Option<u32> {
     match pseudo_get(vm, activity, P_CONTENT) {
         Some(V::Ref(h)) if h != 0 => Some(h),
+        // Appcompat installs content dex-side — the last view attached
+        // under android.R.id.content is the real content root.
+        _ if vm.content_view != 0 => Some(vm.content_view),
         _ => None,
     }
 }
@@ -1509,6 +1512,23 @@ pub(crate) fn attach(vm: &mut Vm, parent: u32, child: V) {
     }
     if let V::Ref(ch) = child {
         pseudo_set(vm, ch, P_PARENT, V::Ref(parent));
+        // App content lands under the `android.R.id.content` frame —
+        // whether via our Window.setContentView or appcompat's dex-side
+        // ensureSubDecor — so remember it as the activity's content and
+        // the enclosing tree as the window's real decor.
+        if view_id(vm, parent) == ANDROID_ID_CONTENT {
+            vm.content_view = ch;
+            let mut top = parent;
+            let mut hops = 0;
+            while let Some(V::Ref(p)) = pseudo_get(vm, top, P_PARENT) {
+                if p == 0 || hops > 64 {
+                    break;
+                }
+                top = p;
+                hops += 1;
+            }
+            vm.decor_root = top;
+        }
     }
 }
 
@@ -1584,6 +1604,12 @@ pub(crate) fn window_of(vm: &mut Vm, activity: u32) -> Option<u32> {
 pub(crate) fn decor_of(vm: &mut Vm, window: u32) -> Option<u32> {
     if window == 0 {
         return None;
+    }
+    // Appcompat builds its own decor tree dex-side — prefer it over the
+    // synthetic one so Window.findViewById sees the real content.
+    if vm.decor_root != 0 {
+        pseudo_set(vm, window, P_DECOR, V::Ref(vm.decor_root));
+        return Some(vm.decor_root);
     }
     if let Some(V::Ref(d)) = pseudo_get(vm, window, P_DECOR) {
         return Some(d);
