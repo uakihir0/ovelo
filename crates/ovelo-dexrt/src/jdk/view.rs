@@ -39,6 +39,8 @@ const P_MERGE: u32 = u32::MAX - 21;
 /// a zero-init stub) or their dex fields read null downstream.
 const P_IND_DRAW: u32 = u32::MAX - 22;
 const P_PROG_DRAW: u32 = u32::MAX - 23;
+/// The window target (activity/dialog handle) owning a decor root.
+const P_WIN_OWNER: u32 = u32::MAX - 24;
 /// Pseudo key: a view's lazily-minted `Menu` (Toolbar.getMenu() etc.) /
 /// the menuish marker on the Menu itself (`I32(1)`).
 const P_MENU: u32 = 0xFFFD_FFF8;
@@ -1047,7 +1049,13 @@ fn make_view_named(vm: &mut Vm, tag: &str, attrs: V, ctx: V) -> V {
         _ if name.contains('.') => format!("L{};", name.replace('.', "/")),
         _ => format!("Landroid/widget/{name};"),
     };
-    let group = is_group_tag(name) || desc_is_a(&desc, VIEWGROUP);
+    // Dex-aware ancestry: `desc_is_a` only knows host supers, so a
+    // dex-defined ViewGroup subclass (MyRecyclerView → androidx
+    // RecyclerView → ViewGroup) must resolve through the VM or it is
+    // never marked as a group — and its onLayout never runs.
+    let group = is_group_tag(name)
+        || desc_is_a(&desc, VIEWGROUP)
+        || vm.assignable_desc(&desc, VIEWGROUP);
     // Dex-defined view classes (custom views, bundled libs like
     // material's NavigationView) get a real instance whose constructor
     // runs — the standard overloads are (Context), (Context, AttributeSet)
@@ -1723,49 +1731,28 @@ pub(crate) fn attach(vm: &mut Vm, parent: u32, child: V) {
         // ensureSubDecor — so remember it as the running activity's
         // content and the enclosing tree as its window's real decor.
         if view_id(vm, parent) == ANDROID_ID_CONTENT {
-            let owner = vm.cur_activity;
-            // Only register when this content frame belongs to the
-            // running activity's own window — a Dialog's window has a
-            // content frame too, and its content must not replace the
-            // activity's recorded view/decor. AppCompat's subDecor can
-            // nest its own id/content frame below the window's, so a
-            // frame counts when the activity's content frame is an
-            // ancestor (or the frame itself).
-            let own_frame = owner == 0
-                || window_of(vm, owner)
-                    .and_then(|w| content_frame_of(vm, w))
-                    .map(|root| {
-                        let mut cur = Some(parent);
-                        let mut hops = 0;
-                        while let Some(p) = cur {
-                            if p == root {
-                                return true;
-                            }
-                            hops += 1;
-                            if hops > 64 {
-                                return false;
-                            }
-                            cur = match pseudo_get(vm, p, P_PARENT) {
-                                Some(V::Ref(x)) if x != 0 => Some(x),
-                                _ => None,
-                            };
-                        }
-                        false
-                    })
-                    .unwrap_or(false);
-            if own_frame {
-                vm.content_views.insert(owner, ch);
-                let mut top = parent;
-                let mut hops = 0;
-                while let Some(V::Ref(p)) = pseudo_get(vm, top, P_PARENT) {
-                    if p == 0 || hops > 64 {
-                        break;
-                    }
-                    top = p;
-                    hops += 1;
+            // Register content under the decor's owning window target:
+            // the top of the frame's tree carries P_WIN_OWNER (set by
+            // decor_of) — an activity's decor tags its activity, a
+            // Dialog's decor tags the dialog so its content lands under
+            // the dialog handle instead of overwriting the activity's.
+            // AppCompat's own (detached) decor has no tag — fall back to
+            // the running activity, matching pre-tagging behavior.
+            let mut top = parent;
+            let mut hops = 0;
+            while let Some(V::Ref(p)) = pseudo_get(vm, top, P_PARENT) {
+                if p == 0 || hops > 64 {
+                    break;
                 }
-                vm.decor_roots.insert(owner, top);
+                top = p;
+                hops += 1;
             }
+            let owner = match pseudo_get(vm, top, P_WIN_OWNER) {
+                Some(V::Ref(a)) => a,
+                _ => vm.cur_activity,
+            };
+            vm.content_views.insert(owner, ch);
+            vm.decor_roots.insert(owner, top);
         }
     }
 }
@@ -1889,6 +1876,10 @@ pub(crate) fn decor_of(vm: &mut Vm, window: u32) -> Option<u32> {
     let d = vm.alloc_host(VIEWGROUP, HostState::Empty);
     pseudo_set(vm, d, P_IS_VIEW, V::I32(1));
     pseudo_set(vm, d, P_IS_GROUP, V::I32(1));
+    // Tag the decor with the window's target so `attach` registers
+    // content under this window's owner — not blindly under the running
+    // activity, which let a Dialog's content replace the activity's.
+    pseudo_set(vm, d, P_WIN_OWNER, V::Ref(owner));
     let cf = vm.alloc_host(FRAMELAYOUT, HostState::Empty);
     pseudo_set(vm, cf, P_IS_VIEW, V::I32(1));
     pseudo_set(vm, cf, P_IS_GROUP, V::I32(1));

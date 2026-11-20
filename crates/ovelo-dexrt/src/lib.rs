@@ -1701,15 +1701,21 @@ impl Vm {
         if Self::builtin_supers(sub).contains(&sup) || jdk::host_supers(sub).contains(&sup) {
             return true;
         }
+        // `super_desc` resolves dex class_defs first, then host_supers —
+        // a dex ViewGroup subclass (custom RecyclerView etc.) walks
+        // through androidx up to the framework class.
         let mut d = sub.to_string();
         for _ in 0..32 {
-            let Some(next) = Self::framework_super(&d) else {
+            let Some(next) = self.super_desc(&d) else {
                 return false;
             };
             if next == sup {
                 return true;
             }
-            d = next.to_string();
+            if next == d {
+                return false;
+            }
+            d = next;
         }
         false
     }

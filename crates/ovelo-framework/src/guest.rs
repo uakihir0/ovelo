@@ -729,8 +729,14 @@ pub fn drive_dex_layout_pass(vm: &mut Vm, activity: u32, frame: u32) {
             return;
         }
         let Some(info) = vm.dex_view(h) else {
+            if std::env::var_os("OVELO_VIEWDBG").is_some() {
+                eprintln!("[viewdbg] walk h{h} not a dex view");
+            }
             return;
         };
+        if std::env::var_os("OVELO_VIEWDBG").is_some() {
+            eprintln!("[viewdbg] walk h{h} {} group={}", info.desc, info.is_group);
+        }
         if info.is_group {
             if let Err(e) = vm.call_virtual(
                 h,
