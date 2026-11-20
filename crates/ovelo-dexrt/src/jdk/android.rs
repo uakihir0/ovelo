@@ -49,6 +49,70 @@ pub(crate) fn call(
             "describeContents" | "writeToParcel" => Some(None),
             _ => None,
         }
+    } else if class == "Landroid/database/Observable;" {
+        // androidx `AdapterDataObservable` et al. extend this framework
+        // class that ships no dex — without the ctor `mObservers` stays
+        // null and every notify NPEs inside `add`.
+        match name {
+            "<init>" => {
+                let list = host(vm, "Ljava/util/ArrayList;", HostState::List(vec![]));
+                if let V::Ref(this) = args[0] {
+                    field_set(vm, this, class, "mObservers", list);
+                }
+                Some(None)
+            }
+            "registerObserver" => {
+                if let V::Ref(this) = args[0] {
+                    let obs = args.get(1).copied().unwrap_or(V::Ref(0));
+                    if let Some(V::Ref(lh)) =
+                        field_get(vm, this, class, "mObservers")
+                    {
+                        if let Some(Obj::Host {
+                            state: HostState::List(l),
+                            ..
+                        }) = vm.heap.get_mut(lh)
+                        {
+                            l.push(obs);
+                        }
+                    }
+                }
+                Some(None)
+            }
+            "unregisterObserver" => {
+                if let V::Ref(this) = args[0] {
+                    let obs = args.get(1).copied().unwrap_or(V::Ref(0));
+                    if let Some(V::Ref(lh)) =
+                        field_get(vm, this, class, "mObservers")
+                    {
+                        if let Some(Obj::Host {
+                            state: HostState::List(l),
+                            ..
+                        }) = vm.heap.get_mut(lh)
+                        {
+                            l.retain(|o| *o != obs);
+                        }
+                    }
+                }
+                Some(None)
+            }
+            "unregisterAll" => {
+                if let V::Ref(this) = args[0] {
+                    if let Some(V::Ref(lh)) =
+                        field_get(vm, this, class, "mObservers")
+                    {
+                        if let Some(Obj::Host {
+                            state: HostState::List(l),
+                            ..
+                        }) = vm.heap.get_mut(lh)
+                        {
+                            l.clear();
+                        }
+                    }
+                }
+                Some(None)
+            }
+            _ => None,
+        }
     } else if class == "Landroid/preference/PreferenceManager;" {
         // Static factory — hand out a map-backed SharedPreferences.
         match name {

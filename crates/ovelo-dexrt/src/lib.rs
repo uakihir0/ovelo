@@ -443,6 +443,35 @@ impl Vm {
                     found = true;
                 }
             }
+            // Defined methods too: a call may reference only the base
+            // class's descriptor (`MenuInflater.inflate`) while virtual
+            // resolution lands on the dex-defined override
+            // (`SupportMenuInflater.inflate`) that nothing references.
+            // Best-effort: one unparseable class must not abort the scan.
+            for def in d.class_defs() {
+                let Ok(desc) = d.type_descriptor(def.class_idx) else {
+                    continue;
+                };
+                if desc != class_desc {
+                    continue;
+                }
+                let Ok(cd) = d.class_data(def) else {
+                    continue;
+                };
+                for m in cd.direct_methods.iter().chain(cd.virtual_methods.iter()) {
+                    let Ok(mid) = d.method(m.method_idx) else {
+                        continue;
+                    };
+                    if d.string(mid.name_idx).map(|n| n == name).unwrap_or(false)
+                        && proto_sig(d, mid.proto_idx as u32)
+                            .map(|s| s == proto_desc)
+                            .unwrap_or(false)
+                    {
+                        self.hosts.insert(gx(di, m.method_idx), f.clone());
+                        found = true;
+                    }
+                }
+            }
         }
         if found {
             // A DEX may reference the same method through a subclass

@@ -1609,10 +1609,20 @@ fn menu_title(vm: &mut Vm, v: V) -> V {
 /// `getVisibleItems`, casts to `MenuItemImpl` all see real entries. A
 /// `<menu>` nested inside an `<item>` inflates into its SubMenu.
 pub(crate) fn menu_inflate(vm: &mut Vm, res_v: Option<V>, menu_h: u32) {
+    let trace = std::env::var_os("OVELO_TRACE_MENU").is_some();
+    if trace {
+        eprintln!("[menu_inflate] res={res_v:?} menu_h={menu_h}");
+    }
     let Some(V::I32(id)) = res_v else { return };
     let Some(doc) = vm.apk_res.as_ref().and_then(|r| r.document(id as u32)) else {
+        if trace {
+            eprintln!("[menu_inflate] no document for {id:#x}");
+        }
         return;
     };
+    if trace {
+        eprintln!("[menu_inflate] doc {} elements", doc.len());
+    }
     if !matches!(vm.heap.get(menu_h), Some(Obj::Instance { .. }))
         && menu_store(vm, menu_h).is_none()
     {
@@ -1628,6 +1638,7 @@ pub(crate) fn menu_inflate(vm: &mut Vm, res_v: Option<V>, menu_h: u32) {
 /// One level of menu xml: `item` adds an entry; a nested `menu` opens
 /// its SubMenu and recurses; any other element is skipped.
 fn menu_inflate_level(vm: &mut Vm, doc: &[Element], i: &mut usize, depth: usize, menu_h: u32) {
+    let trace = std::env::var_os("OVELO_TRACE_MENU").is_some();
     while *i < doc.len() {
         let el = &doc[*i];
         if el.depth < depth {
@@ -1658,6 +1669,9 @@ fn menu_inflate_level(vm: &mut Vm, doc: &[Element], i: &mut usize, depth: usize,
             .get(*i)
             .map(|n| n.name == "menu" && n.depth > depth)
             .unwrap_or(false);
+        if trace {
+            eprintln!("[menu_inflate] item id={:?} sub={sub}", i64v(item_id) as i32);
+        }
         let it = menu_add_entry(
             vm,
             menu_h,
@@ -1700,12 +1714,17 @@ fn menu_add_entry(
     if matches!(vm.heap.get(menu_h), Some(Obj::Instance { .. })) {
         let title_v = menu_title(vm, title);
         let m = if sub { "addSubMenu" } else { "add" };
-        if let Ok(Some(it)) = vm.call_virtual(
+        match vm.call_virtual(
             menu_h,
             m,
             &[V::I32(group), V::I32(id), V::I32(order), title_v],
         ) {
-            return it;
+            Ok(Some(it)) => return it,
+            r => {
+                if std::env::var_os("OVELO_TRACE_MENU").is_some() {
+                    eprintln!("[menu_add] dex {m} failed: {r:?}");
+                }
+            }
         }
     }
     if sub {
@@ -1774,6 +1793,9 @@ pub(crate) fn register_menu_overrides(vm: &mut Vm) {
         "Landroid/view/MenuInflater;",
         "Landroidx/appcompat/view/SupportMenuInflater;",
     ] {
-        let _ = vm.register_host(class, "inflate", "(ILandroid/view/Menu;)V", mk(ov_menu_inflate));
+        let ok = vm.register_host(class, "inflate", "(ILandroid/view/Menu;)V", mk(ov_menu_inflate));
+        if std::env::var_os("OVELO_TRACE_MENU").is_some() {
+            eprintln!("[menu_inflate] register_host {class} -> {ok:?}");
+        }
     }
 }
