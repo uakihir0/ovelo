@@ -169,25 +169,34 @@ impl Drawable for SharedView {
 }
 
 /// Wraps a materialized child whose dex `layout`/`setFrame` assigned a
-/// real rect: the parent's `layout` positions it at the dex-computed
-/// offset instead of the host stacking/overlay heuristic, and its
-/// reported size is the dex frame.
+/// real rect: `dex_frame()` tells the parent where it goes (relative
+/// to the parent's own origin), and its reported size is the dex frame.
 struct AbsView {
     inner: SharedView,
     /// Dex frame relative to the parent `(l, t, r, b)`.
     rect: (i32, i32, i32, i32),
 }
 
-impl Drawable for AbsView {
-    fn measure(&mut self, w: MeasureSpec, h: MeasureSpec) -> Size {
-        let _ = self.inner.measure(w, h);
+impl AbsView {
+    fn frame_size(&self) -> Size {
         Size {
             w: self.rect.2 - self.rect.0,
             h: self.rect.3 - self.rect.1,
         }
     }
+}
+
+impl Drawable for AbsView {
+    fn measure(&mut self, w: MeasureSpec, h: MeasureSpec) -> Size {
+        let s = self.frame_size();
+        let _ = self.inner.measure(w, h);
+        // The dex rect wins — draw and hit tests read the inner
+        // view's measured size, so it must agree with the frame.
+        self.inner.0.borrow_mut().view_mut().measured = s;
+        s
+    }
     fn layout(&mut self, left: i32, top: i32) {
-        self.inner.layout(left + self.rect.0, top + self.rect.1);
+        self.inner.layout(left, top);
     }
     fn draw(&mut self, c: &mut ovelo_ui::Canvas) {
         self.inner.draw(c);
@@ -199,16 +208,16 @@ impl Drawable for AbsView {
         self.inner.is_dirty()
     }
     fn measured(&self) -> Size {
-        Size {
-            w: self.rect.2 - self.rect.0,
-            h: self.rect.3 - self.rect.1,
-        }
+        self.frame_size()
     }
     fn origin(&self) -> (i32, i32) {
         self.inner.origin()
     }
     fn lp(&self) -> (Length, Length) {
         self.inner.lp()
+    }
+    fn dex_frame(&self) -> Option<(i32, i32, i32, i32)> {
+        Some(self.rect)
     }
     fn dispatch_touch(&mut self, down: bool, x: i32, y: i32) -> bool {
         self.inner.dispatch_touch(down, x, y)

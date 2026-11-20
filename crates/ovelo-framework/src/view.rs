@@ -194,7 +194,13 @@ impl ViewGroup {
         self.view.layout(left, top);
         let mut y = top;
         for c in &mut self.children {
-            c.layout(left, y);
+            // A guest-laid-out child carries its own rect relative to
+            // this parent — stack offsets would double-position it.
+            let (cl, ct) = match c.dex_frame() {
+                Some((fl, ft, _, _)) => (left + fl, top + ft),
+                None => (left, y),
+            };
+            c.layout(cl, ct);
             if !self.overlay {
                 y += c.measured().h;
             }

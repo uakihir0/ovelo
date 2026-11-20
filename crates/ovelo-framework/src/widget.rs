@@ -29,6 +29,13 @@ pub trait Drawable {
     fn origin(&self) -> (i32, i32);
     /// Requested layout params (for the parent's `for_child` spec).
     fn lp(&self) -> (Length, Length);
+    /// Dex-assigned frame `(l, t, r, b)` relative to the parent, when
+    /// the guest already laid this node out — the parent's `layout`
+    /// positions the child at `(left + l, top + t)` instead of its
+    /// own stacking/overlay heuristic.
+    fn dex_frame(&self) -> Option<(i32, i32, i32, i32)> {
+        None
+    }
     /// `dispatchTouchEvent` (tap): `down` presses the topmost clickable
     /// view under the point, `!down` releases it — a click only fires
     /// when press and release land on the same view (Android's
