@@ -618,7 +618,42 @@ fn sqlite_call(
         }
         "rawQuery" | "rawQueryWithFactory" => {
             let sql = first_string(vm, &args[1..]).unwrap_or_default();
-            let binds = find_array_arg(vm, &args[2..]);
+            let mut binds = find_array_arg(vm, &args[2..]);
+            // androidx `query(SupportSQLiteQuery)` reaches us as
+            // `rawQueryWithFactory(factory, sql, EMPTY, …)`: the binds
+            // aren't in args — the guest factory's `bindTo` attaches
+            // them to the SQLiteQuery program `newInstance` receives.
+            // Invoke the factory on a host program to capture them.
+            if binds_of(vm, binds).is_empty() && name.ends_with("Factory") {
+                if let Some(&V::Ref(factory)) = args.get(1) {
+                    let V::Ref(prog) = host(
+                        vm,
+                        "Landroid/database/sqlite/SQLiteQuery;",
+                        HostState::List(Vec::new()),
+                    ) else {
+                        unreachable!()
+                    };
+                    let sql_v = jstr(vm, &sql);
+                    pseudo_set(vm, prog, P_SQL, sql_v);
+                    if let Some(n) = db_name_of(vm, this) {
+                        vm.obj_db.insert(prog, n);
+                    }
+                    let _ = vm.call_virtual(
+                        factory,
+                        "newInstance",
+                        &[V::Ref(this), V::Ref(0), V::Ref(0), V::Ref(prog)],
+                    );
+                    if matches!(
+                        vm.heap.get(prog),
+                        Some(Obj::Host {
+                            state: HostState::List(l),
+                            ..
+                        }) if !l.is_empty()
+                    ) {
+                        binds = V::Ref(prog);
+                    }
+                }
+            }
             Some(Some(run_query(vm, this, &sql, binds)?))
         }
         "query" | "queryWithFactory" => {
