@@ -1170,11 +1170,20 @@ fn context_call(
             "Landroid/content/SharedPreferences;",
             HostState::Map(vec![]),
         ))),
-        "getString" => {
-            // resource id → empty/dotted name
-            Some(Some(jstr(vm, "")))
+        "getString" | "getText" => {
+            // Context.getString resolves through resources, not to "" —
+            // apps read defaults this way (NewPipe's saved_tabs JSON
+            // default comes from a string resource).
+            let id = i64v(args.get(1).copied().unwrap_or(V::I32(0))) as u32;
+            Some(Some(match vm
+                .apk_res
+                .as_ref()
+                .and_then(|r| r.string_of(id).map(|s| s.to_string()))
+            {
+                Some(s) => jstr(vm, &s),
+                None => jstr(vm, ""),
+            }))
         }
-        "getText" => Some(Some(jstr(vm, ""))),
         "getColor" => Some(Some(V::I32(0xFF000000u32 as i32))),
         "getDrawable" => {
             let vdc = [
