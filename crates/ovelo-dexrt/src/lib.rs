@@ -91,8 +91,11 @@ struct Loc {
 
 /// A host-implemented framework method. Registered per `method_idx`;
 /// `call_builtin` consults this table before the builtin stubs.
-/// Single-threaded: the shared RefCell lets a callback path (e.g. a
-/// deferred onClick) re-enter the same table entry safely.
+/// Single-threaded. A host callback may itself dispatch guest code that
+/// re-enters the *same* registered callback (e.g. an initializer's
+/// `create` calling `initializeComponent`) — the dispatcher answers a
+/// `dexrt.host.reentrant` error there instead of panicking on the
+/// RefCell's second mutable borrow.
 pub type HostCall = std::rc::Rc<
     std::cell::RefCell<dyn FnMut(&mut Vm, &[V]) -> Result<Option<V>>>,
 >;
@@ -1565,7 +1568,10 @@ impl Vm {
             .cloned()
             .or(self.host_named(midx)?);
         if let Some(f) = host {
-            return f.borrow_mut()(self, args).map_err(E::Vm);
+            let Ok(mut g) = f.try_borrow_mut() else {
+                return vm("dexrt.host.reentrant");
+            };
+            return g(self, args).map_err(E::Vm);
         }
         let Some(d) = self.dex_of(midx) else {
             return vm("dexrt.invoke.unresolved");
@@ -1728,7 +1734,10 @@ impl Vm {
         if let Some(f) = self.hosts.get(&loc.midx).cloned() {
             let has_recv = !matches!(kind, InvokeKind::Static);
             let args = self.compact_args(loc.midx, &args, has_recv);
-            return f.borrow_mut()(self, &args).map_err(E::Vm);
+            let Ok(mut g) = f.try_borrow_mut() else {
+                return vm("dexrt.host.reentrant");
+            };
+            return g(self, &args).map_err(E::Vm);
         }
         if loc.em.code_off == 0 {
             return vm("dexrt.method.no_code");

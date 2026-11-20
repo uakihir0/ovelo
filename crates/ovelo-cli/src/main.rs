@@ -380,7 +380,13 @@ fn find_record(store: &InstallStore, package: &str) -> Result<InstallRecord, Ove
 /// needs a working XmlResourceParser + Drawable backend we don't have
 /// yet. `getDrawable` answers a placeholder so menu/icon inflation
 /// keeps going.
-fn register_compat_shims(v: &mut ovelo_dexrt::Vm, initializers: &[String]) {
+fn register_compat_shims(
+    v: &mut ovelo_dexrt::Vm,
+    initializers: &[String],
+    components: std::rc::Rc<
+        std::cell::RefCell<std::collections::HashMap<String, ovelo_dexrt::V>>,
+    >,
+) {
     use ovelo_dexrt::{HostState, Obj, V};
     use std::cell::RefCell;
     use std::collections::HashMap;
@@ -438,20 +444,26 @@ fn register_compat_shims(v: &mut ovelo_dexrt::Vm, initializers: &[String]) {
         "(Ljava/lang/Class;)Ljava/lang/Object;",
         "(Ljava/lang/Class;Ljava/util/Set;)Ljava/lang/Object;",
     ] {
+        let components2 = components.clone();
         let _ = v.register_host(
             "Landroidx/startup/AppInitializer;",
             "initializeComponent",
             sig,
-            Rc::new(RefCell::new(|vm: &mut ovelo_dexrt::Vm, a: &[V]| {
+            Rc::new(RefCell::new(move |vm: &mut ovelo_dexrt::Vm, a: &[V]| {
                 // Answer the component instance the caller expects:
                 // instantiate the Initializer named by the Class argument
                 // and return its `create(context)` result, the way AOSP's
-                // AppInitializer.initializeComponent does.
+                // AppInitializer.initializeComponent does. Results are
+                // cached — AOSP returns the same component per class and
+                // never runs create twice.
                 let desc = match a.get(1).copied() {
                     Some(V::Ref(h)) => vm.class_descriptor_of(h),
                     _ => None,
                 };
                 if let Some(d) = desc {
+                    if let Some(v) = components2.borrow().get(&d).copied() {
+                        return Ok(Some(v));
+                    }
                     if let Ok(ih) = vm.instantiate(&d) {
                         let ctx = match a.first().copied() {
                             Some(V::Ref(ai)) => vm
@@ -460,6 +472,7 @@ fn register_compat_shims(v: &mut ovelo_dexrt::Vm, initializers: &[String]) {
                             _ => V::Ref(0),
                         };
                         if let Ok(Some(v)) = vm.call_virtual(ih, "create", &[ctx]) {
+                            components2.borrow_mut().insert(d, v);
                             return Ok(Some(v));
                         }
                         return Ok(Some(V::Ref(ih)));
@@ -539,6 +552,9 @@ fn run_initializer(
     desc: &str,
     ctx: ovelo_dexrt::V,
     seen: &mut std::collections::HashSet<String>,
+    components: &std::rc::Rc<
+        std::cell::RefCell<std::collections::HashMap<String, ovelo_dexrt::V>>,
+    >,
 ) {
     if !seen.insert(desc.to_string()) {
         return;
@@ -564,10 +580,14 @@ fn run_initializer(
         }
     }
     for d in deps {
-        run_initializer(v, &d, ctx, seen);
+        run_initializer(v, &d, ctx, seen, components);
     }
-    if let Err(e) = v.call_virtual(ih, "create", &[ctx]) {
-        println!("initializer {desc} create failed: {e}");
+    match v.call_virtual(ih, "create", &[ctx]) {
+        Ok(Some(out)) => {
+            components.borrow_mut().insert(desc.to_string(), out);
+        }
+        Ok(None) => {}
+        Err(e) => println!("initializer {desc} create failed: {e}"),
     }
 }
 
@@ -638,6 +658,12 @@ fn run_app(store: &InstallStore, package: &str) -> Result<(), OveloError> {
         let fonts2 = fonts.clone();
         let out = sup.supervise("guest-dispatch", || {
             let ui = ovelo_framework::GuestUi::new(720, 1280, fonts2);
+            // Components returned by initializer `create()` — shared
+            // between the startup pass and `initializeComponent` so a
+            // component initializes once per run.
+            let components = std::rc::Rc::new(std::cell::RefCell::new(
+                std::collections::HashMap::<String, ovelo_dexrt::V>::new(),
+            ));
             let vm = (|| -> Result<_, OveloError> {
                 let (_cd, entries) =
                     parse_central_directory(&bytes, &ZipLimits::default())?;
@@ -681,7 +707,11 @@ fn run_app(store: &InstallStore, package: &str) -> Result<(), OveloError> {
                     .or(info.manifest.theme)
                     .unwrap_or(0);
                 v.enable_aot();
-                register_compat_shims(&mut v, &info.manifest.startup_initializers);
+                register_compat_shims(
+                    &mut v,
+                    &info.manifest.startup_initializers,
+                    components.clone(),
+                );
                 Ok(v)
             })();
             let mut g = vm
@@ -713,6 +743,7 @@ fn run_app(store: &InstallStore, package: &str) -> Result<(), OveloError> {
                                 &format!("L{};", init.replace('.', "/")),
                                 ovelo_dexrt::V::Ref(app_h),
                                 &mut seen,
+                                &components,
                             );
                         }
                     }

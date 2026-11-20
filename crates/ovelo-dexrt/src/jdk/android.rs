@@ -1738,7 +1738,14 @@ fn res_misc(vm: &mut Vm, class: &str, name: &str, args: &[V]) -> Rt<Option<Optio
                     // A @res/ reference: `getResourceId` wants the id
                     // itself; the numeric getters dereference the arsc
                     // entry value (int data or scaled px for dims).
-                    V::I32(id) if (id as u32) >> 24 == 0x7f && name != "getResourceId" => {
+                    // arsc type ids are 1-based, so a literal whose
+                    // type byte is 0 (e.g. color 0x7f00_0000) is a
+                    // value, not a reference.
+                    V::I32(id)
+                        if (id as u32) >> 24 == 0x7f
+                            && (id as u32) >> 16 & 0xff != 0
+                            && name != "getResourceId" =>
+                    {
                         let entry = vm
                             .apk_res
                             .as_ref()
@@ -1765,13 +1772,18 @@ fn res_misc(vm: &mut Vm, class: &str, name: &str, args: &[V]) -> Rt<Option<Optio
             let found = ta_index(vm, args)
                 .and_then(|(h, i)| view::ta_lookup(vm, h, i))
                 .map(|v| match v {
-                    // A @dimen/ reference resolves to its decoded px value.
-                    V::I32(id) if (id as u32) >> 24 == 0x7f => V::F32(
-                        vm.apk_res
-                            .as_ref()
-                            .and_then(|r| r.dimen(id as u32))
-                            .unwrap_or(id as f32),
-                    ),
+                    // A @dimen/ reference resolves to its decoded px
+                    // value (type byte nonzero — see getInt's guard).
+                    V::I32(id)
+                        if (id as u32) >> 24 == 0x7f && (id as u32) >> 16 & 0xff != 0 =>
+                    {
+                        V::F32(
+                            vm.apk_res
+                                .as_ref()
+                                .and_then(|r| r.dimen(id as u32))
+                                .unwrap_or(id as f32),
+                        )
+                    }
                     other => V::F32(f64v(other) as f32),
                 });
             Some(Some(found.unwrap_or(def)))
@@ -1822,7 +1834,17 @@ fn res_misc(vm: &mut Vm, class: &str, name: &str, args: &[V]) -> Rt<Option<Optio
             });
             Some(Some(V::I32(yes as i32)))
         }
-        ("Landroid/content/res/TypedArray;", "length" | "getIndexCount") => {
+        ("Landroid/content/res/TypedArray;", "length") => {
+            // AOSP: `length()` is the requested styleable array's size —
+            // callers iterate 0..length and check `hasValue` per index.
+            let n = match args.first() {
+                Some(V::Ref(h)) => view::ta_attrs(vm, *h).len() as i32,
+                _ => 0,
+            };
+            Some(Some(V::I32(n)))
+        }
+        ("Landroid/content/res/TypedArray;", "getIndexCount") => {
+            // AOSP: the count of attributes that resolved to a value.
             let n = match args.first() {
                 Some(V::Ref(h)) => {
                     let attrs = view::ta_attrs(vm, *h);
