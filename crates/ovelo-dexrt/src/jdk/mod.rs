@@ -415,11 +415,11 @@ pub(crate) fn list_ref(vm: &Vm, h: u32) -> Option<&Vec<V>> {
             state: HostState::List(l),
             ..
         }) => Some(l),
-        // Guest List wrappers (`unmodifiableList`, `synchronizedList`,
-        // checked/immutable views…) are real dex objects that delegate
-        // element access to a backing list held in a field — resolve
-        // that list through the transparent delegates.
-        Some(Obj::Instance { .. }) => match guest_list_handle(vm, h, 8) {
+        // Guest List implementations (desugared `unmodifiableList`/
+        // `Arrays$ArrayList`/`ImmutableCollections` — all R8-renamable,
+        // so matching is structural, not by name): resolve the backing
+        // store they delegate element access to.
+        Some(Obj::Instance { .. }) => match guest_list_backing(vm, h, 8) {
             Some(x) => match vm.heap.get(x) {
                 Some(Obj::Host {
                     state: HostState::List(l),
@@ -433,28 +433,47 @@ pub(crate) fn list_ref(vm: &Vm, h: u32) -> Option<&Vec<V>> {
     }
 }
 
-/// The `HostState::List` a guest List wrapper delegates to, or None.
-/// Only transparent delegates (unmodifiable/synchronized/checked/
-/// immutable views) are followed — a `SubList` carries offset/size
-/// and would report out-of-range elements, and the depth budget ends
-/// reference cycles instead of overflowing the host stack. Every
-/// Ref-valued field is tried: wrapper field order is a HashMap, so
-/// picking the first could follow an auxiliary reference.
-fn guest_list_handle(vm: &Vm, h: u32, depth: u8) -> Option<u32> {
-    if depth == 0 {
+/// Element snapshot of any List-typed value — host lists, arrays, and
+/// guest List implementations whose backing store is reachable. Read
+/// sites that copy the source (`addAll`, `copyOf`, constructors…) use
+/// this instead of `list_ref`, which borrows and so cannot expose an
+/// array-backed guest list.
+pub(crate) fn list_snapshot(vm: &Vm, h: u32) -> Option<Vec<V>> {
+    match vm.heap.get(h) {
+        Some(Obj::Host {
+            state: HostState::List(l),
+            ..
+        }) => Some(l.clone()),
+        Some(Obj::Array { data, .. }) => Some(data.clone()),
+        Some(Obj::Instance { .. }) => {
+            let x = guest_list_backing(vm, h, 8)?;
+            match vm.heap.get(x) {
+                Some(Obj::Host {
+                    state: HostState::List(l),
+                    ..
+                }) => Some(l.clone()),
+                Some(Obj::Array { data, .. }) => Some(data.clone()),
+                _ => None,
+            }
+        }
+        _ => None,
+    }
+}
+
+/// The `HostState::List` or `Obj::Array` a guest List implementation
+/// delegates to, or None. Verified `instanceof List` so arbitrary
+/// guest objects holding collection fields are not misread; direct
+/// backing fields are preferred over nested delegates, and the depth
+/// budget ends reference cycles. A `SubList` collapses to its
+/// parent — slightly wrong (offset/size lost) but strictly better
+/// than empty.
+fn guest_list_backing(vm: &Vm, h: u32, depth: u8) -> Option<u32> {
+    if depth == 0 || !vm.is_guest_list(h) {
         return None;
     }
     let Some(Obj::Instance { fields, .. }) = vm.heap.get(h) else {
         return None;
     };
-    let desc = class_of(vm, V::Ref(h));
-    if !(desc.contains("Unmodifiable")
-        || desc.contains("Synchronized")
-        || desc.contains("Checked")
-        || desc.contains("Immutable"))
-    {
-        return None;
-    }
     let cands: Vec<u32> = fields
         .values()
         .filter_map(|v| match v {
@@ -462,18 +481,22 @@ fn guest_list_handle(vm: &Vm, h: u32, depth: u8) -> Option<u32> {
             _ => None,
         })
         .collect();
-    for x in cands {
-        match vm.heap.get(x) {
+    for &x in &cands {
+        if matches!(
+            vm.heap.get(x),
             Some(Obj::Host {
                 state: HostState::List(_),
                 ..
-            }) => return Some(x),
-            Some(Obj::Instance { .. }) => {
-                if let Some(y) = guest_list_handle(vm, x, depth - 1) {
-                    return Some(y);
-                }
+            }) | Some(Obj::Array { .. })
+        ) {
+            return Some(x);
+        }
+    }
+    for &x in &cands {
+        if let Some(Obj::Instance { .. }) = vm.heap.get(x) {
+            if let Some(y) = guest_list_backing(vm, x, depth - 1) {
+                return Some(y);
             }
-            _ => {}
         }
     }
     None

@@ -53,7 +53,7 @@ fn main() {
                     }
                 }
                 Some(Obj::Instance { fields, .. }) => {
-                    println!("result instance h={h} class={}", vm.class_descriptor_of(h).unwrap_or_default());
+                    println!("result instance h={h} class={}", vm.dbg_class_of(h));
                     for (k, v) in fields {
                         if let V::Ref(x) = v {
                             println!("  field {k} -> h{x} {}", vm.class_descriptor_of(*x).unwrap_or_default());

@@ -227,7 +227,16 @@ fn make_dex_view(info: &ovelo_dexrt::DexViewInfo, fonts: &Rc<FontSet>) -> GuestV
     let lp = (dex_len(info.lp_w), dex_len(info.lp_h));
     let dark = Color::srgb(0x20, 0x20, 0x20);
     if info.is_group {
-        GuestView::Group(ViewGroup::new(lp.0, lp.1))
+        // FrameLayout-style containers (Frame/Relative/Coordinator/
+        // DrawerLayout, ConstraintLayout, decor frames…) lay children
+        // on top of each other — stacking them vertically pushes every
+        // match_parent sibling offscreen and renders a blank window.
+        let g = if info.desc.contains("LinearLayout") || info.desc.contains("TabLayout") {
+            ViewGroup::new(lp.0, lp.1)
+        } else {
+            ViewGroup::overlay(lp.0, lp.1)
+        };
+        GuestView::Group(g)
     } else if info.desc.contains("Button") {
         GuestView::Btn(Button::new("", 16.0, dark, fonts.clone()))
     } else if info.desc.contains("TextView")

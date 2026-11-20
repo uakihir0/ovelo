@@ -481,6 +481,21 @@ impl Vm {
         }
     }
 
+    /// Runtime class descriptor for any heap object handle (debug use).
+    pub fn dbg_class_of(&self, h: u32) -> String {
+        jdk::class_of(self, V::Ref(h))
+    }
+
+    /// True when `h` is (a subclass of) a `java.util.List` guest object.
+    pub(crate) fn is_guest_list(&self, h: u32) -> bool {
+        let Some(Obj::Instance { class_idx, .. }) = self.heap.get(h) else {
+            return false;
+        };
+        self.type_index_of("Ljava/util/List;")
+            .map(|t| self.assignable(*class_idx, t))
+            .unwrap_or(false)
+    }
+
     /// A `java.lang.Class` mirror handle for `desc` (`Ljava/lang/Foo;`).
     /// Mirrors are interned — the same class returns the same handle.
     pub fn class_handle(&mut self, desc: &str) -> u32 {
@@ -1352,7 +1367,7 @@ impl Vm {
     /// `sub` assignable to `sup` through the superclass chain, with
     /// interfaces walked transitively (a class may implement a
     /// sub-interface of `sup` or reach `sup` through another interface).
-    fn assignable(&self, sub: GIdx, sup: GIdx) -> bool {
+    pub(crate) fn assignable(&self, sub: GIdx, sup: GIdx) -> bool {
         // Cross-dex identity is by descriptor: the same class may be a
         // different GIdx in every dex that references it.
         let sup_desc = self.type_desc_of(sup).unwrap_or_default();

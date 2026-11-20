@@ -133,6 +133,8 @@ fn resolve(desired: i32, spec: MeasureSpec) -> i32 {
 
 /// A vertical linear container (`LinearLayout`, vertical orientation):
 /// children stacked top-to-bottom, width = widest child.
+/// `overlay` flips it to FrameLayout-style: every child at the same
+/// origin (RelativeLayout/CoordinatorLayout/DrawerLayout/…).
 pub struct ViewGroup {
     /// The group's own params and measured size.
     pub view: View,
@@ -141,6 +143,8 @@ pub struct ViewGroup {
     /// Child that consumed the current pointer-down (for routing the
     /// release back to the same pressed view).
     pub pressed_child: Option<usize>,
+    /// Overlay (frame) layout instead of vertical stacking.
+    pub overlay: bool,
 }
 
 impl ViewGroup {
@@ -150,11 +154,20 @@ impl ViewGroup {
             view: View::new(lp_w, lp_h, Size::default()),
             children: Vec::new(),
             pressed_child: None,
+            overlay: false,
         }
     }
 
+    /// FrameLayout-style group: children overlay at the same origin.
+    pub fn overlay(lp_w: Length, lp_h: Length) -> Self {
+        let mut g = Self::new(lp_w, lp_h);
+        g.overlay = true;
+        g
+    }
+
     /// Vertical linear measure: width = max child width, height = sum of
-    /// child heights, each resolved against the child spec.
+    /// child heights, each resolved against the child spec. Overlay
+    /// measure: height = max child height.
     pub fn measure(&mut self, w: MeasureSpec, h: MeasureSpec) -> Size {
         let mut mw = 0;
         let mut mh = 0;
@@ -165,19 +178,26 @@ impl ViewGroup {
                 MeasureSpec::for_child(h, lp_h),
             );
             mw = mw.max(cs.w);
-            mh += cs.h;
+            if self.overlay {
+                mh = mh.max(cs.h);
+            } else {
+                mh += cs.h;
+            }
         }
         self.view.desired = Size { w: mw, h: mh };
         self.view.measure(w, h)
     }
 
-    /// Layout children stacked from (left, top).
+    /// Layout children stacked from (left, top), or all at (left, top)
+    /// for an overlay group.
     pub fn layout(&mut self, left: i32, top: i32) {
         self.view.layout(left, top);
         let mut y = top;
         for c in &mut self.children {
             c.layout(left, y);
-            y += c.measured().h;
+            if !self.overlay {
+                y += c.measured().h;
+            }
         }
     }
 }

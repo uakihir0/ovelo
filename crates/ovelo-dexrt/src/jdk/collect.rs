@@ -297,20 +297,14 @@ fn enum_set_call(vm: &mut Vm, name: &str, sig: &str, args: &[V]) -> Rt<Option<Op
         }
         "copyOf" => {
             let src: Vec<V> = match args.first().copied().unwrap_or(V::Ref(0)) {
-                V::Ref(sh) => match list_ref(vm, sh) {
-                    Some(l) => l.clone(),
-                    None => match vm.heap.get(sh) {
-                        Some(Obj::Array { data, .. }) => data.clone(),
-                        _ => vec![],
-                    },
-                },
+                V::Ref(sh) => list_snapshot(vm, sh).unwrap_or_default(),
                 _ => vec![],
             };
             Some(Some(host(vm, "Ljava/util/EnumSet;", HostState::List(src))))
         }
         "complementOf" => {
             let existing: Vec<V> = match args.first().copied().unwrap_or(V::Ref(0)) {
-                V::Ref(sh) => list_ref(vm, sh).cloned().unwrap_or_default(),
+                V::Ref(sh) => list_snapshot(vm, sh).unwrap_or_default(),
                 _ => vec![],
             };
             let desc = existing.first().and_then(|v| class_desc_of_enum(vm, *v));
@@ -341,14 +335,8 @@ fn list_call(vm: &mut Vm, name: &str, sig: &str, args: &[V]) -> Rt<Option<Option
             // elements — the ctor otherwise lands as a no-op stub and
             // silently empties the copy.
             if let Some(V::Ref(sh)) = args.get(1).copied() {
-                let src: Vec<V> = match list_ref(vm, sh) {
-                    Some(l) => l.clone(),
-                    None => match vm.heap.get(sh) {
-                        Some(Obj::Array { data, .. }) => data.clone(),
-                        _ => vec![],
-                    },
-                };
-                if let Some(l) = list_mut(vm, h) {
+                let src = list_snapshot(vm, sh);
+                if let (Some(l), Some(src)) = (list_mut(vm, h), src) {
                     *l = src;
                 }
             }
@@ -368,13 +356,7 @@ fn list_call(vm: &mut Vm, name: &str, sig: &str, args: &[V]) -> Rt<Option<Option
         }
         "addAll" => {
             let src: Vec<V> = match args.last().copied().unwrap_or(V::Ref(0)) {
-                V::Ref(sh) => match list_ref(vm, sh) {
-                    Some(l) => l.clone(),
-                    None => match vm.heap.get(sh) {
-                        Some(Obj::Array { data, .. }) => data.clone(),
-                        _ => vec![],
-                    },
-                },
+                V::Ref(sh) => list_snapshot(vm, sh).unwrap_or_default(),
                 _ => vec![],
             };
             let l = match list_mut(vm, h) {
@@ -1022,7 +1004,7 @@ fn collections_static(vm: &mut Vm, name: &str, args: &[V]) -> Option<Option<V>> 
         "indexOfSubList" | "lastIndexOfSubList" => Some(Some(V::I32(-1))),
         "min" | "max" => {
             let l = match args[0] {
-                V::Ref(h) => list_ref(vm, h).cloned().unwrap_or_default(),
+                V::Ref(h) => list_snapshot(vm, h).unwrap_or_default(),
                 _ => vec![],
             };
             let best = l.into_iter().reduce(|a, b| {
@@ -1049,7 +1031,7 @@ fn collections_static(vm: &mut Vm, name: &str, args: &[V]) -> Option<Option<V>> 
         }
         "frequency" => {
             let n = match args[0] {
-                V::Ref(h) => list_ref(vm, h)
+                V::Ref(h) => list_snapshot(vm, h)
                     .map(|l| l.iter().filter(|e| value_eq(vm, **e, args[1])).count())
                     .unwrap_or(0),
                 _ => 0,
@@ -1081,7 +1063,7 @@ fn collections_static(vm: &mut Vm, name: &str, args: &[V]) -> Option<Option<V>> 
         }
         "enumeration" => {
             let items = match args[0] {
-                V::Ref(h) => list_ref(vm, h).cloned().unwrap_or_default(),
+                V::Ref(h) => list_snapshot(vm, h).unwrap_or_default(),
                 _ => vec![],
             };
             Some(Some(host(
