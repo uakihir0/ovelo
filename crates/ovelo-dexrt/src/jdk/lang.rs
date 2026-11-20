@@ -1463,7 +1463,14 @@ fn thread_call(vm: &mut Vm, name: &str, _sig: &str, args: &[V]) -> Rt<Option<Opt
             HostState::Empty,
         ))),
         "getUncaughtExceptionHandler" | "getDefaultUncaughtExceptionHandler" => {
-            Some(Some(V::Ref(0)))
+            // A null handler turns a worker's death report into an NPE
+            // that masks the real exception — hand back a placeholder;
+            // its uncaughtException dispatch is a builtin no-op.
+            Some(Some(host(
+                vm,
+                "Ljava/lang/Thread$UncaughtExceptionHandler;",
+                HostState::Empty,
+            )))
         }
         "<init>" => {
             // Thread(Runnable[, name]) / Thread(group, Runnable, …):

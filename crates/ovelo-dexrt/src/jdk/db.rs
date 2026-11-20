@@ -147,6 +147,18 @@ fn sql_err(vm: &mut Vm, e: impl std::fmt::Display) -> E {
     )
 }
 
+/// End the outermost transaction level. A failed COMMIT (deferred
+/// FK violation, …) leaves the SQLite transaction open, so roll it
+/// back — otherwise every later beginTransaction fails too.
+fn commit_or_rollback(conn: &mut rusqlite::Connection, ok: bool) {
+    if conn
+        .execute_batch(if ok { "COMMIT" } else { "ROLLBACK" })
+        .is_err()
+    {
+        let _ = conn.execute_batch("ROLLBACK");
+    }
+}
+
 fn v_to_sql(vm: &Vm, v: V) -> SV {
     match v {
         V::I32(i) => SV::Integer(i as i64),
@@ -449,7 +461,20 @@ fn sqlite_call(
                         }
                         d.tx_stack.push(true);
                     }
-                    let res = vm.call_virtual_rt(this, hook, &cb_args);
+                    // Resolve the hook up front: a void callback that
+                    // ran successfully also yields Ok(None), so only a
+                    // missing method may be treated as "no migration".
+                    let ci = vm.heap.class_of(this).unwrap_or(0);
+                    let has_hook = vm
+                        .find_method_on_chain(ci, hook, cb_args.len())
+                        .ok()
+                        .flatten()
+                        .is_some();
+                    let res = if has_hook {
+                        vm.call_virtual_rt(this, hook, &cb_args)
+                    } else {
+                        Ok(None)
+                    };
                     let ok = res.is_ok();
                     if let Ok(db) = conn_of(vm, this) {
                         let mut d = db.borrow_mut();
@@ -457,25 +482,21 @@ fn sqlite_call(
                         if let Some(top) = d.tx_stack.last_mut() {
                             *top &= ok;
                         } else {
-                            let _ = d.conn.execute_batch(if ok {
-                                "COMMIT"
-                            } else {
-                                "ROLLBACK"
-                            });
+                            commit_or_rollback(&mut d.conn, ok);
                         }
                     }
                     match res {
-                        // A helper without the callback can't perform
-                        // the migration — fail like AOSP instead of
-                        // stamping a version the schema doesn't match.
-                        Ok(Some(_)) => {
+                        Ok(_) if has_hook => {
                             if let Ok(db) = conn_of(vm, this) {
                                 let _ = db.borrow().conn.execute_batch(
                                     &format!("PRAGMA user_version={want}"),
                                 );
                             }
                         }
-                        Ok(None) => {
+                        // A helper without the callback can't perform
+                        // the migration — fail like AOSP instead of
+                        // stamping a version the schema doesn't match.
+                        Ok(_) => {
                             return Err(sql_err(
                                 vm,
                                 format!(
@@ -533,7 +554,13 @@ fn sqlite_call(
                 let commit = ok && !d.tx_failed;
                 d.conn
                     .execute_batch(if commit { "COMMIT" } else { "ROLLBACK" })
-                    .map_err(|e| sql_err(vm, e))?;
+                    .map_err(|e| {
+                        // A failed COMMIT (deferred FK violation, …)
+                        // leaves the SQLite transaction open — close it
+                        // or every later beginTransaction fails too.
+                        let _ = d.conn.execute_batch("ROLLBACK");
+                        sql_err(vm, e)
+                    })?;
                 d.tx_failed = false;
             }
             Some(None)

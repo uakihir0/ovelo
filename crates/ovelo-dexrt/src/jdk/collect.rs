@@ -1671,8 +1671,11 @@ fn fieldupdater_call(vm: &mut Vm, name: &str, args: &[V]) -> Rt<Option<Option<V>
     Ok(match name {
         "newUpdater" | "newUpdaterWithImpl" => {
             let h = vm.alloc_host("Ljava/util/concurrent/atomic/AtomicReferenceFieldUpdater;", HostState::Empty);
-            // remember the field name for get/set
-            if let Some(n) = args.get(2).and_then(|v| sv(vm, *v)) {
+            // The field-name argument is last in every newUpdater
+            // signature: (Class,String), (Class,Class,String) and
+            // (Unsafe,Class,String) — indexing args[2] misses the
+            // two-arg Integer/Long variants.
+            if let Some(n) = args.last().and_then(|v| sv(vm, *v)) {
                 let nv = jstr(vm, &n);
                 pseudo_set(vm, h, P_ACTION, nv);
             }
@@ -1691,11 +1694,14 @@ fn fieldupdater_call(vm: &mut Vm, name: &str, args: &[V]) -> Rt<Option<Option<V>
             };
             let fname = pseudo_get(vm, up, P_ACTION).and_then(|v| sv(vm, v));
             let owner = class_of(vm, args[1]);
+            // Unresolved updaters must not share one pseudo-slot — a
+            // Long updater's I32 write would be read back by a Ref
+            // updater aliasing the same key (dexrt.type at iget).
             let fid = fname
                 .as_deref()
                 .and_then(|n| vm.field_index_of(&owner, n))
                 .map(|g| vm.canon_field(g))
-                .unwrap_or(P_DATA as u64);
+                .unwrap_or_else(|| (u64::from(P_DATA) << 32) | u64::from(up));
             match name {
                 "get" => {
                     let v = match vm.heap.get(obj) {
