@@ -25,7 +25,17 @@ fn main() {
                 for (i, ins) in insns.iter().enumerate() {
                     let mut line = format!("  {i:04x} {} regs={:?}", ins.name, ins.regs);
                     if let Some(ix) = ins.idx {
-                        if let Ok(tm) = dex.method(ix) {
+                        let n = ins.name;
+                        if n.starts_with("iget") || n.starts_with("iput")
+                            || n.starts_with("sget") || n.starts_with("sput")
+                        {
+                            if let Ok(f) = dex.field(ix) {
+                                let fo = dex.type_descriptor(f.class_idx.into()).unwrap_or_default();
+                                let fn_ = dex.string(f.name_idx).unwrap_or_default();
+                                let ft = dex.type_descriptor(f.type_idx.into()).unwrap_or_default();
+                                line += &format!(" -> field {fo}.{fn_}:{ft}");
+                            }
+                        } else if let Ok(tm) = dex.method(ix) {
                             let to = dex.type_descriptor(tm.class_idx.into()).unwrap_or_default();
                             let tn = dex.string(tm.name_idx).unwrap_or_default();
                             line += &format!(" -> {to}.{tn}");

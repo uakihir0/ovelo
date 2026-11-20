@@ -415,6 +415,21 @@ pub(crate) fn list_ref(vm: &Vm, h: u32) -> Option<&Vec<V>> {
             state: HostState::List(l),
             ..
         }) => Some(l),
+        // Guest List wrappers (`unmodifiableList`, subList, …) are real
+        // dex objects that hold the backing list in a field — follow
+        // them so List reads see through the wrapper.
+        Some(Obj::Instance { fields, .. }) => {
+            for v in fields.values() {
+                if let V::Ref(x) = v {
+                    if *x != 0 && *x != h {
+                        if let r @ Some(_) = list_ref(vm, *x) {
+                            return r;
+                        }
+                    }
+                }
+            }
+            None
+        }
         _ => None,
     }
 }
