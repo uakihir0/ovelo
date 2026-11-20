@@ -249,11 +249,18 @@ fn file_call(vm: &mut Vm, name: &str, args: &[V]) -> Option<Option<V>> {
         "mkdir" | "mkdirs" => Some(V::I32(
             std::fs::create_dir_all(&std_path).is_ok() as i32,
         )),
-        "delete" => Some(V::I32(
-            std::fs::remove_file(&std_path)
-                .or_else(|_| std::fs::remove_dir_all(&std_path))
-                .is_ok() as i32,
-        )),
+        "delete" => {
+            // `new File("")` maps onto the storage root — deleting it
+            // would wipe the whole sandbox, which a failed delete must
+            // never do.
+            let guarded = std_path == vm.guest_root;
+            Some(V::I32(
+                (!guarded
+                    && (std::fs::remove_file(&std_path)
+                        .or_else(|_| std::fs::remove_dir_all(&std_path))
+                        .is_ok())) as i32,
+            ))
+        }
         "createNewFile" => Some(V::I32(
             std::fs::OpenOptions::new()
                 .write(true)
