@@ -217,6 +217,11 @@ pub struct Vm {
     /// Nesting depth of inline drains issued from `park` — bounds the
     /// recursion when a task inside such a drain parks again.
     pub(crate) park_depth: u32,
+    /// Runnables that re-parked inside a drain — when the queue holds
+    /// only these, draining them again just makes two waiting workers
+    /// hand the slot back and forth until the instruction budget
+    /// kills one (and its task is lost).
+    reparked: std::collections::HashSet<u32>,
     /// Activity a guest `startActivity` asked to launch — (class
     /// descriptor, the Intent the caller passed). The runner drains
     /// it into a real second-Activity dispatch.
@@ -311,6 +316,7 @@ impl Vm {
             pending_runnables: std::collections::VecDeque::new(),
             draining: false,
             park_depth: 0,
+            reparked: std::collections::HashSet::new(),
             field_idx_cache: std::cell::RefCell::new(HashMap::new()),
             class_mirrors: HashMap::new(),
             granted_permissions: std::collections::HashSet::new(),
@@ -1002,6 +1008,16 @@ impl Vm {
         if self.pending_runnables.is_empty() || self.park_depth >= 8 {
             return Err(E::Vm(err("ovelo.park")));
         }
+        // Every queued runnable already re-parked once — draining them
+        // makes no progress (two waiting workers requeueing each
+        // other), so yield instead of burning the budget in a spin.
+        if !self
+            .pending_runnables
+            .iter()
+            .any(|(r, _)| !self.reparked.contains(r))
+        {
+            return Err(E::Vm(err("ovelo.park")));
+        }
         self.park_depth += 1;
         let was = self.draining;
         self.draining = false;
@@ -1039,12 +1055,16 @@ impl Vm {
                     ),
                 }
             }
-            if let Err(e) = out {
-                // A parked worker yields its slot and reschedules —
-                // the runnable re-enters `run()` on a later drain and
-                // re-scans its own work queue (coroutine schedulers).
-                if e.cause() == "ovelo.park" {
+            match &out {
+                Err(e) if e.cause() == "ovelo.park" => {
+                    // A parked worker yields its slot and reschedules —
+                    // the runnable re-enters `run()` on a later drain
+                    // and re-scans its own work queue.
+                    self.reparked.insert(r);
                     self.pending_runnables.push_back((r, on_main));
+                }
+                _ => {
+                    self.reparked.remove(&r);
                 }
             }
         }
@@ -1338,6 +1358,11 @@ impl Vm {
                             // interfaces may still satisfy `sup`.
                             break 'cls;
                         };
+                        if next == d {
+                            // Self-referential supers entry would loop
+                            // forever — treat as a dead end.
+                            break 'cls;
+                        }
                         match self.type_index_of(next) {
                             Some(next) => {
                                 cur = next;
