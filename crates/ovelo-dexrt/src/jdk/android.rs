@@ -1654,22 +1654,22 @@ fn resources_call(vm: &mut Vm, name: &str, args: &[V]) -> Rt<Option<Option<V>>> 
             Some(Some(V::I32(hit as i32)))
         }
         "getDrawable" | "getDrawableForDensity" => {
-            // AppCompat's ResourceManagerInternal rejects a framework-
-            // returned drawable that isn't the app's own
-            // VectorDrawableCompat ("configure your build for
-            // VectorDrawableCompat"). When the APK bundles androidx
-            // vectordrawable, hand back a guest instance so the
-            // instanceof check passes; otherwise a host drawable.
+            // AppCompat's ResourceManagerInternal throws when the
+            // drawable is not a bundled VectorDrawableCompat AND its
+            // class is literally `android.graphics.drawable.VectorDrawable`
+            // ("configure your build for VectorDrawableCompat"). When the
+            // APK bundles androidx vectordrawable, hand back a guest
+            // instance so the instanceof check passes; otherwise a plain
+            // framework Drawable — any other class name passes through to
+            // the normal inflate path.
             let d = [
                 "Landroidx/vectordrawable/graphics/drawable/VectorDrawableCompat;",
                 "Landroid/support/graphics/drawable/VectorDrawableCompat;",
             ]
             .iter()
             .find_map(|c| vm.instantiate(c).ok().map(V::Ref))
-            // No compat class bundled → the framework type satisfies
-            // appcompat's `instanceof VectorDrawable` check.
             .unwrap_or_else(|| {
-                host(vm, "Landroid/graphics/drawable/VectorDrawable;", HostState::Empty)
+                host(vm, "Landroid/graphics/drawable/Drawable;", HostState::Empty)
             });
             Some(Some(d))
         }

@@ -1651,14 +1651,14 @@ pub(crate) fn host_supers(d: &str) -> &'static [&'static str] {
         | "Landroid/graphics/Paint$Align;" | "Landroid/graphics/Paint$Cap;"
         | "Landroid/graphics/Paint$Join;" | "Landroid/graphics/Paint$FontMetrics;"
         | "Landroid/graphics/drawable/Drawable;" | "Landroid/graphics/drawable/Drawable$Callback;"
-        | "Landroid/graphics/drawable/VectorDrawable;"
-        | "Landroid/graphics/drawable/AnimatedVectorDrawable;"
         | "Landroid/graphics/drawable/PaintDrawable;"
         | "Landroid/graphics/drawable/shapes/Shape;"
         | "Landroid/graphics/drawable/shapes/RectShape;"
         | "Landroid/graphics/drawable/shapes/OvalShape;"
         | "Landroid/graphics/drawable/shapes/RoundRectShape;" => &[OBJ],
-        "Landroid/graphics/drawable/ColorDrawable;" => {
+        "Landroid/graphics/drawable/VectorDrawable;"
+        | "Landroid/graphics/drawable/AnimatedVectorDrawable;"
+        | "Landroid/graphics/drawable/ColorDrawable;" => {
             &["Landroid/graphics/drawable/Drawable;", OBJ]
         }
         "Landroid/graphics/drawable/BitmapDrawable;" => {
