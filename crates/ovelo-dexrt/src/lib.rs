@@ -486,6 +486,18 @@ impl Vm {
         jdk::class_of(self, V::Ref(h))
     }
 
+    /// Debug: the `Class.field` name for a canonical global field index.
+    pub fn dbg_field_name(&self, g: u64) -> String {
+        self.dex_of(g)
+            .and_then(|d| {
+                let f = d.field(gl(g)).ok()?;
+                let name = d.string(f.name_idx).ok()?;
+                let owner = d.type_descriptor(f.class_idx as u32).ok()?;
+                Some(format!("{owner}.{name}"))
+            })
+            .unwrap_or_else(|| format!("g{g}"))
+    }
+
     /// Debug: the superclass chain of `desc`, used by view debugging.
     pub fn dbg_super_chain(&self, desc: &str) -> Vec<String> {
         let mut out = Vec::new();
@@ -3146,10 +3158,12 @@ impl Vm {
         let local_idx = if gd(field) == gd(cg) {
             gl(field)
         } else {
-            let name = self
+            let (name, ty) = self
                 .dex_of(field)
-                .and_then(|d| d.field(gl(field)).ok())
-                .and_then(|f| self.dex_of(field).and_then(|d| d.string(f.name_idx).ok()))?;
+                .and_then(|d| {
+                    let f = d.field(gl(field)).ok()?;
+                    Some((d.string(f.name_idx).ok()?, d.type_descriptor(f.type_idx as u32).ok()?))
+                })?;
             let cd = self.dex_of(cg)?.class_data(def).ok()?;
             let mut found = None;
             for f in &cd.static_fields {
@@ -3159,7 +3173,10 @@ impl Vm {
                 let Ok(n) = self.dex_of(cg)?.string(fr.name_idx) else {
                     continue;
                 };
-                if n == name {
+                let Ok(t) = self.dex_of(cg)?.type_descriptor(fr.type_idx as u32) else {
+                    continue;
+                };
+                if n == name && t == ty {
                     found = Some(f.field_idx);
                     break;
                 }

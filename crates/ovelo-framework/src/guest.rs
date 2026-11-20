@@ -797,6 +797,26 @@ pub fn drive_dex_layout_pass(vm: &mut Vm, activity: u32, frame: u32) {
                 };
                 eprintln!("[viewdbg] pager {h} ref-fields: {fields:?}");
             }
+            if std::env::var_os("OVELO_VIEWDBG").is_some()
+                && info.desc.contains("RecyclerView")
+            {
+                let fields: Vec<String> = match vm.heap().get(h) {
+                    Some(ovelo_dexrt::Obj::Instance { fields, .. })
+                    | Some(ovelo_dexrt::Obj::Host { fields, .. }) => fields
+                        .iter()
+                        .map(|(k, v)| {
+                            let vs = match v {
+                                V::Ref(x) => format!("h{x}"),
+                                V::I32(x) => format!("{x}"),
+                                other => format!("{other:?}"),
+                            };
+                            format!("{}={vs}", vm.dbg_field_name(*k))
+                        })
+                        .collect(),
+                    _ => Vec::new(),
+                };
+                eprintln!("[viewdbg] recycler {h} fields: {fields:?}");
+            }
         }
         // Re-snapshot: the layout pass may have attached children.
         let kids = vm.dex_view(h).map(|i| i.children).unwrap_or_default();
