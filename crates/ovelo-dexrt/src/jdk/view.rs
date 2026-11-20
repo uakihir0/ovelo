@@ -740,6 +740,18 @@ pub(crate) fn call(
             };
             if let (Some(cf), V::Ref(cv)) = (content_frame_of(vm, this), content) {
                 attach(vm, cf, V::Ref(cv));
+                // The renderer keys content off the owning Activity's
+                // P_CONTENT — mirror it there (the window's owner was
+                // stored on P_TARGET by window_of).
+                if cv != 0 {
+                    if let V::Ref(owner) =
+                        pseudo_get(vm, this, P_TARGET).unwrap_or(V::Ref(0))
+                    {
+                        if owner != 0 {
+                            pseudo_set(vm, owner, P_CONTENT, V::Ref(cv));
+                        }
+                    }
+                }
             }
             Some(None)
         }
