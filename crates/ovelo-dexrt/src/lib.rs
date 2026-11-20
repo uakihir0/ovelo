@@ -1449,6 +1449,13 @@ impl Vm {
                         }
                     }
                 }
+            } else if let Ok(id) = self.type_desc_of(i) {
+                // JDK interface absent from the dex (java.util.Set,
+                // Iterable, …) — its super-interfaces live in the
+                // builtin/host tables.
+                if self.assignable_desc(&id, &sup_desc) {
+                    return true;
+                }
             }
         }
         false
