@@ -340,9 +340,17 @@ fn run_app(store: &InstallStore, package: &str) -> Result<(), OveloError> {
                 if dex_files.is_empty() {
                     return Err(err("cli.dex.missing"));
                 }
+                // The launcher class must be *defined* in the dex — a
+                // type reference alone (type_index_of) is satisfied by
+                // dexes that only invoke it.
                 let pos = dex_files
                     .iter()
-                    .position(|d| d.type_index_of(&desc).ok().flatten().is_some())
+                    .position(|d| {
+                        d.class_defs().iter().any(|cd| {
+                            d.type_descriptor(cd.class_idx).ok().as_deref()
+                                == Some(desc.as_str())
+                        })
+                    })
                     .unwrap_or(0);
                 let mut v = ovelo_dexrt::Vm::new(dex_files.swap_remove(pos))?;
                 v.guest_root = data_dir.join("files");
