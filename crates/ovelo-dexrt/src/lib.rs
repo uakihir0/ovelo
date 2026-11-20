@@ -214,6 +214,9 @@ pub struct Vm {
     pub pending_runnables: std::collections::VecDeque<(u32, bool)>,
     /// Reentrancy guard for `drain_runnables`.
     pub(crate) draining: bool,
+    /// Nesting depth of inline drains issued from `park` — bounds the
+    /// recursion when a task inside such a drain parks again.
+    pub(crate) park_depth: u32,
     /// Activity a guest `startActivity` asked to launch — (class
     /// descriptor, the Intent the caller passed). The runner drains
     /// it into a real second-Activity dispatch.
@@ -307,6 +310,7 @@ impl Vm {
             pending_activity: None,
             pending_runnables: std::collections::VecDeque::new(),
             draining: false,
+            park_depth: 0,
             field_idx_cache: std::cell::RefCell::new(HashMap::new()),
             class_mirrors: HashMap::new(),
             granted_permissions: std::collections::HashSet::new(),
@@ -843,6 +847,22 @@ impl Vm {
         }
     }
 
+    /// `field_index_of` walking the superclass chain — atomic field
+    /// updaters resolve against the target's runtime class, but the
+    /// field is usually declared on a base class (JobSupport's
+    /// `_state`); missing it reads a fallback slot that's always null.
+    pub(crate) fn field_index_on_chain(&self, owner: &str, name: &str) -> Option<GIdx> {
+        let mut cur = Some(owner.to_string());
+        for _ in 0..32 {
+            let d = cur?;
+            if let Some(g) = self.field_index_of(&d, name) {
+                return Some(g);
+            }
+            cur = self.super_desc(&d);
+        }
+        None
+    }
+
     /// Superclass descriptor for a class by name — the dex class def
     /// when present, else the framework `host_supers` table.
     pub(crate) fn super_desc(&self, desc: &str) -> Option<String> {
@@ -964,6 +984,31 @@ impl Vm {
             self.drain_runnables(500);
         }
         out
+    }
+
+    /// `LockSupport.park` semantics on a single shared queue: the
+    /// parked Java frame can't resume later, so run queued work
+    /// inline (the task that completes the wait unparks / stores the
+    /// result) and let the caller's event loop re-check its own
+    /// queue. Nested drains are bounded by `park_depth`; past the cap
+    /// we fall back to the preempt-and-requeue unwind, which is
+    /// correct for queue-scanning worker loops (they re-scan on
+    /// re-entry) but makes runBlock-style callers redo work — hence
+    /// the generous cap.
+    pub(crate) fn park_drain(&mut self) -> std::result::Result<(), E> {
+        // Nothing queued anywhere: an inline drain can't complete the
+        // wait, so yield by unwinding — the drain loop requeues the
+        // runnable (queue-scanning workers rescan on re-entry).
+        if self.pending_runnables.is_empty() || self.park_depth >= 8 {
+            return Err(E::Vm(err("ovelo.park")));
+        }
+        self.park_depth += 1;
+        let was = self.draining;
+        self.draining = false;
+        self.drain_runnables(64);
+        self.draining = was;
+        self.park_depth -= 1;
+        Ok(())
     }
 
     /// Run enqueued async work FIFO — `Thread.start`/`Executor.execute`
@@ -2137,7 +2182,7 @@ impl Vm {
 
     /// Execute one frame to return or throw.
     fn exec(&mut self, loc: Loc, args: Vec<V>) -> Rt<Option<V>> {
-        if self.depth >= 96 {
+        if self.depth >= 512 {
             return Err(self.throw_builtin(
                 "Ljava/lang/StackOverflowError;",
                 "call depth exceeded",
@@ -2223,9 +2268,9 @@ impl Vm {
                                 format!("{descriptor} {detail}")
                             }
                             Some(Obj::Host { desc, .. }) => desc.clone(),
-                            Some(Obj::Instance { class_idx, .. }) => {
-                                format!("instance(class_idx={class_idx})")
-                            }
+                            Some(Obj::Instance { class_idx, .. }) => self
+                                .type_desc_of(*class_idx)
+                                .unwrap_or_else(|_| format!("instance(class_idx={class_idx})")),
                             _ => format!("h{r}"),
                         };
                         eprintln!(

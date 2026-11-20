@@ -222,10 +222,11 @@ pub(crate) fn call(
             "isDone" | "isCancelled" => Some(Some(V::I32(1))),
             "cancel" => Some(Some(V::I32(1))),
             "park" | "parkNanos" | "parkUntil" => {
-                // LockSupport.park* — same preempt-and-requeue contract
-                // as Unsafe.park (coroutine schedulers park their
-                // workers here when no task is ready).
-                return Err(crate::E::Vm(crate::err("ovelo.park")));
+                // LockSupport.park* — run queued work inline so the
+                // waiter sees its completion (see `park_drain`); past
+                // the nesting cap it falls back to unwind+requeue.
+                vm.park_drain()?;
+                Some(None)
             }
             "offer" | "add" | "put" | "take" | "poll" | "remove" => {
                 if matches!(name, "add" | "offer") {
@@ -1698,10 +1699,12 @@ fn fieldupdater_call(vm: &mut Vm, name: &str, args: &[V]) -> Rt<Option<Option<V>
             // Long updater's I32 write would be read back by a Ref
             // updater aliasing the same key (dexrt.type at iget). Key
             // the fallback by field name so two updaters for the same
-            // unresolved field still see each other's writes.
+            // unresolved field still see each other's writes. The
+            // field is usually declared on a superclass of `owner`
+            // (JobSupport._state), so walk the chain, not just owner.
             let fid = fname
                 .as_deref()
-                .and_then(|n| vm.field_index_of(&owner, n))
+                .and_then(|n| vm.field_index_on_chain(&owner, n))
                 .map(|g| vm.canon_field(g))
                 .unwrap_or_else(|| {
                     let key = match &fname {

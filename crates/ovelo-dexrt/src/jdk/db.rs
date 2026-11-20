@@ -85,6 +85,14 @@ fn conn_for(vm: &mut Vm, name: &str) -> Result<Rc<RefCell<Db>>, E> {
         AuthAction::Attach { .. } | AuthAction::Detach { .. } => Authorization::Deny,
         _ => Authorization::Allow,
     }));
+    // Android extends SQLite's built-ins (BINARY/NOCASE/RTRIM) with
+    // UNICODE (ICU, locale-independent) and LOCALIZED (locale-aware)
+    // collations — Room emits `COLLATE UNICODE` in its queries.
+    for name in ["UNICODE", "LOCALIZED"] {
+        let _ = conn.create_collation(name, |a, b| {
+            a.to_lowercase().cmp(&b.to_lowercase())
+        });
+    }
     let d = Rc::new(RefCell::new(Db {
         conn,
         tx_stack: Vec::new(),

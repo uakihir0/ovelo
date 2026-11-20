@@ -2325,10 +2325,11 @@ fn unsafe_call(vm: &mut Vm, name: &str, args: &[V]) -> Rt<Option<Option<V>>> {
             });
         }
         "park" => {
-            // Parked = preempted: unwind the runnable and requeue it at
-            // the back of the work queue (see `drain_runnables`) so a
-            // parked worker yields instead of spinning at full speed.
-            return Err(crate::E::Vm(crate::err("ovelo.park")));
+            // Parked threads can't resume their Java stack, so run
+            // queued work inline (see `park_drain`); past the nesting
+            // cap it falls back to the preempt-and-requeue unwind.
+            vm.park_drain()?;
+            return Ok(Some(None));
         }
         "loadFence" | "storeFence" | "fullFence" | "unpark"
         | "monitorEnter" | "monitorExit" => None,

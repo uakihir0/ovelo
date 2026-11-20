@@ -1793,6 +1793,32 @@ pub(crate) fn host_supers(d: &str) -> &'static [&'static str] {
         | "Landroid/database/sqlite/SQLiteProgram;"
         | "Landroid/database/sqlite/SQLiteQueryBuilder;"
         | "Landroid/database/CursorIndexOutOfBoundsException;" => &[OBJ],
+        // android.database exceptions — SQLite*Exception extends
+        // SQLException extends RuntimeException (AOSP).
+        "Landroid/database/SQLException;" | "Landroid/database/sqlite/SQLiteException;"
+        | "Landroid/database/sqlite/SQLiteDatabaseCorruptException;"
+        | "Landroid/database/sqlite/SQLiteConstraintException;"
+        | "Landroid/database/sqlite/SQLiteDiskIOException;"
+        | "Landroid/database/sqlite/SQLiteFullException;"
+        | "Landroid/database/sqlite/SQLiteReadOnlyDatabaseException;"
+        | "Landroid/database/sqlite/SQLiteTableLockedException;"
+        | "Landroid/database/sqlite/SQLiteDatabaseLockedException;"
+        | "Landroid/database/sqlite/SQLiteAbortException;"
+        | "Landroid/database/sqlite/SQLiteAccessPermException;"
+        | "Landroid/database/sqlite/SQLiteBindOrColumnIndexOutOfRangeException;"
+        | "Landroid/database/sqlite/SQLiteBlobTooBigException;"
+        | "Landroid/database/sqlite/SQLiteCantOpenDatabaseException;"
+        | "Landroid/database/sqlite/SQLiteDoneException;"
+        | "Landroid/database/sqlite/SQLiteMisuseException;"
+        | "Landroid/database/sqlite/SQLiteOutOfMemoryException;"
+        | "Landroid/database/StaleDataException;"
+        | "Landroid/database/CursorWindowAllocationException;" => &[
+            "Landroid/database/SQLException;",
+            "Ljava/lang/RuntimeException;",
+            "Ljava/lang/Exception;",
+            THROWABLE,
+            OBJ,
+        ],
         "Landroid/provider/Settings;" | "Landroid/provider/Settings$System;"
         | "Landroid/provider/Settings$Secure;" | "Landroid/provider/Settings$Global;"
         | "Landroid/provider/MediaStore;" | "Landroid/provider/ContactsContract;"
