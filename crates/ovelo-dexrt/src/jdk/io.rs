@@ -346,11 +346,14 @@ fn file_call(vm: &mut Vm, name: &str, args: &[V]) -> Option<Option<V>> {
         "getFreeSpace" | "getTotalSpace" | "getUsableSpace" => {
             Some(V::I64(1i64 << 32))
         }
-        // Hidden on Android == name starts with '.', like Unix.
+        // Hidden on Android == getName() starts with '.' — Java's
+        // getName is the raw last segment, so "." and ".." count too
+        // (std::path's file_name would normalize them away).
         "isHidden" => Some(V::I32(
-            std::path::Path::new(&path)
-                .file_name()
-                .is_some_and(|n| n.to_string_lossy().starts_with('.'))
+            path.trim_end_matches('/')
+                .rsplit('/')
+                .next()
+                .is_some_and(|n| n.starts_with('.'))
                 as i32,
         )),
         "setReadable" | "setWritable" | "setExecutable" | "setReadOnly"
