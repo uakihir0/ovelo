@@ -38,7 +38,7 @@ pub(crate) fn call(
     } else if desc_is_a(class, THROWABLE) {
         throwable_call(vm, name, sig, args)?
     } else if class == "Ljava/lang/Enum;" || desc_is_a(class, "Ljava/lang/Enum;") {
-        enum_call(vm, name, args)?
+        enum_call(vm, class, name, args)?
     } else if class == "Ljava/lang/StackTraceElement;" {
         stacktrace_call(vm, name, args)
     } else if class.starts_with("Ljava/lang/reflect/") {
@@ -49,6 +49,22 @@ pub(crate) fn call(
         || class == "Ljava/lang/ref/PhantomReference;"
     {
         match name {
+            "<init>" => {
+                // Reference(referent[, queue]): keep the referent —
+                // androidx stores the LifecycleOwner in a WeakReference
+                // and reads it back to gate performRestore.
+                let this = args.first().copied().unwrap_or(V::Ref(0));
+                if let (V::Ref(h), Some(&v)) = (this, args.get(1)) {
+                    if let Some(Obj::Host {
+                        state: HostState::Slot(slot),
+                        ..
+                    }) = vm.heap.get_mut(h)
+                    {
+                        *slot = v;
+                    }
+                }
+                Some(None)
+            }
             "get" => Some(Some(match args[0] {
                 V::Ref(h) => slot_of(vm, h).unwrap_or(V::Ref(0)),
                 _ => V::Ref(0),
@@ -1495,20 +1511,87 @@ fn throwable_call(vm: &mut Vm, name: &str, _sig: &str, args: &[V]) -> Rt<Option<
     })
 }
 
-fn enum_call(vm: &mut Vm, name: &str, args: &[V]) -> Rt<Option<Option<V>>> {
+/// `SomeEnum.values()` — the constants are the class's static fields
+/// of its own type, already initialized by `<clinit>` into `statics`.
+fn enum_values(vm: &mut Vm, class: &str) -> V {
+    let mut vals = Vec::new();
+    for cd in vm.dex.class_defs() {
+        if vm.dex.type_descriptor(cd.class_idx).ok().as_deref() != Some(class) {
+            continue;
+        }
+        let Ok(data) = vm.dex.class_data(cd) else { continue };
+        for ef in &data.static_fields {
+            let is_const = vm
+                .dex
+                .field(ef.field_idx)
+                .ok()
+                .and_then(|f| vm.dex.type_descriptor(f.type_idx as u32).ok())
+                .as_deref()
+                == Some(class);
+            if is_const {
+                if let Some(v) = vm.static_of(cd.class_idx, ef.field_idx) {
+                    vals.push(v);
+                }
+            }
+        }
+    }
+    arr(vm, class, vals)
+}
+
+fn enum_call(vm: &mut Vm, class: &str, name: &str, args: &[V]) -> Rt<Option<Option<V>>> {
     Ok(match name {
+        "<init>" => {
+            // Enum(name, ordinal) — the base ctor is a stub, so keep
+            // both on pseudo fields for name()/ordinal()/compareTo.
+            let this = args.first().copied().unwrap_or(V::Ref(0));
+            if let V::Ref(h) = this {
+                if let Some(&n) = args.get(1) {
+                    pseudo_set(vm, h, P_DATA, n);
+                }
+                if let Some(&o) = args.get(2) {
+                    pseudo_set(vm, h, P_FLAGS, o);
+                }
+            }
+            Some(None)
+        }
         "name" | "toString" => {
-            let n = s(vm, match args[0] { V::Ref(h) => h, _ => 0 })
+            let h = match args[0] { V::Ref(h) => h, _ => 0 };
+            let n = pseudo_get(vm, h, P_DATA)
+                .and_then(|v| sv(vm, v))
+                .or_else(|| s(vm, h))
                 .unwrap_or_else(|| "ENUM".into());
             Some(Some(jstr(vm, &n)))
         }
-        "ordinal" => Some(Some(V::I32(0))),
+        "ordinal" => Some(Some(match args[0] {
+            V::Ref(h) => pseudo_get(vm, h, P_FLAGS).unwrap_or(V::I32(0)),
+            _ => V::I32(0),
+        })),
+        "compareTo" => {
+            // ordinal difference — Lifecycle gates like
+            // `state.compareTo(CREATED) >= 0` hang on this.
+            let ord = |v: V| match v {
+                V::Ref(h) => i64v(pseudo_get(vm, h, P_FLAGS).unwrap_or(V::I32(0))),
+                _ => 0,
+            };
+            let d = ord(args[0]) - ord(args[1]);
+            Some(Some(V::I32(d.signum() as i32)))
+        }
         "getDeclaringClass" => Some(Some(class_obj(vm, "Ljava/lang/Enum;".into()))),
         "valueOf" => {
             let n = sv(vm, args[1]).unwrap_or_default();
             Some(Some(host(vm, "Ljava/lang/Enum;", HostState::StrBuf(n))))
         }
-        "values" => Some(Some(arr(vm, OBJ, vec![]))),
+        "values" => {
+            let a = enum_values(vm, class);
+            if std::env::var_os("OVELO_TRACE").is_some() {
+                let n = match vm.heap.get(match a { V::Ref(h) => h, _ => 0 }) {
+                    Some(Obj::Array { data, .. }) => data.len(),
+                    _ => usize::MAX,
+                };
+                eprintln!("[trace] Enum.values() on {class} -> {n} constants");
+            }
+            Some(Some(a))
+        }
         "describeConstable" => Some(Some(V::Ref(0))),
         _ => None,
     })

@@ -1237,7 +1237,7 @@ fn context_call(
                 ))),
                 "getMaxNumPictureInPictureActions" => Some(Some(V::I32(0))),
                 "onProvideKeyboardShortcuts" => Some(None),
-                _ => Some(Some(V::Ref(0))),
+                _ => Some(Some(stub_ret(vm, sig))),
             }
         }
         "runOnUiThread" => {

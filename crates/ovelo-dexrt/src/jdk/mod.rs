@@ -119,6 +119,22 @@ pub(crate) fn main_thread(vm: &mut Vm) -> V {
     V::Ref(vm.main_thread_h)
 }
 
+/// Default return for an uncovered method, by its signature —
+/// object/array types get a typed placeholder (never null, so chained
+/// framework calls keep flowing), String gets "", primitives 0.
+pub(crate) fn stub_ret(vm: &mut Vm, sig: &str) -> V {
+    match ret(sig) {
+        "V" => V::I32(0),
+        "Ljava/lang/String;" => jstr(vm, ""),
+        r if r.starts_with('[') => V::Ref(vm.heap.alloc(Obj::Array {
+            elem: r[1..].to_string(),
+            data: Vec::new(),
+        })),
+        r if r.starts_with('L') => host(vm, r, HostState::Empty),
+        _ => V::I32(0),
+    }
+}
+
 /// `Class` mirror object carrying the named descriptor.
 pub(crate) fn class_obj(vm: &mut Vm, desc: String) -> V {
     host(vm, "Ljava/lang/Class;", HostState::StrBuf(desc))
@@ -488,8 +504,9 @@ fn universal(
         }
         "clone" => Some(Some(args[0])),
         "notify" | "notifyAll" | "wait" | "finalize" => Some(None),
-        "compareTo" if args.len() == 2 => {
-            // Generic compareTo: boxed numbers and strings only.
+        "compareTo" if args.len() == 2 && !desc_is_a(class, "Ljava/lang/Enum;") => {
+            // Generic compareTo: boxed numbers and strings only;
+            // enums compare by ordinal in `enum_call`.
             let c = collect::natural_cmp(vm, args[0], args[1]);
             Some(Some(V::I32(c)))
         }

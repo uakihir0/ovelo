@@ -1391,6 +1391,18 @@ fn atomic_call(vm: &mut Vm, class: &str, name: &str, args: &[V]) -> Option<Optio
         return None;
     };
     match name {
+        "<init>" => {
+            // AtomicX(v): seed the slot — otherwise `get()` reads 0
+            // where the guest just stored an object.
+            if let Some(Obj::Host {
+                state: HostState::Slot(v),
+                ..
+            }) = vm.heap.get_mut(h)
+            {
+                *v = args.get(1).copied().unwrap_or(V::I32(0));
+            }
+            None
+        }
         "get" | "getOpaque" | "getAcquire" | "getPlain" => {
             Some(slot_of(vm, h).unwrap_or(V::I32(0)))
         }

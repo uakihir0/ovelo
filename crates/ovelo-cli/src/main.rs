@@ -83,6 +83,12 @@ enum Cmd {
     Run { app: String },
     Diagnose { apk: PathBuf, json: bool },
     Gate { path: PathBuf },
+    /// Disassemble a dex method for debugging (`apk class.method?`).
+    Disas {
+        apk: PathBuf,
+        class: String,
+        method: Option<String>,
+    },
     Help,
 }
 
@@ -107,10 +113,15 @@ fn parse_args(argv: &[String]) -> Result<Cmd, OveloError> {
     }
     // `install` accepts a split set (base + config.* APKs); every other
     // subcommand takes exactly one positional arg.
+    let (min_args, max_args) = match sub {
+        "install" => (1, usize::MAX),
+        "disas" => (2, 3),
+        _ => (1, 1),
+    };
     if sub != "help"
         && sub != "--help"
         && sub != "-h"
-        && (pos.is_empty() || unknown_flag || (sub != "install" && pos.len() != 1))
+        && (unknown_flag || pos.len() < min_args || pos.len() > max_args)
     {
         return Err(err("cli.usage"));
     }
@@ -130,6 +141,11 @@ fn parse_args(argv: &[String]) -> Result<Cmd, OveloError> {
             json,
         }),
         ("gate", Some(p)) => Ok(Cmd::Gate { path: p.into() }),
+        ("disas", Some(a)) => Ok(Cmd::Disas {
+            apk: a.into(),
+            class: pos.get(1).map(|s| s.to_string()).unwrap_or_default(),
+            method: pos.get(2).map(|s| s.to_string()),
+        }),
         ("help", _) | ("--help", _) | ("-h", _) => Ok(Cmd::Help),
         _ => Err(err("cli.usage")),
     }
@@ -233,6 +249,84 @@ fn verify_dexes(bytes: &[u8], info: &ApkInfo) -> Result<Vec<DexReport>, OveloErr
         });
     }
     Ok(out)
+}
+
+/// Disassemble the methods of `class` (descriptor like
+/// `Lpkg/Foo;`) in the APK's dexes — debugging aid for guest crashes.
+fn disas(apk: &[u8], class: &str, method: Option<&str>) -> Result<(), OveloError> {
+    let (_cd, entries) = parse_central_directory(apk, &ZipLimits::default())?;
+    for e in entries
+        .iter()
+        .filter(|e| e.name.starts_with("classes") && e.name.ends_with(".dex"))
+    {
+        let dex = DexFile::open(read_entry(apk, e)?)?;
+        for (class_idx, em) in dex.methods()? {
+            if dex.type_descriptor(class_idx).ok().as_deref() != Some(class) {
+                continue;
+            }
+            let mid = dex.method(em.method_idx)?;
+            let name = dex.string(mid.name_idx)?;
+            if let Some(want) = method {
+                if name != want {
+                    continue;
+                }
+            }
+            println!("{class}.{name} [{e_name}]", e_name = e.name);
+            let Some(code) = dex.code_item(em.code_off)? else {
+                continue;
+            };
+            for i in ovelo_dex::decode_all(&code.insns)? {
+                if i.is_payload() {
+                    continue;
+                }
+                let mut line = format!(
+                    "  {:04x} {:<22}",
+                    i.offset,
+                    i.name
+                );
+                if !i.regs.is_empty() {
+                    line.push_str(&format!(" v{:?}", i.regs));
+                }
+                if let Some(idx) = i.idx {
+                    line.push_str(&format!(" #{} {}", idx, resolve_idx(&dex, i.opcode, idx)));
+                }
+                if let Some(t) = i.target {
+                    line.push_str(&format!(" -> {:04x}", t));
+                }
+                println!("{line}");
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Best-effort operand resolution for a dex table index.
+fn resolve_idx(dex: &DexFile, op: u8, idx: u32) -> String {
+    let r = match op {
+        // const-string
+        0x1a | 0x1b => dex.string(idx).map(|s| format!("\"{s}\"")),
+        // type-table ops (const-class, cast, instanceof, new, arrays)
+        0x1c | 0x1f..=0x26 => dex.type_descriptor(idx),
+        // instance + static fields
+        0x52..=0x6d => dex.field(idx).and_then(|f| {
+            Ok(format!(
+                "{}.{}:{}",
+                dex.type_descriptor(f.class_idx as u32)?,
+                dex.string(f.name_idx)?,
+                dex.type_descriptor(f.type_idx as u32)?
+            ))
+        }),
+        // invokes
+        0x6e..=0x78 | 0xf0..=0xf2 => dex.method(idx).and_then(|m| {
+            Ok(format!(
+                "{}.{}",
+                dex.type_descriptor(m.class_idx as u32)?,
+                dex.string(m.name_idx)?
+            ))
+        }),
+        _ => return String::new(),
+    };
+    r.unwrap_or_else(|e| format!("<{e}>"))
 }
 
 /// Find an installed record for `package` (any signer) in `store`.
@@ -540,6 +634,11 @@ fn cmd() -> Result<(), OveloError> {
             Ok(())
         }
         Cmd::Run { app } => run_app(&default_store()?, &app),
+        Cmd::Disas {
+            apk,
+            class,
+            method,
+        } => disas(&read_apk(&apk)?, &class, method.as_deref()),
         Cmd::Gate { path } => {
             let items = gate::evaluate(&path)?;
             for i in &items {

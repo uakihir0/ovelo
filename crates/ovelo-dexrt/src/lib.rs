@@ -42,6 +42,7 @@ fn vm<T>(c: &'static str) -> Rt<T> {
 /// Runtime state of one loaded class.
 #[derive(Default)]
 struct ClassRt {
+    /// Class statics by field-id index — enum constants live here.
     statics: HashMap<u32, V>,
     /// 0 = pending, 1 = running (reentrancy guard), 2 = done.
     clinit: u8,
@@ -105,6 +106,14 @@ pub struct Vm {
 }
 
 impl Vm {
+    /// Static field value stored on class `class_idx` (`None` when the
+    /// class is unloaded or the field unset). Used by `Enum.values()`.
+    pub(crate) fn static_of(&self, class_idx: u32, field_idx: u32) -> Option<V> {
+        self.classes
+            .get(&class_idx)
+            .and_then(|cr| cr.statics.get(&field_idx).copied())
+    }
+
     /// Wrap a verified DEX file.
     pub fn new(dex: DexFile) -> Result<Self> {
         let mut defined = HashMap::new();
@@ -326,7 +335,7 @@ impl Vm {
             .unwrap_or_default();
         let mut base = match self.heap.get(h) {
             Some(Obj::Throwable { descriptor, detail }) => {
-                format!("{descriptor}: {detail}")
+                format!("{descriptor}: {detail}{site}")
             }
             Some(Obj::Instance { class_idx, .. }) => {
                 let base = self
@@ -744,6 +753,12 @@ impl Vm {
             descriptor: descriptor.to_string(),
             detail: detail.to_string(),
         });
+        // Runtime-generated throws carry no `throw` insn — credit the
+        // frame that produced it so diagnostics name the method.
+        if let Some(&midx) = self.stack.last() {
+            let site = self.describe_method(midx);
+            self.throw_sites.insert(h, site);
+        }
         E::Throw(h)
     }
 
@@ -1137,21 +1152,22 @@ impl Vm {
             };
         }
         let mut trap: u8 = 0;
+        self.stack.push(midx);
         #[allow(unsafe_code)]
         let ret = unsafe { f(regs.as_mut_ptr(), &mut trap) };
+        self.stack.pop();
+        let site = self.describe_method(midx);
+        let trap_throw = |v: &mut Self, desc: &str| {
+            let h = v.heap.alloc(crate::value::Obj::Throwable {
+                descriptor: "Ljava/lang/ArithmeticException;".into(),
+                detail: desc.into(),
+            });
+            v.throw_sites.insert(h, site.clone());
+            Err(E::Throw(h))
+        };
         match trap {
-            TRAP_DIV_ZERO => {
-                return Err(self.throw_builtin(
-                    "Ljava/lang/ArithmeticException;",
-                    "divide by zero",
-                ));
-            }
-            TRAP_REM_ZERO => {
-                return Err(self.throw_builtin(
-                    "Ljava/lang/ArithmeticException;",
-                    "rem by zero",
-                ));
-            }
+            TRAP_DIV_ZERO => return trap_throw(self, "divide by zero"),
+            TRAP_REM_ZERO => return trap_throw(self, "rem by zero"),
             _ => {}
         }
         let ret_desc = self
@@ -1498,15 +1514,23 @@ impl Vm {
                 set!(regs[0], V::Ref(h));
             }
             0x24 | 0x25 => {
-                // filled-new-array {args}, type@idx
+                // filled-new-array {args}, type@idx — `/range` carries
+                // (count, first_reg), the 35c form lists registers.
                 let desc = self
                     .dex
                     .type_descriptor(ins.idx.unwrap_or(0))
                     .map_err(E::Vm)?;
                 let elem = desc.trim_start_matches('[').to_string();
-                let data: Vec<V> = regs
+                let arg_regs: Vec<usize> = if ins.opcode == 0x25 {
+                    // {vCCCC..+AA}: `regs`=[range start], `lit`=reg count
+                    let (first, n) = (regs[0] as usize, ins.lit.unwrap_or(0) as usize);
+                    (first..first + n).collect()
+                } else {
+                    regs.iter().map(|&i| i as usize).collect()
+                };
+                let data: Vec<V> = arg_regs
                     .iter()
-                    .map(|&i| Self::reg(fr, i as usize))
+                    .map(|&i| Self::reg(fr, i))
                     .collect::<Rt<_>>()?;
                 let h = self.heap.alloc(Obj::Array { elem, data });
                 fr.result = Some(Some(V::Ref(h)));
@@ -1833,9 +1857,10 @@ impl Vm {
         match self.heap.get_mut(h) {
             Some(Obj::Array { data, .. }) => {
                 if i < 0 || i as usize >= data.len() {
+                    let d = format!("aput idx {i} len {}", data.len());
                     return Err(self.throw_builtin(
                         "Ljava/lang/ArrayIndexOutOfBoundsException;",
-                        "aput",
+                        &d,
                     ));
                 }
                 data[i as usize] = v;
