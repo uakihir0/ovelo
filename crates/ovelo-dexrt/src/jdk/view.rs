@@ -1301,8 +1301,12 @@ pub(crate) fn ta_lookup(vm: &mut Vm, h: u32, index: usize) -> Option<V> {
 
 /// `Theme.resolveAttribute` backing: look `attr_id` up in the Activity
 /// theme (parents walked by `style_item`), chasing `?attr/`
-/// indirections, and convert to the caller-visible value.
-pub(crate) fn theme_attr_value(vm: &mut Vm, attr_id: u32) -> Option<V> {
+/// indirections, and return the raw entry so the caller keeps the
+/// exact TypedValue type (`TYPE_INT_BOOLEAN` etc.).
+pub(crate) fn theme_attr_entry(
+    vm: &mut Vm,
+    attr_id: u32,
+) -> Option<ovelo_apk::arsc::EntryValue> {
     let res = vm.apk_res.as_ref()?;
     let mut ev = res.style_item(vm.theme_id, attr_id)?.clone();
     for _ in 0..8 {
@@ -1317,7 +1321,7 @@ pub(crate) fn theme_attr_value(vm: &mut Vm, attr_id: u32) -> Option<V> {
     if ev.data_type == 0x02 {
         return None;
     }
-    Some(entry_v(vm, &ev))
+    Some(ev)
 }
 
 /// Instantiate a dex-defined view class and run its best-matching
@@ -1720,17 +1724,27 @@ pub(crate) fn attach(vm: &mut Vm, parent: u32, child: V) {
         // content and the enclosing tree as its window's real decor.
         if view_id(vm, parent) == ANDROID_ID_CONTENT {
             let owner = vm.cur_activity;
-            vm.content_views.insert(owner, ch);
-            let mut top = parent;
-            let mut hops = 0;
-            while let Some(V::Ref(p)) = pseudo_get(vm, top, P_PARENT) {
-                if p == 0 || hops > 64 {
-                    break;
+            // Only register when this content frame belongs to the
+            // running activity's own window — a Dialog's window has a
+            // content frame too, and its content must not replace the
+            // activity's recorded view/decor.
+            let own_frame = owner == 0
+                || window_of(vm, owner)
+                    .and_then(|w| content_frame_of(vm, w))
+                    == Some(parent);
+            if own_frame {
+                vm.content_views.insert(owner, ch);
+                let mut top = parent;
+                let mut hops = 0;
+                while let Some(V::Ref(p)) = pseudo_get(vm, top, P_PARENT) {
+                    if p == 0 || hops > 64 {
+                        break;
+                    }
+                    top = p;
+                    hops += 1;
                 }
-                top = p;
-                hops += 1;
+                vm.decor_roots.insert(owner, top);
             }
-            vm.decor_roots.insert(owner, top);
         }
     }
 }
