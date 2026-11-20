@@ -1034,7 +1034,12 @@ fn run_app(store: &InstallStore, package: &str) -> Result<(), OveloError> {
             if (bw, bh) != (u.root.w, u.root.h) {
                 u.root.resize(bw, bh);
             }
-            let _ = u.root.perform_traversals(prod);
+            let posted = u.root.perform_traversals(prod);
+            if std::env::var_os("OVELO_VIEWDBG").is_some() && posted.ok().flatten().is_some() {
+                if let Some(c) = &u.root.content {
+                    eprintln!("[viewdbg] drew root measured={:?} lp={:?}", c.measured(), c.lp());
+                }
+            }
         }
     })
 }

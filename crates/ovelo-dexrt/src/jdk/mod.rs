@@ -417,63 +417,66 @@ pub(crate) fn list_ref(vm: &Vm, h: u32) -> Option<&Vec<V>> {
         }) => Some(l),
         // Guest List wrappers (`unmodifiableList`, `synchronizedList`,
         // checked/immutable views…) are real dex objects that delegate
-        // element access to a backing list held in a field. Only
-        // transparent delegates are followed — a `SubList` carries
-        // offset/size and would report out-of-range elements, and the
-        // hop bound ends reference cycles instead of overflowing the
-        // host stack.
-        Some(Obj::Instance { .. }) => {
-            let mut out = None;
-            let mut cur = h;
-            for _ in 0..8 {
-                let Some(Obj::Instance { fields: f, .. }) = vm.heap.get(cur) else {
-                    break;
-                };
-                let desc = class_of(vm, V::Ref(cur));
-                if !(desc.contains("Unmodifiable")
-                    || desc.contains("Synchronized")
-                    || desc.contains("Checked")
-                    || desc.contains("Immutable"))
-                {
-                    break;
-                }
-                let mut next = None;
-                for v in f.values() {
-                    if let V::Ref(x) = v {
-                        if *x != 0 && *x != cur && *x != h {
-                            next = Some(*x);
-                            break;
-                        }
-                    }
-                }
-                match next {
-                    Some(x) => {
-                        if let Some(Obj::Host {
-                            state: HostState::List(_),
-                            ..
-                        }) = vm.heap.get(x)
-                        {
-                            out = Some(x);
-                            break;
-                        }
-                        cur = x;
-                    }
-                    None => break,
-                }
-            }
-            match out {
-                Some(x) => match vm.heap.get(x) {
-                    Some(Obj::Host {
-                        state: HostState::List(l),
-                        ..
-                    }) => Some(l),
-                    _ => None,
-                },
-                None => None,
-            }
-        }
+        // element access to a backing list held in a field — resolve
+        // that list through the transparent delegates.
+        Some(Obj::Instance { .. }) => match guest_list_handle(vm, h, 8) {
+            Some(x) => match vm.heap.get(x) {
+                Some(Obj::Host {
+                    state: HostState::List(l),
+                    ..
+                }) => Some(l),
+                _ => None,
+            },
+            None => None,
+        },
         _ => None,
     }
+}
+
+/// The `HostState::List` a guest List wrapper delegates to, or None.
+/// Only transparent delegates (unmodifiable/synchronized/checked/
+/// immutable views) are followed — a `SubList` carries offset/size
+/// and would report out-of-range elements, and the depth budget ends
+/// reference cycles instead of overflowing the host stack. Every
+/// Ref-valued field is tried: wrapper field order is a HashMap, so
+/// picking the first could follow an auxiliary reference.
+fn guest_list_handle(vm: &Vm, h: u32, depth: u8) -> Option<u32> {
+    if depth == 0 {
+        return None;
+    }
+    let Some(Obj::Instance { fields, .. }) = vm.heap.get(h) else {
+        return None;
+    };
+    let desc = class_of(vm, V::Ref(h));
+    if !(desc.contains("Unmodifiable")
+        || desc.contains("Synchronized")
+        || desc.contains("Checked")
+        || desc.contains("Immutable"))
+    {
+        return None;
+    }
+    let cands: Vec<u32> = fields
+        .values()
+        .filter_map(|v| match v {
+            V::Ref(x) if *x != 0 && *x != h => Some(*x),
+            _ => None,
+        })
+        .collect();
+    for x in cands {
+        match vm.heap.get(x) {
+            Some(Obj::Host {
+                state: HostState::List(_),
+                ..
+            }) => return Some(x),
+            Some(Obj::Instance { .. }) => {
+                if let Some(y) = guest_list_handle(vm, x, depth - 1) {
+                    return Some(y);
+                }
+            }
+            _ => {}
+        }
+    }
+    None
 }
 
 pub(crate) fn map_mut(vm: &mut Vm, h: u32) -> Option<&mut Vec<(V, V)>> {
