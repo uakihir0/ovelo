@@ -40,7 +40,7 @@ pub(crate) fn call(
     } else if class == "Ljava/lang/Enum;" || desc_is_a(class, "Ljava/lang/Enum;") {
         enum_call(vm, class, name, args)?
     } else if class == "Lsun/misc/Unsafe;" {
-        unsafe_call(vm, name, args)
+        unsafe_call(vm, name, args)?
     } else if class == "Ljava/lang/StackTraceElement;" {
         stacktrace_call(vm, name, args)
     } else if class.starts_with("Ljava/lang/reflect/") {
@@ -1808,8 +1808,23 @@ fn unsafe_key(args: &[V]) -> Option<(u32, i64)> {
     }
 }
 
+/// Marker descriptor for the object `staticFieldBase` hands out — ops on
+/// it read/write the owning class's static table, not instance fields.
+const UNSAFE_STATIC_BASE: &str = "Lsun/misc/Unsafe$StaticBase;";
+
 fn unsafe_read(vm: &mut Vm, obj: u32, off: i64) -> V {
     if off < UNSAFE_TOKEN_BASE {
+        // Static base: the offset indexes the owning class's statics.
+        if let Some(Obj::Host { desc, .. }) = vm.heap.get(obj) {
+            if desc == UNSAFE_STATIC_BASE {
+                let owner = pseudo_get(vm, obj, P_DATA)
+                    .map(|v| i32v(v) as u32)
+                    .unwrap_or(u32::MAX);
+                return vm
+                    .static_read(owner, off as u32)
+                    .unwrap_or(V::I32(0));
+            }
+        }
         return match vm.heap.get(obj) {
             Some(Obj::Instance { fields, .. }) | Some(Obj::Host { fields, .. }) => {
                 fields.get(&(off as u32)).copied().unwrap_or(V::I32(0))
@@ -1825,6 +1840,15 @@ fn unsafe_read(vm: &mut Vm, obj: u32, off: i64) -> V {
 
 fn unsafe_write(vm: &mut Vm, obj: u32, off: i64, v: V) {
     if off < UNSAFE_TOKEN_BASE {
+        if let Some(Obj::Host { desc, .. }) = vm.heap.get(obj) {
+            if desc == UNSAFE_STATIC_BASE {
+                let owner = pseudo_get(vm, obj, P_DATA)
+                    .map(|v| i32v(v) as u32)
+                    .unwrap_or(u32::MAX);
+                vm.static_write(owner, off as u32, v);
+                return;
+            }
+        }
         if let Some(f) = fields_mut(vm, obj) {
             f.insert(off as u32, v);
         }
@@ -1840,7 +1864,7 @@ fn cas_eq(vm: &mut Vm, a: V, b: V) -> bool {
     (nullish(a) && nullish(b)) || crate::jdk::value_eq(vm, a, b)
 }
 
-fn unsafe_call(vm: &mut Vm, name: &str, args: &[V]) -> Option<Option<V>> {
+fn unsafe_call(vm: &mut Vm, name: &str, args: &[V]) -> Rt<Option<Option<V>>> {
     let v = match name {
         "getUnsafe" => Some(host(vm, "Lsun/misc/Unsafe;", HostState::Empty)),
         "objectFieldOffset" | "staticFieldOffset" => {
@@ -1864,16 +1888,38 @@ fn unsafe_call(vm: &mut Vm, name: &str, args: &[V]) -> Option<Option<V>> {
                 });
             Some(V::I64(off))
         }
-        "staticFieldBase" => Some(host(vm, OBJ, HostState::Empty)),
+        "staticFieldBase" => {
+            // Marker object carrying the owning class idx — ops on it
+            // read/write that class's static table.
+            let h = match args.get(1) {
+                Some(V::Ref(h)) => *h,
+                _ => 0,
+            };
+            let owner = pseudo_get(vm, h, P_COMPONENT)
+                .and_then(|v| sv(vm, v))
+                .unwrap_or_default();
+            let owner_idx = vm
+                .dex
+                .type_index_of(&owner)
+                .ok()
+                .flatten()
+                .unwrap_or(u32::MAX);
+            let base = V::Ref(vm.alloc_host(UNSAFE_STATIC_BASE, HostState::Empty));
+            if let V::Ref(bh) = base {
+                pseudo_set(vm, bh, P_DATA, V::I32(owner_idx as i32));
+            }
+            Some(base)
+        }
         "arrayBaseOffset" => Some(V::I32(0)),
         "arrayIndexScale" => Some(V::I32(1)),
         "allocateInstance" => {
+            // No constructor runs for Unsafe.allocateInstance.
             let d = class_desc_of(vm, match args.get(1) {
                 Some(V::Ref(h)) => *h,
                 _ => 0,
             })
             .unwrap_or_default();
-            match vm.instantiate(&d) {
+            match vm.alloc_instance_raw(&d) {
                 Ok(h) => Some(V::Ref(h)),
                 Err(_) => Some(host(vm, OBJ, HostState::Empty)),
             }
@@ -1968,11 +2014,38 @@ fn unsafe_call(vm: &mut Vm, name: &str, args: &[V]) -> Option<Option<V>> {
                 0
             }))
         }
-        "shouldBeInitialized" => Some(V::I32(1)),
-        "ensureClassInitialized" | "loadFence" | "storeFence" | "fullFence"
-        | "park" | "unpark" | "monitorEnter" | "monitorExit"
-        | "throwException" => None,
-        _ => return None,
+        "shouldBeInitialized" => {
+            let d = class_desc_of(vm, match args.get(1) {
+                Some(V::Ref(h)) => *h,
+                _ => 0,
+            })
+            .unwrap_or_default();
+            let idx = vm.dex.type_index_of(&d).ok().flatten();
+            Some(V::I32(match idx {
+                Some(i) => !vm.class_initialized(i) as i32,
+                None => 0,
+            }))
+        }
+        "ensureClassInitialized" => {
+            let d = class_desc_of(vm, match args.get(1) {
+                Some(V::Ref(h)) => *h,
+                _ => 0,
+            })
+            .unwrap_or_default();
+            if let Some(i) = vm.dex.type_index_of(&d).ok().flatten() {
+                vm.ensure_class_init(i)?;
+            }
+            None
+        }
+        "throwException" => {
+            return Err(match args.get(1) {
+                Some(V::Ref(h)) => crate::E::Throw(*h),
+                _ => vm.throw_builtin("Ljava/lang/RuntimeException;", "throwException"),
+            });
+        }
+        "loadFence" | "storeFence" | "fullFence" | "park" | "unpark"
+        | "monitorEnter" | "monitorExit" => None,
+        _ => return Ok(None),
     };
-    Some(v)
+    Ok(Some(v))
 }

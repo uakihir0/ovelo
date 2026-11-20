@@ -309,6 +309,55 @@ impl Vm {
         Ok(h)
     }
 
+    /// Allocate an instance without running its `<init>` — for
+    /// `Unsafe.allocateInstance`, which must not execute constructors.
+    pub(crate) fn alloc_instance_raw(&mut self, class_desc: &str) -> Result<u32> {
+        let ty = self
+            .dex
+            .type_index_of(class_desc)?
+            .ok_or_else(|| errd("dexrt.class.missing", class_desc.to_string()))?;
+        match self.ensure_init(ty) {
+            Ok(()) => {}
+            Err(E::Vm(e)) => return Err(e),
+            Err(E::Throw(r)) => {
+                let d = self.describe_throw(r);
+                return Err(errd("dexrt.exception.uncaught", d));
+            }
+        }
+        Ok(self.heap.alloc(Obj::Instance {
+            class_idx: ty,
+            fields: HashMap::new(),
+        }))
+    }
+
+    /// `clinit` reached state 2 (done), or the class needs no init.
+    pub(crate) fn class_initialized(&self, class_idx: u32) -> bool {
+        self.classes
+            .get(&class_idx)
+            .map(|c| c.clinit == 2)
+            .unwrap_or(self.def_of(class_idx).is_none())
+    }
+
+    /// pub(crate) gate for jdk builtins (Unsafe.ensureClassInitialized).
+    pub(crate) fn ensure_class_init(&mut self, class_idx: u32) -> Rt<()> {
+        self.ensure_init(class_idx)
+    }
+
+    /// Read/write a class's static table (Unsafe staticFieldBase model).
+    pub(crate) fn static_read(&self, class_idx: u32, field_idx: u32) -> Option<V> {
+        self.classes
+            .get(&class_idx)
+            .and_then(|c| c.statics.get(&field_idx).copied())
+    }
+
+    pub(crate) fn static_write(&mut self, class_idx: u32, field_idx: u32, v: V) {
+        self.classes
+            .entry(class_idx)
+            .or_default()
+            .statics
+            .insert(field_idx, v);
+    }
+
     /// Invoke the virtual method `name` on `this`, with `args` after the
     /// receiver. `Ok(None)` when the object's class doesn't declare it —
     /// the platform base class (not in this DEX) provides the default.
