@@ -890,6 +890,27 @@ impl Vm {
         jdk::host_supers(desc).first().map(|s| (*s).to_string())
     }
 
+    /// Whether `desc` is, or descends from, a class whose simple name is
+    /// `simple` — `extends_named("Lorg/foo/MainPager;", "ViewPager")` is
+    /// true when `MainPager extends ViewPager`. Walks dex class_defs
+    /// first, then the host_supers chain (via `super_desc`).
+    pub fn extends_named(&self, desc: &str, simple: &str) -> bool {
+        let mut d = desc.to_string();
+        for _ in 0..32 {
+            if d.rsplit('/').next().unwrap_or(&d).trim_end_matches(';') == simple {
+                return true;
+            }
+            let Some(next) = self.super_desc(&d) else {
+                return false;
+            };
+            if next == d {
+                return false;
+            }
+            d = next;
+        }
+        false
+    }
+
     /// Allocate an instance without running its `<init>` — for
     /// `Unsafe.allocateInstance`, which must not execute constructors.
     pub(crate) fn alloc_instance_raw(&mut self, class_desc: &str) -> Result<u32> {
@@ -1689,7 +1710,11 @@ impl Vm {
                 if descriptor == &sup {
                     return true;
                 }
+                // builtin_supers is the java.* table — framework
+                // exception hierarchies (android.database.*) live in
+                // host_supers and are reachable via assignable_desc.
                 Self::builtin_supers(descriptor).contains(&sup.as_str())
+                    || self.assignable_desc(descriptor, &sup)
             }
             Some(Obj::Str(_)) => {
                 sup == "Ljava/lang/String;"
