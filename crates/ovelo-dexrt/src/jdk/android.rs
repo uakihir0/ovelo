@@ -636,6 +636,17 @@ fn intent_call(vm: &mut Vm, name: &str, sig: &str, args: &[V]) -> Rt<Option<Opti
         return Ok(None);
     };
     Ok(match name {
+        "<init>" => {
+            // Intent(action) / Intent(context,class) / Intent(action,uri):
+            // record the leading string as the action.
+            if let Some(a) = args.get(1) {
+                match sv(vm, *a) {
+                    Some(_) => pseudo_set(vm, h, P_ACTION, *a),
+                    None => pseudo_set(vm, h, P_COMPONENT, *a),
+                }
+            }
+            Some(None)
+        }
         "setAction" => {
             pseudo_set(vm, h, P_ACTION, args[1]);
             Some(Some(args[0]))

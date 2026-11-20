@@ -86,6 +86,9 @@ pub struct Vm {
     /// Package name of the guest app, set by the launcher so
     /// `Context.getPackageName` etc. answer correctly.
     pub guest_package: Option<String>,
+    /// Guest-visible filesystem root: `java.io.File` paths resolve
+    /// under this directory, never onto the host fs directly.
+    pub guest_root: std::path::PathBuf,
     /// Live interpreter call depth — unbounded guest or builtin
     /// recursion would overflow the native stack; cap it instead.
     depth: u32,
@@ -116,6 +119,7 @@ impl Vm {
             hosts_named: HashMap::new(),
             aot: None,
             guest_package: None,
+            guest_root: std::env::temp_dir().join("ovelo-guest"),
             depth: 0,
             stack: Vec::new(),
         })
@@ -607,6 +611,8 @@ impl Vm {
             | "Ljava/util/concurrent/CountDownLatch;" | "Ljava/util/concurrent/Semaphore;"
             | "Landroid/os/Message;" => HostState::Slot(V::I32(0)),
             "Ljava/io/File;" => HostState::Path(String::new()),
+            "Lorg/json/JSONObject;" => HostState::Map(Vec::new()),
+            "Lorg/json/JSONArray;" => HostState::List(Vec::new()),
             "Ljava/util/regex/Pattern;" | "Ljava/util/regex/Matcher;"
             | "Ljava/text/SimpleDateFormat;" | "Ljava/text/DateFormat;"
             | "Ljava/text/DecimalFormat;" | "Ljava/text/NumberFormat;"
@@ -836,7 +842,61 @@ impl Vm {
         Ok(None)
     }
 
-    fn call_builtin(&mut self, midx: u32, args: &[V]) -> Rt<Option<V>> {
+    /// Compact `args` for a builtin: DEX passes `J`/`D` params as
+    /// two mirrored register slots, and float bits arrive as `I32`.
+    /// Builtins index args per declared parameter, so rebuild the
+    /// list walking the proto — receiver first when present.
+    fn compact_args(&self, midx: u32, args: &[V], has_receiver: bool) -> Vec<V> {
+        let mut out: Vec<V> = Vec::with_capacity(args.len());
+        let mut i = 0;
+        if has_receiver {
+            out.push(args.first().copied().unwrap_or(V::Ref(0)));
+            i = 1;
+        }
+        let Ok(mid) = self.dex.method(midx) else {
+            return args.to_vec();
+        };
+        let Ok(p) = self.dex.proto(mid.proto_idx as u32) else {
+            return args.to_vec();
+        };
+        let Ok(ps) = self.dex.proto_params(p) else {
+            return args.to_vec();
+        };
+        for ty in ps {
+            let Ok(desc) = self.dex.type_descriptor(ty as u32) else {
+                return args.to_vec();
+            };
+            let v = args.get(i).copied().unwrap_or(V::I32(0));
+            let v = match desc.as_str() {
+                // const f32 bits live in an int register at the boundary.
+                "F" => match v {
+                    V::I32(b) => V::F32(f32::from_bits(b as u32)),
+                    x => x,
+                },
+                "D" => match v {
+                    V::I64(b) => V::F64(f64::from_bits(b as u64)),
+                    V::I32(b) => V::F64(f64::from_bits(b as u32 as u64)),
+                    x => x,
+                },
+                "J" => match v {
+                    V::I32(b) => V::I64(b as i64),
+                    x => x,
+                },
+                _ => v,
+            };
+            out.push(v);
+            i += if matches!(desc.as_str(), "J" | "D") {
+                2
+            } else {
+                1
+            };
+        }
+        out
+    }
+
+    fn call_builtin(&mut self, midx: u32, args: &[V], has_receiver: bool) -> Rt<Option<V>> {
+        let args = self.compact_args(midx, args, has_receiver);
+        let args = args.as_slice();
         let host = self
             .hosts
             .get(&midx)
@@ -893,13 +953,36 @@ impl Vm {
                 // with a default would let the app compute on a lie.
                 if self.def_of(mid.class_idx as u32).is_none() {
                     let ret = ret_desc.clone();
-                    if ret == "V" {
-                        Ok(None)
-                    } else {
-                        vm("dexrt.invoke.unresolved").map_err(|e| match e {
+                    match ret.as_str() {
+                        "V" => Ok(None),
+                        // Object/array returns get a typed placeholder so
+                        // chained framework calls cascade (`getLogger(x)
+                        // .info(y)`); methods on it hit this same stub
+                        // path. Strings come back empty — a placeholder
+                        // would break the String builtins.
+                        "Ljava/lang/String;" => {
+                            Ok(Some(V::Ref(self.heap.intern_str(""))))
+                        }
+                        r if r.starts_with('L') || r.starts_with('[') => {
+                            let desc = r.to_string();
+                            let ci = self
+                                .dex
+                                .type_index_of(&desc)
+                                .ok()
+                                .flatten()
+                                .unwrap_or(u32::MAX);
+                            let h = self.heap.alloc(Obj::Host {
+                                class_idx: ci,
+                                desc,
+                                fields: HashMap::new(),
+                                state: HostState::Empty,
+                            });
+                            Ok(Some(V::Ref(h)))
+                        }
+                        _ => vm("dexrt.invoke.unresolved").map_err(|e| match e {
                             E::Vm(v) => E::Vm(v.with_detail(self.describe_method(midx))),
                             t => t,
-                        })
+                        }),
                     }
                 } else {
                     vm("dexrt.invoke.unresolved").map_err(|e| match e {
@@ -917,7 +1000,9 @@ impl Vm {
             InvokeKind::Static | InvokeKind::Direct => {
                 match self.resolve_defined(midx) {
                     Ok(l) => l,
-                    Err(_) => return self.call_builtin(midx, &args),
+                    Err(_) => {
+                        return self.call_builtin(midx, &args, matches!(kind, InvokeKind::Direct));
+                    }
                 }
             }
             InvokeKind::Virtual | InvokeKind::Interface => {
@@ -933,7 +1018,7 @@ impl Vm {
                 let ci = self.heap.class_of(recv).unwrap_or(u32::MAX);
                 match self.resolve_virtual(midx, ci, true) {
                     Ok(l) => l,
-                    Err(_) => return self.call_builtin(midx, &args),
+                    Err(_) => return self.call_builtin(midx, &args, true),
                 }
             }
             InvokeKind::Super { caller_class } => {
@@ -945,7 +1030,7 @@ impl Vm {
                 // caller's own method would recurse forever.
                 match self.resolve_virtual(midx, sup, false) {
                     Ok(l) => l,
-                    Err(_) => return self.call_builtin(midx, &args),
+                    Err(_) => return self.call_builtin(midx, &args, true),
                 }
             }
         };

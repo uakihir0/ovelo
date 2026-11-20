@@ -128,16 +128,26 @@ fn string_call(vm: &mut Vm, name: &str, sig: &str, args: &[V]) -> Option<Option<
             ))
         }
         "indexOf" => {
+            // `from` is a char index: convert to a byte offset — slicing
+            // at a non-boundary would panic on non-ASCII text.
             let from = args.get(2).map(|v| i32v(*v) as usize).unwrap_or(0);
+            let start = t
+                .char_indices()
+                .nth(from)
+                .map(|(i, _)| i)
+                .unwrap_or(t.len());
             let idx = match args[1] {
-                V::I32(ch) => t[from.min(t.len())..]
+                V::I32(ch) => t[start..]
                     .find(char::from_u32(ch as u32).unwrap_or('\0')),
                 _ => {
                     let n = sv(vm, args[1]).unwrap_or_default();
-                    t[from.min(t.len())..].find(&n)
+                    t[start..].find(&n)
                 }
             };
-            Some(V::I32(idx.map(|i| (from + i) as i32).unwrap_or(-1)))
+            Some(V::I32(
+                idx.map(|i| (from + t[start..start + i].chars().count()) as i32)
+                    .unwrap_or(-1),
+            ))
         }
         "lastIndexOf" => {
             let n = match args[1] {
@@ -340,6 +350,18 @@ fn strbuf(vm: &mut Vm, name: &str, sig: &str, args: &[V]) -> Rt<Option<Option<V>
         return Ok(None);
     };
     Ok(match name {
+        "<init>" => {
+            // StringBuilder(String|CharSequence|int capacity).
+            let seed = args
+                .get(1)
+                .filter(|v| matches!(v, V::Ref(_)))
+                .and_then(|v| sv(vm, *v))
+                .unwrap_or_default();
+            if let Some(Obj::Host { state, .. }) = vm.heap.get_mut(h) {
+                *state = HostState::StrBuf(seed);
+            }
+            Some(None)
+        }
         "append" => {
             let p = params(sig);
             let add = match p.first().copied().unwrap_or("") {
@@ -1231,7 +1253,7 @@ fn class_call(vm: &mut Vm, name: &str, _sig: &str, args: &[V]) -> Rt<Option<Opti
         | "getSigners" | "getTypeParameters" | "getRecordComponents"
         | "getNestMembers" | "getGenericInterfaces" => Some(Some(arr(vm, OBJ, vec![]))),
         "getField" | "getDeclaredField" => {
-            let owner = s(vm, match args[0] { V::Ref(h) => h, _ => 0 })
+            let owner = class_desc_of(vm, match args[0] { V::Ref(h) => h, _ => 0 })
                 .unwrap_or_default();
             let fname = sv(vm, args[1]).unwrap_or_default();
             let cv = jstr(vm, &owner);
@@ -1246,7 +1268,7 @@ fn class_call(vm: &mut Vm, name: &str, _sig: &str, args: &[V]) -> Rt<Option<Opti
             Some(Some(hv))
         }
         "getMethod" | "getDeclaredMethod" => {
-            let owner = s(vm, match args[0] { V::Ref(h) => h, _ => 0 })
+            let owner = class_desc_of(vm, match args[0] { V::Ref(h) => h, _ => 0 })
                 .unwrap_or_default();
             let mname = sv(vm, args[1]).unwrap_or_default();
             let cv = jstr(vm, &owner);
@@ -1261,7 +1283,7 @@ fn class_call(vm: &mut Vm, name: &str, _sig: &str, args: &[V]) -> Rt<Option<Opti
             Some(Some(hv))
         }
         "getConstructor" | "getDeclaredConstructor" => {
-            let owner = s(vm, match args[0] { V::Ref(h) => h, _ => 0 })
+            let owner = class_desc_of(vm, match args[0] { V::Ref(h) => h, _ => 0 })
                 .unwrap_or_default();
             let cv = jstr(vm, &owner);
             let hv = host(
@@ -1275,7 +1297,7 @@ fn class_call(vm: &mut Vm, name: &str, _sig: &str, args: &[V]) -> Rt<Option<Opti
             Some(Some(hv))
         }
         "newInstance" => {
-            let d = s(vm, match args[0] { V::Ref(h) => h, _ => 0 }).unwrap_or_default();
+            let d = class_desc_of(vm, match args[0] { V::Ref(h) => h, _ => 0 }).unwrap_or_default();
             match vm.instantiate(&d) {
                 Ok(h) => Some(Some(V::Ref(h))),
                 Err(_) => {

@@ -114,8 +114,10 @@ pub(crate) fn call(
         objects_static(vm, name, args)?
     } else if class.starts_with("Ljava/util/Optional") {
         optional_call(vm, class, name, args)
-    } else if class == "Ljava/util/Random;" || class == "Ljava/security/SecureRandom;" {
-        random_call(vm, name, args)
+    } else if class == "Ljava/security/SecureRandom;" {
+        random_call(vm, name, args, true)
+    } else if class == "Ljava/util/Random;" {
+        random_call(vm, name, args, false)
     } else if class == "Ljava/util/UUID;" {
         uuid_call(vm, name, args)
     } else if class == "Ljava/util/StringTokenizer;" {
@@ -1194,12 +1196,22 @@ fn optional_call(vm: &mut Vm, class: &str, name: &str, args: &[V]) -> Option<Opt
 // ---------------------------------------------------------------------
 // Random / UUID / StringTokenizer / BitSet
 
-fn random_call(vm: &mut Vm, name: &str, args: &[V]) -> Option<Option<V>> {
+fn random_call(vm: &mut Vm, name: &str, args: &[V], secure: bool) -> Option<Option<V>> {
+    // `java.util.Random` is contractually deterministic; `SecureRandom`
+    // must not be guessable — mix in OS entropy each call.
+    let os_entropy = if secure {
+        std::fs::read("/dev/urandom")
+            .ok()
+            .and_then(|b| b.get(..8).map(|w| u64::from_ne_bytes(w.try_into().unwrap())))
+            .unwrap_or_else(|| now_ms() as u64)
+    } else {
+        0
+    };
     let seed = match args[0] {
         V::Ref(h) => slot_of(vm, h).unwrap_or(V::I64(now_ms())),
         _ => V::I64(now_ms()),
     };
-    let mut s = i64v(seed) as u64;
+    let mut s = i64v(seed) as u64 ^ os_entropy;
     if let V::Ref(h) = args[0] {
         s ^= h as u64;
     }

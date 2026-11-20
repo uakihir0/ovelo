@@ -110,6 +110,15 @@ pub(crate) fn class_obj(vm: &mut Vm, desc: String) -> V {
     host(vm, "Ljava/lang/Class;", HostState::StrBuf(desc))
 }
 
+/// The descriptor a `java.lang.Class` handle names, from either mirror
+/// form: `Obj::Class` (`SomeType.class` literal) or a `class_obj` Host.
+pub(crate) fn class_desc_of(vm: &Vm, h: u32) -> Option<String> {
+    match vm.heap.get(h) {
+        Some(Obj::Class { type_idx }) => vm.dex.type_descriptor(*type_idx).ok(),
+        _ => s(vm, h),
+    }
+}
+
 pub(crate) fn fmt_f64(f: f64) -> String {
     if f == f.trunc() && f.is_finite() && f.abs() < 1e15 {
         format!("{f:.1}")

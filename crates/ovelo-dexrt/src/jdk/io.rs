@@ -156,10 +156,52 @@ fn stream_call(vm: &mut Vm, name: &str, args: &[V]) -> Option<Option<V>> {
 // ---------------------------------------------------------------------
 // File
 
+/// Guest-visible path -> host path under `vm.guest_root`. Absolute
+/// guest paths and `..` can never escape the sandbox: root/prefix
+/// components are dropped and `..` above the root is discarded.
+fn fspath(vm: &Vm, guest: &str) -> std::path::PathBuf {
+    use std::path::Component as C;
+    let mut out = vm.guest_root.clone();
+    let mut depth = 0usize;
+    for c in std::path::Path::new(guest).components() {
+        match c {
+            C::RootDir | C::Prefix(_) | C::CurDir => {}
+            C::ParentDir => {
+                if depth > 0 {
+                    out.pop();
+                    depth -= 1;
+                }
+            }
+            C::Normal(p) => {
+                out.push(p);
+                depth += 1;
+            }
+        }
+    }
+    out
+}
+
 fn file_call(vm: &mut Vm, name: &str, args: &[V]) -> Option<Option<V>> {
     let path = s(vm, match args[0] { V::Ref(h) => h, _ => 0 }).unwrap_or_default();
-    let std_path = std::path::Path::new(&path);
+    let std_path = fspath(vm, &path);
     match name {
+        "<init>" => {
+            // File(path) / File(parent, child) — fold the args into the
+            // receiver's stored path. A File parent contributes its own
+            // stored path; everything else reads as its string form.
+            let parts: Vec<String> = args[1..]
+                .iter()
+                .map(|v| sv(vm, *v).unwrap_or_default())
+                .filter(|p| !p.is_empty())
+                .collect();
+            if let Some(V::Ref(h)) = args.first() {
+                if let Some(Obj::Host { state, .. }) = vm.heap.get_mut(*h) {
+                    *state = HostState::Path(parts.join("/"));
+                }
+            }
+            // Void: the class-not-in-DEX stub already answers handled.
+            None
+        }
         "getPath" | "toString" => Some(jstr(vm, &path)),
         "getAbsolutePath" | "getCanonicalPath" => {
             let p = if path.starts_with('/') {
@@ -170,14 +212,14 @@ fn file_call(vm: &mut Vm, name: &str, args: &[V]) -> Option<Option<V>> {
             Some(jstr(vm, &p))
         }
         "getName" => {
-            let n = std_path
+            let n = std::path::Path::new(&path)
                 .file_name()
                 .map(|n| n.to_string_lossy().to_string())
                 .unwrap_or_default();
             Some(jstr(vm, &n))
         }
         "getParent" | "getParentFile" => {
-            let p = std_path
+            let p = std::path::Path::new(&path)
                 .parent()
                 .map(|p| p.to_string_lossy().to_string())
                 .unwrap_or_default();
@@ -205,22 +247,28 @@ fn file_call(vm: &mut Vm, name: &str, args: &[V]) -> Option<Option<V>> {
                 .unwrap_or(0),
         )),
         "mkdir" | "mkdirs" => Some(V::I32(
-            std::fs::create_dir_all(&path).is_ok() as i32,
+            std::fs::create_dir_all(&std_path).is_ok() as i32,
         )),
         "delete" => Some(V::I32(
-            std::fs::remove_file(&path)
-                .or_else(|_| std::fs::remove_dir_all(&path))
+            std::fs::remove_file(&std_path)
+                .or_else(|_| std::fs::remove_dir_all(&std_path))
                 .is_ok() as i32,
         )),
         "createNewFile" => Some(V::I32(
-            std::fs::File::create(&path).is_ok() as i32,
+            std::fs::OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .open(&std_path)
+                .is_ok() as i32,
         )),
         "renameTo" => {
             let to = s(vm, match args[1] { V::Ref(h) => h, _ => 0 }).unwrap_or_default();
-            Some(V::I32(std::fs::rename(&path, &to).is_ok() as i32))
+            Some(V::I32(
+                std::fs::rename(&std_path, fspath(vm, &to)).is_ok() as i32,
+            ))
         }
         "list" | "listFiles" => {
-            let names: Vec<String> = std::fs::read_dir(&path)
+            let names: Vec<String> = std::fs::read_dir(&std_path)
                 .map(|rd| {
                     rd.filter_map(|e| e.ok())
                         .map(|e| e.file_name().to_string_lossy().to_string())
@@ -598,7 +646,12 @@ fn json_string(b: &[char], mut i: usize) -> Option<(String, usize)> {
     Some((s, i + 1))
 }
 
-fn json_value(vm: &mut Vm, b: &[char], i: &mut usize) -> Option<V> {
+fn json_value(vm: &mut Vm, b: &[char], i: &mut usize, depth: u32) -> Option<V> {
+    // Host-side recursion on untrusted text: cap nesting so a deep
+    // `[[[[...` can't exhaust the native stack past the guest budget.
+    if depth > 128 {
+        return None;
+    }
     *i = json_ws(b, *i);
     match *b.get(*i)? {
         '{' => {
@@ -619,7 +672,7 @@ fn json_value(vm: &mut Vm, b: &[char], i: &mut usize) -> Option<V> {
                             return None;
                         }
                         *i += 1;
-                        let v = json_value(vm, b, i)?;
+                        let v = json_value(vm, b, i, depth + 1)?;
                         let kv = jstr(vm, &k);
                         map_put(vm, h, kv, v);
                         *i = json_ws(b, *i);
@@ -641,7 +694,7 @@ fn json_value(vm: &mut Vm, b: &[char], i: &mut usize) -> Option<V> {
                     *i += 1;
                     return Some(hv);
                 }
-                let v = json_value(vm, b, i)?;
+                let v = json_value(vm, b, i, depth + 1)?;
                 if let Some(l) = list_mut(vm, h) {
                     l.push(v);
                 }
@@ -732,7 +785,7 @@ fn json_obj(vm: &mut Vm, name: &str, args: &[V]) -> Option<Option<V>> {
             if let Some(src) = args.get(1).and_then(|v| sv(vm, *v)) {
                 let b: Vec<char> = src.chars().collect();
                 let mut i = 0;
-                if let Some(V::Ref(parsed)) = json_value(vm, &b, &mut i) {
+                if let Some(V::Ref(parsed)) = json_value(vm, &b, &mut i, 0) {
                     if let (Some(Obj::Host {
                         state: HostState::Map(src_m),
                         ..

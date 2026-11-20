@@ -327,11 +327,25 @@ fn run_app(store: &InstallStore, package: &str) -> Result<(), OveloError> {
             let vm = (|| -> Result<_, OveloError> {
                 let (_cd, entries) =
                     parse_central_directory(&bytes, &ZipLimits::default())?;
-                let e = entries
+                // Multi-dex: until the Vm merges dexes, run on the dex
+                // that defines the launcher Activity — fdroid puts it in
+                // classes2.dex, so a fixed `classes.dex` can't dispatch it.
+                let mut dex_files: Vec<DexFile> = Vec::new();
+                for e in entries
                     .iter()
-                    .find(|e| e.name == "classes.dex")
-                    .ok_or_else(|| err("cli.dex.missing"))?;
-                let mut v = ovelo_dexrt::Vm::new(DexFile::open(read_entry(&bytes, e)?)?)?;
+                    .filter(|e| e.name.starts_with("classes") && e.name.ends_with(".dex"))
+                {
+                    dex_files.push(DexFile::open(read_entry(&bytes, e)?)?);
+                }
+                if dex_files.is_empty() {
+                    return Err(err("cli.dex.missing"));
+                }
+                let pos = dex_files
+                    .iter()
+                    .position(|d| d.type_index_of(&desc).ok().flatten().is_some())
+                    .unwrap_or(0);
+                let mut v = ovelo_dexrt::Vm::new(dex_files.swap_remove(pos))?;
+                v.guest_root = data_dir.join("files");
                 v.enable_aot();
                 Ok(v)
             })();

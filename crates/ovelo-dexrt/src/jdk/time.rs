@@ -127,6 +127,27 @@ fn set_millis(vm: &mut Vm, h: u32, ms: i64) {
 fn date_call(vm: &mut Vm, name: &str, args: &[V]) -> Rt<Option<Option<V>>> {
     let ms = millis_of(vm, args[0]);
     Ok(match name {
+        "<init>" => {
+            // Date() -> now; Date(long) -> millis; Date(y,m,d[,h,mi,s])
+            // (deprecated) -> civil with 1900-based year.
+            if let Some(V::Ref(h)) = args.first() {
+                let g =
+                    |i: usize| args.get(i).map(|v| i64v(*v)).unwrap_or(0);
+                let v = match args.len() {
+                    0 | 1 => now_ms(),
+                    2 => g(1),
+                    _ => {
+                        days_from_civil(g(1) + 1900, g(2) + 1, g(3))
+                            * 86_400_000
+                            + g(4) * 3_600_000
+                            + g(5) * 60_000
+                            + g(6) * 1000
+                    }
+                };
+                set_millis(vm, *h, v);
+            }
+            Some(None)
+        }
         "getTime" => Some(Some(V::I64(ms))),
         "setTime" => {
             if let V::Ref(h) = args[0] {
@@ -204,6 +225,21 @@ fn cal_call(vm: &mut Vm, name: &str, sig: &str, args: &[V]) -> Rt<Option<Option<
     };
     let ms = millis_of(vm, args[0]);
     Ok(match name {
+        "<init>" => {
+            // GregorianCalendar() -> now; (y,m,d[,h,mi[,s]]) -> civil.
+            let g =
+                |i: usize| args.get(i).map(|v| i64v(*v)).unwrap_or(0);
+            let v = if args.len() > 1 {
+                days_from_civil(g(1), g(2) + 1, g(3)) * 86_400_000
+                    + g(4) * 3_600_000
+                    + g(5) * 60_000
+                    + g(6) * 1000
+            } else {
+                now_ms()
+            };
+            set_millis(vm, h, v);
+            Some(None)
+        }
         "getInstance" => Some(Some(host(
             vm,
             "Ljava/util/GregorianCalendar;",
@@ -281,15 +317,17 @@ fn cal_call(vm: &mut Vm, name: &str, sig: &str, args: &[V]) -> Rt<Option<Option<
                         * 86_400_000,
                 );
             } else {
-                // set(y,m,d,h,mi[,s])
+                // set(y,m,d,h,mi[,s]) — read through get() so a short
+                // overload can never index past the arg list.
+                let g =
+                    |i: usize| args.get(i).map(|v| i64v(*v)).unwrap_or(0);
                 set_millis(
                     vm,
                     h,
-                    days_from_civil(i64v(args[1]), i64v(args[2]) + 1, i64v(args[3]))
-                        * 86_400_000
-                        + i64v(args[4]) * 3_600_000
-                        + i64v(args[5]) * 60_000
-                        + args.get(6).map(|v| i64v(*v)).unwrap_or(0) * 1000,
+                    days_from_civil(g(1), g(2) + 1, g(3)) * 86_400_000
+                        + g(4) * 3_600_000
+                        + g(5) * 60_000
+                        + g(6) * 1000,
                 );
             }
             Some(None)
