@@ -1666,8 +1666,10 @@ fn resources_call(vm: &mut Vm, name: &str, args: &[V]) -> Rt<Option<Option<V>>> 
             ]
             .iter()
             .find_map(|c| vm.instantiate(c).ok().map(V::Ref))
+            // No compat class bundled → the framework type satisfies
+            // appcompat's `instanceof VectorDrawable` check.
             .unwrap_or_else(|| {
-                host(vm, "Landroid/graphics/drawable/Drawable;", HostState::Empty)
+                host(vm, "Landroid/graphics/drawable/VectorDrawable;", HostState::Empty)
             });
             Some(Some(d))
         }
