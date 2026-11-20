@@ -31,12 +31,19 @@ const P_DECOR: u32 = u32::MAX - 16;
 const P_LISTENER: u32 = u32::MAX - 17;
 const P_CONTEXT: u32 = u32::MAX - 18;
 const P_VIS: u32 = u32::MAX - 19;
-/// Pseudo key: a view's lazily-minted `Menu` (Toolbar.getMenu() etc.).
-const P_MENU: u32 = u32::MAX - 20;
+/// Pseudo key: a view's lazily-minted `Menu` (Toolbar.getMenu() etc.) /
+/// the menuish marker on the Menu itself (`I32(1)`).
+const P_MENU: u32 = 0xFFFD_FFF8;
 /// Pseudo key: a MenuItem's `android:id`.
-const P_MENU_ID: u32 = u32::MAX - 21;
+const P_MENU_ID: u32 = 0xFFFD_FFF7;
 /// Pseudo key: a MenuItem's visible flag.
-const P_MENU_VIS: u32 = u32::MAX - 22;
+const P_MENU_VIS: u32 = 0xFFFD_FFF6;
+/// Pseudo key: a MenuItem's enabled/checkable flag.
+const P_MENU_EN: u32 = 0xFFFD_FFF5;
+/// Pseudo key: a MenuItem's checked flag.
+const P_MENU_CHK: u32 = 0xFFFD_FFF4;
+/// Pseudo key: a MenuItem's group id.
+const P_MENU_GROUP: u32 = 0xFFFD_FFF3;
 
 // TypedArray backing — below the `tag_key` band (which bottoms out at
 // ~u32::MAX - 0x10014).
@@ -149,8 +156,16 @@ pub(crate) fn call(
         }
         "findItem" => Some(Some(menu_find(vm, this, args.get(1).copied()))),
         "add" | "addSubMenu" if is_menuish(vm, this) => {
-            // add(group, itemId, order, title) — the id is the second arg.
-            Some(Some(menu_item(vm, this, i64v(args.get(2).copied().unwrap_or(V::I32(0))) as i32)))
+            // add(groupId, itemId, order, title) — duplicate ids are
+            // legal in AOSP, so add always appends; findItem walks the
+            // list for the first match.
+            let group = i64v(args.get(1).copied().unwrap_or(V::I32(0))) as i32;
+            let id = i64v(args.get(2).copied().unwrap_or(V::I32(0))) as i32;
+            if name == "addSubMenu" {
+                Some(Some(menu_sub_add(vm, this, group, id)))
+            } else {
+                Some(Some(menu_item_add(vm, this, group, id)))
+            }
         }
         "size" if is_menuish(vm, this) => {
             Some(Some(V::I32(menu_items(vm, this).len() as i32)))
@@ -161,40 +176,75 @@ pub(crate) fn call(
             Some(Some(items.get(i).copied().unwrap_or(V::Ref(0))))
         }
         "clear" | "removeGroup" | "removeItem" if is_menuish(vm, this) => {
-            if name == "clear" {
-                if let Some(Obj::Host {
-                    state: HostState::Map(items),
-                    ..
-                }) = vm.heap.get_mut(this)
-                {
-                    items.clear();
+            let keep: Vec<(V, V)> = match name {
+                "clear" => Vec::new(),
+                "removeItem" => {
+                    let id = i64v(args.get(1).copied().unwrap_or(V::I32(0))) as i32;
+                    menu_items_paired(vm, this)
+                        .into_iter()
+                        .filter(|(k, _)| *k != id)
+                        .map(|(k, v)| (V::I32(k), v))
+                        .collect()
                 }
+                _ => {
+                    // removeGroup: drop items whose stored group id matches.
+                    let gid = i64v(args.get(1).copied().unwrap_or(V::I32(0))) as i32;
+                    menu_items_paired(vm, this)
+                        .into_iter()
+                        .filter(|(_, v)| {
+                            !matches!(v, V::Ref(ih) if pseudo_get(vm, *ih, P_MENU_GROUP) == Some(V::I32(gid)))
+                        })
+                        .map(|(k, v)| (V::I32(k), v))
+                        .collect()
+                }
+            };
+            if let Some(Obj::Host {
+                state: HostState::Map(items),
+                ..
+            }) = vm.heap.get_mut(this)
+            {
+                *items = keep;
             }
             Some(None)
         }
         "setVisible" | "setEnabled" | "setChecked" | "setCheckable"
-        | "setTitle" | "setIcon" | "setShowAsAction" | "setShowAsActionFlags"
-        | "setActionView" | "setIntent" | "setAlphabeticShortcut"
-        | "setNumericShortcut" | "setTooltipText" | "setContentDescription"
-            if is_menuitem(vm, this) =>
+        | "setTitle" | "setTitleCondensed" | "setIcon" | "setShowAsAction"
+        | "setShowAsActionFlags" | "setActionView" | "setIntent"
+        | "setAlphabeticShortcut" | "setNumericShortcut" | "setTooltipText"
+        | "setContentDescription" | "setGroupVisible" if is_menuitem(vm, this) =>
         {
-            let key = if name == "setVisible" { P_MENU_VIS } else { P_TAG };
+            let key = match name {
+                "setVisible" => P_MENU_VIS,
+                "setEnabled" | "setCheckable" => P_MENU_EN,
+                "setChecked" => P_MENU_CHK,
+                "setTitle" | "setTitleCondensed" => P_TEXT,
+                _ => P_TAG,
+            };
             pseudo_set(vm, this, key, args.get(1).copied().unwrap_or(V::Ref(0)));
+            // AOSP item mutators return the item for chaining.
             Some(Some(V::Ref(this)))
         }
         "setOnMenuItemClickListener" | "setOnActionExpandListener"
             if is_menuitem(vm, this) =>
         {
             pseudo_set(vm, this, P_LISTENER, args.get(1).copied().unwrap_or(V::Ref(0)));
-            Some(Some(V::I32(1)))
+            Some(Some(V::Ref(this)))
         }
-        "getItemId" | "getGroupId" if is_menuitem(vm, this) => {
+        "getItemId" if is_menuitem(vm, this) => {
             Some(Some(pseudo_get(vm, this, P_MENU_ID).unwrap_or(V::I32(0))))
+        }
+        "getGroupId" if is_menuitem(vm, this) => {
+            Some(Some(pseudo_get(vm, this, P_MENU_GROUP).unwrap_or(V::I32(0))))
         }
         "isVisible" | "isEnabled" | "isChecked" | "isCheckable"
             if is_menuitem(vm, this) =>
         {
-            let v = pseudo_get(vm, this, P_MENU_VIS).unwrap_or(V::I32(1));
+            let key = match name {
+                "isEnabled" | "isCheckable" => P_MENU_EN,
+                "isChecked" => P_MENU_CHK,
+                _ => P_MENU_VIS,
+            };
+            let v = pseudo_get(vm, this, key).unwrap_or(V::I32(1));
             Some(Some(V::I32(i64v(v) as i32)))
         }
         "getTitle" | "getTitleCondensed" if is_menuitem(vm, this) => {
@@ -1279,8 +1329,10 @@ fn is_menuish(vm: &Vm, h: u32) -> bool {
     matches!(pseudo_get(vm, h, P_MENU), Some(V::I32(1)))
 }
 
+/// A MenuItem handle — includes SubMenu, which is both a menu and an
+/// item in AOSP.
 fn is_menuitem(vm: &Vm, h: u32) -> bool {
-    pseudo_get(vm, h, P_MENU_VIS).is_some() && !is_menuish(vm, h)
+    pseudo_get(vm, h, P_MENU_VIS).is_some()
 }
 
 fn menu_of(vm: &mut Vm, view_h: u32) -> V {
@@ -1297,48 +1349,84 @@ fn menu_of(vm: &mut Vm, view_h: u32) -> V {
     m
 }
 
-/// Find-or-create the MenuItem for `id` on `menu_h`. AOSP returns null
-/// for missing ids; a compat stub keeps the guest running instead.
-fn menu_item(vm: &mut Vm, menu_h: u32, id: i32) -> V {
-    if let Some(Obj::Host {
-        state: HostState::Map(items),
-        ..
-    }) = vm.heap.get(menu_h)
-    {
-        if let Some((_, v)) = items
-            .iter()
-            .find(|(k, _)| matches!(k, V::I32(k) if *k == id))
-        {
-            return *v;
-        }
-    }
-    let it = host(vm, "Landroid/view/MenuItem;", HostState::Empty);
+fn menu_item_new(vm: &mut Vm, desc: &str, state: HostState, group: i32, id: i32) -> V {
+    let it = host(vm, desc, state);
     if let V::Ref(ih) = it {
         pseudo_set(vm, ih, P_MENU_ID, V::I32(id));
+        pseudo_set(vm, ih, P_MENU_GROUP, V::I32(group));
         pseudo_set(vm, ih, P_MENU_VIS, V::I32(1));
-        if let Some(Obj::Host {
-            state: HostState::Map(items),
-            ..
-        }) = vm.heap.get_mut(menu_h)
-        {
-            items.push((V::I32(id), it));
-        }
     }
     it
 }
 
-fn menu_find(vm: &mut Vm, menu_h: u32, id_v: Option<V>) -> V {
-    menu_item(vm, menu_h, i64v(id_v.unwrap_or(V::I32(0))) as i32)
+fn menu_push(vm: &mut Vm, menu_h: u32, id: i32, it: V) {
+    if let Some(Obj::Host {
+        state: HostState::Map(items),
+        ..
+    }) = vm.heap.get_mut(menu_h)
+    {
+        items.push((V::I32(id), it));
+    }
 }
 
-fn menu_items(vm: &Vm, menu_h: u32) -> Vec<V> {
+/// AOSP `Menu.add` always appends — duplicate item ids are legal.
+fn menu_item_add(vm: &mut Vm, menu_h: u32, group: i32, id: i32) -> V {
+    let it = menu_item_new(vm, "Landroid/view/MenuItem;", HostState::Empty, group, id);
+    menu_push(vm, menu_h, id, it);
+    it
+}
+
+/// `addSubMenu` returns a SubMenu — itself a menu container, so nested
+/// `add` calls register on it.
+fn menu_sub_add(vm: &mut Vm, menu_h: u32, group: i32, id: i32) -> V {
+    let sub = menu_item_new(
+        vm,
+        "Landroid/view/SubMenu;",
+        HostState::Map(vec![]),
+        group,
+        id,
+    );
+    if let V::Ref(sh) = sub {
+        pseudo_set(vm, sh, P_MENU, V::I32(1));
+    }
+    menu_push(vm, menu_h, id, sub);
+    sub
+}
+
+fn menu_items_paired(vm: &Vm, menu_h: u32) -> Vec<(i32, V)> {
     match vm.heap.get(menu_h) {
         Some(Obj::Host {
             state: HostState::Map(items),
             ..
-        }) => items.iter().map(|(_, v)| *v).collect(),
+        }) => items
+            .iter()
+            .map(|(k, v)| (i64v(*k) as i32, *v))
+            .collect(),
         _ => vec![],
     }
+}
+
+fn menu_items(vm: &Vm, menu_h: u32) -> Vec<V> {
+    menu_items_paired(vm, menu_h)
+        .into_iter()
+        .map(|(_, v)| v)
+        .collect()
+}
+
+/// Find-or-create: `findItem` for a missing id mints a stub (AOSP's
+/// null would NPE most guests on the next chained call).
+fn menu_item(vm: &mut Vm, menu_h: u32, id: i32) -> V {
+    if let Some((_, v)) = menu_items_paired(vm, menu_h)
+        .into_iter()
+        .find(|(k, _)| *k == id)
+    {
+        return v;
+    }
+    menu_item_add(vm, menu_h, 0, id)
+}
+
+fn menu_find(vm: &mut Vm, menu_h: u32, id_v: Option<V>) -> V {
+    menu_item(vm, menu_h, i64v(id_v.unwrap_or(V::I32(0))) as i32)
 }
 
 /// `MenuInflater.inflate(menuRes, Menu)` — parse the res/menu xml and
