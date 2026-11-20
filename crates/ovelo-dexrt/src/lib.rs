@@ -99,6 +99,9 @@ pub struct Vm {
     /// Last framework stub calls (callee only), for uncaught reports —
     /// a crash usually follows a stub that returned a placeholder.
     stub_trace: Vec<String>,
+    /// Interned main-thread object — `Thread.currentThread()` and
+    /// `Looper.getThread()` must compare equal (androidx checks `==`).
+    pub(crate) main_thread_h: u32,
 }
 
 impl Vm {
@@ -129,6 +132,7 @@ impl Vm {
             stack: Vec::new(),
             throw_sites: HashMap::new(),
             stub_trace: Vec::new(),
+            main_thread_h: 0,
         })
     }
 
@@ -331,7 +335,16 @@ impl Vm {
                     .unwrap_or_else(|_| format!("object #{h}"));
                 format!("guest throwable {base}{site}")
             }
-            Some(Obj::Host { desc, .. }) => format!("host throwable {desc}{site}"),
+            Some(Obj::Host { desc, .. }) => {
+                let msg = jdk::pseudo_get(self, h, jdk::P_DATA)
+                    .and_then(|v| match v {
+                        V::Ref(r) => self.heap.str_val(r),
+                        _ => None,
+                    })
+                    .map(|t| format!(": {t}"))
+                    .unwrap_or_default();
+                format!("host throwable {desc}{msg}{site}")
+            }
             _ => format!("object #{h}"),
         };
         // The stub tail explains most guest crashes: the app read a
@@ -980,6 +993,19 @@ impl Vm {
                         self.stub_trace.remove(0);
                     }
                     self.stub_trace.push(trace);
+                    // Throwable.<init>(message): keep the message on the
+                    // host object so describe_throw can report *why*.
+                    if name == "<init>"
+                        && (class.ends_with("Exception;")
+                            || class.ends_with("Error;")
+                            || class.ends_with("Throwable;"))
+                    {
+                        if let (V::Ref(this), Some(&msg)) =
+                            (args.first().copied().unwrap_or(V::Ref(0)), args.get(1))
+                        {
+                            jdk::pseudo_set(self, this, jdk::P_DATA, msg);
+                        }
+                    }
                     match ret.as_str() {
                         "V" => Ok(None),
                         // Object/array returns get a typed placeholder so

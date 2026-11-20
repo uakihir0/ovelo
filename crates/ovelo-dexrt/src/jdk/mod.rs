@@ -105,6 +105,20 @@ pub(crate) fn host(vm: &mut Vm, desc: &str, state: HostState) -> V {
     V::Ref(vm.alloc_host(desc, state))
 }
 
+/// The one main-thread object — androidx checks
+/// `Looper.getMainLooper().getThread() == Thread.currentThread()` by
+/// identity, so both must return the same handle.
+pub(crate) fn main_thread(vm: &mut Vm) -> V {
+    if vm.main_thread_h == 0 {
+        let V::Ref(h) = host(vm, "Ljava/lang/Thread;", HostState::StrBuf("main".into()))
+        else {
+            unreachable!()
+        };
+        vm.main_thread_h = h;
+    }
+    V::Ref(vm.main_thread_h)
+}
+
 /// `Class` mirror object carrying the named descriptor.
 pub(crate) fn class_obj(vm: &mut Vm, desc: String) -> V {
     host(vm, "Ljava/lang/Class;", HostState::StrBuf(desc))

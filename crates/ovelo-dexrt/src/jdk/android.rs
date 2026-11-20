@@ -1614,11 +1614,7 @@ fn looper_call(vm: &mut Vm, name: &str, _args: &[V]) -> Rt<Option<Option<V>>> {
         }
         "loop" | "quit" | "quitSafely" => Some(None),
         "isCurrentThread" => Some(Some(V::I32(1))),
-        "getThread" => Some(Some(host(
-            vm,
-            "Ljava/lang/Thread;",
-            HostState::StrBuf("main".into()),
-        ))),
+        "getThread" => Some(Some(main_thread(vm))),
         "getQueue" => Some(Some(host(
             vm,
             "Landroid/os/MessageQueue;",
