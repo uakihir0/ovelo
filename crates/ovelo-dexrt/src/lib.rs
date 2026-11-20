@@ -3139,14 +3139,36 @@ impl Vm {
     /// has no encoded value or one we can't materialize.
     fn encoded_static(&mut self, owner: GIdx, field: GIdx) -> Option<V> {
         let (cg, def) = self.def_loc_of(owner)?;
-        // The encoded array lives in the dex that DEFINES the class;
-        // the canonical field index only addresses it there.
-        if gd(field) != gd(cg) {
-            return None;
-        }
+        // The encoded array lives in the dex that DEFINES the class,
+        // indexed by that dex's local field ids. When the canonical
+        // index belongs to a referencing dex (multi-dex apps), match
+        // the static field by name instead of the raw index.
+        let local_idx = if gd(field) == gd(cg) {
+            gl(field)
+        } else {
+            let name = self
+                .dex_of(field)
+                .and_then(|d| d.field(gl(field)).ok())
+                .and_then(|f| self.dex_of(field).and_then(|d| d.string(f.name_idx).ok()))?;
+            let cd = self.dex_of(cg)?.class_data(def).ok()?;
+            let mut found = None;
+            for f in &cd.static_fields {
+                let Ok(fr) = self.dex_of(cg)?.field(f.field_idx) else {
+                    continue;
+                };
+                let Ok(n) = self.dex_of(cg)?.string(fr.name_idx) else {
+                    continue;
+                };
+                if n == name {
+                    found = Some(f.field_idx);
+                    break;
+                }
+            }
+            found?
+        };
         let v = self
             .dex_of(cg)?
-            .static_value(def, gl(field))
+            .static_value(def, local_idx)
             .ok()
             .flatten()?;
         use ovelo_dex::EncodedValue as EV;
