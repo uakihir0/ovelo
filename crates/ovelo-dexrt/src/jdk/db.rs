@@ -9,6 +9,7 @@
 use std::cell::RefCell;
 use std::rc::Rc;
 
+use rusqlite::hooks::{AuthAction, AuthContext, Authorization};
 use rusqlite::{params_from_iter, types::Value as SV, types::ValueRef, Connection};
 
 use super::io::fspath;
@@ -22,21 +23,42 @@ pub(crate) const P_CUR_ROWS: u32 = u32::MAX - 31;
 pub(crate) const P_CUR_POS: u32 = u32::MAX - 32;
 pub(crate) const P_SQL: u32 = u32::MAX - 33;
 pub(crate) const P_DBNAME: u32 = u32::MAX - 34;
+pub(crate) const P_DBVER: u32 = u32::MAX - 35;
 
 /// One open SQLite database (connection + transaction state).
 pub(crate) struct Db {
     pub conn: Connection,
-    pub in_tx: bool,
-    pub tx_ok: bool,
+    /// Per-level success flags — one bool per open `beginTransaction`,
+    /// so a nested `endTransaction` can never commit the outer level.
+    pub tx_stack: Vec<bool>,
 }
 
 fn db_dir(vm: &Vm) -> std::path::PathBuf {
     fspath(vm, "/data/local/ovelo/databases")
 }
 
+/// File name a guest database name maps to inside the sandbox dir —
+/// strips every path component so `../` or absolute paths handed to
+/// `SQLiteOpenHelper`/`openOrCreateDatabase` can't escape it.
+fn safe_name(name: &str) -> String {
+    if name == ":memory:" {
+        return name.to_string();
+    }
+    let n = std::path::Path::new(name)
+        .file_name()
+        .map(|n| n.to_string_lossy().to_string())
+        .unwrap_or_default();
+    if n.is_empty() || n == ".." {
+        "ovelo".to_string()
+    } else {
+        n
+    }
+}
+
 /// Open (or fetch) the connection for `name`; `:memory:` stays in RAM.
 fn conn_for(vm: &mut Vm, name: &str) -> Result<Rc<RefCell<Db>>, E> {
-    if let Some(d) = vm.dbs.get(name) {
+    let name = safe_name(name);
+    if let Some(d) = vm.dbs.get(&name) {
         return Ok(d.clone());
     }
     let conn = if name == ":memory:" {
@@ -44,7 +66,7 @@ fn conn_for(vm: &mut Vm, name: &str) -> Result<Rc<RefCell<Db>>, E> {
     } else {
         let dir = db_dir(vm);
         let _ = std::fs::create_dir_all(&dir);
-        Connection::open(dir.join(name))
+        Connection::open(dir.join(&name))
     }
     .map_err(|e| {
         vm.throw_builtin(
@@ -52,20 +74,27 @@ fn conn_for(vm: &mut Vm, name: &str) -> Result<Rc<RefCell<Db>>, E> {
             &format!("open {name}: {e}"),
         )
     })?;
+    // Guest SQL reaches the host engine as text — ATTACH DATABASE with
+    // an absolute path would escape the sandbox, so deny it (and
+    // DETACH) at the SQLite authorizer.
+    conn.authorizer(Some(|ctx: AuthContext| match ctx.action {
+        AuthAction::Attach { .. } | AuthAction::Detach { .. } => Authorization::Deny,
+        _ => Authorization::Allow,
+    }));
     let d = Rc::new(RefCell::new(Db {
         conn,
-        in_tx: false,
-        tx_ok: false,
+        tx_stack: Vec::new(),
     }));
-    vm.dbs.insert(name.to_string(), d.clone());
+    vm.dbs.insert(name, d.clone());
     Ok(d)
 }
 
 /// The `SQLiteDatabase` object for `name` — one per name (AOSP caches
 /// database connections per thread; one shared handle is close enough).
 fn db_obj(vm: &mut Vm, name: &str) -> Result<V, E> {
-    conn_for(vm, name)?;
-    if let Some(&h) = vm.db_handles.get(name) {
+    let name = safe_name(name);
+    conn_for(vm, &name)?;
+    if let Some(&h) = vm.db_handles.get(&name) {
         return Ok(V::Ref(h));
     }
     let V::Ref(h) = host(
@@ -75,8 +104,8 @@ fn db_obj(vm: &mut Vm, name: &str) -> Result<V, E> {
     ) else {
         unreachable!()
     };
-    vm.db_handles.insert(name.to_string(), h);
-    vm.obj_db.insert(h, name.to_string());
+    vm.db_handles.insert(name.clone(), h);
+    vm.obj_db.insert(h, name);
     Ok(V::Ref(h))
 }
 
@@ -84,11 +113,7 @@ fn db_obj(vm: &mut Vm, name: &str) -> Result<V, E> {
 /// `SQLiteDatabase.openOrCreateDatabase(path|File)` land here.
 pub(crate) fn open_or_create(vm: &mut Vm, name: &str) -> Result<V, E> {
     // A full path keeps only its file name inside the sandboxed dir.
-    let short = std::path::Path::new(name)
-        .file_name()
-        .map(|n| n.to_string_lossy().to_string())
-        .unwrap_or_else(|| name.to_string());
-    db_obj(vm, &short)
+    db_obj(vm, &safe_name(name))
 }
 
 fn db_name_of(vm: &Vm, h: u32) -> Option<String> {
@@ -129,6 +154,13 @@ fn v_to_sql(vm: &Vm, v: V) -> SV {
                 SV::Text(t)
             } else if let Some(Obj::Array { data, .. }) = vm.heap.get(h) {
                 SV::Blob(data.iter().map(|b| i32v(*b) as u8).collect())
+            } else if let Some(Obj::Host {
+                state: HostState::Slot(inner),
+                ..
+            }) = vm.heap.get(h)
+            {
+                // Boxed Integer/Long/Double/Boolean — bind the payload.
+                v_to_sql(vm, *inner)
             } else {
                 SV::Null
             }
@@ -364,15 +396,104 @@ fn sqlite_call(
     Ok(match name {
         "<init>" => {
             // SQLiteOpenHelper(context, name, factory, version): record
-            // the db name so getWritableDatabase finds the connection.
+            // the db name + schema version so getWritableDatabase can
+            // find the connection and run onCreate/onUpgrade.
             if let Some(n) = args.get(2).and_then(|v| sv(vm, *v)) {
                 bind_name(vm, this, &n);
+            }
+            if let Some(&v) = args.get(4) {
+                pseudo_set(vm, this, P_DBVER, V::I32(i32v(v)));
             }
             Some(None)
         }
         "getWritableDatabase" | "getReadableDatabase" => {
             let n = db_name_of(vm, this).unwrap_or_else(|| "ovelo".into());
-            Some(Some(db_obj(vm, &n)?))
+            let out = db_obj(vm, &n)?;
+            // AOSP migrates on open: when the stored user_version
+            // differs from the helper's schema version the matching
+            // guest callback runs before the db is handed out.
+            let want = pseudo_get(vm, this, P_DBVER).map(i32v).unwrap_or(0);
+            if want > 0 {
+                let cur: i32 = conn_of(vm, this)
+                    .ok()
+                    .map(|d| {
+                        d.borrow()
+                            .conn
+                            .query_row::<i64, _, _>(
+                                "PRAGMA user_version",
+                                [],
+                                |r| r.get(0),
+                            )
+                            .unwrap_or(0) as i32
+                    })
+                    .unwrap_or(0);
+                if cur != want {
+                    let (hook, cb_args): (&str, Vec<V>) = if cur == 0 {
+                        ("onCreate", vec![out])
+                    } else if cur < want {
+                        ("onUpgrade", vec![out, V::I32(cur), V::I32(want)])
+                    } else {
+                        ("onDowngrade", vec![out, V::I32(cur), V::I32(want)])
+                    };
+                    vm.call_virtual(this, hook, &cb_args).map_err(E::Vm)?;
+                    if let Ok(db) = conn_of(vm, this) {
+                        let _ = db
+                            .borrow()
+                            .conn
+                            .execute_batch(&format!("PRAGMA user_version={want}"));
+                    }
+                }
+            }
+            Some(Some(out))
+        }
+        "beginTransaction" | "beginTransactionNonExclusive"
+        | "beginTransactionWithListener"
+        | "beginTransactionWithListenerNonExclusive" => {
+            let db = conn_of(vm, this)?;
+            let mut d = db.borrow_mut();
+            // Nested begins stack on one level each — only the
+            // outermost pair issues BEGIN/COMMIT/ROLLBACK.
+            if d.tx_stack.is_empty() {
+                d.conn
+                    .execute_batch("BEGIN")
+                    .map_err(|e| sql_err(vm, e))?;
+            }
+            d.tx_stack.push(false);
+            Some(None)
+        }
+        "setTransactionSuccessful" => {
+            if let Ok(db) = conn_of(vm, this) {
+                if let Some(top) = db.borrow_mut().tx_stack.last_mut() {
+                    *top = true;
+                }
+            }
+            Some(None)
+        }
+        "endTransaction" => {
+            let db = conn_of(vm, this)?;
+            let mut d = db.borrow_mut();
+            let Some(ok) = d.tx_stack.pop() else {
+                return Err(vm.throw_builtin(
+                    "Ljava/lang/IllegalStateException;",
+                    "endTransaction without beginTransaction",
+                ));
+            };
+            if let Some(top) = d.tx_stack.last_mut() {
+                // Fold this level into the parent — an unmarked inner
+                // transaction poisons the outer one's outcome.
+                *top &= ok;
+            } else {
+                d.conn
+                    .execute_batch(if ok { "COMMIT" } else { "ROLLBACK" })
+                    .map_err(|e| sql_err(vm, e))?;
+            }
+            Some(None)
+        }
+        "inTransaction" => {
+            let t = conn_of(vm, this)
+                .map(|d| !d.borrow().tx_stack.is_empty())
+                .unwrap_or(false);
+            Some(Some(V::I32(t as i32)))
         }
         "getDatabaseName" => Some(Some(match db_name_of(vm, this) {
             Some(n) => jstr(vm, &n),
@@ -511,38 +632,6 @@ fn sqlite_call(
                 .execute(&sql, params_from_iter(binds_of(vm, find_array_arg(vm, args))))
                 .map_err(|e| sql_err(vm, e))?;
             Some(Some(V::I32(n as i32)))
-        }
-        "beginTransaction" | "beginTransactionNonExclusive"
-        | "beginTransactionWithListener"
-        | "beginTransactionWithListenerNonExclusive" => {
-            let db = conn_of(vm, this)?;
-            let mut d = db.borrow_mut();
-            let _ = d.conn.execute_batch("BEGIN");
-            d.in_tx = true;
-            d.tx_ok = false;
-            Some(None)
-        }
-        "setTransactionSuccessful" => {
-            if let Ok(db) = conn_of(vm, this) {
-                db.borrow_mut().tx_ok = true;
-            }
-            Some(None)
-        }
-        "endTransaction" => {
-            let db = conn_of(vm, this)?;
-            let mut d = db.borrow_mut();
-            let _ = d
-                .conn
-                .execute_batch(if d.tx_ok { "COMMIT" } else { "ROLLBACK" });
-            d.in_tx = false;
-            d.tx_ok = false;
-            Some(None)
-        }
-        "inTransaction" => {
-            let t = conn_of(vm, this)
-                .map(|d| d.borrow().in_tx)
-                .unwrap_or(false);
-            Some(Some(V::I32(t as i32)))
         }
         "isOpen" => Some(Some(V::I32(1))),
         "close" => {

@@ -14,7 +14,7 @@ cranelift-native = "0.137"
 ovelo-apk = { path = "../ovelo-apk" }
 ovelo-dex = { path = "../ovelo-dex" }
 ovelo-error = { path = "../ovelo-error" }
-rusqlite = { version = "0.32", features = ["bundled"] }
+rusqlite = { version = "0.32", features = ["bundled", "hooks"] }
 
 [dev-dependencies]
 ovelo-dex = { path = "../ovelo-dex", features = ["testkit"] }
