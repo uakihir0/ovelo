@@ -695,6 +695,10 @@ pub fn drive_dex_layout_pass(vm: &mut Vm, activity: u32, frame: u32) {
         "ViewPager", "RecyclerView", "ListView", "GridView", "AdapterView",
         "DrawerLayout", "SwipeRefresh",
     ];
+    // MeasureSpec mode EXACTLY (mode << 30) — containers like
+    // DrawerLayout throw unless both specs are EXACTLY, so
+    // UNSPECIFIED/0 would leave them unmeasured forever.
+    const MS_EXACTLY: i32 = 1 << 30;
     fn walk(vm: &mut Vm, h: u32, depth: u32) {
         if depth > 64 {
             return;
@@ -702,8 +706,14 @@ pub fn drive_dex_layout_pass(vm: &mut Vm, activity: u32, frame: u32) {
         let Some(info) = vm.dex_view(h) else {
             return;
         };
-        if ADAPTER.iter().any(|k| info.desc.contains(k)) {
-            let _ = vm.call_virtual(h, "onMeasure", &[V::I32(0), V::I32(0)]);
+        // Ancestry, not name substring: subclasses like `MainPager
+        // extends ViewPager` need the inherited onMeasure/onLayout too.
+        if ADAPTER.iter().any(|k| vm.extends_named(&info.desc, k)) {
+            let _ = vm.call_virtual(
+                h,
+                "onMeasure",
+                &[V::I32(MS_EXACTLY | 1080), V::I32(MS_EXACTLY | 1920)],
+            );
             let _ = vm.call_virtual(
                 h,
                 "onLayout",
