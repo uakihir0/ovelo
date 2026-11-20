@@ -898,6 +898,15 @@ fn read_sized_sint(r: &mut R, n: usize) -> Result<i64> {
 }
 
 fn read_encoded_value(r: &mut R) -> Result<EncodedValue> {
+    read_encoded_value_at(r, 0)
+}
+
+/// Nested arrays/annotations recurse — cap the depth so a crafted
+/// `static_values` blob can't exhaust the host stack.
+fn read_encoded_value_at(r: &mut R, depth: usize) -> Result<EncodedValue> {
+    if depth > 32 {
+        return Err(err("dex.encoded_value.depth"));
+    }
     let b = r.u8()?;
     let (ty, arg) = (b & 0x1f, (b >> 5) as usize);
     let n = arg + 1;
@@ -924,9 +933,12 @@ fn read_encoded_value(r: &mut R) -> Result<EncodedValue> {
         0x1b => EncodedValue::Enum(read_sized_uint(r, n)? as u32),
         0x1c => {
             let size = r.uleb128()? as usize;
-            let mut items = Vec::with_capacity(size.min(1 << 16));
+            if size > 1 << 16 {
+                return Err(err("dex.encoded_value.bounds"));
+            }
+            let mut items = Vec::with_capacity(size);
             for _ in 0..size {
-                items.push(read_encoded_value(r)?);
+                items.push(read_encoded_value_at(r, depth + 1)?);
             }
             EncodedValue::Array(items)
         }
@@ -937,7 +949,7 @@ fn read_encoded_value(r: &mut R) -> Result<EncodedValue> {
             let size = r.uleb128()? as usize;
             for _ in 0..size.min(1 << 16) {
                 let _name = r.uleb128()?;
-                let _ = read_encoded_value(r)?;
+                let _ = read_encoded_value_at(r, depth + 1)?;
             }
             EncodedValue::Annotation
         }
