@@ -1,0 +1,65 @@
+name: Release
+
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+
+jobs:
+  app:
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+
+      - name: Build ovelo (release)
+        run: cargo build --release -p ovelo-cli
+
+      - name: Assemble Ovelo.app
+        run: |
+          APP=dist/Ovelo.app
+          mkdir -p "$APP/Contents/MacOS" "$APP/Contents/Resources"
+          cp target/release/ovelo "$APP/Contents/MacOS/ovelo"
+          cat > "$APP/Contents/MacOS/Ovelo" <<'EOF'
+          #!/bin/sh
+          # Finder launch: open Terminal on the CLI so `ovelo --help`
+          # is visible. With args (services/open-with) exec directly.
+          DIR="$(cd "$(dirname "$0")" && pwd)"
+          if [ $# -eq 0 ]; then
+            open -a Terminal "$DIR/ovelo"
+          else
+            exec "$DIR/ovelo" "$@"
+          fi
+          EOF
+          chmod +x "$APP/Contents/MacOS/Ovelo"
+          VER="${GITHUB_REF_NAME#v}"
+          [ "$VER" = "$GITHUB_REF_NAME" ] && VER=0.1.0
+          cat > "$APP/Contents/Info.plist" <<EOF
+          <?xml version="1.0" encoding="UTF-8"?>
+          <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN"
+            "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+          <plist version="1.0">
+          <dict>
+            <key>CFBundleName</key><string>Ovelo</string>
+            <key>CFBundleIdentifier</key><string>ai.ovelo.runtime</string>
+            <key>CFBundleExecutable</key><string>Ovelo</string>
+            <key>CFBundlePackageType</key><string>APPL</string>
+            <key>CFBundleShortVersionString</key><string>$VER</string>
+            <key>LSMinimumSystemVersion</key><string>14.0</string>
+            <key>NSHighResolutionCapable</key><true/>
+          </dict>
+          </plist>
+          EOF
+
+      - name: Sign (ad-hoc) and package
+        run: |
+          # Ad-hoc signature: lets Gatekeeper identify the binary and the
+          # hardened-runtime flag work; real Developer ID signing needs
+          # secrets — add them later without changing the layout.
+          codesign --force --deep --sign - dist/Ovelo.app || true
+          ditto -c -k --keepParent dist/Ovelo.app Ovelo.app.zip
+
+      - name: Publish release asset
+        uses: softprops/action-gh-release@v2
+        with:
+          files: Ovelo.app.zip

@@ -1775,6 +1775,9 @@ impl Vm {
             };
             return g(self, &args).map_err(E::Vm);
         }
+        if matches!(kind, InvokeKind::Static) {
+            self.ensure_init(loc.class_idx)?;
+        }
         if loc.em.code_off == 0 {
             // Bodiless declaration (native / external / abstract decl):
             // jdk shims may still answer it; otherwise a typed
@@ -1784,7 +1787,7 @@ impl Vm {
                 let d = self
                     .dex_of(loc.midx)
                     .ok_or_else(|| E::Vm(err("dexrt.dex.idx")))?;
-                let mid = *d.method(gl(midx)).map_err(E::Vm)?;
+                let mid = *d.method(gl(loc.midx)).map_err(E::Vm)?;
                 (
                     d.type_descriptor(mid.class_idx as u32).map_err(E::Vm)?,
                     d.string(mid.name_idx).map_err(E::Vm)?,
@@ -1800,9 +1803,6 @@ impl Vm {
                 return Ok(r);
             }
             return self.stub_placeholder(loc.midx, &ret_desc, &name, &class, &args);
-        }
-        if matches!(kind, InvokeKind::Static) {
-            self.ensure_init(loc.class_idx)?;
         }
         if let Some(f) = self.aot.as_ref().and_then(|a| a.get(loc.midx)) {
             return self.run_native(f, loc.midx, loc.em.code_off, args);
