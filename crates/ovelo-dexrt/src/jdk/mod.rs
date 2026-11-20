@@ -135,6 +135,20 @@ pub(crate) fn main_looper(vm: &mut Vm) -> V {
     V::Ref(vm.main_looper_h)
 }
 
+/// The one `Application` — `Context.getApplication[Context]` callers
+/// `check-cast` the result (e.g. Glide's `RequestManagerRetriever`),
+/// so it must be Application-typed, not the Activity receiver.
+pub(crate) fn app_object(vm: &mut Vm) -> V {
+    if vm.app_h == 0 {
+        let V::Ref(h) = host(vm, "Landroid/app/Application;", HostState::Empty)
+        else {
+            unreachable!()
+        };
+        vm.app_h = h;
+    }
+    V::Ref(vm.app_h)
+}
+
 /// Default return for an uncovered method, by its signature —
 /// object/array types get a typed placeholder (never null, so chained
 /// framework calls keep flowing), String gets "", primitives 0.

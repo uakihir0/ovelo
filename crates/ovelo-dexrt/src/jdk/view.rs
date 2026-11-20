@@ -500,7 +500,21 @@ pub(crate) fn call(
             } else {
                 this
             };
-            let hit = find_in_tree(vm, root, id).unwrap_or(0);
+            let mut hit = find_in_tree(vm, root, id).unwrap_or(0);
+            if hit == 0 {
+                // The receiver's subtree missed — appcompat content lives
+                // in its own decor tree, so retry across inflated roots.
+                for i in (0..vm.view_roots.len()).rev() {
+                    let r = vm.view_roots[i];
+                    if r == root {
+                        continue;
+                    }
+                    if let Some(h) = find_in_tree(vm, r, id) {
+                        hit = h;
+                        break;
+                    }
+                }
+            }
             if hit == 0 && std::env::var_os("OVELO_VIEWDBG").is_some() {
                 let nm = vm
                     .apk_res
@@ -850,7 +864,19 @@ pub(crate) fn inflate_res(vm: &mut Vm, res_id: u32, ctx: V) -> V {
         );
     }
     match elems {
-        Some(e) if !e.is_empty() => build_tree(vm, &e, ctx),
+        Some(e) if !e.is_empty() => {
+            let v = build_tree(vm, &e, ctx);
+            // Remember every inflated root: appcompat builds its own
+            // decor tree dex-side, so Window/Activity.findViewById must
+            // be able to reach the real content even when it was never
+            // attached through our synthetic decor.
+            if let V::Ref(h) = v {
+                if !vm.view_roots.contains(&h) {
+                    vm.view_roots.push(h);
+                }
+            }
+            v
+        }
         _ => empty_view(vm),
     }
 }
@@ -886,12 +912,31 @@ fn make_view_named(vm: &mut Vm, tag: &str, attrs: V, ctx: V) -> V {
     // runs — the standard overloads are (Context), (Context, AttributeSet)
     // and (Context, AttributeSet, int). A crashed ctor falls back to the
     // opaque host stub.
+    if std::env::var_os("OVELO_VIEWDBG").is_some() && desc.contains("Toolbar") {
+        let names: Vec<String> = match attrs {
+            V::Ref(ah) => match vm.heap.get(ah) {
+                Some(Obj::Host {
+                    state: HostState::Map(m),
+                    ..
+                }) => m
+                    .iter()
+                    .filter_map(|(k, _)| sv(vm, *k))
+                    .collect(),
+                _ => Vec::new(),
+            },
+            _ => Vec::new(),
+        };
+        eprintln!("[viewdbg] toolbar ctor attrs: {names:?}");
+    }
     let h = try_construct_view(vm, &desc, ctx, attrs).unwrap_or_else(|| {
         if std::env::var_os("OVELO_VIEWDBG").is_some() {
             eprintln!("[viewdbg] make_view_named {desc} -> host stub");
         }
         vm.alloc_host(&desc, HostState::Empty)
     });
+    if std::env::var_os("OVELO_VIEWDBG").is_some() && desc.contains("Toolbar") {
+        eprintln!("[viewdbg] toolbar -> {h:?}");
+    }
     pseudo_set(vm, h, P_IS_VIEW, V::I32(1));
     if group {
         pseudo_set(vm, h, P_IS_GROUP, V::I32(1));
@@ -1375,6 +1420,9 @@ fn build_tree(vm: &mut Vm, elems: &[Element], ctx: V) -> V {
         match stack.last() {
             Some((_, p)) => {
                 let p = *p;
+                if std::env::var_os("OVELO_VIEWDBG").is_some() {
+                    eprintln!("[viewdbg] attach h{h} -> parent h{p}");
+                }
                 attach(vm, p, V::Ref(h));
                 // A parent with XML children is a container.
                 pseudo_set(vm, p, P_IS_GROUP, V::I32(1));
@@ -1598,6 +1646,9 @@ pub(crate) fn menu_of(vm: &mut Vm, view_h: u32) -> V {
         }
     }
     let m = host(vm, "Landroid/view/Menu;", HostState::Map(vec![]));
+    if std::env::var_os("OVELO_TRACE_MENU").is_some() {
+        eprintln!("[menu_of] view={view_h} menu={m:?}");
+    }
     if let V::Ref(mh) = m {
         pseudo_set(vm, mh, P_MENU, V::I32(1));
     }
@@ -1752,6 +1803,12 @@ fn menu_item(vm: &mut Vm, menu_h: u32, id: i32) -> V {
 }
 
 pub(crate) fn menu_find(vm: &mut Vm, menu_h: u32, id_v: Option<V>) -> V {
+    if std::env::var_os("OVELO_TRACE_MENU").is_some() {
+        eprintln!(
+            "[menu_find] menu={menu_h} items={} want={id_v:?}",
+            menu_items(vm, menu_h).len()
+        );
+    }
     if menu_store(vm, menu_h).is_none() {
         return V::Ref(0);
     }

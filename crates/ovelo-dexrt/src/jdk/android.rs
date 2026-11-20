@@ -1127,9 +1127,10 @@ fn context_call(
         "getPackageCodePath" | "getPackageResourcePath" => {
             Some(Some(jstr(vm, "/data/app/base.apk")))
         }
-        "getApplicationContext" | "getApplication" | "getBaseContext" => {
-            Some(Some(args[0]))
+        "getApplicationContext" | "getApplication" => {
+            Some(Some(app_object(vm)))
         }
+        "getBaseContext" => Some(Some(args[0])),
         "getApplicationInfo" | "getActivityInfo" => Some(Some(host(
             vm,
             "Landroid/content/pm/ApplicationInfo;",
@@ -1343,7 +1344,15 @@ fn context_call(
         | "moveResources" | "reloadResources" | "bindServiceAsUser"
         | "bindIsolatedService" | "updateServiceGroup" => {
             if name.starts_with("check") {
-                Some(Some(V::I32(0))) // PERMISSION_GRANTED
+                // checkSelfPermission/checkPermission/…: PERMISSION_
+                // GRANTED only when the name is in the granted set
+                // (manifest normal-level + requestPermissions). Calls
+                // that carry no permission-looking arg (checkSignatures
+                // and friends) keep the permissive default.
+                let g = perm_arg(vm, args)
+                    .map(|p| vm.granted_permissions.contains(&p))
+                    .unwrap_or(true);
+                Some(Some(V::I32(if g { 0 } else { -1 })))
             } else if matches!(name, "bindService" | "bindServiceAsUser"
                 | "bindIsolatedService" | "stopService")
             {
@@ -1378,6 +1387,43 @@ fn context_call(
             "Landroid/content/Intent;",
             HostState::Map(vec![]),
         ))),
+        "requestPermissions" => {
+            // (String[] perms, int requestCode): model "user grants
+            // everything asked" — dangerous permissions join the
+            // granted set — then deliver onRequestPermissionsResult
+            // the way AOSP does after the dialog resolves.
+            let perms_v = args.get(1).copied().unwrap_or(V::Ref(0));
+            let mut names: Vec<String> = Vec::new();
+            if let V::Ref(ah) = perms_v {
+                if let Some(Obj::Array { data, .. }) = vm.heap.get(ah) {
+                    names = data
+                        .iter()
+                        .filter_map(|v| sv(vm, *v))
+                        .collect();
+                }
+            }
+            for p in &names {
+                vm.granted_permissions.insert(p.clone());
+            }
+            let code = match args.get(2) {
+                Some(V::I32(c)) => *c,
+                _ => 0,
+            };
+            let results = vm.heap.alloc(Obj::Array {
+                elem: "I".to_string(),
+                data: vec![V::I32(0); names.len()],
+            });
+            if let V::Ref(this) = args.first().copied().unwrap_or(V::Ref(0)) {
+                if this != 0 {
+                    let _ = vm.call_virtual(
+                        this,
+                        "onRequestPermissionsResult",
+                        &[V::I32(code), perms_v, V::Ref(results)],
+                    );
+                }
+            }
+            Some(None)
+        }
         "setIntent" | "requestWindowFeature"
         | "setTitle" | "setTitleColor" | "setVisible" | "setResult"
         | "setRequestedOrientation" | "setTaskDescription"
@@ -1387,7 +1433,7 @@ fn context_call(
         | "openOptionsMenu" | "closeOptionsMenu" | "openContextMenu"
         | "closeContextMenu" | "registerForContextMenu"
         | "unregisterForContextMenu" | "showDialog" | "dismissDialog"
-        | "removeDialog" | "managedQuery" | "requestPermissions"
+        | "removeDialog" | "managedQuery"
         | "requestDragAndDropPermissions"
         | "startLocalVoiceInteraction" | "stopLocalVoiceInteraction"
         | "startSearch" | "triggerSearch" | "takeKeyEvents"
@@ -1558,7 +1604,19 @@ fn context_call(
 // ---------------------------------------------------------------------
 // PackageManager / Resources / res misc
 
-fn pm_call(vm: &mut Vm, name: &str, _args: &[V]) -> Rt<Option<Option<V>>> {
+/// The permission-name argument of a check*/enforce* call: the first
+/// string arg containing "permission" — covers both
+/// `checkSelfPermission(String)` (args[1]) and
+/// `PackageManager.checkPermission(String, String)` (args[1]),
+/// whatever wrapper the app bundles.
+fn perm_arg(vm: &Vm, args: &[V]) -> Option<String> {
+    args.iter()
+        .skip(1)
+        .filter_map(|a| sv(vm, *a))
+        .find(|s| s.contains("permission"))
+}
+
+fn pm_call(vm: &mut Vm, name: &str, args: &[V]) -> Rt<Option<Option<V>>> {
     Ok(match name {
         "getPackageInfo" => {
             let h = vm.alloc_host("Landroid/content/pm/PackageInfo;", HostState::Empty);
@@ -1670,7 +1728,10 @@ fn pm_call(vm: &mut Vm, name: &str, _args: &[V]) -> Rt<Option<Option<V>>> {
                     HostState::List(vec![]),
                 ))),
                 "checkPermission" | "checkSignatures" => {
-                    Some(Some(V::I32(0)))
+                    let g = perm_arg(vm, args)
+                        .map(|p| vm.granted_permissions.contains(&p))
+                        .unwrap_or(true);
+                    Some(Some(V::I32(if g { 0 } else { -1 })))
                 }
                 "hasSystemFeature" | "isInstantApp" | "isPackageSuspended"
                 | "canRequestPackageInstalls" | "hasSigningCertificate"
@@ -1773,7 +1834,10 @@ fn resources_call(vm: &mut Vm, name: &str, args: &[V]) -> Rt<Option<Option<V>>> 
         | "getConfiguration" | "getAssets" | "getSystem" | "newTheme"
         | "getMovie" => {
             match name {
-                "getLayout" => Some(Some(V::I32(0))),
+                "getLayout" => Some(Some(xml::parser_of(
+                    vm,
+                    i64v(args.get(1).copied().unwrap_or(V::I32(0))) as u32,
+                ))),
                 "getDisplayMetrics" => Some(Some(host(
                     vm,
                     "Landroid/util/DisplayMetrics;",

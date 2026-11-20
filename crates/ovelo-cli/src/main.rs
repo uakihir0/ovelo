@@ -833,6 +833,10 @@ fn run_app(store: &InstallStore, package: &str) -> Result<(), OveloError> {
                     .copied()
                     .or(info.manifest.theme)
                     .unwrap_or(0);
+                // Install-time grants: manifest <uses-permission> ∩
+                // normal-level; the rest stay denied until the app
+                // calls requestPermissions.
+                v.grant_manifest_permissions(&info.manifest.permissions);
                 v.enable_aot();
                 register_compat_shims(
                     &mut v,

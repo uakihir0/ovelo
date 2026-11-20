@@ -150,6 +150,9 @@ pub struct Vm {
     /// Interned main `Looper` — `Looper.myLooper()` and
     /// `Handler.getLooper()` must return the same handle.
     pub(crate) main_looper_h: u32,
+    /// Interned `Application` — `getApplication[Context]` must return a
+    /// real Application-typed object (callers `check-cast` it).
+    pub(crate) app_h: u32,
     /// sun.misc.Unsafe model: offset tokens minted by `objectFieldOffset`,
     /// `(object handle, offset)` -> stored value (CAS/volatile get/put).
     pub(crate) unsafe_offsets: HashMap<(u32, i64), V>,
@@ -163,6 +166,10 @@ pub struct Vm {
     /// `OVELO_TRACE_CALL` — log invoke sites whose resolved method name
     /// contains this substring (debug aid).
     trace_call: Option<String>,
+    /// Roots of every inflated view tree — `findViewById` falls back to
+    /// them when the receiver's own subtree misses (appcompat decor is
+    /// built dex-side, outside our synthetic window decor).
+    pub(crate) view_roots: Vec<u32>,
     /// Installed-APK resource index for `LayoutInflater.inflate` — `None`
     /// degrades inflation to bare placeholder views.
     pub apk_res: Option<res::ApkResources>,
@@ -176,7 +183,38 @@ pub struct Vm {
     /// canonical class_idx → `java.lang.Class` mirror handle — Class
     /// objects are singletons (`Foo.class == x.getClass()`).
     class_mirrors: HashMap<GIdx, u32>,
+    /// Permission names currently granted to the guest package —
+    /// seeded from the manifest's normal-level `<uses-permission>`
+    /// entries and grown by `requestPermissions` (user grants all).
+    pub granted_permissions: std::collections::HashSet<String>,
 }
+
+/// Permissions Android grants automatically at install time
+/// (`PROTECTION_NORMAL`). Dangerous/signature permissions start denied
+/// even when declared — they need `requestPermissions` or a grant the
+/// runtime cannot infer.
+pub const NORMAL_PERMISSIONS: &[&str] = &[
+    "android.permission.INTERNET",
+    "android.permission.ACCESS_NETWORK_STATE",
+    "android.permission.ACCESS_WIFI_STATE",
+    "android.permission.CHANGE_NETWORK_STATE",
+    "android.permission.CHANGE_WIFI_STATE",
+    "android.permission.VIBRATE",
+    "android.permission.WAKE_LOCK",
+    "android.permission.RECEIVE_BOOT_COMPLETED",
+    "android.permission.FOREGROUND_SERVICE",
+    "android.permission.FOREGROUND_SERVICE_DATA_SYNC",
+    "android.permission.FOREGROUND_SERVICE_SPECIAL_USE",
+    "android.permission.SCHEDULE_EXACT_ALARM",
+    "android.permission.USE_EXACT_ALARM",
+    "android.permission.REORDER_TASKS",
+    "android.permission.SET_WALLPAPER",
+    "android.permission.EXPAND_STATUS_BAR",
+    "android.permission.MODIFY_AUDIO_SETTINGS",
+    "android.permission.NFC",
+    "android.permission.BLUETOOTH",
+    "android.permission.BLUETOOTH_ADMIN",
+];
 
 impl Vm {
     /// Static field value stored on class `class_idx` (`None` when the
@@ -208,18 +246,32 @@ impl Vm {
             stub_trace: Vec::new(),
             main_thread_h: 0,
             main_looper_h: 0,
+            app_h: 0,
             unsafe_offsets: HashMap::new(),
             unsafe_next_offset: 0,
             trace_field: std::env::var("OVELO_TRACE_FIELD").ok(),
             trace_throw: std::env::var_os("OVELO_TRACE_THROW").is_some(),
             trace_call: std::env::var("OVELO_TRACE_CALL").ok(),
+            view_roots: Vec::new(),
             apk_res: None,
             theme_id: 0,
             pending_activity: None,
             class_mirrors: HashMap::new(),
+            granted_permissions: std::collections::HashSet::new(),
         };
         v.add_dex(dex)?;
         Ok(v)
+    }
+
+    /// Seed install-time grants: the manifest's `<uses-permission>`
+    /// entries that are normal-level auto-grant; the rest stay denied
+    /// until the app calls `requestPermissions`.
+    pub fn grant_manifest_permissions(&mut self, declared: &[String]) {
+        for p in declared {
+            if NORMAL_PERMISSIONS.contains(&p.as_str()) {
+                self.granted_permissions.insert(p.clone());
+            }
+        }
     }
 
     /// Merge another DEX (classes2.dex, …) into the shared index space.
@@ -2411,8 +2463,15 @@ impl Vm {
                 let t = match op {
                     // if-eq/if-ne also compare references by identity.
                     0x32 | 0x33 => {
-                        let eq = match (va, vb) {
-                            (V::Ref(a), V::Ref(b)) => a == b,
+                        // `const/4 v, 0` puts a null reference in a register,
+                        // so Ref may be compared against I32(0).
+                        let refv = |v: V| match v {
+                            V::Ref(h) => Some(h),
+                            V::I32(0) => Some(0),
+                            _ => None,
+                        };
+                        let eq = match (refv(va), refv(vb)) {
+                            (Some(a), Some(b)) => a == b,
                             _ => Self::i32v(va)? == Self::i32v(vb)?,
                         };
                         if op == 0x32 {
@@ -2619,6 +2678,7 @@ impl Vm {
                     .iter()
                     .map(|&i| Self::reg(fr, i as usize))
                     .collect::<Rt<_>>()?;
+                let this_arg = args.first().copied();
                 let res = self.invoke(midx, args, kind).map_err(|e| match e {
                     E::Vm(v) => {
                         let d = format!("{v} in {}", self.describe_method(fr.loc.midx));
@@ -2636,9 +2696,10 @@ impl Vm {
                 if let Some(p) = self.trace_call.as_deref() {
                     if fr.last_call.contains(p) {
                         eprintln!(
-                            "[call] {} +{pc:04x} -> {} ({:?})",
+                            "[call] {} +{pc:04x} -> {} this={:?} ({:?})",
                             self.describe_method(fr.loc.midx),
                             fr.last_call,
+                            this_arg,
                             res
                         );
                     }
