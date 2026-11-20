@@ -113,6 +113,17 @@ fn vto_of(vm: &mut Vm, view: u32) -> V {
 /// see a layout that never reached them (one-shot init would fire
 /// early and consume itself without an actual layout).
 pub fn fire_global_layout(vm: &mut Vm, root: u32) {
+    // Listeners hang on ancestors of the laid-out content too (decor,
+    // android.R.id.content frames) — normalize root to its topmost
+    // ancestor before testing membership.
+    let mut top = root;
+    for _ in 0..64 {
+        match pseudo_get(vm, top, P_PARENT) {
+            Some(V::Ref(p)) if p != 0 => top = p,
+            _ => break,
+        }
+    }
+    let root = top;
     fn attached(vm: &Vm, mut v: u32, root: u32) -> bool {
         for _ in 0..64 {
             if v == root {
@@ -138,6 +149,9 @@ pub fn fire_global_layout(vm: &mut Vm, root: u32) {
         eprintln!("[viewdbg] fire_global_layout {} listeners", all.len());
     }
     for l in all {
+        if std::env::var_os("OVELO_VIEWDBG").is_some() {
+            eprintln!("[viewdbg] onGlobalLayout h{l} {}", vm.dbg_class_of(l));
+        }
         if let Err(e) = vm.call_virtual(l, "onGlobalLayout", &[]) {
             if std::env::var_os("OVELO_VIEWDBG").is_some() {
                 eprintln!("[viewdbg] onGlobalLayout {l} err {e:?}");
@@ -704,7 +718,14 @@ pub(crate) fn call(
         "addView" | "addViewInLayout" | "attachViewToParent" | "attachViewToParentInLayout"
         | "addFocusables" | "addChildrenForAccessibility" => {
             if let Some(&child @ V::Ref(_)) = args.get(1) {
-                attach(vm, this, child);
+                // addView(v,i)/attachViewToParent(v,i,lp) carry an index —
+                // inserting at the end misorders children the container
+                // then indexes (getChildAt, indexOfChild).
+                let idx = match args.get(2) {
+                    Some(V::I32(i)) if *i >= 0 => Some(*i as usize),
+                    _ => None,
+                };
+                attach_at(vm, this, child, idx);
             }
             Some(match ret(sig) {
                 "V" => None,
@@ -1811,6 +1832,12 @@ fn view_id(vm: &Vm, h: u32) -> i32 {
 }
 
 pub(crate) fn attach(vm: &mut Vm, parent: u32, child: V) {
+    attach_at(vm, parent, child, None)
+}
+
+/// `idx` mirrors ViewGroup's positional add/attach: absent or past-the-
+/// end appends, otherwise the child lands at that child index.
+pub(crate) fn attach_at(vm: &mut Vm, parent: u32, child: V, idx: Option<usize>) {
     if parent == 0 {
         return;
     }
@@ -1832,7 +1859,10 @@ pub(crate) fn attach(vm: &mut Vm, parent: u32, child: V) {
     }
     if let Some(a) = children_arr(vm, parent) {
         if let Some(Obj::Array { data, .. }) = vm.heap.get_mut(a) {
-            data.push(child);
+            match idx {
+                Some(i) if i <= data.len() => data.insert(i, child),
+                _ => data.push(child),
+            }
         }
         pseudo_set(vm, parent, P_IS_GROUP, V::I32(1));
     }
