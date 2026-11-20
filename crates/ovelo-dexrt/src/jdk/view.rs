@@ -1618,8 +1618,11 @@ pub(crate) fn menu_inflate(vm: &mut Vm, res_v: Option<V>, menu_h: u32) {
     {
         return;
     }
-    let mut i = 0;
-    menu_inflate_level(vm, &doc, &mut i, 0, menu_h);
+    // doc[0] is the root `<menu>` (depth 0) — its `item`s are one
+    // level deeper (and a nested `<menu>` inside an item nests two).
+    let items_depth = doc.first().map(|e| e.depth + 1).unwrap_or(1);
+    let mut i = usize::from(!doc.is_empty());
+    menu_inflate_level(vm, &doc, &mut i, items_depth, menu_h);
 }
 
 /// One level of menu xml: `item` adds an entry; a nested `menu` opens
@@ -1674,7 +1677,10 @@ fn menu_inflate_level(vm: &mut Vm, doc: &[Element], i: &mut usize, depth: usize,
                 V::Ref(h) => h,
                 _ => 0,
             };
-            menu_inflate_level(vm, doc, i, depth + 1, sub_h);
+            // `*i` is the nested `<menu>` element (`depth+1`) — skip it;
+            // its `item`s sit at `depth+2`.
+            *i += 1;
+            menu_inflate_level(vm, doc, i, depth + 2, sub_h);
         }
     }
 }
