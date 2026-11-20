@@ -90,14 +90,21 @@ pub struct TtfFont {
     name: String,
     /// Rasterizer face (fontdue), built once at load.
     fd: Option<fontdue::Font>,
+    /// Face index inside a `.ttc` collection (0 for plain `ttf`/`otf`).
+    index: u32,
 }
 
 impl TtfFont {
-    /// Parse font bytes (`ttf`, `otf`; `.ttc` collections are unsupported and
-    /// rejected — callers pick a face index when support lands).
+    /// Parse font bytes (`ttf`, `otf`; for a `.ttc` collection pick the
+    /// face with [`Self::from_bytes_at`]).
     pub fn from_bytes(bytes: &[u8]) -> Result<Self> {
-        let face =
-            ttf_parser::Face::parse(bytes, 0).map_err(|e| err("ui.font.parse", e))?;
+        Self::from_bytes_at(bytes, 0)
+    }
+
+    /// Parse face `index` of a font file or TrueType collection.
+    pub fn from_bytes_at(bytes: &[u8], index: u32) -> Result<Self> {
+        let face = ttf_parser::Face::parse(bytes, index)
+            .map_err(|e| err("ui.font.parse", e))?;
         if face.is_variable() {
             // Variable fonts need instance pinning for deterministic layout;
             // reject until pinning is implemented.
@@ -118,6 +125,7 @@ impl TtfFont {
             bytes,
             fontdue::FontSettings {
                 scale: 100.0,
+                collection_index: index,
                 ..fontdue::FontSettings::default()
             },
         )
@@ -126,12 +134,13 @@ impl TtfFont {
             bytes: bytes.to_vec(),
             name,
             fd,
+            index,
         })
     }
 
     fn face(&self) -> ttf_parser::Face<'_> {
-        // Invariant: bytes were parse-checked in from_bytes.
-        ttf_parser::Face::parse(&self.bytes, 0).expect("font parsed at registration")
+        // Invariant: bytes were parse-checked in from_bytes_at.
+        ttf_parser::Face::parse(&self.bytes, self.index).expect("font parsed at registration")
     }
 
     /// Shape `text` with rustybuzz; returns per-cluster advances in px.
@@ -139,7 +148,7 @@ impl TtfFont {
     pub fn shape(&self, text: &str, size_px: f32) -> Vec<(usize, f32)> {
         let upm = self.face().units_per_em() as f32;
         let scale = size_px / upm;
-        let rb_face = rustybuzz::Face::from_slice(&self.bytes, 0)
+        let rb_face = rustybuzz::Face::from_slice(&self.bytes, self.index)
             .expect("font parsed at registration");
         let mut buf = rustybuzz::UnicodeBuffer::new();
         buf.push_str(text);
@@ -286,7 +295,8 @@ impl FontSet {
         self.fonts.push(f);
     }
 
-    /// Scan directories for `.ttf`/`.otf` files, registering parseable fonts.
+    /// Scan directories for `.ttf`/`.otf`/`.ttc` files, registering
+    /// parseable fonts — every face of a `.ttc` collection is registered.
     /// On macOS callers pass `/System/Library/Fonts`,
     /// `/System/Library/Fonts/Supplemental`, `/Library/Fonts`. Missing dirs
     /// are skipped; unparsable files are skipped, not fatal.
@@ -299,12 +309,24 @@ impl FontSet {
                 let ok = p
                     .extension()
                     .and_then(|e| e.to_str())
-                    .is_some_and(|e| e.eq_ignore_ascii_case("ttf") || e.eq_ignore_ascii_case("otf"));
+                    .is_some_and(|e| {
+                        e.eq_ignore_ascii_case("ttf")
+                            || e.eq_ignore_ascii_case("otf")
+                            || e.eq_ignore_ascii_case("ttc")
+                    });
                 if !ok {
                     continue;
                 }
-                if let Ok(bytes) = std::fs::read(&p) {
-                    if let Ok(f) = TtfFont::from_bytes(&bytes) {
+                let Ok(bytes) = std::fs::read(&p) else { continue };
+                let faces = ttf_parser::fonts_in_collection(&bytes).unwrap_or(1).max(1);
+                for i in 0..faces {
+                    if let Ok(f) = TtfFont::from_bytes_at(&bytes, i) {
+                        // ".LastResort" (macOS placeholder font) claims
+                        // coverage for every char and draws tofu boxes —
+                        // never let it win the fallback race.
+                        if f.name.starts_with('.') {
+                            continue;
+                        }
                         self.fonts.push(Box::new(f));
                         n += 1;
                     }
