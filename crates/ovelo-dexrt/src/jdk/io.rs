@@ -299,7 +299,7 @@ fn file_call(vm: &mut Vm, name: &str, args: &[V]) -> Option<Option<V>> {
             // `new File("")` maps onto the storage root — deleting it
             // would wipe the whole sandbox, which a failed delete must
             // never do.
-            let guarded = std_path == vm.guest_root;
+            let guarded = std_path == vm.guest_root || std_path == vm.external_root;
             Some(V::I32(
                 (!guarded
                     && (std::fs::remove_file(&std_path)
