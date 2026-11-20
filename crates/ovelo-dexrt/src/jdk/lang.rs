@@ -1801,6 +1801,25 @@ fn stacktrace_call(vm: &mut Vm, name: &str, args: &[V]) -> Option<Option<V>> {
         _ => 0,
     };
     match name {
+        "<init>" => {
+            // StackTraceElement(declaringClass, methodName, fileName,
+            // lineNumber) — same slots getStackTrace fills.
+            if let Some(n) = args.get(1).and_then(|v| sv(vm, *v)) {
+                if let Some(Obj::Host { state, .. }) = vm.heap.get_mut(h) {
+                    *state = HostState::StrBuf(n);
+                }
+            }
+            if let Some(&mn) = args.get(2) {
+                pseudo_set(vm, h, P_COMPONENT, mn);
+            }
+            if let Some(&f) = args.get(3) {
+                pseudo_set(vm, h, P_DATA, f);
+            }
+            if let Some(&l) = args.get(4) {
+                pseudo_set(vm, h, P_FLAGS, l);
+            }
+            Some(None)
+        }
         "getClassName" => Some(Some(
             s(vm, h)
                 .map(|n| jstr(vm, &n))
@@ -1812,8 +1831,16 @@ fn stacktrace_call(vm: &mut Vm, name: &str, args: &[V]) -> Option<Option<V>> {
                 .map(|n| jstr(vm, &n))
                 .unwrap_or(V::Ref(0)),
         )),
-        "getFileName" => Some(Some(jstr(vm, ""))),
-        "getLineNumber" | "getModuleVersion" => Some(Some(V::I32(0))),
+        "getFileName" => Some(Some(
+            pseudo_get(vm, h, P_DATA)
+                .and_then(|v| sv(vm, v))
+                .map(|n| jstr(vm, &n))
+                .unwrap_or_else(|| jstr(vm, "")),
+        )),
+        "getLineNumber" => Some(Some(
+            pseudo_get(vm, h, P_FLAGS).unwrap_or(V::I32(0)),
+        )),
+        "getModuleVersion" => Some(Some(V::I32(0))),
         "isNativeMethod" => Some(Some(V::I32(0))),
         _ => Some(Some(V::Ref(0))),
     }
