@@ -1223,7 +1223,9 @@ fn context_call(
         | "startActivityFromChild" | "startActivityFromFragment"
         | "startActivityIfNeeded" | "startNextMatchingActivity" => {
             // Component-targeted intents become a pending launch the
-            // runner drains into a real second-Activity dispatch.
+            // runner drains into a real second-Activity dispatch. The
+            // Intent travels with the launch so the target's getIntent
+            // sees the caller's extras/URI.
             if let Some(V::Ref(ih)) = args.get(1).copied() {
                 if let Some(c) = pseudo_get(vm, ih, P_COMPONENT) {
                     let desc = match c {
@@ -1233,7 +1235,7 @@ fn context_call(
                         _ => None,
                     };
                     if let Some(d) = desc {
-                        vm.pending_activity = Some(d);
+                        vm.pending_activity = Some((d, V::Ref(ih)));
                     }
                 }
             }
@@ -1382,15 +1384,18 @@ fn context_call(
                         matches!(name, "isTaskRoot" | "hasWindowFocus") as i32,
                     )))
                 }
-                "finish" | "finishAffinity" | "finishActivity"
-                | "finishActivityFromChild" | "finishAfterTransition"
+                "finish" | "finishAffinity" | "finishAfterTransition"
                 | "finishAndRemoveTask" | "finishFromChild" => {
                     if let V::Ref(h) = args[0] {
                         pseudo_set(vm, h, view::P_FINISHED, V::I32(1));
                     }
                     Some(None)
                 }
-                "onBackPressed" | "onUserInteraction" | "onPostResume"
+                // finishActivity*(requestCode) ends a *child* activity
+                // started for a result, not the caller — flagging it
+                // would mark `this` finished and abort its lifecycle.
+                "finishActivity" | "finishActivityFromChild"
+                | "onBackPressed" | "onUserInteraction" | "onPostResume"
                 | "onRetainNonConfigurationInstance" | "moveTaskToBack" => {
                     Some(None)
                 }
@@ -1407,11 +1412,18 @@ fn context_call(
                     "Landroid/content/ComponentName;",
                     HostState::StrBuf(dotted(&class_of(vm, args[0]))),
                 ))),
-                "getIntent" => Some(Some(host(
-                    vm,
-                    "Landroid/content/Intent;",
-                    HostState::Map(vec![]),
-                ))),
+                "getIntent" => {
+                    // The launch Intent recorded by the runner when the
+                    // activity was started via startActivity; otherwise a
+                    // fresh empty one.
+                    let i = match args[0] {
+                        V::Ref(h) => view::activity_intent(vm, h),
+                        _ => None,
+                    };
+                    Some(Some(i.unwrap_or_else(|| {
+                        host(vm, "Landroid/content/Intent;", HostState::Map(vec![]))
+                    })))
+                }
                 "getMaxNumPictureInPictureActions" => Some(Some(V::I32(0))),
                 "onProvideKeyboardShortcuts" => Some(None),
                 _ => Some(Some(stub_ret(vm, sig))),

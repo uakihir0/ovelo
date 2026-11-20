@@ -162,9 +162,10 @@ pub struct Vm {
     /// The Activity/theme res id (`android:theme` from the manifest) that
     /// theme-scoped `obtainStyledAttributes` resolves attributes against.
     pub theme_id: u32,
-    /// An Activity class the guest asked to start (`startActivity` with a
-    /// component Intent) — the runner drains this and launches it.
-    pub pending_activity: Option<String>,
+    /// Activity a guest `startActivity` asked to launch — (class
+    /// descriptor, the Intent the caller passed). The runner drains
+    /// it into a real second-Activity dispatch.
+    pub pending_activity: Option<(String, V)>,
     /// canonical class_idx → `java.lang.Class` mirror handle — Class
     /// objects are singletons (`Foo.class == x.getClass()`).
     class_mirrors: HashMap<GIdx, u32>,
@@ -792,6 +793,11 @@ impl Vm {
     /// lifecycle callbacks (onStart/onResume/…) should be skipped.
     pub fn is_finishing(&self, activity: u32) -> bool {
         jdk::view::is_finishing(self, activity)
+    }
+    /// Record the launch Intent on an Activity the runner is about to
+    /// start — `Activity.getIntent` hands it back to guest code.
+    pub fn set_activity_intent(&mut self, activity: u32, intent: V) {
+        jdk::view::set_activity_intent(self, activity, intent);
     }
 
     fn describe_throw(&self, h: u32) -> String {

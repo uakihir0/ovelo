@@ -53,6 +53,7 @@ const P_ITEM_SUBMENU: u32 = 0xFFFD_FFF0;
 /// Pseudo key: `Activity.finish()` was called — later lifecycle
 /// callbacks must be skipped.
 pub(crate) const P_FINISHED: u32 = 0xFFFD_FFEF;
+pub(crate) const P_INTENT: u32 = 0xFFFD_FFEE;
 
 // TypedArray backing — below the `tag_key` band (which bottoms out at
 // ~u32::MAX - 0x10014).
@@ -1401,6 +1402,15 @@ fn is_menuitem(vm: &Vm, h: u32) -> bool {
 /// Whether the guest finished this Activity (`finish()` and family).
 pub(crate) fn is_finishing(vm: &Vm, h: u32) -> bool {
     pseudo_get(vm, h, P_FINISHED) == Some(V::I32(1))
+}
+
+/// The Intent the Activity was launched with — set by the runner when
+/// it instantiates the target of a guest `startActivity`.
+pub(crate) fn set_activity_intent(vm: &mut Vm, h: u32, intent: V) {
+    pseudo_set(vm, h, P_INTENT, intent);
+}
+pub(crate) fn activity_intent(vm: &Vm, h: u32) -> Option<V> {
+    pseudo_get(vm, h, P_INTENT)
 }
 
 pub(crate) fn menu_of(vm: &mut Vm, view_h: u32) -> V {

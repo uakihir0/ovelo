@@ -590,6 +590,47 @@ fn register_compat_shims(
     );
 }
 
+/// Launch any Activity a guest queued via `startActivity` (component
+/// Intent) — the target replaces the finished one on the same VM and
+/// window (single-task model). Its own `android:theme` and the caller's
+/// Intent come along. Bounded: a chain of redirects still terminates.
+fn drain_pending_activity(
+    vm: &mut ovelo_dexrt::Vm,
+    this: &mut u32,
+    callbacks: &[String],
+    manifest: &ovelo_apk::manifest::ManifestInfo,
+) {
+    for _ in 0..4 {
+        let Some((next, intent)) = vm.pending_activity.take() else {
+            break;
+        };
+        // Resolve the target's own theme before instantiation — theme-
+        // scoped obtainStyledAttributes reads vm.theme_id.
+        let qualified = next
+            .trim_start_matches('L')
+            .trim_end_matches(';')
+            .replace('/', ".");
+        vm.theme_id = manifest
+            .activity_themes
+            .get(&qualified)
+            .copied()
+            .or(manifest.theme)
+            .unwrap_or(0);
+        match vm.instantiate(&next) {
+            Ok(h2) => {
+                println!("activity {} (started)", disp(&next));
+                vm.set_activity_intent(h2, intent);
+                *this = h2;
+                run_activity_cbs(vm, *this, callbacks);
+            }
+            Err(e) => {
+                println!("activity {} not launched: {e}", disp(&next));
+                break;
+            }
+        }
+    }
+}
+
 /// Deliver the queued lifecycle callbacks to a guest Activity:
 /// `finish()` stops the sequence, and the options menu is prepared
 /// before `onResume` the way AOSP lazily creates it on first use.
@@ -835,25 +876,12 @@ fn run_app(store: &InstallStore, package: &str) -> Result<(), OveloError> {
                 .ok();
             if let Some((vm, this)) = &mut g {
                 run_activity_cbs(vm, *this, &callbacks);
-                // `startActivity` during a callback records the target —
-                // launch it on the same VM/window (single-task model:
-                // the new Activity replaces the finished one).
-                for _ in 0..4 {
-                    let Some(next) = vm.pending_activity.take() else {
-                        break;
-                    };
-                    match vm.instantiate(&next) {
-                        Ok(h2) => {
-                            println!("activity {} (started)", disp(&next));
-                            *this = h2;
-                            run_activity_cbs(vm, *this, &callbacks);
-                        }
-                        Err(e) => {
-                            println!("activity {} not launched: {e}", disp(&next));
-                            break;
-                        }
-                    }
-                }
+                drain_pending_activity(
+                    vm,
+                    this,
+                    &callbacks,
+                    &info.manifest,
+                );
             }
             (g, ui)
         });
@@ -931,7 +959,7 @@ fn run_app(store: &InstallStore, package: &str) -> Result<(), OveloError> {
         // the same views (RefCell re-entrancy avoided).
         let pending = ui2.borrow().drain_clicks();
         let mut dead = false;
-        if let Some((vm, _this)) = &mut guest {
+        if let Some((vm, this)) = &mut guest {
             for (l, vh) in pending {
                 match sup.supervise("onClick", || {
                     vm.call_virtual(l, "onClick", &[ovelo_dexrt::V::Ref(vh)])
@@ -946,6 +974,11 @@ fn run_app(store: &InstallStore, package: &str) -> Result<(), OveloError> {
                         break;
                     }
                 }
+            }
+            // A click handler may call startActivity — launch the target
+            // the same way the initial-lifecycle drain does.
+            if !dead {
+                drain_pending_activity(vm, this, &callbacks, &info.manifest);
             }
         }
         // Panicked worker: drop its surface generation so no stale frame
