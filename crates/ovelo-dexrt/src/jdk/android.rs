@@ -1940,7 +1940,9 @@ fn resources_call(vm: &mut Vm, name: &str, args: &[V]) -> Rt<Option<Option<V>>> 
                     v.string
                         .clone()
                         .or_else(|| {
-                            if v.data_type == 0x03 {
+                            if v.data_type == 0x03 || v.data_type == 0x01 {
+                                // Inline string or a reference to
+                                // another resource (`@string/…`).
                                 vm.apk_res
                                     .as_ref()
                                     .and_then(|r| r.string_of(v.data).map(|s| s.to_string()))
@@ -1951,8 +1953,12 @@ fn resources_call(vm: &mut Vm, name: &str, args: &[V]) -> Rt<Option<Option<V>>> 
                         .unwrap_or_default()
                 })
                 .unwrap_or_default();
-            // The varargs tail formats %d/%s placeholders with the
-            // boxed args (Integer.valueOf(count), …).
+            // Format only the 3-arg `getQuantityString(id, n, args...)`:
+            // `getQuantityText` and the 2-arg form hand the caller a
+            // template to format later — `%d`/`%s` must survive.
+            if name == "getQuantityText" || args.len() < 4 {
+                return Ok(Some(Some(jstr(vm, &text))));
+            }
             let mut fmt_args: Vec<String> = Vec::new();
             if let Some(V::Ref(a)) = args.get(3) {
                 let items = match vm.heap().get(*a) {
@@ -1964,29 +1970,35 @@ fn resources_call(vm: &mut Vm, name: &str, args: &[V]) -> Rt<Option<Option<V>>> 
                 }
             }
             let mut out = String::with_capacity(text.len() + 8);
-            let mut ai = 0usize;
+            let mut next = 0usize;
             let mut chars = text.chars().peekable();
             while let Some(c) = chars.next() {
-                if c == '%' {
-                    // skip positional `1$` and take the conversion char
-                    let mut conv = chars.next().unwrap_or('%');
-                    if conv.is_ascii_digit() {
-                        let _ = chars.next(); // '$'
-                        conv = chars.next().unwrap_or('%');
-                    }
-                    let arg = fmt_args.get(ai).cloned().unwrap_or_default();
-                    ai += 1;
-                    match conv {
-                        'd' | 'i' => out.push_str(&arg),
-                        's' => out.push_str(&arg),
-                        '%' => out.push('%'),
-                        _ => {
-                            out.push('%');
-                            out.push(conv);
-                        }
-                    }
-                } else {
+                if c != '%' {
                     out.push(c);
+                    continue;
+                }
+                // `%N$` pins the arg index without advancing the
+                // sequential cursor; `%%` consumes no arg.
+                let mut conv = chars.next().unwrap_or('%');
+                let arg = if conv.is_ascii_digit() {
+                    let idx = conv.to_digit(10).unwrap_or(0) as usize;
+                    let _ = chars.next(); // '$'
+                    conv = chars.next().unwrap_or('%');
+                    fmt_args.get(idx.saturating_sub(1)).cloned()
+                } else {
+                    fmt_args.get(next).cloned()
+                };
+                match conv {
+                    'd' | 'i' | 's' => {
+                        out.push_str(&arg.unwrap_or_default());
+                        next += 1;
+                    }
+                    '%' => out.push('%'),
+                    _ => {
+                        out.push('%');
+                        out.push(conv);
+                        next += 1;
+                    }
                 }
             }
             Some(Some(jstr(vm, &out)))
@@ -2645,9 +2657,11 @@ fn handler_call(vm: &mut Vm, name: &str, args: &[V]) -> Rt<Option<Option<V>>> {
         }
         "handleMessage" | "dispatchMessage" | "callback" => {
             if let V::Ref(h) = args[0] {
-                if let Ok(v) = vm.call_virtual(h, "handleMessage", &args[1..]) {
-                    return Ok(Some(v));
-                }
+                // `call_virtual_rt` — no builtin fallback: `call_virtual`
+                // would route a non-overridden handleMessage back here
+                // and recurse until the stack blows.
+                let v = vm.call_virtual_rt(h, "handleMessage", &args[1..])?;
+                return Ok(Some(v));
             }
             Some(None)
         }
