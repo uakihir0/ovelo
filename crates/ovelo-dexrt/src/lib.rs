@@ -103,6 +103,10 @@ pub struct Vm {
     /// Interned main-thread object — `Thread.currentThread()` and
     /// `Looper.getThread()` must compare equal (androidx checks `==`).
     pub(crate) main_thread_h: u32,
+    /// sun.misc.Unsafe model: offset tokens minted by `objectFieldOffset`,
+    /// `(object handle, offset)` -> stored value (CAS/volatile get/put).
+    pub(crate) unsafe_offsets: HashMap<(u32, i64), V>,
+    pub(crate) unsafe_next_offset: i64,
 }
 
 impl Vm {
@@ -142,6 +146,8 @@ impl Vm {
             throw_sites: HashMap::new(),
             stub_trace: Vec::new(),
             main_thread_h: 0,
+            unsafe_offsets: HashMap::new(),
+            unsafe_next_offset: 0,
         })
     }
 
@@ -718,8 +724,16 @@ impl Vm {
         };
         match self.heap.get(h) {
             Some(Obj::Instance { class_idx, .. }) => self.assignable(*class_idx, type_idx),
-            Some(Obj::Host { class_idx, desc, .. }) => {
-                (*class_idx != u32::MAX && self.assignable(*class_idx, type_idx))
+            Some(Obj::Host {
+                class_idx,
+                desc,
+                state,
+                ..
+            }) => {
+                // Opaque placeholders (empty stubs we minted to satisfy a
+                // return type) carry no verifiable class — let casts pass.
+                matches!(state, HostState::Empty)
+                    || (*class_idx != u32::MAX && self.assignable(*class_idx, type_idx))
                     || self.assignable_desc(desc, &sup)
             }
             Some(Obj::Throwable { descriptor, .. }) => {

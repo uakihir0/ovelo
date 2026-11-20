@@ -39,6 +39,8 @@ pub(crate) fn call(
         throwable_call(vm, name, sig, args)?
     } else if class == "Ljava/lang/Enum;" || desc_is_a(class, "Ljava/lang/Enum;") {
         enum_call(vm, class, name, args)?
+    } else if class == "Lsun/misc/Unsafe;" {
+        unsafe_call(vm, name, args)
     } else if class == "Ljava/lang/StackTraceElement;" {
         stacktrace_call(vm, name, args)
     } else if class.starts_with("Ljava/lang/reflect/") {
@@ -66,12 +68,24 @@ pub(crate) fn call(
                 Some(None)
             }
             "get" => Some(Some(match args[0] {
+                // PhantomReference.get() is null by contract.
+                _ if class == "Ljava/lang/ref/PhantomReference;" => V::Ref(0),
                 V::Ref(h) => slot_of(vm, h).unwrap_or(V::Ref(0)),
                 _ => V::Ref(0),
             })),
-            "clear" | "enqueue" | "isEnqueued" => {
-                Some(if name == "clear" { None } else { Some(V::I32(0)) })
+            "clear" => {
+                if let V::Ref(h) = args[0] {
+                    if let Some(Obj::Host {
+                        state: HostState::Slot(slot),
+                        ..
+                    }) = vm.heap.get_mut(h)
+                    {
+                        *slot = V::Ref(0);
+                    }
+                }
+                Some(None)
             }
+            "enqueue" | "isEnqueued" => Some(Some(V::I32(0))),
             _ => None,
         }
     } else {
@@ -1704,7 +1718,14 @@ fn reflect_call(
                             }
                             _ => V::Ref(0),
                         },
-                        _ => V::Ref(0),
+                        // `Field.get(null)` reads a static field — the
+                        // field id is guest-owned (`Unsafe.theUnsafe` etc.),
+                        // so hand back an opaque placeholder.
+                        _ if name == "get" => host(vm, OBJ, HostState::Empty),
+                        _ if name == "getLong" => V::I64(0),
+                        _ if name == "getFloat" => V::F32(0.0),
+                        _ if name == "getDouble" => V::F64(0.0),
+                        _ => V::I32(0),
                     };
                     Some(Some(v))
                 }
@@ -1771,5 +1792,107 @@ fn reflect_call(
             let _ = (sig, class);
             None
         }
+    })
+}
+
+/// sun.misc.Unsafe: offset tokens over a per-object slot map so guest
+/// atomic updaters (kotlinx-coroutines' *$volatile field updaters) CAS
+/// against real stored values instead of null placeholders.
+fn unsafe_call(vm: &mut Vm, name: &str, args: &[V]) -> Option<Option<V>> {
+    let slot = |_vm: &mut Vm, args: &[V]| -> Option<(u32, i64)> {
+        match (args.get(1), args.get(2)) {
+            (Some(V::Ref(h)), Some(V::I64(off))) => Some((*h, *off)),
+            (Some(V::Ref(h)), Some(V::I32(off))) => Some((*h, *off as i64)),
+            _ => None,
+        }
+    };
+    Some(match name {
+        "getUnsafe" => Some(host(vm, "Lsun/misc/Unsafe;", HostState::Empty)),
+        "objectFieldOffset" | "staticFieldOffset" => {
+            vm.unsafe_next_offset += 1;
+            Some(V::I64(vm.unsafe_next_offset))
+        }
+        "arrayBaseOffset" => Some(V::I32(0)),
+        "arrayIndexScale" => Some(V::I32(1)),
+        "getObject" | "getObjectVolatile" => Some(match slot(vm, args) {
+            Some(k) => vm.unsafe_offsets.get(&k).copied().unwrap_or(V::Ref(0)),
+            None => V::Ref(0),
+        }),
+        "putObject" | "putObjectVolatile" => {
+            if let Some(k) = slot(vm, args) {
+                vm.unsafe_offsets
+                    .insert(k, args.get(3).copied().unwrap_or(V::Ref(0)));
+            }
+            None
+        }
+        "compareAndSwapObject" => Some(match slot(vm, args) {
+            Some(k) => {
+                let (expect, new) = (
+                    args.get(3).copied().unwrap_or(V::Ref(0)),
+                    args.get(4).copied().unwrap_or(V::Ref(0)),
+                );
+                let cur = vm.unsafe_offsets.get(&k).copied().unwrap_or(V::Ref(0));
+                if crate::jdk::value_eq(vm, cur, expect) {
+                    vm.unsafe_offsets.insert(k, new);
+                    V::I32(1)
+                } else {
+                    V::I32(0)
+                }
+            }
+            None => V::I32(0),
+        }),
+        "getInt" | "getIntVolatile" | "getLong" | "getLongVolatile" => {
+            Some(match slot(vm, args) {
+                Some(k) => vm.unsafe_offsets.get(&k).copied().unwrap_or(V::I32(0)),
+                None => V::I32(0),
+            })
+        }
+        "putInt" | "putIntVolatile" | "putLong" | "putLongVolatile" => {
+            if let Some(k) = slot(vm, args) {
+                vm.unsafe_offsets
+                    .insert(k, args.get(3).copied().unwrap_or(V::I32(0)));
+            }
+            None
+        }
+        "compareAndSwapInt" | "compareAndSwapLong" => Some(match slot(vm, args) {
+            Some(k) => {
+                let (expect, new) = (
+                    args.get(3).copied().unwrap_or(V::I32(0)),
+                    args.get(4).copied().unwrap_or(V::I32(0)),
+                );
+                let cur = vm.unsafe_offsets.get(&k).copied().unwrap_or(V::I32(0));
+                if crate::jdk::value_eq(vm, cur, expect) {
+                    vm.unsafe_offsets.insert(k, new);
+                    V::I32(1)
+                } else {
+                    V::I32(0)
+                }
+            }
+            None => V::I32(0),
+        }),
+        "getAndSetObject" | "getAndAddInt" | "getAndAddLong" | "getAndSetInt"
+        | "getAndSetLong" => {
+            // Atomic read-then-write: return the old value, store the new.
+            match slot(vm, args) {
+                Some(k) => {
+                    let old = vm.unsafe_offsets.get(&k).copied().unwrap_or(V::I32(0));
+                    let new = match name {
+                        "getAndAddInt" | "getAndAddLong" => {
+                            let add = args.get(3).copied().unwrap_or(V::I32(0));
+                            match (old, add) {
+                                (V::I64(a), V::I64(b)) => V::I64(a.wrapping_add(b)),
+                                (V::I32(a), V::I32(b)) => V::I32(a.wrapping_add(b)),
+                                _ => old,
+                            }
+                        }
+                        _ => args.get(3).copied().unwrap_or(V::Ref(0)),
+                    };
+                    vm.unsafe_offsets.insert(k, new);
+                    Some(old)
+                }
+                None => Some(V::I32(0)),
+            }
+        }
+        _ => None,
     })
 }
