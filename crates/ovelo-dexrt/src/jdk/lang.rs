@@ -2038,9 +2038,12 @@ fn unsafe_call(vm: &mut Vm, name: &str, args: &[V]) -> Rt<Option<Option<V>>> {
             None
         }
         "throwException" => {
+            // Null throwable -> NullPointerException (per Unsafe spec).
             return Err(match args.get(1) {
-                Some(V::Ref(h)) => crate::E::Throw(*h),
-                _ => vm.throw_builtin("Ljava/lang/RuntimeException;", "throwException"),
+                Some(V::Ref(h)) if *h != 0 => crate::E::Throw(*h),
+                _ => {
+                    vm.throw_builtin("Ljava/lang/NullPointerException;", "throwException(null)")
+                }
             });
         }
         "loadFence" | "storeFence" | "fullFence" | "park" | "unpark"
