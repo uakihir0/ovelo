@@ -184,6 +184,9 @@ pub struct GuestUi {
     dex_views: HashMap<u32, Rc<RefCell<GuestView>>>,
     /// The dex view-tree content root last materialized.
     dex_root: u32,
+    /// The host view currently mounted as content — remount only when
+    /// it differs (a bridge view may replace the materialized one).
+    dex_mounted: Option<Rc<RefCell<GuestView>>>,
     /// True once the guest set a real `GuestView` content view — the
     /// dex-tree renderer must not clobber it.
     guest_content_set: bool,
@@ -235,21 +238,43 @@ fn make_dex_view(info: &ovelo_dexrt::DexViewInfo, fonts: &Rc<FontSet>) -> GuestV
 }
 
 fn update_dex_view(g: &mut GuestView, info: &ovelo_dexrt::DexViewInfo) {
-    let v = g.view_mut();
-    let (w, h) = (dex_len(info.lp_w), dex_len(info.lp_h));
-    v.lp_w = w;
-    v.lp_h = h;
-    v.background = info.bg_color.map(argb);
+    let mut changed = false;
+    {
+        let v = g.view_mut();
+        let (w, h) = (dex_len(info.lp_w), dex_len(info.lp_h));
+        if v.lp_w != w || v.lp_h != h {
+            v.lp_w = w;
+            v.lp_h = h;
+            changed = true;
+        }
+        let bg = info.bg_color.map(argb);
+        if v.background != bg {
+            v.background = bg;
+            changed = true;
+        }
+    }
     if let Some(tv) = g.text_mut() {
         if let Some(t) = &info.text {
-            tv.set_text(t.clone());
+            if tv.text != *t {
+                tv.set_text(t.clone());
+            }
         }
         if let Some(s) = info.text_size {
-            tv.text_size = s;
+            if tv.text_size != s {
+                tv.text_size = s;
+                tv.set_text(tv.text.clone()); // re-measure at the new size
+            }
         }
         if let Some(c) = info.text_color {
-            tv.color = argb(c);
+            let col = argb(c);
+            if tv.color != col {
+                tv.color = col;
+                tv.invalidate();
+            }
         }
+    }
+    if changed {
+        g.invalidate();
     }
 }
 
@@ -263,6 +288,7 @@ impl GuestUi {
             clicks: Rc::new(RefCell::new(VecDeque::new())),
             dex_views: HashMap::new(),
             dex_root: 0,
+            dex_mounted: None,
             guest_content_set: false,
         }))
     }
@@ -507,12 +533,32 @@ impl GuestUi {
             return false;
         };
         let Some(rc) = self.materialize_dex(vm, root) else {
+            // Content root went GONE/INVISIBLE: swap in an empty group
+            // so the stale tree stops drawing and answering touches.
+            if self.dex_root != 0 {
+                self.dex_root = 0;
+                self.dex_mounted = None;
+                self.root.set_content_view(Box::new(ViewGroup::new(
+                    Length::MatchParent,
+                    Length::MatchParent,
+                )));
+            }
             return false;
         };
-        if root != self.dex_root {
+        // Mount once per root: per-view objects persist across calls,
+        // so the same SharedView stays attached and only changes
+        // (update_dex_view) mark the tree dirty — a static screen
+        // doesn't re-measure/re-draw every frame.
+        let mounted = self.dex_root == root
+            && self
+                .dex_mounted
+                .as_ref()
+                .is_some_and(|m| Rc::ptr_eq(m, &rc));
+        if !mounted {
             self.dex_root = root;
+            self.dex_mounted = Some(rc.clone());
+            self.root.set_content_view(Box::new(SharedView(rc)));
         }
-        self.root.set_content_view(Box::new(SharedView(rc)));
         true
     }
 
@@ -522,11 +568,17 @@ impl GuestUi {
             return None;
         }
         let fonts = self.fonts.clone();
-        let rc = self
-            .dex_views
-            .entry(h)
-            .or_insert_with(|| Rc::new(RefCell::new(make_dex_view(&info, &fonts))))
-            .clone();
+        // Reuse the bridge-bound instance when the inflated widget's
+        // ctor already made one — the bridge setters (`setText` etc.)
+        // update `views`, and clicks/text must reach the drawn view.
+        let rc = match self.views.get(&h) {
+            Some(rc) => rc.clone(),
+            None => self
+                .dex_views
+                .entry(h)
+                .or_insert_with(|| Rc::new(RefCell::new(make_dex_view(&info, &fonts))))
+                .clone(),
+        };
         let mut g = rc.borrow_mut();
         // `g` borrows the view object while `self.materialize_dex`
         // recurses into children — different cells, no aliasing.
