@@ -1200,10 +1200,16 @@ fn random_call(vm: &mut Vm, name: &str, args: &[V], secure: bool) -> Option<Opti
     // `java.util.Random` is contractually deterministic; `SecureRandom`
     // must not be guessable — mix in OS entropy each call.
     let os_entropy = if secure {
-        std::fs::read("/dev/urandom")
-            .ok()
-            .and_then(|b| b.get(..8).map(|w| u64::from_ne_bytes(w.try_into().unwrap())))
-            .unwrap_or_else(|| now_ms() as u64)
+        use std::io::Read;
+        // Read exactly 8 bytes — `fs::read` on /dev/urandom never sees
+        // EOF and would exhaust host memory.
+        std::fs::File::open("/dev/urandom")
+            .and_then(|mut f| {
+                let mut w = [0u8; 8];
+                f.read_exact(&mut w).map(|_| w)
+            })
+            .map(u64::from_ne_bytes)
+            .unwrap_or_else(|_| now_ms() as u64)
     } else {
         0
     };
