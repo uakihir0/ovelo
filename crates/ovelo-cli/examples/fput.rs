@@ -30,11 +30,26 @@ fn main() {
                 let Ok(Some(code)) = dex.code_item(m.code_off) else { continue };
                 let Ok(insns) = decode_all(&code.insns) else { continue };
                 for ins in &insns {
-                    if let Some(ix) = ins.idx {
-                        if tgt.contains(&ix) {
-                            let o = dex.type_descriptor(cd.class_idx).unwrap_or_default();
-                            let mn = dex.string(dex.method(m.method_idx).unwrap().name_idx).unwrap_or_default();
-                            println!("  used in {o}.{mn} ({})", ins.name);
+                    // ins.idx is a field index only on field insns —
+                    // the same number indexes strings/types/methods on
+                    // other opcodes.
+                    let is_field_insn = matches!(
+                        ins.name.split_whitespace().next().unwrap_or(""),
+                        n if n.starts_with("iget")
+                            || n.starts_with("iput")
+                            || n.starts_with("sget")
+                            || n.starts_with("sput")
+                    );
+                    if is_field_insn {
+                        if let Some(ix) = ins.idx {
+                            if tgt.contains(&ix) {
+                                let o =
+                                    dex.type_descriptor(cd.class_idx).unwrap_or_default();
+                                let mn = dex
+                                    .string(dex.method(m.method_idx).unwrap().name_idx)
+                                    .unwrap_or_default();
+                                println!("  used in {o}.{mn} ({})", ins.name);
+                            }
                         }
                     }
                 }

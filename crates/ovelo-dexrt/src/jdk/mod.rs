@@ -415,20 +415,62 @@ pub(crate) fn list_ref(vm: &Vm, h: u32) -> Option<&Vec<V>> {
             state: HostState::List(l),
             ..
         }) => Some(l),
-        // Guest List wrappers (`unmodifiableList`, subList, …) are real
-        // dex objects that hold the backing list in a field — follow
-        // them so List reads see through the wrapper.
-        Some(Obj::Instance { fields, .. }) => {
-            for v in fields.values() {
-                if let V::Ref(x) = v {
-                    if *x != 0 && *x != h {
-                        if let r @ Some(_) = list_ref(vm, *x) {
-                            return r;
+        // Guest List wrappers (`unmodifiableList`, `synchronizedList`,
+        // checked/immutable views…) are real dex objects that delegate
+        // element access to a backing list held in a field. Only
+        // transparent delegates are followed — a `SubList` carries
+        // offset/size and would report out-of-range elements, and the
+        // hop bound ends reference cycles instead of overflowing the
+        // host stack.
+        Some(Obj::Instance { .. }) => {
+            let mut out = None;
+            let mut cur = h;
+            for _ in 0..8 {
+                let Some(Obj::Instance { fields: f, .. }) = vm.heap.get(cur) else {
+                    break;
+                };
+                let desc = class_of(vm, V::Ref(cur));
+                if !(desc.contains("Unmodifiable")
+                    || desc.contains("Synchronized")
+                    || desc.contains("Checked")
+                    || desc.contains("Immutable"))
+                {
+                    break;
+                }
+                let mut next = None;
+                for v in f.values() {
+                    if let V::Ref(x) = v {
+                        if *x != 0 && *x != cur && *x != h {
+                            next = Some(*x);
+                            break;
                         }
                     }
                 }
+                match next {
+                    Some(x) => {
+                        if let Some(Obj::Host {
+                            state: HostState::List(_),
+                            ..
+                        }) = vm.heap.get(x)
+                        {
+                            out = Some(x);
+                            break;
+                        }
+                        cur = x;
+                    }
+                    None => break,
+                }
             }
-            None
+            match out {
+                Some(x) => match vm.heap.get(x) {
+                    Some(Obj::Host {
+                        state: HostState::List(l),
+                        ..
+                    }) => Some(l),
+                    _ => None,
+                },
+                None => None,
+            }
         }
         _ => None,
     }
