@@ -444,13 +444,24 @@ fn register_compat_shims(v: &mut ovelo_dexrt::Vm, initializers: &[String]) {
             sig,
             Rc::new(RefCell::new(|vm: &mut ovelo_dexrt::Vm, a: &[V]| {
                 // Answer the component instance the caller expects:
-                // instantiate the class named by the Class argument.
+                // instantiate the Initializer named by the Class argument
+                // and return its `create(context)` result, the way AOSP's
+                // AppInitializer.initializeComponent does.
                 let desc = match a.get(1).copied() {
                     Some(V::Ref(h)) => vm.class_descriptor_of(h),
                     _ => None,
                 };
                 if let Some(d) = desc {
                     if let Ok(ih) = vm.instantiate(&d) {
+                        let ctx = match a.first().copied() {
+                            Some(V::Ref(ai)) => vm
+                                .get_object_field(ai, "Landroidx/startup/AppInitializer;", "mContext")
+                                .unwrap_or(V::Ref(0)),
+                            _ => V::Ref(0),
+                        };
+                        if let Ok(Some(v)) = vm.call_virtual(ih, "create", &[ctx]) {
+                            return Ok(Some(v));
+                        }
                         return Ok(Some(V::Ref(ih)));
                     }
                 }
@@ -518,6 +529,46 @@ fn register_compat_shims(v: &mut ovelo_dexrt::Vm, initializers: &[String]) {
             Ok(Some(ai))
         })) as ovelo_dexrt::HostCall,
     );
+}
+
+/// AOSP `AppInitializer.doInitialize`: an initializer's `dependencies()`
+/// run before its own `create`. The `seen` set guards manifest/dex
+/// dependency cycles and dedupes shared deps.
+fn run_initializer(
+    v: &mut ovelo_dexrt::Vm,
+    desc: &str,
+    ctx: ovelo_dexrt::V,
+    seen: &mut std::collections::HashSet<String>,
+) {
+    if !seen.insert(desc.to_string()) {
+        return;
+    }
+    let Ok(ih) = v.instantiate(desc) else {
+        println!("initializer {desc} not instantiated");
+        return;
+    };
+    let mut deps: Vec<String> = Vec::new();
+    if let Ok(Some(ovelo_dexrt::V::Ref(lh))) = v.call_virtual(ih, "dependencies", &[]) {
+        if let Some(ovelo_dexrt::Obj::Host {
+            state: ovelo_dexrt::HostState::List(items),
+            ..
+        }) = v.heap.get(lh)
+        {
+            deps = items
+                .iter()
+                .filter_map(|x| match x {
+                    ovelo_dexrt::V::Ref(ch) => v.class_descriptor_of(*ch),
+                    _ => None,
+                })
+                .collect();
+        }
+    }
+    for d in deps {
+        run_initializer(v, &d, ctx, seen);
+    }
+    if let Err(e) = v.call_virtual(ih, "create", &[ctx]) {
+        println!("initializer {desc} create failed: {e}");
+    }
 }
 
 fn run_app(store: &InstallStore, package: &str) -> Result<(), OveloError> {
@@ -636,31 +687,38 @@ fn run_app(store: &InstallStore, package: &str) -> Result<(), OveloError> {
             let mut g = vm
                 .and_then(|mut v| {
                     ovelo_framework::GuestUi::register(&ui, &mut v);
-                    // Android startup order: ContentProviders attach and
-                    // androidx.startup initializers run *before*
-                    // Application.onCreate — WorkManager.initialize and
-                    // friends are expected inside an Initializer's create().
+                    // Android startup order: androidx.startup initializers
+                    // run *before* Application.onCreate — regardless of
+                    // whether the manifest names an Application subclass.
+                    let app_h = info
+                        .manifest
+                        .application_class
+                        .as_ref()
+                        .and_then(|app| {
+                            v.instantiate(&format!("L{};", app.replace('.', "/"))).ok()
+                        })
+                        .unwrap_or_else(|| {
+                            v.heap.alloc(ovelo_dexrt::Obj::Host {
+                                class_idx: u64::MAX,
+                                desc: "Landroid/app/Application;".to_string(),
+                                fields: std::collections::HashMap::new(),
+                                state: ovelo_dexrt::HostState::Empty,
+                            })
+                        });
+                    {
+                        let mut seen = std::collections::HashSet::new();
+                        for init in &info.manifest.startup_initializers {
+                            run_initializer(
+                                &mut v,
+                                &format!("L{};", init.replace('.', "/")),
+                                ovelo_dexrt::V::Ref(app_h),
+                                &mut seen,
+                            );
+                        }
+                    }
                     if let Some(app) = &info.manifest.application_class {
-                        let ad = format!("L{};", app.replace('.', "/"));
-                        if let Ok(ah) = v.instantiate(&ad) {
-                            for init in &info.manifest.startup_initializers {
-                                let id = format!("L{};", init.replace('.', "/"));
-                                match v.instantiate(&id) {
-                                    Ok(ih) => {
-                                        if let Err(e) =
-                                            v.call_virtual(ih, "create", &[ovelo_dexrt::V::Ref(ah)])
-                                        {
-                                            println!("initializer {init} create failed: {e}");
-                                        }
-                                    }
-                                    Err(e) => {
-                                        println!("initializer {init} not instantiated: {e}")
-                                    }
-                                }
-                            }
-                            if let Err(e) = v.call_virtual(ah, "onCreate", &[]) {
-                                println!("application {app} onCreate failed: {e}");
-                            }
+                        if let Err(e) = v.call_virtual(app_h, "onCreate", &[]) {
+                            println!("application {app} onCreate failed: {e}");
                         }
                     }
                     v.instantiate(&desc).map(|h| (v, h))

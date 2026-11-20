@@ -1735,6 +1735,24 @@ fn res_misc(vm: &mut Vm, class: &str, name: &str, args: &[V]) -> Rt<Option<Optio
             let found = ta_index(vm, args)
                 .and_then(|(h, i)| view::ta_lookup(vm, h, i))
                 .map(|v| match v {
+                    // A @res/ reference: `getResourceId` wants the id
+                    // itself; the numeric getters dereference the arsc
+                    // entry value (int data or scaled px for dims).
+                    V::I32(id) if (id as u32) >> 24 == 0x7f && name != "getResourceId" => {
+                        let entry = vm
+                            .apk_res
+                            .as_ref()
+                            .and_then(|r| r.entry_value(id as u32).cloned());
+                        match entry {
+                            Some(v) if name.starts_with("getDimension")
+                                || name == "getLayoutDimension" =>
+                            {
+                                V::I32(crate::res::typed_px(&v) as i32)
+                            }
+                            Some(v) => V::I32(v.data as i32),
+                            None => V::I32(id),
+                        }
+                    }
                     V::I32(_) | V::I64(_) => V::I32(i64v(v) as i32),
                     V::F32(f) => V::I32(f as i32),
                     other => other,
@@ -1806,14 +1824,37 @@ fn res_misc(vm: &mut Vm, class: &str, name: &str, args: &[V]) -> Rt<Option<Optio
         }
         ("Landroid/content/res/TypedArray;", "length" | "getIndexCount") => {
             let n = match args.first() {
-                Some(V::Ref(h)) => view::ta_attrs(vm, *h).len() as i32,
+                Some(V::Ref(h)) => {
+                    let attrs = view::ta_attrs(vm, *h);
+                    // Theme-scoped arrays (no AttributeSet) answer `set`
+                    // for every in-range index — mirror `hasValue`.
+                    if matches!(pseudo_get(vm, *h, view::P_TA_SET), Some(V::Ref(s)) if s != 0) {
+                        (0..attrs.len())
+                            .filter(|i| view::ta_lookup(vm, *h, *i).is_some())
+                            .count() as i32
+                    } else {
+                        attrs.len() as i32
+                    }
+                }
                 _ => 0,
             };
             Some(Some(V::I32(n)))
         }
         ("Landroid/content/res/TypedArray;", "getIndex") => {
             let v = ta_index(vm, args)
-                .and_then(|(h, i)| view::ta_attrs(vm, h).get(i).copied())
+                .and_then(|(h, i)| {
+                    let attrs = view::ta_attrs(vm, h);
+                    if matches!(pseudo_get(vm, h, view::P_TA_SET), Some(V::Ref(s)) if s != 0) {
+                        // The i-th *set* attribute's position in the
+                        // styleable array (AOSP `mIndices` entry).
+                        (0..attrs.len())
+                            .filter(|j| view::ta_lookup(vm, h, *j).is_some())
+                            .nth(i)
+                            .map(|j| j as i32)
+                    } else {
+                        attrs.get(i).map(|_| i as i32)
+                    }
+                })
                 .unwrap_or(0);
             Some(Some(V::I32(v)))
         }

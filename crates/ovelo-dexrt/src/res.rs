@@ -17,7 +17,9 @@ use crate::res_attrs::framework_attr_name;
 #[derive(Default)]
 struct StyleDef {
     parent: u32,
-    items: HashMap<u32, EntryValue>,
+    /// Attr id → value, in arsc document order: array items reuse the
+    /// same key (or key 0) so a map would drop repeats and ordering.
+    items: Vec<(u32, EntryValue)>,
 }
 
 /// Resource index of the installed APK. Built once per `Vm` from the APK
@@ -75,7 +77,7 @@ impl ApkResources {
                         let s = res.styles.entry(e.res_id).or_default();
                         if e.config == "default" || (s.parent == 0 && s.items.is_empty()) {
                             s.parent = e.parent;
-                            s.items = e.items.iter().cloned().collect();
+                            s.items = e.items.clone();
                         }
                     }
                     // Any entry whose value is a `res/` file path —
@@ -176,7 +178,7 @@ impl ApkResources {
         let mut cur = style_id;
         for _ in 0..32 {
             let s = self.styles.get(&cur)?;
-            if let Some(v) = s.items.get(&attr_id) {
+            if let Some((_, v)) = s.items.iter().find(|(k, _)| *k == attr_id) {
                 return Some(v);
             }
             match s.parent {
@@ -197,7 +199,7 @@ impl ApkResources {
     pub fn array_items(&self, res_id: u32) -> Vec<EntryValue> {
         self.styles
             .get(&res_id)
-            .map(|s| s.items.values().cloned().collect())
+            .map(|s| s.items.iter().map(|(_, v)| v.clone()).collect())
             .unwrap_or_default()
     }
 
@@ -205,7 +207,7 @@ impl ApkResources {
     pub fn style_attrs(&self, style_id: u32) -> Vec<(u32, EntryValue)> {
         self.styles
             .get(&style_id)
-            .map(|s| s.items.iter().map(|(k, v)| (*k, v.clone())).collect())
+            .map(|s| s.items.clone())
             .unwrap_or_default()
     }
 

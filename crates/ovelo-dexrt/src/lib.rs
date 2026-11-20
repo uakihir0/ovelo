@@ -361,6 +361,18 @@ impl Vm {
         }
     }
 
+    /// Companion to `set_object_field` — resolves the canonical field
+    /// id and reads it off the object's field map.
+    pub fn get_object_field(&self, h: u32, owner: &str, name: &str) -> Option<V> {
+        let f = self.canon_field(self.field_index_of(owner, name)?);
+        match self.heap.get(h) {
+            Some(Obj::Instance { fields, .. }) | Some(Obj::Host { fields, .. }) => {
+                fields.get(&f).copied()
+            }
+            _ => None,
+        }
+    }
+
     pub(crate) fn type_desc_of(&self, g: GIdx) -> Result<String> {
         self.dex_of(g)
             .ok_or_else(|| err("dexrt.dex.idx"))?
@@ -763,6 +775,15 @@ impl Vm {
     }
 
     fn describe_throw(&self, h: u32) -> String {
+        self.describe_throw_inner(h, &mut std::collections::HashSet::new())
+    }
+
+    fn describe_throw_inner(&self, h: u32, seen: &mut std::collections::HashSet<u32>) -> String {
+        // Guest exceptions sometimes store themselves (or a cycle of
+        // wrappers) as their own cause — bound the walk.
+        if !seen.insert(h) {
+            return format!("object #{h}");
+        }
         let site = self
             .throw_sites
             .get(&h)
@@ -806,7 +827,7 @@ impl Vm {
                     .unwrap_or_default();
                 let cause = match jdk::pseudo_get(self, h, jdk::P_TARGET) {
                     Some(V::Ref(c)) if c != 0 && c != h => {
-                        format!(" caused by {}", self.describe_throw(c))
+                        format!(" caused by {}", self.describe_throw_inner(c, seen))
                     }
                     _ => String::new(),
                 };

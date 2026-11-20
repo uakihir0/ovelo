@@ -1551,7 +1551,8 @@ fn threadlocal_call(vm: &mut Vm, name: &str, args: &[V]) -> Option<Option<V>> {
         "withInitial" => {
             let hv = host(vm, "Ljava/lang/ThreadLocal;", HostState::Slot(V::Ref(0)));
             if let V::Ref(h) = hv {
-                pseudo_set(vm, h, P_DATA, args.get(1).copied().unwrap_or(V::Ref(0)));
+                // Static method: the Supplier is args[0], not args[1].
+                pseudo_set(vm, h, P_DATA, args.first().copied().unwrap_or(V::Ref(0)));
             }
             Some(Some(hv))
         }
