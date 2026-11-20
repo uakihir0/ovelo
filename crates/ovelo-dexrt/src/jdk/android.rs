@@ -452,9 +452,14 @@ pub(crate) fn call(
         match name {
             // Material checks `animator instanceof ObjectAnimator` and
             // throws otherwise — return an ObjectAnimator-typed stub.
-            "loadAnimator" | "loadStateListAnimator" => Some(Some(host(
+            "loadAnimator" => Some(Some(host(
                 vm,
                 "Landroid/animation/ObjectAnimator;",
+                HostState::Empty,
+            ))),
+            "loadStateListAnimator" => Some(Some(host(
+                vm,
+                "Landroid/animation/StateListAnimator;",
                 HostState::Empty,
             ))),
             _ => Some(None),
