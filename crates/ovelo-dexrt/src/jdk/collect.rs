@@ -1002,17 +1002,21 @@ fn arrays_static(vm: &mut Vm, name: &str, _sig: &str, args: &[V]) -> Rt<Option<O
         "fill" | "setAll" => {
             if let V::Ref(h) = args[0] {
                 if let Some(Obj::Array { data, .. }) = vm.heap.get_mut(h) {
-                    let end = args
-                        .get(3)
-                        .map(|v| i32v(*v) as usize)
-                        .unwrap_or(data.len())
-                        .min(data.len());
-                    let a = args
-                        .get(2)
-                        .map(|v| i32v(*v).max(0) as usize)
-                        .unwrap_or(0);
-                    for e in data.iter_mut().take(end).skip(a) {
-                        *e = args[1];
+                    if args.len() >= 4 {
+                        // fill(arr, fromIndex, toIndex, val)
+                        let (a, b, v) = (
+                            i32v(args[1]).max(0) as usize,
+                            (i32v(args[2]).max(0) as usize).min(data.len()),
+                            args[3],
+                        );
+                        for e in data.iter_mut().take(b).skip(a) {
+                            *e = v;
+                        }
+                    } else {
+                        // fill(arr, val)
+                        for e in data.iter_mut() {
+                            *e = args[1];
+                        }
                     }
                 }
             }

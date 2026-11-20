@@ -725,15 +725,9 @@ impl Vm {
         match self.heap.get(h) {
             Some(Obj::Instance { class_idx, .. }) => self.assignable(*class_idx, type_idx),
             Some(Obj::Host {
-                class_idx,
-                desc,
-                state,
-                ..
+                class_idx, desc, ..
             }) => {
-                // Opaque placeholders (empty stubs we minted to satisfy a
-                // return type) carry no verifiable class — let casts pass.
-                matches!(state, HostState::Empty)
-                    || (*class_idx != u32::MAX && self.assignable(*class_idx, type_idx))
+                (*class_idx != u32::MAX && self.assignable(*class_idx, type_idx))
                     || self.assignable_desc(desc, &sup)
             }
             Some(Obj::Throwable { descriptor, .. }) => {
@@ -1246,7 +1240,7 @@ impl Vm {
             if steps > 20_000_000 {
                 return Err(self.throw_builtin(
                     "Ljava/lang/InternalError;",
-                    "instruction budget exceeded",
+                    &format!("instruction budget exceeded at +{pc:04x}"),
                 ));
             }
             let res = self.step(&mut fr, pc);
@@ -1463,7 +1457,17 @@ impl Vm {
             // ---- casts ----
             0x1f => {
                 let h = Self::refv(r(0)?)?;
-                if h != 0 && !self.is_instance(h, ins.idx.unwrap_or(0)) {
+                // Opaque placeholders (empty stubs we minted to satisfy a
+                // return type) carry no verifiable class — let the cast
+                // pass. `instanceof`/catch matching stay strict.
+                let opaque_stub = matches!(
+                    self.heap.get(h),
+                    Some(Obj::Host {
+                        state: HostState::Empty,
+                        ..
+                    })
+                );
+                if h != 0 && !opaque_stub && !self.is_instance(h, ins.idx.unwrap_or(0)) {
                     return Err(self.throw_builtin(
                         "Ljava/lang/ClassCastException;",
                         "check-cast",

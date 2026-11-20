@@ -1795,104 +1795,184 @@ fn reflect_call(
     })
 }
 
-/// sun.misc.Unsafe: offset tokens over a per-object slot map so guest
-/// atomic updaters (kotlinx-coroutines' *$volatile field updaters) CAS
-/// against real stored values instead of null placeholders.
-fn unsafe_call(vm: &mut Vm, name: &str, args: &[V]) -> Option<Option<V>> {
-    let slot = |_vm: &mut Vm, args: &[V]| -> Option<(u32, i64)> {
-        match (args.get(1), args.get(2)) {
-            (Some(V::Ref(h)), Some(V::I64(off))) => Some((*h, *off)),
-            (Some(V::Ref(h)), Some(V::I32(off))) => Some((*h, *off as i64)),
-            _ => None,
+/// sun.misc.Unsafe. Offsets below `UNSAFE_TOKEN_BASE` are real dex field
+/// ids, so CAS/volatile get-put share storage with normal `iget`/`iput`;
+/// unresolvable fields get opaque tokens over `Vm::unsafe_offsets`.
+const UNSAFE_TOKEN_BASE: i64 = 1 << 62;
+
+fn unsafe_key(args: &[V]) -> Option<(u32, i64)> {
+    match (args.get(1), args.get(2)) {
+        (Some(V::Ref(h)), Some(V::I64(off))) => Some((*h, *off)),
+        (Some(V::Ref(h)), Some(V::I32(off))) => Some((*h, *off as i64)),
+        _ => None,
+    }
+}
+
+fn unsafe_read(vm: &mut Vm, obj: u32, off: i64) -> V {
+    if off < UNSAFE_TOKEN_BASE {
+        return match vm.heap.get(obj) {
+            Some(Obj::Instance { fields, .. }) | Some(Obj::Host { fields, .. }) => {
+                fields.get(&(off as u32)).copied().unwrap_or(V::I32(0))
+            }
+            _ => V::I32(0),
+        };
+    }
+    vm.unsafe_offsets
+        .get(&(obj, off))
+        .copied()
+        .unwrap_or(V::I32(0))
+}
+
+fn unsafe_write(vm: &mut Vm, obj: u32, off: i64, v: V) {
+    if off < UNSAFE_TOKEN_BASE {
+        if let Some(f) = fields_mut(vm, obj) {
+            f.insert(off as u32, v);
         }
-    };
-    Some(match name {
+        return;
+    }
+    vm.unsafe_offsets.insert((obj, off), v);
+}
+
+/// CAS equality: guest `null` reaches us as `I32(0)` while an unset slot
+/// holds `Ref(0)` — both must count as null.
+fn cas_eq(vm: &mut Vm, a: V, b: V) -> bool {
+    let nullish = |v: V| matches!(v, V::I32(0) | V::Ref(0));
+    (nullish(a) && nullish(b)) || crate::jdk::value_eq(vm, a, b)
+}
+
+fn unsafe_call(vm: &mut Vm, name: &str, args: &[V]) -> Option<Option<V>> {
+    let v = match name {
         "getUnsafe" => Some(host(vm, "Lsun/misc/Unsafe;", HostState::Empty)),
         "objectFieldOffset" | "staticFieldOffset" => {
-            vm.unsafe_next_offset += 1;
-            Some(V::I64(vm.unsafe_next_offset))
+            // Same field, same offset — resolve the mirror's owner+name to
+            // the real field id so reads share storage with `iget`/`iput`.
+            let h = match args.first() {
+                Some(V::Ref(h)) => *h,
+                _ => 0,
+            };
+            let member = s(vm, h).unwrap_or_default();
+            let owner = pseudo_get(vm, h, P_COMPONENT)
+                .and_then(|v| sv(vm, v))
+                .unwrap_or_default();
+            let off = vm
+                .dex
+                .field_index_of(&owner, &member)
+                .map(|f| f as i64)
+                .unwrap_or_else(|| {
+                    vm.unsafe_next_offset += 1;
+                    UNSAFE_TOKEN_BASE + vm.unsafe_next_offset
+                });
+            Some(V::I64(off))
         }
+        "staticFieldBase" => Some(host(vm, OBJ, HostState::Empty)),
         "arrayBaseOffset" => Some(V::I32(0)),
         "arrayIndexScale" => Some(V::I32(1)),
-        "getObject" | "getObjectVolatile" => Some(match slot(vm, args) {
-            Some(k) => vm.unsafe_offsets.get(&k).copied().unwrap_or(V::Ref(0)),
-            None => V::Ref(0),
-        }),
+        "allocateInstance" => {
+            let d = class_desc_of(vm, match args.get(1) {
+                Some(V::Ref(h)) => *h,
+                _ => 0,
+            })
+            .unwrap_or_default();
+            match vm.instantiate(&d) {
+                Ok(h) => Some(V::Ref(h)),
+                Err(_) => Some(host(vm, OBJ, HostState::Empty)),
+            }
+        }
+        "getObject" | "getObjectVolatile" | "getAndSetObject" => {
+            let (o, k) = unsafe_key(args).unwrap_or((0, 0));
+            let old = unsafe_read(vm, o, k);
+            let old = if matches!(old, V::I32(0) | V::I64(0)) {
+                V::Ref(0)
+            } else {
+                old
+            };
+            if name == "getAndSetObject" {
+                unsafe_write(vm, o, k, args.get(3).copied().unwrap_or(V::Ref(0)));
+            }
+            Some(old)
+        }
         "putObject" | "putObjectVolatile" => {
-            if let Some(k) = slot(vm, args) {
-                vm.unsafe_offsets
-                    .insert(k, args.get(3).copied().unwrap_or(V::Ref(0)));
+            if let Some((o, k)) = unsafe_key(args) {
+                unsafe_write(vm, o, k, args.get(3).copied().unwrap_or(V::Ref(0)));
             }
             None
         }
-        "compareAndSwapObject" => Some(match slot(vm, args) {
-            Some(k) => {
-                let (expect, new) = (
-                    args.get(3).copied().unwrap_or(V::Ref(0)),
-                    args.get(4).copied().unwrap_or(V::Ref(0)),
-                );
-                let cur = vm.unsafe_offsets.get(&k).copied().unwrap_or(V::Ref(0));
-                if crate::jdk::value_eq(vm, cur, expect) {
-                    vm.unsafe_offsets.insert(k, new);
-                    V::I32(1)
-                } else {
-                    V::I32(0)
+        "compareAndSwapObject" => {
+            let (o, k) = unsafe_key(args).unwrap_or((0, 0));
+            let (expect, new) = (
+                args.get(3).copied().unwrap_or(V::Ref(0)),
+                args.get(4).copied().unwrap_or(V::Ref(0)),
+            );
+            let cur = unsafe_read(vm, o, k);
+            Some(V::I32(if cas_eq(vm, cur, expect) {
+                unsafe_write(vm, o, k, new);
+                1
+            } else {
+                0
+            }))
+        }
+        "getInt" | "getIntVolatile" | "getAndSetInt" | "getAndAddInt"
+        | "getLong" | "getLongVolatile" | "getAndSetLong" | "getAndAddLong" => {
+            let wide = name.contains("Long");
+            let (o, k) = unsafe_key(args).unwrap_or((0, 0));
+            let old = unsafe_read(vm, o, k);
+            let old = match (old, wide) {
+                (V::I32(0), true) | (V::I64(0), false) => {
+                    if wide {
+                        V::I64(0)
+                    } else {
+                        V::I32(0)
+                    }
                 }
+                (other, _) => other,
+            };
+            match name {
+                n if n.starts_with("getAndSet") => unsafe_write(
+                    vm,
+                    o,
+                    k,
+                    args.get(3).copied().unwrap_or(V::I32(0)),
+                ),
+                n if n.starts_with("getAndAdd") => {
+                    let add = args.get(3).copied().unwrap_or(V::I32(0));
+                    let new = match (old, add) {
+                        (V::I64(a), V::I64(b)) => V::I64(a.wrapping_add(b)),
+                        (V::I32(a), V::I32(b)) => V::I32(a.wrapping_add(b)),
+                        (V::I32(a), V::I64(b)) => V::I64((a as i64).wrapping_add(b)),
+                        (V::I64(a), V::I32(b)) => V::I64(a.wrapping_add(b as i64)),
+                        _ => old,
+                    };
+                    unsafe_write(vm, o, k, new);
+                }
+                _ => {}
             }
-            None => V::I32(0),
-        }),
-        "getInt" | "getIntVolatile" | "getLong" | "getLongVolatile" => {
-            Some(match slot(vm, args) {
-                Some(k) => vm.unsafe_offsets.get(&k).copied().unwrap_or(V::I32(0)),
-                None => V::I32(0),
-            })
+            Some(old)
         }
         "putInt" | "putIntVolatile" | "putLong" | "putLongVolatile" => {
-            if let Some(k) = slot(vm, args) {
-                vm.unsafe_offsets
-                    .insert(k, args.get(3).copied().unwrap_or(V::I32(0)));
+            if let Some((o, k)) = unsafe_key(args) {
+                unsafe_write(vm, o, k, args.get(3).copied().unwrap_or(V::I32(0)));
             }
             None
         }
-        "compareAndSwapInt" | "compareAndSwapLong" => Some(match slot(vm, args) {
-            Some(k) => {
-                let (expect, new) = (
-                    args.get(3).copied().unwrap_or(V::I32(0)),
-                    args.get(4).copied().unwrap_or(V::I32(0)),
-                );
-                let cur = vm.unsafe_offsets.get(&k).copied().unwrap_or(V::I32(0));
-                if crate::jdk::value_eq(vm, cur, expect) {
-                    vm.unsafe_offsets.insert(k, new);
-                    V::I32(1)
-                } else {
-                    V::I32(0)
-                }
-            }
-            None => V::I32(0),
-        }),
-        "getAndSetObject" | "getAndAddInt" | "getAndAddLong" | "getAndSetInt"
-        | "getAndSetLong" => {
-            // Atomic read-then-write: return the old value, store the new.
-            match slot(vm, args) {
-                Some(k) => {
-                    let old = vm.unsafe_offsets.get(&k).copied().unwrap_or(V::I32(0));
-                    let new = match name {
-                        "getAndAddInt" | "getAndAddLong" => {
-                            let add = args.get(3).copied().unwrap_or(V::I32(0));
-                            match (old, add) {
-                                (V::I64(a), V::I64(b)) => V::I64(a.wrapping_add(b)),
-                                (V::I32(a), V::I32(b)) => V::I32(a.wrapping_add(b)),
-                                _ => old,
-                            }
-                        }
-                        _ => args.get(3).copied().unwrap_or(V::Ref(0)),
-                    };
-                    vm.unsafe_offsets.insert(k, new);
-                    Some(old)
-                }
-                None => Some(V::I32(0)),
-            }
+        "compareAndSwapInt" | "compareAndSwapLong" => {
+            let (o, k) = unsafe_key(args).unwrap_or((0, 0));
+            let (expect, new) = (
+                args.get(3).copied().unwrap_or(V::I32(0)),
+                args.get(4).copied().unwrap_or(V::I32(0)),
+            );
+            let cur = unsafe_read(vm, o, k);
+            Some(V::I32(if cas_eq(vm, cur, expect) {
+                unsafe_write(vm, o, k, new);
+                1
+            } else {
+                0
+            }))
         }
-        _ => None,
-    })
+        "shouldBeInitialized" => Some(V::I32(1)),
+        "ensureClassInitialized" | "loadFence" | "storeFence" | "fullFence"
+        | "park" | "unpark" | "monitorEnter" | "monitorExit"
+        | "throwException" => None,
+        _ => return None,
+    };
+    Some(v)
 }
