@@ -1795,7 +1795,13 @@ pub(crate) fn host_supers(d: &str) -> &'static [&'static str] {
         | "Landroid/database/CursorIndexOutOfBoundsException;" => &[OBJ],
         // android.database exceptions — SQLite*Exception extends
         // SQLException extends RuntimeException (AOSP).
-        "Landroid/database/SQLException;" | "Landroid/database/sqlite/SQLiteException;"
+        "Landroid/database/SQLException;" => &[
+            "Ljava/lang/RuntimeException;",
+            "Ljava/lang/Exception;",
+            THROWABLE,
+            OBJ,
+        ],
+        "Landroid/database/sqlite/SQLiteException;"
         | "Landroid/database/sqlite/SQLiteDatabaseCorruptException;"
         | "Landroid/database/sqlite/SQLiteConstraintException;"
         | "Landroid/database/sqlite/SQLiteDiskIOException;"
