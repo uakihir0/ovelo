@@ -175,6 +175,10 @@ pub struct Vm {
     /// them when the receiver's own subtree misses (appcompat decor is
     /// built dex-side, outside our synthetic window decor).
     pub(crate) view_roots: Vec<u32>,
+    /// `SharedPreferences` are file-backed: every `getSharedPreferences`
+    /// call for the same file must see the same map, so intern the host
+    /// objects per file name.
+    pub(crate) prefs_files: HashMap<String, u32>,
     /// Activity currently being dispatched — owns any content/decor
     /// roots attached while it runs, so a second activity's trees
     /// never leak into the first's lookups.
@@ -309,6 +313,7 @@ impl Vm {
             trace_throw: std::env::var_os("OVELO_TRACE_THROW").is_some(),
             trace_call: std::env::var("OVELO_TRACE_CALL").ok(),
             view_roots: Vec::new(),
+            prefs_files: HashMap::new(),
             cur_activity: 0,
             content_views: HashMap::new(),
             decor_roots: HashMap::new(),

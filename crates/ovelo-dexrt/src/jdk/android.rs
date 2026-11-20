@@ -114,13 +114,12 @@ pub(crate) fn call(
             _ => None,
         }
     } else if class == "Landroid/preference/PreferenceManager;" {
-        // Static factory — hand out a map-backed SharedPreferences.
+        // Static factory — map-backed SharedPreferences, interned
+        // per file so writes are visible to later readers.
         match name {
-            "getDefaultSharedPreferences" => Some(Some(host(
-                vm,
-                "Landroid/content/SharedPreferences;",
-                HostState::Map(vec![]),
-            ))),
+            "getDefaultSharedPreferences" => {
+                Some(Some(prefs_file(vm, "__default__")))
+            }
             _ => None,
         }
     } else if class == "Landroid/content/SharedPreferences;"
@@ -1165,11 +1164,10 @@ fn context_call(
             "Landroid/content/res/AssetManager;",
             HostState::Empty,
         ))),
-        "getSharedPreferences" => Some(Some(host(
-            vm,
-            "Landroid/content/SharedPreferences;",
-            HostState::Map(vec![]),
-        ))),
+        "getSharedPreferences" => {
+            let file = sv(vm, args[1]).unwrap_or_default();
+            Some(Some(prefs_file(vm, &file)))
+        }
         "getString" | "getText" => {
             // Context.getString resolves through resources, not to "" —
             // apps read defaults this way (NewPipe's saved_tabs JSON
@@ -2623,6 +2621,25 @@ fn rect_write(vm: &mut Vm, h: u32, l: i32, t: i32, r: i32, b: i32) {
             }
         }
     }
+}
+
+/// `SharedPreferences` host object interned per file name — Android
+/// prefs are file-backed, so every getter for one file must share a
+/// map (a fresh empty map per call silently dropped every write).
+fn prefs_file(vm: &mut Vm, file: &str) -> V {
+    if let Some(&h) = vm.prefs_files.get(file) {
+        return V::Ref(h);
+    }
+    let V::Ref(h) = host(
+        vm,
+        "Landroid/content/SharedPreferences;",
+        HostState::Map(vec![]),
+    )
+    else {
+        unreachable!()
+    };
+    vm.prefs_files.insert(file.to_string(), h);
+    V::Ref(h)
 }
 
 /// The drawable's cached bounds Rect handle (None until created).
