@@ -990,7 +990,16 @@ impl Vm {
                         "Ljava/lang/String;" => {
                             Ok(Some(V::Ref(self.heap.intern_str(""))))
                         }
-                        r if r.starts_with('L') || r.starts_with('[') => {
+                        r if r.starts_with('[') => {
+                            // Array return: must be a real Obj::Array or
+                            // array-length/a*get on the value type-checks.
+                            let h = self.heap.alloc(Obj::Array {
+                                elem: r[1..].to_string(),
+                                data: Vec::new(),
+                            });
+                            Ok(Some(V::Ref(h)))
+                        }
+                        r if r.starts_with('L') => {
                             let desc = r.to_string();
                             let ci = self
                                 .dex
