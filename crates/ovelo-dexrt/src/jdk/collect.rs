@@ -180,9 +180,11 @@ pub(crate) fn call(
             "sleep" | "timedWait" | "timedJoin" => Some(None),
             _ => None,
         }
-    } else if class == "Ljava/util/concurrent/Executors;"
+    } else if (class == "Ljava/util/concurrent/Executors;"
         || class == "Ljava/util/concurrent/ExecutorService;"
-        || class.starts_with("Ljava/util/concurrent/")
+        || class.starts_with("Ljava/util/concurrent/"))
+        && !is_list(class)
+        && !is_map(class)
     {
         match name {
             "execute" => {
