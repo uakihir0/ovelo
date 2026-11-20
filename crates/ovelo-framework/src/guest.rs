@@ -815,6 +815,28 @@ pub fn drive_dex_layout_pass(vm: &mut Vm, activity: u32, frame: u32) {
                             .map(|v| format!("{v:?}"))
                             .unwrap_or("?".into());
                         eprintln!("[viewdbg] recycler {h} adapter=h{ad} count={n}");
+                        let afields: Vec<String> = match vm.heap().get(ad) {
+                            Some(ovelo_dexrt::Obj::Instance { fields, .. }) => fields
+                                .values()
+                                .filter_map(|v| match v {
+                                    V::Ref(y) if *y != 0 => {
+                                        let mut t =
+                                            format!("h{y}:{}", vm.dbg_class_of(*y));
+                                        if let Some(ovelo_dexrt::Obj::Host {
+                                            state: ovelo_dexrt::HostState::List(l),
+                                            ..
+                                        }) = vm.heap().get(*y)
+                                        {
+                                            t.push_str(&format!("(len={})", l.len()));
+                                        }
+                                        Some(t)
+                                    }
+                                    _ => None,
+                                })
+                                .collect(),
+                            _ => Vec::new(),
+                        };
+                        eprintln!("[viewdbg] adapter {ad} fields: {afields:?}");
                     }
                     other => eprintln!("[viewdbg] recycler {h} getAdapter -> {other:?}"),
                 }

@@ -346,9 +346,16 @@ fn file_call(vm: &mut Vm, name: &str, args: &[V]) -> Option<Option<V>> {
         "getFreeSpace" | "getTotalSpace" | "getUsableSpace" => {
             Some(V::I64(1i64 << 32))
         }
+        // Hidden on Android == name starts with '.', like Unix.
+        "isHidden" => Some(V::I32(
+            std::path::Path::new(&path)
+                .file_name()
+                .is_some_and(|n| n.to_string_lossy().starts_with('.'))
+                as i32,
+        )),
         "setReadable" | "setWritable" | "setExecutable" | "setReadOnly"
         | "setLastModified" | "deleteOnExit" | "toPath" | "toURI" | "toURL"
-        | "listRoots" | "createTempFile" | "isHidden" | "compareTo" => {
+        | "listRoots" | "createTempFile" | "compareTo" => {
             if name == "listRoots" || name == "createTempFile" {
                 Some(host(vm, "Ljava/io/File;", HostState::Path("/tmp/x".into())))
             } else if matches!(name, "toPath" | "toURI" | "toURL") {
