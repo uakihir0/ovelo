@@ -118,7 +118,9 @@ pub(crate) fn call(
         // per file so writes are visible to later readers.
         match name {
             "getDefaultSharedPreferences" => {
-                Some(Some(prefs_file(vm, "__default__")))
+                // NUL can't appear in a real prefs file name — this
+                // key can never collide with a named file.
+                Some(Some(prefs_file(vm, "\u{0}default")))
             }
             _ => None,
         }
