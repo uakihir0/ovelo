@@ -341,7 +341,7 @@ fn run_app(store: &InstallStore, package: &str) -> Result<(), OveloError> {
                     v.instantiate(&desc).map(|h| (v, h))
                 })
                 .map_err(|e| {
-                    println!("guest    {desc_safe} not dispatched: {}", e.cause());
+                    println!("guest    {desc_safe} not dispatched: {e}");
                 })
                 .ok();
             if let Some((vm, this)) = &mut g {
@@ -352,7 +352,7 @@ fn run_app(store: &InstallStore, package: &str) -> Result<(), OveloError> {
                             s @ Some(_) => Ok(s),
                             None => vm.call_virtual(*this, cb, &[ovelo_dexrt::V::Ref(0)]),
                         })
-                        .inspect_err(|e| println!("callback {cb} crashed: {}", e.cause()));
+                        .inspect_err(|e| println!("callback {cb} crashed: {e}"));
                     let ran = matches!(r, Ok(Some(_)));
                     println!("callback {} ({})", cb, if ran { "dex" } else { "framework" });
                 }

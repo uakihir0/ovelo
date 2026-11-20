@@ -322,6 +322,24 @@ impl DexFile {
         self.fields.get(idx as usize).ok_or_else(|| err("dex.field.idx"))
     }
 
+    /// Number of entries in the `field_ids` table — the valid range for
+    /// [`DexFile::field`].
+    pub fn field_ids_len(&self) -> usize {
+        self.fields.len()
+    }
+
+    /// Field index for `owner` (descriptor).`name`, or `None` when the
+    /// reference isn't in this DEX's field table.
+    pub fn field_index_of(&self, owner: &str, name: &str) -> Option<u32> {
+        self.fields
+            .iter()
+            .position(|f| {
+                self.type_descriptor(f.class_idx as u32).ok().as_deref() == Some(owner)
+                    && self.string(f.name_idx).ok().as_deref() == Some(name)
+            })
+            .map(|i| i as u32)
+    }
+
     /// Method id item.
     pub fn method(&self, idx: u32) -> Result<&MethodId> {
         self.methods.get(idx as usize).ok_or_else(|| err("dex.method.idx"))

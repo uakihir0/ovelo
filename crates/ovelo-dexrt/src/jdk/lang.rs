@@ -1,0 +1,1674 @@
+//! java.lang builtins: boxed numbers, Math, System, Class, Thread,
+//! Throwable, String extras, StringBuilder.
+
+use super::*;
+use crate::value::{HostState, Obj, V};
+
+pub(crate) fn call(
+    vm: &mut Vm,
+    class: &str,
+    name: &str,
+    sig: &str,
+    args: &[V],
+) -> Rt<Option<Option<V>>> {
+    Ok(if class == STRING {
+        string_call(vm, name, sig, args)
+    } else if desc_is_a(class, "Ljava/lang/AbstractStringBuilder;") {
+        strbuf(vm, name, sig, args)?
+    } else if boxed(class) {
+        boxed_call(vm, class, name, sig, args)?
+    } else if desc_is_a(class, "Ljava/lang/Number;") {
+        number_call(vm, name, args)
+    } else if class == "Ljava/lang/Math;" || class == "Ljava/lang/StrictMath;" {
+        math_call(name, args)
+    } else if class == "Ljava/lang/System;" {
+        system_call(vm, name, sig, args)?
+    } else if class == "Ljava/lang/Runtime;" {
+        runtime_call(vm, name, args)
+    } else if desc_is_a(class, "Ljava/lang/Class;") {
+        class_call(vm, name, sig, args)?
+    } else if desc_is_a(class, "Ljava/lang/ClassLoader;")
+        || class.ends_with("ClassLoader;")
+    {
+        classloader_call(vm, name, args)
+    } else if desc_is_a(class, "Ljava/lang/Thread;") {
+        thread_call(vm, name, sig, args)?
+    } else if class.ends_with("ThreadLocal;") {
+        threadlocal_call(vm, name, args)
+    } else if desc_is_a(class, THROWABLE) {
+        throwable_call(vm, name, sig, args)?
+    } else if class == "Ljava/lang/Enum;" || desc_is_a(class, "Ljava/lang/Enum;") {
+        enum_call(vm, name, args)?
+    } else if class == "Ljava/lang/StackTraceElement;" {
+        stacktrace_call(vm, name, args)
+    } else if class.starts_with("Ljava/lang/reflect/") {
+        reflect_call(vm, class, name, sig, args)?
+    } else if class == "Ljava/lang/ref/WeakReference;"
+        || class == "Ljava/lang/ref/SoftReference;"
+        || class == "Ljava/lang/ref/Reference;"
+        || class == "Ljava/lang/ref/PhantomReference;"
+    {
+        match name {
+            "get" => Some(Some(match args[0] {
+                V::Ref(h) => slot_of(vm, h).unwrap_or(V::Ref(0)),
+                _ => V::Ref(0),
+            })),
+            "clear" | "enqueue" | "isEnqueued" => {
+                Some(if name == "clear" { None } else { Some(V::I32(0)) })
+            }
+            _ => None,
+        }
+    } else {
+        return Ok(None);
+    })
+}
+
+pub(crate) fn primitive_type(o: &str) -> bool {
+    matches!(
+        o,
+        "Ljava/lang/Integer;" | "Ljava/lang/Long;" | "Ljava/lang/Short;"
+            | "Ljava/lang/Byte;" | "Ljava/lang/Character;" | "Ljava/lang/Boolean;"
+            | "Ljava/lang/Double;" | "Ljava/lang/Float;"
+    )
+}
+
+pub(crate) fn hashcode(vm: &mut Vm, args: &[V]) -> V {
+    match args[0] {
+        V::Ref(0) => V::I32(0),
+        V::Ref(h) => match vm.heap.get(h) {
+            Some(Obj::Str(t)) => V::I32(java_str_hash(t)),
+            Some(Obj::Host {
+                state: HostState::Slot(v),
+                ..
+            }) => v_hash(*v),
+            Some(Obj::Host {
+                state: HostState::StrBuf(t),
+                ..
+            }) => V::I32(java_str_hash(t)),
+            _ => V::I32(h as i32),
+        },
+        v => v_hash(v),
+    }
+}
+
+fn v_hash(v: V) -> V {
+    match v {
+        V::I32(i) => V::I32(i),
+        V::I64(i) => V::I32((i ^ (i >> 32)) as i32),
+        V::F32(f) => V::I32(f.to_bits() as i32),
+        V::F64(f) => V::I32((f.to_bits() ^ (f.to_bits() >> 32)) as i32),
+        _ => V::I32(0),
+    }
+}
+
+fn java_str_hash(t: &str) -> i32 {
+    t.chars()
+        .fold(0i32, |h, c| h.wrapping_mul(31).wrapping_add(c as i32))
+}
+
+// ---------------------------------------------------------------------
+// String
+
+fn string_call(vm: &mut Vm, name: &str, sig: &str, args: &[V]) -> Option<Option<V>> {
+    let t = sv(vm, args[0]).unwrap_or_default();
+    let p = params(sig);
+    let r: Option<V> = match name {
+        "length" => Some(V::I32(t.chars().count() as i32)),
+        "isEmpty" => Some(V::I32(t.is_empty() as i32)),
+        "charAt" => Some(V::I32(
+            t.chars().nth(i32v(args[1]) as usize).map(|c| c as i32).unwrap_or(0),
+        )),
+        "codePointAt" => Some(V::I32(
+            t.chars().nth(i32v(args[1]) as usize).map(|c| c as u32 as i32).unwrap_or(0),
+        )),
+        "codePointBefore" => {
+            let i = i32v(args[1]) as usize;
+            Some(V::I32(
+                t.chars().nth(i.saturating_sub(1)).map(|c| c as u32 as i32).unwrap_or(0),
+            ))
+        }
+        "indexOf" => {
+            let from = args.get(2).map(|v| i32v(*v) as usize).unwrap_or(0);
+            let idx = match args[1] {
+                V::I32(ch) => t[from.min(t.len())..]
+                    .find(char::from_u32(ch as u32).unwrap_or('\0')),
+                _ => {
+                    let n = sv(vm, args[1]).unwrap_or_default();
+                    t[from.min(t.len())..].find(&n)
+                }
+            };
+            Some(V::I32(idx.map(|i| (from + i) as i32).unwrap_or(-1)))
+        }
+        "lastIndexOf" => {
+            let n = match args[1] {
+                V::I32(ch) => char::from_u32(ch as u32).unwrap_or('\0').to_string(),
+                _ => sv(vm, args[1]).unwrap_or_default(),
+            };
+            Some(V::I32(t.rfind(&n).map(|i| i as i32).unwrap_or(-1)))
+        }
+        "contains" => {
+            let n = sv(vm, args[1]).unwrap_or_default();
+            Some(V::I32(t.contains(&n) as i32))
+        }
+        "startsWith" => {
+            let n = sv(vm, args[1]).unwrap_or_default();
+            let off = args.get(2).map(|v| i32v(*v) as usize).unwrap_or(0);
+            Some(V::I32(
+                t.get(off..).is_some_and(|s| s.starts_with(&n)) as i32,
+            ))
+        }
+        "endsWith" => Some(V::I32(
+            t.ends_with(&sv(vm, args[1]).unwrap_or_default()) as i32,
+        )),
+        "equals" => {
+            let n = sv(vm, args[1]).unwrap_or_default();
+            Some(V::I32((t == n) as i32))
+        }
+        "equalsIgnoreCase" => {
+            let n = sv(vm, args[1]).unwrap_or_default();
+            Some(V::I32(t.eq_ignore_ascii_case(&n) as i32))
+        }
+        "compareTo" => {
+            let n = sv(vm, args[1]).unwrap_or_default();
+            Some(V::I32(t.cmp(&n) as i32))
+        }
+        "compareToIgnoreCase" => {
+            let n = sv(vm, args[1]).unwrap_or_default();
+            Some(V::I32(t.to_lowercase().cmp(&n.to_lowercase()) as i32))
+        }
+        "contentEquals" => {
+            let n = sv(vm, args[1]).unwrap_or_default();
+            Some(V::I32((t == n) as i32))
+        }
+        "regionMatches" => {
+            let (to, oo, len) = (
+                i32v(args[1]) as usize,
+                i32v(args[3]) as usize,
+                i32v(args[4]) as usize,
+            );
+            let n = sv(vm, args[2]).unwrap_or_default();
+            let a: Vec<char> = t.chars().skip(to).take(len).collect();
+            let b: Vec<char> = n.chars().skip(oo).take(len).collect();
+            Some(V::I32((a == b) as i32))
+        }
+        "substring" | "subSequence" => {
+            let b = i32v(args[1]) as usize;
+            let e = if args.len() > 2 {
+                i32v(args[2]) as usize
+            } else {
+                t.chars().count()
+            };
+            let sub: String = t.chars().skip(b).take(e.saturating_sub(b)).collect();
+            Some(jstr(vm, &sub))
+        }
+        "concat" => {
+            let n = sv(vm, args[1]).unwrap_or_default();
+            Some(jstr(vm, &format!("{t}{n}")))
+        }
+        "replace" => {
+            if p.first() == Some(&"Ljava/lang/CharSequence;") {
+                let a = sv(vm, args[1]).unwrap_or_default();
+                let b = sv(vm, args[2]).unwrap_or_default();
+                Some(jstr(vm, &t.replace(&a, &b)))
+            } else {
+                let a = char::from_u32(i32v(args[1]) as u32).unwrap_or('\0');
+                let b = char::from_u32(i32v(args[2]) as u32).unwrap_or('\0');
+                Some(jstr(vm, &t.replace(a, &b.to_string())))
+            }
+        }
+        "replaceAll" | "replaceFirst" => {
+            let pat = sv(vm, args[1]).unwrap_or_default();
+            let rep = sv(vm, args[2]).unwrap_or_default();
+            let out = if name == "replaceFirst" {
+                t.replacen(&pat, &rep, 1)
+            } else {
+                t.replace(&pat, &rep)
+            };
+            Some(jstr(vm, &out))
+        }
+        "toUpperCase" | "toLowerCase" => {
+            let out = if name == "toUpperCase" {
+                t.to_uppercase()
+            } else {
+                t.to_lowercase()
+            };
+            Some(jstr(vm, &out))
+        }
+        "trim" | "strip" => Some(jstr(vm, t.trim())),
+        "isBlank" => Some(V::I32(t.trim().is_empty() as i32)),
+        "repeat" => Some(jstr(vm, &t.repeat(i32v(args[1]).max(0) as usize))),
+        "getBytes" => {
+            let bs: Vec<V> = t.bytes().map(|b| V::I32(b as i8 as i32)).collect();
+            Some(arr(vm, "B", bs))
+        }
+        "toCharArray" => {
+            let cs: Vec<V> = t.chars().map(|c| V::I32(c as i32)).collect();
+            Some(arr(vm, "C", cs))
+        }
+        "matches" => {
+            let pat = sv(vm, args[1]).unwrap_or_default();
+            Some(V::I32(io::literal_match(&pat, &t) as i32))
+        }
+        "split" => {
+            let pat = sv(vm, args[1]).unwrap_or_default();
+            let lim = args.get(2).map(|v| i32v(*v)).unwrap_or(0);
+            let parts: Vec<V> = t
+                .split(if pat == "." { "\\." } else { &pat })
+                .take(if lim > 0 { lim as usize } else { usize::MAX })
+                .map(|x| jstr(vm, x))
+                .collect();
+            Some(arr(vm, STRING, parts))
+        }
+        "intern" => Some(args[0]),
+        "toString" => Some(args[0]),
+        "valueOf" => {
+            // static: valueOf(x) → string of arg (or char array slice)
+            let s = match args[0] {
+                V::Ref(h) => match vm.heap.get(h) {
+                    Some(Obj::Array { data, .. }) => {
+                        let a = args.get(1).map(|v| i32v(*v) as usize).unwrap_or(0);
+                        let n = args.get(2).map(|v| i32v(*v) as usize).unwrap_or(usize::MAX);
+                        data.iter()
+                            .skip(a)
+                            .take(n)
+                            .filter_map(|v| char::from_u32(i32v(*v) as u32))
+                            .collect()
+                    }
+                    _ => v_to_s(vm, args[0]),
+                },
+                _ => v_to_s(vm, args[0]),
+            };
+            Some(jstr(vm, &s))
+        }
+        "format" => {
+            // format(fmt, args...) or format(locale, fmt, args...)
+            let (fmt_i, rest) = if p.len() > 1 && p[0] == "Ljava/util/Locale;" {
+                (1, &args[2..])
+            } else {
+                (0, &args[1..])
+            };
+            let fmt = sv(vm, args[fmt_i]).unwrap_or_default();
+            let flat: Vec<V> = match rest.first() {
+                Some(V::Ref(h)) => match vm.heap.get(*h) {
+                    Some(Obj::Array { data, .. }) => data.clone(),
+                    _ => rest.to_vec(),
+                },
+                _ => rest.to_vec(),
+            };
+            let out = io::simple_format(vm, &fmt, &flat);
+            Some(jstr(vm, &out))
+        }
+        "join" => {
+            let d = sv(vm, args[0]).unwrap_or_default();
+            let parts: Vec<String> = match args[1] {
+                V::Ref(h) => match vm.heap.get(h) {
+                    Some(Obj::Host {
+                        state: HostState::List(l),
+                        ..
+                    }) => l.iter().map(|v| sv(vm, *v).unwrap_or_default()).collect(),
+                    Some(Obj::Array { data, .. }) => {
+                        data.iter().map(|v| sv(vm, *v).unwrap_or_default()).collect()
+                    }
+                    _ => args[1..]
+                        .iter()
+                        .map(|v| sv(vm, *v).unwrap_or_default())
+                        .collect(),
+                },
+                _ => vec![],
+            };
+            Some(jstr(vm, &parts.join(&d)))
+        }
+        "copyValueOf" | "valueOf0" => {
+            let s = v_to_s(vm, args[0]);
+            Some(jstr(vm, &s))
+        }
+        "chars" | "codePoints" => {
+            let cs: Vec<V> = t.chars().map(|c| V::I32(c as u32 as i32)).collect();
+            Some(arr(vm, "I", cs))
+        }
+        "hashCode" => Some(V::I32(java_str_hash(&t))),
+        _ => None,
+    };
+    r.map(Some)
+}
+
+// ---------------------------------------------------------------------
+// StringBuilder / StringBuffer
+
+fn strbuf(vm: &mut Vm, name: &str, sig: &str, args: &[V]) -> Rt<Option<Option<V>>> {
+    let V::Ref(h) = args.first().copied().unwrap_or(V::Ref(0)) else {
+        return Ok(None);
+    };
+    Ok(match name {
+        "append" => {
+            let p = params(sig);
+            let add = match p.first().copied().unwrap_or("") {
+                "Z" => (i32v(args[1]) != 0).to_string(),
+                "C" => char::from_u32(i32v(args[1]) as u32)
+                    .map(|c| c.to_string())
+                    .unwrap_or_default(),
+                "I" | "B" | "S" => i32v(args[1]).to_string(),
+                "J" => i64v(args[1]).to_string(),
+                "F" | "D" => fmt_f64(f64v(args[1])),
+                "[C" => {
+                    match args[1] {
+                        V::Ref(ah) => match vm.heap.get(ah) {
+                            Some(Obj::Array { data, .. }) => data
+                                .iter()
+                                .filter_map(|v| char::from_u32(i32v(*v) as u32))
+                                .collect(),
+                            _ => String::new(),
+                        },
+                        _ => String::new(),
+                    }
+                }
+                _ => v_to_s(vm, args[1]),
+            };
+            if let Some(Obj::Host {
+                state: HostState::StrBuf(b),
+                ..
+            }) = vm.heap.get_mut(h)
+            {
+                b.push_str(&add);
+            }
+            Some(Some(args[0]))
+        }
+        "insert" => {
+            let off = i32v(args[1]) as usize;
+            let add = v_to_s(vm, *args.get(2).unwrap_or(&V::Ref(0)));
+            if let Some(Obj::Host {
+                state: HostState::StrBuf(b),
+                ..
+            }) = vm.heap.get_mut(h)
+            {
+                let at = b.char_indices().nth(off).map(|(i, _)| i).unwrap_or(b.len());
+                b.insert_str(at, &add);
+            }
+            Some(Some(args[0]))
+        }
+        "delete" => {
+            let (a, z) = (i32v(args[1]) as usize, i32v(args[2]) as usize);
+            if let Some(Obj::Host {
+                state: HostState::StrBuf(b),
+                ..
+            }) = vm.heap.get_mut(h)
+            {
+                let lo = b.char_indices().nth(a).map(|(i, _)| i).unwrap_or(b.len());
+                let hi = b.char_indices().nth(z).map(|(i, _)| i).unwrap_or(b.len());
+                b.replace_range(lo..hi, "");
+            }
+            Some(Some(args[0]))
+        }
+        "deleteCharAt" => {
+            let a = i32v(args[1]) as usize;
+            if let Some(Obj::Host {
+                state: HostState::StrBuf(b),
+                ..
+            }) = vm.heap.get_mut(h)
+            {
+                let lo = b.char_indices().nth(a).map(|(i, _)| i).unwrap_or(b.len());
+                let hi = b.char_indices().nth(a + 1).map(|(i, _)| i).unwrap_or(b.len());
+                if lo < b.len() {
+                    b.replace_range(lo..hi, "");
+                }
+            }
+            Some(Some(args[0]))
+        }
+        "setCharAt" => {
+            let a = i32v(args[1]) as usize;
+            let c = char::from_u32(i32v(args[2]) as u32).unwrap_or('\0');
+            if let Some(Obj::Host {
+                state: HostState::StrBuf(b),
+                ..
+            }) = vm.heap.get_mut(h)
+            {
+                let lo = b.char_indices().nth(a).map(|(i, _)| i).unwrap_or(b.len());
+                let hi = b.char_indices().nth(a + 1).map(|(i, _)| i).unwrap_or(b.len());
+                if lo < b.len() {
+                    b.replace_range(lo..hi, &c.to_string());
+                }
+            }
+            Some(None)
+        }
+        "setLength" => {
+            let n = i32v(args[1]).max(0) as usize;
+            if let Some(Obj::Host {
+                state: HostState::StrBuf(b),
+                ..
+            }) = vm.heap.get_mut(h)
+            {
+                let cur = b.chars().count();
+                if n < cur {
+                    let at = b.char_indices().nth(n).map(|(i, _)| i).unwrap_or(b.len());
+                    b.truncate(at);
+                } else {
+                    b.extend(std::iter::repeat_n('\0', n - cur));
+                }
+            }
+            Some(None)
+        }
+        "toString" => {
+            let t = s(vm, h).unwrap_or_default();
+            Some(Some(jstr(vm, &t)))
+        }
+        "length" => {
+            let n = s(vm, h).map(|t| t.chars().count() as i32).unwrap_or(0);
+            Some(Some(V::I32(n)))
+        }
+        "capacity" => {
+            let n = s(vm, h).map(|t| t.chars().count().max(16) as i32).unwrap_or(16);
+            Some(Some(V::I32(n)))
+        }
+        "charAt" => {
+            let t = s(vm, h).unwrap_or_default();
+            let c = t.chars().nth(i32v(args[1]) as usize).map(|c| c as i32).unwrap_or(0);
+            Some(Some(V::I32(c)))
+        }
+        "substring" | "subSequence" => {
+            let t = s(vm, h).unwrap_or_default();
+            let b = i32v(args[1]) as usize;
+            let e = if args.len() > 2 {
+                i32v(args[2]) as usize
+            } else {
+                t.chars().count()
+            };
+            let sub: String = t.chars().skip(b).take(e.saturating_sub(b)).collect();
+            Some(Some(jstr(vm, &sub)))
+        }
+        "indexOf" | "lastIndexOf" => {
+            let t = s(vm, h).unwrap_or_default();
+            let n = sv(vm, args[1]).unwrap_or_default();
+            let i = if name == "indexOf" { t.find(&n) } else { t.rfind(&n) };
+            Some(Some(V::I32(i.map(|x| x as i32).unwrap_or(-1))))
+        }
+        "ensureCapacity" => Some(None),
+        "reverse" => {
+            if let Some(Obj::Host {
+                state: HostState::StrBuf(b),
+                ..
+            }) = vm.heap.get_mut(h)
+            {
+                *b = b.chars().rev().collect();
+            }
+            Some(Some(args[0]))
+        }
+        "replace" => {
+            let (a, z) = (i32v(args[1]) as usize, i32v(args[2]) as usize);
+            let rep = sv(vm, args[3]).unwrap_or_default();
+            if let Some(Obj::Host {
+                state: HostState::StrBuf(b),
+                ..
+            }) = vm.heap.get_mut(h)
+            {
+                let lo = b.char_indices().nth(a).map(|(i, _)| i).unwrap_or(b.len());
+                let hi = b.char_indices().nth(z).map(|(i, _)| i).unwrap_or(b.len());
+                b.replace_range(lo..hi, &rep);
+            }
+            Some(Some(args[0]))
+        }
+        "appendCodePoint" => {
+            if let Some(Obj::Host {
+                state: HostState::StrBuf(b),
+                ..
+            }) = vm.heap.get_mut(h)
+            {
+                if let Some(c) = char::from_u32(i32v(args[1]) as u32) {
+                    b.push(c);
+                }
+            }
+            Some(Some(args[0]))
+        }
+        "getChars" => Some(None),
+        _ => None,
+    })
+}
+
+// ---------------------------------------------------------------------
+// boxed primitives
+
+fn boxed(class: &str) -> bool {
+    matches!(
+        class,
+        "Ljava/lang/Integer;" | "Ljava/lang/Long;" | "Ljava/lang/Short;"
+            | "Ljava/lang/Byte;" | "Ljava/lang/Character;" | "Ljava/lang/Boolean;"
+            | "Ljava/lang/Double;" | "Ljava/lang/Float;"
+    )
+}
+
+fn prim(vm: &Vm, v: V) -> V {
+    if let V::Ref(h) = v {
+        slot_of(vm, h).unwrap_or(v)
+    } else {
+        v
+    }
+}
+
+fn boxed_call(
+    vm: &mut Vm,
+    class: &str,
+    name: &str,
+    sig: &str,
+    args: &[V],
+) -> Rt<Option<Option<V>>> {
+    Ok(match name {
+        "intValue" | "longValue" | "shortValue" | "byteValue" | "charValue"
+        | "booleanValue" | "doubleValue" | "floatValue" => {
+            let v = prim(vm, args[0]);
+            Some(Some(match name {
+                "longValue" => V::I64(i64v(v)),
+                "shortValue" => V::I32(i32v(v) as i16 as i32),
+                "byteValue" => V::I32(i32v(v) as i8 as i32),
+                "booleanValue" => V::I32((i32v(v) != 0) as i32),
+                "doubleValue" => V::F64(f64v(v)),
+                "floatValue" => V::F32(f64v(v) as f32),
+                _ => V::I32(i32v(v)),
+            }))
+        }
+        "valueOf" => {
+            let p = params(sig);
+            if p.first() == Some(&"Ljava/lang/String;") {
+                let t = sv(vm, args[0]).unwrap_or_default();
+                let parsed: Result<V, ()> = match class {
+                    "Ljava/lang/Integer;" => {
+                        t.trim().parse::<i32>().map(V::I32).map_err(|_| ())
+                    }
+                    "Ljava/lang/Long;" => t.trim().parse::<i64>().map(V::I64).map_err(|_| ()),
+                    "Ljava/lang/Short;" => {
+                        t.trim().parse::<i16>().map(|i| V::I32(i as i32)).map_err(|_| ())
+                    }
+                    "Ljava/lang/Byte;" => {
+                        t.trim().parse::<i8>().map(|i| V::I32(i as i32)).map_err(|_| ())
+                    }
+                    "Ljava/lang/Double;" => {
+                        t.trim().parse::<f64>().map(V::F64).map_err(|_| ())
+                    }
+                    "Ljava/lang/Float;" => {
+                        t.trim().parse::<f32>().map(V::F32).map_err(|_| ())
+                    }
+                    "Ljava/lang/Boolean;" => Ok(V::I32((t == "true") as i32)),
+                    _ => Err(()),
+                };
+                match parsed {
+                    Ok(v) => Some(Some(host(vm, class, HostState::Slot(v)))),
+                    Err(()) => {
+                        let e = vm.throw_builtin(
+                            "Ljava/lang/NumberFormatException;",
+                            &format!("For input string: \"{t}\""),
+                        );
+                        return Err(e);
+                    }
+                }
+            } else {
+                Some(Some(host(vm, class, HostState::Slot(args[0]))))
+            }
+        }
+        "parseInt" => {
+            let t = sv(vm, args[0]).unwrap_or_default();
+            let radix = args.get(1).map(|v| i32v(*v) as u32).unwrap_or(10);
+            match i32::from_str_radix(t.trim(), radix) {
+                Ok(i) => Some(Some(V::I32(i))),
+                Err(_) => {
+                    let e = vm.throw_builtin(
+                        "Ljava/lang/NumberFormatException;",
+                        &format!("For input string: \"{t}\""),
+                    );
+                    return Err(e);
+                }
+            }
+        }
+        "parseLong" => {
+            let t = sv(vm, args[0]).unwrap_or_default();
+            let radix = args.get(1).map(|v| i32v(*v) as u32).unwrap_or(10);
+            match i64::from_str_radix(t.trim(), radix) {
+                Ok(i) => Some(Some(V::I64(i))),
+                Err(_) => {
+                    let e = vm.throw_builtin(
+                        "Ljava/lang/NumberFormatException;",
+                        &format!("For input string: \"{t}\""),
+                    );
+                    return Err(e);
+                }
+            }
+        }
+        "parseShort" => Some(Some(V::I32(
+            sv(vm, args[0])
+                .unwrap_or_default()
+                .trim()
+                .parse::<i16>()
+                .unwrap_or(0) as i32,
+        ))),
+        "parseByte" => Some(Some(V::I32(
+            sv(vm, args[0])
+                .unwrap_or_default()
+                .trim()
+                .parse::<i8>()
+                .unwrap_or(0) as i32,
+        ))),
+        "parseBoolean" => Some(Some(V::I32(
+            (sv(vm, args[0]).unwrap_or_default() == "true") as i32,
+        ))),
+        "parseDouble" => Some(Some(V::F64(
+            sv(vm, args[0]).unwrap_or_default().trim().parse().unwrap_or(f64::NAN),
+        ))),
+        "parseFloat" => Some(Some(V::F32(
+            sv(vm, args[0]).unwrap_or_default().trim().parse().unwrap_or(f32::NAN),
+        ))),
+        "parseUnsignedInt" | "parseUnsignedLong" => {
+            let t = sv(vm, args[0]).unwrap_or_default();
+            Some(Some(if name == "parseUnsignedLong" {
+                V::I64(t.trim().parse::<u64>().unwrap_or(0) as i64)
+            } else {
+                V::I32(t.trim().parse::<u32>().unwrap_or(0) as i32)
+            }))
+        }
+        "numberOfLeadingZeros" => Some(Some(V::I32(if class == "Ljava/lang/Long;" {
+            i64v(args[0]).leading_zeros() as i32
+        } else {
+            i32v(args[0]).leading_zeros() as i32
+        }))),
+        "numberOfTrailingZeros" => Some(Some(V::I32(if class == "Ljava/lang/Long;" {
+            i64v(args[0]).trailing_zeros() as i32
+        } else {
+            i32v(args[0]).trailing_zeros() as i32
+        }))),
+        "bitCount" => Some(Some(V::I32(if class == "Ljava/lang/Long;" {
+            i64v(args[0]).count_ones() as i32
+        } else {
+            i32v(args[0]).count_ones() as i32
+        }))),
+        "highestOneBit" => Some(Some(if class == "Ljava/lang/Long;" {
+            V::I64(if i64v(args[0]) == 0 {
+                0
+            } else {
+                1i64 << (63 - i64v(args[0]).leading_zeros())
+            })
+        } else {
+            V::I32(if i32v(args[0]) == 0 {
+                0
+            } else {
+                1i32 << (31 - i32v(args[0]).leading_zeros())
+            })
+        })),
+        "lowestOneBit" => Some(Some(if class == "Ljava/lang/Long;" {
+            V::I64(i64v(args[0]) & i64v(args[0]).wrapping_neg())
+        } else {
+            V::I32(i32v(args[0]) & i32v(args[0]).wrapping_neg())
+        })),
+        "reverse" => Some(Some(if class == "Ljava/lang/Long;" {
+            V::I64(i64v(args[0]).reverse_bits())
+        } else {
+            V::I32(i32v(args[0]).reverse_bits())
+        })),
+        "reverseBytes" => Some(Some(match class {
+            "Ljava/lang/Long;" => V::I64(i64v(args[0]).swap_bytes()),
+            "Ljava/lang/Short;" => V::I32((i32v(args[0]) as i16).swap_bytes() as i32),
+            _ => V::I32(i32v(args[0]).swap_bytes()),
+        })),
+        "rotateLeft" | "rotateRight" => {
+            let (x, d) = (i32v(args[0]), i32v(args[1]) as u32);
+            Some(Some(V::I32(if name == "rotateLeft" {
+                x.rotate_left(d)
+            } else {
+                x.rotate_right(d)
+            })))
+        }
+        "signum" => Some(Some(V::I32(i32v(args[0]).signum()))),
+        "compare" | "compareUnsigned" => {
+            let c = if name == "compareUnsigned" {
+                (i32v(args[0]) as u32).cmp(&(i32v(args[1]) as u32))
+            } else if matches!(args[0], V::I64(_)) {
+                i64v(args[0]).cmp(&i64v(args[1]))
+            } else if matches!(args[0], V::F64(_) | V::F32(_)) {
+                f64v(args[0])
+                    .partial_cmp(&f64v(args[1]))
+                    .unwrap_or(std::cmp::Ordering::Equal)
+            } else {
+                i32v(args[0]).cmp(&i32v(args[1]))
+            };
+            Some(Some(V::I32(c as i32)))
+        }
+        "sum" | "max" | "min" => {
+            let (a, b) = (i64v(args[0]), i64v(args[1]));
+            let v = match name {
+                "sum" => a.wrapping_add(b),
+                "max" => a.max(b),
+                _ => a.min(b),
+            };
+            Some(Some(if class == "Ljava/lang/Long;" {
+                V::I64(v)
+            } else {
+                V::I32(v as i32)
+            }))
+        }
+        "divideUnsigned" | "remainderUnsigned" => {
+            let div = name.starts_with("divide");
+            Some(Some(if class == "Ljava/lang/Long;" {
+                let (a, b) = (i64v(args[0]) as u64, (i64v(args[1]) as u64).max(1));
+                V::I64(if div { (a / b) as i64 } else { (a % b) as i64 })
+            } else {
+                let (a, b) = (i32v(args[0]) as u32, (i32v(args[1]) as u32).max(1));
+                V::I32(if div { (a / b) as i32 } else { (a % b) as i32 })
+            }))
+        }
+        "toHexString" => Some(Some(jstr(vm, &format!("{:x}", i64v(args[0]))))),
+        "toOctalString" => Some(Some(jstr(vm, &format!("{:o}", i64v(args[0]))))),
+        "toBinaryString" => Some(Some(jstr(vm, &format!("{:b}", i64v(args[0]))))),
+        "toUnsignedString" => Some(Some(jstr(
+            vm,
+            &format!("{}", i32v(args[0]) as u32),
+        ))),
+        "toString" if args.len() == 1 => {
+            let p = params(sig);
+            if p.first() == Some(&"Ljava/lang/String;") {
+                // instance toString handled by universal — skip
+                return Ok(None);
+            }
+            let v = prim(vm, args[0]);
+            let t = match v {
+                V::I32(i) => i.to_string(),
+                V::I64(i) => i.to_string(),
+                V::F32(f) => fmt_f64(f as f64),
+                V::F64(f) => fmt_f64(f),
+                V::Ref(0) => "false".into(),
+                _ => fmt_v(v),
+            };
+            Some(Some(jstr(vm, &t)))
+        }
+        "toString" => {
+            // toString(int, radix)
+            let (v, radix) = (i64v(args[0]), i32v(args[1]) as u32);
+            let radix = radix.clamp(2, 36);
+            let mut n = v.unsigned_abs();
+            let mut t = String::new();
+            loop {
+                t.push(std::char::from_digit((n % radix as u64) as u32, radix).unwrap_or('0'));
+                n /= radix as u64;
+                if n == 0 {
+                    break;
+                }
+            }
+            if v < 0 {
+                t.push('-');
+            }
+            Some(Some(jstr(vm, &t.chars().rev().collect::<String>())))
+        }
+        "decode" => {
+            let t = sv(vm, args[0]).unwrap_or_default();
+            let t = t.trim();
+            let (neg, s) = match t.strip_prefix('-') {
+                Some(x) => (true, x),
+                None => (false, t),
+            };
+            let (radix, s) = if let Some(x) = s.strip_prefix("0x").or_else(|| s.strip_prefix("0X")) {
+                (16, x)
+            } else if let Some(x) = s.strip_prefix('#') {
+                (16, x)
+            } else if s.len() > 1 && s.starts_with('0') {
+                (8, &s[1..])
+            } else {
+                (10, s)
+            };
+            let v = i64::from_str_radix(s, radix).unwrap_or(0) * if neg { -1 } else { 1 };
+            Some(Some(host(
+                vm,
+                class,
+                HostState::Slot(if class == "Ljava/lang/Long;" {
+                    V::I64(v)
+                } else {
+                    V::I32(v as i32)
+                }),
+            )))
+        }
+        "getInteger" => Some(Some(V::Ref(0))),
+        "isNaN" | "isInfinite" | "isFinite" => {
+            let v = f64v(args[0]);
+            let r = match name {
+                "isNaN" => v.is_nan(),
+                "isInfinite" => v.is_infinite(),
+                _ => v.is_finite(),
+            };
+            Some(Some(V::I32(r as i32)))
+        }
+        "doubleToLongBits" | "doubleToRawLongBits" => {
+            Some(Some(V::I64(f64v(args[0]).to_bits() as i64)))
+        }
+        "longBitsToDouble" => Some(Some(V::F64(f64::from_bits(i64v(args[0]) as u64)))),
+        "floatToIntBits" | "floatToRawIntBits" => Some(Some(V::I32(
+            (f64v(args[0]) as f32).to_bits() as i32,
+        ))),
+        "intBitsToFloat" => Some(Some(V::F32(f32::from_bits(i32v(args[0]) as u32)))),
+        "forDigit" => {
+            let c = std::char::from_digit(i32v(args[0]) as u32, i32v(args[1]) as u32)
+                .unwrap_or('\0');
+            Some(Some(V::I32(c as i32)))
+        }
+        "digit" => {
+            let c = match args[0] {
+                V::I32(i) => char::from_u32(i as u32).unwrap_or('\0'),
+                _ => sv(vm, args[0]).and_then(|t| t.chars().next()).unwrap_or('\0'),
+            };
+            Some(Some(V::I32(
+                c.to_digit(i32v(args[1]) as u32).map(|d| d as i32).unwrap_or(-1),
+            )))
+        }
+        "isDigit" | "isLetter" | "isLetterOrDigit" | "isWhitespace" | "isSpaceChar"
+        | "isUpperCase" | "isLowerCase" | "isHighSurrogate" | "isLowSurrogate"
+        | "isSurrogate" | "isAlphabetic" | "isDefined" | "isIdeographic"
+        | "isJavaIdentifierStart" | "isJavaIdentifierPart" | "isTitleCase"
+        | "isUnicodeIdentifierStart" | "isUnicodeIdentifierPart" | "isISOControl"
+        | "isMirrored" | "isIdentifierIgnorable" => {
+            let cp = i32v(args[0]) as u32;
+            let c = char::from_u32(cp).unwrap_or('\0');
+            let r = match name {
+                "isDigit" => c.is_ascii_digit(),
+                "isLetter" | "isAlphabetic" => c.is_alphabetic(),
+                "isLetterOrDigit" => c.is_alphanumeric(),
+                "isWhitespace" | "isSpaceChar" => c.is_whitespace(),
+                "isUpperCase" => c.is_uppercase(),
+                "isLowerCase" => c.is_lowercase(),
+                "isTitleCase" => c.is_uppercase(),
+                "isHighSurrogate" => (0xD800..0xDC00).contains(&cp),
+                "isLowSurrogate" => (0xDC00..0xE000).contains(&cp),
+                "isSurrogate" => (0xD800..0xE000).contains(&cp),
+                "isDefined" => cp < 0x110000,
+                "isJavaIdentifierStart" | "isUnicodeIdentifierStart" => {
+                    c.is_alphabetic() || c == '_' || c == '$'
+                }
+                "isJavaIdentifierPart" | "isUnicodeIdentifierPart" => {
+                    c.is_alphanumeric() || c == '_' || c == '$'
+                }
+                "isISOControl" => c.is_control(),
+                "isMirrored" | "isIdentifierIgnorable" | "isIdeographic" => false,
+                _ => false,
+            };
+            Some(Some(V::I32(r as i32)))
+        }
+        "toUpperCase" | "toLowerCase" | "toTitleCase" => {
+            let c = char::from_u32(i32v(args[0]) as u32).unwrap_or('\0');
+            let out = match name {
+                "toLowerCase" => c.to_lowercase().next().unwrap_or(c),
+                _ => c.to_uppercase().next().unwrap_or(c),
+            };
+            Some(Some(V::I32(out as i32)))
+        }
+        "toChars" => {
+            let c = char::from_u32(i32v(args[0]) as u32).unwrap_or('\0');
+            if args.len() > 1 {
+                // toChars(codePoint, dst, dstIndex)
+                if let V::Ref(ah) = args[1] {
+                    let di = i32v(args[2]) as usize;
+                    if let Some(Obj::Array { data, .. }) = vm.heap.get_mut(ah) {
+                        if di < data.len() {
+                            data[di] = V::I32(c as i32);
+                        }
+                    }
+                }
+                Some(Some(V::I32(1)))
+            } else {
+                Some(Some(arr(vm, "C", vec![V::I32(c as i32)])))
+            }
+        }
+        "toCodePoint" => {
+            let (hi, lo) = (i32v(args[0]) as u32, i32v(args[1]) as u32);
+            Some(Some(V::I32(
+                (0x10000 + ((hi & 0x3ff) << 10) + (lo & 0x3ff)) as i32,
+            )))
+        }
+        "charCount" => Some(Some(V::I32(if i32v(args[0]) >= 0x10000 { 2 } else { 1 }))),
+        "highSurrogate" | "lowSurrogate" => {
+            let cp = i32v(args[0]) as u32;
+            let v = if name == "highSurrogate" {
+                0xD800 + ((cp - 0x10000) >> 10)
+            } else {
+                0xDC00 + ((cp - 0x10000) & 0x3ff)
+            };
+            Some(Some(V::I32(v as i32)))
+        }
+        "hashCode" if args.len() == 1 && !matches!(args[0], V::Ref(_)) => {
+            Some(Some(v_hash(args[0])))
+        }
+        _ => None,
+    })
+}
+
+fn number_call(vm: &mut Vm, name: &str, args: &[V]) -> Option<Option<V>> {
+    let v = match args[0] {
+        V::Ref(h) => slot_of(vm, h).unwrap_or(V::I32(0)),
+        x => x,
+    };
+    Some(Some(match name {
+        "intValue" => V::I32(i32v(v)),
+        "longValue" => V::I64(i64v(v)),
+        "shortValue" => V::I32(i32v(v) as i16 as i32),
+        "byteValue" => V::I32(i32v(v) as i8 as i32),
+        "doubleValue" => V::F64(f64v(v)),
+        "floatValue" => V::F32(f64v(v) as f32),
+        _ => return None,
+    }))
+}
+
+// ---------------------------------------------------------------------
+// Math
+
+fn math_call(name: &str, args: &[V]) -> Option<Option<V>> {
+    let r: V = match name {
+        "abs" => match args[0] {
+            V::I64(i) => V::I64(i.wrapping_abs()),
+            V::F32(f) => V::F32(f.abs()),
+            V::F64(f) => V::F64(f.abs()),
+            _ => V::I32(i32v(args[0]).wrapping_abs()),
+        },
+        "min" | "max" => {
+            let mx = name == "max";
+            match (args[0], args[1]) {
+                (V::F64(_), _) | (_, V::F64(_)) => {
+                    let (a, b) = (f64v(args[0]), f64v(args[1]));
+                    V::F64(if mx { a.max(b) } else { a.min(b) })
+                }
+                (V::F32(a), V::F32(b)) => V::F32(if mx { a.max(b) } else { a.min(b) }),
+                (V::I64(a), V::I64(b)) => V::I64(if mx { a.max(b) } else { a.min(b) }),
+                _ => {
+                    let (a, b) = (i32v(args[0]), i32v(args[1]));
+                    V::I32(if mx { a.max(b) } else { a.min(b) })
+                }
+            }
+        }
+        "floor" => V::F64(f64v(args[0]).floor()),
+        "ceil" => V::F64(f64v(args[0]).ceil()),
+        "round" => match args[0] {
+            V::F32(f) => V::I32(f.round() as i32),
+            _ => V::I64(f64v(args[0]).round() as i64),
+        },
+        "rint" => V::F64(f64v(args[0]).round()),
+        "pow" => V::F64(f64v(args[0]).powf(f64v(args[1]))),
+        "sqrt" => V::F64(f64v(args[0]).sqrt()),
+        "cbrt" => V::F64(f64v(args[0]).cbrt()),
+        "exp" => V::F64(f64v(args[0]).exp()),
+        "expm1" => V::F64(f64v(args[0]).exp_m1()),
+        "log" => V::F64(f64v(args[0]).ln()),
+        "log10" => V::F64(f64v(args[0]).log10()),
+        "log1p" => V::F64(f64v(args[0]).ln_1p()),
+        "sin" => V::F64(f64v(args[0]).sin()),
+        "cos" => V::F64(f64v(args[0]).cos()),
+        "tan" => V::F64(f64v(args[0]).tan()),
+        "asin" => V::F64(f64v(args[0]).asin()),
+        "acos" => V::F64(f64v(args[0]).acos()),
+        "atan" => V::F64(f64v(args[0]).atan()),
+        "sinh" => V::F64(f64v(args[0]).sinh()),
+        "cosh" => V::F64(f64v(args[0]).cosh()),
+        "tanh" => V::F64(f64v(args[0]).tanh()),
+        "atan2" => V::F64(f64v(args[0]).atan2(f64v(args[1]))),
+        "hypot" => V::F64(f64v(args[0]).hypot(f64v(args[1]))),
+        "toRadians" => V::F64(f64v(args[0]).to_radians()),
+        "toDegrees" => V::F64(f64v(args[0]).to_degrees()),
+        "signum" => V::F64(f64v(args[0]).signum()),
+        "floorDiv" | "floorMod" => match args[0] {
+            V::I64(a) => {
+                let b = i64v(args[1]).max(1);
+                if name == "floorDiv" {
+                    V::I64(a.div_euclid(b))
+                } else {
+                    V::I64(a.rem_euclid(b))
+                }
+            }
+            _ => {
+                let (a, b) = (i32v(args[0]), i32v(args[1]).max(1));
+                if name == "floorDiv" {
+                    V::I32(a.div_euclid(b))
+                } else {
+                    V::I32(a.rem_euclid(b))
+                }
+            }
+        },
+        "addExact" | "subtractExact" | "multiplyExact" | "negateExact"
+        | "incrementExact" | "decrementExact" | "toIntExact" => {
+            let wide = matches!(args[0], V::I64(_));
+            let (a, b) = (i64v(args[0]), i64v(args.get(1).copied().unwrap_or(V::I64(0))));
+            let v = match name {
+                "addExact" => a + b,
+                "subtractExact" => a - b,
+                "multiplyExact" => a * b,
+                "negateExact" => -a,
+                "incrementExact" => a + 1,
+                "decrementExact" => a - 1,
+                _ => a,
+            };
+            if wide {
+                V::I64(v)
+            } else {
+                V::I32(v as i32)
+            }
+        }
+        "random" => V::F64(
+            (std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.subsec_nanos() as u64)
+                .unwrap_or(1)
+                .wrapping_mul(6364136223846793005)
+                >> 11) as f64
+                / (1u64 << 53) as f64,
+        ),
+        "IEEEremainder" => V::F64(f64v(args[0]) % f64v(args[1])),
+        "copySign" => V::F64(f64v(args[0]).copysign(f64v(args[1]))),
+        "scalb" => V::F64(f64v(args[0]) * 2f64.powi(i32v(args[1]))),
+        "ulp" | "nextAfter" | "nextUp" | "nextDown" => V::F64(f64v(args[0])),
+        "getExponent" => V::I32(0),
+        _ => return None,
+    };
+    Some(Some(r))
+}
+
+// ---------------------------------------------------------------------
+// System / Runtime
+
+fn system_call(vm: &mut Vm, name: &str, _sig: &str, args: &[V]) -> Rt<Option<Option<V>>> {
+    Ok(match name {
+        "currentTimeMillis" => Some(Some(V::I64(now_ms()))),
+        "nanoTime" => Some(Some(V::I64(now_ms() * 1_000_000))),
+        "arraycopy" => {
+            let (V::Ref(src), V::Ref(dst)) = (args[0], args[2]) else {
+                return Ok(Some(None));
+            };
+            if !(matches!(vm.heap.get(src), Some(Obj::Array { .. }))
+                && matches!(vm.heap.get(dst), Some(Obj::Array { .. })))
+            {
+                return Ok(Some(None));
+            }
+            let (sp, dp, len) = (
+                i32v(args[1]) as usize,
+                i32v(args[3]) as usize,
+                i32v(args[4]) as usize,
+            );
+            let vals: Vec<V> = match vm.heap.get(src) {
+                Some(Obj::Array { data, .. }) => {
+                    data.iter().skip(sp).take(len).copied().collect()
+                }
+                _ => vec![],
+            };
+            if let Some(Obj::Array { data, .. }) = vm.heap.get_mut(dst) {
+                for (i, v) in vals.into_iter().enumerate() {
+                    if dp + i < data.len() {
+                        data[dp + i] = v;
+                    }
+                }
+            }
+            Some(None)
+        }
+        "identityHashCode" => Some(Some(match args[0] {
+            V::Ref(h) => V::I32(h as i32),
+            _ => V::I32(0),
+        })),
+        "getProperty" => {
+            let k = sv(vm, args[0]).unwrap_or_default();
+            let v = match k.as_str() {
+                "file.separator" => "/",
+                "path.separator" => ":",
+                "line.separator" => "\n",
+                "os.name" => "Linux",
+                "os.arch" => "aarch64",
+                "os.version" => "ovelo",
+                "user.home" | "user.dir" => "/data/local/ovelo",
+                "user.name" | "java.vendor" | "http.agent" => "ovelo",
+                "java.version" => "17",
+                "java.io.tmpdir" => "/data/local/ovelo/tmp",
+                "file.encoding" | "sun.jnu.encoding" | "sun.stdout.encoding"
+                | "stderr.encoding" => "UTF-8",
+                _ => {
+                    if args.len() > 1 {
+                        return Ok(Some(Some(args[1])));
+                    }
+                    return Ok(Some(Some(V::Ref(0))));
+                }
+            };
+            Some(Some(jstr(vm, v)))
+        }
+        "setProperty" | "clearProperty" => Some(Some(V::Ref(0))),
+        "lineSeparator" => Some(Some(jstr(vm, "\n"))),
+        "gc" | "runFinalization" | "exit" | "halt" | "loadLibrary" | "load"
+        | "setIn" | "setOut" | "setErr" | "setProperties" | "setSecurityManager" => {
+            Some(None)
+        }
+        "mapLibraryName" => {
+            let n = sv(vm, args[0]).unwrap_or_default();
+            Some(Some(jstr(vm, &format!("lib{n}.so"))))
+        }
+        "getSecurityManager" | "console" | "inheritedChannel" | "getLogger" => {
+            Some(Some(V::Ref(0)))
+        }
+        _ => None,
+    })
+}
+
+fn runtime_call(vm: &mut Vm, name: &str, args: &[V]) -> Option<Option<V>> {
+    match name {
+        "getRuntime" => Some(Some(host(vm, "Ljava/lang/Runtime;", HostState::Empty))),
+        "availableProcessors" => Some(Some(V::I32(4))),
+        "freeMemory" => Some(Some(V::I64(64 << 20))),
+        "totalMemory" => Some(Some(V::I64(256 << 20))),
+        "maxMemory" => Some(Some(V::I64(512 << 20))),
+        "exec" => Some(Some(V::Ref(0))),
+        "exit" | "halt" | "gc" | "runFinalization" | "addShutdownHook"
+        | "removeShutdownHook" | "loadLibrary" | "load" => {
+            let _ = args;
+            Some(None)
+        }
+        _ => None,
+    }
+}
+
+// ---------------------------------------------------------------------
+// Class / reflection
+
+fn class_call(vm: &mut Vm, name: &str, _sig: &str, args: &[V]) -> Rt<Option<Option<V>>> {
+    Ok(match name {
+        "forName" => {
+            let mut d = sv(vm, args[0]).unwrap_or_default();
+            if !d.starts_with('L') && !d.starts_with('[') {
+                d = format!("L{};", d.replace('.', "/"));
+            }
+            Some(Some(class_obj(vm, d)))
+        }
+        "getName" | "getCanonicalName" | "getTypeName" => {
+            let d = s(vm, match args[0] { V::Ref(h) => h, _ => 0 })
+                .unwrap_or_else(|| class_of(vm, args[0]));
+            Some(Some(jstr(vm, &dotted(&d))))
+        }
+        "getSimpleName" => {
+            let d = s(vm, match args[0] { V::Ref(h) => h, _ => 0 })
+                .unwrap_or_else(|| class_of(vm, args[0]));
+            let base = dotted(&d);
+            let short = base.rsplit(['.', '$']).next().unwrap_or(&base).to_string();
+            Some(Some(jstr(vm, &short)))
+        }
+        "getPackageName" | "getPackage" => {
+            let d = s(vm, match args[0] { V::Ref(h) => h, _ => 0 }).unwrap_or_default();
+            let base = dotted(&d);
+            let pkg = base.rsplit_once('.').map(|(p, _)| p).unwrap_or("");
+            if name == "getPackageName" {
+                Some(Some(jstr(vm, pkg)))
+            } else {
+                Some(Some(V::Ref(0)))
+            }
+        }
+        "isInterface" | "isPrimitive" | "isEnum" | "isAnnotation" | "isSynthetic"
+        | "isAnonymousClass" | "isLocalClass" | "isMemberClass" | "isSealed"
+        | "isRecord" | "isHidden" | "isAnnotationPresent" => Some(Some(V::I32(0))),
+        "isArray" => {
+            let d = s(vm, match args[0] { V::Ref(h) => h, _ => 0 }).unwrap_or_default();
+            Some(Some(V::I32(d.starts_with('[') as i32)))
+        }
+        "isInstance" => {
+            let want = s(vm, match args[0] { V::Ref(h) => h, _ => 0 }).unwrap_or_default();
+            let got = class_of(vm, args[1]);
+            Some(Some(V::I32(desc_is_a(&got, &want) as i32)))
+        }
+        "isAssignableFrom" => {
+            let a = s(vm, match args[0] { V::Ref(h) => h, _ => 0 }).unwrap_or_default();
+            let b = s(vm, match args[1] { V::Ref(h) => h, _ => 0 }).unwrap_or_default();
+            Some(Some(V::I32(desc_is_a(&b, &a) as i32)))
+        }
+        "getSuperclass" => {
+            let d = s(vm, match args[0] { V::Ref(h) => h, _ => 0 }).unwrap_or_default();
+            match host_supers(&d).first() {
+                Some(sup) => Some(Some(class_obj(vm, sup.to_string()))),
+                None if d != OBJ => Some(Some(class_obj(vm, OBJ.into()))),
+                None => Some(Some(V::Ref(0))),
+            }
+        }
+        "getComponentType" => {
+            let d = s(vm, match args[0] { V::Ref(h) => h, _ => 0 }).unwrap_or_default();
+            Some(Some(if let Some(inner) = d.strip_prefix('[') {
+                class_obj(vm, inner.to_string())
+            } else {
+                V::Ref(0)
+            }))
+        }
+        "getClassLoader" => Some(Some(host(vm, "Ljava/lang/ClassLoader;", HostState::Empty))),
+        "getMethods" | "getDeclaredMethods" | "getFields" | "getDeclaredFields"
+        | "getConstructors" | "getDeclaredConstructors" | "getInterfaces"
+        | "getDeclaredClasses" | "getClasses" | "getAnnotations"
+        | "getDeclaredAnnotations" | "getEnumConstants" | "getPermittedSubclasses"
+        | "getSigners" | "getTypeParameters" | "getRecordComponents"
+        | "getNestMembers" | "getGenericInterfaces" => Some(Some(arr(vm, OBJ, vec![]))),
+        "getField" | "getDeclaredField" => {
+            let owner = s(vm, match args[0] { V::Ref(h) => h, _ => 0 })
+                .unwrap_or_default();
+            let fname = sv(vm, args[1]).unwrap_or_default();
+            let cv = jstr(vm, &owner);
+            let hv = host(
+                vm,
+                "Ljava/lang/reflect/Field;",
+                HostState::StrBuf(fname.clone()),
+            );
+            if let V::Ref(h) = hv {
+                pseudo_set(vm, h, P_COMPONENT, cv);
+            }
+            Some(Some(hv))
+        }
+        "getMethod" | "getDeclaredMethod" => {
+            let owner = s(vm, match args[0] { V::Ref(h) => h, _ => 0 })
+                .unwrap_or_default();
+            let mname = sv(vm, args[1]).unwrap_or_default();
+            let cv = jstr(vm, &owner);
+            let hv = host(
+                vm,
+                "Ljava/lang/reflect/Method;",
+                HostState::StrBuf(mname.clone()),
+            );
+            if let V::Ref(h) = hv {
+                pseudo_set(vm, h, P_COMPONENT, cv);
+            }
+            Some(Some(hv))
+        }
+        "getConstructor" | "getDeclaredConstructor" => {
+            let owner = s(vm, match args[0] { V::Ref(h) => h, _ => 0 })
+                .unwrap_or_default();
+            let cv = jstr(vm, &owner);
+            let hv = host(
+                vm,
+                "Ljava/lang/reflect/Constructor;",
+                HostState::StrBuf(String::new()),
+            );
+            if let V::Ref(h) = hv {
+                pseudo_set(vm, h, P_COMPONENT, cv);
+            }
+            Some(Some(hv))
+        }
+        "newInstance" => {
+            let d = s(vm, match args[0] { V::Ref(h) => h, _ => 0 }).unwrap_or_default();
+            match vm.instantiate(&d) {
+                Ok(h) => Some(Some(V::Ref(h))),
+                Err(_) => {
+                    let e = vm.throw_builtin("Ljava/lang/InstantiationException;", &d);
+                    return Err(e);
+                }
+            }
+        }
+        "getResource" | "getResourceAsStream" | "getProtectionDomain"
+        | "getEnclosingMethod" | "getEnclosingConstructor" | "getEnclosingClass"
+        | "getDeclaringClass" | "getModule" | "getNestHost"
+        | "getGenericSuperclass" | "getAnnotation" | "getDeclaredAnnotation"
+        | "describeConstable" | "getModifiers0" => Some(Some(V::Ref(0))),
+        "getModifiers" => Some(Some(V::I32(1))),
+        "cast" | "asSubclass" => Some(Some(args[0])),
+        "desiredAssertionStatus" => Some(Some(V::I32(0))),
+        "arrayType" | "componentType" => Some(Some(V::Ref(0))),
+        "toString" => {
+            let d = s(vm, match args[0] { V::Ref(h) => h, _ => 0 }).unwrap_or_default();
+            Some(Some(jstr(vm, &format!("class {}", dotted(&d)))))
+        }
+        _ => None,
+    })
+}
+
+fn classloader_call(vm: &mut Vm, name: &str, args: &[V]) -> Option<Option<V>> {
+    match name {
+        "getSystemClassLoader" | "getPlatformClassLoader" | "getParent"
+        | "getClassLoader" => {
+            Some(Some(host(vm, "Ljava/lang/ClassLoader;", HostState::Empty)))
+        }
+        "loadClass" | "findClass" => {
+            let mut d = sv(vm, args[0]).unwrap_or_default();
+            if !d.starts_with('L') {
+                d = format!("L{};", d.replace('.', "/"));
+            }
+            Some(Some(class_obj(vm, d)))
+        }
+        "getResource" | "getResourceAsStream" | "getDefinedPackage" | "getName"
+        | "getUnnamedModule" => Some(Some(V::Ref(0))),
+        "getResources" => Some(Some(host(
+            vm,
+            "Ljava/util/Enumeration;",
+            HostState::Iter(std::rc::Rc::new(vec![]), 0),
+        ))),
+        "isRegisteredAsParallelCapable" | "clearAssertionStatus"
+        | "setClassAssertionStatus" | "setPackageAssertionStatus"
+        | "setDefaultAssertionStatus" => {
+            if name.starts_with("is") {
+                Some(Some(V::I32(0)))
+            } else {
+                Some(None)
+            }
+        }
+        _ => None,
+    }
+}
+
+// ---------------------------------------------------------------------
+// Thread
+
+fn thread_call(vm: &mut Vm, name: &str, _sig: &str, args: &[V]) -> Rt<Option<Option<V>>> {
+    Ok(match name {
+        "currentThread" => Some(Some(host(
+            vm,
+            "Ljava/lang/Thread;",
+            HostState::StrBuf("main".into()),
+        ))),
+        "getId" => Some(Some(V::I64(1))),
+        "getName" => {
+            let n = s(vm, match args[0] { V::Ref(h) => h, _ => 0 })
+                .unwrap_or_else(|| "main".into());
+            Some(Some(jstr(vm, &n)))
+        }
+        "setName" => {
+            if let V::Ref(h) = args[0] {
+                let n = sv(vm, args[1]).unwrap_or_default();
+                if let Some(Obj::Host {
+                    state: HostState::StrBuf(t),
+                    ..
+                }) = vm.heap.get_mut(h)
+                {
+                    *t = n;
+                }
+            }
+            Some(None)
+        }
+        "getPriority" => Some(Some(V::I32(5))),
+        "isAlive" | "isDaemon" | "isVirtual" | "isInterrupted" | "interrupted"
+        | "isCCLOverriden" => Some(Some(V::I32(0))),
+        "holdsLock" => Some(Some(V::I32(1))),
+        "activeCount" => Some(Some(V::I32(1))),
+        "getState" => Some(Some(host(
+            vm,
+            "Ljava/lang/Thread$State;",
+            HostState::StrBuf("RUNNABLE".into()),
+        ))),
+        "getStackTrace" | "getAllStackTraces" => Some(Some(arr(
+            vm,
+            "Ljava/lang/StackTraceElement;",
+            vec![],
+        ))),
+        "getContextClassLoader" => Some(Some(host(
+            vm,
+            "Ljava/lang/ClassLoader;",
+            HostState::Empty,
+        ))),
+        "getUncaughtExceptionHandler" | "getDefaultUncaughtExceptionHandler" => {
+            Some(Some(V::Ref(0)))
+        }
+        "start" => {
+            // Inline the Runnable — single-looper threading model.
+            if let V::Ref(h) = args[0] {
+                let t = pseudo_get(vm, h, P_TARGET).unwrap_or(V::Ref(h));
+                if let V::Ref(r) = t {
+                    let _ = vm.call_virtual(r, "run", &[]);
+                }
+            }
+            Some(None)
+        }
+        "setPriority" | "setDaemon" | "interrupt" | "join" | "sleep" | "yield"
+        | "setUncaughtExceptionHandler" | "setDefaultUncaughtExceptionHandler"
+        | "dumpStack" | "setContextClassLoader" | "onSpinWait" | "stop"
+        | "suspend" | "resume" | "checkAccess" | "run" | "start0" | "setName0"
+        | "enumerate" | "registerNatives" => Some(None),
+        "currentCarrierThread" | "threadId" => Some(Some(args[0])),
+        _ => None,
+    })
+}
+
+fn threadlocal_call(vm: &mut Vm, name: &str, args: &[V]) -> Option<Option<V>> {
+    match name {
+        "get" => Some(Some(match args[0] {
+            V::Ref(h) => slot_of(vm, h).unwrap_or(V::Ref(0)),
+            _ => V::Ref(0),
+        })),
+        "set" | "remove" => {
+            if let V::Ref(h) = args[0] {
+                if let Some(Obj::Host {
+                    state: HostState::Slot(s),
+                    ..
+                }) = vm.heap.get_mut(h)
+                {
+                    *s = if name == "set" {
+                        args[1]
+                    } else {
+                        V::Ref(0)
+                    };
+                }
+            }
+            Some(None)
+        }
+        "withInitial" => Some(Some(host(
+            vm,
+            "Ljava/lang/ThreadLocal;",
+            HostState::Slot(V::Ref(0)),
+        ))),
+        "initialValue" => Some(Some(V::Ref(0))),
+        _ => None,
+    }
+}
+
+// ---------------------------------------------------------------------
+// Throwable / Enum / StackTraceElement
+
+fn throwable_call(vm: &mut Vm, name: &str, _sig: &str, args: &[V]) -> Rt<Option<Option<V>>> {
+    let V::Ref(h) = args.first().copied().unwrap_or(V::Ref(0)) else {
+        return Ok(None);
+    };
+    Ok(match name {
+        "getMessage" | "getLocalizedMessage" => {
+            Some(Some(slot_of(vm, h).unwrap_or(V::Ref(0))))
+        }
+        "getCause" => Some(Some(
+            field_get(vm, h, THROWABLE, "cause")
+                .or_else(|| field_get(vm, h, "Ljava/lang/Exception;", "cause"))
+                .unwrap_or(V::Ref(0)),
+        )),
+        "initCause" => {
+            field_set(vm, h, THROWABLE, "cause", args[1]);
+            pseudo_set(vm, h, P_TARGET, args[1]);
+            Some(Some(args[0]))
+        }
+        "fillInStackTrace" => Some(Some(args[0])),
+        "getStackTrace" | "getOurStackTrace" => Some(Some(arr(
+            vm,
+            "Ljava/lang/StackTraceElement;",
+            vec![],
+        ))),
+        "setStackTrace" | "addSuppressed" => Some(None),
+        "getSuppressed" => Some(Some(arr(vm, THROWABLE, vec![]))),
+        "printStackTrace" => {
+            let d = class_of(vm, args[0]);
+            let msg = slot_of(vm, h).and_then(|v| sv(vm, v)).unwrap_or_default();
+            eprintln!("[guest] {}: {}", dotted(&d), msg);
+            Some(None)
+        }
+        _ => None,
+    })
+}
+
+fn enum_call(vm: &mut Vm, name: &str, args: &[V]) -> Rt<Option<Option<V>>> {
+    Ok(match name {
+        "name" | "toString" => {
+            let n = s(vm, match args[0] { V::Ref(h) => h, _ => 0 })
+                .unwrap_or_else(|| "ENUM".into());
+            Some(Some(jstr(vm, &n)))
+        }
+        "ordinal" => Some(Some(V::I32(0))),
+        "getDeclaringClass" => Some(Some(class_obj(vm, "Ljava/lang/Enum;".into()))),
+        "valueOf" => {
+            let n = sv(vm, args[1]).unwrap_or_default();
+            Some(Some(host(vm, "Ljava/lang/Enum;", HostState::StrBuf(n))))
+        }
+        "values" => Some(Some(arr(vm, OBJ, vec![]))),
+        "describeConstable" => Some(Some(V::Ref(0))),
+        _ => None,
+    })
+}
+
+fn stacktrace_call(vm: &mut Vm, name: &str, args: &[V]) -> Option<Option<V>> {
+    let _ = args;
+    match name {
+        "getClassName" | "getMethodName" | "getFileName" => Some(Some(jstr(vm, ""))),
+        "getLineNumber" | "getModuleVersion" => Some(Some(V::I32(0))),
+        "isNativeMethod" => Some(Some(V::I32(0))),
+        _ => Some(Some(V::Ref(0))),
+    }
+}
+
+// ---------------------------------------------------------------------
+// java.lang.reflect — Field/Method/Constructor mirrors backed by the
+// declaring class descriptor (P_COMPONENT) and member name (StrBuf).
+
+fn reflect_call(
+    vm: &mut Vm,
+    class: &str,
+    name: &str,
+    sig: &str,
+    args: &[V],
+) -> Rt<Option<Option<V>>> {
+    let h = match args.first() {
+        Some(V::Ref(h)) => *h,
+        _ => 0,
+    };
+    let member = s(vm, h).unwrap_or_default();
+    let owner = pseudo_get(vm, h, P_COMPONENT)
+        .and_then(|v| sv(vm, v))
+        .unwrap_or_default();
+    Ok(match name {
+        "getName" => Some(Some(jstr(vm, &member))),
+        "getDeclaringClass" => Some(Some(class_obj(vm, owner))),
+        "getModifiers" => Some(Some(V::I32(1))),
+        "setAccessible" | "checkCanSetAccessible" | "checkCanSetAccessible0"
+        | "trySetAccessible" | "notifyAccessFlagsForrant" => Some(
+            if name == "trySetAccessible" { Some(V::I32(1)) } else { None },
+        ),
+        "isAccessible" | "canAccess" | "isVarArgs" | "isSynthetic"
+        | "isBridge" | "isDefault" | "isEnumConstant" => Some(Some(V::I32(1))),
+        "getType" | "getReturnType" | "getGenericType" | "getGenericReturnType" => {
+            Some(Some(class_obj(vm, OBJ.into())))
+        }
+        "getParameterTypes" | "getExceptionTypes" | "getGenericParameterTypes"
+        | "getGenericExceptionTypes" | "getParameterAnnotations"
+        | "getAnnotations" | "getDeclaredAnnotations" | "getTypeParameters" => {
+            Some(Some(arr(vm, OBJ, vec![])))
+        }
+        "getAnnotation" | "getDeclaredAnnotation" | "getDefaultValue"
+        | "getGenericSignature" | "getSignature" => Some(Some(V::Ref(0))),
+        "getParameterCount" => Some(Some(V::I32(0))),
+        "toString" | "toGenericString" => {
+            Some(Some(jstr(vm, &format!("{}.{}", dotted(&owner), member))))
+        }
+        "invoke" if class.contains("Method") => {
+            // args: [method_mirror, obj, args_array]
+            let target = match args.get(1) {
+                Some(V::Ref(t)) => *t,
+                _ => 0,
+            };
+            let argv: Vec<V> = match args.get(2) {
+                Some(V::Ref(a)) => match vm.heap.get(*a) {
+                    Some(Obj::Array { data, .. }) => data.clone(),
+                    _ => vec![],
+                },
+                _ => vec![],
+            };
+            match vm.call_virtual(target, &member, &argv) {
+                Ok(Some(v)) => Some(Some(v)),
+                Ok(None) => Some(Some(V::Ref(0))),
+                Err(e) => {
+                    let t = vm.throw_builtin(
+                        "Ljava/lang/reflect/InvocationTargetException;",
+                        &format!("{member}: {e}"),
+                    );
+                    return Err(t);
+                }
+            }
+        }
+        "newInstance" if class.contains("Constructor") => {
+            match vm.instantiate(&owner) {
+                Ok(nh) => Some(Some(V::Ref(nh))),
+                Err(_) => {
+                    let t = vm.throw_builtin(
+                        "Ljava/lang/InstantiationException;",
+                        &owner,
+                    );
+                    return Err(t);
+                }
+            }
+        }
+        _ if class.contains("Field") => {
+            let fid = vm
+                .dex
+                .field_index_of(&owner, &member)
+                .unwrap_or(P_DATA);
+            match name {
+                "get" | "getInt" | "getLong" | "getBoolean" | "getByte"
+                | "getShort" | "getChar" | "getFloat" | "getDouble" => {
+                    let obj = args.get(1).copied().unwrap_or(V::Ref(0));
+                    let v = match obj {
+                        V::Ref(oh) if oh != 0 => match vm.heap.get(oh) {
+                            Some(Obj::Instance { fields, .. })
+                            | Some(Obj::Host { fields, .. }) => {
+                                fields.get(&fid).copied().unwrap_or(V::Ref(0))
+                            }
+                            _ => V::Ref(0),
+                        },
+                        _ => V::Ref(0),
+                    };
+                    Some(Some(v))
+                }
+                "set" | "setInt" | "setLong" | "setBoolean" | "setByte"
+                | "setShort" | "setChar" | "setFloat" | "setDouble" => {
+                    let obj = args.get(1).copied().unwrap_or(V::Ref(0));
+                    let v = args.get(2).copied().unwrap_or(V::Ref(0));
+                    if let V::Ref(oh) = obj {
+                        if let Some(f) = fields_mut(vm, oh) {
+                            f.insert(fid, v);
+                        }
+                    }
+                    Some(None)
+                }
+                _ => None,
+            }
+        }
+        _ if class.contains("Array") => {
+            match name {
+                "newInstance" => {
+                    Some(Some(arr(vm, OBJ, vec![V::Ref(0); i32v(args.get(1).copied().unwrap_or(V::I32(0))) as usize])))
+                }
+                "getLength" => {
+                    let n = match args.get(1) {
+                        Some(V::Ref(a)) => match vm.heap.get(*a) {
+                            Some(Obj::Array { data, .. }) => data.len() as i32,
+                            _ => 0,
+                        },
+                        _ => 0,
+                    };
+                    Some(Some(V::I32(n)))
+                }
+                "get" | "getInt" | "getLong" | "getBoolean" | "getByte"
+                | "getShort" | "getChar" | "getFloat" | "getDouble" => {
+                    let v = match (args.get(1), args.get(2)) {
+                        (Some(V::Ref(a)), Some(i)) => match vm.heap.get(*a) {
+                            Some(Obj::Array { data, .. }) => {
+                                data.get(i32v(*i) as usize).copied().unwrap_or(V::Ref(0))
+                            }
+                            _ => V::Ref(0),
+                        },
+                        _ => V::Ref(0),
+                    };
+                    Some(Some(v))
+                }
+                "set" | "setInt" | "setLong" | "setBoolean" | "setByte"
+                | "setShort" | "setChar" | "setFloat" | "setDouble" => {
+                    if let (Some(V::Ref(a)), Some(i), Some(v)) =
+                        (args.get(1), args.get(2), args.get(3))
+                    {
+                        let (a, i, v) = (*a, i32v(*i) as usize, *v);
+                        if let Some(Obj::Array { data, .. }) = vm.heap.get_mut(a) {
+                            if i < data.len() {
+                                data[i] = v;
+                            }
+                        }
+                    }
+                    Some(None)
+                }
+                _ => None,
+            }
+        }
+        _ => {
+            let _ = (sig, class);
+            None
+        }
+    })
+}

@@ -8,10 +8,11 @@
 //! `DexUnsupported` — never silently.
 
 mod aot;
+mod jdk;
 mod value;
 
 pub use aot::Aot;
-pub use value::{Heap, Obj, V};
+pub use value::{Heap, HostState, Obj, V};
 
 use aot::{AotFn, TRAP_DIV_ZERO, TRAP_REM_ZERO};
 
@@ -82,6 +83,14 @@ pub struct Vm {
     hosts_named: HashMap<(String, String), Vec<(u32, HostCall)>>,
     /// AOT-compiled method bodies (`None` until `enable_aot`).
     aot: Option<Aot>,
+    /// Package name of the guest app, set by the launcher so
+    /// `Context.getPackageName` etc. answer correctly.
+    pub guest_package: Option<String>,
+    /// Live interpreter call depth — unbounded guest or builtin
+    /// recursion would overflow the native stack; cap it instead.
+    depth: u32,
+    /// Method refs of live frames, for recursion diagnosis.
+    stack: Vec<u32>,
 }
 
 impl Vm {
@@ -106,6 +115,9 @@ impl Vm {
             hosts: HashMap::new(),
             hosts_named: HashMap::new(),
             aot: None,
+            guest_package: None,
+            depth: 0,
+            stack: Vec::new(),
         })
     }
 
@@ -296,8 +308,44 @@ impl Vm {
             Some(Obj::Throwable { descriptor, detail }) => {
                 format!("{descriptor}: {detail}")
             }
+            Some(Obj::Instance { class_idx, .. }) => self
+                .dex
+                .type_descriptor(*class_idx)
+                .map(|d| format!("guest throwable {d} (#{h})"))
+                .unwrap_or_else(|_| format!("object #{h}")),
+            Some(Obj::Host { desc, .. }) => format!("host throwable {desc} (#{h})"),
             _ => format!("object #{h}"),
         }
+    }
+
+    /// `Lcls;.name(params)ret` for error details — an unresolved call
+    /// must name the API it needed (compat reports key off this).
+    fn describe_method(&self, midx: u32) -> String {
+        let fmt = || -> Result<String> {
+            let mid = self.dex.method(midx)?;
+            let class = self.dex.type_descriptor(mid.class_idx as u32)?;
+            let name = self.dex.string(mid.name_idx)?;
+            let p = self.dex.proto(mid.proto_idx as u32)?;
+            let mut sig = String::from("(");
+            for t in self.dex.proto_params(p)? {
+                sig.push_str(&self.dex.type_descriptor(t as u32)?);
+            }
+            sig.push(')');
+            sig.push_str(&self.dex.type_descriptor(p.return_type_idx)?);
+            Ok(format!("{class}.{name}{sig}"))
+        };
+        fmt().unwrap_or_else(|_| format!("method@{midx}"))
+    }
+
+    /// `Lcls;.name` for a field ref — error details identify the field.
+    fn describe_field(&self, fidx: u32) -> String {
+        let fmt = || -> Result<String> {
+            let f = self.dex.field(fidx)?;
+            let class = self.dex.type_descriptor(f.class_idx as u32)?;
+            let name = self.dex.string(f.name_idx)?;
+            Ok(format!("{class}.{name}"))
+        };
+        fmt().unwrap_or_else(|_| format!("field@{fidx}"))
     }
 
     /// `find_method_by_name` over the class's superclass chain — an
@@ -424,18 +472,9 @@ impl Vm {
     }
 
     /// Superclass descriptor for a host-provided framework class (the
-    /// bridged widget tree; `None` at `Object`/unknown).
+    /// first entry of [`jdk::host_supers`]; `None` at `Object`/unknown).
     fn framework_super(d: &str) -> Option<&'static str> {
-        Some(match d {
-            "Landroid/view/ViewGroup;" => "Landroid/view/View;",
-            "Landroid/widget/LinearLayout;" => "Landroid/view/ViewGroup;",
-            "Landroid/widget/TextView;" => "Landroid/view/View;",
-            "Landroid/widget/Button;" => "Landroid/widget/TextView;",
-            "Landroid/app/Activity;" => "Landroid/content/ContextWrapper;",
-            "Landroid/content/ContextWrapper;" => "Landroid/content/Context;",
-            "Landroid/view/View;" | "Landroid/content/Context;" => "Ljava/lang/Object;",
-            _ => return None,
-        })
+        jdk::host_supers(d).first().copied()
     }
 
     /// Known supers of builtin throwable descriptors.
@@ -483,6 +522,145 @@ impl Vm {
         }
     }
 
+    /// Allocate a host-provided object: `class_idx` is `u32::MAX` when the
+    /// DEX never references the type (builtin-created helpers).
+    pub(crate) fn alloc_host(&mut self, desc: &str, state: HostState) -> u32 {
+        let class_idx = self
+            .dex
+            .type_index_of(desc)
+            .ok()
+            .flatten()
+            .unwrap_or(u32::MAX);
+        self.heap.alloc(Obj::Host {
+            class_idx,
+            desc: desc.to_string(),
+            fields: HashMap::new(),
+            state,
+        })
+    }
+
+    /// Builtin state for a host-provided class, chosen by descriptor.
+    fn host_state_for(desc: &str) -> HostState {
+        let now_ms = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_millis() as i64)
+            .unwrap_or(0);
+        match desc {
+            "Ljava/lang/StringBuilder;" | "Ljava/lang/StringBuffer;" => {
+                HostState::StrBuf(String::new())
+            }
+            "Ljava/util/ArrayList;" | "Ljava/util/LinkedList;" | "Ljava/util/Vector;"
+            | "Ljava/util/Stack;" | "Ljava/util/HashSet;" | "Ljava/util/LinkedHashSet;"
+            | "Ljava/util/TreeSet;" | "Ljava/util/ArrayDeque;" | "Ljava/util/BitSet;"
+            | "Ljava/util/PriorityQueue;" | "Ljava/util/AbstractCollection;"
+            | "Ljava/util/AbstractList;" | "Ljava/util/AbstractSet;"
+            | "Ljava/util/AbstractQueue;" | "Ljava/util/AbstractSequentialList;"
+            | "Ljava/util/Arrays$ArrayList;" | "Ljava/util/Collections$EmptyList;"
+            | "Ljava/util/Collections$EmptySet;" | "Ljava/util/Collections$SingletonList;"
+            | "Ljava/util/Collections$SingletonSet;"
+            | "Ljava/util/concurrent/CopyOnWriteArrayList;"
+            | "Ljava/util/concurrent/CopyOnWriteArraySet;"
+            | "Ljava/util/concurrent/ConcurrentLinkedQueue;"
+            | "Ljava/util/concurrent/ConcurrentLinkedDeque;"
+            | "Ljava/util/concurrent/LinkedBlockingQueue;"
+            | "Ljava/util/concurrent/LinkedBlockingDeque;"
+            | "Ljava/util/concurrent/ArrayBlockingQueue;"
+            | "Ljava/util/concurrent/PriorityBlockingQueue;" | "Landroid/util/ArraySet;" => {
+                HostState::List(Vec::new())
+            }
+            "Ljava/util/HashMap;" | "Ljava/util/LinkedHashMap;" | "Ljava/util/Hashtable;"
+            | "Ljava/util/TreeMap;" | "Ljava/util/WeakHashMap;" | "Ljava/util/IdentityHashMap;"
+            | "Ljava/util/EnumMap;" | "Ljava/util/Properties;" | "Ljava/util/AbstractMap;"
+            | "Ljava/util/Collections$EmptyMap;" | "Ljava/util/Collections$SingletonMap;"
+            | "Ljava/util/concurrent/ConcurrentHashMap;"
+            | "Ljava/util/concurrent/ConcurrentSkipListMap;" | "Landroid/util/ArrayMap;"
+            | "Landroid/util/SparseArray;" | "Landroid/util/SparseIntArray;"
+            | "Landroid/util/SparseBooleanArray;" | "Landroid/util/LongSparseArray;"
+            | "Landroid/util/LruCache;" | "Landroid/os/Bundle;" | "Landroid/os/BaseBundle;"
+            | "Landroid/os/PersistableBundle;" | "Landroid/content/Intent;" => {
+                HostState::Map(Vec::new())
+            }
+            "Ljava/util/Calendar;" | "Ljava/util/GregorianCalendar;" | "Ljava/util/Date;"
+            | "Ljava/time/Instant;" | "Ljava/sql/Date;" | "Ljava/sql/Timestamp;"
+            | "Ljava/sql/Time;" => HostState::Millis(now_ms),
+            "Ljava/util/Random;" | "Ljava/security/SecureRandom;"
+            | "Ljava/util/concurrent/ThreadLocalRandom;" | "Ljava/util/SplittableRandom;" => {
+                HostState::Slot(V::I64(0x9E3779B97F4A7C15_u64 as i64))
+            }
+            "Ljava/lang/Integer;" | "Ljava/lang/Long;" | "Ljava/lang/Short;"
+            | "Ljava/lang/Byte;" | "Ljava/lang/Float;" | "Ljava/lang/Double;"
+            | "Ljava/lang/Boolean;" | "Ljava/lang/Character;" | "Ljava/lang/Void;"
+            | "Ljava/lang/Thread;" | "Ljava/lang/ThreadLocal;"
+            | "Ljava/lang/InheritableThreadLocal;" | "Ljava/lang/ref/WeakReference;"
+            | "Ljava/lang/ref/SoftReference;" | "Ljava/lang/ref/PhantomReference;"
+            | "Ljava/util/Optional;" | "Ljava/util/OptionalInt;" | "Ljava/util/OptionalLong;"
+            | "Ljava/util/OptionalDouble;" | "Landroid/util/Pair;" | "Landroid/util/MutableInt;"
+            | "Ljava/util/concurrent/atomic/AtomicReference;"
+            | "Ljava/util/concurrent/atomic/AtomicInteger;"
+            | "Ljava/util/concurrent/atomic/AtomicLong;"
+            | "Ljava/util/concurrent/atomic/AtomicBoolean;"
+            | "Ljava/util/concurrent/atomic/AtomicMarkableReference;"
+            | "Ljava/util/concurrent/atomic/AtomicStampedReference;"
+            | "Ljava/util/concurrent/atomic/AtomicReferenceFieldUpdater;"
+            | "Ljava/util/concurrent/atomic/AtomicIntegerFieldUpdater;"
+            | "Ljava/util/concurrent/atomic/AtomicLongFieldUpdater;"
+            | "Ljava/util/concurrent/CountDownLatch;" | "Ljava/util/concurrent/Semaphore;"
+            | "Landroid/os/Message;" => HostState::Slot(V::I32(0)),
+            "Ljava/io/File;" => HostState::Path(String::new()),
+            "Ljava/util/regex/Pattern;" | "Ljava/util/regex/Matcher;"
+            | "Ljava/text/SimpleDateFormat;" | "Ljava/text/DateFormat;"
+            | "Ljava/text/DecimalFormat;" | "Ljava/text/NumberFormat;"
+            | "Ljava/text/MessageFormat;" | "Ljava/time/format/DateTimeFormatter;" => {
+                HostState::Regex(String::new())
+            }
+            _ => HostState::Empty,
+        }
+    }
+
+    /// A static field on a host-provided class (called when the owner has
+    /// no class_def and no stored value — `Build.VERSION.SDK_INT`,
+    /// `StandardCharsets.UTF_8`, `Boolean.TRUE`, …).
+    fn builtin_sfield(&mut self, f: u32) -> Option<V> {
+        let fd = self.dex.field(f).ok()?;
+        let owner = self.dex.type_descriptor(fd.class_idx as u32).ok()?;
+        let name = self.dex.string(fd.name_idx).ok()?;
+        jdk::sfield(self, &owner, &name)
+    }
+
+    /// A named field exposed by a host object (`PackageInfo.versionCode`,
+    /// `Message.what`, `Pair.first`…) — read when `iget` misses `fields`.
+    fn builtin_ifield(&self, h: u32, f: u32) -> Option<V> {
+        let Some(Obj::Host { .. }) = self.heap.get(h) else {
+            return None;
+        };
+        let fd = self.dex.field(f).ok()?;
+        let owner = self.dex.type_descriptor(fd.class_idx as u32).ok()?;
+        let name = self.dex.string(fd.name_idx).ok()?;
+        jdk::ifield(self, h, &owner, &name)
+    }
+
+    /// Descriptor-level assignability for host objects whose class_idx is
+    /// absent from the DEX: consults the builtin super tables.
+    fn assignable_desc(&self, sub: &str, sup: &str) -> bool {
+        if sub == sup || sup == "Ljava/lang/Object;" {
+            return true;
+        }
+        if Self::builtin_supers(sub).contains(&sup) || jdk::host_supers(sub).contains(&sup) {
+            return true;
+        }
+        let mut d = sub.to_string();
+        for _ in 0..32 {
+            let Some(next) = Self::framework_super(&d) else {
+                return false;
+            };
+            if next == sup {
+                return true;
+            }
+            d = next.to_string();
+        }
+        false
+    }
+
     /// Is `h` (non-null) an instance of `type_idx`'s descriptor?
     fn is_instance(&self, h: u32, type_idx: u32) -> bool {
         let Ok(sup) = self.dex.type_descriptor(type_idx) else {
@@ -490,6 +668,10 @@ impl Vm {
         };
         match self.heap.get(h) {
             Some(Obj::Instance { class_idx, .. }) => self.assignable(*class_idx, type_idx),
+            Some(Obj::Host { class_idx, desc, .. }) => {
+                (*class_idx != u32::MAX && self.assignable(*class_idx, type_idx))
+                    || self.assignable_desc(desc, &sup)
+            }
             Some(Obj::Throwable { descriptor, .. }) => {
                 if descriptor == &sup {
                     return true;
@@ -497,7 +679,11 @@ impl Vm {
                 Self::builtin_supers(descriptor).contains(&sup.as_str())
             }
             Some(Obj::Str(_)) => {
-                sup == "Ljava/lang/String;" || sup == "Ljava/lang/Object;"
+                sup == "Ljava/lang/String;"
+                    || sup == "Ljava/lang/Object;"
+                    || sup == "Ljava/lang/CharSequence;"
+                    || sup == "Ljava/lang/Comparable;"
+                    || sup == "Ljava/io/Serializable;"
             }
             Some(Obj::Class { .. }) => {
                 sup == "Ljava/lang/Class;" || sup == "Ljava/lang/Object;"
@@ -512,7 +698,7 @@ impl Vm {
     }
 
     /// Allocate a builtin throwable.
-    fn throw_builtin(&mut self, descriptor: &str, detail: &str) -> E {
+    pub(crate) fn throw_builtin(&mut self, descriptor: &str, detail: &str) -> E {
         let h = self.heap.alloc(Obj::Throwable {
             descriptor: descriptor.to_string(),
             detail: detail.to_string(),
@@ -588,8 +774,8 @@ impl Vm {
 
     /// Virtual/interface dispatch: find the override in `start_class`'s
     /// virtual table matching the target's (name, proto).
-    fn resolve_virtual(&self, midx: u32, start_class: u32) -> Rt<Loc> {
-        let mid = self.dex.method(midx).map_err(E::Vm)?;
+    fn resolve_virtual(&self, midx: u32, start_class: u32, fallback: bool) -> Rt<Loc> {
+        let mid = *self.dex.method(midx).map_err(E::Vm)?;
         let mut cur = Some(start_class);
         for _ in 0..64 {
             let Some(ci) = cur else { break };
@@ -613,7 +799,11 @@ impl Vm {
         }
         // Fall back to the declared method itself (e.g. dispatch target is the
         // declared class — a class that doesn't override).
-        self.resolve_defined(midx)
+        if fallback {
+            self.resolve_defined(midx)
+        } else {
+            Err(E::Vm(err("dexrt.invoke.unresolved")))
+        }
     }
 
     /// Builtin method table: (class descriptor, name) — never silent success,
@@ -622,7 +812,7 @@ impl Vm {
     /// framework method through a subclass descriptor the exact-midx
     /// registration doesn't cover (e.g. `LSubAct;.setContentView`).
     fn host_named(&self, midx: u32) -> Rt<Option<HostCall>> {
-        let mid = self.dex.method(midx).map_err(E::Vm)?;
+        let mid = *self.dex.method(midx).map_err(E::Vm)?;
         let name = self.dex.string(mid.name_idx).map_err(E::Vm)?;
         let p = self.dex.proto(mid.proto_idx as u32).map_err(E::Vm)?;
         let mut sig = String::from("(");
@@ -655,7 +845,7 @@ impl Vm {
         if let Some(f) = host {
             return f.borrow_mut()(self, args).map_err(E::Vm);
         }
-        let mid = self.dex.method(midx).map_err(E::Vm)?;
+        let mid = *self.dex.method(midx).map_err(E::Vm)?;
         let class = self.dex.type_descriptor(mid.class_idx as u32).map_err(E::Vm)?;
         let name = self.dex.string(mid.name_idx).map_err(E::Vm)?;
         match (class.as_str(), name.as_str()) {
@@ -678,6 +868,22 @@ impl Vm {
                 Err(self.throw_builtin("Ljava/lang/NullPointerException;", "String.length"))
             }
             _ => {
+                let mut sig = String::from("(");
+                let ret_desc;
+                {
+                    let p = self.dex.proto(mid.proto_idx as u32).map_err(E::Vm)?;
+                    for t in self.dex.proto_params(p).map_err(E::Vm)? {
+                        sig.push_str(&self.dex.type_descriptor(t as u32).map_err(E::Vm)?);
+                    }
+                    sig.push(')');
+                    ret_desc = self.dex.type_descriptor(p.return_type_idx).map_err(E::Vm)?;
+                }
+                sig.push_str(&ret_desc);
+                // JDK/framework builtins cover real behavior for the
+                // common java.* / android.* surface.
+                if let Some(r) = jdk::call(self, &class, &name, &sig, args)? {
+                    return Ok(r);
+                }
                 // A method whose class isn't in this DEX is a framework
                 // stub: the host models the base behavior, so return the
                 // proto's default (None for void) instead of failing —
@@ -686,18 +892,20 @@ impl Vm {
                 // host no-ops — a value-returning stub (Math.abs) answering
                 // with a default would let the app compute on a lie.
                 if self.def_of(mid.class_idx as u32).is_none() {
-                    let p = self.dex.proto(mid.proto_idx as u32).map_err(E::Vm)?;
-                    let ret = self
-                        .dex
-                        .type_descriptor(p.return_type_idx)
-                        .map_err(E::Vm)?;
+                    let ret = ret_desc.clone();
                     if ret == "V" {
                         Ok(None)
                     } else {
-                        vm("dexrt.invoke.unresolved")
+                        vm("dexrt.invoke.unresolved").map_err(|e| match e {
+                            E::Vm(v) => E::Vm(v.with_detail(self.describe_method(midx))),
+                            t => t,
+                        })
                     }
                 } else {
-                    vm("dexrt.invoke.unresolved")
+                    vm("dexrt.invoke.unresolved").map_err(|e| match e {
+                        E::Vm(v) => E::Vm(v.with_detail(self.describe_method(midx))),
+                        t => t,
+                    })
                 }
             }
         }
@@ -723,7 +931,7 @@ impl Vm {
                     }
                 };
                 let ci = self.heap.class_of(recv).unwrap_or(u32::MAX);
-                match self.resolve_virtual(midx, ci) {
+                match self.resolve_virtual(midx, ci, true) {
                     Ok(l) => l,
                     Err(_) => return self.call_builtin(midx, &args),
                 }
@@ -733,7 +941,9 @@ impl Vm {
                     .def_of(caller_class)
                     .map(|d| d.superclass_idx)
                     .unwrap_or(u32::MAX);
-                match self.resolve_virtual(midx, sup) {
+                // No defined-method fallback: an operand that names the
+                // caller's own method would recurse forever.
+                match self.resolve_virtual(midx, sup, false) {
                     Ok(l) => l,
                     Err(_) => return self.call_builtin(midx, &args),
                 }
@@ -813,6 +1023,21 @@ impl Vm {
 
     /// Execute one frame to return or throw.
     fn exec(&mut self, loc: Loc, args: Vec<V>) -> Rt<Option<V>> {
+        if self.depth >= 96 {
+            return Err(self.throw_builtin(
+                "Ljava/lang/StackOverflowError;",
+                "call depth exceeded",
+            ));
+        }
+        self.depth += 1;
+        self.stack.push(loc.em.method_idx);
+        let r = self.exec_frame(loc, args);
+        self.stack.pop();
+        self.depth -= 1;
+        r
+    }
+
+    fn exec_frame(&mut self, loc: Loc, args: Vec<V>) -> Rt<Option<V>> {
         let code = self
             .dex
             .code_item(loc.em.code_off)
@@ -836,7 +1061,17 @@ impl Vm {
             }
         }
         let mut pc: usize = 0;
+        // Instruction budget — a guest (or stub-driven) loop that never
+        // terminates must fail loudly, not hang the host process.
+        let mut steps: u64 = 0;
         loop {
+            steps += 1;
+            if steps > 20_000_000 {
+                return Err(self.throw_builtin(
+                    "Ljava/lang/InternalError;",
+                    "instruction budget exceeded",
+                ));
+            }
             let res = self.step(&mut fr, pc);
             match res {
                 Ok(Out::Next(n)) => pc = n,
@@ -1075,13 +1310,25 @@ impl Vm {
             0x22 => {
                 let ty = ins.idx.unwrap_or(0);
                 self.ensure_init(ty)?;
-                // A type with no class_def is a host-provided framework
-                // class: allocate a field-less instance — its <init>
-                // dispatches to a host stub via call_builtin.
-                let h = self.heap.alloc(Obj::Instance {
-                    class_idx: ty,
-                    fields: HashMap::new(),
-                });
+                // A type with no class_def is a host-provided framework/JDK
+                // class: allocate a Host object whose builtin state matches
+                // the descriptor (StringBuilder buffer, collection, …) —
+                // methods dispatch to builtins via call_builtin.
+                let h = if self.def_of(ty).is_none() {
+                    let desc = self.dex.type_descriptor(ty).map_err(E::Vm)?;
+                    let state = Self::host_state_for(&desc);
+                    self.heap.alloc(Obj::Host {
+                        class_idx: ty,
+                        desc,
+                        fields: HashMap::new(),
+                        state,
+                    })
+                } else {
+                    self.heap.alloc(Obj::Instance {
+                        class_idx: ty,
+                        fields: HashMap::new(),
+                    })
+                };
                 set!(regs[0], V::Ref(h));
             }
             0x23 => {
@@ -1239,22 +1486,36 @@ impl Vm {
                 let h = Self::refv(r(1)?)?;
                 self.null_check(h, "iget")?;
                 let f = ins.idx.unwrap_or(0);
-                let v = match self.heap.get(h) {
-                    Some(Obj::Instance { fields, .. }) => {
-                        fields.get(&f).copied().unwrap_or_else(|| {
-                            self.field_default(f).unwrap_or(V::I32(0))
-                        })
+                let stored = match self.heap.get(h) {
+                    Some(Obj::Instance { fields, .. }) | Some(Obj::Host { fields, .. }) => {
+                        fields.get(&f).copied()
                     }
                     _ => return vm("dexrt.type"),
+                };
+                let v = match stored {
+                    Some(v) => v,
+                    // Host objects expose named fields through builtins
+                    // (PackageInfo.versionCode, ApplicationInfo.dataDir);
+                    // guest objects fall back to the field's type default.
+                    None => self
+                        .builtin_ifield(h, f)
+                        .unwrap_or_else(|| self.field_default(f).unwrap_or(V::I32(0))),
                 };
                 set!(regs[0], v);
             }
             0x59..=0x5f => {
                 let h = Self::refv(r(1)?)?;
-                self.null_check(h, "iput")?;
+                if h == 0 {
+                    let d = format!(
+                        "iput {} in {}",
+                        self.describe_field(ins.idx.unwrap_or(0)),
+                        self.describe_method(fr.loc.em.method_idx),
+                    );
+                    return Err(self.throw_builtin("Ljava/lang/NullPointerException;", &d));
+                }
                 let f = ins.idx.unwrap_or(0);
                 match self.heap.get_mut(h) {
-                    Some(Obj::Instance { fields, .. }) => {
+                    Some(Obj::Instance { fields, .. }) | Some(Obj::Host { fields, .. }) => {
                         fields.insert(f, r(0)?);
                     }
                     _ => return vm("dexrt.type"),
@@ -1265,14 +1526,24 @@ impl Vm {
                 let f = ins.idx.unwrap_or(0);
                 let owner = self.dex.field(f).map_err(E::Vm)?.class_idx as u32;
                 self.ensure_init(owner)?;
-                let v = self
+                let stored = self
                     .classes
                     .entry(owner)
                     .or_default()
                     .statics
                     .get(&f)
-                    .copied()
-                    .unwrap_or_else(|| self.field_default(f).unwrap_or(V::I32(0)));
+                    .copied();
+                let v = match stored {
+                    Some(v) => v,
+                    // A static on a host-provided class (Build.VERSION,
+                    // Charset constants) comes from the builtin table —
+                    // the type default would silently lie (SDK_INT == 0
+                    // flips every `>= O` gate to the legacy path).
+                    None if self.def_of(owner).is_none() => self
+                        .builtin_sfield(f)
+                        .unwrap_or_else(|| self.field_default(f).unwrap_or(V::I32(0))),
+                    None => self.field_default(f).unwrap_or(V::I32(0)),
+                };
                 set!(regs[0], v);
             }
             0x67..=0x6d => {
@@ -1308,7 +1579,19 @@ impl Vm {
                     .iter()
                     .map(|&i| Self::reg(fr, i as usize))
                     .collect::<Rt<_>>()?;
-                let res = self.invoke(midx, args, kind)?;
+                let res = self.invoke(midx, args, kind).map_err(|e| match e {
+                    E::Vm(v) => {
+                        let d = format!("{v} in {}", self.describe_method(fr.loc.em.method_idx));
+                        E::Vm(v.with_detail(d))
+                    }
+                    E::Throw(h) => {
+                        let caller = self.describe_method(fr.loc.em.method_idx);
+                        if let Some(Obj::Throwable { detail, .. }) = self.heap.get_mut(h) {
+                            *detail = format!("{} in {}", detail, caller);
+                        }
+                        E::Throw(h)
+                    }
+                })?;
                 fr.result = Some(res);
             }
             // ---- unary ops ----
