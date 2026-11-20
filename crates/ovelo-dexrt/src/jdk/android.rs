@@ -1111,17 +1111,21 @@ fn context_call(
         }
         "getText" => Some(Some(jstr(vm, ""))),
         "getColor" => Some(Some(V::I32(0xFF000000u32 as i32))),
-        "getDrawable" => Some(Some(
-            [
+        "getDrawable" => {
+            let vdc = [
                 "Landroidx/vectordrawable/graphics/drawable/VectorDrawableCompat;",
                 "Landroid/support/graphics/drawable/VectorDrawableCompat;",
             ]
             .iter()
-            .find_map(|c| vm.instantiate(c).ok().map(V::Ref))
-            .unwrap_or_else(|| {
-                host(vm, "Landroid/graphics/drawable/Drawable;", HostState::Empty)
-            }),
-        )),
+            .find_map(|c| vm.instantiate(c).ok().map(V::Ref));
+            let r = vdc.unwrap_or_else(|| {
+                host(vm, "Landroid/graphics/drawable/VectorDrawable;", HostState::Empty)
+            });
+            if std::env::var_os("OVELO_TRACE_DRAW").is_some() {
+                eprintln!("[ctx.getDrawable] class={class} args={:?} -> {r:?}", args.get(1));
+            }
+            Some(Some(r))
+        }
         "getColorStateList" => Some(Some(host(
             vm,
             "Landroid/content/res/ColorStateList;",
@@ -1683,7 +1687,7 @@ fn resources_call(vm: &mut Vm, name: &str, args: &[V]) -> Rt<Option<Option<V>>> 
             .iter()
             .find_map(|c| vm.instantiate(c).ok().map(V::Ref))
             .unwrap_or_else(|| {
-                host(vm, "Landroid/graphics/drawable/Drawable;", HostState::Empty)
+                host(vm, "Landroid/graphics/drawable/VectorDrawable;", HostState::Empty)
             });
             Some(Some(d))
         }

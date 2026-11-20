@@ -156,6 +156,12 @@ pub struct Vm {
     /// `OVELO_TRACE_FIELD` — debug-only iget/iput tracing for a field
     /// name substring (e.g. `readyAsyncCalls`).
     trace_field: Option<String>,
+    /// `OVELO_TRACE_THROW` — log every thrown/caught throwable with the
+    /// throwing method and pc (debug aid for swallowed guest errors).
+    trace_throw: bool,
+    /// `OVELO_TRACE_CALL` — log invoke sites whose resolved method name
+    /// contains this substring (debug aid).
+    trace_call: Option<String>,
     /// Installed-APK resource index for `LayoutInflater.inflate` — `None`
     /// degrades inflation to bare placeholder views.
     pub apk_res: Option<res::ApkResources>,
@@ -204,6 +210,8 @@ impl Vm {
             unsafe_offsets: HashMap::new(),
             unsafe_next_offset: 0,
             trace_field: std::env::var("OVELO_TRACE_FIELD").ok(),
+            trace_throw: std::env::var_os("OVELO_TRACE_THROW").is_some(),
+            trace_call: std::env::var("OVELO_TRACE_CALL").ok(),
             apk_res: None,
             theme_id: 0,
             pending_activity: None,
@@ -1936,8 +1944,39 @@ impl Vm {
             match res {
                 Ok(Out::Next(n)) => pc = n,
                 Ok(Out::Return(v)) => return Ok(v),
-                Err(E::Vm(e)) => return Err(E::Vm(e)),
+                Err(E::Vm(e)) => {
+                    if self.trace_throw {
+                        eprintln!(
+                            "[vmerr] {} +{pc:04x}: {e}",
+                            self.describe_method(fr.loc.midx)
+                        );
+                    }
+                    return Err(E::Vm(e));
+                }
                 Err(E::Throw(r)) => match self.find_handler(&fr, pc, r) {
+                    _ if self.trace_throw => {
+                        let d = match self.heap.get(r) {
+                            Some(Obj::Throwable { descriptor, detail }) => {
+                                format!("{descriptor} {detail}")
+                            }
+                            Some(Obj::Host { desc, .. }) => desc.clone(),
+                            Some(Obj::Instance { class_idx, .. }) => {
+                                format!("instance(class_idx={class_idx})")
+                            }
+                            _ => format!("h{r}"),
+                        };
+                        eprintln!(
+                            "[throw] {} +{pc:04x} -> {d}",
+                            self.describe_method(fr.loc.midx)
+                        );
+                        match self.find_handler(&fr, pc, r) {
+                            Some(addr) => {
+                                pc = addr as usize;
+                                fr.exc = Some(r);
+                            }
+                            None => return Err(E::Throw(r)),
+                        }
+                    }
                     Some(addr) => {
                         pc = addr as usize;
                         fr.exc = Some(r);
@@ -2553,6 +2592,16 @@ impl Vm {
                     }
                 })?;
                 fr.last_call = self.describe_method(midx);
+                if let Some(p) = self.trace_call.as_deref() {
+                    if fr.last_call.contains(p) {
+                        eprintln!(
+                            "[call] {} +{pc:04x} -> {} ({:?})",
+                            self.describe_method(fr.loc.midx),
+                            fr.last_call,
+                            res
+                        );
+                    }
+                }
                 fr.result = Some(res);
             }
             // ---- unary ops ----
