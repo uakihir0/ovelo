@@ -42,6 +42,10 @@ const LIST_CLASSES: &[&str] = &[
     "Ljava/util/Collections$CheckedSet;",
     "Ljava/util/List;",
     "Ljava/util/Collection;",
+    // Interface `Iterable.iterator()` calls (the for-each desugar
+    // pattern) must reach `list_call`, or they fall to
+    // `stub_placeholder` and iterate nothing.
+    "Ljava/lang/Iterable;",
     "Ljava/util/Set;",
     "Ljava/util/Queue;",
     "Ljava/util/Deque;",
@@ -548,8 +552,31 @@ fn list_call(vm: &mut Vm, name: &str, sig: &str, args: &[V]) -> Rt<Option<Option
         }
         "iterator" | "listIterator" | "descendingIterator" | "spliterator" => {
             let items: Vec<V> = match list_ref(vm, h) {
-                Some(l) => l.clone(),
-                None => vec![],
+                Some(l) => {
+                    if std::env::var("OVELO_ITERDBG").is_ok() {
+                        eprintln!(
+                            "[iterdbg] iterator on h{h} {} len={}",
+                            vm.dbg_class_of(h),
+                            l.len()
+                        );
+                    }
+                    l.clone()
+                }
+                None => {
+                    if std::env::var("OVELO_ITERDBG").is_ok() {
+                        let cls = vm.dbg_class_of(h);
+                        let kind = match vm.heap.get(h) {
+                            Some(Obj::Host { state, .. }) => format!("host:{state:?}"),
+                            Some(Obj::Instance { fields, .. }) => {
+                                format!("inst:fields={fields:?}")
+                            }
+                            Some(Obj::Array { data, .. }) => format!("arr:{}", data.len()),
+                            other => format!("{other:?}"),
+                        };
+                        eprintln!("[iterdbg] iterator on h{h} {cls} {kind} -> empty");
+                    }
+                    vec![]
+                }
             };
             Some(Some(host(
                 vm,

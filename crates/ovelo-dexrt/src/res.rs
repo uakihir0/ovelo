@@ -44,6 +44,9 @@ pub struct ApkResources {
     entry_values: HashMap<u32, EntryValue>,
     /// style res_id → parent + items, for theme attribute resolution.
     styles: HashMap<u32, StyleDef>,
+    /// `<plurals>` res_id → (quantity name, value) items —
+    /// `getQuantityString` picks the AOSP bucket for the count.
+    plurals: HashMap<u32, Vec<(String, EntryValue)>>,
 }
 
 impl ApkResources {
@@ -63,6 +66,7 @@ impl ApkResources {
             package_name: String::new(),
             entry_values: HashMap::new(),
             styles: HashMap::new(),
+            plurals: HashMap::new(),
         };
         let arsc = res.read("resources.arsc")?;
         for pkg in parse_arsc(&arsc).ok()? {
@@ -90,6 +94,24 @@ impl ApkResources {
                         if e.config == "default" || (s.parent == 0 && s.items.is_empty()) {
                             s.parent = e.parent;
                             s.items = e.items.clone();
+                        }
+                    }
+                    if t.name == "plurals" && !e.items.is_empty() {
+                        let slot = res.plurals.entry(e.res_id).or_default();
+                        if slot.is_empty() || e.config == "default" {
+                            *slot = e
+                                .items
+                                .iter()
+                                .map(|(k, v)| {
+                                    (
+                                        pkg.key_strings
+                                            .get(*k as usize)
+                                            .cloned()
+                                            .unwrap_or_default(),
+                                        v.clone(),
+                                    )
+                                })
+                                .collect();
                         }
                     }
                     // Any entry whose value is a `res/` file path —
@@ -232,6 +254,27 @@ impl ApkResources {
     /// Parent style res_id, for debugging resolution chains.
     pub fn style_parent(&self, style_id: u32) -> Option<u32> {
         self.styles.get(&style_id).map(|s| s.parent)
+    }
+
+    /// `<plurals>` entry → the item for `quantity` (AOSP buckets with
+    /// "other" as the always-required fallback).
+    pub fn plural_string(&self, res_id: u32, quantity: i64) -> Option<&EntryValue> {
+        let items = self.plurals.get(&res_id)?;
+        let want = match quantity {
+            0 => "zero",
+            1 => "one",
+            2 => "two",
+            3..=10 => "few",
+            11..=99 => "many",
+            _ => "other",
+        };
+        items
+            .iter()
+            .find(|(k, _)| k == want)
+            .or_else(|| items.iter().find(|(k, _)| k == "other"))
+            .or_else(|| items.iter().find(|(k, _)| k == "many"))
+            .or(items.first())
+            .map(|(_, v)| v)
     }
 
     /// A complex entry's item values in document order — `<array>` and

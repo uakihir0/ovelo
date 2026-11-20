@@ -1930,7 +1930,66 @@ fn resources_call(vm: &mut Vm, name: &str, args: &[V]) -> Rt<Option<Option<V>>> 
             None => jstr(vm, ""),
         })),
         "getQuantityString" | "getQuantityText" => {
-            Some(Some(args.get(2).copied().unwrap_or(jstr(vm, ""))))
+            let id = res_id();
+            let qty = i64v(args.get(2).copied().unwrap_or(V::I32(0)));
+            let text = vm
+                .apk_res
+                .as_ref()
+                .and_then(|r| r.plural_string(id, qty))
+                .map(|v| {
+                    v.string
+                        .clone()
+                        .or_else(|| {
+                            if v.data_type == 0x03 {
+                                vm.apk_res
+                                    .as_ref()
+                                    .and_then(|r| r.string_of(v.data).map(|s| s.to_string()))
+                            } else {
+                                Some(v.data.to_string())
+                            }
+                        })
+                        .unwrap_or_default()
+                })
+                .unwrap_or_default();
+            // The varargs tail formats %d/%s placeholders with the
+            // boxed args (Integer.valueOf(count), …).
+            let mut fmt_args: Vec<String> = Vec::new();
+            if let Some(V::Ref(a)) = args.get(3) {
+                let items = match vm.heap().get(*a) {
+                    Some(Obj::Array { data, .. }) => data.clone(),
+                    _ => Vec::new(),
+                };
+                for it in items {
+                    fmt_args.push(v_to_s(vm, it));
+                }
+            }
+            let mut out = String::with_capacity(text.len() + 8);
+            let mut ai = 0usize;
+            let mut chars = text.chars().peekable();
+            while let Some(c) = chars.next() {
+                if c == '%' {
+                    // skip positional `1$` and take the conversion char
+                    let mut conv = chars.next().unwrap_or('%');
+                    if conv.is_ascii_digit() {
+                        let _ = chars.next(); // '$'
+                        conv = chars.next().unwrap_or('%');
+                    }
+                    let arg = fmt_args.get(ai).cloned().unwrap_or_default();
+                    ai += 1;
+                    match conv {
+                        'd' | 'i' => out.push_str(&arg),
+                        's' => out.push_str(&arg),
+                        '%' => out.push('%'),
+                        _ => {
+                            out.push('%');
+                            out.push(conv);
+                        }
+                    }
+                } else {
+                    out.push(c);
+                }
+            }
+            Some(Some(jstr(vm, &out)))
         }
         "getStringArray" | "getTextArray" => {
             let items = vm

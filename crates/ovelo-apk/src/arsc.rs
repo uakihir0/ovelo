@@ -50,6 +50,10 @@ impl StringPool {
     pub fn len(&self) -> usize {
         self.strings.len()
     }
+    /// All strings, in pool order.
+    pub fn to_vec(&self) -> Vec<String> {
+        self.strings.clone()
+    }
     /// Whether the pool is empty.
     pub fn is_empty(&self) -> bool {
         self.strings.is_empty()
@@ -193,6 +197,9 @@ pub struct ResourcePackage {
     pub name: String,
     /// Types in this package.
     pub types: Vec<ResourceType>,
+    /// The package's key string pool — item keys of complex entries
+    /// (`<plurals>` quantity names) index into it.
+    pub key_strings: Vec<String>,
 }
 
 /// Parse `resources.arsc` into packages and entries.
@@ -522,6 +529,7 @@ fn parse_package(
         package_id,
         name,
         types,
+        key_strings: key_strings.to_vec(),
     })
 }
 

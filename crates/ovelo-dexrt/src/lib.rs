@@ -1040,7 +1040,22 @@ impl Vm {
             .class_of(this)
             .ok_or_else(|| errd("dexrt.bad_this", name.to_string()))?;
         let Some(midx) = self.find_method_on_chain(ci, name, args.len())? else {
-            return Ok(None);
+            // No dex override — a framework method (`View.layout`,
+            // `View.measure`, …). Route it through the builtin
+            // dispatcher so host arms still apply when the caller is
+            // the host itself rather than a dex invoke site.
+            let desc = self.type_desc_of(ci).unwrap_or_default();
+            let mut a = Vec::with_capacity(args.len() + 1);
+            a.push(V::Ref(this));
+            a.extend_from_slice(args);
+            let r = jdk::call(self, &desc, name, "", &a).map_err(|e| match e {
+                E::Vm(v) => v,
+                E::Throw(t) => {
+                    let d = self.describe_throw(t);
+                    errd("dexrt.exception.uncaught", d)
+                }
+            })?;
+            return Ok(r.flatten());
         };
         let mut a = Vec::with_capacity(args.len() + 1);
         a.push(V::Ref(this));
@@ -3128,6 +3143,20 @@ impl Vm {
                     .map(|&i| Self::reg(fr, i as usize))
                     .collect::<Rt<_>>()?;
                 let this_arg = args.first().copied();
+                let argfmt: Vec<String> = if self.trace_call.is_some() {
+                    args.iter()
+                        .skip(1)
+                        .map(|v| match v {
+                            V::Ref(h) if *h != 0 => {
+                                format!("h{h}:{}", self.dbg_class_of(*h))
+                            }
+                            V::Ref(_) => "null".into(),
+                            other => format!("{other:?}"),
+                        })
+                        .collect()
+                } else {
+                    Vec::new()
+                };
                 let res = self.invoke(midx, args, kind).map_err(|e| match e {
                     E::Vm(v) => {
                         let d = format!("{v} in {}", self.describe_method(fr.loc.midx));
@@ -3145,7 +3174,7 @@ impl Vm {
                 if let Some(p) = self.trace_call.as_deref() {
                     if fr.last_call.contains(p) {
                         eprintln!(
-                            "[call] {} +{pc:04x} -> {} this={:?} ({:?})",
+                            "[call] {} +{pc:04x} -> {} this={:?} args={argfmt:?} ({:?})",
                             self.describe_method(fr.loc.midx),
                             fr.last_call,
                             this_arg,

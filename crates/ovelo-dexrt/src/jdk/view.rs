@@ -92,6 +92,19 @@ const P_ATTRS: u32 = 0xFFFD_FFFA;
 /// constructed lazily on first `getLayoutParams`.
 const P_LP: u32 = 0xFFFD_FFF9;
 
+// View frame: `layout`/`setFrame`/`measure`/`setMeasuredDimension`
+// record geometry here so `getWidth`/`getHeight`/`getMeasured*` and
+// `getLeft`/`getTop`/`getRight`/`getBottom` answer with real numbers.
+// Without them, dex layout code (e.g. RecyclerView's
+// `OrientationHelper` totals) sees every view as 0×0 and lays out
+// nothing.
+const P_LEFT: u32 = 0xFFFD_FFE9;
+const P_TOP: u32 = 0xFFFD_FFE8;
+const P_RIGHT: u32 = 0xFFFD_FFE7;
+const P_BOTTOM: u32 = 0xFFFD_FFE6;
+const P_MEAS_W: u32 = 0xFFFD_FFE5;
+const P_MEAS_H: u32 = 0xFFFD_FFE4;
+
 /// Lazily mint a per-view `ViewTreeObserver` — guests register
 /// `OnGlobalLayoutListener`s on it; `fire_global_layout` (called from
 /// the host layout driver) invokes them.
@@ -251,6 +264,51 @@ fn color_v(vm: &Vm, v: V) -> Option<i32> {
             .map(|e| e.data as i32),
         _ => None,
     }
+}
+
+/// Int coercion for view args (dex passes I32; a few APIs accept F32).
+fn vint(v: Option<&V>) -> i32 {
+    match v {
+        Some(V::I32(n)) => *n,
+        Some(V::F32(f)) => *f as i32,
+        Some(V::I64(n)) => *n as i32,
+        _ => 0,
+    }
+}
+
+/// `MeasureSpec` → the size the view should report (mode bits stripped;
+/// UNSPECIFIED leaves 0).
+fn spec_size(v: Option<V>) -> i32 {
+    match v {
+        Some(V::I32(s)) => {
+            let mode = s >> 30;
+            if mode == 0 { 0 } else { s & 0x3FFF_FFFF }
+        }
+        _ => 0,
+    }
+}
+
+/// Read a pseudo int field (0 when unset).
+fn pint(vm: &Vm, h: u32, key: u32) -> i32 {
+    match pseudo_get(vm, h, key) {
+        Some(V::I32(n)) => n,
+        _ => 0,
+    }
+}
+
+/// Store a view frame; returns whether it changed (View.setFrame's
+/// contract and `layout`'s `changed` argument).
+fn frame_set(vm: &mut Vm, h: u32, l: i32, t: i32, r: i32, b: i32) -> bool {
+    let changed = pint(vm, h, P_LEFT) != l
+        || pint(vm, h, P_TOP) != t
+        || pint(vm, h, P_RIGHT) != r
+        || pint(vm, h, P_BOTTOM) != b
+        || pseudo_get(vm, h, P_RIGHT).is_none();
+    pseudo_set(vm, h, P_LEFT, V::I32(l));
+    pseudo_set(vm, h, P_TOP, V::I32(t));
+    pseudo_set(vm, h, P_RIGHT, V::I32(r));
+    pseudo_set(vm, h, P_BOTTOM, V::I32(b));
+    changed
 }
 
 /// A layout length: `-1`/`MATCH_PARENT`, `-2`/`WRAP_CONTENT`, px otherwise.
@@ -947,22 +1005,99 @@ pub(crate) fn call(
             let lp = layout_params(vm, this);
             if std::env::var_os("OVELO_VIEWDBG").is_some() {
                 let desc = class_of(vm, V::Ref(this));
-                if desc.contains("DrawerLayout") || desc.contains("NavigationView") {
-                    let lp_desc = match lp {
-                        V::Ref(h) => class_of(vm, V::Ref(h)),
-                        _ => "primitive".into(),
-                    };
-                    eprintln!("[viewdbg] {desc}.getLayoutParams h{this} -> {lp_desc}");
-                }
+                let lp_desc = match lp {
+                    V::Ref(h) => class_of(vm, V::Ref(h)),
+                    _ => "primitive".into(),
+                };
+                eprintln!("[viewdbg] {desc}.getLayoutParams h{this} -> {lp_desc}");
             }
             Some(Some(lp))
         }
         "setLayoutParams" => {
+            if std::env::var_os("OVELO_VIEWDBG").is_some() {
+                let lp_desc = match args.get(1) {
+                    Some(V::Ref(h)) => class_of(vm, V::Ref(*h)),
+                    _ => "primitive".into(),
+                };
+                eprintln!(
+                    "[viewdbg] setLayoutParams h{this} {} <- {lp_desc}",
+                    class_of(vm, V::Ref(this))
+                );
+            }
             pseudo_set(vm, this, P_LP, args.get(1).copied().unwrap_or(V::Ref(0)));
             Some(None)
         }
+        "measure" => {
+            // View.measure(wSpec, hSpec): the EXACTLY/AT_MOST size is
+            // what getMeasured* reports until the dex onMeasure calls
+            // setMeasuredDimension (which many custom views do).
+            pseudo_set(vm, this, P_MEAS_W, V::I32(spec_size(args.get(1).copied())));
+            pseudo_set(vm, this, P_MEAS_H, V::I32(spec_size(args.get(2).copied())));
+            let _ = vm.call_virtual(
+                this,
+                "onMeasure",
+                &[
+                    args.get(1).copied().unwrap_or(V::I32(0)),
+                    args.get(2).copied().unwrap_or(V::I32(0)),
+                ],
+            );
+            Some(None)
+        }
+        "setMeasuredDimension" => {
+            pseudo_set(vm, this, P_MEAS_W, args.get(1).copied().unwrap_or(V::I32(0)));
+            pseudo_set(vm, this, P_MEAS_H, args.get(2).copied().unwrap_or(V::I32(0)));
+            Some(None)
+        }
+        "layout" => {
+            let (l, t, r, b) = (vint(args.get(1)), vint(args.get(2)), vint(args.get(3)), vint(args.get(4)));
+            let changed = frame_set(vm, this, l, t, r, b);
+            if let Err(e) = vm.call_virtual(this, "onLayout", &[V::I32(changed as i32), V::I32(l), V::I32(t), V::I32(r), V::I32(b)]) {
+                if std::env::var_os("OVELO_VIEWDBG").is_some() {
+                    eprintln!("[viewdbg] onLayout h{this} err {e}");
+                }
+            }
+            Some(None)
+        }
+        "setFrame" => {
+            let (l, t, r, b) = (vint(args.get(1)), vint(args.get(2)), vint(args.get(3)), vint(args.get(4)));
+            Some(Some(V::I32(frame_set(vm, this, l, t, r, b) as i32)))
+        }
+        "offsetLeftAndRight" => {
+            let d = vint(args.get(1));
+            pseudo_set(vm, this, P_LEFT, V::I32(pint(vm, this, P_LEFT) + d));
+            pseudo_set(vm, this, P_RIGHT, V::I32(pint(vm, this, P_RIGHT) + d));
+            Some(None)
+        }
+        "offsetTopAndBottom" => {
+            let d = vint(args.get(1));
+            pseudo_set(vm, this, P_TOP, V::I32(pint(vm, this, P_TOP) + d));
+            pseudo_set(vm, this, P_BOTTOM, V::I32(pint(vm, this, P_BOTTOM) + d));
+            Some(None)
+        }
+        "getLeft" => Some(Some(V::I32(pint(vm, this, P_LEFT)))),
+        "getTop" => Some(Some(V::I32(pint(vm, this, P_TOP)))),
+        "getRight" => Some(Some(V::I32(pint(vm, this, P_RIGHT)))),
+        "getBottom" => Some(Some(V::I32(pint(vm, this, P_BOTTOM)))),
+        "getX" => Some(Some(V::F32(pint(vm, this, P_LEFT) as f32))),
+        "getY" => Some(Some(V::F32(pint(vm, this, P_TOP) as f32))),
+        "getWidth" => Some(Some(V::I32(
+            pint(vm, this, P_RIGHT).saturating_sub(pint(vm, this, P_LEFT)),
+        ))),
+        "getHeight" => Some(Some(V::I32(
+            pint(vm, this, P_BOTTOM).saturating_sub(pint(vm, this, P_TOP)),
+        ))),
+        "getMeasuredWidth" => Some(Some(V::I32(pint(vm, this, P_MEAS_W)))),
+        "getMeasuredHeight" => Some(Some(V::I32(pint(vm, this, P_MEAS_H)))),
+        "getMeasuredWidthAndState" | "getMeasuredHeightAndState" => {
+            Some(Some(V::I32(0)))
+        }
+        "getPaddingLeft" | "getPaddingTop" | "getPaddingRight" | "getPaddingBottom"
+        | "getPaddingStart" | "getPaddingEnd" | "getMinimumWidth" | "getMinimumHeight"
+        | "getScrollX" | "getScrollY" => Some(Some(V::I32(0))),
+        "getBaseline" => Some(Some(V::I32(-1))),
+        "isLayoutRequested" | "willNotDraw" => Some(Some(V::I32(0))),
         "requestLayout" | "invalidate" | "postInvalidate"
-        | "requestFocus" | "clearFocus" | "forceLayout" | "measure" | "layout"
+        | "requestFocus" | "clearFocus" | "forceLayout"
         | "setAlpha" | "setBackgroundColor" | "setBackgroundResource" | "setPadding"
         | "setMinimumHeight" | "setMinimumWidth" | "setElevation" | "setTranslationX"
         | "setTranslationY" | "setTranslationZ" | "setScaleX" | "setScaleY" | "setX"
@@ -1146,6 +1281,27 @@ fn inflate_call(vm: &mut Vm, args: &[V]) -> V {
                 attach(vm, r, k);
             }
             return root;
+        }
+        // attachToRoot=false: real LayoutInflater still gives the
+        // inflated root its parent's LayoutParams —
+        // `root.generateLayoutParams(attrs)` + `setLayoutParams` —
+        // which is where dex-side params (RecyclerView's own
+        // LayoutParams with `mDecorInsets`, …) come from. Skipping it
+        // leaves a host placeholder that dex field reads (`iget
+        // LP.mDecorInsets.top`) see as null.
+        if r != 0 {
+            if let V::Ref(h) = inflated {
+                if h != 0 && pseudo_get(vm, h, P_LP).is_none() {
+                    let attrs = pseudo_get(vm, h, P_ATTRS).unwrap_or(V::Ref(0));
+                    if let Ok(Some(v @ V::Ref(lp))) =
+                        vm.call_virtual(r, "generateLayoutParams", &[attrs])
+                    {
+                        if lp != 0 {
+                            pseudo_set(vm, h, P_LP, v);
+                        }
+                    }
+                }
+            }
         }
     }
     inflated
@@ -1607,7 +1763,14 @@ fn layout_params(vm: &mut Vm, this: u32) -> V {
             }
         }
     }
-    host(vm, "Landroid/view/ViewGroup$LayoutParams;", HostState::Empty)
+    let v = host(vm, "Landroid/view/ViewGroup$LayoutParams;", HostState::Empty);
+    if std::env::var_os("OVELO_VIEWDBG").is_some() {
+        eprintln!(
+            "[viewdbg] layout_params h{this} {} -> host placeholder",
+            class_of(vm, V::Ref(this))
+        );
+    }
+    v
 }
 
 fn is_group_tag(tag: &str) -> bool {

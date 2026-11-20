@@ -18,12 +18,27 @@ fn main() {
             for m in data.direct_methods.iter().chain(data.virtual_methods.iter()) {
                 let Ok(mm) = dex.method(m.method_idx) else { continue };
                 let mn = dex.string(mm.name_idx).unwrap_or_default();
-                if !mn.contains(&pat) { continue; }
+                let hit = if pat == "*" {
+                    true
+                } else if let Some(exact) = pat.strip_prefix('=') {
+                    mn == exact
+                } else {
+                    mn.contains(&pat)
+                };
+                if !hit { continue; }
                 println!("== {owner}.{mn} proto={}", m.method_idx);
                 let Ok(Some(code)) = dex.code_item(m.code_off) else { continue };
                 let Ok(insns) = decode_all(&code.insns) else { continue };
                 for (i, ins) in insns.iter().enumerate() {
                     let mut line = format!("  {i:04x} {} regs={:?}", ins.name, ins.regs);
+                    if let Some(t) = ins.target {
+                        let ti = insns
+                            .iter()
+                            .position(|x| x.offset == t)
+                            .map(|x| format!("{x:04x}"))
+                            .unwrap_or_else(|| format!("cu{t:04x}"));
+                        line += &format!(" -> {ti}");
+                    }
                     if let Some(ix) = ins.idx {
                         let n = ins.name;
                         if n.starts_with("iget") || n.starts_with("iput")

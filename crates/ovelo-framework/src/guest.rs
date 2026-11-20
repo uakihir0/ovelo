@@ -738,22 +738,28 @@ pub fn drive_dex_layout_pass(vm: &mut Vm, activity: u32, frame: u32) {
             eprintln!("[viewdbg] walk h{h} {} group={}", info.desc, info.is_group);
         }
         if info.is_group {
+            // Drive the real traversal: `measure`/`layout` (not bare
+            // `onMeasure`/`onLayout`) — `View.layout` runs `setFrame`,
+            // which is the only place `mLeft`/`mTop`/`mRight`/`mBottom`
+            // get stored. Containers that size themselves in layout
+            // (RecyclerView's `fill` reads `OrientationHelper` totals)
+            // see a 0×0 rect and lay out nothing otherwise.
             if let Err(e) = vm.call_virtual(
                 h,
-                "onMeasure",
+                "measure",
                 &[V::I32(MS_EXACTLY | 1080), V::I32(MS_EXACTLY | 1920)],
             ) {
                 if std::env::var_os("OVELO_VIEWDBG").is_some() {
-                    eprintln!("[viewdbg] onMeasure {} err {e}", info.desc);
+                    eprintln!("[viewdbg] measure {} err {e}", info.desc);
                 }
             }
             if let Err(e) = vm.call_virtual(
                 h,
-                "onLayout",
-                &[V::I32(0), V::I32(0), V::I32(0), V::I32(1080), V::I32(1920)],
+                "layout",
+                &[V::I32(0), V::I32(0), V::I32(1080), V::I32(1920)],
             ) {
                 if std::env::var_os("OVELO_VIEWDBG").is_some() {
-                    eprintln!("[viewdbg] onLayout {} err {e}", info.desc);
+                    eprintln!("[viewdbg] layout {} err {e}", info.desc);
                 }
             }
             if std::env::var_os("OVELO_VIEWDBG").is_some()
