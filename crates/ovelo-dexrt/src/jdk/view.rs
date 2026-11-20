@@ -108,14 +108,31 @@ fn vto_of(vm: &mut Vm, view: u32) -> V {
     V::Ref(o)
 }
 
-/// Fire every registered `OnGlobalLayoutListener` — called once per
-/// layout pass (listeners that deregister themselves inside the
-/// callback, the common one-shot pattern, see exactly one call).
-pub fn fire_global_layout(vm: &mut Vm) {
+/// Fire `OnGlobalLayoutListener`s whose view belongs to `root`'s tree —
+/// listeners on detached views or a previous screen's views must not
+/// see a layout that never reached them (one-shot init would fire
+/// early and consume itself without an actual layout).
+pub fn fire_global_layout(vm: &mut Vm, root: u32) {
+    fn attached(vm: &Vm, mut v: u32, root: u32) -> bool {
+        for _ in 0..64 {
+            if v == root {
+                return true;
+            }
+            match pseudo_get(vm, v, P_PARENT) {
+                Some(V::Ref(p)) if p != 0 => v = p,
+                _ => return false,
+            }
+        }
+        false
+    }
     let all: Vec<u32> = vm
         .vto_listeners
-        .values()
-        .flat_map(|ls| ls.iter().copied())
+        .iter()
+        .filter(|(obs, _)| match pseudo_get(vm, **obs, P_TARGET) {
+            Some(V::Ref(v)) => attached(vm, v, root),
+            _ => false,
+        })
+        .flat_map(|(_, ls)| ls.iter().copied())
         .collect();
     if std::env::var_os("OVELO_VIEWDBG").is_some() && !all.is_empty() {
         eprintln!("[viewdbg] fire_global_layout {} listeners", all.len());
@@ -666,7 +683,26 @@ pub(crate) fn call(
                 .unwrap_or(-1);
             Some(Some(V::I32(i)))
         }
-        "addView" | "addViewInLayout" | "addFocusables" | "addChildrenForAccessibility" => {
+        "detachViewFromParent" => {
+            match args.get(1).copied() {
+                Some(child @ V::Ref(_)) => detach(vm, this, child),
+                Some(V::I32(i)) if i >= 0 => {
+                    if let Some(arrh) = children_arr(vm, this) {
+                        if let Some(Obj::Array { data, .. }) = vm.heap.get_mut(arrh) {
+                            if (i as usize) < data.len() {
+                                if let V::Ref(ch) = data.remove(i as usize) {
+                                    pseudo_set(vm, ch, P_PARENT, V::Ref(0));
+                                }
+                            }
+                        }
+                    }
+                }
+                _ => {}
+            }
+            Some(None)
+        }
+        "addView" | "addViewInLayout" | "attachViewToParent" | "attachViewToParentInLayout"
+        | "addFocusables" | "addChildrenForAccessibility" => {
             if let Some(&child @ V::Ref(_)) = args.get(1) {
                 attach(vm, this, child);
             }
@@ -750,7 +786,7 @@ pub(crate) fn call(
             }
             Some(None)
         }
-        "removeOnGlobalLayoutListener" => {
+        "removeOnGlobalLayoutListener" | "removeGlobalOnLayoutListener" => {
             if let Some(&V::Ref(l)) = args.get(1) {
                 if let Some(ls) = vm.vto_listeners.get_mut(&this) {
                     ls.retain(|x| *x != l);

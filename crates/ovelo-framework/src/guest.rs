@@ -806,6 +806,18 @@ pub fn drive_dex_layout_pass(vm: &mut Vm, activity: u32, frame: u32) {
             if std::env::var_os("OVELO_VIEWDBG").is_some()
                 && info.desc.contains("RecyclerView")
             {
+                match vm.call_virtual(h, "getAdapter", &[]) {
+                    Ok(Some(V::Ref(ad))) if ad != 0 => {
+                        let n = vm
+                            .call_virtual(ad, "getItemCount", &[])
+                            .ok()
+                            .flatten()
+                            .map(|v| format!("{v:?}"))
+                            .unwrap_or("?".into());
+                        eprintln!("[viewdbg] recycler {h} adapter=h{ad} count={n}");
+                    }
+                    other => eprintln!("[viewdbg] recycler {h} getAdapter -> {other:?}"),
+                }
                 let fields: Vec<String> = match vm.heap().get(h) {
                     Some(ovelo_dexrt::Obj::Instance { fields, .. })
                     | Some(ovelo_dexrt::Obj::Host { fields, .. }) => fields
@@ -834,7 +846,7 @@ pub fn drive_dex_layout_pass(vm: &mut Vm, activity: u32, frame: u32) {
     // Android fires OnGlobalLayoutListener after each layout pass —
     // guests defer init work there (fossify's initFileManager runs its
     // first openPath inside one).
-    ovelo_dexrt::fire_global_layout(vm);
+    ovelo_dexrt::fire_global_layout(vm, root);
 }
 
 #[cfg(test)]
