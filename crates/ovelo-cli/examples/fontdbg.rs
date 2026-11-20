@@ -1,3 +1,4 @@
+//! list loaded font faces and glyph coverage for probe chars
 fn main() {
     let mut fs = ovelo_ui::FontSet::new();
     let n = fs.load_dirs(&["/System/Library/Fonts", "/System/Library/Fonts/Supplemental"]);
