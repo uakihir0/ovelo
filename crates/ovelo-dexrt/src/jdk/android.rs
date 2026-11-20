@@ -2154,6 +2154,48 @@ fn fill_typed_value(vm: &mut Vm, tv: V, v: V) {
     }
 }
 
+/// Like `fill_typed_value` but from a raw arsc entry — the arsc
+/// `data_type` numbering IS `android.util.TypedValue.TYPE_*`, so
+/// boolean/dimension/color attrs keep their exact type and a
+/// `TYPE_REFERENCE` keeps its resource id.
+fn fill_typed_value_ev(
+    vm: &mut Vm,
+    tv: V,
+    ev: &ovelo_apk::arsc::EntryValue,
+) {
+    let V::Ref(h) = tv else {
+        return;
+    };
+    let string = if ev.data_type == 0x03 {
+        ev.string
+            .as_deref()
+            .map(|s| jstr(vm, s))
+            .unwrap_or(V::Ref(0))
+    } else {
+        V::Ref(0)
+    };
+    let res_id = if ev.data_type == 0x01 {
+        ev.data as i32
+    } else {
+        0
+    };
+    for (name, val) in [
+        ("type", V::I32(ev.data_type as i32)),
+        ("string", string),
+        ("data", V::I32(ev.data as i32)),
+        ("resourceId", V::I32(res_id)),
+    ] {
+        if let Some(f) = vm
+            .field_index_of("Landroid/util/TypedValue;", name)
+            .map(|g| vm.canon_field(g))
+        {
+            if let Some(m) = fields_mut(vm, h) {
+                m.insert(f, val);
+            }
+        }
+    }
+}
+
 fn res_misc(vm: &mut Vm, class: &str, name: &str, args: &[V]) -> Rt<Option<Option<V>>> {
     Ok(match (class, name) {
         ("Landroid/util/DisplayMetrics;", "scaledDensity") => Some(Some(V::F32(2.0))),
@@ -2402,10 +2444,26 @@ fn res_misc(vm: &mut Vm, class: &str, name: &str, args: &[V]) -> Rt<Option<Optio
             // resolveAttribute(attrResId, TypedValue out, resolveRefs):
             // fill the TypedValue from the theme and answer bool.
             let attr = i64v(args.get(1).copied().unwrap_or(V::I32(0))) as u32;
-            match view::theme_attr_value(vm, attr) {
-                Some(v) => {
+            let resolve_refs = i32v(args.get(3).copied().unwrap_or(V::I32(0))) != 0;
+            match view::theme_attr_entry(vm, attr) {
+                Some(mut ev) => {
+                    // resolveRefs=true resolves a @ref to the target's
+                    // own type/value (e.g. a @color yields a color int).
+                    for _ in 0..8 {
+                        if !resolve_refs || ev.data_type != 0x01 {
+                            break;
+                        }
+                        match vm
+                            .apk_res
+                            .as_ref()
+                            .and_then(|r| r.entry_value(ev.data))
+                        {
+                            Some(next) => ev = next.clone(),
+                            None => break,
+                        }
+                    }
                     if let Some(tv) = args.get(2).copied() {
-                        fill_typed_value(vm, tv, v);
+                        fill_typed_value_ev(vm, tv, &ev);
                     }
                     Some(Some(V::I32(1)))
                 }
