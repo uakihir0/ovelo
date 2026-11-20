@@ -90,7 +90,14 @@ fn conn_for(vm: &mut Vm, name: &str) -> Result<Rc<RefCell<Db>>, E> {
     // collations — Room emits `COLLATE UNICODE` in its queries.
     for name in ["UNICODE", "LOCALIZED"] {
         let _ = conn.create_collation(name, |a, b| {
-            a.to_lowercase().cmp(&b.to_lowercase())
+            // Case-fold + canonical-decomposition compare: without NFD,
+            // canonically-equivalent `é` vs `e\u0301` sort as different
+            // keys — equality lookups miss and UNIQUE columns accept
+            // duplicates ICU would reject.
+            use unicode_normalization::UnicodeNormalization;
+            let an: String = a.nfd().flat_map(char::to_lowercase).collect();
+            let bn: String = b.nfd().flat_map(char::to_lowercase).collect();
+            an.cmp(&bn)
         });
     }
     let d = Rc::new(RefCell::new(Db {
