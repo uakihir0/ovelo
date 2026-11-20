@@ -290,6 +290,11 @@ fn disas(apk: &[u8], class: &str, method: Option<&str>) -> Result<(), OveloError
                 if let Some(idx) = i.idx {
                     line.push_str(&format!(" #{} {}", idx, resolve_idx(&dex, i.opcode, idx)));
                 }
+                if let Some(lit) = i.lit {
+                    if i.idx.is_none() {
+                        line.push_str(&format!(" {lit}"));
+                    }
+                }
                 if let Some(t) = i.target {
                     line.push_str(&format!(" -> {:04x}", t));
                 }
