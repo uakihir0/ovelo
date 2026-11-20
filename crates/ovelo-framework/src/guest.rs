@@ -831,6 +831,10 @@ pub fn drive_dex_layout_pass(vm: &mut Vm, activity: u32, frame: u32) {
         }
     }
     walk(vm, root, 0);
+    // Android fires OnGlobalLayoutListener after each layout pass —
+    // guests defer init work there (fossify's initFileManager runs its
+    // first openPath inside one).
+    ovelo_dexrt::fire_global_layout(vm);
 }
 
 #[cfg(test)]

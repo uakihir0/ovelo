@@ -29,6 +29,10 @@ pub(crate) const P_ACTION: u32 = u32::MAX - 1;
 pub(crate) const P_DATA: u32 = u32::MAX - 2;
 pub(crate) const P_FLAGS: u32 = u32::MAX - 3;
 pub(crate) const P_COMPONENT: u32 = u32::MAX - 4;
+/// Resolved `GIdx` of the `<init>` a `Constructor` mirror stands for.
+pub(crate) const P_CTOR: u32 = u32::MAX - 36;
+/// A `Drawable`'s cached `Paint` host (ShapeDrawable.getPaint).
+pub(crate) const P_PAINT: u32 = u32::MAX - 37;
 pub(crate) const P_TARGET: u32 = u32::MAX - 5;
 pub(crate) const P_EDIT_PARENT: u32 = u32::MAX - 6;
 // Rect pseudo-fields (left/top/right/bottom ints) + a Drawable's
@@ -759,7 +763,19 @@ pub(crate) fn sfield(vm: &mut Vm, owner: &str, name: &str, ftype: &str) -> Optio
             return Some(host(vm, "Ljava/lang/Boolean;", HostState::Slot(V::I32(0))))
         }
         (o, "TYPE") if lang::primitive_type(o) => {
-            return Some(class_obj(vm, o.to_string()))
+            // `Integer.TYPE` is `int.class` — the primitive descriptor,
+            // not the boxed class.
+            let prim = match o {
+                "Ljava/lang/Integer;" => "I",
+                "Ljava/lang/Long;" => "J",
+                "Ljava/lang/Short;" => "S",
+                "Ljava/lang/Byte;" => "B",
+                "Ljava/lang/Character;" => "C",
+                "Ljava/lang/Boolean;" => "Z",
+                "Ljava/lang/Double;" => "D",
+                _ => "F",
+            };
+            return Some(class_obj(vm, prim.to_string()));
         }
         ("Ljava/lang/System;", "out") | ("Ljava/lang/System;", "err") => {
             return Some(host(vm, "Ljava/io/PrintStream;", HostState::Empty))

@@ -1342,6 +1342,39 @@ fn class_call(vm: &mut Vm, name: &str, _sig: &str, args: &[V]) -> Rt<Option<Opti
         "getConstructor" | "getDeclaredConstructor" => {
             let owner = class_desc_of(vm, match args[0] { V::Ref(h) => h, _ => 0 })
                 .unwrap_or_default();
+            // The `Class[]` signature argument → param descriptors, so
+            // `newInstance` runs the ctor the caller actually resolved.
+            let params: Vec<String> = match args.get(1) {
+                Some(V::Ref(a)) => match vm.heap.get(*a) {
+                    Some(Obj::Array { data, .. }) => data
+                        .iter()
+                        .map(|e| match e {
+                            V::Ref(h) => {
+                                class_desc_of(vm, *h).unwrap_or_default()
+                            }
+                            _ => String::new(),
+                        })
+                        .collect(),
+                    _ => Vec::new(),
+                },
+                _ => Vec::new(),
+            };
+            let midx = vm.find_ctor_sig(&owner, &params).unwrap_or_default();
+            if params.iter().any(|p| p.is_empty()) && !params.is_empty() {
+                // Unreadable param class — cannot match a real ctor.
+                let t = vm.throw_builtin(
+                    "Ljava/lang/NoSuchMethodException;",
+                    &format!("{owner}.<init>"),
+                );
+                return Err(t);
+            }
+            if midx.is_none() {
+                let t = vm.throw_builtin(
+                    "Ljava/lang/NoSuchMethodException;",
+                    &format!("{owner}.<init>({})", params.join(",")),
+                );
+                return Err(t);
+            }
             let cv = jstr(vm, &owner);
             let hv = host(
                 vm,
@@ -1350,6 +1383,9 @@ fn class_call(vm: &mut Vm, name: &str, _sig: &str, args: &[V]) -> Rt<Option<Opti
             );
             if let V::Ref(h) = hv {
                 pseudo_set(vm, h, P_COMPONENT, cv);
+                if let Some(m) = midx {
+                    pseudo_set(vm, h, P_CTOR, V::I64(m as i64));
+                }
             }
             Some(Some(hv))
         }
@@ -1369,7 +1405,10 @@ fn class_call(vm: &mut Vm, name: &str, _sig: &str, args: &[V]) -> Rt<Option<Opti
         | "getGenericSuperclass" | "getAnnotation" | "getDeclaredAnnotation"
         | "describeConstable" | "getModifiers0" => Some(Some(V::Ref(0))),
         "getModifiers" => Some(Some(V::I32(1))),
-        "cast" | "asSubclass" => Some(Some(args.get(1).copied().unwrap_or(args[0]))),
+        // `cast(obj)` yields the object arg; `asSubclass(Class)` yields
+        // `this` Class (the arg is the bound to check, not the result).
+        "cast" => Some(Some(args.get(1).copied().unwrap_or(args[0]))),
+        "asSubclass" => Some(Some(args[0])),
         "desiredAssertionStatus" => Some(Some(V::I32(0))),
         "arrayType" | "componentType" => Some(Some(V::Ref(0))),
         "toString" => {
@@ -1936,9 +1975,9 @@ fn reflect_call(
             }
         }
         "newInstance" if class.contains("Constructor") => {
-            // args: [ctor_mirror, argv_array] — run the `<init>` the
-            // caller supplies (PreferenceInflater's (Context, attrs)),
-            // not a default-ctor guess.
+            // args: [ctor_mirror, argv_array] — run the exact `<init>`
+            // `getConstructor` resolved (P_CTOR) when present; otherwise
+            // fall back to the slot-count guess.
             let argv: Vec<V> = match args.get(1) {
                 Some(V::Ref(a)) => match vm.heap.get(*a) {
                     Some(Obj::Array { data, .. }) => data.clone(),
@@ -1946,9 +1985,26 @@ fn reflect_call(
                 },
                 _ => vec![],
             };
-            match vm.instantiate_with(&owner, &argv) {
+            let res = match args[0] {
+                V::Ref(h) => match pseudo_get(vm, h, P_CTOR) {
+                    Some(V::I64(m)) => {
+                        // Pad/truncate to the ctor's declared arity.
+                        let n = vm.method_params(m as u64).len();
+                        let mut av = argv;
+                        av.resize(n, V::I32(0));
+                        av.truncate(n);
+                        vm.instantiate_ctor(&owner, m as u64, &av)
+                    }
+                    _ => vm.instantiate_with(&owner, &argv),
+                },
+                _ => vm.instantiate_with(&owner, &argv),
+            };
+            match res {
                 Ok(nh) => Some(Some(V::Ref(nh))),
                 Err(e) => {
+                    if std::env::var_os("OVELO_VIEWDBG").is_some() {
+                        eprintln!("[viewdbg] newInstance {owner} failed: {e}");
+                    }
                     let t = vm.throw_builtin(
                         "Ljava/lang/InstantiationException;",
                         &format!("{owner}: {e}"),

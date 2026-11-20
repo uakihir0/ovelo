@@ -297,6 +297,36 @@ pub(crate) fn call(
             }
             _ => Some(None),
         }
+    } else if class == "Landroid/os/Environment;" {
+        match name {
+            // The guest sandbox's shared storage: real File I/O maps
+            // absolute guest paths under vm.guest_root, so report the
+            // canonical emulated path.
+            "getExternalStorageDirectory" | "getStorageDirectory" => Some(Some(
+                host(vm, "Ljava/io/File;", HostState::Path("/storage/emulated/0".into())),
+            )),
+            "getExternalStorageState" | "getStorageState" | "getExternalStorageStateLegacy" => {
+                Some(Some(jstr(vm, "mounted")))
+            }
+            "getDataDirectory" => Some(Some(host(
+                vm,
+                "Ljava/io/File;",
+                HostState::Path("/data".into()),
+            ))),
+            "getRootDirectory" => Some(Some(host(
+                vm,
+                "Ljava/io/File;",
+                HostState::Path("/system".into()),
+            ))),
+            "getDownloadCacheDirectory" => Some(Some(host(
+                vm,
+                "Ljava/io/File;",
+                HostState::Path("/cache".into()),
+            ))),
+            "isExternalStorageRemovable" | "isExternalStorageEmulated"
+            | "isExternalStorageManager" => Some(Some(V::I32(1))),
+            _ => Some(None),
+        }
     } else if desc_is_a(class, "Landroid/os/AsyncTask;") {
         match name {
             "execute" | "executeOnExecutor" => {
@@ -418,6 +448,17 @@ pub(crate) fn call(
         || class == "Landroid/util/AttributeSet;"
     {
         graphics_call(vm, class, name, args)?
+    } else if class == "Landroid/animation/AnimatorInflater;" {
+        match name {
+            // Material checks `animator instanceof ObjectAnimator` and
+            // throws otherwise — return an ObjectAnimator-typed stub.
+            "loadAnimator" | "loadStateListAnimator" => Some(Some(host(
+                vm,
+                "Landroid/animation/ObjectAnimator;",
+                HostState::Empty,
+            ))),
+            _ => Some(None),
+        }
     } else if class == "Landroid/view/View$MeasureSpec;" {
         measurespec_call(vm, name, args)
     } else if class == "Landroid/view/ViewConfiguration;"
@@ -2714,6 +2755,22 @@ fn graphics_call(
                 }
                 _ => Some(V::Ref(0)),
             })
+        }
+        // `ShapeDrawable.getPaint()`: a real Paint object — callers
+        // (SwipeRefreshLayout) immediately call setColor on it.
+        (c, "getPaint") if c.ends_with("Drawable;") => {
+            match args.first() {
+                Some(V::Ref(h)) => {
+                    if let Some(v @ V::Ref(_)) = pseudo_get(vm, *h, P_PAINT) {
+                        Some(Some(v))
+                    } else {
+                        let p = host(vm, "Landroid/graphics/Paint;", HostState::Empty);
+                        pseudo_set(vm, *h, P_PAINT, p);
+                        Some(Some(p))
+                    }
+                }
+                _ => Some(Some(V::Ref(0))),
+            }
         }
         // Drawable bounds: a cached Rect mirroring setBounds writes —
         // TabLayout's indicator path reads `drawable.getBounds().left`.

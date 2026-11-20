@@ -41,6 +41,8 @@ const P_IND_DRAW: u32 = u32::MAX - 22;
 const P_PROG_DRAW: u32 = u32::MAX - 23;
 /// The window target (activity/dialog handle) owning a decor root.
 const P_WIN_OWNER: u32 = u32::MAX - 24;
+/// View -> its lazily minted ViewTreeObserver object.
+const P_VTO: u32 = u32::MAX - 25;
 /// Pseudo key: a view's lazily-minted `Menu` (Toolbar.getMenu() etc.) /
 /// the menuish marker on the Menu itself (`I32(1)`).
 const P_MENU: u32 = 0xFFFD_FFF8;
@@ -89,6 +91,43 @@ const P_ATTRS: u32 = 0xFFFD_FFFA;
 /// Pseudo key: `LayoutParams` object set by `setLayoutParams` or
 /// constructed lazily on first `getLayoutParams`.
 const P_LP: u32 = 0xFFFD_FFF9;
+
+/// Lazily mint a per-view `ViewTreeObserver` — guests register
+/// `OnGlobalLayoutListener`s on it; `fire_global_layout` (called from
+/// the host layout driver) invokes them.
+fn vto_of(vm: &mut Vm, view: u32) -> V {
+    if let Some(v) = pseudo_get(vm, view, P_VTO) {
+        return v;
+    }
+    let V::Ref(o) = host(vm, "Landroid/view/ViewTreeObserver;", HostState::Empty)
+    else {
+        return V::Ref(0);
+    };
+    pseudo_set(vm, o, P_TARGET, V::Ref(view));
+    pseudo_set(vm, view, P_VTO, V::Ref(o));
+    V::Ref(o)
+}
+
+/// Fire every registered `OnGlobalLayoutListener` — called once per
+/// layout pass (listeners that deregister themselves inside the
+/// callback, the common one-shot pattern, see exactly one call).
+pub fn fire_global_layout(vm: &mut Vm) {
+    let all: Vec<u32> = vm
+        .vto_listeners
+        .values()
+        .flat_map(|ls| ls.iter().copied())
+        .collect();
+    if std::env::var_os("OVELO_VIEWDBG").is_some() && !all.is_empty() {
+        eprintln!("[viewdbg] fire_global_layout {} listeners", all.len());
+    }
+    for l in all {
+        if let Err(e) = vm.call_virtual(l, "onGlobalLayout", &[]) {
+            if std::env::var_os("OVELO_VIEWDBG").is_some() {
+                eprintln!("[viewdbg] onGlobalLayout {l} err {e:?}");
+            }
+        }
+    }
+}
 
 /// Re-exported for `context_call` — Activity.findViewById searches the
 /// content tree set by setContentView.
@@ -283,6 +322,7 @@ pub(crate) fn is_viewish(vm: &Vm, class: &str, args: &[V]) -> bool {
             | "Landroidx/appcompat/view/SupportMenuInflater;"
             | "Landroidx/appcompat/view/menu/MenuBuilder;"
             | "Landroidx/appcompat/view/menu/MenuItemImpl;"
+            | "Landroid/view/ViewTreeObserver;"
     ) || desc_is_a(class, VIEW)
         || class.ends_with("$DecorView;")
     {
@@ -697,6 +737,42 @@ pub(crate) fn call(
                 }
             }
             Some(None)
+        }
+        "getViewTreeObserver" => Some(Some(vto_of(vm, this))),
+        "addOnGlobalLayoutListener" => {
+            if std::env::var_os("OVELO_VIEWDBG").is_some() {
+                eprintln!("[viewdbg] addOnGlobalLayoutListener obs={this} args={args:?}");
+            }
+            if let Some(&V::Ref(l)) = args.get(1) {
+                if l != 0 {
+                    vm.vto_listeners.entry(this).or_default().push(l);
+                }
+            }
+            Some(None)
+        }
+        "removeOnGlobalLayoutListener" => {
+            if let Some(&V::Ref(l)) = args.get(1) {
+                if let Some(ls) = vm.vto_listeners.get_mut(&this) {
+                    ls.retain(|x| *x != l);
+                }
+            }
+            Some(None)
+        }
+        // Other observer listener kinds are accepted but never fired
+        // (preDraw returning false would suppress drawing).
+        "addOnPreDrawListener" | "addOnDrawListener"
+        | "addOnScrollChangedListener" | "addOnTouchModeChangeListener"
+        | "addOnWindowAttachListener" | "addOnWindowFocusChangeListener"
+        | "removeOnPreDrawListener" | "removeOnDrawListener"
+        | "removeOnScrollChangedListener" | "removeOnTouchModeChangeListener"
+        | "removeOnWindowAttachListener" | "removeOnWindowFocusChangeListener"
+        | "addOnWindowShownListener" | "removeOnWindowShownListener"
+        | "dispatchOnGlobalLayout" | "dispatchOnPreDraw" | "isAlive" => {
+            Some(if name == "isAlive" || name == "dispatchOnPreDraw" {
+                Some(V::I32(1))
+            } else {
+                None
+            })
         }
         "getParent" => Some(Some(pseudo_get(vm, this, P_PARENT).unwrap_or(V::Ref(0)))),
         "getRootView" => {

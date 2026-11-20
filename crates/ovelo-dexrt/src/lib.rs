@@ -14,7 +14,7 @@ mod res_attrs;
 mod value;
 
 pub use aot::Aot;
-pub use jdk::view::DexViewInfo;
+pub use jdk::view::{fire_global_layout, DexViewInfo};
 pub use value::{Heap, HostState, Obj, V};
 
 use aot::{AotFn, TRAP_DIV_ZERO, TRAP_REM_ZERO};
@@ -216,6 +216,8 @@ pub struct Vm {
     /// deadlocks on self-rescheduling executors). Drained at the
     /// outermost `call_virtual` boundary.
     pub pending_runnables: std::collections::VecDeque<(u32, bool)>,
+    /// ViewTreeObserver handle -> registered onGlobalLayout listeners.
+    pub(crate) vto_listeners: HashMap<u32, Vec<u32>>,
     /// Reentrancy guard for `drain_runnables`.
     pub(crate) draining: bool,
     /// Nesting depth of inline drains issued from `park` — bounds the
@@ -325,6 +327,7 @@ impl Vm {
             total_steps: 0,
             pending_activity: None,
             pending_runnables: std::collections::VecDeque::new(),
+            vto_listeners: HashMap::new(),
             draining: false,
             park_depth: 0,
             reparked: std::collections::HashSet::new(),
@@ -1384,6 +1387,60 @@ impl Vm {
             }
         }
         Ok(None)
+    }
+
+    /// `<init>` on `class_desc` whose declared parameter descriptors
+    /// equal `params` exactly — what `Class.getConstructor(sig)`
+    /// resolves by signature rather than slot count.
+    pub(crate) fn find_ctor_sig(
+        &self,
+        class_desc: &str,
+        params: &[String],
+    ) -> Result<Option<GIdx>> {
+        for (di, d) in self.dexes.iter().enumerate() {
+            for def in d.class_defs() {
+                if d.type_descriptor(def.class_idx)? != class_desc {
+                    continue;
+                }
+                let cd = d.class_data(def)?;
+                for m in cd.direct_methods.iter().chain(cd.virtual_methods.iter()) {
+                    let mid = d.method(m.method_idx)?;
+                    if d.string(mid.name_idx)? != "<init>" {
+                        continue;
+                    }
+                    let p = d.proto(mid.proto_idx as u32)?;
+                    let got: Vec<String> = d
+                        .proto_params(p)?
+                        .iter()
+                        .filter_map(|t| d.type_descriptor(*t as u32).ok())
+                        .collect();
+                    if got == params {
+                        return Ok(Some(gx(di, m.method_idx)));
+                    }
+                }
+            }
+        }
+        Ok(None)
+    }
+
+    /// Declared parameter descriptors of the method `midx` names.
+    pub(crate) fn method_params(&self, midx: GIdx) -> Vec<String> {
+        let Some(d) = self.dex_of(midx) else {
+            return Vec::new();
+        };
+        let Ok(mid) = d.method(gl(midx)) else {
+            return Vec::new();
+        };
+        let Ok(p) = d.proto(mid.proto_idx as u32) else {
+            return Vec::new();
+        };
+        d.proto_params(p)
+            .map(|list| {
+                list.iter()
+                    .filter_map(|t| d.type_descriptor(*t as u32).ok())
+                    .collect()
+            })
+            .unwrap_or_default()
     }
 
     fn def_of(&self, class_idx: GIdx) -> Option<&ClassDef> {
