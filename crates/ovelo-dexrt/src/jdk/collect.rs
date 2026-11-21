@@ -8,16 +8,19 @@ use crate::value::{HostState, Obj, V};
 /// via `equals`, not identity. A dex `equals` (e.g. Glide's
 /// `CallResourceReady` keyed on cb+executor) is honored through
 /// `call_virtual_rt`; host objects and unresolved equals fall back to
-/// `value_eq` (identity / string content / class mirror).
-fn elem_eq(vm: &mut Vm, e: V, other: V) -> bool {
+/// `value_eq` (identity / string content / class mirror). A guest
+/// `equals` that throws propagates — swallowing it would let a
+/// `remove` succeed where Java surfaces the exception.
+fn elem_eq(vm: &mut Vm, e: V, other: V) -> Rt<bool> {
     match e {
         V::Ref(h) if h != 0 && matches!(vm.heap.get(h), Some(Obj::Instance { .. })) => {
             match vm.call_virtual_rt(h, "equals", &[other]) {
-                Ok(Some(v)) => i32v(v) != 0,
-                _ => value_eq(vm, e, other),
+                Ok(Some(v)) => Ok(i32v(v) != 0),
+                Ok(None) => Ok(value_eq(vm, e, other)),
+                Err(e2) => Err(e2),
             }
         }
-        _ => value_eq(vm, e, other),
+        _ => Ok(value_eq(vm, e, other)),
     }
 }
 use std::rc::Rc;
@@ -478,7 +481,13 @@ fn list_call(vm: &mut Vm, name: &str, sig: &str, args: &[V]) -> Rt<Option<Option
                 Some(Some(if i < l.len() { l.remove(i) } else { V::Ref(0) }))
             } else {
                 let items: Vec<V> = list_ref(vm, h).map(|l| l.to_vec()).unwrap_or_default();
-                let pos = items.iter().position(|e| elem_eq(vm, *e, args[1]));
+                let mut pos = None;
+                for (i, e) in items.iter().enumerate() {
+                    if elem_eq(vm, *e, args[1])? {
+                        pos = Some(i);
+                        break;
+                    }
+                }
                 match pos {
                     Some(i) => {
                         if let Some(l) = list_mut(vm, h) {
@@ -606,7 +615,13 @@ fn list_call(vm: &mut Vm, name: &str, sig: &str, args: &[V]) -> Rt<Option<Option
         }
         "contains" => {
             let items: Vec<V> = list_ref(vm, h).map(|l| l.to_vec()).unwrap_or_default();
-            let c = items.iter().any(|e| elem_eq(vm, *e, args[1]));
+            let mut c = false;
+            for e in &items {
+                if elem_eq(vm, *e, args[1])? {
+                    c = true;
+                    break;
+                }
+            }
             Some(Some(V::I32(c as i32)))
         }
         "containsAll" | "equals" => Some(Some(V::I32(1))),
@@ -615,11 +630,22 @@ fn list_call(vm: &mut Vm, name: &str, sig: &str, args: &[V]) -> Rt<Option<Option
                 Some(l) => l.to_vec(),
                 None => return Ok(None),
             };
-            let i = if name == "indexOf" {
-                items.iter().position(|e| elem_eq(vm, *e, args[1]))
+            let mut i = None;
+            if name == "indexOf" {
+                for (x, e) in items.iter().enumerate() {
+                    if elem_eq(vm, *e, args[1])? {
+                        i = Some(x);
+                        break;
+                    }
+                }
             } else {
-                items.iter().rposition(|e| elem_eq(vm, *e, args[1]))
-            };
+                for (x, e) in items.iter().enumerate().rev() {
+                    if elem_eq(vm, *e, args[1])? {
+                        i = Some(x);
+                        break;
+                    }
+                }
+            }
             Some(Some(V::I32(i.map(|x| x as i32).unwrap_or(-1))))
         }
         "iterator" | "listIterator" | "descendingIterator" | "spliterator" => {
@@ -973,7 +999,8 @@ fn map_call(vm: &mut Vm, name: &str, sig: &str, args: &[V]) -> Rt<Option<Option<
         // caller then reads fields off of.
         "ceilingKey" | "floorKey" | "higherKey" | "lowerKey" | "firstKey" | "lastKey" => {
             let pairs = map_pairs(vm, h);
-            match nav_pick(vm, &pairs, name, args.get(1).copied()) {
+            let nm = nav_name(name, nav_desc(vm, h));
+            match nav_pick(vm, &pairs, nm, args.get(1).copied()) {
                 Some((k, _)) => Some(Some(k)),
                 None if name == "firstKey" || name == "lastKey" => {
                     return Err(vm.throw_builtin("Ljava/util/NoSuchElementException;", name));
@@ -984,8 +1011,9 @@ fn map_call(vm: &mut Vm, name: &str, sig: &str, args: &[V]) -> Rt<Option<Option<
         "ceilingEntry" | "floorEntry" | "higherEntry" | "lowerEntry" | "firstEntry"
         | "lastEntry" => {
             let pairs = map_pairs(vm, h);
+            let nm = nav_name(name, nav_desc(vm, h));
             Some(Some(
-                match nav_pick(vm, &pairs, name, args.get(1).copied()) {
+                match nav_pick(vm, &pairs, nm, args.get(1).copied()) {
                     Some((k, v)) => entry_of(vm, k, v),
                     None => V::Ref(0),
                 },
@@ -994,6 +1022,7 @@ fn map_call(vm: &mut Vm, name: &str, sig: &str, args: &[V]) -> Rt<Option<Option<
         "pollFirstEntry" | "pollLastEntry" => {
             let pairs = map_pairs(vm, h);
             let op = if name == "pollFirstEntry" { "first" } else { "last" };
+            let op = nav_name(op, nav_desc(vm, h));
             match nav_pick(vm, &pairs, op, None) {
                 Some((k, v)) => {
                     let _ = map_remove(vm, h, k);
@@ -1004,24 +1033,57 @@ fn map_call(vm: &mut Vm, name: &str, sig: &str, args: &[V]) -> Rt<Option<Option<
         }
         "headMap" | "tailMap" | "subMap" => {
             let pairs = map_pairs(vm, h);
-            let (lo, lo_incl, hi, hi_incl) = match name {
-                "headMap" => (
+            let desc_view = nav_desc(vm, h);
+            // Bounds in (lo, lo_incl, hi, hi_incl); on a descending view
+            // head/tail swap and subMap's from/to flip roles.
+            let (lo, lo_incl, hi, hi_incl) = match (name, desc_view) {
+                ("headMap", false) => (
                     None,
                     false,
                     args.get(1).copied(),
                     args.get(2).map(|v| i32v(*v) != 0).unwrap_or(false),
                 ),
-                "tailMap" => (
+                ("headMap", true) => (
+                    args.get(1).copied(),
+                    args.get(2).map(|v| i32v(*v) != 0).unwrap_or(false),
+                    None,
+                    false,
+                ),
+                ("tailMap", false) => (
                     args.get(1).copied(),
                     args.get(2).map(|v| i32v(*v) != 0).unwrap_or(true),
                     None,
                     false,
                 ),
-                _ => (
+                ("tailMap", true) => (
+                    None,
+                    false,
+                    args.get(1).copied(),
+                    args.get(2).map(|v| i32v(*v) != 0).unwrap_or(true),
+                ),
+                (_, false) if args.len() >= 5 => (
                     args.get(1).copied(),
                     args.get(2).map(|v| i32v(*v) != 0).unwrap_or(true),
                     args.get(3).copied(),
                     args.get(4).map(|v| i32v(*v) != 0).unwrap_or(false),
+                ),
+                (_, true) if args.len() >= 5 => (
+                    args.get(3).copied(),
+                    args.get(4).map(|v| i32v(*v) != 0).unwrap_or(false),
+                    args.get(1).copied(),
+                    args.get(2).map(|v| i32v(*v) != 0).unwrap_or(true),
+                ),
+                (_, false) => (
+                    args.get(1).copied(),
+                    true,
+                    args.get(2).copied(),
+                    false,
+                ),
+                (_, true) => (
+                    args.get(2).copied(),
+                    true,
+                    args.get(1).copied(),
+                    false,
                 ),
             };
             let mut out = Vec::new();
@@ -1039,12 +1101,16 @@ fn map_call(vm: &mut Vm, name: &str, sig: &str, args: &[V]) -> Rt<Option<Option<
                     out.push((k, v));
                 }
             }
-            Some(Some(host(vm, "Ljava/util/TreeMap;", HostState::Map(out))))
+            let v = host(vm, "Ljava/util/TreeMap;", HostState::Map(out));
+            if let (V::Ref(oh), true) = (v, desc_view) {
+                pseudo_set(vm, oh, P_NAV_DESC, V::I32(1));
+            }
+            Some(Some(v))
         }
         "navigableKeySet" | "descendingKeySet" => {
             let mut keys: Vec<V> = map_pairs(vm, h).into_iter().map(|(k, _)| k).collect();
             sort_keys(vm, &mut keys);
-            if name == "descendingKeySet" {
+            if (name == "descendingKeySet") != nav_desc(vm, h) {
                 keys.reverse();
             }
             Some(Some(host(vm, "Ljava/util/NavigableSet;", HostState::List(keys))))
@@ -1052,8 +1118,16 @@ fn map_call(vm: &mut Vm, name: &str, sig: &str, args: &[V]) -> Rt<Option<Option<
         "descendingMap" => {
             let mut pairs = map_pairs(vm, h);
             sort_pairs(vm, &mut pairs);
-            pairs.reverse();
-            Some(Some(host(vm, "Ljava/util/TreeMap;", HostState::Map(pairs))))
+            // descendingMap() of a descending view is ascending again.
+            let desc_view = !nav_desc(vm, h);
+            if desc_view {
+                pairs.reverse();
+            }
+            let v = host(vm, "Ljava/util/TreeMap;", HostState::Map(pairs));
+            if let (V::Ref(oh), true) = (v, desc_view) {
+                pseudo_set(vm, oh, P_NAV_DESC, V::I32(1));
+            }
+            Some(Some(v))
         }
         "comparator" => Some(Some(V::Ref(0))),
         _ => {
@@ -1123,6 +1197,37 @@ fn sort_pairs(vm: &mut Vm, pairs: &mut [(V, V)]) {
         }
     }
     pairs.clone_from_slice(&out);
+}
+
+/// True when `h` is a `descendingMap()` view — key navigation inverts.
+fn nav_desc(vm: &Vm, h: u32) -> bool {
+    pseudo_get(vm, h, P_NAV_DESC).is_some_and(|v| i32v(v) != 0)
+}
+
+/// The nav op a `descendingMap()` view must actually run for `name`:
+/// "first" of a descending order is the largest key, "ceiling" is the
+/// nearest key on the lower side, and so on.
+fn nav_name(name: &str, desc: bool) -> &str {
+    if !desc {
+        return name;
+    }
+    match name {
+        "ceilingKey" => "floorKey",
+        "floorKey" => "ceilingKey",
+        "higherKey" => "lowerKey",
+        "lowerKey" => "higherKey",
+        "firstKey" => "lastKey",
+        "lastKey" => "firstKey",
+        "ceilingEntry" => "floorEntry",
+        "floorEntry" => "ceilingEntry",
+        "higherEntry" => "lowerEntry",
+        "lowerEntry" => "higherEntry",
+        "firstEntry" => "lastEntry",
+        "lastEntry" => "firstEntry",
+        "first" => "last",
+        "last" => "first",
+        _ => name,
+    }
 }
 
 /// `first/last` scan the extremes; `ceiling/floor/higher/lower` take a
