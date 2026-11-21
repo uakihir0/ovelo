@@ -943,7 +943,11 @@ pub fn drive_dex_layout_pass(vm: &mut Vm, activity: u32, frame: u32) {
         // every node and no frame would ever be set.
         let parent_is_dex =
             depth != 0 && info.parent != 0 && vm.is_dex_view(info.parent);
-        if info.is_group && !parent_is_dex {
+        // Drive subtree roots regardless of group-ness: a leaf custom
+        // view at the XML root has no dex parent to measure/layout it,
+        // so without this its frame stays unset and `onDraw` ops never
+        // capture (blank screen).
+        if !parent_is_dex {
             let (w, hgt) = info
                 .frame
                 .map(|f| (f.2 - f.0, f.3 - f.1))
