@@ -206,6 +206,9 @@ pub struct TextView {
     pub text_size: f32,
     /// Uniform padding px.
     pub padding: i32,
+    /// AOSP gravity flags (CENTER_HORIZONTAL=1, CENTER_VERTICAL=0x10,
+    /// RIGHT/END=5, BOTTOM=0x50). 0 = top|start.
+    pub gravity: i32,
 }
 
 impl TextView {
@@ -218,6 +221,7 @@ impl TextView {
             fonts,
             text_size,
             padding: 0,
+            gravity: 0,
         };
         v.view.desired = v.measure_text(None);
         v
@@ -287,12 +291,25 @@ impl Drawable for TextView {
             eprintln!("[posdbg] text {:?} at {},{} size {}", self.text, self.view.left, self.view.top, self.text_size);
         }
         let lh = t.ascent + t.descent;
-        let mut baseline = self.view.top + self.padding + t.ascent;
+        // Vertical gravity: 0x10 center, 0x50 bottom, else top.
+        let text_h = lh * t.lines.len().max(1) as i32;
+        let vy = match self.gravity & 0x70 {
+            0x10 => self.view.top + (s.h - text_h) / 2,
+            0x50 => self.view.top + s.h - self.padding - text_h,
+            _ => self.view.top + self.padding,
+        };
+        let mut baseline = vy + t.ascent;
         for line in &t.lines {
             let seg = &self.text[line.range.0..line.range.1];
+            // Horizontal gravity: 1 center, 5 right/end, else left.
+            let tx = match self.gravity & 0x7 {
+                0x1 => self.view.left + (s.w - line.width) / 2,
+                0x5 => self.view.left + s.w - self.padding - line.width,
+                _ => self.view.left + self.padding,
+            };
             c.draw_text(
                 seg,
-                self.view.left + self.padding,
+                tx,
                 baseline,
                 Paint {
                     color: self.color,

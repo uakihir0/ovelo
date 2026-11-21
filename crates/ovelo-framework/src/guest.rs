@@ -379,6 +379,10 @@ fn update_dex_view(g: &mut GuestView, info: &ovelo_dexrt::DexViewInfo) {
                 tv.invalidate();
             }
         }
+        if tv.gravity != info.gravity {
+            tv.gravity = info.gravity;
+            tv.invalidate();
+        }
     }
     if changed {
         g.invalidate();

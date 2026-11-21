@@ -237,6 +237,10 @@ pub struct DexViewInfo {
     pub parent: u32,
     /// Child view handles, in z-order.
     pub children: Vec<u32>,
+    /// `android:gravity` as the AOSP flag int (LEFT=3, RIGHT=5,
+    /// CENTER_HORIZONTAL=1, TOP=0x30, BOTTOM=0x50, CENTER_VERTICAL=0x10).
+    /// 0 = unset — treat as top|start.
+    pub gravity: i32,
 }
 
 /// The activity's content view handle (what `setContentView` attached).
@@ -430,6 +434,27 @@ pub(crate) fn dex_view_info(vm: &Vm, h: u32) -> Option<DexViewInfo> {
         Some(V::Ref(l)) => l,
         _ => 0,
     };
+    let gravity = match attr_find(vm, h, "gravity") {
+        Some(V::I32(g)) => g,
+        Some(V::Ref(r)) => s(vm, r)
+            .map(|n| {
+                n.split('|').fold(0, |acc, f| {
+                    acc | match f.trim() {
+                        "center" => 0x11,
+                        "center_horizontal" => 0x1,
+                        "center_vertical" => 0x10,
+                        "top" => 0x30,
+                        "bottom" => 0x50,
+                        "left" | "start" => 0x3,
+                        "right" | "end" => 0x5,
+                        "fill" => 0x77,
+                        _ => 0,
+                    }
+                })
+            })
+            .unwrap_or(0),
+        _ => 0,
+    };
     let kids: Vec<u32> = children(vm, h)
         .iter()
         .filter_map(|c| match c {
@@ -465,6 +490,7 @@ pub(crate) fn dex_view_info(vm: &Vm, h: u32) -> Option<DexViewInfo> {
             _ => 0,
         },
         children: kids,
+        gravity,
     })
 }
 
