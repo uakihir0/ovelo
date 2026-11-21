@@ -260,11 +260,15 @@ fn config_name(b: &[u8], off: usize, size: usize) -> String {
     //   +16 input, +20 screenSize, +24 version, +28 screenConfig…
     let mut parts = Vec::new();
     let packed = |c0: u8, c1: u8, base: u8| -> String {
-        // byte0 is the high byte of the packed u16; chars sit in 5-bit
-        // groups as base+1..base+26.
-        let v = ((c0 as u16) << 8) | c1 as u16;
-        let c = |s: u16| (base.wrapping_sub(1) + ((v >> s) & 0x1f) as u8) as char;
-        format!("{}{}{}", c(10), c(5), c(0))
+        // byte0 is the HIGH byte of the packed u16 (layout is big-endian
+        // regardless of host arch): bit15 is the marker, chars sit in
+        // 5-bit groups first→last as `c - base`.
+        let first = base.wrapping_add(c1 & 0x1f);
+        let second = base
+            .wrapping_add((c1 & 0xe0) >> 5)
+            .wrapping_add((c0 & 0x03) << 3);
+        let third = base.wrapping_add((c0 & 0x7c) >> 2);
+        format!("{first}{second}{third}")
     };
     if size >= 12 {
         let lang = [b[off + 8], b[off + 9]];
