@@ -1672,6 +1672,30 @@ impl Vm {
         s
     }
 
+    /// Innermost-first chain of live guest frames for throw-site
+    /// diagnostics — `Luv0;.t <- DateTimeFormatter;.parseDateTime <-
+    /// Lgt1;.g0`. Consecutive repeats collapse (recursion) and the
+    /// string is length-capped so recursive call paths stay readable.
+    fn throw_site_desc(&self) -> String {
+        let mut out = String::new();
+        let mut prev = None;
+        for &midx in self.stack.iter().rev() {
+            if Some(midx) == prev {
+                continue;
+            }
+            prev = Some(midx);
+            if !out.is_empty() {
+                out.push_str(" <- ");
+            }
+            out.push_str(&self.describe_method(midx));
+            if out.len() > 700 {
+                out.push_str(" <- ...");
+                break;
+            }
+        }
+        out
+    }
+
     /// Live call stack as `Lcls;.name(sig)ret` strings, newest frame
     /// last — jdk shims read it to build guest stack traces.
     pub(crate) fn describe_stack(&self) -> Vec<String> {
@@ -2410,9 +2434,9 @@ impl Vm {
         });
         // Runtime-generated throws carry no `throw` insn — credit the
         // frame that produced it so diagnostics name the method.
-        if let Some(&midx) = self.stack.last() {
-            let site = self.describe_method(midx);
-            self.throw_sites.insert(h, site.to_string());
+        if !self.stack.is_empty() {
+            let site = self.throw_site_desc();
+            self.throw_sites.insert(h, site);
         }
         E::Throw(h)
     }
@@ -3037,13 +3061,13 @@ impl Vm {
         #[allow(unsafe_code)]
         let ret = unsafe { f(regs.as_mut_ptr(), &mut trap) };
         self.stack.pop();
-        let site = self.describe_method(midx);
+        let site = self.describe_method(midx).to_string();
         let trap_throw = |v: &mut Self, desc: &str| {
             let h = v.heap.alloc(crate::value::Obj::Throwable {
                 descriptor: "Ljava/lang/ArithmeticException;".into(),
                 detail: desc.into(),
             });
-            v.throw_sites.insert(h, site.to_string());
+            v.throw_sites.insert(h, site.clone());
             Err(E::Throw(h))
         };
         match trap {
@@ -3522,8 +3546,16 @@ impl Vm {
                         self.throw_builtin("Ljava/lang/NullPointerException;", "throw null")
                     );
                 }
-                let site = self.describe_method(fr.loc.midx);
-                self.throw_sites.insert(h, site.to_string());
+                // First-throw wins: a catch-all `throw` at the top of a
+                // helper (FragmentManager force-complete & co) would
+                // otherwise clobber the real origin site.
+                if !self.stack.is_empty() {
+                    let site = self.throw_site_desc();
+                    self.throw_sites.entry(h).or_insert(site);
+                } else {
+                    let site = self.describe_method(fr.loc.midx).to_string();
+                    self.throw_sites.entry(h).or_insert(site);
+                }
                 return Err(E::Throw(h));
             }
             // ---- branches ----
