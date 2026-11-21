@@ -2663,7 +2663,13 @@ fn unsafe_call(vm: &mut Vm, name: &str, args: &[V]) -> Rt<Option<Option<V>>> {
             vm.park_drain()?;
             return Ok(Some(None));
         }
-        "loadFence" | "storeFence" | "fullFence" | "unpark" | "monitorEnter" | "monitorExit" => {
+        // `unpark` may target a worker that parked out of the live
+        // queue — re-arm dropped parkers so they rescan their queues.
+        "unpark" => {
+            vm.wake_parked();
+            None
+        }
+        "loadFence" | "storeFence" | "fullFence" | "monitorEnter" | "monitorExit" => {
             None
         }
         _ => return Ok(None),

@@ -292,6 +292,10 @@ pub struct Vm {
     /// past the cap the requeue is dropped instead of re-running
     /// `run()` from the top each drain.
     repark_counts: HashMap<u32, u32>,
+    /// Runnables that parked out of the live queue (dropped after the
+    /// repark bound). Re-armed when fresh work is posted or `unpark`
+    /// fires — either may feed a dropped worker's internal queue.
+    parked_runnables: HashMap<u32, bool>,
     /// Activity a guest `startActivity` asked to launch — (class
     /// descriptor, the Intent the caller passed). The runner drains
     /// it into a real second-Activity dispatch.
@@ -396,6 +400,7 @@ impl Vm {
             reparked: std::collections::HashSet::new(),
             park_spins: 0,
             repark_counts: HashMap::new(),
+            parked_runnables: HashMap::new(),
             field_idx_cache: std::cell::RefCell::new(HashMap::new()),
             type_idx_cache: std::cell::RefCell::new(HashMap::new()),
             fields_named_cache: std::cell::RefCell::new(None),
@@ -1299,7 +1304,22 @@ impl Vm {
     /// still idle.
     pub(crate) fn enqueue_runnable(&mut self, r: u32, on_main: bool) {
         self.reparked.clear();
+        // The newly posted work may feed a worker that parked out of
+        // the live queue — re-arm dropped parkers so they rescan.
+        self.parked_runnables.remove(&r);
+        self.wake_parked();
         self.pending_runnables.push_back((r, on_main));
+    }
+
+    /// Re-arm runnables that parked out of the live queue — called
+    /// from `enqueue_runnable` (fresh work may feed a dropped worker's
+    /// internal queue) and `LockSupport.unpark`.
+    pub(crate) fn wake_parked(&mut self) {
+        for (r, on_main) in self.parked_runnables.drain() {
+            self.repark_counts.remove(&r);
+            self.reparked.remove(&r);
+            self.pending_runnables.push_back((r, on_main));
+        }
     }
 
     /// Run enqueued async work FIFO — `Thread.start`/`Executor.execute`
@@ -1344,6 +1364,10 @@ impl Vm {
                         self.pending_runnables.push_back((r, on_main));
                     } else {
                         self.reparked.remove(&r);
+                        // Parked out of the live queue — not gone: a
+                        // later `enqueue_runnable`/`unpark` re-arms it
+                        // so work posted to its queue still resumes it.
+                        self.parked_runnables.insert(r, on_main);
                     }
                 }
                 _ => {
