@@ -125,6 +125,11 @@ pub const P_TSIZE: u32 = 0xFFFD_FFE2;
 /// Resolved layout direction stored on a `*LayoutParams` by
 /// `resolveLayoutDirection` (AOSP `mLayoutDirection`).
 const P_LP_DIR: u32 = u32::MAX - 29;
+/// Relative margins (`startMargin`/`endMargin`) — pseudos because
+/// `MarginLayoutParams.startMargin`/`endMargin` are never referenced
+/// by dex, so they get no canon field key to store under.
+const P_MSTART: u32 = u32::MAX - 42;
+const P_MEND: u32 = u32::MAX - 43;
 
 /// Lazily mint a per-view `ViewTreeObserver` — guests register
 /// `OnGlobalLayoutListener`s on it; `fire_global_layout` (called from
@@ -2525,10 +2530,18 @@ fn lp_resolve_dir(vm: &mut Vm, lp: u32, dir: i32) {
         return;
     }
     pseudo_set(vm, lp, P_LP_DIR, V::I32(dir));
-    // DEFAULT_MARGIN_RELATIVE — "no relative margin set".
+    // DEFAULT_MARGIN_RELATIVE — "no relative margin set". Relative
+    // margins arrive as pseudos (see lp_ctor); a code-side
+    // setMarginStart/End may still land on canon fields, so check both.
     const UNSET: i32 = i32::MIN;
-    let start = lp_field(vm, lp, "startMargin").map(i32v).unwrap_or(UNSET);
-    let end = lp_field(vm, lp, "endMargin").map(i32v).unwrap_or(UNSET);
+    let start = pseudo_get(vm, lp, P_MSTART)
+        .or_else(|| lp_field(vm, lp, "startMargin"))
+        .map(i32v)
+        .unwrap_or(UNSET);
+    let end = pseudo_get(vm, lp, P_MEND)
+        .or_else(|| lp_field(vm, lp, "endMargin"))
+        .map(i32v)
+        .unwrap_or(UNSET);
     if start == UNSET && end == UNSET {
         return;
     }
@@ -3163,6 +3176,22 @@ fn lp_ctor(vm: &mut Vm, class: &str, sig: &str, args: &[V]) {
                 } else if let Some(px) = lp_px(vm, v) {
                     writes.push((f.to_string(), "I".to_string(), V::I32(px)));
                 }
+            }
+        }
+        // Relative margins can't reach a canon field (dex never refs
+        // `startMargin`/`endMargin`) — hold them on pseudos; the
+        // resolveLayoutDirection fold writes them into left/right.
+        let margin = attrset_value(vm, args.get(2).copied().unwrap_or(V::Ref(0)), "layout_margin")
+            .and_then(|v| lp_px(vm, v));
+        for (attr, key) in [
+            ("layout_marginStart", P_MSTART),
+            ("layout_marginEnd", P_MEND),
+        ] {
+            let v = attrset_value(vm, args.get(2).copied().unwrap_or(V::Ref(0)), attr)
+                .and_then(|v| lp_px(vm, v))
+                .or(margin);
+            if let Some(px) = v {
+                pseudo_set(vm, this, key, V::I32(px));
             }
         }
         let _ = class;
