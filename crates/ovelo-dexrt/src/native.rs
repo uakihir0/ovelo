@@ -39,6 +39,13 @@ extern "C" {
     fn memcpy(d: *mut c_void, s: *const c_void, n: usize) -> *mut c_void;
     fn memset(d: *mut c_void, c: i32, n: usize) -> *mut c_void;
     fn strcpy(d: *mut i8, s: *const i8) -> *mut i8;
+    fn strncpy(d: *mut i8, s: *const i8, n: usize) -> *mut i8;
+    fn strcat(d: *mut i8, s: *const i8) -> *mut i8;
+    fn memmove(d: *mut c_void, s: *const c_void, n: usize) -> *mut c_void;
+    fn vsnprintf(s: *mut i8, n: usize, fmt: *const i8, ap: *mut c_void) -> i32;
+    fn open(path: *const i8, flags: i32, ...) -> i32;
+    fn abort() -> !;
+    fn pthread_threadid_np(t: usize, id: *mut u64) -> i32;
     #[cfg(target_os = "macos")]
     fn sys_icache_invalidate(start: *mut c_void, len: usize);
     #[cfg(target_os = "macos")]
@@ -422,6 +429,112 @@ extern "C" fn sh_strcpy_chk(d: *mut i8, s: *const i8, dlen: usize) -> *mut i8 {
         }
         strcpy(d, s)
     }
+}
+extern "C" fn sh_strchr_chk(s: *const i8, c: i32, slen: usize) -> *mut i8 {
+    let n = unsafe { strlen(s) };
+    if n > slen {
+        sh_chk_fail();
+    }
+    let mut p = s as *const u8;
+    unsafe {
+        loop {
+            if *p == c as u8 {
+                return p as *mut i8;
+            }
+            if *p == 0 {
+                return std::ptr::null_mut();
+            }
+            p = p.add(1);
+        }
+    }
+}
+extern "C" fn sh_memmove_chk(
+    d: *mut c_void,
+    s: *const c_void,
+    n: usize,
+    dlen: usize,
+) -> *mut c_void {
+    if n > dlen {
+        sh_chk_fail();
+    }
+    unsafe { memmove(d, s, n) }
+}
+extern "C" fn sh_strcat_chk(d: *mut i8, s: *const i8, dlen: usize) -> *mut i8 {
+    unsafe {
+        if strlen(d) + strlen(s) + 1 > dlen {
+            sh_chk_fail();
+        }
+        strcat(d, s)
+    }
+}
+// `__vsnprintf_chk(dst, size, flag, dlen, fmt, ap)` — the `flag` arg is
+// FORTIFY source info; only the size bound is enforced.
+extern "C" fn sh_vsnprintf_chk(
+    d: *mut i8,
+    size: usize,
+    _flag: i32,
+    dlen: usize,
+    fmt: *const i8,
+    ap: *mut c_void,
+) -> i32 {
+    if size > dlen {
+        sh_chk_fail();
+    }
+    unsafe { vsnprintf(d, size, fmt, ap) }
+}
+static mut SH_ERRNO: i32 = 0;
+extern "C" fn sh_errno() -> *mut i32 {
+    unsafe { std::ptr::addr_of_mut!(SH_ERRNO) }
+}
+extern "C" fn sh_assert2(
+    file: *const i8,
+    line: i32,
+    func: *const i8,
+    msg: *const i8,
+) -> ! {
+    let (f, g, m) = unsafe {
+        (
+            std::ffi::CStr::from_ptr(file).to_string_lossy(),
+            std::ffi::CStr::from_ptr(func).to_string_lossy(),
+            std::ffi::CStr::from_ptr(msg).to_string_lossy(),
+        )
+    };
+    eprintln!("[native] assertion failed {f}:{line} {g}: {m}");
+    unsafe { abort() }
+}
+extern "C" fn sh_zero() -> i64 {
+    0
+}
+extern "C" fn sh_neg1() -> i64 {
+    -1
+}
+extern "C" fn sh_gettid() -> i32 {
+    unsafe {
+        let mut id = 0u64;
+        pthread_threadid_np(0, &mut id);
+        id as i32
+    }
+}
+extern "C" fn sh_open2(path: *const i8, flags: i32) -> i32 {
+    unsafe { open(path, flags) }
+}
+extern "C" fn sh_terminate() -> ! {
+    eprintln!("[native] cxa handler invoked");
+    unsafe { abort() }
+}
+// Bionic's `__strncpy_chk2` adds a compile-time `n` bound on top of the
+// runtime dstlen check: `__strncpy_chk2(d, s, n, dlen, max_n)`.
+extern "C" fn sh_strncpy_chk2(
+    d: *mut i8,
+    s: *const i8,
+    n: usize,
+    dlen: usize,
+    max_n: usize,
+) -> *mut i8 {
+    if n > dlen || n > max_n {
+        sh_chk_fail();
+    }
+    unsafe { strncpy(d, s, n) }
 }
 extern "C" fn sh_memcpy_chk(d: *mut c_void, s: *const c_void, n: usize, dlen: usize) -> *mut c_void {
     if n > dlen {
@@ -817,8 +930,36 @@ extern "C" fn sh_atoi(s: *const i8) -> i32 {
 fn data_shim(name: &str) -> Option<usize> {
     match name {
         "_ctype_" => Some(ctype_table()),
+        // libc++abi handler variables: a cell the guest reads/writes;
+        // defaulted to a terminating stub like Bionic's defaults.
+        "__cxa_terminate_handler" | "__cxa_unexpected_handler" | "__cxa_new_handler" => {
+            Some(cxa_handler_cell(name))
+        }
         _ => None,
     }
+}
+
+#[cfg(target_os = "macos")]
+fn cxa_handler_cell(name: &str) -> usize {
+    static C: std::sync::LazyLock<Mutex<HashMap<String, usize>>> =
+        std::sync::LazyLock::new(|| Mutex::new(HashMap::new()));
+    let mut m = C.lock().unwrap();
+    if let Some(&a) = m.get(name) {
+        return a;
+    }
+    // One cell per name, leaked into the guest zone.
+    let a = unsafe {
+        let p = malloc_zone_calloc(guest_zone(), 8, 1) as *mut u64;
+        *p = sh_terminate as *const () as usize as u64;
+        p as usize
+    };
+    m.insert(name.to_string(), a);
+    a
+}
+
+#[cfg(not(target_os = "macos"))]
+fn cxa_handler_cell(_name: &str) -> usize {
+    0
 }
 
 #[cfg(target_os = "macos")]
@@ -834,7 +975,11 @@ fn ctype_table() -> usize {
         const C: u8 = 0x20;
         const X: u8 = 0x40;
         const B: u8 = 0x80;
-        let p = malloc_zone_calloc(guest_zone(), 384, 1) as *mut u8;
+        // `_ctype_` is a `const unsigned char*` variable — the guest
+        // dereferences the symbol to a pointer first, then indexes it by
+        // signed char (-128..=255), so the stored pointer is offset 128.
+        let p = malloc_zone_calloc(guest_zone(), 384 + 8, 1) as *mut u8;
+        let table = p.add(8);
         for c in 0..=127u8 {
             let f = match c {
                 9 => C | S | B,
@@ -848,9 +993,10 @@ fn ctype_table() -> usize {
                 b'g'..=b'z' => L,
                 _ => P, // ASCII punctuation runs
             };
-            *p.add(c as usize + 128) = f;
+            *table.add(c as usize + 128) = f;
         }
-        p.add(128) as usize
+        *(p as *mut u64) = table.add(128) as u64;
+        p as usize
     })
 }
 
@@ -911,6 +1057,21 @@ fn builtin_shim(name: &str) -> Option<usize> {
         "sincos" => sh_sincos as *const () as usize,
         "__strlen_chk" => sh_strlen_chk as *const () as usize,
         "__strcpy_chk" => sh_strcpy_chk as *const () as usize,
+        "__strncpy_chk2" => sh_strncpy_chk2 as *const () as usize,
+        "__strchr_chk" => sh_strchr_chk as *const () as usize,
+        "__memmove_chk" => sh_memmove_chk as *const () as usize,
+        "__strcat_chk" => sh_strcat_chk as *const () as usize,
+        "__vsnprintf_chk" => sh_vsnprintf_chk as *const () as usize,
+        "__errno" => sh_errno as *const () as usize,
+        "__assert2" => sh_assert2 as *const () as usize,
+        "getauxval" => sh_zero as *const () as usize,
+        "__system_property_get" => sh_zero as *const () as usize,
+        "prctl" => sh_zero as *const () as usize,
+        "sched_setaffinity" => sh_zero as *const () as usize,
+        "sched_getaffinity" => sh_zero as *const () as usize,
+        "syscall" => sh_neg1 as *const () as usize,
+        "gettid" => sh_gettid as *const () as usize,
+        "__open_2" => sh_open2 as *const () as usize,
         "__memcpy_chk" => sh_memcpy_chk as *const () as usize,
         "__memset_chk" => sh_memset_chk as *const () as usize,
         "dl_iterate_phdr" => sh_dl_iterate_phdr as *const () as usize,
