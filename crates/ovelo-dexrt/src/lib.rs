@@ -3945,11 +3945,15 @@ impl Vm {
                 };
                 if let Some(p) = self.trace_call.as_deref() {
                     let callee = self.describe_method(midx);
-                    if p.split(',').any(|one| !one.is_empty() && callee.contains(one)) {
-                        let caller = self.describe_method(fr.loc.midx);
+                    let caller = self.describe_method(fr.loc.midx);
+                    if p.split(',').any(|one| !one.is_empty() && callee.contains(one))
+                        && self
+                            .trace_from
+                            .as_deref()
+                            .is_none_or(|f| caller.contains(f))
+                    {
                         eprintln!(
-                            "[call>] {} +{pc:04x} -> {callee} this={} args={argfmt:?}",
-                            caller,
+                            "[call>] {caller} +{pc:04x} -> {callee} this={} args={argfmt:?}",
                             match this_arg {
                                 Some(V::Ref(0)) | None => "null".into(),
                                 other => format!("{other:?}"),

@@ -1142,7 +1142,7 @@ pub(crate) fn sfield(vm: &mut Vm, owner: &str, name: &str, ftype: &str) -> Optio
                     "content://com.android.calendar/calendars"
                 }
                 "CalendarContract$Instances" => {
-                    "content://com.android.calendar/instances"
+                    "content://com.android.calendar/instances/when"
                 }
                 "CalendarContract$Reminders" => {
                     "content://com.android.calendar/reminders"
