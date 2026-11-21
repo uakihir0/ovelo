@@ -526,6 +526,17 @@ extern "C" fn sh_ab_get_info(_env: usize, bitmap: usize, info: *mut AndroidBitma
     0
 }
 
+/// Buffers pinned by AndroidBitmap_lockPixels until unlockPixels: the
+/// guest `.so` keeps writing through the raw pointer for the whole
+/// lock, so the Rc must outlive the Bitmap object even if GC reclaims
+/// the host object mid-decode.
+struct PinnedRc(#[allow(dead_code)] std::rc::Rc<Vec<u8>>);
+// Stored in a static: the value is only pushed/dropped from threads
+// that already entered the VM — the refcount is never raced from two
+// threads at once in practice.
+unsafe impl Send for PinnedRc {}
+static LOCKED_PIXELS: Mutex<Vec<PinnedRc>> = Mutex::new(Vec::new());
+
 extern "C" fn sh_ab_lock_pixels(_env: usize, bitmap: usize, addr: *mut *mut c_void) -> i32 {
     if addr.is_null() {
         return -1;
@@ -538,6 +549,9 @@ extern "C" fn sh_ab_lock_pixels(_env: usize, bitmap: usize, addr: *mut *mut c_vo
             // make_mut clones on shared refs (COW) — the returned
             // pointer then stays stable through unlockPixels.
             unsafe { *addr = std::rc::Rc::make_mut(rgba).as_mut_ptr().cast() };
+            if let Ok(mut l) = LOCKED_PIXELS.lock() {
+                l.push(PinnedRc(rgba.clone()));
+            }
             0
         }
         _ => -1,
@@ -545,6 +559,10 @@ extern "C" fn sh_ab_lock_pixels(_env: usize, bitmap: usize, addr: *mut *mut c_vo
 }
 
 extern "C" fn sh_ab_unlock_pixels(_env: usize, _bitmap: usize) -> i32 {
+    // Release one pinned buffer — a leaked pin only wastes memory.
+    if let Ok(mut l) = LOCKED_PIXELS.lock() {
+        l.pop();
+    }
     0
 }
 

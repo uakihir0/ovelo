@@ -25,9 +25,76 @@ use crate::{gl, E, GIdx, Rt, Vm};
 thread_local! {
     static CUR_VM: Cell<*mut Vm> = const { Cell::new(std::ptr::null_mut()) };
 }
+// Guest `.so`s can spawn real pthreads (pthread_create resolves to
+// libsystem); JNI entry points reached from those threads have no
+// thread-local binding, so they read the last Vm bound anywhere.
+static FALLBACK_VM: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
 
-pub(crate) fn vm() -> &'static mut Vm {
-    unsafe { &mut *CUR_VM.get() }
+// All Vm access from JNI entry points serializes on a recursive mutex:
+// a guest thread that AttachCurrentThread's and calls FindClass/etc.
+// would otherwise hold a second live &mut Vm and corrupt the heap
+// (observed as allocator faults during Vec/String growth).
+// Recursive because call_native re-enters JNI on the same thread.
+static VM_MTX: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+static MTX_ONCE: std::sync::Once = std::sync::Once::new();
+
+extern "C" {
+    fn pthread_mutex_init(m: *mut c_void, attr: *const c_void) -> i32;
+    fn pthread_mutex_lock(m: *mut c_void) -> i32;
+    fn pthread_mutex_unlock(m: *mut c_void) -> i32;
+    fn pthread_mutexattr_init(a: *mut c_void) -> i32;
+    fn pthread_mutexattr_settype(a: *mut c_void, t: i32) -> i32;
+}
+
+// pthread_mutex_t is 64 bytes on macOS; 128 leaves room for other Unix.
+static mut MUTEX_STORAGE: [u8; 128] = [0; 128];
+static mut MUTEX_ATTR_STORAGE: [u8; 128] = [0; 128];
+
+fn vm_mtx() -> *mut c_void {
+    MTX_ONCE.call_once(|| unsafe {
+        let a = std::ptr::addr_of_mut!(MUTEX_ATTR_STORAGE) as *mut c_void;
+        pthread_mutexattr_init(a);
+        pthread_mutexattr_settype(a, 2); // PTHREAD_MUTEX_RECURSIVE
+        let m = std::ptr::addr_of_mut!(MUTEX_STORAGE) as *mut c_void;
+        pthread_mutex_init(m, a);
+        VM_MTX.store(m as usize, std::sync::atomic::Ordering::Release);
+    });
+    VM_MTX.load(std::sync::atomic::Ordering::Acquire) as *mut c_void
+}
+
+/// Guard holding the VM lock; derefs to `&mut Vm` so every existing
+/// `vm().heap…` call site works unchanged.
+pub(crate) struct VmGuard(&'static mut Vm);
+impl std::ops::Deref for VmGuard {
+    type Target = Vm;
+    fn deref(&self) -> &Vm {
+        self.0
+    }
+}
+impl std::ops::DerefMut for VmGuard {
+    fn deref_mut(&mut self) -> &mut Vm {
+        self.0
+    }
+}
+impl Drop for VmGuard {
+    fn drop(&mut self) {
+        unsafe {
+            pthread_mutex_unlock(vm_mtx());
+        }
+    }
+}
+
+pub(crate) fn vm() -> VmGuard {
+    unsafe {
+        pthread_mutex_lock(vm_mtx());
+    }
+    let p = CUR_VM.get() as usize;
+    let p = if p != 0 {
+        p
+    } else {
+        FALLBACK_VM.load(std::sync::atomic::Ordering::Acquire)
+    };
+    VmGuard(unsafe { &mut *(p as *mut Vm) })
 }
 
 /// Run `f` with the JNIEnv bound to `vm` — every native call holds this
@@ -35,6 +102,7 @@ pub(crate) fn vm() -> &'static mut Vm {
 pub(crate) fn with_vm<R>(vm: &mut Vm, f: impl FnOnce(&mut Vm) -> R) -> R {
     let prev = CUR_VM.get();
     CUR_VM.set(vm as *mut Vm);
+    FALLBACK_VM.store(vm as *mut Vm as usize, std::sync::atomic::Ordering::Release);
     let r = f(vm);
     CUR_VM.set(prev);
     r
@@ -382,7 +450,7 @@ fn sig_return(sig: &str) -> String {
 /// Invoke a dex/host method through the interpreter.
 fn call_obj(obj: u64, mid: u64, args: &[V], is_static: bool) -> Option<V> {
     let g = mid_of(mid)?;
-    let v = vm();
+    let mut v = vm();
     let kind = if is_static {
         crate::InvokeKind::Static
     } else {
@@ -403,7 +471,7 @@ fn find_method_id(clazz: u64, name_p: u64, sig_p: u64) -> u64 {
     if std::env::var("OVELO_JNIDBG").is_ok() { eprintln!("[jni] GetMethodID {name}{sig} clazz={clazz:#x}"); }
     let params = split_params(&sig);
     let pref: Vec<&str> = params.iter().map(String::as_str).collect();
-    let v = vm();
+    let mut v = vm();
     let Some(ci) = (match clazz {
         h if h != 0 => v.class_for_jclass(h as u32),
         _ => None,
@@ -425,7 +493,7 @@ fn find_method_id(clazz: u64, name_p: u64, sig_p: u64) -> u64 {
 fn find_field_id(clazz: u64, name_p: u64, _sig_p: u64, is_static: bool) -> u64 {
     let name = cstr_ro(name_p);
     if std::env::var("OVELO_JNIDBG").is_ok() { eprintln!("[jni] GetFieldID {name} clazz={clazz:#x}"); }
-    let v = vm();
+    let mut v = vm();
     let Some(ci) = (match clazz {
         h if h != 0 => v.class_for_jclass(h as u32),
         _ => None,
@@ -451,7 +519,7 @@ extern "C" fn find_class(_e: u64, name_p: u64) -> u64 {
     let dbg = std::env::var("OVELO_JNIDBG").is_ok();
     if dbg { eprintln!("[jni] FindClass {name}"); }
     let desc = format!("L{};", name.replace('.', "/"));
-    let v = vm();
+    let mut v = vm();
     if dbg { eprintln!("[jni]   type_index_of.."); }
     let ci = v.type_index_of(&desc);
     if dbg { eprintln!("[jni]   ci={ci:?} -> mirror.."); }
@@ -509,7 +577,7 @@ extern "C" fn is_same_object(_e: u64, a: u64, b: u64) -> u64 {
 }
 
 extern "C" fn alloc_object(_e: u64, clazz: u64) -> u64 {
-    let v = vm();
+    let mut v = vm();
     let ci = v.heap.class_of(clazz as u32).unwrap_or(crate::GX_NONE);
     let h = v.heap.alloc(Obj::Instance {
         class_idx: ci,
@@ -518,7 +586,7 @@ extern "C" fn alloc_object(_e: u64, clazz: u64) -> u64 {
     h as u64
 }
 extern "C" fn get_object_class(_e: u64, obj: u64) -> u64 {
-    let v = vm();
+    let mut v = vm();
     match v.heap.class_of(obj as u32) {
         Some(ci) => v.class_mirror(ci) as u64,
         None => 0,
@@ -614,7 +682,7 @@ fn field_get_v(obj: u64, id: u64) -> V {
 }
 fn field_set_v(obj: u64, id: u64, val: u64) {
     let Some(g) = fid_of(id) else { return };
-    let v = vm();
+    let mut v = vm();
     let f = v.canon_field(g);
     if let Some(Obj::Instance { fields, .. }) | Some(Obj::Host { fields, .. }) =
         v.heap.get_mut(obj as u32)
@@ -744,7 +812,7 @@ extern "C" fn get_array_length(_e: u64, a: u64) -> u64 {
     arr_data(a as u32).map(|d| d.len() as u64).unwrap_or(0)
 }
 extern "C" fn new_object_array(_e: u64, len: u64, _clazz: u64, init: u64) -> u64 {
-    let v = vm();
+    let mut v = vm();
     let h = v.heap.alloc(Obj::Array {
         elem: "Ljava/lang/Object;".into(),
         data: vec![V::Ref(init as u32); len as usize],
@@ -768,7 +836,7 @@ extern "C" fn set_object_array_element(_e: u64, a: u64, i: u64, v: u64) {
 macro_rules! new_arr {
     ($n:ident, $elem:expr, $v:expr) => {
         extern "C" fn $n(_e: u64, len: u64) -> u64 {
-            let v = vm();
+            let mut v = vm();
             let h = v.heap.alloc(Obj::Array {
                 elem: $elem.into(),
                 data: vec![$v; len as usize],
@@ -987,7 +1055,7 @@ sr!(set_double_array_region);
 
 extern "C" fn register_natives(_e: u64, clazz: u64, methods: u64, n: u64) -> u64 {
     if std::env::var("OVELO_JNIDBG").is_ok() { eprintln!("[jni] RegisterNatives clazz={clazz:#x} n={n}"); }
-    let v = vm();
+    let mut v = vm();
     let desc = v
         .class_for_jclass(clazz as u32)
         .and_then(|ci| v.type_desc_of(ci).ok())
@@ -1035,7 +1103,7 @@ extern "C" fn vm_attach(_vm: u64, a: u64, _b: u64) -> u64 {
 }
 
 extern "C" fn new_direct_byte_buffer(_e: u64, addr: u64, cap: u64) -> u64 {
-    let v = vm();
+    let mut v = vm();
     let ci = v.type_index_of("Ljava/nio/ByteBuffer;").unwrap_or(crate::GX_NONE);
     let mut fields = std::collections::HashMap::new();
     fields.insert(jdk::P_DATA as u64, V::I64(addr as i64));
@@ -1049,12 +1117,12 @@ extern "C" fn new_direct_byte_buffer(_e: u64, addr: u64, cap: u64) -> u64 {
     h as u64
 }
 extern "C" fn get_direct_buffer_address(_e: u64, buf: u64) -> u64 {
-    jdk::pseudo_get(vm(), buf as u32, jdk::P_DATA)
+    jdk::pseudo_get(&vm(), buf as u32, jdk::P_DATA)
         .map(v_to_u64)
         .unwrap_or(0)
 }
 extern "C" fn get_direct_buffer_capacity(_e: u64, buf: u64) -> u64 {
-    jdk::pseudo_get(vm(), buf as u32, jdk::P_FLAGS)
+    jdk::pseudo_get(&vm(), buf as u32, jdk::P_FLAGS)
         .map(v_to_u64)
         .unwrap_or(0)
 }
