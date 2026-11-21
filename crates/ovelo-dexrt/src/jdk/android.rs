@@ -268,24 +268,90 @@ pub(crate) fn call(
         looper_call(vm, name, args)?
     } else if class == "Landroid/os/Message;" || class == "Landroid/os/Messenger;" {
         match name {
-            "obtain" => Some(Some(host(vm, "Landroid/os/Message;", HostState::Empty))),
-            "sendToTarget" | "recycle" | "send" | "sendMessage" | "sendMessageDelayed"
-            | "sendEmptyMessage" => {
-                if name == "sendEmptyMessage" || name == "sendToTarget" {
-                    // invoke the linked Handler's handleMessage inline
-                    let _ = args;
+            "obtain" | "obtainMessage" => {
+                // obtain(Handler[, what|Runnable|obj ...]): first Ref is
+                // the target handler; a second Ref is the callback
+                // Runnable or the `obj` payload.
+                let m = host(vm, "Landroid/os/Message;", HostState::Empty);
+                if let V::Ref(mh) = m {
+                    let refs: Vec<u32> = args
+                        .iter()
+                        .filter_map(|a| {
+                            if let V::Ref(h) = a {
+                                Some(*h)
+                            } else {
+                                None
+                            }
+                        })
+                        .collect();
+                    if let Some(&t) = refs.first() {
+                        pseudo_set(vm, mh, P_MSG_TARGET, V::Ref(t));
+                    }
+                    if let Some(&o) = refs.get(1) {
+                        if args.len() == 2 {
+                            pseudo_set(vm, mh, P_MSG_CALLBACK, V::Ref(o));
+                        } else {
+                            pseudo_set(vm, mh, P_MSG_OBJ, V::Ref(o));
+                        }
+                    }
+                    // Int args after the target are what/arg1/arg2.
+                    let after_target = args
+                        .iter()
+                        .position(|a| matches!(a, V::Ref(_)))
+                        .map(|i| &args[i + 1..])
+                        .unwrap_or(&[]);
+                    let mut ints = after_target
+                        .iter()
+                        .filter(|a| matches!(a, V::I32(_) | V::I64(_)));
+                    if let Some(&w) = ints.next() {
+                        pseudo_set(vm, mh, P_MSG_WHAT, w);
+                    }
+                    if let Some(&a1) = ints.next() {
+                        pseudo_set(vm, mh, P_MSG_ARG1, a1);
+                    }
+                    if let Some(&a2) = ints.next() {
+                        pseudo_set(vm, mh, P_MSG_ARG2, a2);
+                    }
                 }
-                Some(if name.starts_with("send") {
-                    Some(V::I32(1))
-                } else {
-                    None
-                })
+                Some(Some(m))
             }
-            "getData" | "peekData" | "getCallback" | "getTarget" | "getMessenger" => {
-                Some(Some(V::Ref(0)))
+            "sendToTarget" => {
+                if let Some(&V::Ref(mh)) = args.first() {
+                    vm.enqueue_runnable(mh, true);
+                }
+                Some(Some(V::I32(1)))
             }
+            "getTarget" => Some(Some(match args.first() {
+                Some(&V::Ref(mh)) => {
+                    pseudo_get(vm, mh, P_MSG_TARGET).unwrap_or(V::Ref(0))
+                }
+                _ => V::Ref(0),
+            })),
+            "getCallback" => Some(Some(match args.first() {
+                Some(&V::Ref(mh)) => {
+                    pseudo_get(vm, mh, P_MSG_CALLBACK).unwrap_or(V::Ref(0))
+                }
+                _ => V::Ref(0),
+            })),
+            "obj" | "getObj" => Some(Some(match args.first() {
+                Some(&V::Ref(mh)) => pseudo_get(vm, mh, P_MSG_OBJ).unwrap_or(V::Ref(0)),
+                _ => V::Ref(0),
+            })),
+            "setTarget" => {
+                if let (Some(&V::Ref(mh)), Some(&t)) = (args.first(), args.get(1)) {
+                    pseudo_set(vm, mh, P_MSG_TARGET, t);
+                }
+                Some(None)
+            }
+            "recycle" | "send" | "sendMessage" | "sendMessageDelayed"
+            | "sendEmptyMessage" => Some(if name.starts_with("send") {
+                Some(V::I32(1))
+            } else {
+                None
+            }),
+            "getData" | "peekData" | "getMessenger" => Some(Some(V::Ref(0))),
             "getWhen" | "getSendingUid" => Some(Some(V::I64(0))),
-            "setData" | "setTarget" | "copyFrom" => Some(None),
+            "setData" | "copyFrom" => Some(None),
             _ => None,
         }
     } else if class == "Landroid/os/SystemClock;" {
@@ -314,6 +380,29 @@ pub(crate) fn call(
             | "isIsolated" => Some(Some(V::I32((name == "is64Bit") as i32))),
             _ => None,
         }
+    } else if class.starts_with("Landroid/os/StrictMode$") {
+        // ThreadPolicy/VmPolicy and their Builders: builder mutators
+        // return the builder; build() mints the matching policy.
+        match name {
+            "build" => Some(Some(host(
+                vm,
+                if class.contains("VmPolicy") {
+                    "Landroid/os/StrictMode$VmPolicy;"
+                } else {
+                    "Landroid/os/StrictMode$ThreadPolicy;"
+                },
+                HostState::Empty,
+            ))),
+            "toString" | "hashCode" => {
+                if name == "hashCode" {
+                    Some(Some(V::I32(0)))
+                } else {
+                    Some(Some(jstr(vm, class)))
+                }
+            }
+            "<init>" => Some(None),
+            _ => Some(Some(args[0])),
+        }
     } else if class == "Landroid/os/Trace;"
         || class == "Landroid/os/StrictMode;"
         || class == "Landroid/os/Debug;"
@@ -327,16 +416,19 @@ pub(crate) fn call(
                     Some(None)
                 }
             }
-            "allowThreadDiskWrites"
-            | "allowThreadDiskReads"
-            | "detectAll"
+            "allowThreadDiskWrites" | "allowThreadDiskReads" | "getThreadPolicy" => Some(
+                Some(host(vm, "Landroid/os/StrictMode$ThreadPolicy;", HostState::Empty)),
+            ),
+            "getVmPolicy" | "build" => Some(Some(host(
+                vm,
+                "Landroid/os/StrictMode$VmPolicy;",
+                HostState::Empty,
+            ))),
+            "detectAll"
             | "penaltyLog"
             | "penaltyDeath"
-            | "build"
             | "setVmPolicy"
             | "setThreadPolicy"
-            | "getVmPolicy"
-            | "getThreadPolicy"
             | "noteSlowCall"
             | "noteUntaggedSocket"
             | "noteDiskRead"
@@ -452,7 +544,22 @@ pub(crate) fn call(
                 };
                 Some(Some(V::I64(n)))
             }
-            "getParcelFileDescriptor" => Some(Some(args[0])),
+            "getParcelFileDescriptor" => {
+                // AssetFileDescriptor carries an inner ParcelFileDescriptor
+                // over the same bytes — minting a correctly-typed host keeps
+                // later `check-cast ParcelFileDescriptor` honest.
+                let st = match args.first().copied() {
+                    Some(V::Ref(h)) => match vm.heap.get(h) {
+                        Some(Obj::Host {
+                            state: HostState::Bytes(b, p),
+                            ..
+                        }) => HostState::Bytes(b.clone(), *p),
+                        _ => HostState::Empty,
+                    },
+                    _ => HostState::Empty,
+                };
+                Some(Some(host(vm, "Landroid/os/ParcelFileDescriptor;", st)))
+            }
             "close" | "detachFd" | "dup" | "canDetectErrors" => match name {
                 "canDetectErrors" => Some(Some(V::I32(0))),
                 "dup" => Some(Some(args[0])),
@@ -1000,7 +1107,12 @@ fn uri_call(vm: &mut Vm, name: &str, args: &[V]) -> Rt<Option<Option<V>>> {
             Some(Some(jstr(vm, &t)))
         }
         "getScheme" => {
-            let sc = text.split("://").next().unwrap_or("").to_string();
+            // Opaque uris ("scheme:ssp") have no "//" after the scheme; a
+            // bare path has no scheme at all.
+            let sc = match text.split_once(':') {
+                Some((s, _)) if !s.is_empty() && !s.contains('/') => s.to_string(),
+                _ => String::new(),
+            };
             Some(Some(jstr(vm, &sc)))
         }
         "getHost" | "getAuthority" | "getEncodedAuthority" => {
@@ -1054,7 +1166,7 @@ fn uri_call(vm: &mut Vm, name: &str, args: &[V]) -> Rt<Option<Option<V>>> {
         "getPort" => Some(Some(V::I32(-1))),
         "isRelative" | "isAbsolute" | "isHierarchical" | "isOpaque" => {
             let r = match name {
-                "isAbsolute" => text.contains("://"),
+                "isAbsolute" => text.contains(':'),
                 "isRelative" => !text.contains("://"),
                 "isHierarchical" => true,
                 _ => false,
@@ -1112,7 +1224,49 @@ fn uri_call(vm: &mut Vm, name: &str, args: &[V]) -> Rt<Option<Option<V>>> {
             .unwrap_or_default();
             Some(Some(host(vm, "Landroid/net/Uri;", HostState::StrBuf(t))))
         }
-        "fromFile" | "fromParts" | "fromBundle" => Some(Some(host(
+        "fromFile" => {
+            // File arg -> "file://<absolute path>" Uri text; an empty
+            // buffer makes every later getScheme()/getPath() lie.
+            let p = s(
+                vm,
+                match args[0] {
+                    V::Ref(h) => h,
+                    _ => 0,
+                },
+            )
+            .unwrap_or_default();
+            let p = if p.is_empty() {
+                p
+            } else {
+                // Escape characters that would cut the path short when the
+                // Uri is parsed back ('#'/'?' end the path component).
+                let mut enc = String::with_capacity(p.len());
+                for c in p.chars() {
+                    match c {
+                        '#' => enc.push_str("%23"),
+                        '?' => enc.push_str("%3F"),
+                        '%' => enc.push_str("%25"),
+                        _ => enc.push(c),
+                    }
+                }
+                format!("file://{enc}")
+            };
+            Some(Some(host(vm, "Landroid/net/Uri;", HostState::StrBuf(p))))
+        }
+        "fromParts" => {
+            // (scheme, ssp, fragment) -> scheme:ssp[#fragment]; the ssp keeps
+            // authority+path verbatim in an opaque URI.
+            let sc = sv(vm, args.first().copied().unwrap_or(V::I32(0))).unwrap_or_default();
+            let ssp = sv(vm, args.get(1).copied().unwrap_or(V::I32(0))).unwrap_or_default();
+            let frag = sv(vm, args.get(2).copied().unwrap_or(V::I32(0)));
+            let mut u = format!("{sc}:{ssp}");
+            if let Some(f) = frag.filter(|f| !f.is_empty()) {
+                u.push('#');
+                u.push_str(&f);
+            }
+            Some(Some(host(vm, "Landroid/net/Uri;", HostState::StrBuf(u))))
+        }
+        "fromBundle" => Some(Some(host(
             vm,
             "Landroid/net/Uri;",
             HostState::StrBuf("".into()),
@@ -3244,7 +3398,28 @@ fn handler_call(vm: &mut Vm, name: &str, args: &[V]) -> Rt<Option<Option<V>>> {
             if let Some(V::Ref(r)) = args.get(1).copied() {
                 // Handler posts land on the main looper — deferred so a
                 // re-posting callback can't spin inside its own frame.
-                vm.enqueue_runnable(r, true);
+                // For sendMessage* the posted object is a Message —
+                // stamp this handler as its target so the drain-time
+                // dispatch can route it back here.
+                if name.starts_with("send") && is_message(vm, r) {
+                    if let Some(&V::Ref(h)) = args.first() {
+                        pseudo_set(vm, r, P_MSG_TARGET, V::Ref(h));
+                    }
+                }
+                // *Delayed takes (r, delayMs); *AtTime takes (r, when) —
+                // our clocks are epoch-ms so `when - now` is the delay.
+                let delay = if name.contains("Delayed") {
+                    args.get(2).copied().map(i64v).unwrap_or(0)
+                } else if name.contains("AtTime") {
+                    args.get(2).copied().map(i64v).unwrap_or(0) - now_ms()
+                } else {
+                    0
+                };
+                if delay > 0 {
+                    vm.enqueue_runnable_delayed(r, true, delay);
+                } else {
+                    vm.enqueue_runnable(r, true);
+                }
             }
             Some(Some(V::I32(1)))
         }
@@ -3263,7 +3438,48 @@ fn handler_call(vm: &mut Vm, name: &str, args: &[V]) -> Rt<Option<Option<V>>> {
         | "removeCallbacksAndMessages"
         | "removeEqualMessages" => Some(None),
         "hasMessages" | "hasCallbacks" | "hasEqualMessages" => Some(Some(V::I32(0))),
-        "obtainMessage" => Some(Some(host(vm, "Landroid/os/Message;", HostState::Empty))),
+        "obtainMessage" => {
+            // obtainMessage(what[, obj|arg1,arg2,obj]) — target is `this`.
+            let m = host(vm, "Landroid/os/Message;", HostState::Empty);
+            if let (V::Ref(mh), Some(&V::Ref(h))) = (m, args.first()) {
+                pseudo_set(vm, mh, P_MSG_TARGET, V::Ref(h));
+                let mut ints = args
+                    .iter()
+                    .skip(1)
+                    .filter(|a| matches!(a, V::I32(_) | V::I64(_)));
+                if let Some(&w) = ints.next() {
+                    pseudo_set(vm, mh, P_MSG_WHAT, w);
+                }
+                if let Some(&a1) = ints.next() {
+                    pseudo_set(vm, mh, P_MSG_ARG1, a1);
+                }
+                if let Some(&a2) = ints.next() {
+                    pseudo_set(vm, mh, P_MSG_ARG2, a2);
+                }
+                if let Some(&V::Ref(o)) = args.iter().skip(1).find(|a| matches!(a, V::Ref(_))) {
+                    pseudo_set(vm, mh, P_MSG_OBJ, V::Ref(o));
+                }
+            }
+            Some(Some(m))
+        }
+        "<init>" => {
+            // <init>(Looper?, Callback?, boolean?) — remember the
+            // Handler.Callback so dispatch routes handleMessage there.
+            if let Some(&V::Ref(this)) = args.first() {
+                for a in &args[1..] {
+                    let V::Ref(h) = a else { continue };
+                    let is_looper = matches!(
+                        vm.heap.get(*h),
+                        Some(Obj::Host { desc, .. }) if desc == "Landroid/os/Looper;"
+                    );
+                    if !is_looper && *h != 0 {
+                        pseudo_set(vm, this, P_HANDLER_CB, V::Ref(*h));
+                        break;
+                    }
+                }
+            }
+            Some(None)
+        }
         "getLooper" => Some(Some(main_looper(vm))),
         "getMessageName" | "getTraceName" => Some(Some(jstr(vm, ""))),
         "createAsync" => Some(Some(args[0])),
@@ -3657,6 +3873,26 @@ fn graphics_call(vm: &mut Vm, class: &str, name: &str, args: &[V]) -> Rt<Option<
             }
             Some(None)
         }
+        ("Landroid/graphics/drawable/LayerDrawable;", "<init>")
+        | ("Landroid/graphics/drawable/TransitionDrawable;", "<init>") => {
+            // Keep the `Drawable[]` layers arg discoverable: the
+            // renderer's bitmap field-walk descends into it to reach
+            // the wrapped drawables (Glide fades through a
+            // TransitionDrawable).
+            if let Some(V::Ref(this)) = args.first() {
+                let layers = args[1..]
+                    .iter()
+                    .find(|a| {
+                        matches!(a, V::Ref(h)
+                            if matches!(vm.heap.get(*h), Some(Obj::Array { .. })))
+                    })
+                    .copied();
+                if let Some(l) = layers {
+                    pseudo_set(vm, *this, P_LAYERS, l);
+                }
+            }
+            Some(None)
+        }
         ("Landroid/graphics/drawable/BitmapDrawable;", "getBitmap") => Some(Some(
             match args.first() {
                 Some(V::Ref(h)) => pseudo_get(vm, *h, P_BITMAP_SLOT).unwrap_or(V::Ref(0)),
@@ -3666,7 +3902,7 @@ fn graphics_call(vm: &mut Vm, class: &str, name: &str, args: &[V]) -> Rt<Option<
         ("Landroid/graphics/BitmapFactory;", "decodeFile") => {
             let path = sv(vm, args[0]).unwrap_or_default();
             let bytes = std::fs::read(io::fspath(vm, &path)).unwrap_or_default();
-            Some(bitmap_decode(vm, &bytes))
+            Some(bitmap_decode_opts(vm, &bytes, args))
         }
         ("Landroid/graphics/BitmapFactory;", "decodeByteArray") => {
             let data = match args.first().copied() {
@@ -3683,37 +3919,21 @@ fn graphics_call(vm: &mut Vm, class: &str, name: &str, args: &[V]) -> Rt<Option<
             let len = i32v(args.get(2).copied().unwrap_or(V::I32(data.len() as i32)))
                 .max(0) as usize;
             let bytes = &data[off.min(data.len())..(off + len).min(data.len())];
-            Some(bitmap_decode(vm, bytes))
+            Some(bitmap_decode_opts(vm, bytes, args))
         }
         ("Landroid/graphics/BitmapFactory;", "decodeStream") => {
             let bytes = match args.first().copied() {
-                Some(V::Ref(h)) => match vm.heap.get(h) {
-                    Some(Obj::Host {
-                        state: HostState::Bytes(b, pos),
-                        ..
-                    }) => b[*pos..].to_vec(),
-                    _ => vec![],
-                },
+                Some(V::Ref(h)) => stream_bytes(vm, h),
                 _ => vec![],
             };
-            Some(bitmap_decode(vm, &bytes))
+            Some(bitmap_decode_opts(vm, &bytes, args))
         }
         ("Landroid/graphics/BitmapFactory;", "decodeFileDescriptor") => {
             let bytes = match args.first().copied() {
-                Some(V::Ref(h)) => match vm.heap.get(h) {
-                    Some(Obj::Host {
-                        state: HostState::Bytes(b, pos),
-                        ..
-                    }) => b[*pos..].to_vec(),
-                    Some(Obj::Host {
-                        state: HostState::Path(p),
-                        ..
-                    }) => std::fs::read(io::fspath(vm, p)).unwrap_or_default(),
-                    _ => vec![],
-                },
+                Some(V::Ref(h)) => stream_bytes(vm, h),
                 _ => vec![],
             };
-            Some(bitmap_decode(vm, &bytes))
+            Some(bitmap_decode_opts(vm, &bytes, args))
         }
         ("Landroid/graphics/BitmapFactory;", "decodeResource") => {
             // (Resources, resId): vector drawables rasterize too, then
@@ -4002,6 +4222,47 @@ fn bounds_rect(vm: &mut Vm, h: u32) -> V {
 // Bitmap decode / scale
 //
 
+/// Drain an `InputStream`-ish handle to bytes: host Bytes/Path fast
+/// path, then a `read(byte[],off,len)` loop for guest wrappers
+/// (Glide's RecyclableBufferedInputStream, ContentLengthInputStream…).
+fn stream_bytes(vm: &mut Vm, h: u32) -> Vec<u8> {
+    match vm.heap.get(h) {
+        Some(Obj::Host {
+            state: HostState::Bytes(b, pos),
+            ..
+        }) => return b[*pos..].to_vec(),
+        Some(Obj::Host {
+            state: HostState::Path(p),
+            ..
+        }) => return std::fs::read(io::fspath(vm, p)).unwrap_or_default(),
+        _ => {}
+    }
+    const CHUNK: usize = 65536;
+    let buf = vm.heap.alloc(Obj::Array {
+        elem: "B".into(),
+        data: vec![V::I32(0); CHUNK],
+    });
+    let mut out = Vec::new();
+    for _ in 0..4096 {
+        let r = vm.call_virtual_sig(
+            h,
+            "read",
+            &["[B", "I", "I"],
+            &[V::Ref(buf), V::I32(0), V::I32(CHUNK as i32)],
+        );
+        let n = match r {
+            Ok(Some(V::I32(n))) if n > 0 => n as usize,
+            _ => break,
+        };
+        if let Some(Obj::Array { data, .. }) = vm.heap.get(buf) {
+            out.extend(data[..n.min(data.len())].iter().map(|v| i32v(*v) as u8));
+        } else {
+            break;
+        }
+    }
+    out
+}
+
 /// Decode real image bytes into a `Bitmap` host object. Empty or
 /// undecodable input -> null, matching `BitmapFactory` returning null.
 fn bitmap_decode(vm: &mut Vm, bytes: &[u8]) -> Option<V> {
@@ -4023,8 +4284,44 @@ fn bitmap_decode(vm: &mut Vm, bytes: &[u8]) -> Option<V> {
     ))
 }
 
+/// Decode honoring `Options.inBitmap`: Glide's BitmapPool pre-allocates
+/// the destination Bitmap and reads it back from the options object —
+/// ignoring the returned handle would leave the pool bitmap blank.
+/// Pixels are scaled into the reused bitmap's dimensions.
+fn bitmap_decode_opts(vm: &mut Vm, bytes: &[u8], args: &[V]) -> Option<V> {
+    let in_bm = args.iter().find_map(|a| match a {
+        V::Ref(h) if *h != 0 => vm
+            .get_object_field(*h, "Landroid/graphics/BitmapFactory$Options;", "inBitmap")
+            .and_then(|v| match v {
+                V::Ref(b) if b != 0 => Some(b),
+                _ => None,
+            }),
+        _ => None,
+    });
+    if let Some(in_bm) = in_bm {
+        if let Ok(img) = image::load_from_memory(bytes) {
+            let rgba = img.to_rgba8();
+            let (sw, sh) = rgba.dimensions();
+            let raw = rgba.into_raw();
+            if let Some(Obj::Host {
+                state: HostState::Bitmap { w, h, rgba: dst },
+                ..
+            }) = vm.heap.get_mut(in_bm)
+            {
+                *dst = std::rc::Rc::new(if (*w, *h) == (sw, sh) {
+                    raw
+                } else {
+                    scale_rgba(sw, sh, &raw, *w, *h)
+                });
+                return Some(V::Ref(in_bm));
+            }
+        }
+    }
+    bitmap_decode(vm, bytes)
+}
+
 /// (w, h) of a Bitmap host; (0, 0) for anything else.
-fn bitmap_dims(vm: &Vm, v: V) -> (u32, u32) {
+pub(crate) fn bitmap_dims(vm: &Vm, v: V) -> (u32, u32) {
     match v {
         V::Ref(h) => match vm.heap.get(h) {
             Some(Obj::Host {
@@ -4059,6 +4356,10 @@ fn bitmap_pixels_at(vm: &Vm, v: V, depth: u32) -> Option<(u32, u32, std::rc::Rc<
         }) => Some((*w, *h, rgba.clone())),
         Some(Obj::Instance { fields, .. }) | Some(Obj::Host { fields, .. }) => fields
             .values()
+            .find_map(|f| bitmap_pixels_at(vm, *f, depth + 1)),
+        // LayerDrawable/TransitionDrawable keep drawables in an array.
+        Some(Obj::Array { data, .. }) => data
+            .iter()
             .find_map(|f| bitmap_pixels_at(vm, *f, depth + 1)),
         _ => None,
     }

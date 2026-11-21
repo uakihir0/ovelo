@@ -45,6 +45,13 @@ fn vm<T>(c: &'static str) -> Rt<T> {
     Err(E::Vm(err(c)))
 }
 
+/// A resolved method that returns void reports `None` — the same
+/// value `invoke` callers read as "unresolved, try the builtin path".
+/// Wrap it as a null placeholder so a handled call reads as handled.
+fn void_resolved(o: Option<V>) -> Option<V> {
+    o.or(Some(V::Ref(0)))
+}
+
 /// `(params)ret` descriptor for a proto index local to `d`.
 fn proto_sig(d: &DexFile, pidx: u32) -> Result<String> {
     let p = d.proto(pidx)?;
@@ -277,8 +284,17 @@ pub struct Vm {
     /// deadlocks on self-rescheduling executors). Drained at the
     /// outermost `call_virtual` boundary.
     pub pending_runnables: std::collections::VecDeque<(u32, bool)>,
+    /// Time-gated posts (`Handler.postDelayed`/`sendMessageDelayed`) —
+    /// `(handle, on_main, due_ms)`. Promoted into `pending_runnables` by
+    /// `drain_runnables` once due; without this a self-rescheduling
+    /// handler floods every drain tick regardless of its delay.
+    pub(crate) delayed_runnables: Vec<(u32, bool, u64)>,
     /// ViewTreeObserver handle -> registered onGlobalLayout listeners.
     pub(crate) vto_listeners: HashMap<u32, Vec<u32>>,
+    /// ViewTreeObserver handle -> `OnPreDrawListener` handles — Glide's
+    /// ViewTarget waits on onPreDraw to learn the view's real size
+    /// before kicking off the decode.
+    pub(crate) vto_predraw: HashMap<u32, Vec<u32>>,
     /// Reentrancy guard for `drain_runnables`.
     pub(crate) draining: bool,
     /// Nesting depth of inline drains issued from `park` — bounds the
@@ -428,7 +444,9 @@ impl Vm {
             total_steps: 0,
             pending_activity: None,
             pending_runnables: std::collections::VecDeque::new(),
+            delayed_runnables: Vec::new(),
             vto_listeners: HashMap::new(),
+            vto_predraw: HashMap::new(),
             draining: false,
             park_depth: 0,
             reparked: std::collections::HashSet::new(),
@@ -946,8 +964,19 @@ impl Vm {
         let midx = self
             .find_method_by_name(class_desc, name, args.len())?
             .ok_or_else(|| errd("dexrt.method.missing", format!("{class_desc}.{name}")))?;
+        // invoke reports a resolved void method as Some(null) — translate
+        // back to the documented contract (None = void return).
+        let ret_void = self
+            .dex_of(midx)
+            .and_then(|d| {
+                d.method(gl(midx))
+                    .ok()
+                    .and_then(|m| d.proto(m.proto_idx as u32).ok().map(|p| p.return_type_idx))
+                    .and_then(|t| d.type_descriptor(t).ok())
+            })
+            .is_some_and(|r| r == "V");
         match self.invoke(midx, args.to_vec(), InvokeKind::Static) {
-            Ok(v) => Ok(v),
+            Ok(v) => Ok(if ret_void { None } else { v }),
             Err(E::Vm(e)) => Err(e),
             Err(E::Throw(r)) => {
                 let d = self.describe_throw(r);
@@ -1362,6 +1391,16 @@ impl Vm {
         self.pending_runnables.push_back((r, on_main));
     }
 
+    /// `enqueue_runnable` with a millisecond delay — the runnable sits
+    /// in `delayed_runnables` until `drain_runnables` sees it due.
+    pub(crate) fn enqueue_runnable_delayed(&mut self, r: u32, on_main: bool, delay_ms: i64) {
+        self.reparked.clear();
+        self.parked_runnables.remove(&r);
+        self.wake_parked();
+        let due = jdk::now_ms().saturating_add(delay_ms.max(0)) as u64;
+        self.delayed_runnables.push((r, on_main, due));
+    }
+
     /// Re-arm runnables that parked out of the live queue — called
     /// from `enqueue_runnable` (fresh work may feed a dropped worker's
     /// internal queue) and `LockSupport.unpark`.
@@ -1395,11 +1434,14 @@ impl Vm {
             }));
         }
         roots.extend(self.pending_runnables.iter().map(|(h, _)| *h));
+        roots.extend(self.delayed_runnables.iter().map(|(h, _, _)| *h));
         roots.extend(self.parked_runnables.keys().copied());
         roots.extend(self.reparked.iter().copied());
         roots.extend(self.repark_counts.keys().copied());
         roots.extend(self.vto_listeners.keys().copied());
         roots.extend(self.vto_listeners.values().flatten().copied());
+        roots.extend(self.vto_predraw.keys().copied());
+        roots.extend(self.vto_predraw.values().flatten().copied());
         roots.extend(self.class_mirrors.values().copied());
         roots.push(self.jni_pending_exc);
         // Runtime-held singletons and registries — Application, thread
@@ -1458,6 +1500,13 @@ impl Vm {
     pub fn drain_runnables(&mut self, max: usize) -> usize {
         if self.draining {
             return 0;
+        }
+        let now = jdk::now_ms() as u64;
+        let (due, later): (Vec<_>, Vec<_>) =
+            self.delayed_runnables.drain(..).partition(|(_, _, t)| *t <= now);
+        self.delayed_runnables = later;
+        for (r, on_main, _) in due {
+            self.pending_runnables.push_back((r, on_main));
         }
         self.draining = true;
         let mut ran = 0usize;
@@ -2145,6 +2194,44 @@ impl Vm {
                 "Ljava/lang/Throwable;",
                 "Ljava/lang/Object;",
             ],
+            // java.io exception tree — `catch (IOException)` sites (Glide's
+            // header parse, stream wrappers) must see the subtype.
+            "Ljava/io/IOException;" => &[
+                "Ljava/lang/Exception;",
+                "Ljava/lang/Throwable;",
+                "Ljava/lang/Object;",
+            ],
+            "Ljava/io/EOFException;"
+            | "Ljava/io/FileNotFoundException;"
+            | "Ljava/io/InterruptedIOException;"
+            | "Ljava/io/MalformedURLException;"
+            | "Ljava/io/ObjectStreamException;"
+            | "Ljava/io/OptionalDataException;"
+            | "Ljava/io/ProtocolException;"
+            | "Ljava/io/SyncFailedException;"
+            | "Ljava/io/UnknownServiceException;"
+            | "Ljava/io/UnsupportedEncodingException;"
+            | "Ljava/io/UTFDataFormatException;"
+            | "Ljava/io/WriteAbortedException;"
+            | "Ljava/util/zip/ZipException;"
+            | "Ljava/net/UnknownHostException;"
+            | "Ljava/net/HttpRetryException;"
+            | "Ljava/net/SocketException;"
+            | "Ljava/net/ConnectException;"
+            | "Ljava/net/BindException;"
+            | "Ljava/net/NoRouteToHostException;"
+            | "Ljava/net/PortUnreachableException;"
+            | "Ljava/net/SocketTimeoutException;"
+            | "Ljava/net/ProtocolException;"
+            | "Ljava/net/MalformedURLException;"
+            | "Ljavax/net/ssl/SSLException;"
+            | "Ljavax/net/ssl/SSLHandshakeException;"
+            | "Ljavax/net/ssl/SSLPeerUnverifiedException;" => &[
+                "Ljava/io/IOException;",
+                "Ljava/lang/Exception;",
+                "Ljava/lang/Throwable;",
+                "Ljava/lang/Object;",
+            ],
             "Ljava/lang/NoClassDefFoundError;" => &[
                 "Ljava/lang/LinkageError;",
                 "Ljava/lang/Error;",
@@ -2746,8 +2833,17 @@ impl Vm {
             ("Ljava/lang/Object;", "getClass") => {
                 let this = args.first().copied().unwrap_or(V::Ref(0));
                 let ci = match this {
-                    V::Ref(h) if h != 0 => self.heap.class_of(h).unwrap_or(0),
-                    _ => 0,
+                    V::Ref(h) if h != 0 => match self.heap.class_of(h) {
+                        Some(c) if c != GX_NONE => c,
+                        // Str/Class/Array/Throwable have no stored
+                        // class_idx — derive the descriptor instead so
+                        // e.g. "x".getClass() mirrors String, not the
+                        // class that happens to sit at type index 0.
+                        _ => self
+                            .type_index_of(&jdk::class_of(self, V::Ref(h)))
+                            .unwrap_or(GX_NONE),
+                    },
+                    _ => GX_NONE,
                 };
                 Ok(Some(V::Ref(self.class_mirror(ci))))
             }
@@ -3006,14 +3102,19 @@ impl Vm {
                     &ret_desc,
                     matches!(kind, InvokeKind::Static),
                     &args,
-                );
+                )
+                .map(void_resolved);
             }
-            return self.stub_placeholder(loc.midx, &ret_desc, &name, &class, &args);
+            return self
+                .stub_placeholder(loc.midx, &ret_desc, &name, &class, &args)
+                .map(void_resolved);
         }
         if let Some(f) = self.aot.as_ref().and_then(|a| a.get(loc.midx)) {
-            return self.run_native(f, loc.midx, loc.em.code_off, args);
+            return self
+                .run_native(f, loc.midx, loc.em.code_off, args)
+                .map(void_resolved);
         }
-        self.exec(loc, args)
+        self.exec(loc, args).map(void_resolved)
     }
 
     /// JNI-facing wrappers — the `jni` module sits outside `Vm` but
@@ -3913,6 +4014,9 @@ impl Vm {
                         .map(|v| match v {
                             V::Ref(h) if *h != 0 => {
                                 let mut s = format!("h{h}:{}", self.dbg_class_of(*h));
+                                if let Some(Obj::Array { data, .. }) = self.heap.get(*h) {
+                                    s.push_str(&format!(";{}", data.len()));
+                                }
                                 if let Some(Obj::Host {
                                     state: HostState::List(l),
                                     ..
@@ -3934,6 +4038,11 @@ impl Vm {
                                 if let Some(Obj::Str(t)) = self.heap.get(*h) {
                                     s.push_str(&format!("=\"{}\"", t.chars().take(80).collect::<String>()));
                                 }
+                                if let Some(Obj::Class { type_idx }) = self.heap.get(*h) {
+                                    if let Ok(d) = self.type_desc_of(*type_idx) {
+                                        s.push_str(&format!("<{d}>"));
+                                    }
+                                }
                                 s
                             }
                             V::Ref(_) => "null".into(),
@@ -3943,6 +4052,25 @@ impl Vm {
                 } else {
                     Vec::new()
                 };
+                if let Some(p) = self.trace_call.as_deref() {
+                    let callee = self.describe_method(midx);
+                    let caller = self.describe_method(fr.loc.midx);
+                    if p.split(',').any(|one| !one.is_empty() && callee.contains(one))
+                        && self
+                            .trace_from
+                            .as_deref()
+                            .is_none_or(|f| caller.contains(f))
+                    {
+                        eprintln!(
+                            "[call>] {caller} +{pc:04x} -> {callee} this={} args={argfmt:?}",
+                            match this_arg {
+                                Some(V::Ref(0)) | None => "null".into(),
+                                Some(V::Ref(h)) => format!("h{h}:{}", self.dbg_class_of(h)),
+                                other => format!("{other:?}"),
+                            }
+                        );
+                    }
+                }
                 let res = self.invoke(midx, args, kind).map_err(|e| match e {
                     E::Vm(v) => {
                         let d = format!("{v} in {}", self.describe_method(fr.loc.midx));

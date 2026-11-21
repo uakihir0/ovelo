@@ -17,6 +17,10 @@ const PK_SW: u32 = 0xFFFD_FF04;
 const PK_BOLD: u32 = 0xFFFD_FF05;
 const PK_CW: u32 = 0xFFFD_FF10;
 const PK_CH: u32 = 0xFFFD_FF11;
+/// `new Canvas(bitmap)`: the backing bitmap handle — drawBitmap
+/// composites pixels into it instead of only recording ops (Glide's
+/// transform path draws into a pooled Bitmap this way).
+const PK_TARGET: u32 = 0xFFFD_FF12;
 
 fn flt(v: V) -> f32 {
     f64v(v) as f32
@@ -94,7 +98,21 @@ fn canvas_call(vm: &mut Vm, name: &str, sig: &str, args: &[V]) -> Rt<Option<Opti
     let this = arg(args, 0);
     let ps = |vm: &Vm, args: &[V]| paint_state(vm, arg(args, args.len() - 1));
     Ok(match name {
-        "<init>" => Some(None),
+        "<init>" => {
+            // Canvas() or Canvas(Bitmap): a Bitmap arg becomes the
+            // draw target (pixel-backed) and its size the canvas size.
+            if let V::Ref(h) = this {
+                if let Some(V::Ref(b)) = args.get(1).copied() {
+                    if android::bitmap_dims(vm, V::Ref(b)) != (0, 0) {
+                        pseudo_set(vm, h, PK_TARGET, V::Ref(b));
+                        let (w, hh) = android::bitmap_dims(vm, V::Ref(b));
+                        pseudo_set(vm, h, PK_CW, V::I32(w as i32));
+                        pseudo_set(vm, h, PK_CH, V::I32(hh as i32));
+                    }
+                }
+            }
+            Some(None)
+        }
         "getWidth" => Some(Some(V::I32(match this {
             V::Ref(h) => i32v(pseudo_get(vm, h, PK_CW).unwrap_or(V::I32(0))),
             _ => 0,
@@ -361,25 +379,97 @@ fn canvas_call(vm: &mut Vm, name: &str, sig: &str, args: &[V]) -> Rt<Option<Opti
                 dw = src_w as f32;
                 dh = src_h as f32;
             }
-            rec(
-                vm,
-                this,
-                CanvasOp::Bitmap {
-                    x,
-                    y,
-                    w: dw.max(0.0) as u32,
-                    h: dh.max(0.0) as u32,
-                    src_w,
-                    src_h,
-                    rgba,
-                },
-            );
+            // A canvas bound to a Bitmap (`new Canvas(bitmap)`)
+            // composites pixels into the bitmap itself — recording an
+            // op would leave the target blank (Glide's transform).
+            let target = match this {
+                V::Ref(h) => pseudo_get(vm, h, PK_TARGET),
+                _ => None,
+            };
+            match target {
+                Some(V::Ref(th)) if th != 0 => {
+                    bitmap_blit(vm, th, (x, y, dw, dh), (src_w, src_h), &rgba);
+                }
+                _ => rec(
+                    vm,
+                    this,
+                    CanvasOp::Bitmap {
+                        x,
+                        y,
+                        w: dw.max(0.0) as u32,
+                        h: dh.max(0.0) as u32,
+                        src_w,
+                        src_h,
+                        rgba,
+                    },
+                ),
+            }
             Some(None)
         }
         // No-op or non-recordable transforms: scale/rotate/skew/
         // concat/clipPath/drawPicture/drawPath/drawVertices/drawPatch.
         _ => None,
     })
+}
+
+/// Composite `src` (RGBA8, `sw`x`sh`) scaled into the dest rect
+/// `(x, y, dw, dh)` of bitmap `dst_h`, src-over. Nearest-neighbor.
+fn bitmap_blit(
+    vm: &mut Vm,
+    dst_h: u32,
+    dst_rect: (f32, f32, f32, f32),
+    src_dim: (u32, u32),
+    src: &[u8],
+) {
+    let (x, y, dw, dh) = dst_rect;
+    let (sw, sh) = src_dim;
+    let (bw, bh, base) = match vm.heap.get(dst_h) {
+        Some(Obj::Host {
+            state: HostState::Bitmap { w, h, rgba },
+            ..
+        }) => (*w, *h, rgba.clone()),
+        _ => return,
+    };
+    if bw == 0 || bh == 0 || sw == 0 || sh == 0 || dw <= 0.0 || dh <= 0.0 {
+        return;
+    }
+    let dx = x.max(0.0) as u32;
+    let dy = y.max(0.0) as u32;
+    let dw = (dw as u32).min(bw.saturating_sub(dx));
+    let dh = (dh as u32).min(bh.saturating_sub(dy));
+    if dw == 0 || dh == 0 {
+        return;
+    }
+    let mut out = base.as_ref().clone();
+    for yy in 0..dh {
+        for xx in 0..dw {
+            let sx = (xx * sw / dw).min(sw - 1);
+            let sy = (yy * sh / dh).min(sh - 1);
+            let si = ((sy * sw + sx) * 4) as usize;
+            let di = (((dy + yy) * bw + dx + xx) * 4) as usize;
+            let a = src[si + 3] as u32;
+            if a == 0 {
+                continue;
+            }
+            if a == 255 {
+                out[di..di + 4].copy_from_slice(&src[si..si + 4]);
+            } else {
+                let ia = 255 - a;
+                for c in 0..3 {
+                    out[di + c] =
+                        ((src[si + c] as u32 * a + out[di + c] as u32 * ia) / 255) as u8;
+                }
+                out[di + 3] = (a + (out[di + 3] as u32 * ia) / 255) as u8;
+            }
+        }
+    }
+    if let Some(Obj::Host {
+        state: HostState::Bitmap { rgba: dst, .. },
+        ..
+    }) = vm.heap.get_mut(dst_h)
+    {
+        *dst = std::rc::Rc::new(out);
+    }
 }
 
 fn paint_call(vm: &mut Vm, name: &str, _sig: &str, args: &[V]) -> Rt<Option<Option<V>>> {

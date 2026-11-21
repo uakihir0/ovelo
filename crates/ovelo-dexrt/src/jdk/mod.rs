@@ -49,6 +49,30 @@ pub(crate) const P_BOUNDS: u32 = u32::MAX - 11;
 pub(crate) const P_BITMAP_SLOT: u64 = 0xFFFD_FEE0;
 /// A `ColorDrawable`'s fill ARGB — `Drawable.draw` emits a rect fill.
 pub(crate) const P_DRAW_COLOR: u64 = 0xFFFD_FEE1;
+/// `ByteBuffer` write/read cursor and endianness (1 = little) — the
+/// backing bytes live in `HostState::Slot`.
+pub(crate) const P_BBUF_POS: u64 = 0xFFFD_FEE2;
+pub(crate) const P_BBUF_ORD: u64 = 0xFFFD_FEE3;
+/// `Message` routing: target `Handler`, payload `obj`, `callback`
+/// `Runnable` — and a `Handler`'s own `Handler.Callback` — so
+/// `obtainMessage(...).sendToTarget()`/`sendMessage` actually deliver
+/// (Glide's `EngineJob` drives `onResourceReady` through this path).
+pub(crate) const P_MSG_TARGET: u64 = 0xFFFD_FEE4;
+pub(crate) const P_MSG_OBJ: u64 = 0xFFFD_FEE5;
+pub(crate) const P_MSG_CALLBACK: u64 = 0xFFFD_FEE6;
+pub(crate) const P_HANDLER_CB: u64 = 0xFFFD_FEE7;
+pub(crate) const P_MSG_WHAT: u64 = 0xFFFD_FEE8;
+/// A `LayerDrawable`/`TransitionDrawable`'s `Drawable[]` layers — kept as
+/// a fields entry so the renderer's bitmap field-walk reaches the
+/// wrapped drawables (Glide's TransitionDrawable).
+pub(crate) const P_LAYERS: u64 = 0xFFFD_FEE9;
+/// `Message.arg1`/`arg2` int payloads — separate keys so they don't
+/// alias `what`.
+pub(crate) const P_MSG_ARG1: u64 = 0xFFFD_FEEA;
+pub(crate) const P_MSG_ARG2: u64 = 0xFFFD_FEEB;
+/// Marks a `TreeMap` view created by `descendingMap()` — key navigation
+/// (`firstKey`, `ceilingKey`, `subMap` bounds, …) inverts.
+pub(crate) const P_NAV_DESC: u64 = 0xFFFD_FEEC;
 
 pub(crate) fn now_ms() -> i64 {
     std::time::SystemTime::now()
@@ -174,6 +198,49 @@ pub(crate) fn worker_thread(vm: &mut Vm) -> V {
 /// (Room, WorkManager, kotlinx dispatchers) assert they are NOT on
 /// the main thread, so `Thread.currentThread()` must differ while
 /// they execute. Nested calls restore the previous context.
+/// A queued `Message` isn't a `Runnable` — `drain_runnables` must
+/// deliver it to its target `Handler` (callback → `handleMessage`)
+/// rather than call `run()` on it.
+fn dispatch_message(
+    vm: &mut Vm,
+    msg: u32,
+) -> std::result::Result<Option<V>, ovelo_error::OveloError> {
+    if let Some(V::Ref(h)) = pseudo_get(vm, msg, P_MSG_CALLBACK) {
+        if h != 0 {
+            return vm.call_virtual(h, "run", &[]);
+        }
+    }
+    if let Some(V::Ref(h)) = pseudo_get(vm, msg, P_MSG_TARGET) {
+        if h != 0 {
+            if let Some(V::Ref(cbh)) = pseudo_get(vm, h, P_HANDLER_CB) {
+                if cbh != 0 {
+                    // Handler.Callback.handleMessage returning false means
+                    // "not handled" — the Handler's own handleMessage must
+                    // still see the message.
+                    match vm.call_virtual(cbh, "handleMessage", &[V::Ref(msg)]) {
+                        Ok(Some(v)) if i32v(v) != 0 => return Ok(Some(v)),
+                        Err(e) => return Err(e),
+                        _ => {}
+                    }
+                }
+            }
+            // Host Handler with no callback: `call_virtual` resolves a
+            // dex override if present, else falls back to the builtin
+            // `handler_call` arm which no-ops cleanly.
+            return vm.call_virtual(h, "handleMessage", &[V::Ref(msg)]);
+        }
+    }
+    Ok(None)
+}
+
+/// `true` when `h` is a host `Message` needing `dispatch_message`.
+fn is_message(vm: &Vm, h: u32) -> bool {
+    matches!(
+        vm.heap.get(h),
+        Some(Obj::Host { desc, .. }) if desc == "Landroid/os/Message;"
+    )
+}
+
 pub(crate) fn run_on_worker(
     vm: &mut Vm,
     r: u32,
@@ -181,7 +248,11 @@ pub(crate) fn run_on_worker(
     let prev = vm.cur_thread;
     worker_thread(vm);
     vm.cur_thread = vm.worker_thread_h;
-    let v = vm.call_virtual(r, "run", &[]);
+    let v = if is_message(vm, r) {
+        dispatch_message(vm, r)
+    } else {
+        vm.call_virtual(r, "run", &[])
+    };
     vm.cur_thread = prev;
     v
 }
@@ -196,7 +267,11 @@ pub(crate) fn run_on_main(
     let prev = vm.cur_thread;
     main_thread(vm);
     vm.cur_thread = vm.main_thread_h;
-    let v = vm.call_virtual(r, "run", &[]);
+    let v = if is_message(vm, r) {
+        dispatch_message(vm, r)
+    } else {
+        vm.call_virtual(r, "run", &[])
+    };
     vm.cur_thread = prev;
     v
 }
@@ -842,6 +917,20 @@ pub(crate) fn sfield(vm: &mut Vm, owner: &str, name: &str, ftype: &str) -> Optio
         ("Ljava/lang/System;", "in") => {
             return Some(host(vm, "Ljava/io/InputStream;", HostState::Empty))
         }
+        ("Ljava/nio/ByteOrder;", "BIG_ENDIAN") => {
+            return Some(host(
+                vm,
+                "Ljava/nio/ByteOrder;",
+                HostState::Slot(V::I32(0)),
+            ))
+        }
+        ("Ljava/nio/ByteOrder;", "LITTLE_ENDIAN") => {
+            return Some(host(
+                vm,
+                "Ljava/nio/ByteOrder;",
+                HostState::Slot(V::I32(1)),
+            ))
+        }
         ("Ljava/lang/Void;", "TYPE") => return Some(class_obj(vm, "V".into())),
         ("Ljava/nio/charset/StandardCharsets;", n) => {
             return Some(host(
@@ -1075,6 +1164,110 @@ pub(crate) fn sfield(vm: &mut Vm, owner: &str, name: &str, ftype: &str) -> Optio
                 HostState::StrBuf(format!("content://media/{vol}/{media}")),
             ));
         }
+        // Other android.provider contract *_URI statics — SMS/contacts/
+        // call-log/calendar apps sget them and `checkNotNull` on the
+        // value, so a null here aborts whole data paths (fossify
+        // messages' getConversations died on BlockedNumberContract).
+        (o, "CONTENT_URI" | "AUTHORITY_URI" | "BASE_CONTENT_URI")
+            if o.starts_with("Landroid/provider/") =>
+        {
+            let body = o
+                .trim_start_matches("Landroid/provider/")
+                .trim_end_matches(';');
+            let uri = match body {
+                "Telephony$Sms" => "content://sms",
+                "Telephony$Sms$Inbox" => "content://sms/inbox",
+                "Telephony$Sms$Sent" => "content://sms/sent",
+                "Telephony$Sms$Draft" => "content://sms/draft",
+                "Telephony$Sms$Outbox" => "content://sms/outbox",
+                "Telephony$Sms$Conversations" => "content://sms/conversations",
+                "Telephony$Mms" => "content://mms",
+                "Telephony$Mms$Inbox" => "content://mms/inbox",
+                "Telephony$Mms$Sent" => "content://mms/sent",
+                "Telephony$Mms$Draft" => "content://mms/draft",
+                "Telephony$Mms$Outbox" => "content://mms/outbox",
+                "Telephony$Threads" => "content://mms-sms/conversations",
+                "Telephony$MmsSms" => "content://mms-sms",
+                "Telephony$MmsSms$PendingMessages" => {
+                    "content://mms-sms/pending"
+                }
+                "Telephony$CanonicalAddresses" => {
+                    "content://mms-sms/canonical-addresses"
+                }
+                "Telephony$CarrierMessages" => "content://carrier_information",
+                "BlockedNumberContract$BlockedNumbers" => {
+                    "content://com.android.blockednumber/blocked"
+                }
+                "CallLog$Calls" => "content://call_log/calls",
+                "ContactsContract$Contacts" => {
+                    "content://com.android.contacts/contacts"
+                }
+                "ContactsContract$RawContacts" => {
+                    "content://com.android.contacts/raw_contacts"
+                }
+                "ContactsContract$Data" => "content://com.android.contacts/data",
+                "ContactsContract$CommonDataKinds$Phone" => {
+                    "content://com.android.contacts/data/phones"
+                }
+                "ContactsContract$CommonDataKinds$Email" => {
+                    "content://com.android.contacts/data/emails"
+                }
+                "ContactsContract$CommonDataKinds$StructuredName" => {
+                    "content://com.android.contacts/data"
+                }
+                "ContactsContract$CommonDataKinds$Photo" => {
+                    "content://com.android.contacts/data/photos"
+                }
+                "ContactsContract$Groups" => {
+                    "content://com.android.contacts/groups"
+                }
+                "ContactsContract$PhoneLookup" => {
+                    "content://com.android.contacts/phone_lookup"
+                }
+                "CalendarContract$Events" => {
+                    "content://com.android.calendar/events"
+                }
+                "CalendarContract$Calendars" => {
+                    "content://com.android.calendar/calendars"
+                }
+                "CalendarContract$Instances" => {
+                    "content://com.android.calendar/instances/when"
+                }
+                "CalendarContract$Reminders" => {
+                    "content://com.android.calendar/reminders"
+                }
+                "CalendarContract$Attendees" => {
+                    "content://com.android.calendar/attendees"
+                }
+                "UserDictionary$Words" => "content://user_dictionary/words",
+                "VoicemailContract$Voicemails" => {
+                    "content://com.android.voicemail/voicemails"
+                }
+                "Settings$System" => "content://settings/system",
+                "Settings$Secure" => "content://settings/secure",
+                "Settings$Global" => "content://settings/global",
+                "DocumentsContract$Document" => "content://com.android.externalstorage.documents",
+                "DocumentsContract$Root" => {
+                    "content://com.android.externalstorage.documents/root"
+                }
+                _ => "",
+            };
+            // Fallback for unmapped contracts: a deterministic URI built
+            // from the class name — never null, so `checkNotNull` sites
+            // survive; queries on it just return the empty cursor.
+            let uri = if uri.is_empty() {
+                format!(
+                    "content://com.android.{}",
+                    body.split('$')
+                        .collect::<Vec<_>>()
+                        .join("/")
+                        .to_lowercase()
+                )
+            } else {
+                uri.to_string()
+            };
+            return Some(host(vm, "Landroid/net/Uri;", HostState::StrBuf(uri)));
+        }
         _ if ftype == owner => {
             // Self-typed constant on a host class: an enum constant
             // (TimeUnit.SECONDS, TimeUnit.MILLISECONDS, …). The pseudo
@@ -1169,7 +1362,18 @@ pub(crate) fn ifield(vm: &Vm, h: u32, owner: &str, name: &str) -> Option<V> {
         ("Landroid/content/pm/ApplicationInfo;", "targetSdkVersion") => Some(V::I32(35)),
         ("Landroid/content/pm/ApplicationInfo;", "minSdkVersion") => Some(V::I32(21)),
         ("Landroid/content/pm/ApplicationInfo;", "flags") => Some(V::I32(0)),
-        ("Landroid/os/Message;", "what" | "arg1" | "arg2") => Some(V::I32(0)),
+        ("Landroid/os/Message;", "what") => {
+            Some(pseudo_get(vm, h, P_MSG_WHAT).unwrap_or(V::I32(0)))
+        }
+        ("Landroid/os/Message;", "arg1") => {
+            Some(pseudo_get(vm, h, P_MSG_ARG1).unwrap_or(V::I32(0)))
+        }
+        ("Landroid/os/Message;", "arg2") => {
+            Some(pseudo_get(vm, h, P_MSG_ARG2).unwrap_or(V::I32(0)))
+        }
+        ("Landroid/os/Message;", "obj") => {
+            Some(pseudo_get(vm, h, P_MSG_OBJ).unwrap_or(V::Ref(0)))
+        }
         ("Landroid/graphics/Point;", "x" | "y")
         | ("Landroid/graphics/RectF;", "left" | "top" | "right" | "bottom")
         | ("Landroid/graphics/PointF;", "x" | "y") => Some(V::I32(0)),
@@ -1301,6 +1505,150 @@ pub(crate) fn host_supers(d: &str) -> &'static [&'static str] {
             "Ljava/lang/Iterable;",
             OBJ,
         ],
+        // Collections.empty*/singleton*/unmodifiable*/synchronized*
+        // wrappers — without these a `check-cast`/`instanceof List`
+        // on Collections.emptyList() throws (Glide's empty
+        // ModelLoader list failed exactly that way).
+        "Ljava/util/Collections$EmptyList;" => &[
+            "Ljava/util/AbstractList;",
+            "Ljava/util/AbstractCollection;",
+            "Ljava/util/List;",
+            "Ljava/util/RandomAccess;",
+            "Ljava/io/Serializable;",
+            "Ljava/util/Collection;",
+            "Ljava/lang/Iterable;",
+            OBJ,
+        ],
+        "Ljava/util/Collections$EmptySet;" => &[
+            "Ljava/util/AbstractSet;",
+            "Ljava/util/AbstractCollection;",
+            "Ljava/util/Set;",
+            "Ljava/io/Serializable;",
+            "Ljava/util/Collection;",
+            "Ljava/lang/Iterable;",
+            OBJ,
+        ],
+        "Ljava/util/Collections$EmptyMap;" => &[
+            "Ljava/util/AbstractMap;",
+            "Ljava/util/Map;",
+            "Ljava/io/Serializable;",
+            OBJ,
+        ],
+        "Ljava/util/Collections$EmptyIterator;" => &[OBJ, "Ljava/util/Iterator;"],
+        "Ljava/util/Collections$EmptyListIterator;" => &[
+            OBJ,
+            "Ljava/util/ListIterator;",
+            "Ljava/util/Iterator;",
+        ],
+        "Ljava/util/Collections$EmptyEnumeration;" => {
+            &[OBJ, "Ljava/util/Enumeration;"]
+        }
+        "Ljava/util/Collections$SingletonList;" => &[
+            "Ljava/util/AbstractList;",
+            "Ljava/util/AbstractCollection;",
+            "Ljava/util/List;",
+            "Ljava/util/RandomAccess;",
+            "Ljava/io/Serializable;",
+            "Ljava/util/Collection;",
+            "Ljava/lang/Iterable;",
+            OBJ,
+        ],
+        "Ljava/util/Collections$SingletonSet;" => &[
+            "Ljava/util/AbstractSet;",
+            "Ljava/util/AbstractCollection;",
+            "Ljava/util/Set;",
+            "Ljava/io/Serializable;",
+            "Ljava/util/Collection;",
+            "Ljava/lang/Iterable;",
+            OBJ,
+        ],
+        "Ljava/util/Collections$SingletonMap;" => &[
+            "Ljava/util/AbstractMap;",
+            "Ljava/util/Map;",
+            "Ljava/io/Serializable;",
+            OBJ,
+        ],
+        "Ljava/util/Arrays$ArrayList;" => &[
+            "Ljava/util/AbstractList;",
+            "Ljava/util/AbstractCollection;",
+            "Ljava/util/List;",
+            "Ljava/util/RandomAccess;",
+            "Ljava/io/Serializable;",
+            "Ljava/util/Collection;",
+            "Ljava/lang/Iterable;",
+            OBJ,
+        ],
+        "Ljava/util/Collections$UnmodifiableCollection;" => &[
+            OBJ,
+            "Ljava/util/Collection;",
+            "Ljava/lang/Iterable;",
+            "Ljava/io/Serializable;",
+        ],
+        "Ljava/util/Collections$UnmodifiableList;" => &[
+            "Ljava/util/Collections$UnmodifiableCollection;",
+            "Ljava/util/List;",
+            "Ljava/util/Collection;",
+            "Ljava/lang/Iterable;",
+            "Ljava/io/Serializable;",
+            OBJ,
+        ],
+        "Ljava/util/Collections$UnmodifiableSet;" => &[
+            "Ljava/util/Collections$UnmodifiableCollection;",
+            "Ljava/util/Set;",
+            "Ljava/util/Collection;",
+            "Ljava/lang/Iterable;",
+            "Ljava/io/Serializable;",
+            OBJ,
+        ],
+        "Ljava/util/Collections$UnmodifiableMap;" => {
+            &[OBJ, "Ljava/util/Map;", "Ljava/io/Serializable;"]
+        }
+        "Ljava/util/Collections$SynchronizedCollection;" => &[
+            OBJ,
+            "Ljava/util/Collection;",
+            "Ljava/lang/Iterable;",
+            "Ljava/io/Serializable;",
+        ],
+        "Ljava/util/Collections$SynchronizedList;" => &[
+            "Ljava/util/Collections$SynchronizedCollection;",
+            "Ljava/util/List;",
+            "Ljava/util/Collection;",
+            "Ljava/lang/Iterable;",
+            OBJ,
+        ],
+        "Ljava/util/Collections$SynchronizedSet;" => &[
+            "Ljava/util/Collections$SynchronizedCollection;",
+            "Ljava/util/Set;",
+            "Ljava/util/Collection;",
+            "Ljava/lang/Iterable;",
+            OBJ,
+        ],
+        "Ljava/util/Collections$SynchronizedMap;" => &[
+            OBJ,
+            "Ljava/util/Map;",
+            "Ljava/io/Serializable;",
+        ],
+        "Ljava/util/Collections$CheckedCollection;" => &[
+            OBJ,
+            "Ljava/util/Collection;",
+            "Ljava/lang/Iterable;",
+            "Ljava/io/Serializable;",
+        ],
+        "Ljava/util/Collections$CheckedList;" => &[
+            "Ljava/util/Collections$CheckedCollection;",
+            "Ljava/util/List;",
+            "Ljava/util/Collection;",
+            "Ljava/lang/Iterable;",
+            OBJ,
+        ],
+        "Ljava/util/Collections$CheckedSet;" => &[
+            "Ljava/util/Collections$CheckedCollection;",
+            "Ljava/util/Set;",
+            "Ljava/util/Collection;",
+            "Ljava/lang/Iterable;",
+            OBJ,
+        ],
+        "Ljava/util/Collections$CheckedMap;" => &[OBJ, "Ljava/util/Map;"],
         "Ljava/util/AbstractSequentialList;" => &[
             "Ljava/util/AbstractList;",
             "Ljava/util/AbstractCollection;",

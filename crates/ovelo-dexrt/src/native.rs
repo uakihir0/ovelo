@@ -11,6 +11,8 @@
 use std::collections::HashMap;
 use std::ffi::{c_void, CString};
 use std::sync::{Arc, Mutex};
+#[cfg(target_os = "macos")]
+use std::sync::OnceLock;
 
 use ovelo_error::{ErrorCategory, OveloError, Phase, Result};
 
@@ -37,6 +39,19 @@ extern "C" {
     fn memcpy(d: *mut c_void, s: *const c_void, n: usize) -> *mut c_void;
     fn memset(d: *mut c_void, c: i32, n: usize) -> *mut c_void;
     fn strcpy(d: *mut i8, s: *const i8) -> *mut i8;
+    fn strncpy(d: *mut i8, s: *const i8, n: usize) -> *mut i8;
+    fn strcat(d: *mut i8, s: *const i8) -> *mut i8;
+    fn memmove(d: *mut c_void, s: *const c_void, n: usize) -> *mut c_void;
+    fn vsnprintf(s: *mut i8, n: usize, fmt: *const i8, ap: *mut c_void) -> i32;
+    fn open(path: *const i8, flags: i32, ...) -> i32;
+    fn abort() -> !;
+    #[cfg(target_os = "macos")]
+    fn pthread_threadid_np(t: usize, id: *mut u64) -> i32;
+    #[cfg(target_os = "macos")]
+    fn __error() -> *mut i32;
+    #[cfg(not(target_os = "macos"))]
+    fn __errno_location() -> *mut i32;
+    fn lseek(fd: i32, off: i64, whence: i32) -> i64;
     #[cfg(target_os = "macos")]
     fn sys_icache_invalidate(start: *mut c_void, len: usize);
     #[cfg(target_os = "macos")]
@@ -47,6 +62,24 @@ extern "C" {
     fn write(fd: i32, buf: *const c_void, n: usize) -> isize;
     #[cfg(target_os = "macos")]
     fn dladdr(addr: *const c_void, info: *mut DlInfo) -> i32;
+    #[cfg(target_os = "macos")]
+    fn malloc_create_zone(start_size: usize, flags: u32) -> *mut c_void;
+    #[cfg(target_os = "macos")]
+    fn malloc_zone_malloc(zone: *mut c_void, size: usize) -> *mut c_void;
+    #[cfg(target_os = "macos")]
+    fn malloc_zone_calloc(zone: *mut c_void, n: usize, size: usize) -> *mut c_void;
+    #[cfg(target_os = "macos")]
+    fn malloc_zone_realloc(zone: *mut c_void, ptr: *mut c_void, size: usize) -> *mut c_void;
+    #[cfg(target_os = "macos")]
+    fn malloc_zone_free(zone: *mut c_void, ptr: *mut c_void);
+    #[cfg(target_os = "macos")]
+    fn malloc_zone_memalign(zone: *mut c_void, align: usize, size: usize) -> *mut c_void;
+    #[cfg(target_os = "macos")]
+    fn malloc_zone_from_ptr(ptr: *const c_void) -> *mut c_void;
+    #[cfg(target_os = "macos")]
+    fn malloc_size(ptr: *const c_void) -> usize;
+    #[cfg(target_os = "macos")]
+    fn free(ptr: *mut c_void);
 }
 
 #[cfg(target_os = "macos")]
@@ -403,6 +436,185 @@ extern "C" fn sh_strcpy_chk(d: *mut i8, s: *const i8, dlen: usize) -> *mut i8 {
         strcpy(d, s)
     }
 }
+// Bionic scans at most `slen` bytes: a match or NUL inside the bound
+// succeeds even when the buffer is unterminated past it.
+extern "C" fn sh_strchr_chk(s: *const i8, c: i32, slen: usize) -> *mut i8 {
+    let p = s as *const u8;
+    unsafe {
+        for i in 0..slen {
+            let b = *p.add(i);
+            if b == c as u8 {
+                return p.add(i) as *mut i8;
+            }
+            if b == 0 {
+                return std::ptr::null_mut();
+            }
+        }
+        sh_chk_fail();
+    }
+}
+extern "C" fn sh_memmove_chk(
+    d: *mut c_void,
+    s: *const c_void,
+    n: usize,
+    dlen: usize,
+) -> *mut c_void {
+    if n > dlen {
+        sh_chk_fail();
+    }
+    unsafe { memmove(d, s, n) }
+}
+extern "C" fn sh_strcat_chk(d: *mut i8, s: *const i8, dlen: usize) -> *mut i8 {
+    unsafe {
+        if strlen(d) + strlen(s) + 1 > dlen {
+            sh_chk_fail();
+        }
+        strcat(d, s)
+    }
+}
+// `__vsnprintf_chk(dst, size, flag, dlen, fmt, ap)` — the `flag` arg is
+// FORTIFY source info; only the size bound is enforced.
+extern "C" fn sh_vsnprintf_chk(
+    d: *mut i8,
+    size: usize,
+    _flag: i32,
+    dlen: usize,
+    fmt: *const i8,
+    ap: *mut c_void,
+) -> i32 {
+    if size > dlen {
+        sh_chk_fail();
+    }
+    unsafe { vsnprintf(d, size, fmt, ap) }
+}
+// `__errno()` must return the REAL host errno cell — host libc calls
+// (open, read) write failures there and the guest reads them back.
+extern "C" fn sh_errno() -> *mut i32 {
+    unsafe {
+        #[cfg(target_os = "macos")]
+        {
+            __error()
+        }
+        #[cfg(not(target_os = "macos"))]
+        {
+            __errno_location()
+        }
+    }
+}
+extern "C" fn sh_assert2(
+    file: *const i8,
+    line: i32,
+    func: *const i8,
+    msg: *const i8,
+) -> ! {
+    let (f, g, m) = unsafe {
+        (
+            std::ffi::CStr::from_ptr(file).to_string_lossy(),
+            std::ffi::CStr::from_ptr(func).to_string_lossy(),
+            std::ffi::CStr::from_ptr(msg).to_string_lossy(),
+        )
+    };
+    eprintln!("[native] assertion failed {f}:{line} {g}: {m}");
+    unsafe { abort() }
+}
+extern "C" fn sh_zero() -> i64 {
+    0
+}
+extern "C" fn sh_neg1() -> i64 {
+    -1
+}
+#[cfg(target_os = "macos")]
+extern "C" fn sh_gettid() -> i32 {
+    unsafe {
+        let mut id = 0u64;
+        pthread_threadid_np(0, &mut id);
+        id as i32
+    }
+}
+#[cfg(not(target_os = "macos"))]
+extern "C" fn sh_gettid() -> i32 {
+    0
+}
+#[cfg(target_os = "macos")]
+extern "C" fn sh_terminate() -> ! {
+    eprintln!("[native] cxa handler invoked");
+    unsafe { abort() }
+}
+// Bionic's `__strncpy_chk2` enforces both compile-time bounds:
+// n over the dst size truncates, n over the src size reads past the
+// source object — FORTIFY aborts on either.
+extern "C" fn sh_strncpy_chk2(
+    d: *mut i8,
+    s: *const i8,
+    n: usize,
+    dlen: usize,
+    max_n: usize,
+) -> *mut i8 {
+    if n > dlen || n > max_n {
+        sh_chk_fail();
+    }
+    unsafe { strncpy(d, s, n) }
+}
+extern "C" fn sh_system_property_get(_name: *const i8, value: *mut i8) -> i32 {
+    unsafe { *value = 0 };
+    0
+}
+extern "C" fn sh_getaffinity(_pid: i32, size: usize, mask: *mut u8) -> i32 {
+    unsafe {
+        memset(mask as *mut c_void, 0, size);
+        let cpus = std::thread::available_parallelism()
+            .map(|n| n.get())
+            .unwrap_or(1);
+        let bytes = cpus.div_ceil(8).min(size);
+        for i in 0..bytes {
+            *mask.add(i) = 0xff;
+        }
+        if !cpus.is_multiple_of(8) && bytes > 0 {
+            *mask.add(bytes - 1) = (1 << (cpus % 8)) - 1;
+        }
+    }
+    0
+}
+/// Translate Bionic `O_*` bits (asm-generic values) to the host's.
+/// Access-mode bits 0-1 are identical everywhere; named flags differ —
+/// e.g. Bionic O_APPEND=0x400 is Darwin's O_TRUNC.
+#[cfg(target_os = "macos")]
+fn guest_oflags(flags: i32) -> i32 {
+    const MAP: &[(i32, i32)] = &[
+        (0x00040, 0x00200),    // O_CREAT
+        (0x00080, 0x00800),    // O_EXCL
+        (0x00100, 0x20000),    // O_NOCTTY
+        (0x00200, 0x00400),    // O_TRUNC
+        (0x00400, 0x00008),    // O_APPEND
+        (0x00800, 0x00004),    // O_NONBLOCK
+        (0x01000, 0x400000),   // O_DSYNC
+        (0x10000, 0x100000),   // O_DIRECTORY
+        (0x20000, 0x00100),    // O_NOFOLLOW
+        (0x80000, 0x1000000),  // O_CLOEXEC
+        (0x101000, 0x00080),   // O_SYNC (Bionic's value includes DSYNC)
+        (0x200000, 0x00000),   // O_PATH — no Darwin equivalent
+        (0x04000, 0x00000),    // O_DIRECT — drop (Darwin uses fcntl)
+        (0x08000, 0x00000),    // O_LARGEFILE — implicit on 64-bit
+        (0x40000, 0x00000),    // O_NOATIME — no Darwin equivalent
+    ];
+    let mut out = flags & 0x3;
+    for &(b, d) in MAP {
+        if flags & b == b {
+            out |= d;
+        }
+    }
+    out
+}
+#[cfg(not(target_os = "macos"))]
+fn guest_oflags(flags: i32) -> i32 {
+    flags // Linux host: Bionic values are the native ones
+}
+extern "C" fn sh_open(path: *const i8, flags: i32, mode: i32) -> i32 {
+    unsafe { open(path, guest_oflags(flags), mode) }
+}
+extern "C" fn sh_open2(path: *const i8, flags: i32) -> i32 {
+    unsafe { open(path, guest_oflags(flags)) }
+}
 extern "C" fn sh_memcpy_chk(d: *mut c_void, s: *const c_void, n: usize, dlen: usize) -> *mut c_void {
     if n > dlen {
         sh_chk_fail();
@@ -606,6 +818,179 @@ extern "C" fn sh_log_print(
 extern "C" fn sh_log_write(prio: i32, tag: *const i8, text: *const i8) -> i32 {
     sh_log_print(prio, tag, text, 0, 0, 0, 0)
 }
+/// Guest-private malloc zone. Guest `.so` code runs in this address
+/// space and its imports resolve to real host functions — if `malloc`
+/// resolved straight to libSystem's default zone, a guest heap bug
+/// (overflow, double free) would corrupt the *host* heap and kill an
+/// unrelated allocation later (observed as nondeterministic segvs in
+/// `format!`/cstr_ro while loading libglide-webp). Routing all guest
+/// allocation through its own zone confines that damage to the guest
+/// heap: host code keeps running and a real bug surfaces as a crash
+/// inside zone functions with `[so]` frames pointing at the culprit.
+#[cfg(target_os = "macos")]
+pub(crate) fn guest_zone() -> *mut c_void {
+    static ZONE: OnceLock<usize> = OnceLock::new();
+    *ZONE.get_or_init(|| unsafe { malloc_create_zone(0, 0) as usize }) as *mut c_void
+}
+
+#[cfg(target_os = "macos")]
+extern "C" fn sh_malloc(size: usize) -> *mut c_void {
+    unsafe { malloc_zone_malloc(guest_zone(), size.max(1)) }
+}
+
+/// Route the free to whichever zone owns the pointer — covers the
+/// (intentional or accidental) case of a guest freeing memory that a
+/// shim or a host-resolved libc call (strdup, realpath) returned from
+/// the default zone.
+#[cfg(target_os = "macos")]
+extern "C" fn sh_free(ptr: *mut c_void) {
+    if ptr.is_null() {
+        return;
+    }
+    unsafe {
+        let zone = malloc_zone_from_ptr(ptr);
+        if zone.is_null() {
+            // Not a malloc-family pointer — let real free() abort at
+            // this call site so the guest frame is the one that faults.
+            eprintln!("[shim] free() of non-malloc pointer {ptr:p}");
+            free(ptr);
+            return;
+        }
+        malloc_zone_free(zone, ptr);
+    }
+}
+
+#[cfg(target_os = "macos")]
+extern "C" fn sh_calloc(n: usize, size: usize) -> *mut c_void {
+    unsafe { malloc_zone_calloc(guest_zone(), n, size) }
+}
+
+#[cfg(target_os = "macos")]
+extern "C" fn sh_realloc(ptr: *mut c_void, size: usize) -> *mut c_void {
+    unsafe {
+        if ptr.is_null() {
+            malloc_zone_malloc(guest_zone(), size)
+        } else {
+            let zone = malloc_zone_from_ptr(ptr);
+            let zone = if zone.is_null() { guest_zone() } else { zone };
+            malloc_zone_realloc(zone, ptr, size)
+        }
+    }
+}
+
+#[cfg(target_os = "macos")]
+extern "C" fn sh_memalign(align: usize, size: usize) -> *mut c_void {
+    unsafe { malloc_zone_memalign(guest_zone(), align.max(16), size) }
+}
+
+#[cfg(target_os = "macos")]
+extern "C" fn sh_valloc(size: usize) -> *mut c_void {
+    unsafe { malloc_zone_memalign(guest_zone(), PAGE, size) }
+}
+
+#[cfg(target_os = "macos")]
+extern "C" fn sh_pvalloc(size: usize) -> *mut c_void {
+    unsafe { malloc_zone_memalign(guest_zone(), PAGE, size.div_ceil(PAGE) * PAGE) }
+}
+
+#[cfg(target_os = "macos")]
+extern "C" fn sh_posix_memalign(out: *mut *mut c_void, align: usize, size: usize) -> i32 {
+    if out.is_null() || align < 8 || !align.is_power_of_two() {
+        return 22; // EINVAL
+    }
+    unsafe {
+        *out = malloc_zone_memalign(guest_zone(), align, size);
+        if (*out).is_null() {
+            12 // ENOMEM
+        } else {
+            0
+        }
+    }
+}
+
+#[cfg(target_os = "macos")]
+extern "C" fn sh_malloc_usable_size(ptr: *const c_void) -> usize {
+    if ptr.is_null() {
+        return 0;
+    }
+    unsafe { malloc_size(ptr) }
+}
+
+#[cfg(target_os = "macos")]
+extern "C" fn sh_strdup(s: *const i8) -> *mut i8 {
+    if s.is_null() {
+        return std::ptr::null_mut();
+    }
+    unsafe {
+        let n = strlen(s) + 1;
+        let p = malloc_zone_malloc(guest_zone(), n) as *mut i8;
+        if !p.is_null() {
+            memcpy(p.cast(), s.cast(), n);
+        }
+        p
+    }
+}
+
+#[cfg(target_os = "macos")]
+extern "C" fn sh_strndup(s: *const i8, n: usize) -> *mut i8 {
+    if s.is_null() {
+        return std::ptr::null_mut();
+    }
+    unsafe {
+        // strnlen semantics: stop at n even without a terminator —
+        // strlen could read past the caller's bounded buffer.
+        let mut len = 0;
+        while len < n && *s.add(len) != 0 {
+            len += 1;
+        }
+        let p = malloc_zone_malloc(guest_zone(), len + 1) as *mut i8;
+        if !p.is_null() {
+            memcpy(p.cast(), s.cast(), len);
+            *p.add(len) = 0;
+        }
+        p
+    }
+}
+
+#[cfg(target_os = "macos")]
+extern "C" fn sh_guest_new(size: usize) -> *mut c_void {
+    // operator new must not return null — spin until it succeeds is
+    // what libc++ does under -fno-exceptions; for us a null means the
+    // guest heap is genuinely exhausted, so abort loudly instead.
+    let p = unsafe { malloc_zone_malloc(guest_zone(), size.max(1)) };
+    if p.is_null() {
+        eprintln!("[shim] guest operator new({size}) failed");
+        std::process::abort();
+    }
+    p
+}
+
+#[cfg(target_os = "macos")]
+extern "C" fn sh_guest_new_aligned(size: usize, align: usize) -> *mut c_void {
+    let p = unsafe { malloc_zone_memalign(guest_zone(), align.max(16), size.max(1)) };
+    if p.is_null() {
+        eprintln!("[shim] guest aligned operator new({size},{align}) failed");
+        std::process::abort();
+    }
+    p
+}
+
+/// nothrow new variants must return null on failure, never abort.
+#[cfg(target_os = "macos")]
+extern "C" fn sh_guest_new_nothrow(size: usize) -> *mut c_void {
+    unsafe { malloc_zone_malloc(guest_zone(), size.max(1)) }
+}
+
+#[cfg(target_os = "macos")]
+extern "C" fn sh_guest_new_aligned_nothrow(size: usize, align: usize) -> *mut c_void {
+    unsafe { malloc_zone_memalign(guest_zone(), align.max(16), size.max(1)) }
+}
+
+#[cfg(target_os = "macos")]
+extern "C" fn sh_guest_delete(ptr: *mut c_void) {
+    sh_free(ptr)
+}
+
 extern "C" fn sh_atoi(s: *const i8) -> i32 {
     unsafe {
         let mut n = 0i32;
@@ -618,6 +1003,87 @@ extern "C" fn sh_atoi(s: *const i8) -> i32 {
     }
 }
 
+/// Bionic data symbols (STT_OBJECT) — storage is guest-zone memory so
+/// the guest reads real bytes. `_ctype_` is indexed by signed char
+/// (-128..=255): the export points 128 entries into a 384-byte table.
+fn data_shim(name: &str) -> Option<usize> {
+    match name {
+        "_ctype_" => Some(ctype_table()),
+        // libc++abi handler variables: a cell the guest reads/writes;
+        // defaulted to a terminating stub like Bionic's defaults.
+        "__cxa_terminate_handler" | "__cxa_unexpected_handler" | "__cxa_new_handler" => {
+            Some(cxa_handler_cell(name))
+        }
+        _ => None,
+    }
+}
+
+#[cfg(target_os = "macos")]
+fn cxa_handler_cell(name: &str) -> usize {
+    static C: std::sync::LazyLock<Mutex<HashMap<String, usize>>> =
+        std::sync::LazyLock::new(|| Mutex::new(HashMap::new()));
+    let mut m = C.lock().unwrap();
+    if let Some(&a) = m.get(name) {
+        return a;
+    }
+    // One cell per name, leaked into the guest zone.
+    let a = unsafe {
+        let p = malloc_zone_calloc(guest_zone(), 8, 1) as *mut u64;
+        *p = sh_terminate as *const () as usize as u64;
+        p as usize
+    };
+    m.insert(name.to_string(), a);
+    a
+}
+
+#[cfg(not(target_os = "macos"))]
+fn cxa_handler_cell(_name: &str) -> usize {
+    0
+}
+
+#[cfg(target_os = "macos")]
+fn ctype_table() -> usize {
+    static T: OnceLock<usize> = OnceLock::new();
+    *T.get_or_init(|| unsafe {
+        // Bionic bits/ctype.h flags.
+        const U: u8 = 0x01;
+        const L: u8 = 0x02;
+        const N: u8 = 0x04;
+        const S: u8 = 0x08;
+        const P: u8 = 0x10;
+        const C: u8 = 0x20;
+        const X: u8 = 0x40;
+        const B: u8 = 0x80;
+        // `_ctype_` is a `const unsigned char*` variable — the guest
+        // dereferences the symbol to a pointer first, then indexes it by
+        // signed char (-128..=255), so the stored pointer is offset 128.
+        let p = malloc_zone_calloc(guest_zone(), 384 + 8, 1) as *mut u8;
+        let table = p.add(8);
+        for c in 0..=127u8 {
+            let f = match c {
+                9 => C | S | B,
+                10..=13 => C | S,
+                0..=8 | 14..=31 | 127 => C,
+                32 => S | B,
+                b'0'..=b'9' => N | X,
+                b'A'..=b'F' => U | X,
+                b'G'..=b'Z' => U,
+                b'a'..=b'f' => L | X,
+                b'g'..=b'z' => L,
+                _ => P, // ASCII punctuation runs
+            };
+            *table.add(c as usize + 128) = f;
+        }
+        *(p as *mut u64) = table.add(128) as u64;
+        p as usize
+    })
+}
+
+#[cfg(not(target_os = "macos"))]
+fn ctype_table() -> usize {
+    0
+}
+
 fn builtin_shim(name: &str) -> Option<usize> {
     Some(match name {
         "__cxa_pure_virtual" => sh_pure_virtual as *const () as usize,
@@ -625,10 +1091,68 @@ fn builtin_shim(name: &str) -> Option<usize> {
         "__cxa_finalize" => sh_cxa_finalize as *const () as usize,
         "__cxa_atexit" => sh_cxa_atexit as *const () as usize,
         "atoi" | "strtol" => sh_atoi as *const () as usize,
+        #[cfg(target_os = "macos")]
+        "malloc" => sh_malloc as *const () as usize,
+        #[cfg(target_os = "macos")]
+        "_Znwm" | "_Znam" => sh_guest_new as *const () as usize,
+        #[cfg(target_os = "macos")]
+        "_ZnwmRKSt9nothrow_t" | "_ZnamRKSt9nothrow_t" => {
+            sh_guest_new_nothrow as *const () as usize
+        }
+        #[cfg(target_os = "macos")]
+        "_ZnwmSt11align_val_t" | "_ZnamSt11align_val_t" => {
+            sh_guest_new_aligned as *const () as usize
+        }
+        #[cfg(target_os = "macos")]
+        "_ZnwmSt11align_val_tRKSt9nothrow_t" | "_ZnamSt11align_val_tRKSt9nothrow_t" => {
+            sh_guest_new_aligned_nothrow as *const () as usize
+        }
+        #[cfg(target_os = "macos")]
+        "free" | "_ZdlPv" | "_ZdaPv" | "_ZdlPvm" | "_ZdaPvm" | "_ZdlPvRKSt9nothrow_t"
+        | "_ZdaPvRKSt9nothrow_t" | "_ZdlPvSt11align_val_t" | "_ZdaPvSt11align_val_t"
+        | "_ZdlPvmSt11align_val_t" | "_ZdaPvmSt11align_val_t"
+        | "_ZdlPvSt11align_val_tRKSt9nothrow_t" | "_ZdaPvSt11align_val_tRKSt9nothrow_t" => {
+            sh_guest_delete as *const () as usize
+        }
+        #[cfg(target_os = "macos")]
+        "calloc" => sh_calloc as *const () as usize,
+        #[cfg(target_os = "macos")]
+        "realloc" => sh_realloc as *const () as usize,
+        #[cfg(target_os = "macos")]
+        "memalign" | "aligned_alloc" => sh_memalign as *const () as usize,
+        #[cfg(target_os = "macos")]
+        "valloc" => sh_valloc as *const () as usize,
+        #[cfg(target_os = "macos")]
+        "pvalloc" => sh_pvalloc as *const () as usize,
+        #[cfg(target_os = "macos")]
+        "posix_memalign" => sh_posix_memalign as *const () as usize,
+        #[cfg(target_os = "macos")]
+        "malloc_usable_size" | "malloc_size" => sh_malloc_usable_size as *const () as usize,
+        #[cfg(target_os = "macos")]
+        "strdup" => sh_strdup as *const () as usize,
+        #[cfg(target_os = "macos")]
+        "strndup" => sh_strndup as *const () as usize,
         "sincosf" => sh_sincosf as *const () as usize,
         "sincos" => sh_sincos as *const () as usize,
         "__strlen_chk" => sh_strlen_chk as *const () as usize,
         "__strcpy_chk" => sh_strcpy_chk as *const () as usize,
+        "__strncpy_chk2" => sh_strncpy_chk2 as *const () as usize,
+        "__strchr_chk" => sh_strchr_chk as *const () as usize,
+        "__memmove_chk" => sh_memmove_chk as *const () as usize,
+        "__strcat_chk" => sh_strcat_chk as *const () as usize,
+        "__vsnprintf_chk" => sh_vsnprintf_chk as *const () as usize,
+        "__errno" => sh_errno as *const () as usize,
+        "__assert2" => sh_assert2 as *const () as usize,
+        "getauxval" => sh_zero as *const () as usize,
+        "prctl" => sh_zero as *const () as usize,
+        "sched_setaffinity" => sh_zero as *const () as usize,
+        "syscall" => sh_neg1 as *const () as usize,
+        "gettid" => sh_gettid as *const () as usize,
+        "__open_2" => sh_open2 as *const () as usize,
+        "open" => sh_open as *const () as usize,
+        "__system_property_get" => sh_system_property_get as *const () as usize,
+        "sched_getaffinity" => sh_getaffinity as *const () as usize,
+        "lseek64" => lseek as *const () as usize,
         "__memcpy_chk" => sh_memcpy_chk as *const () as usize,
         "__memset_chk" => sh_memset_chk as *const () as usize,
         "dl_iterate_phdr" => sh_dl_iterate_phdr as *const () as usize,
@@ -869,6 +1393,9 @@ pub fn load_so(name: &str, elf: &[u8]) -> Result<NativeLib> {
             return Ok(a);
         }
         if let Some(a) = builtin_shim(&name) {
+            return Ok(a);
+        }
+        if let Some(a) = data_shim(&name) {
             return Ok(a);
         }
         if let Some(a) = host_dlsym(&name) {

@@ -174,6 +174,24 @@ pub fn fire_global_layout(vm: &mut Vm, root: u32) {
         }
         false
     }
+    // OnPreDraw fires before OnGlobalLayout in a real VTO pass —
+    // Glide's ViewTarget derives the view size here and kicks the
+    // request engine, which only then calls onSizeReady.
+    let predraw: Vec<u32> = vm
+        .vto_predraw
+        .iter()
+        .filter(|(obs, _)| match pseudo_get(vm, **obs, P_TARGET) {
+            Some(V::Ref(v)) => attached(vm, v, root),
+            _ => false,
+        })
+        .flat_map(|(_, ls)| ls.iter().copied())
+        .collect();
+    for l in predraw {
+        if std::env::var_os("OVELO_VIEWDBG").is_some() {
+            eprintln!("[viewdbg] onPreDraw h{l} {}", vm.dbg_class_of(l));
+        }
+        let _ = vm.call_virtual(l, "onPreDraw", &[]);
+    }
     let all: Vec<u32> = vm
         .vto_listeners
         .iter()
@@ -502,6 +520,7 @@ pub(crate) fn dex_view_info(vm: &Vm, h: u32) -> Option<DexViewInfo> {
     })
 }
 
+
 /// `ImageView.getDrawable()` — the stored image source normalized to a
 /// Drawable-typed object: guest Drawable instances pass through; bare
 /// values (Bitmap host, res-id int, Uri/path object) get wrapped in a
@@ -585,6 +604,14 @@ fn image_pixels_at(
                         .values()
                         .find_map(|f| image_pixels_at(vm, *f, depth + 1))
                 }
+                // LayerDrawable/TransitionDrawable keep their drawables
+                // in an array field — the topmost (last) layer wins: a
+                // TransitionDrawable's "to" drawable is the real image,
+                // layer[0] is a (often blank) placeholder.
+                Some(Obj::Array { data, .. }) => data
+                    .iter()
+                    .rev()
+                    .find_map(|f| image_pixels_at(vm, *f, depth + 1)),
                 _ => None,
             }),
         _ => None,
@@ -1021,6 +1048,48 @@ pub(crate) fn call(
             );
             Some(None)
         }
+        // Framework-stub ViewGroups have no dex `generateLayoutParams`:
+        // fabricate a host LP whose `width`/`height`/margin fields are
+        // parsed from the child's attrs by lp_ctor — otherwise inflated
+        // children carry an empty LP and `iget lp.width` reads 0 forever
+        // (Glide's SizeDeterminer waits on it).
+        "generateLayoutParams" => {
+            let arg = args
+                .get(1)
+                .copied()
+                .filter(|a| matches!(a, V::Ref(h) if *h != 0));
+            let v = match arg {
+                // AOSP: a null/nullable arg defers to
+                // generateDefaultLayoutParams — never inherit the
+                // parent's own attrs (the child would copy e.g. a
+                // 0dp layout_height and vanish).
+                None => default_lp(vm, this),
+                Some(a) => {
+                    let lp = lp_class_for(vm, this);
+                    let h = vm.alloc_host(&lp, HostState::Empty);
+                    if class_of(vm, a).contains("LayoutParams") {
+                        // generateLayoutParams(LayoutParams): copy ctor.
+                        lp_ctor(
+                            vm,
+                            &lp,
+                            "(Landroid/view/ViewGroup$LayoutParams;)V",
+                            &[V::Ref(h), a],
+                        );
+                    } else {
+                        let ctx = pseudo_get(vm, this, P_CONTEXT).unwrap_or(V::Ref(0));
+                        lp_ctor(
+                            vm,
+                            &lp,
+                            "(Landroid/content/Context;Landroid/util/AttributeSet;)V",
+                            &[V::Ref(h), ctx, a],
+                        );
+                    }
+                    V::Ref(h)
+                }
+            };
+            Some(Some(v))
+        }
+        "generateDefaultLayoutParams" => Some(Some(default_lp(vm, this))),
         "getChildCount" => {
             let n = children(vm, this).len();
             if std::env::var_os("OVELO_VIEWDBG").is_some() {
@@ -1222,15 +1291,31 @@ pub(crate) fn call(
             }
             Some(None)
         }
-        // Other observer listener kinds are accepted but never fired
-        // (preDraw returning false would suppress drawing).
-        "addOnPreDrawListener"
-        | "addOnDrawListener"
+        "addOnPreDrawListener" => {
+            if std::env::var_os("OVELO_VIEWDBG").is_some() {
+                eprintln!("[viewdbg] addOnPreDrawListener obs={this} args={args:?}");
+            }
+            if let Some(&V::Ref(l)) = args.get(1) {
+                if l != 0 {
+                    vm.vto_predraw.entry(this).or_default().push(l);
+                }
+            }
+            Some(None)
+        }
+        "removeOnPreDrawListener" => {
+            if let Some(&V::Ref(l)) = args.get(1) {
+                if let Some(ls) = vm.vto_predraw.get_mut(&this) {
+                    ls.retain(|x| *x != l);
+                }
+            }
+            Some(None)
+        }
+        // Other observer listener kinds are accepted but never fired.
+        "addOnDrawListener"
         | "addOnScrollChangedListener"
         | "addOnTouchModeChangeListener"
         | "addOnWindowAttachListener"
         | "addOnWindowFocusChangeListener"
-        | "removeOnPreDrawListener"
         | "removeOnDrawListener"
         | "removeOnScrollChangedListener"
         | "removeOnTouchModeChangeListener"
@@ -1239,12 +1324,23 @@ pub(crate) fn call(
         | "addOnWindowShownListener"
         | "removeOnWindowShownListener"
         | "dispatchOnGlobalLayout"
-        | "dispatchOnPreDraw"
-        | "isAlive" => Some(if name == "isAlive" || name == "dispatchOnPreDraw" {
+        | "isAlive" => Some(if name == "isAlive" {
             Some(V::I32(1))
         } else {
             None
         }),
+        "dispatchOnPreDraw" => {
+            // AOSP contract: returns true when a listener CANCELLED the
+            // draw (any onPreDraw returned false) — not "proceed".
+            let ls: Vec<u32> = vm.vto_predraw.get(&this).cloned().unwrap_or_default();
+            let mut cancel = false;
+            for l in ls {
+                if let Ok(Some(V::I32(0))) = vm.call_virtual(l, "onPreDraw", &[]) {
+                    cancel = true;
+                }
+            }
+            Some(Some(V::I32(cancel as i32)))
+        }
         "getParent" => Some(Some(pseudo_get(vm, this, P_PARENT).unwrap_or(V::Ref(0)))),
         "getRootView" => {
             let mut cur = this;
@@ -1395,6 +1491,18 @@ pub(crate) fn call(
                     _ => "primitive".into(),
                 };
                 eprintln!("[viewdbg] {desc}.getLayoutParams h{this} -> {lp_desc}");
+                if let V::Ref(lh) = lp {
+                    let dump: Vec<String> = match vm.heap.get(lh) {
+                        Some(Obj::Instance { fields, .. }) | Some(Obj::Host { fields, .. }) => {
+                            fields
+                                .iter()
+                                .map(|(g, v)| format!("{g}={v:?}"))
+                                .collect()
+                        }
+                        _ => Vec::new(),
+                    };
+                    eprintln!("[viewdbg]   lp h{lh} fields {dump:?}");
+                }
             }
             Some(Some(lp))
         }
@@ -2404,11 +2512,12 @@ fn layout_params(vm: &mut Vm, this: u32) -> V {
             }
         }
     }
-    let v = host(
-        vm,
-        "Landroid/view/ViewGroup$LayoutParams;",
-        HostState::Empty,
-    );
+    // Last resort: a host LP, but populated from the child's attrs via
+    // lp_ctor — an empty placeholder leaves `iget lp.width` reading 0.
+    let v = match pseudo_get(vm, this, P_PARENT) {
+        Some(V::Ref(p)) if p != 0 => gen_lp(vm, p, attrs),
+        _ => host(vm, "Landroid/view/ViewGroup$LayoutParams;", HostState::Empty),
+    };
     pseudo_set(vm, this, P_LP, v);
     if std::env::var_os("OVELO_VIEWDBG").is_some() {
         let p = match pseudo_get(vm, this, P_PARENT) {
@@ -2744,7 +2853,7 @@ fn group_measure_fallback(vm: &mut Vm, this: u32, pw: i32, ph: i32) {
     let desc = class_of(vm, V::Ref(this));
     let linear = desc.contains("LinearLayout") || vm.extends_named(&desc, "LinearLayout");
     let (mut cw, mut chh) = (0i32, 0i32);
-    for c in kids {
+    for c in kids.iter().copied() {
         let V::Ref(ch) = c else { continue };
         if ch == 0 {
             continue;
@@ -2756,17 +2865,131 @@ fn group_measure_fallback(vm: &mut Vm, this: u32, pw: i32, ph: i32) {
         measure_child(vm, this, ch, pw, 0, ph, if linear { chh } else { 0 }, true);
         let w = pint(vm, ch, P_MEAS_W) & 0x00FF_FFFF;
         let hh = pint(vm, ch, P_MEAS_H) & 0x00FF_FFFF;
+        // AOSP's mTotalLength / FrameLayout maxHeight fold in the
+        // child's vertical margins — omitting them under-reports the
+        // group's own height and starves the match_parent re-measure
+        // below of space that was never accounted for.
+        let lp_obj = match pseudo_get(vm, ch, P_LP) {
+            Some(V::Ref(l)) => l,
+            _ => 0,
+        };
+        let mv = lp_field(vm, lp_obj, "topMargin")
+            .and_then(|v| lp_px(vm, v))
+            .or_else(|| attr_find(vm, ch, "layout_marginTop").map(|v| len_v(vm, v)))
+            .unwrap_or(0)
+            + lp_field(vm, lp_obj, "bottomMargin")
+                .and_then(|v| lp_px(vm, v))
+                .or_else(|| attr_find(vm, ch, "layout_marginBottom").map(|v| len_v(vm, v)))
+                .unwrap_or(0);
         cw = cw.max(w);
         // LinearLayout stacks: consumed height accumulates; the rest
         // report their tallest child (FrameLayout semantics).
         if linear {
-            chh += hh;
+            chh += hh + mv;
         } else {
-            chh = chh.max(hh);
+            chh = chh.max(hh + mv);
         }
     }
-    pseudo_set(vm, this, P_MEAS_W, V::I32(resolve_size(cw + pad_w, pw, true)));
-    pseudo_set(vm, this, P_MEAS_H, V::I32(resolve_size(chh + pad_h, ph, true)));
+    let self_w = resolve_size(cw + pad_w, pw, true).max(0);
+    let self_h = resolve_size(chh + pad_h, ph, true).max(0);
+    // Negative extents (e.g. 0-height child with negative margins)
+    // must not be stored — getMeasuredHeight masks to 24 bits and a
+    // negative would read back as ~16M px.
+    pseudo_set(vm, this, P_MEAS_W, V::I32(self_w));
+    pseudo_set(vm, this, P_MEAS_H, V::I32(self_h));
+    // AOSP ViewGroup#measureMatchParentChildren: under a non-EXACTLY
+    // parent spec a match_parent child measures UNSPEC/0 first, then
+    // gets a second pass at EXACTLY(resolved - padding - margins).
+    // Without it match_parent children of a wrap/unspec container
+    // stay 0×0 forever — the grid cell's thumbnail never gets a
+    // frame and Glide's SizeDeterminer waits on getWidth()>0.
+    const EXACTLY: i32 = 1 << 30;
+    const MODE_MASK: i32 = 0x3 << 30;
+    if (pw & MODE_MASK) != EXACTLY || (ph & MODE_MASK) != EXACTLY {
+        let cw_in = self_w - pad_w;
+        let ch_in = self_h - pad_h;
+        if cw_in > 0 || ch_in > 0 {
+            // AOSP LinearLayout#measureVertical re-measures each
+            // match_parent child with `delta = height - mTotalLength`
+            // (non-match children plus every margin) — not the full
+            // resolved height, which would stack it past the bottom.
+            let (nonmatch_h, match_margins_h) = if linear {
+                kids.iter().copied().fold((0i32, 0i32), |(nm, mm), c| {
+                    let V::Ref(ch) = c else {
+                        return (nm, mm);
+                    };
+                    if ch == 0 {
+                        return (nm, mm);
+                    }
+                    let lp_obj = match pseudo_get(vm, ch, P_LP) {
+                        Some(V::Ref(l)) => l,
+                        _ => 0,
+                    };
+                    let lph = lp_field(vm, lp_obj, "height")
+                        .and_then(|v| lp_px(vm, v))
+                        .or_else(|| attr_find(vm, ch, "layout_height").map(|v| len_v(vm, v)))
+                        .unwrap_or(-2);
+                    let mv = lp_field(vm, lp_obj, "topMargin")
+                        .and_then(|v| lp_px(vm, v))
+                        .unwrap_or(0)
+                        + lp_field(vm, lp_obj, "bottomMargin")
+                            .and_then(|v| lp_px(vm, v))
+                            .unwrap_or(0);
+                    if lph == -1 {
+                        (nm, mm + mv)
+                    } else {
+                        (nm + (pint(vm, ch, P_MEAS_H) & 0x00FF_FFFF) + mv, mm)
+                    }
+                })
+            } else {
+                (0, 0)
+            };
+            let match_h = (ch_in - nonmatch_h - match_margins_h).max(0);
+            for c in kids.iter().copied() {
+                let V::Ref(ch) = c else { continue };
+                if ch == 0 {
+                    continue;
+                }
+                let lp_obj = match pseudo_get(vm, ch, P_LP) {
+                    Some(V::Ref(l)) => l,
+                    _ => 0,
+                };
+                let dim = |field: &str, xml: &str| {
+                    lp_field(vm, lp_obj, field)
+                        .and_then(|v| lp_px(vm, v))
+                        .or_else(|| attr_find(vm, ch, xml).map(|v| len_v(vm, v)))
+                        .unwrap_or(-2)
+                };
+                let (lpw, lph) = (dim("width", "layout_width"), dim("height", "layout_height"));
+                if lpw != -1 && lph != -1 {
+                    continue;
+                }
+                let marg = |name: &str| {
+                    lp_field(vm, lp_obj, name)
+                        .and_then(|v| lp_px(vm, v))
+                        .unwrap_or(0)
+                };
+                let mh = marg("leftMargin") + marg("rightMargin");
+                let mv = marg("topMargin") + marg("bottomMargin");
+                let ws = if lpw == -1 {
+                    EXACTLY | (cw_in - mh).max(0)
+                } else {
+                    child_measure_spec(pw, pad_w + mh, lpw)
+                };
+                let hs = if lph == -1 {
+                    EXACTLY
+                        | if linear {
+                            match_h
+                        } else {
+                            (ch_in - mv).max(0)
+                        }
+                } else {
+                    child_measure_spec(ph, pad_h + mv, lph)
+                };
+                let _ = vm.call_virtual(ch, "measure", &[V::I32(ws), V::I32(hs)]);
+            }
+        }
+    }
 }
 
 /// Generic `onLayout` for framework skeleton containers: FrameLayout
@@ -3247,6 +3470,61 @@ fn lp_ctor(vm: &mut Vm, class: &str, sig: &str, args: &[V]) {
             }
         }
     }
+}
+
+/// `Foo$LayoutParams` name for the nearest ancestor that declares one:
+/// a dex subclass with no LP type of its own yields its framework
+/// parent's canonical LP (`FrameLayout$LayoutParams`), not an invented
+/// `MyFrame$LayoutParams` a dex `check-cast` would reject. A
+/// dex-defined `Foo$LayoutParams` wins at each level, then the first
+/// `Landroid/` ancestor's canonical name, else the ViewGroup base.
+fn lp_class_for(vm: &Vm, parent: u32) -> String {
+    let mut d = class_of(vm, V::Ref(parent));
+    for _ in 0..32 {
+        let cand = format!("{}$LayoutParams;", d.trim_end_matches(';'));
+        let dex_def = vm
+            .type_index_of(&cand)
+            .and_then(|g| vm.def_loc_of(g))
+            .is_some();
+        if dex_def || d.starts_with("Landroid/") {
+            return cand;
+        }
+        match vm.super_desc(&d) {
+            Some(s) if s != d => d = s,
+            _ => break,
+        }
+    }
+    "Landroid/view/ViewGroup$LayoutParams;".to_string()
+}
+
+/// Default `Foo$LayoutParams` (wrap_content × wrap_content) for a
+/// host-stub parent.
+fn default_lp(vm: &mut Vm, parent: u32) -> V {
+    let lp = lp_class_for(vm, parent);
+    let h = vm.alloc_host(&lp, HostState::Empty);
+    lp_ctor(
+        vm,
+        &lp,
+        "(II)V",
+        &[V::Ref(h), V::I32(-2), V::I32(-2)],
+    );
+    V::Ref(h)
+}
+
+/// Host-fabricated `ViewGroup$LayoutParams` for framework-stub parents:
+/// a host object whose field map `lp_ctor` fills from the child attrs,
+/// so dex `iget lp.width`/`lp.height` reads real dims (-1/-2/px).
+fn gen_lp(vm: &mut Vm, parent: u32, attrs: V) -> V {
+    let lp = lp_class_for(vm, parent);
+    let ctx = pseudo_get(vm, parent, P_CONTEXT).unwrap_or(V::Ref(0));
+    let h = vm.alloc_host(&lp, HostState::Empty);
+    lp_ctor(
+        vm,
+        &lp,
+        "(Landroid/content/Context;Landroid/util/AttributeSet;)V",
+        &[V::Ref(h), ctx, attrs],
+    );
+    V::Ref(h)
 }
 
 fn is_group_tag(tag: &str) -> bool {
