@@ -1434,14 +1434,14 @@ pub(crate) fn host_supers(d: &str) -> &'static [&'static str] {
             "Ljava/io/Serializable;",
             OBJ,
         ],
-        "Ljava/util/Collections$EmptyIterator;" => &["Ljava/util/Iterator;", OBJ],
+        "Ljava/util/Collections$EmptyIterator;" => &[OBJ, "Ljava/util/Iterator;"],
         "Ljava/util/Collections$EmptyListIterator;" => &[
+            OBJ,
             "Ljava/util/ListIterator;",
             "Ljava/util/Iterator;",
-            OBJ,
         ],
         "Ljava/util/Collections$EmptyEnumeration;" => {
-            &["Ljava/util/Enumeration;", OBJ]
+            &[OBJ, "Ljava/util/Enumeration;"]
         }
         "Ljava/util/Collections$SingletonList;" => &[
             "Ljava/util/AbstractList;",
@@ -1479,10 +1479,10 @@ pub(crate) fn host_supers(d: &str) -> &'static [&'static str] {
             OBJ,
         ],
         "Ljava/util/Collections$UnmodifiableCollection;" => &[
+            OBJ,
             "Ljava/util/Collection;",
             "Ljava/lang/Iterable;",
             "Ljava/io/Serializable;",
-            OBJ,
         ],
         "Ljava/util/Collections$UnmodifiableList;" => &[
             "Ljava/util/Collections$UnmodifiableCollection;",
@@ -1501,13 +1501,13 @@ pub(crate) fn host_supers(d: &str) -> &'static [&'static str] {
             OBJ,
         ],
         "Ljava/util/Collections$UnmodifiableMap;" => {
-            &["Ljava/util/Map;", "Ljava/io/Serializable;", OBJ]
+            &[OBJ, "Ljava/util/Map;", "Ljava/io/Serializable;"]
         }
         "Ljava/util/Collections$SynchronizedCollection;" => &[
+            OBJ,
             "Ljava/util/Collection;",
             "Ljava/lang/Iterable;",
             "Ljava/io/Serializable;",
-            OBJ,
         ],
         "Ljava/util/Collections$SynchronizedList;" => &[
             "Ljava/util/Collections$SynchronizedCollection;",
@@ -1524,15 +1524,15 @@ pub(crate) fn host_supers(d: &str) -> &'static [&'static str] {
             OBJ,
         ],
         "Ljava/util/Collections$SynchronizedMap;" => &[
+            OBJ,
             "Ljava/util/Map;",
             "Ljava/io/Serializable;",
-            OBJ,
         ],
         "Ljava/util/Collections$CheckedCollection;" => &[
+            OBJ,
             "Ljava/util/Collection;",
             "Ljava/lang/Iterable;",
             "Ljava/io/Serializable;",
-            OBJ,
         ],
         "Ljava/util/Collections$CheckedList;" => &[
             "Ljava/util/Collections$CheckedCollection;",
@@ -1548,7 +1548,7 @@ pub(crate) fn host_supers(d: &str) -> &'static [&'static str] {
             "Ljava/lang/Iterable;",
             OBJ,
         ],
-        "Ljava/util/Collections$CheckedMap;" => &["Ljava/util/Map;", OBJ],
+        "Ljava/util/Collections$CheckedMap;" => &[OBJ, "Ljava/util/Map;"],
         "Ljava/util/AbstractSequentialList;" => &[
             "Ljava/util/AbstractList;",
             "Ljava/util/AbstractCollection;",
