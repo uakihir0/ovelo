@@ -1075,6 +1075,110 @@ pub(crate) fn sfield(vm: &mut Vm, owner: &str, name: &str, ftype: &str) -> Optio
                 HostState::StrBuf(format!("content://media/{vol}/{media}")),
             ));
         }
+        // Other android.provider contract *_URI statics — SMS/contacts/
+        // call-log/calendar apps sget them and `checkNotNull` on the
+        // value, so a null here aborts whole data paths (fossify
+        // messages' getConversations died on BlockedNumberContract).
+        (o, "CONTENT_URI" | "AUTHORITY_URI" | "BASE_CONTENT_URI")
+            if o.starts_with("Landroid/provider/") =>
+        {
+            let body = o
+                .trim_start_matches("Landroid/provider/")
+                .trim_end_matches(';');
+            let uri = match body {
+                "Telephony$Sms" => "content://sms",
+                "Telephony$Sms$Inbox" => "content://sms/inbox",
+                "Telephony$Sms$Sent" => "content://sms/sent",
+                "Telephony$Sms$Draft" => "content://sms/draft",
+                "Telephony$Sms$Outbox" => "content://sms/outbox",
+                "Telephony$Sms$Conversations" => "content://sms/conversations",
+                "Telephony$Mms" => "content://mms",
+                "Telephony$Mms$Inbox" => "content://mms/inbox",
+                "Telephony$Mms$Sent" => "content://mms/sent",
+                "Telephony$Mms$Draft" => "content://mms/draft",
+                "Telephony$Mms$Outbox" => "content://mms/outbox",
+                "Telephony$Threads" => "content://mms-sms/conversations",
+                "Telephony$MmsSms" => "content://mms-sms",
+                "Telephony$MmsSms$PendingMessages" => {
+                    "content://mms-sms/pending"
+                }
+                "Telephony$CanonicalAddresses" => {
+                    "content://mms-sms/canonical-addresses"
+                }
+                "Telephony$CarrierMessages" => "content://carrier_information",
+                "BlockedNumberContract$BlockedNumbers" => {
+                    "content://com.android.blockednumber/blocked"
+                }
+                "CallLog$Calls" => "content://call_log/calls",
+                "ContactsContract$Contacts" => {
+                    "content://com.android.contacts/contacts"
+                }
+                "ContactsContract$RawContacts" => {
+                    "content://com.android.contacts/raw_contacts"
+                }
+                "ContactsContract$Data" => "content://com.android.contacts/data",
+                "ContactsContract$CommonDataKinds$Phone" => {
+                    "content://com.android.contacts/data/phones"
+                }
+                "ContactsContract$CommonDataKinds$Email" => {
+                    "content://com.android.contacts/data/emails"
+                }
+                "ContactsContract$CommonDataKinds$StructuredName" => {
+                    "content://com.android.contacts/data"
+                }
+                "ContactsContract$CommonDataKinds$Photo" => {
+                    "content://com.android.contacts/data/photos"
+                }
+                "ContactsContract$Groups" => {
+                    "content://com.android.contacts/groups"
+                }
+                "ContactsContract$PhoneLookup" => {
+                    "content://com.android.contacts/phone_lookup"
+                }
+                "CalendarContract$Events" => {
+                    "content://com.android.calendar/events"
+                }
+                "CalendarContract$Calendars" => {
+                    "content://com.android.calendar/calendars"
+                }
+                "CalendarContract$Instances" => {
+                    "content://com.android.calendar/instances/when"
+                }
+                "CalendarContract$Reminders" => {
+                    "content://com.android.calendar/reminders"
+                }
+                "CalendarContract$Attendees" => {
+                    "content://com.android.calendar/attendees"
+                }
+                "UserDictionary$Words" => "content://user_dictionary/words",
+                "VoicemailContract$Voicemails" => {
+                    "content://com.android.voicemail/voicemails"
+                }
+                "Settings$System" => "content://settings/system",
+                "Settings$Secure" => "content://settings/secure",
+                "Settings$Global" => "content://settings/global",
+                "DocumentsContract$Document" => "content://com.android.externalstorage.documents",
+                "DocumentsContract$Root" => {
+                    "content://com.android.externalstorage.documents/root"
+                }
+                _ => "",
+            };
+            // Fallback for unmapped contracts: a deterministic URI built
+            // from the class name — never null, so `checkNotNull` sites
+            // survive; queries on it just return the empty cursor.
+            let uri = if uri.is_empty() {
+                format!(
+                    "content://com.android.{}",
+                    body.split('$')
+                        .collect::<Vec<_>>()
+                        .join("/")
+                        .to_lowercase()
+                )
+            } else {
+                uri.to_string()
+            };
+            return Some(host(vm, "Landroid/net/Uri;", HostState::StrBuf(uri)));
+        }
         _ if ftype == owner => {
             // Self-typed constant on a host class: an enum constant
             // (TimeUnit.SECONDS, TimeUnit.MILLISECONDS, …). The pseudo

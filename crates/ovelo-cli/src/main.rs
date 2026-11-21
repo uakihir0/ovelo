@@ -974,7 +974,9 @@ fn run_app(store: &InstallStore, package: &str) -> Result<(), OveloError> {
                 // normal-level; the rest stay denied until the app
                 // calls requestPermissions.
                 v.grant_manifest_permissions(&info.manifest.permissions);
-                v.enable_aot();
+                if std::env::var_os("OVELO_NO_AOT").is_none() {
+                    v.enable_aot();
+                }
                 register_compat_shims(
                     &mut v,
                     &info.manifest.startup_initializers,
