@@ -252,32 +252,35 @@ pub fn parse_arsc(b: &[u8]) -> Result<Vec<ResourcePackage>> {
 
 fn config_name(b: &[u8], off: usize, size: usize) -> String {
     let size = size.min(b.len().saturating_sub(off));
-    // ResTable_config: imsi(4) locale(4) screenType(4) input(4) screenSize(4)
-    // version(4) screenConfig(4) screenSizeDp(4) localeScript(4)...
-    // Keep it pragmatic: locale bytes + density bucket.
+    // ResTable_config (off points at its `size` u32):
+    //   +4  imsi   : mcc u16, mnc u16
+    //   +8  locale : language[2], country[2]   — each either two ASCII
+    //                chars or a 0x8000-tagged packed 3-char code
+    //   +12 screenType : orientation u8, touchscreen u8, density u16
+    //   +16 input, +20 screenSize, +24 version, +28 screenConfig…
     let mut parts = Vec::new();
-    if size >= 8 {
-        let lang = b[off + 4];
-        let region = b[off + 5];
-        if lang != 0 {
-            let l = if lang & 0x80 != 0 {
-                // packed 3-letter code
-                format!(
-                    "{}{}{}",
-                    (b'a' + ((b[off + 4] >> 2) & 0x1f)) as char,
-                    (b'a' + (((b[off + 4] & 0x3) << 3) | ((b[off + 5] >> 5) & 0x7))) as char,
-                    (b'a' + (b[off + 5] & 0x1f)) as char
-                )
+    let packed = |c0: u8, c1: u8, base: u8| -> String {
+        // byte0 is the high byte of the packed u16; chars sit in 5-bit
+        // groups as base+1..base+26.
+        let v = ((c0 as u16) << 8) | c1 as u16;
+        let c = |s: u16| (base.wrapping_sub(1) + ((v >> s) & 0x1f) as u8) as char;
+        format!("{}{}{}", c(10), c(5), c(0))
+    };
+    if size >= 12 {
+        let lang = [b[off + 8], b[off + 9]];
+        let region = [b[off + 10], b[off + 11]];
+        if lang != [0, 0] {
+            let l = if lang[0] & 0x80 != 0 {
+                packed(lang[0], lang[1], b'a')
             } else {
-                (lang as char).to_string()
+                String::from_utf8_lossy(&lang).to_string()
             };
-            let r = if region & 0x80 != 0 {
-                let n = (((b[off + 5] >> 2) & 0x1f) << 4) | ((b[off + 5] >> 1) & 0x0f);
-                format!("{n}")
-            } else if region != 0 {
-                (region as char).to_string()
-            } else {
+            let r = if region == [0, 0] {
                 String::new()
+            } else if region[0] & 0x80 != 0 {
+                packed(region[0], region[1], b'0')
+            } else {
+                String::from_utf8_lossy(&region).to_string()
             };
             if r.is_empty() {
                 parts.push(l);
@@ -287,7 +290,7 @@ fn config_name(b: &[u8], off: usize, size: usize) -> String {
         }
     }
     if size >= 16 {
-        let density = u16::from_le_bytes(b[off + 10..off + 12].try_into().unwrap());
+        let density = u16::from_le_bytes(b[off + 14..off + 16].try_into().unwrap());
         match density {
             0 => {}
             120 => parts.push("ldpi".into()),
