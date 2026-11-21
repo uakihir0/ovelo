@@ -39,18 +39,24 @@ extern "C" {
     fn strcpy(d: *mut i8, s: *const i8) -> *mut i8;
     #[cfg(target_os = "macos")]
     fn sys_icache_invalidate(start: *mut c_void, len: usize);
+    #[cfg(target_os = "macos")]
     fn sigaction(sig: i32, act: *const Sigaction, old: *mut Sigaction) -> i32;
+    #[cfg(target_os = "macos")]
     fn _exit(code: i32) -> !;
+    #[cfg(target_os = "macos")]
     fn write(fd: i32, buf: *const c_void, n: usize) -> isize;
+    #[cfg(target_os = "macos")]
     fn dladdr(addr: *const c_void, info: *mut DlInfo) -> i32;
 }
 
+#[cfg(target_os = "macos")]
 #[repr(C)]
 struct Sigaction {
     sa_sigaction: usize,
     sa_mask: u32,
     sa_flags: i32,
 }
+#[cfg(target_os = "macos")]
 #[repr(C)]
 struct DlInfo {
     dli_fname: *const i8,
