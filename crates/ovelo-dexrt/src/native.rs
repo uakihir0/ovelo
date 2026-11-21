@@ -568,7 +568,7 @@ extern "C" fn sh_getaffinity(_pid: i32, size: usize, mask: *mut u8) -> i32 {
         for i in 0..bytes {
             *mask.add(i) = 0xff;
         }
-        if cpus % 8 != 0 && bytes > 0 {
+        if !cpus.is_multiple_of(8) && bytes > 0 {
             *mask.add(bytes - 1) = (1 << (cpus % 8)) - 1;
         }
     }
