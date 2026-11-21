@@ -45,6 +45,13 @@ fn vm<T>(c: &'static str) -> Rt<T> {
     Err(E::Vm(err(c)))
 }
 
+/// A resolved method that returns void reports `None` — the same
+/// value `invoke` callers read as "unresolved, try the builtin path".
+/// Wrap it as a null placeholder so a handled call reads as handled.
+fn void_resolved(o: Option<V>) -> Option<V> {
+    o.or(Some(V::Ref(0)))
+}
+
 /// `(params)ret` descriptor for a proto index local to `d`.
 fn proto_sig(d: &DexFile, pidx: u32) -> Result<String> {
     let p = d.proto(pidx)?;
@@ -3084,14 +3091,19 @@ impl Vm {
                     &ret_desc,
                     matches!(kind, InvokeKind::Static),
                     &args,
-                );
+                )
+                .map(void_resolved);
             }
-            return self.stub_placeholder(loc.midx, &ret_desc, &name, &class, &args);
+            return self
+                .stub_placeholder(loc.midx, &ret_desc, &name, &class, &args)
+                .map(void_resolved);
         }
         if let Some(f) = self.aot.as_ref().and_then(|a| a.get(loc.midx)) {
-            return self.run_native(f, loc.midx, loc.em.code_off, args);
+            return self
+                .run_native(f, loc.midx, loc.em.code_off, args)
+                .map(void_resolved);
         }
-        self.exec(loc, args)
+        self.exec(loc, args).map(void_resolved)
     }
 
     /// JNI-facing wrappers — the `jni` module sits outside `Vm` but
