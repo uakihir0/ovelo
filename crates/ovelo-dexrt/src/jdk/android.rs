@@ -2081,7 +2081,21 @@ fn context_call(
         }
         "runOnUiThread" => {
             if let V::Ref(r) = args[1] {
-                let _ = vm.call_virtual(r, "run", &[]);
+                if std::env::var_os("OVELO_VIEWDBG").is_some() {
+                    eprintln!(
+                        "[viewdbg] runOnUiThread runnable={r} dex_run={}",
+                        vm.has_dex_virtual(r, "run", &[])
+                    );
+                }
+                if let Err(e) = vm.call_virtual(r, "run", &[]) {
+                    // The runnable is the app's UI-commit point — a throw
+                    // here means the data never reaches the view. Swallowing
+                    // it silently leaves every screen looking "empty for no
+                    // reason", so surface it under the debug flag.
+                    if std::env::var_os("OVELO_VIEWDBG").is_some() {
+                        eprintln!("[viewdbg] runOnUiThread runnable={r} err {e:?}");
+                    }
+                }
             }
             Some(None)
         }

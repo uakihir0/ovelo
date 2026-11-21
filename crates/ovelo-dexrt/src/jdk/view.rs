@@ -1102,17 +1102,40 @@ pub(crate) fn call(
                         Ok(Some(V::I32(n))) => n.clamp(0, 8),
                         _ => 0,
                     };
+                    let mut items: Vec<V> = Vec::new();
                     for i in 0..n {
-                        if let Err(e) =
-                            vm.call_virtual(ad, "instantiateItem", &[V::Ref(this), V::I32(i)])
+                        match vm.call_virtual(ad, "instantiateItem", &[V::Ref(this), V::I32(i)])
                         {
+                            Ok(v) => items.push(v.unwrap_or(V::I32(0))),
+                            Err(e) => {
+                                items.push(V::I32(0));
+                                if std::env::var_os("OVELO_VIEWDBG").is_some() {
+                                    eprintln!("[viewdbg] instantiateItem {i} err {e:?}");
+                                }
+                            }
+                        }
+                    }
+                    // FragmentStatePagerAdapter only promotes a fragment to
+                    // RESUMED via setPrimaryItem — instantiateItem alone caps
+                    // it at STARTED, so onResume (and the fragment's data
+                    // load) never runs. Drive it for the current page.
+                    let cur = match vm.call_virtual(this, "getCurrentItem", &[]) {
+                        Ok(Some(V::I32(i))) if n > 0 => i.clamp(0, n - 1) as usize,
+                        _ => 0,
+                    };
+                    if let Some(item) = items.get(cur).copied() {
+                        if let Err(e) = vm.call_virtual(
+                            ad,
+                            "setPrimaryItem",
+                            &[V::Ref(this), V::I32(cur as i32), item],
+                        ) {
                             if std::env::var_os("OVELO_VIEWDBG").is_some() {
-                                eprintln!("[viewdbg] instantiateItem {i} err {e:?}");
+                                eprintln!("[viewdbg] setPrimaryItem {cur} err {e:?}");
                             }
                         }
                     }
                     if std::env::var_os("OVELO_VIEWDBG").is_some() {
-                        eprintln!("[viewdbg] setAdapter {class} adapter={ad} count={n}");
+                        eprintln!("[viewdbg] setAdapter {class} adapter={ad} count={n} cur={cur}");
                     }
                 }
             }
