@@ -3816,10 +3816,11 @@ fn bounds_rect(vm: &mut Vm, h: u32) -> V {
 /// Decode real image bytes into a `Bitmap` host object. Empty or
 /// undecodable input -> null, matching `BitmapFactory` returning null.
 fn bitmap_decode(vm: &mut Vm, bytes: &[u8]) -> Option<V> {
-    if bytes.is_empty() {
+    // Undecodable input -> null, matching `BitmapFactory` returning null
+    // for corrupt/unsupported images (guest then null-checks normally).
+    let Ok(img) = image::load_from_memory(bytes) else {
         return Some(V::Ref(0));
-    }
-    let img = image::load_from_memory(bytes).ok()?;
+    };
     let rgba = img.to_rgba8();
     let (w, h) = rgba.dimensions();
     Some(host(
@@ -3851,6 +3852,16 @@ fn bitmap_dims(vm: &Vm, v: V) -> (u32, u32) {
 /// like object holding a bitmap in any ref field (BitmapDrawable.mBitmapState.mBitmap,
 /// Glide's BitmapDrawable, …).
 pub(crate) fn bitmap_pixels(vm: &Vm, v: V) -> Option<(u32, u32, std::rc::Rc<Vec<u8>>)> {
+    bitmap_pixels_at(vm, v, 0)
+}
+
+fn bitmap_pixels_at(vm: &Vm, v: V, depth: u32) -> Option<(u32, u32, std::rc::Rc<Vec<u8>>)> {
+    // Depth bound: drawable graphs can be cyclic (a container holding a
+    // ref back to itself) — without this the field walk overflows the
+    // host stack.
+    if depth > 8 {
+        return None;
+    }
     let V::Ref(h) = v else { return None };
     match vm.heap.get(h) {
         Some(Obj::Host {
@@ -3859,7 +3870,7 @@ pub(crate) fn bitmap_pixels(vm: &Vm, v: V) -> Option<(u32, u32, std::rc::Rc<Vec<
         }) => Some((*w, *h, rgba.clone())),
         Some(Obj::Instance { fields, .. }) | Some(Obj::Host { fields, .. }) => fields
             .values()
-            .find_map(|f| bitmap_pixels(vm, *f)),
+            .find_map(|f| bitmap_pixels_at(vm, *f, depth + 1)),
         _ => None,
     }
 }
