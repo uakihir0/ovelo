@@ -10,7 +10,7 @@
 
 use std::collections::HashMap;
 use std::ffi::{c_void, CString};
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 
 use ovelo_error::{ErrorCategory, OveloError, Phase, Result};
 
@@ -116,6 +116,9 @@ unsafe impl Sync for NativeLib {}
 
 impl Drop for NativeLib {
     fn drop(&mut self) {
+        // Unregister first — later dl_iterate_phdr walks must not
+        // report this lib's phdrs after the image is unmapped.
+        PHDR_LIBS.lock().unwrap().retain(|l| l.bias != self.bias);
         unsafe { munmap(self.map as *mut c_void, self.span) };
     }
 }
@@ -228,7 +231,7 @@ struct PhdrLib {
     phnum: u16,
 }
 unsafe impl Send for PhdrLib {}
-static PHDR_LIBS: Mutex<Vec<PhdrLib>> = Mutex::new(Vec::new());
+static PHDR_LIBS: Mutex<Vec<Arc<PhdrLib>>> = Mutex::new(Vec::new());
 
 #[repr(C)]
 struct DlPhdrInfo {
@@ -253,7 +256,9 @@ extern "C" fn sh_dl_iterate_phdr(cb: *const c_void, data: *mut c_void) -> i32 {
         return -1;
     }
     let cb: PhdrCb = unsafe { std::mem::transmute(cb) };
-    let libs = PHDR_LIBS.lock().unwrap();
+    // Snapshot under the lock, then run guest callbacks unlocked —
+    // libunwind-style callbacks may re-enter dl_iterate_phdr.
+    let libs: Vec<Arc<PhdrLib>> = PHDR_LIBS.lock().unwrap().clone();
     for l in libs.iter() {
         let mut info = DlPhdrInfo {
             dlpi_addr: l.bias as u64,
@@ -277,6 +282,82 @@ extern "C" fn sh_dl_iterate_phdr(cb: *const c_void, data: *mut c_void) -> i32 {
             return r;
         }
     }
+    0
+}
+
+// Bionic-only: stores a message shown on abort; we just keep the last
+// one for diagnostics.
+extern "C" fn sh_set_abort_message(s: *const i8) {
+    if s.is_null() {
+        return;
+    }
+    unsafe {
+        eprintln!("[native] abort-msg: {}",
+            std::ffi::CStr::from_ptr(s).to_string_lossy());
+    }
+}
+// NDK jnigraphics — glide-webp decodes into Android Bitmap objects.
+// jobjects are guest heap handles; `jni::vm()` is bound for the
+// duration of every native call so these can reach the heap.
+#[repr(C)]
+struct AndroidBitmapInfo {
+    width: u32,
+    height: u32,
+    stride: u32,
+    format: i32,
+    flags: u32,
+    reserved: [u32; 2],
+}
+
+fn bitmap_at(handle: usize) -> Option<(u32, u32)> {
+    match crate::jni::vm().heap.get(handle as u32) {
+        Some(crate::Obj::Host {
+            state: crate::HostState::Bitmap { w, h, .. },
+            ..
+        }) => Some((*w, *h)),
+        _ => None,
+    }
+}
+
+extern "C" fn sh_ab_get_info(_env: usize, bitmap: usize, info: *mut AndroidBitmapInfo) -> i32 {
+    if info.is_null() {
+        return -1;
+    }
+    let Some((w, h)) = bitmap_at(bitmap) else {
+        return -1;
+    };
+    unsafe {
+        *info = AndroidBitmapInfo {
+            width: w,
+            height: h,
+            stride: w * 4,
+            format: 1, // ANDROID_BITMAP_FORMAT_RGBA_8888
+            flags: 0,
+            reserved: [0; 2],
+        };
+    }
+    0
+}
+
+extern "C" fn sh_ab_lock_pixels(_env: usize, bitmap: usize, addr: *mut *mut c_void) -> i32 {
+    if addr.is_null() {
+        return -1;
+    }
+    match crate::jni::vm().heap.get_mut(bitmap as u32) {
+        Some(crate::Obj::Host {
+            state: crate::HostState::Bitmap { rgba, .. },
+            ..
+        }) => {
+            // make_mut clones on shared refs (COW) — the returned
+            // pointer then stays stable through unlockPixels.
+            unsafe { *addr = std::rc::Rc::make_mut(rgba).as_mut_ptr().cast() };
+            0
+        }
+        _ => -1,
+    }
+}
+
+extern "C" fn sh_ab_unlock_pixels(_env: usize, _bitmap: usize) -> i32 {
     0
 }
 
@@ -306,6 +387,10 @@ fn builtin_shim(name: &str) -> Option<usize> {
         "__memcpy_chk" => sh_memcpy_chk as *const () as usize,
         "__memset_chk" => sh_memset_chk as *const () as usize,
         "dl_iterate_phdr" => sh_dl_iterate_phdr as *const () as usize,
+        "android_set_abort_message" => sh_set_abort_message as *const () as usize,
+        "AndroidBitmap_getInfo" => sh_ab_get_info as *const () as usize,
+        "AndroidBitmap_lockPixels" => sh_ab_lock_pixels as *const () as usize,
+        "AndroidBitmap_unlockPixels" => sh_ab_unlock_pixels as *const () as usize,
         "__emutls_get_address" => 0, // TLS unimplemented — signal caller
         _ => return None,
     })
@@ -663,6 +748,21 @@ pub fn load_so(name: &str, elf: &[u8]) -> Result<NativeLib> {
         unsafe { munmap(map, span) };
         return Err(err("elf.init"));
     }
+    // Register with dl_iterate_phdr BEFORE the initializers run —
+    // unwind-table registration (e.g. glide-webp's) walks the phdr
+    // list during DT_INIT and must find this lib. The phdr copy is
+    // leaked so the reported pointer stays valid for the process.
+    if let Ok(name_c) = CString::new(name) {
+        if let Some(raw) = elf.get(phoff..phoff + phentsize * phnum) {
+            PHDR_LIBS.lock().unwrap().push(Arc::new(PhdrLib {
+                bias,
+                name: name_c,
+                phdrs: raw.into(),
+                phnum: phnum.try_into().unwrap_or(u16::MAX),
+            }));
+        }
+    }
+
     if d.init != 0 {
         let f: extern "C" fn() = unsafe { std::mem::transmute(d.init) };
         f();
@@ -675,19 +775,6 @@ pub fn load_so(name: &str, elf: &[u8]) -> Result<NativeLib> {
     for k in 0..n_init {
         let f: extern "C" fn() = unsafe { std::mem::transmute(((d.init_array + k * 8) as *const u64).read()) };
         f();
-    }
-
-    // Register with dl_iterate_phdr: leak a copy of the phdrs so the
-    // reported pointer stays valid for the process lifetime.
-    if let Ok(name_c) = CString::new(name) {
-        if let Some(raw) = elf.get(phoff..phoff + phentsize * phnum) {
-            PHDR_LIBS.lock().unwrap().push(PhdrLib {
-                bias,
-                name: name_c,
-                phdrs: raw.into(),
-                phnum: phnum.try_into().unwrap_or(u16::MAX),
-            });
-        }
     }
 
     Ok(NativeLib {
