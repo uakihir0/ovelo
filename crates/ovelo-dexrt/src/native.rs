@@ -32,14 +32,28 @@ extern "C" {
     fn mprotect(addr: *mut c_void, len: usize, prot: i32) -> i32;
     fn munmap(addr: *mut c_void, len: usize) -> i32;
     fn dlsym(handle: *mut c_void, symbol: *const i8) -> *mut c_void;
+    #[cfg(target_os = "macos")]
     fn sys_icache_invalidate(start: *mut c_void, len: usize);
 }
+
+/// Flush the instruction cache over a freshly-written code region.
+/// macOS arm64 requires `sys_icache_invalidate`; ovelo only runs guest
+/// code on macOS/Apple Silicon, elsewhere this is unreachable anyway.
+#[cfg(target_os = "macos")]
+unsafe fn icache_flush(p: *mut c_void, n: usize) {
+    unsafe { sys_icache_invalidate(p, n) };
+}
+#[cfg(not(target_os = "macos"))]
+unsafe fn icache_flush(_p: *mut c_void, _n: usize) {}
 
 const PROT_READ: i32 = 1;
 const PROT_WRITE: i32 = 2;
 const PROT_EXEC: i32 = 4;
 const MAP_PRIVATE: i32 = 0x2;
+#[cfg(target_os = "macos")]
 const MAP_ANON: i32 = 0x1000;
+#[cfg(not(target_os = "macos"))]
+const MAP_ANON: i32 = 0x20;
 const MAP_FAILED: *mut c_void = !0usize as *mut c_void;
 const RTLD_DEFAULT: *mut c_void = (-2isize) as *mut c_void;
 
@@ -474,7 +488,7 @@ pub fn load_so(name: &str, elf: &[u8]) -> Result<NativeLib> {
         unsafe { munmap(map, span) };
         return Err(errd("elf.mprotect", format!("{e}")));
     }
-    unsafe { sys_icache_invalidate(map.cast(), span) };
+    unsafe { icache_flush(map.cast(), span) };
 
     // Initializers: DT_INIT then DT_INIT_ARRAY.
     if d.init != 0 {

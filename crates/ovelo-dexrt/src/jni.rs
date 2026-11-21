@@ -42,6 +42,7 @@ pub(crate) fn with_vm<R>(vm: &mut Vm, f: impl FnOnce(&mut Vm) -> R) -> R {
 
 // ---------- trampoline ----------
 
+#[cfg(target_arch = "aarch64")]
 core::arch::global_asm!(
     ".global _ovelo_jni_call",
     ".p2align 2",
@@ -63,6 +64,7 @@ core::arch::global_asm!(
     "ret",
 );
 
+#[cfg(target_arch = "aarch64")]
 extern "C" {
     /// fnptr(iargs as x0-x7, fargs as d0-d7) → out[0]=x0, out[1]=d0 bits.
     fn ovelo_jni_call(fnptr: usize, iargs: *const u64, fargs: *const f64, out: *mut u64);
@@ -70,10 +72,22 @@ extern "C" {
 
 /// Call a native function: int-class args in `iargs` (≤8), float-class
 /// args in `fargs` (≤8). Returns (x0, d0's bit pattern).
+#[cfg(target_arch = "aarch64")]
 pub(crate) fn call_native(fnptr: usize, iargs: &[u64; 8], fargs: &[f64; 8]) -> (u64, u64) {
     let mut out = [0u64; 2];
     unsafe { ovelo_jni_call(fnptr, iargs.as_ptr(), fargs.as_ptr(), out.as_mut_ptr()) };
     (out[0], out[1])
+}
+
+/// Non-aarch64 host: no trampoline exists — guest native code cannot
+/// run anyway (all guest `.so`s are aarch64).
+#[cfg(not(target_arch = "aarch64"))]
+pub(crate) fn call_native(
+    _fnptr: usize,
+    _iargs: &[u64; 8],
+    _fargs: &[f64; 8],
+) -> (u64, u64) {
+    (0, 0)
 }
 
 // ---------- env/vm tables ----------
