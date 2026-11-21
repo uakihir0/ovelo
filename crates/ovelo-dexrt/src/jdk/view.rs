@@ -406,7 +406,24 @@ pub(crate) fn dex_view_info(vm: &Vm, h: u32) -> Option<DexViewInfo> {
     let lp_h = attr_find(vm, h, "layout_height")
         .map(|v| len_v(vm, v))
         .unwrap_or(-2);
-    let visible = !matches!(pseudo_get(vm, h, P_VIS), Some(V::I32(4) | V::I32(8)));
+    // `android:visibility` is an XML enum: 0=visible, 1=invisible,
+    // 2=gone — map to the View constants (0/4/8) the rest of the
+    // runtime uses.
+    let vis_attr = attr_find(vm, h, "visibility").and_then(|v| match v {
+        V::I32(2) => Some(8),
+        V::I32(1) => Some(4),
+        V::I32(_) => Some(0),
+        V::Ref(r) => match s(vm, r).as_deref() {
+            Some("invisible") => Some(4),
+            Some("gone") => Some(8),
+            _ => Some(0),
+        },
+        _ => None,
+    });
+    let visible = !matches!(
+        pseudo_get(vm, h, P_VIS).or(vis_attr.map(V::I32)),
+        Some(V::I32(4) | V::I32(8))
+    );
     let listener = match pseudo_get(vm, h, P_LISTENER) {
         Some(V::Ref(l)) => l,
         _ => 0,
