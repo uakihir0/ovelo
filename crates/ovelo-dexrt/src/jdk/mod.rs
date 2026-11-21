@@ -686,7 +686,60 @@ fn universal(vm: &mut Vm, class: &str, name: &str, sig: &str, args: &[V]) -> Rt<
             let d = class_of(vm, args[0]);
             Some(Some(class_obj(vm, d)))
         }
-        "clone" => Some(Some(args[0])),
+        "clone" => {
+            // Object.clone() is a shallow copy. Returning the receiver
+            // itself lets callers mutate the source through the "clone"
+            // (e.g. fossify's `getSortedDirectories`/`mDirs` lists grow
+            // forever when clone aliases the input).
+            let h = match args[0] {
+                V::Ref(h) => h,
+                _ => {
+                    return Ok(Some(Some(args[0])));
+                }
+            };
+            let copy = match vm.heap.get(h) {
+                Some(Obj::Host {
+                    class_idx,
+                    desc,
+                    state: HostState::List(l),
+                    fields,
+                }) => Some(Obj::Host {
+                    class_idx: *class_idx,
+                    desc: desc.clone(),
+                    state: HostState::List(l.clone()),
+                    fields: fields.clone(),
+                }),
+                Some(Obj::Host {
+                    class_idx,
+                    desc,
+                    state: HostState::Map(m),
+                    fields,
+                }) => Some(Obj::Host {
+                    class_idx: *class_idx,
+                    desc: desc.clone(),
+                    state: HostState::Map(m.clone()),
+                    fields: fields.clone(),
+                }),
+                Some(Obj::Instance { class_idx, fields }) => Some(Obj::Instance {
+                    class_idx: *class_idx,
+                    fields: fields.clone(),
+                }),
+                Some(Obj::Array { elem, data }) => Some(Obj::Array {
+                    elem: elem.clone(),
+                    data: data.clone(),
+                }),
+                // Strings/class mirrors/other host states: immutable or
+                // singleton — aliasing is correct.
+                _ => None,
+            };
+            match copy {
+                Some(o) => {
+                    let nh = vm.heap.alloc(o);
+                    Some(Some(V::Ref(nh)))
+                }
+                None => Some(Some(args[0])),
+            }
+        }
         // kotlinx MainCoroutineDispatcher.getImmediate() returns the
         // dispatcher itself.
         "getImmediate" => Some(Some(args[0])),

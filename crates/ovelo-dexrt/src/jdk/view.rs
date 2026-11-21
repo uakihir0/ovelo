@@ -25,6 +25,10 @@ const P_TAG: u32 = u32::MAX - 10;
 /// inflated `android:text` attribute. `pub`: the guest bridge's setter
 /// overrides write it for dex-inflated (non-GuestView) receivers.
 pub const P_TEXT: u32 = u32::MAX - 11;
+/// Pseudo key: `android:hint` / `setHint` text — kept separate from
+/// P_TEXT so `getText` on a search box returns the user's input (empty)
+/// rather than the hint.
+const P_HINT: u32 = u32::MAX - 26;
 const P_CONTENT: u32 = u32::MAX - 12;
 const P_WINDOW: u32 = u32::MAX - 13;
 // Marker keys are pub(crate): `is_instance` consults them so inflated
@@ -1047,7 +1051,7 @@ pub(crate) fn call(
             }
             Some(None)
         }
-        "setText" | "setHint" | "setTitle" | "setContentDescription" | "setTextScaleX" => {
+        "setText" | "setTitle" | "setContentDescription" | "setTextScaleX" => {
             if name != "setTextScaleX" {
                 pseudo_set(vm, this, P_TEXT, args.get(1).copied().unwrap_or(V::Ref(0)));
                 if std::env::var_os("OVELO_VIEWDBG").is_some() {
@@ -1056,7 +1060,14 @@ pub(crate) fn call(
             }
             Some(None)
         }
-        "getText" | "getHint" | "getTitle" | "getContentDescription" => Some(Some(
+        "setHint" => {
+            pseudo_set(vm, this, P_HINT, args.get(1).copied().unwrap_or(V::Ref(0)));
+            Some(None)
+        }
+        "getHint" => Some(Some(
+            pseudo_get(vm, this, P_HINT).unwrap_or_else(|| jstr(vm, "")),
+        )),
+        "getText" | "getTitle" | "getContentDescription" => Some(Some(
             pseudo_get(vm, this, P_TEXT).unwrap_or_else(|| jstr(vm, "")),
         )),
         "setOnClickListener"

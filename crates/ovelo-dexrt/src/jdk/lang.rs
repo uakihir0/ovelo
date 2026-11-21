@@ -236,15 +236,37 @@ fn string_call(vm: &mut Vm, name: &str, sig: &str, args: &[V]) -> Option<Option<
             Some(V::I32((t == n) as i32))
         }
         "regionMatches" => {
-            let (to, oo, len) = (
-                i32v(args[1]) as usize,
-                i32v(args[3]) as usize,
-                i32v(args[4]) as usize,
-            );
-            let n = sv(vm, args[2]).unwrap_or_default();
+            // Two overloads: regionMatches(to, other, oo, len) and
+            // regionMatches(ignoreCase, to, other, oo, len). Kotlin's
+            // `startsWith`/`contains` with ignoreCase use the latter.
+            let (ic, to, oo, len, other_idx) = if args.len() >= 6 {
+                (
+                    i32v(args[1]) != 0,
+                    i32v(args[2]) as usize,
+                    i32v(args[4]) as usize,
+                    i32v(args[5]) as usize,
+                    3,
+                )
+            } else {
+                (
+                    false,
+                    i32v(args[1]) as usize,
+                    i32v(args[3]) as usize,
+                    i32v(args[4]) as usize,
+                    2,
+                )
+            };
+            let n = sv(vm, args[other_idx]).unwrap_or_default();
             let a: Vec<char> = t.chars().skip(to).take(len).collect();
             let b: Vec<char> = n.chars().skip(oo).take(len).collect();
-            Some(V::I32((a == b) as i32))
+            let eq = if ic {
+                a.iter()
+                    .map(|c| c.to_ascii_lowercase())
+                    .eq(b.iter().map(|c| c.to_ascii_lowercase()))
+            } else {
+                a == b
+            };
+            Some(V::I32(eq as i32))
         }
         "substring" | "subSequence" => {
             let b = i32v(args[1]) as usize;

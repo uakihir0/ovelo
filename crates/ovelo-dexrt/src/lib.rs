@@ -179,6 +179,9 @@ pub struct Vm {
     /// `OVELO_TRACE_CALL` — log invoke sites whose resolved method name
     /// contains this substring (debug aid).
     trace_call: Option<String>,
+    /// `OVELO_TRACE_FROM` — with `OVELO_TRACE_CALL`, additionally require
+    /// the *caller* method name to contain this substring.
+    trace_from: Option<String>,
     /// Roots of every inflated view tree — `findViewById` falls back to
     /// them when the receiver's own subtree misses (appcompat decor is
     /// built dex-side, outside our synthetic window decor).
@@ -399,6 +402,7 @@ impl Vm {
             trace_field: std::env::var("OVELO_TRACE_FIELD").ok(),
             trace_throw: std::env::var_os("OVELO_TRACE_THROW").is_some(),
             trace_call: std::env::var("OVELO_TRACE_CALL").ok(),
+            trace_from: std::env::var("OVELO_TRACE_FROM").ok(),
             view_roots: Vec::new(),
             prefs_files: HashMap::new(),
             cur_activity: 0,
@@ -3717,6 +3721,20 @@ impl Vm {
                                 }) = self.heap.get(*h)
                                 {
                                     s.push_str(&format!("(n={})", l.len()));
+                                    let els: Vec<String> = l
+                                        .iter()
+                                        .take(12)
+                                        .map(|e| match e {
+                                            V::Ref(eh) => {
+                                                format!("h{eh}:{}", self.dbg_class_of(*eh))
+                                            }
+                                            other => format!("{other:?}"),
+                                        })
+                                        .collect();
+                                    s.push_str(&format!("[{}]", els.join(",")));
+                                }
+                                if let Some(Obj::Str(t)) = self.heap.get(*h) {
+                                    s.push_str(&format!("=\"{}\"", &t[..t.len().min(80)]));
                                 }
                                 s
                             }
@@ -3742,13 +3760,34 @@ impl Vm {
                 })?;
                 fr.last_call = self.describe_method(midx);
                 if let Some(p) = self.trace_call.as_deref() {
-                    if fr.last_call.contains(p) {
+                    let caller = self.describe_method(fr.loc.midx);
+                    if fr.last_call.contains(p)
+                        && self
+                            .trace_from
+                            .as_deref()
+                            .is_none_or(|f| caller.contains(f))
+                    {
+                        let thisfmt = match this_arg {
+                            Some(V::Ref(h)) => match self.heap.get(h) {
+                                Some(Obj::Str(t)) => {
+                                    format!("h{h}:String=\"{}\"", &t[..t.len().min(80)])
+                                }
+                                _ => format!("{:?}", this_arg.unwrap()),
+                            },
+                            _ => format!("{:?}", this_arg),
+                        };
+                        let resfmt = match res {
+                            Some(V::Ref(h)) if h != 0 => match self.heap.get(h) {
+                                Some(Obj::Str(t)) => {
+                                    format!("Some(h{h}:String=\"{}\")", &t[..t.len().min(80)])
+                                }
+                                _ => format!("{res:?}"),
+                            },
+                            _ => format!("{res:?}"),
+                        };
                         eprintln!(
-                            "[call] {} +{pc:04x} -> {} this={:?} args={argfmt:?} ({:?})",
-                            self.describe_method(fr.loc.midx),
-                            fr.last_call,
-                            this_arg,
-                            res
+                            "[call] {} +{pc:04x} -> {} this={} args={argfmt:?} ({})",
+                            caller, fr.last_call, thisfmt, resfmt
                         );
                     }
                 }

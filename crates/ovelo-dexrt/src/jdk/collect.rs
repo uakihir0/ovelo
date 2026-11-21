@@ -104,6 +104,17 @@ fn is_iter(class: &str) -> bool {
             && (class.starts_with("Ljava/util/") || class.starts_with("Landroid/util/"))
 }
 
+/// Whether the receiver's own class is a `Set` — checked on the object,
+/// not the call site's declared type (guests declare `Collection`).
+fn is_set_obj(vm: &Vm, v: V) -> bool {
+    match v {
+        V::Ref(h) if h != 0 => desc_is_a(&class_of(vm, v), "Ljava/util/Set;")
+            || desc_is_a(&class_of(vm, v), "Landroid/util/ArraySet;")
+            || class_of(vm, v).contains("$Set;"),
+        _ => false,
+    }
+}
+
 pub(crate) fn call(
     vm: &mut Vm,
     class: &str,
@@ -357,26 +368,42 @@ fn list_call(vm: &mut Vm, name: &str, sig: &str, args: &[V]) -> Rt<Option<Option
             Some(None)
         }
         "add" => {
+            // Sets reject duplicates — `distinctBy`, `union` etc. rely
+            // on `add` reporting "already present" via false.
+            let is_set = is_set_obj(vm, args[0]);
+            let dup = is_set
+                && list_ref(vm, h).is_some_and(|l| l.iter().any(|e| value_eq(vm, *e, args[1])));
             let l = match list_mut(vm, h) {
                 Some(l) => l,
                 None => return Ok(None),
             };
             if args.len() > 2 && params(sig).first() == Some(&"I") {
                 l.insert((i32v(args[1]).max(0) as usize).min(l.len()), args[2]);
+                Some(None)
+            } else if dup {
+                Some(Some(V::I32(0)))
             } else {
                 l.push(args[1]);
+                Some(Some(V::I32(1)))
             }
-            Some(if args.len() > 2 {
-                None
-            } else {
-                Some(V::I32(1))
-            })
         }
         "addAll" => {
             let src: Vec<V> = match args.last().copied().unwrap_or(V::Ref(0)) {
                 V::Ref(sh) => list_snapshot(vm, sh).unwrap_or_default(),
                 _ => vec![],
             };
+            let is_set = is_set_obj(vm, args[0]);
+            let src: Vec<V> = if is_set {
+                src.into_iter()
+                    .filter(|v| {
+                        !list_ref(vm, h)
+                            .is_some_and(|l| l.iter().any(|e| value_eq(vm, *e, *v)))
+                    })
+                    .collect()
+            } else {
+                src
+            };
+            let added = src.len();
             let l = match list_mut(vm, h) {
                 Some(l) => l,
                 None => return Ok(None),
@@ -389,7 +416,7 @@ fn list_call(vm: &mut Vm, name: &str, sig: &str, args: &[V]) -> Rt<Option<Option
             for (i, v) in src.iter().enumerate() {
                 l.insert((at + i).min(l.len()), *v);
             }
-            Some(Some(V::I32((!src.is_empty()) as i32)))
+            Some(Some(V::I32((added > 0) as i32)))
         }
         "addFirst" | "addLast" | "push" | "offerFirst" | "offerLast" | "offer" => {
             let l = match list_mut(vm, h) {
