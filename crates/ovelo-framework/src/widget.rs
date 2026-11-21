@@ -507,8 +507,13 @@ fn replay_guest_ops(c: &mut Canvas, ops: &[ovelo_dexrt::CanvasOp]) {
             }
             O::Oval { l, t, r, b, paint: p } => {
                 let r = Rect::new(*l as i32, *t as i32, (*r - *l) as i32, (*b - *t) as i32);
-                let rad = (r.x1 - r.x).min(r.y1 - r.y) / 2;
-                stroke_or_fill(c, r, p, rad);
+                if p.style == 1 {
+                    // STROKE — a real ring, not a rect outline.
+                    c.stroke_oval(r, p.stroke_w.max(1.0) as i32, paint(p));
+                } else {
+                    let rad = (r.x1 - r.x).min(r.y1 - r.y) / 2;
+                    stroke_or_fill(c, r, p, rad);
+                }
             }
             O::Circle {
                 cx,
@@ -522,7 +527,11 @@ fn replay_guest_ops(c: &mut Canvas, ops: &[ovelo_dexrt::CanvasOp]) {
                     (*r * 2.0) as i32,
                     (*r * 2.0) as i32,
                 );
-                stroke_or_fill(c, rect, p, *r as i32);
+                if p.style == 1 {
+                    c.stroke_oval(rect, p.stroke_w.max(1.0) as i32, paint(p));
+                } else {
+                    stroke_or_fill(c, rect, p, *r as i32);
+                }
             }
             O::Line {
                 x0,
