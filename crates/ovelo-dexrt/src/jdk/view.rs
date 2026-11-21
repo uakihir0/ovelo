@@ -2655,7 +2655,11 @@ fn group_measure_fallback(vm: &mut Vm, this: u32, pw: i32, ph: i32) {
         pseudo_set(vm, this, P_MEAS_H, V::I32(resolve_size(chh + pad_h, ph, true)));
         return;
     }
-    let linear = class_of(vm, V::Ref(this)).contains("LinearLayout");
+    // Stack containers by ancestry, not name — a `MyColumn extends
+    // LinearLayout` stacks vertically even when its name doesn't say
+    // so (matches the layout-side check below).
+    let desc = class_of(vm, V::Ref(this));
+    let linear = desc.contains("LinearLayout") || vm.extends_named(&desc, "LinearLayout");
     let (mut cw, mut chh) = (0i32, 0i32);
     for c in kids {
         let V::Ref(ch) = c else { continue };
@@ -2975,6 +2979,20 @@ fn relative_layout_fallback(vm: &mut Vm, this: u32, w: i32, h: i32) {
         .collect();
     for (i, &ch) in kids.iter().enumerate() {
         let (cl, ct, cr, cb) = pos[i];
+        // AOSP RelativeLayout measures children twice — once raw, once
+        // under the dependency-resolved extent. Re-measure a child
+        // whose rule-resolved size differs from its first pass so its
+        // own `onLayout`/descendants see the squeezed bounds instead
+        // of the unconstrained measurement.
+        let (rw, rh) = (cr - cl, cb - ct);
+        if rw != ks[i].w || rh != ks[i].h {
+            const AT_MOST: i32 = 2 << 30;
+            let _ = vm.call_virtual(
+                ch,
+                "measure",
+                &[V::I32(AT_MOST | rw.max(0)), V::I32(AT_MOST | rh.max(0))],
+            );
+        }
         if std::env::var_os("OVELO_VIEWDBG").is_some() {
             let rules: Vec<String> = [
                 "layout_centerInParent", "layout_centerHorizontal", "layout_centerVertical",
