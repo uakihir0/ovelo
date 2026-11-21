@@ -350,7 +350,7 @@ pub(crate) fn media_cursor(vm: &mut Vm, uri: &str, projection: &[String]) -> V {
         }
     }
     files.sort_by(|a, b| a.0.cmp(&b.0));
-    for (idx, (p, mime, mtype)) in files.into_iter().enumerate() {
+    for (p, mime, mtype) in files {
             // A scoped volume (images/video/audio) filters by media
             // type; "file"/"media" volumes accept everything.
             let wanted = if images {
@@ -399,12 +399,17 @@ pub(crate) fn media_cursor(vm: &mut Vm, uri: &str, projection: &[String]) -> V {
                 .unwrap_or(0);
             let (w, h) = img_dims(&p);
             let data = format!("/storage/emulated/0/{rel}");
-            // `_id` is the file's position in the sorted full scan —
-            // unique and stable however the volume filter narrows the
-            // rows, like a real MediaStore rowid. `bucket_id` follows
-            // MediaStore's parent-path hashCode (AOSP collides there
-            // too, so keep it).
-            let row_id = idx as i64 + 1;
+            // `_id` persists per path for the runtime's life — like a
+            // real MediaStore rowid, adding/removing other files never
+            // reshuffles it. `bucket_id` follows MediaStore's
+            // parent-path hashCode (AOSP collides there too).
+            let row_id = if let Some(&id) = vm.media_ids.get(&data) {
+                id
+            } else {
+                vm.next_media_id += 1;
+                vm.media_ids.insert(data.clone(), vm.next_media_id);
+                vm.next_media_id
+            };
             let bucket_id = java_hash(&rel_dir.to_lowercase()) as i64;
             rows.push(vec![
                 V::I64(row_id),

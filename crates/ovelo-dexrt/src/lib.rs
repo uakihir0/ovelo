@@ -303,6 +303,12 @@ pub struct Vm {
     /// canonical class_idx → `java.lang.Class` mirror handle — Class
     /// objects are singletons (`Foo.class == x.getClass()`).
     class_mirrors: HashMap<GIdx, u32>,
+    /// MediaStore `_id` per `_data` path — ids persist for the
+    /// runtime's life so adding/removing other files never reshuffles
+    /// a file's id (real MediaStore rowid semantics).
+    pub media_ids: HashMap<String, i64>,
+    /// next MediaStore `_id` to hand out (see `media_ids`).
+    pub next_media_id: i64,
     /// Permission names currently granted to the guest package —
     /// seeded from the manifest's normal-level `<uses-permission>`
     /// entries and grown by `requestPermissions` (user grants all).
@@ -401,6 +407,8 @@ impl Vm {
             park_spins: 0,
             repark_counts: HashMap::new(),
             parked_runnables: HashMap::new(),
+            media_ids: HashMap::new(),
+            next_media_id: 0,
             field_idx_cache: std::cell::RefCell::new(HashMap::new()),
             type_idx_cache: std::cell::RefCell::new(HashMap::new()),
             fields_named_cache: std::cell::RefCell::new(None),
