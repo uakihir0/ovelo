@@ -150,8 +150,8 @@ pub fn install_crash_dump() {
                 }
                 // Guest frame chain: fp → [prev_fp, saved_lr] — best-effort
                 // backtrace of the guest/native call path. Each lr is
-                // dladdr-resolved to <image>+<off> so the owning module
-                // (our binary vs a guest .so) is unambiguous.
+                // dladdr-resolved to <image>+<off>, or marked [so] when
+                // it lands inside a loaded guest library's map.
                 let mut f = fp;
                 for _ in 0..6 {
                     if f == 0 || !f.is_multiple_of(8) {
@@ -159,6 +159,27 @@ pub fn install_crash_dump() {
                     }
                     let nf = *(f as *const usize);
                     let lr = *((f + 8) as *const usize);
+                    if LOADED_RANGES
+                        .lock()
+                        .map(|v| v.iter().any(|(b, s)| lr >= *b && lr < b + s))
+                        .unwrap_or(false)
+                    {
+                        for c in b"[so]" {
+                            msg[n] = *c;
+                            n += 1;
+                        }
+                        for i in (0..16).rev() {
+                            msg[n] = b"0123456789abcdef"[(lr >> (i * 4)) & 0xf];
+                            n += 1;
+                        }
+                        msg[n] = b' ';
+                        n += 1;
+                        if nf <= f {
+                            break;
+                        }
+                        f = nf;
+                        continue;
+                    }
                     let mut di: DlInfo = std::mem::zeroed();
                     if dladdr(lr as *const c_void, &mut di) != 0 && !di.dli_fname.is_null() {
                         let off = lr - di.dli_fbase as usize;
