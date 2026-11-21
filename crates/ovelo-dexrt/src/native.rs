@@ -277,19 +277,30 @@ pub fn load_so(name: &str, elf: &[u8]) -> Result<NativeLib> {
     }
     let bias = map as usize - lo as usize;
 
-    // Copy PT_LOAD segments.
+    // Copy PT_LOAD segments, remembering each one's declared
+    // permissions for the post-relocation mprotect. Anything from the
+    // APK is validated against the mapping before a raw pointer sees it.
+    let map_end = map as usize + span;
+    let mut segs: Vec<(usize, usize, u32)> = Vec::new();
     for i in 0..phnum {
         let p = phoff + i * phentsize;
         if rd32(elf, p) != PT_LOAD {
             continue;
         }
+        let flags = rd32(elf, p + 4);
         let off = rd64(elf, p + 8) as usize;
         let va = rd64(elf, p + 16) as usize;
         let filesz = rd64(elf, p + 32) as usize;
         let memsz = rd64(elf, p + 40) as usize;
-        if off + filesz > elf.len() {
+        if off + filesz > elf.len()
+            || filesz > memsz
+            || va < lo as usize
+            || bias + va + memsz > map_end
+        {
+            unsafe { munmap(map, span) };
             return Err(err("elf.seg"));
         }
+        segs.push((va, memsz, flags));
         unsafe {
             std::ptr::copy_nonoverlapping(elf.as_ptr().add(off), (bias + va) as *mut u8, filesz);
             if memsz > filesz {
@@ -297,6 +308,9 @@ pub fn load_so(name: &str, elf: &[u8]) -> Result<NativeLib> {
             }
         }
     }
+    // A raw guest-vaddr-derived pointer is legal only inside the
+    // mapping — relocations and init pointers must all pass this.
+    let in_img = |a: usize, n: usize| a >= map as usize && a + n <= map_end;
 
     // Dynamic table.
     let mut d = Dyn {
@@ -442,6 +456,9 @@ pub fn load_so(name: &str, elf: &[u8]) -> Result<NativeLib> {
             let sym_i = (r_info >> 32) as usize;
             let rtype = (r_info & 0xffff_ffff) as u32;
             let loc = (bias + r_off) as *mut u64;
+            if !in_img(loc as usize, 8) {
+                return Err(errd("elf.reloc", format!("target oob {r_off:#x}")));
+            }
             match rtype {
                 R_AARCH64_RELATIVE => unsafe {
                     loc.write((bias as i64 + r_add) as u64)
@@ -467,6 +484,9 @@ pub fn load_so(name: &str, elf: &[u8]) -> Result<NativeLib> {
         let (r_off, r_info) = unsafe { ((r as *const u64).read() as usize, ((r as *const u64).add(1)).read()) };
         let rtype = (r_info & 0xffff_ffff) as u32;
         let loc = (bias + r_off) as *mut u64;
+        if !in_img(loc as usize, 8) {
+            return Err(errd("elf.reloc", format!("rel target oob {r_off:#x}")));
+        }
         match rtype {
             R_AARCH64_RELATIVE => unsafe {
                 let cur = loc.read();
@@ -481,21 +501,43 @@ pub fn load_so(name: &str, elf: &[u8]) -> Result<NativeLib> {
         }
     }
     // RELR packed relocation.
-    apply_relr(bias, d.relr, d.relrsz)?;
+    apply_relr(bias, d.relr, d.relrsz, map as usize, map_end)?;
 
-    if unsafe { mprotect(map, span, PROT_READ | PROT_EXEC) } != 0 {
-        let e = std::io::Error::last_os_error();
-        unsafe { munmap(map, span) };
-        return Err(errd("elf.mprotect", format!("{e}")));
+    // Apply each segment's declared permissions — writable data and
+    // bss must stay writable after relocation, executable pages go RX.
+    for &(va, memsz, flags) in &segs {
+        if memsz == 0 {
+            continue;
+        }
+        let base = (bias + va) & !(PAGE - 1);
+        let end = (bias + va + memsz + PAGE - 1) & !(PAGE - 1);
+        let prot = (if flags & 4 != 0 { PROT_READ } else { 0 })
+            | (if flags & 2 != 0 { PROT_WRITE } else { 0 })
+            | (if flags & 1 != 0 { PROT_EXEC } else { 0 });
+        if unsafe { mprotect(base as *mut c_void, end - base, prot) } != 0 {
+            let e = std::io::Error::last_os_error();
+            unsafe { munmap(map, span) };
+            return Err(errd("elf.mprotect", format!("{e}")));
+        }
     }
     unsafe { icache_flush(map.cast(), span) };
 
-    // Initializers: DT_INIT then DT_INIT_ARRAY.
+    // Initializers: DT_INIT then DT_INIT_ARRAY — both guest-vaddr
+    // derived, both checked against the mapping before they can branch
+    // anywhere outside it.
+    if d.init != 0 && !in_img(d.init, 4) {
+        unsafe { munmap(map, span) };
+        return Err(err("elf.init"));
+    }
     if d.init != 0 {
         let f: extern "C" fn() = unsafe { std::mem::transmute(d.init) };
         f();
     }
-    let n_init = d.init_array_sz / 8;
+    let n_init = if in_img(d.init_array, d.init_array_sz) {
+        d.init_array_sz / 8
+    } else {
+        0
+    };
     for k in 0..n_init {
         let f: extern "C" fn() = unsafe { std::mem::transmute(((d.init_array + k * 8) as *const u64).read()) };
         f();
@@ -538,7 +580,13 @@ fn gnu_sym_count(gh: usize) -> usize {
     }
 }
 
-fn apply_relr(bias: usize, table: usize, bytes: usize) -> Result<()> {
+fn apply_relr(
+    bias: usize,
+    table: usize,
+    bytes: usize,
+    map_lo: usize,
+    map_end: usize,
+) -> Result<()> {
     if table == 0 {
         return Ok(());
     }
@@ -549,10 +597,11 @@ fn apply_relr(bias: usize, table: usize, bytes: usize) -> Result<()> {
         i += 1;
         if e & 1 == 0 {
             addr = e as usize;
-            unsafe {
-                let loc = (bias + addr) as *mut u64;
-                loc.write(bias as u64 + loc.read());
+            let loc = (bias + addr) as *mut u64;
+            if (loc as usize) < map_lo || (loc as usize) + 8 > map_end {
+                return Err(errd("elf.reloc", format!("relr target oob {addr:#x}")));
             }
+            unsafe { loc.write(bias as u64 + loc.read()) };
             addr += 8;
         } else {
             let mut bits = e >> 1;
@@ -560,10 +609,11 @@ fn apply_relr(bias: usize, table: usize, bytes: usize) -> Result<()> {
             while bits != 0 {
                 if bits & 1 == 1 {
                     let off = addr + bit * 8;
-                    unsafe {
-                        let loc = (bias + off) as *mut u64;
-                        loc.write(bias as u64 + loc.read());
+                    let loc = (bias + off) as *mut u64;
+                    if (loc as usize) < map_lo || (loc as usize) + 8 > map_end {
+                        return Err(errd("elf.reloc", format!("relr target oob {off:#x}")));
                     }
+                    unsafe { loc.write(bias as u64 + loc.read()) };
                 }
                 bits >>= 1;
                 bit += 1;
