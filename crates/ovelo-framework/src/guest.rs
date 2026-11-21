@@ -396,6 +396,19 @@ impl GuestUi {
         self.clicks.borrow_mut().drain(..).collect()
     }
 
+    /// Every guest heap handle the UI keeps alive — GC roots for
+    /// `Vm::collect_garbage`: bound views, materialized dex views and
+    /// their child lists, the dex root, and queued click targets.
+    pub fn guest_handles(&self) -> Vec<u32> {
+        let mut v: Vec<u32> = self.views.keys().copied().collect();
+        v.extend(self.dex_views.keys().copied());
+        v.extend(self.dex_kids.keys().copied());
+        v.extend(self.dex_kids.values().flatten().copied());
+        v.push(self.dex_root);
+        v.extend(self.clicks.borrow().iter().flat_map(|(a, b)| [*a, *b]));
+        v
+    }
+
     /// The host view bound to a guest heap handle.
     pub fn view(&self, h: u32) -> Option<Rc<RefCell<GuestView>>> {
         self.views.get(&h).cloned()

@@ -1355,6 +1355,45 @@ impl Vm {
     /// Reentrant-safe; `max` bounds total runnables per drain so a
     /// self-rescheduling queue can't wedge the caller forever. Returns
     /// how many runnables completed — re-parked workers don't count.
+    /// Stop-the-world mark-sweep GC. Only safe between dex activations —
+    /// live interpreter frames hold their refs in Rust locals, so this
+    /// no-ops while dex code is in flight (`depth`/`stack`/`draining`).
+    /// `extra_roots` are guest handles held by callers (e.g. the UI's
+    /// bound-view tables) that the VM cannot see itself.
+    pub fn collect_garbage(&mut self, extra_roots: &mut dyn Iterator<Item = u32>) -> usize {
+        if self.depth != 0 || !self.stack.is_empty() || self.draining {
+            return 0;
+        }
+        let mut roots: Vec<u32> = Vec::new();
+        for c in self.classes.values() {
+            roots.extend(c.statics.values().filter_map(|v| match v {
+                V::Ref(h) if *h != 0 => Some(*h),
+                _ => None,
+            }));
+        }
+        roots.extend(self.pending_runnables.iter().map(|(h, _)| *h));
+        roots.extend(self.parked_runnables.keys().copied());
+        roots.extend(self.reparked.iter().copied());
+        roots.extend(self.repark_counts.keys().copied());
+        roots.extend(self.vto_listeners.keys().copied());
+        roots.extend(self.vto_listeners.values().flatten().copied());
+        roots.extend(self.class_mirrors.values().copied());
+        roots.push(self.jni_pending_exc);
+        if let Some((_, V::Ref(h))) = &self.pending_activity {
+            if *h != 0 {
+                roots.push(*h);
+            }
+        }
+        roots.extend(extra_roots);
+        let freed = self.heap.collect(roots);
+        if std::env::var_os("OVELO_MEMDBG").is_some() {
+            eprintln!("[gc] freed {freed} slots={}", self.heap.len());
+        }
+        freed
+    }
+
+    /// Run up to `max` queued runnables (main + worker queues).
+    /// Returns how many completed — re-parked workers don't count.
     pub fn drain_runnables(&mut self, max: usize) -> usize {
         if self.draining {
             return 0;

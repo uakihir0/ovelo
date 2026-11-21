@@ -306,7 +306,6 @@ struct AndroidBitmapInfo {
     stride: u32,
     format: i32,
     flags: u32,
-    reserved: [u32; 2],
 }
 
 fn bitmap_at(handle: usize) -> Option<(u32, u32)> {
@@ -333,7 +332,6 @@ extern "C" fn sh_ab_get_info(_env: usize, bitmap: usize, info: *mut AndroidBitma
             stride: w * 4,
             format: 1, // ANDROID_BITMAP_FORMAT_RGBA_8888
             flags: 0,
-            reserved: [0; 2],
         };
     }
     0

@@ -170,13 +170,90 @@ pub fn xml_events(elements: &[ovelo_apk::manifest::Element]) -> Vec<XmlEvent> {
 pub struct Heap {
     objs: Vec<Option<Obj>>,
     interned: HashMap<String, u32>,
+    /// Sweep-freed slots (1-based handles) recycled by `alloc`.
+    free: Vec<u32>,
 }
 
 impl Heap {
     /// Allocate; returns the handle (1-based; 0 is reserved for null).
     pub fn alloc(&mut self, o: Obj) -> u32 {
+        if let Some(h) = self.free.pop() {
+            self.objs[h as usize - 1] = Some(o);
+            return h;
+        }
         self.objs.push(Some(o));
         self.objs.len() as u32
+    }
+
+    /// Number of slots ever allocated (live + free).
+    pub fn len(&self) -> usize {
+        self.objs.len()
+    }
+
+    /// True when no objects were ever allocated.
+    pub fn is_empty(&self) -> bool {
+        self.objs.is_empty()
+    }
+
+    /// Stop-the-world mark-sweep: `roots` plus every interned string
+    /// are kept; unmarked slots are freed and their handles recycled.
+    /// Returns the number of freed objects.
+    pub fn collect(&mut self, roots: impl IntoIterator<Item = u32>) -> usize {
+        fn handle(v: &V) -> Option<u32> {
+            match v {
+                V::Ref(h) if *h != 0 => Some(*h),
+                _ => None,
+            }
+        }
+        let mut marked = vec![false; self.objs.len()];
+        let mut wl: Vec<u32> = roots
+            .into_iter()
+            .chain(self.interned.values().copied())
+            .filter(|&h| h != 0 && (h as usize) <= self.objs.len())
+            .collect();
+        while let Some(h) = wl.pop() {
+            let i = h as usize - 1;
+            if marked[i] {
+                continue;
+            }
+            marked[i] = true;
+            match &self.objs[i] {
+                Some(Obj::Instance { fields, .. }) => {
+                    wl.extend(fields.values().filter_map(handle));
+                }
+                Some(Obj::Array { data, .. }) => {
+                    wl.extend(data.iter().filter_map(handle));
+                }
+                Some(Obj::Host { fields, state, .. }) => {
+                    wl.extend(fields.values().filter_map(handle));
+                    match state {
+                        HostState::List(l) => {
+                            wl.extend(l.iter().filter_map(handle));
+                        }
+                        HostState::Map(m) => {
+                            wl.extend(m.iter().flat_map(|(k, v)| [k, v]).filter_map(handle));
+                        }
+                        HostState::Iter(rc, _) => {
+                            wl.extend(rc.iter().filter_map(handle));
+                        }
+                        HostState::Slot(v) => {
+                            wl.extend(handle(v));
+                        }
+                        _ => {}
+                    }
+                }
+                _ => {}
+            }
+        }
+        let mut freed = 0;
+        for (i, slot) in self.objs.iter_mut().enumerate() {
+            if slot.is_some() && !marked[i] {
+                *slot = None;
+                self.free.push(i as u32 + 1);
+                freed += 1;
+            }
+        }
+        freed
     }
 
     /// Borrow an object by handle.
