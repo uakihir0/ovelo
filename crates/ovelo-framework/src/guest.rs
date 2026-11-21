@@ -951,10 +951,17 @@ pub fn drive_dex_layout_pass(vm: &mut Vm, activity: u32, frame: u32, win_w: i32,
         // so without this its frame stays unset and `onDraw` ops never
         // capture (blank screen).
         if !parent_is_dex {
-            let (w, hgt) = info
-                .frame
-                .map(|f| (f.2 - f.0, f.3 - f.1))
-                .unwrap_or((win_w, win_h));
+            // The root tracks the window: after a resize its stored
+            // frame is stale, so re-measure at the new extent — the
+            // stored frame only wins for deeper subtree roots whose
+            // size genuinely came from a prior pass.
+            let (w, hgt) = if depth == 0 {
+                (win_w, win_h)
+            } else {
+                info.frame
+                    .map(|f| (f.2 - f.0, f.3 - f.1))
+                    .unwrap_or((win_w, win_h))
+            };
             if let Err(e) = vm.call_virtual(
                 h,
                 "measure",
