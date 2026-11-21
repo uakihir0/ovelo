@@ -255,6 +255,12 @@ pub struct Vm {
     /// `(sub GIdx, sup GIdx)` → is-assignable — the chain+interface walk
     /// ran per check-cast / host registration probe.
     assignable_cache: std::cell::RefCell<HashMap<(GIdx, GIdx), bool>>,
+    /// Bumped by every `pseudo_set` — lets the host render/layout
+    /// passes skip rebuilding the dex-view tree when nothing changed.
+    pub view_gen: u64,
+    /// `view_gen` value the last driven layout walk ran against —
+    /// `u64::MAX` until the first pass so it always runs once.
+    pub layout_gen_done: std::cell::Cell<u64>,
     /// Deferred async work — `(runnable, on_main)`. `Thread.start`,
     /// `Executor.execute`/`submit` and `Handler.post*` enqueue here
     /// instead of running inline (AOSP is async; inline execution
@@ -394,6 +400,8 @@ impl Vm {
             host_named_cache: std::cell::RefCell::new(HashMap::new()),
             named_chain_cache: std::cell::RefCell::new(HashMap::new()),
             assignable_cache: std::cell::RefCell::new(HashMap::new()),
+            view_gen: 0,
+            layout_gen_done: std::cell::Cell::new(u64::MAX),
             class_mirrors: HashMap::new(),
             granted_permissions: std::collections::HashSet::new(),
         };
@@ -789,6 +797,9 @@ impl Vm {
             }
         }
         if found {
+            // Misses are memoized — a subclass-named call resolved to
+            // None before this registration must see the new impl.
+            self.host_named_cache.borrow_mut().clear();
             // A DEX may reference the same method through a subclass
             // descriptor; fall back to (name, sig) in call_builtin.
             let owner = self.type_index_of(class_desc).unwrap_or(GX_NONE);
@@ -1340,6 +1351,13 @@ impl Vm {
     /// text, colors, layout params, visibility, listener, children.
     pub fn dex_view(&self, h: u32) -> Option<jdk::view::DexViewInfo> {
         jdk::view::dex_view_info(self, h)
+    }
+
+    /// Cheap P_IS_VIEW probe — `dex_view` builds full node info
+    /// (attrs, children, strings) and costs far more than callers
+    /// that only need to know whether a handle is a view.
+    pub fn is_dex_view(&self, h: u32) -> bool {
+        h != 0 && jdk::pseudo_get(self, h, jdk::view::P_IS_VIEW).is_some()
     }
 
     /// The options `Menu` attached to an Activity — the runner hands it
