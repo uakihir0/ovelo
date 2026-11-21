@@ -155,6 +155,9 @@ pub(crate) fn env_enter(name: &'static str) {
     if std::env::var_os("OVELO_ENVCALL").is_some() {
         eprintln!("[env>] {name}");
     }
+    // malloc_zone_check is a Darwin-only API; keep the whole probe macOS-gated
+    // so the Linux build neither links nor runs it.
+    #[cfg(target_os = "macos")]
     if std::env::var_os("OVELO_ZONECHECK").is_some() {
         unsafe {
             extern "C" {
@@ -505,7 +508,10 @@ fn cstr_ro(p: u64) -> String {
         while *q != 0 {
             s.push(*q);
             q = q.add(1);
-            if s.len() > 16384 {
+            // JNI strings are NUL-terminated and can legitimately be large
+            // (JSON payloads, base64 blobs); the cap only guards against a
+            // bad pointer walking forever through mapped memory.
+            if s.len() > 16 * 1024 * 1024 {
                 eprintln!("[jni] cstr_ro runaway at {p:#x} ({}+ bytes)", s.len());
                 break;
             }
