@@ -543,7 +543,7 @@ pub(crate) fn call(
             // `Telephony$Sms.getDefaultSmsPackage` — report ourselves as
             // the default SMS app so SMS apps don't bail to a setup UI.
             "getDefaultSmsPackage" if class.contains("Telephony") => {
-                let pkg = vm.guest_package.clone().unwrap_or_default();
+                let pkg = vm.guest_package.clone().unwrap_or_else(|| "app".into());
                 Some(Some(jstr(vm, &pkg)))
             }
             _ => Some(Some(V::Ref(0))),

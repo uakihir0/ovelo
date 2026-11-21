@@ -926,6 +926,11 @@ fn run_app(store: &InstallStore, package: &str) -> Result<(), OveloError> {
                     v.add_dex(d)?;
                 }
                 v.guest_root = data_dir.join("files");
+                // The app's real package name — `getPackageName` and
+                // `Telephony.getDefaultSmsPackage` both answer with it, and
+                // SMS apps compare the two to decide they are the default
+                // handler (an empty answer sends them to a setup screen).
+                v.guest_package = Some(rec.app.package.clone());
                 // Seed shared external storage once so file managers
                 // have something to list (safe: only fills what's absent).
                 let ext = &v.external_root;
