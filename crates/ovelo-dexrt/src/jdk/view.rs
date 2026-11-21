@@ -3181,15 +3181,15 @@ fn lp_ctor(vm: &mut Vm, class: &str, sig: &str, args: &[V]) {
         // Relative margins can't reach a canon field (dex never refs
         // `startMargin`/`endMargin`) — hold them on pseudos; the
         // resolveLayoutDirection fold writes them into left/right.
-        let margin = attrset_value(vm, args.get(2).copied().unwrap_or(V::Ref(0)), "layout_margin")
-            .and_then(|v| lp_px(vm, v));
+        // AOSP keeps `layout_margin` absolute-only — it must NOT feed
+        // start/end, or the fold would later overwrite left/right
+        // margins a caller mutated after construction.
         for (attr, key) in [
             ("layout_marginStart", P_MSTART),
             ("layout_marginEnd", P_MEND),
         ] {
             let v = attrset_value(vm, args.get(2).copied().unwrap_or(V::Ref(0)), attr)
-                .and_then(|v| lp_px(vm, v))
-                .or(margin);
+                .and_then(|v| lp_px(vm, v));
             if let Some(px) = v {
                 pseudo_set(vm, this, key, V::I32(px));
             }
@@ -3227,6 +3227,13 @@ fn lp_ctor(vm: &mut Vm, class: &str, sig: &str, args: &[V]) {
                     {
                         writes.push((f.to_string(), ty.to_string(), v));
                     }
+                }
+            }
+            // Relative margins live on pseudos — carry them too (AOSP
+            // copies startMargin/endMargin in the copy ctor).
+            for key in [P_MSTART, P_MEND] {
+                if let Some(v) = src_fields.get(&(key as u64)).copied() {
+                    pseudo_set(vm, this, key, v);
                 }
             }
         }
