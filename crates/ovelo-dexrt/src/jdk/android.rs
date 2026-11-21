@@ -3378,6 +3378,7 @@ fn absolute_gravity(gravity: i32, dir: i32) -> i32 {
 /// gravity flags and write the resulting frame into `out`. Without
 /// this the AOSP `GravityCompat.apply(container, out)` idiom leaves
 /// `out` at (0,0,0,0) — every child then gets `layout(0,0,0,0)`.
+#[allow(clippy::too_many_arguments)]
 fn gravity_apply(
     vm: &mut Vm,
     gravity: i32,

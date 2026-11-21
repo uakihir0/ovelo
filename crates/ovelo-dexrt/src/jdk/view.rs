@@ -2257,6 +2257,7 @@ fn lp_px(vm: &Vm, v: V) -> Option<i32> {
 /// framework containers (RelativeLayout, FrameLayout, LinearLayout)
 /// arrive as skeleton classes with no dex `onMeasure`/`onLayout`, so
 /// without a host fallback their children stay 0×0 forever.
+#[allow(clippy::too_many_arguments)]
 fn measure_child(
     vm: &mut Vm,
     parent: u32,
