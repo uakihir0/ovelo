@@ -685,10 +685,15 @@ impl GuestUi {
                     // the child exactly where its `setFrame` put it.
                     let view: Box<dyn Drawable> = match vm.dex_view(*ch).and_then(|i| i.frame)
                     {
-                        Some(rect) => Box::new(AbsView {
-                            inner: SharedView(crc),
-                            rect,
-                        }),
+                        Some(rect) => {
+                            if std::env::var_os("OVELO_VIEWDBG").is_some() {
+                                eprintln!("[viewdbg] frame h{ch} = {rect:?}");
+                            }
+                            Box::new(AbsView {
+                                inner: SharedView(crc),
+                                rect,
+                            })
+                        }
                         None => Box::new(SharedView(crc)),
                     };
                     kids.push(view);
@@ -803,26 +808,34 @@ pub fn drive_dex_layout_pass(vm: &mut Vm, activity: u32, frame: u32) {
         if std::env::var_os("OVELO_VIEWDBG").is_some() {
             eprintln!("[viewdbg] walk h{h} {} group={}", info.desc, info.is_group);
         }
-        if info.is_group {
-            // Drive the real traversal: `measure`/`layout` (not bare
-            // `onMeasure`/`onLayout`) — `View.layout` runs `setFrame`,
-            // which is the only place `mLeft`/`mTop`/`mRight`/`mBottom`
-            // get stored. Containers that size themselves in layout
-            // (RecyclerView's `fill` reads `OrientationHelper` totals)
-            // see a 0×0 rect and lay out nothing otherwise.
+        // Drive the real traversal: `measure`/`layout` (not bare
+        // `onMeasure`/`onLayout`) — `View.layout` runs `setFrame`,
+        // which is the only place `mLeft`/`mTop`/`mRight`/`mBottom`
+        // get stored. Containers that size themselves in layout
+        // (RecyclerView's `fill` reads `OrientationHelper` totals)
+        // see a 0×0 rect and lay out nothing otherwise.
+        // Only drive where no frame exists yet: once a parent's own
+        // dex `onLayout` has placed the child, re-driving `layout`
+        // with a full-screen rect would overwrite the real bounds.
+        if info.is_group && (depth == 0 || info.frame.is_none()) {
+            let (w, hgt) = info
+                .frame
+                .map(|f| (f.2 - f.0, f.3 - f.1))
+                .unwrap_or((1080, 1920));
             if let Err(e) = vm.call_virtual(
                 h,
                 "measure",
-                &[V::I32(MS_EXACTLY | 1080), V::I32(MS_EXACTLY | 1920)],
+                &[V::I32(MS_EXACTLY | w), V::I32(MS_EXACTLY | hgt)],
             ) {
                 if std::env::var_os("OVELO_VIEWDBG").is_some() {
                     eprintln!("[viewdbg] measure {} err {e}", info.desc);
                 }
             }
+            let (l, t) = info.frame.map(|f| (f.0, f.1)).unwrap_or((0, 0));
             if let Err(e) = vm.call_virtual(
                 h,
                 "layout",
-                &[V::I32(0), V::I32(0), V::I32(1080), V::I32(1920)],
+                &[V::I32(l), V::I32(t), V::I32(l + w), V::I32(t + hgt)],
             ) {
                 if std::env::var_os("OVELO_VIEWDBG").is_some() {
                     eprintln!("[viewdbg] layout {} err {e}", info.desc);

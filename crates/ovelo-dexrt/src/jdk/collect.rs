@@ -674,10 +674,24 @@ fn map_call(vm: &mut Vm, name: &str, sig: &str, args: &[V]) -> Rt<Option<Option<
             if name == "remove" || name == "removeObject" {
                 Some(Some(map_remove(vm, h, args[1]).unwrap_or(V::Ref(0))))
             } else {
+                // Primitive-valued sparse maps return a numeric default on a
+                // miss, not null — `SparseIntArray.get(key)` is `0`, and a
+                // null Ref crashes `i32` consumers (e.g. packed-switch in
+                // ConstraintLayout.LayoutParams.<clinit>-driven minting).
+                let int_valued = matches!(
+                    class.as_str(),
+                    "Landroid/util/SparseIntArray;"
+                        | "Landroid/util/SparseBooleanArray;"
+                        | "Landroidx/collection/SparseIntArray;"
+                );
                 let v = map_get(vm, h, args[1]);
                 Some(Some(match v {
                     Some(v) => v,
-                    None => args.get(2).copied().unwrap_or(V::Ref(0)),
+                    None => args.get(2).copied().unwrap_or(if int_valued {
+                        V::I32(0)
+                    } else {
+                        V::Ref(0)
+                    }),
                 }))
             }
         }
@@ -1882,7 +1896,7 @@ fn pair_call(vm: &mut Vm, name: &str, args: &[V]) -> Rt<Option<Option<V>>> {
     })
 }
 
-fn sparse_call(vm: &mut Vm, _class: &str, name: &str, args: &[V]) -> Rt<Option<Option<V>>> {
+fn sparse_call(vm: &mut Vm, class: &str, name: &str, args: &[V]) -> Rt<Option<Option<V>>> {
     let V::Ref(h) = args.first().copied().unwrap_or(V::Ref(0)) else {
         return Ok(None);
     };
@@ -1891,11 +1905,21 @@ fn sparse_call(vm: &mut Vm, _class: &str, name: &str, args: &[V]) -> Rt<Option<O
             map_put(vm, h, V::I32(i32v(args[1])), *args.last().unwrap());
             Some(None)
         }
-        "get" => Some(Some(
-            map_get(vm, h, V::I32(i32v(args[1])))
-                .or_else(|| args.get(2).copied())
-                .unwrap_or(V::Ref(0)),
-        )),
+        "get" => {
+            // `SparseIntArray.get(key)`/`SparseBooleanArray.get(key)` are
+            // primitive-valued: a miss returns the int/boolean default, not
+            // null — a null Ref crashes `i32` consumers (packed-switch in
+            // ConstraintLayout.LayoutParams.<init>).
+            let int_valued = matches!(
+                class,
+                "Landroid/util/SparseIntArray;" | "Landroid/util/SparseBooleanArray;"
+            );
+            Some(Some(
+                map_get(vm, h, V::I32(i32v(args[1])))
+                    .or_else(|| args.get(2).copied())
+                    .unwrap_or(if int_valued { V::I32(0) } else { V::Ref(0) }),
+            ))
+        }
         "remove" | "delete" | "removeAt" => {
             map_remove(vm, h, V::I32(i32v(args[1])));
             Some(None)

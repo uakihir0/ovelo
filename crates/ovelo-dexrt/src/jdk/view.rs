@@ -1313,11 +1313,25 @@ fn inflate_call(vm: &mut Vm, args: &[V]) -> V {
             if let V::Ref(h) = inflated {
                 if h != 0 && pseudo_get(vm, h, P_LP).is_none() {
                     let attrs = pseudo_get(vm, h, P_ATTRS).unwrap_or(V::Ref(0));
-                    if let Ok(Some(v @ V::Ref(lp))) =
-                        vm.call_virtual(r, "generateLayoutParams", &[attrs])
-                    {
+                    if let Ok(Some(v @ V::Ref(lp))) = vm.call_virtual_sig(
+                        r,
+                        "generateLayoutParams",
+                        &["Landroid/util/AttributeSet;"],
+                        &[attrs],
+                    ) {
                         if lp != 0 {
                             pseudo_set(vm, h, P_LP, v);
+                        }
+                    }
+                    if pseudo_get(vm, h, P_LP).is_none() {
+                        // Attr parsing may have thrown — the attr-free
+                        // default still fully initializes the params.
+                        if let Ok(Some(v @ V::Ref(lp))) =
+                            vm.call_virtual_sig(r, "generateDefaultLayoutParams", &[], &[])
+                        {
+                            if lp != 0 {
+                                pseudo_set(vm, h, P_LP, v);
+                            }
                         }
                     }
                 }
@@ -1753,7 +1767,32 @@ fn layout_params(vm: &mut Vm, this: u32) -> V {
         // via `generateLayoutParams(AttributeSet)` — dex-defined for
         // bundled groups like DrawerLayout, whose R8-inlined ctor body
         // is the only place `layout_gravity` is read.
-        if let Ok(Some(v @ V::Ref(h))) = vm.call_virtual(p, "generateLayoutParams", &[attrs]) {
+        // Signature-exact: `generateLayoutParams` overloads on attrs
+        // and on LayoutParams share a slot count — arity lookup can
+        // hit the copy-ctor with an AttributeSet and die mid-body.
+        let lp_v = vm.call_virtual_sig(
+            p,
+            "generateLayoutParams",
+            &["Landroid/util/AttributeSet;"],
+            &[attrs],
+        );
+        if std::env::var_os("OVELO_VIEWDBG").is_some() {
+            if let Err(e) = &lp_v {
+                eprintln!("[viewdbg] generateLayoutParams h{this} -> {e}");
+            }
+        }
+        if let Ok(Some(v @ V::Ref(h))) = lp_v {
+            if h != 0 {
+                pseudo_set(vm, this, P_LP, v);
+                return v;
+            }
+        }
+        // Attr parsing may have thrown — `generateDefaultLayoutParams`
+        // is the attr-free sibling and still fully initializes the
+        // params object (ConstraintLayout$LayoutParams' widget, …).
+        if let Ok(Some(v @ V::Ref(h))) =
+            vm.call_virtual_sig(p, "generateDefaultLayoutParams", &[], &[])
+        {
             if h != 0 {
                 pseudo_set(vm, this, P_LP, v);
                 return v;

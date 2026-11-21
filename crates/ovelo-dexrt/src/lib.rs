@@ -1453,6 +1453,114 @@ impl Vm {
         Ok(None)
     }
 
+    /// Method `name` on `class_desc` whose declared params equal
+    /// `params` exactly — overloads sharing a slot count (like
+    /// `generateLayoutParams(AttributeSet)` vs `(LayoutParams)`)
+    /// need the signature, not just arity.
+    pub(crate) fn find_method_by_sig(
+        &self,
+        class_desc: &str,
+        name: &str,
+        params: &[&str],
+    ) -> Result<Option<GIdx>> {
+        for (di, d) in self.dexes.iter().enumerate() {
+            for def in d.class_defs() {
+                if d.type_descriptor(def.class_idx)? != class_desc {
+                    continue;
+                }
+                let cd = d.class_data(def)?;
+                for m in cd.direct_methods.iter().chain(cd.virtual_methods.iter()) {
+                    let mid = d.method(m.method_idx)?;
+                    if d.string(mid.name_idx)? != name {
+                        continue;
+                    }
+                    let p = d.proto(mid.proto_idx as u32)?;
+                    let got: Vec<String> = d
+                        .proto_params(p)?
+                        .iter()
+                        .filter_map(|t| d.type_descriptor(*t as u32).ok())
+                        .collect();
+                    if got.iter().map(String::as_str).eq(params.iter().copied()) {
+                        return Ok(Some(gx(di, m.method_idx)));
+                    }
+                }
+            }
+        }
+        Ok(None)
+    }
+
+    /// Walk `class_idx`'s superclass chain for a signature-exact
+    /// `name(params)` — like [`find_method_on_chain`] but resolved by
+    /// signature rather than slot count.
+    pub(crate) fn find_method_on_chain_sig(
+        &self,
+        mut class_idx: GIdx,
+        name: &str,
+        params: &[&str],
+    ) -> Result<Option<GIdx>> {
+        for _ in 0..64 {
+            let Some((cg, def)) = self.def_loc_of(class_idx) else {
+                return Ok(None);
+            };
+            let sup = def.superclass_idx;
+            let desc = self.type_desc_of(cg)?;
+            if let Some(m) = self.find_method_by_sig(&desc, name, params)? {
+                return Ok(Some(m));
+            }
+            if sup == u32::MAX {
+                return Ok(None);
+            }
+            class_idx = gx(gd(cg), sup);
+        }
+        Ok(None)
+    }
+
+    /// [`call_virtual`] resolved by exact parameter descriptors —
+    /// host callers that know the overload signature (framework
+    /// contract methods like `generateLayoutParams(AttributeSet)`).
+    /// Falls back to the builtin dispatcher when no dex override exists.
+    pub fn call_virtual_sig(
+        &mut self,
+        this: u32,
+        name: &str,
+        params: &[&str],
+        args: &[V],
+    ) -> Result<Option<V>> {
+        let ci = self
+            .heap
+            .class_of(this)
+            .ok_or_else(|| errd("dexrt.bad_this", name.to_string()))?;
+        let Some(midx) = self.find_method_on_chain_sig(ci, name, params)? else {
+            let desc = self.type_desc_of(ci).unwrap_or_default();
+            let mut a = Vec::with_capacity(args.len() + 1);
+            a.push(V::Ref(this));
+            a.extend_from_slice(args);
+            let r = jdk::call(self, &desc, name, "", &a).map_err(|e| match e {
+                E::Vm(v) => v,
+                E::Throw(t) => {
+                    let d = self.describe_throw(t);
+                    errd("dexrt.exception.uncaught", d)
+                }
+            })?;
+            return Ok(r.flatten());
+        };
+        let mut a = Vec::with_capacity(args.len() + 1);
+        a.push(V::Ref(this));
+        a.extend_from_slice(args);
+        let out = match self.invoke(midx, a, InvokeKind::Virtual) {
+            Ok(v) => Ok(v),
+            Err(E::Vm(e)) => Err(e),
+            Err(E::Throw(r)) => {
+                let d = self.describe_throw(r);
+                Err(errd("dexrt.exception.uncaught", d))
+            }
+        };
+        if self.depth == 0 {
+            self.drain_runnables(500);
+        }
+        out
+    }
+
     /// Declared parameter descriptors of the method `midx` names.
     pub(crate) fn method_params(&self, midx: GIdx) -> Vec<String> {
         let Some(d) = self.dex_of(midx) else {
@@ -2990,7 +3098,24 @@ impl Vm {
                     Some(Obj::Instance { fields, .. }) | Some(Obj::Host { fields, .. }) => {
                         fields.get(&f).copied()
                     }
-                    _ => return vm("dexrt.type"),
+                    other => {
+                        if std::env::var_os("OVELO_VIEWDBG").is_some() {
+                            let kind = match other {
+                                Some(Obj::Array { .. }) => "array",
+                                Some(Obj::Str(_)) => "string",
+                                Some(Obj::Throwable { .. }) => "throwable",
+                                Some(Obj::Class { .. }) => "class",
+                                Some(Obj::Instance { .. }) | Some(Obj::Host { .. }) => "obj",
+                                None => "freed",
+                            };
+                            eprintln!(
+                                "[viewdbg] iget.type h{h} {kind} field={} in {}",
+                                self.describe_field(gi(ins.idx.unwrap_or(0))),
+                                self.describe_method(fr.loc.midx)
+                            );
+                        }
+                        return vm("dexrt.type");
+                    }
                 };
                 if self.trace_field.as_deref().is_some_and(|t| {
                     self.describe_field(gi(ins.idx.unwrap_or(0))).contains(t)

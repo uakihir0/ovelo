@@ -30,7 +30,10 @@ fn main() {
                 let Ok(Some(code)) = dex.code_item(m.code_off) else { continue };
                 let Ok(insns) = decode_all(&code.insns) else { continue };
                 for (i, ins) in insns.iter().enumerate() {
-                    let mut line = format!("  {i:04x} {} regs={:?}", ins.name, ins.regs);
+                    let mut line = format!(
+                        "  {i:04x}@{:04x} {} regs={:?}",
+                        ins.offset, ins.name, ins.regs
+                    );
                     if let Some(t) = ins.target {
                         let ti = insns
                             .iter()
