@@ -1,0 +1,1128 @@
+//! Real JNI bridge: a `JNIEnv` function table of real code pointers the
+//! guest `.so` calls back into the VM with, `RegisterNatives` capture, and
+//! a small asm trampoline that calls native functions with AAPCS64 arg
+//! placement (x0-x7 integer, d0-d7 float).
+
+// Inherently unsafe: raw pointer interop with guest native code and
+// read-only-after-init static function tables shared with it.
+#![allow(unsafe_code, static_mut_refs)]
+//!
+//! Handles crossing the boundary:
+//! * `jobject`/`jclass`/`jstring`/`jarray`/`jthrowable` = heap handle (u32)
+//!   widened to a pointer-sized value; 0 is null.
+//! * `jmethodID`/`jfieldID` = index into `Vm.jni_mids`/`jni_fids` + 1.
+//! * Java calls into native: dex `native` method → symbol lookup →
+//!   `jni_call` trampoline.
+
+use std::cell::Cell;
+use std::ffi::{c_void, CString};
+
+use crate::jdk;
+use crate::proto_sig;
+use crate::value::{HostState, Obj, V};
+use crate::{gl, E, GIdx, Rt, Vm};
+
+thread_local! {
+    static CUR_VM: Cell<*mut Vm> = const { Cell::new(std::ptr::null_mut()) };
+}
+
+fn vm() -> &'static mut Vm {
+    unsafe { &mut *CUR_VM.get() }
+}
+
+/// Run `f` with the JNIEnv bound to `vm` — every native call holds this
+/// for the duration so env functions can reach the heap.
+pub(crate) fn with_vm<R>(vm: &mut Vm, f: impl FnOnce(&mut Vm) -> R) -> R {
+    let prev = CUR_VM.get();
+    CUR_VM.set(vm as *mut Vm);
+    let r = f(vm);
+    CUR_VM.set(prev);
+    r
+}
+
+// ---------- trampoline ----------
+
+core::arch::global_asm!(
+    ".global _ovelo_jni_call",
+    ".p2align 2",
+    "_ovelo_jni_call:",
+    // x0=fnptr, x1=iargs[8], x2=fargs[8], x3=out[2]
+    "mov x9, x0",
+    "mov x10, x3",
+    "ldp d0, d1, [x2]",
+    "ldp d2, d3, [x2, #16]",
+    "ldp d4, d5, [x2, #32]",
+    "ldp d6, d7, [x2, #48]",
+    "ldp x2, x3, [x1, #16]",
+    "ldp x4, x5, [x1, #32]",
+    "ldp x6, x7, [x1, #48]",
+    "ldp x0, x1, [x1]",
+    "blr x9",
+    "str x0, [x10]",
+    "str d0, [x10, #8]",
+    "ret",
+);
+
+extern "C" {
+    /// fnptr(iargs as x0-x7, fargs as d0-d7) → out[0]=x0, out[1]=d0 bits.
+    fn ovelo_jni_call(fnptr: usize, iargs: *const u64, fargs: *const f64, out: *mut u64);
+}
+
+/// Call a native function: int-class args in `iargs` (≤8), float-class
+/// args in `fargs` (≤8). Returns (x0, d0's bit pattern).
+pub(crate) fn call_native(fnptr: usize, iargs: &[u64; 8], fargs: &[f64; 8]) -> (u64, u64) {
+    let mut out = [0u64; 2];
+    unsafe { ovelo_jni_call(fnptr, iargs.as_ptr(), fargs.as_ptr(), out.as_mut_ptr()) };
+    (out[0], out[1])
+}
+
+// ---------- env/vm tables ----------
+
+static mut JNI_TABLE: [u64; 240] = [0; 240];
+static mut JAVAVM_TABLE: [u64; 8] = [0; 8];
+
+pub(crate) fn env_ptr() -> usize {
+    unsafe { JNI_TABLE.as_ptr() as usize }
+}
+pub(crate) fn vm_ptr() -> usize {
+    unsafe { JAVAVM_TABLE.as_ptr() as usize }
+}
+
+extern "C" fn unimpl() -> u64 {
+    eprintln!("[jni] unimplemented env fn");
+    0
+}
+
+macro_rules! ef {
+    ($f:expr) => {
+        $f as usize as u64
+    };
+}
+
+/// Fill both tables once at first use.
+pub(crate) fn init_tables() {
+    use std::sync::Once;
+    static ONCE: Once = Once::new();
+    ONCE.call_once(|| unsafe {
+        for s in JNI_TABLE.iter_mut() {
+            *s = ef!(unimpl as *const ());
+        }
+        let t = &mut JNI_TABLE;
+        t[4] = ef!(get_version as *const ());
+        t[6] = ef!(find_class as *const ());
+        t[13] = ef!(throw as *const ());
+        t[14] = ef!(throw_new as *const ());
+        t[15] = ef!(exception_occurred as *const ());
+        t[16] = ef!(exception_describe as *const ());
+        t[17] = ef!(exception_clear as *const ());
+        t[19] = ef!(ret0 as *const ());
+        t[20] = ef!(pop_local_frame as *const ());
+        t[21] = ef!(new_ref as *const ());
+        t[22] = ef!(ret0 as *const ());
+        t[23] = ef!(ret0 as *const ());
+        t[24] = ef!(is_same_object as *const ());
+        t[25] = ef!(new_ref as *const ());
+        t[26] = ef!(ret0 as *const ());
+        t[27] = ef!(alloc_object as *const ());
+        t[31] = ef!(get_object_class as *const ());
+        t[32] = ef!(is_instance_of as *const ());
+        t[33] = ef!(get_method_id as *const ());
+        t[36] = ef!(call_object_method_a as *const ());
+        t[39] = ef!(call_boolean_method_a as *const ());
+        t[42] = ef!(call_byte_method_a as *const ());
+        t[45] = ef!(call_char_method_a as *const ());
+        t[48] = ef!(call_short_method_a as *const ());
+        t[51] = ef!(call_int_method_a as *const ());
+        t[54] = ef!(call_long_method_a as *const ());
+        t[57] = ef!(call_float_method_a as *const ());
+        t[60] = ef!(call_double_method_a as *const ());
+        t[63] = ef!(call_void_method_a as *const ());
+        t[94] = ef!(get_field_id as *const ());
+        t[95] = ef!(get_object_field as *const ());
+        t[96] = ef!(get_boolean_field as *const ());
+        t[97] = ef!(get_byte_field as *const ());
+        t[98] = ef!(get_char_field as *const ());
+        t[99] = ef!(get_short_field as *const ());
+        t[100] = ef!(get_int_field as *const ());
+        t[101] = ef!(get_long_field as *const ());
+        t[102] = ef!(get_float_field as *const ());
+        t[103] = ef!(get_double_field as *const ());
+        t[104] = ef!(set_object_field as *const ());
+        t[105] = ef!(set_boolean_field as *const ());
+        t[106] = ef!(set_byte_field as *const ());
+        t[107] = ef!(set_char_field as *const ());
+        t[108] = ef!(set_short_field as *const ());
+        t[109] = ef!(set_int_field as *const ());
+        t[110] = ef!(set_long_field as *const ());
+        t[111] = ef!(set_float_field as *const ());
+        t[112] = ef!(set_double_field as *const ());
+        t[113] = ef!(get_static_method_id as *const ());
+        t[116] = ef!(call_static_object_method_a as *const ());
+        t[119] = ef!(call_static_boolean_method_a as *const ());
+        t[122] = ef!(call_static_byte_method_a as *const ());
+        t[125] = ef!(call_static_char_method_a as *const ());
+        t[128] = ef!(call_static_short_method_a as *const ());
+        t[131] = ef!(call_static_int_method_a as *const ());
+        t[134] = ef!(call_static_long_method_a as *const ());
+        t[137] = ef!(call_static_float_method_a as *const ());
+        t[140] = ef!(call_static_double_method_a as *const ());
+        t[143] = ef!(call_static_void_method_a as *const ());
+        t[144] = ef!(get_static_field_id as *const ());
+        t[145] = ef!(get_static_object_field as *const ());
+        t[146] = ef!(get_static_boolean_field as *const ());
+        t[147] = ef!(get_static_byte_field as *const ());
+        t[148] = ef!(get_static_char_field as *const ());
+        t[149] = ef!(get_static_short_field as *const ());
+        t[150] = ef!(get_static_int_field as *const ());
+        t[151] = ef!(get_static_long_field as *const ());
+        t[152] = ef!(get_static_float_field as *const ());
+        t[153] = ef!(get_static_double_field as *const ());
+        t[154] = ef!(set_static_object_field as *const ());
+        t[155] = ef!(set_static_boolean_field as *const ());
+        t[156] = ef!(set_static_byte_field as *const ());
+        t[157] = ef!(set_static_char_field as *const ());
+        t[158] = ef!(set_static_short_field as *const ());
+        t[159] = ef!(set_static_int_field as *const ());
+        t[160] = ef!(set_static_long_field as *const ());
+        t[161] = ef!(set_static_float_field as *const ());
+        t[162] = ef!(set_static_double_field as *const ());
+        t[163] = ef!(new_string as *const ());
+        t[164] = ef!(get_string_length as *const ());
+        t[167] = ef!(new_string_utf as *const ());
+        t[168] = ef!(get_string_utf_length as *const ());
+        t[169] = ef!(get_string_utf_chars as *const ());
+        t[170] = ef!(release_string_utf_chars as *const ());
+        t[171] = ef!(get_array_length as *const ());
+        t[172] = ef!(new_object_array as *const ());
+        t[173] = ef!(get_object_array_element as *const ());
+        t[174] = ef!(set_object_array_element as *const ());
+        t[175] = ef!(new_boolean_array as *const ());
+        t[176] = ef!(new_byte_array as *const ());
+        t[177] = ef!(new_char_array as *const ());
+        t[178] = ef!(new_short_array as *const ());
+        t[179] = ef!(new_int_array as *const ());
+        t[180] = ef!(new_long_array as *const ());
+        t[181] = ef!(new_float_array as *const ());
+        t[182] = ef!(new_double_array as *const ());
+        t[183] = ef!(get_boolean_array_elements as *const ());
+        t[184] = ef!(get_byte_array_elements as *const ());
+        t[185] = ef!(get_char_array_elements as *const ());
+        t[186] = ef!(get_short_array_elements as *const ());
+        t[187] = ef!(get_int_array_elements as *const ());
+        t[188] = ef!(get_long_array_elements as *const ());
+        t[189] = ef!(get_float_array_elements as *const ());
+        t[190] = ef!(get_double_array_elements as *const ());
+        t[191] = ef!(release_boolean_array_elements as *const ());
+        t[192] = ef!(release_byte_array_elements as *const ());
+        t[193] = ef!(release_char_array_elements as *const ());
+        t[194] = ef!(release_short_array_elements as *const ());
+        t[195] = ef!(release_int_array_elements as *const ());
+        t[196] = ef!(release_long_array_elements as *const ());
+        t[197] = ef!(release_float_array_elements as *const ());
+        t[198] = ef!(release_double_array_elements as *const ());
+        t[199] = ef!(get_boolean_array_region as *const ());
+        t[200] = ef!(get_byte_array_region as *const ());
+        t[201] = ef!(get_char_array_region as *const ());
+        t[202] = ef!(get_short_array_region as *const ());
+        t[203] = ef!(get_int_array_region as *const ());
+        t[204] = ef!(get_long_array_region as *const ());
+        t[205] = ef!(get_float_array_region as *const ());
+        t[206] = ef!(get_double_array_region as *const ());
+        t[207] = ef!(set_boolean_array_region as *const ());
+        t[208] = ef!(set_byte_array_region as *const ());
+        t[209] = ef!(set_char_array_region as *const ());
+        t[210] = ef!(set_short_array_region as *const ());
+        t[211] = ef!(set_int_array_region as *const ());
+        t[212] = ef!(set_long_array_region as *const ());
+        t[213] = ef!(set_float_array_region as *const ());
+        t[214] = ef!(set_double_array_region as *const ());
+        t[215] = ef!(register_natives as *const ());
+        t[216] = ef!(ret0 as *const ());
+        t[217] = ef!(ret0 as *const ());
+        t[218] = ef!(ret0 as *const ());
+        t[219] = ef!(get_java_vm as *const ());
+        t[228] = ef!(exception_check as *const ());
+        t[229] = ef!(new_direct_byte_buffer as *const ());
+        t[230] = ef!(get_direct_buffer_address as *const ());
+        t[231] = ef!(get_direct_buffer_capacity as *const ());
+        t[232] = ef!(ret1 as *const ());
+
+        JAVAVM_TABLE[3] = ef!(ret0 as *const ()); // DestroyJavaVM
+        JAVAVM_TABLE[4] = ef!(vm_attach as *const ());
+        JAVAVM_TABLE[5] = ef!(ret0 as *const ()); // DetachCurrentThread
+        JAVAVM_TABLE[6] = ef!(vm_get_env as *const ());
+        JAVAVM_TABLE[7] = ef!(vm_attach as *const ());
+    });
+}
+
+// ---------- small helpers ----------
+
+extern "C" fn ret0() -> u64 {
+    0
+}
+extern "C" fn ret1() -> u64 {
+    1
+}
+
+fn cstr_ro(p: u64) -> String {
+    if p == 0 {
+        return String::new();
+    }
+    let mut s = Vec::new();
+    let mut q = p as *const u8;
+    unsafe {
+        while *q != 0 {
+            s.push(*q);
+            q = q.add(1);
+        }
+    }
+    String::from_utf8_lossy(&s).into_owned()
+}
+
+/// decode a jmethodID / jfieldID
+fn mid_of(id: u64) -> Option<GIdx> {
+    vm().jni_mids.get(id.checked_sub(1)? as usize).copied()
+}
+fn fid_of(id: u64) -> Option<GIdx> {
+    vm().jni_fids.get(id.checked_sub(1)? as usize).copied()
+}
+
+/// jvalue → V by param descriptor char.
+fn jval(slot: u64, desc: &str) -> V {
+    match desc {
+        "Z" | "B" | "C" | "S" | "I" => V::I32(slot as u32 as i32),
+        "J" => V::I64(slot as i64),
+        "F" => V::F32(f32::from_bits(slot as u32)),
+        "D" => V::F64(f64::from_bits(slot)),
+        _ => V::Ref(slot as u32),
+    }
+}
+
+fn v_to_u64(v: V) -> u64 {
+    match v {
+        V::Ref(h) => h as u64,
+        V::I32(i) => i as u32 as u64,
+        V::I64(i) => i as u64,
+        V::F32(f) => f.to_bits() as u64,
+        V::F64(f) => f.to_bits(),
+    }
+}
+
+/// Method proto params of a dex method id.
+fn method_params(midx: GIdx) -> (String, Vec<String>, String) {
+    let v = vm();
+    let Some(d) = v.dex_of(midx) else {
+        return (String::new(), Vec::new(), String::new());
+    };
+    let Ok(m) = d.method(gl(midx)) else {
+        return (String::new(), Vec::new(), String::new());
+    };
+    let class = d.type_descriptor(m.class_idx as u32).unwrap_or_default();
+    let sig = proto_sig(d, m.proto_idx as u32).unwrap_or_default();
+    (class, split_params(&sig), sig_return(&sig))
+}
+
+fn split_params(sig: &str) -> Vec<String> {
+    let mut out = Vec::new();
+    let Some(p) = sig.strip_prefix('(').and_then(|s| s.split(')').next()) else {
+        return out;
+    };
+    let mut cur = String::new();
+    let mut in_ref = false;
+    for c in p.chars() {
+        cur.push(c);
+        match c {
+            'L' if !in_ref => in_ref = true,
+            ';' if in_ref => {
+                in_ref = false;
+                out.push(std::mem::take(&mut cur));
+            }
+            '[' => {}
+            _ if !in_ref => {
+                out.push(std::mem::take(&mut cur));
+            }
+            _ => {}
+        }
+    }
+    out
+}
+
+fn sig_return(sig: &str) -> String {
+    sig.split(')').nth(1).unwrap_or("V").to_string()
+}
+
+/// Invoke a dex/host method through the interpreter.
+fn call_obj(obj: u64, mid: u64, args: &[V], is_static: bool) -> Option<V> {
+    let g = mid_of(mid)?;
+    let v = vm();
+    let kind = if is_static {
+        crate::InvokeKind::Static
+    } else {
+        crate::InvokeKind::Virtual
+    };
+    let mut a = Vec::with_capacity(args.len() + 1);
+    if !is_static {
+        a.push(V::Ref(obj as u32));
+    }
+    a.extend_from_slice(args);
+    v.invoke_pub(g, a, kind).ok().flatten()
+}
+
+/// Method-id registration: name+sig on `clazz` (a jclass handle) → id.
+fn find_method_id(clazz: u64, name_p: u64, sig_p: u64) -> u64 {
+    let name = cstr_ro(name_p);
+    let sig = cstr_ro(sig_p);
+    let params = split_params(&sig);
+    let pref: Vec<&str> = params.iter().map(String::as_str).collect();
+    let v = vm();
+    let Some(ci) = (match clazz {
+        h if h != 0 => v.heap.class_of(h as u32),
+        _ => None,
+    }) else {
+        return 0;
+    };
+    match v.find_method_on_chain_sig(ci, &name, &pref) {
+        Ok(Some(g)) => {
+            v.jni_mids.push(g);
+            v.jni_mids.len() as u64
+        }
+        _ => {
+            eprintln!("[jni] GetMethodID miss {name}{sig}");
+            0
+        }
+    }
+}
+
+fn find_field_id(clazz: u64, name_p: u64, _sig_p: u64, is_static: bool) -> u64 {
+    let name = cstr_ro(name_p);
+    let v = vm();
+    let Some(ci) = (match clazz {
+        h if h != 0 => v.heap.class_of(h as u32),
+        _ => None,
+    }) else {
+        return 0;
+    };
+    if let Some(g) = v.find_field_by_name(ci, &name, is_static) {
+        v.jni_fids.push(g);
+        return v.jni_fids.len() as u64;
+    }
+    0
+}
+
+// ---------- env function impls ----------
+
+extern "C" fn get_version(_e: u64) -> u64 {
+    0x0001_0008
+}
+
+extern "C" fn find_class(_e: u64, name_p: u64) -> u64 {
+    let name = cstr_ro(name_p);
+    let desc = format!("L{};", name.replace('.', "/"));
+    let v = vm();
+    match v.type_index_of(&desc) {
+        Some(ci) => v.class_mirror(ci) as u64,
+        None => {
+            eprintln!("[jni] FindClass miss {desc}");
+            0
+        }
+    }
+}
+
+extern "C" fn throw(_e: u64, obj: u64) -> u64 {
+    vm().jni_pending_exc = obj as u32;
+    0
+}
+extern "C" fn throw_new(_e: u64, _clazz: u64, msg: u64) -> u64 {
+    let m = cstr_ro(msg);
+    eprintln!("[jni] ThrowNew {m}");
+    vm().jni_pending_exc = u32::MAX;
+    0
+}
+extern "C" fn exception_occurred(_e: u64) -> u64 {
+    let p = vm().jni_pending_exc;
+    if p == u32::MAX {
+        0
+    } else {
+        p as u64
+    }
+}
+extern "C" fn exception_describe(_e: u64) -> u64 {
+    eprintln!("[jni] ExceptionDescribe: pending={:#x}", vm().jni_pending_exc);
+    0
+}
+extern "C" fn exception_clear(_e: u64) -> u64 {
+    vm().jni_pending_exc = 0;
+    0
+}
+extern "C" fn exception_check(_e: u64) -> u64 {
+    u64::from(vm().jni_pending_exc != 0)
+}
+
+extern "C" fn pop_local_frame(_e: u64, obj: u64) -> u64 {
+    obj
+}
+extern "C" fn new_ref(_e: u64, obj: u64) -> u64 {
+    obj
+}
+extern "C" fn is_same_object(_e: u64, a: u64, b: u64) -> u64 {
+    u64::from(a == b)
+}
+
+extern "C" fn alloc_object(_e: u64, clazz: u64) -> u64 {
+    let v = vm();
+    let ci = v.heap.class_of(clazz as u32).unwrap_or(crate::GX_NONE);
+    let h = v.heap.alloc(Obj::Instance {
+        class_idx: ci,
+        fields: std::collections::HashMap::new(),
+    });
+    h as u64
+}
+extern "C" fn get_object_class(_e: u64, obj: u64) -> u64 {
+    let v = vm();
+    match v.heap.class_of(obj as u32) {
+        Some(ci) => v.class_mirror(ci) as u64,
+        None => 0,
+    }
+}
+extern "C" fn is_instance_of(_e: u64, obj: u64, clazz: u64) -> u64 {
+    let v = vm();
+    match (v.heap.class_of(obj as u32), v.heap.class_of(clazz as u32)) {
+        (Some(a), Some(b)) => u64::from(v.assignable(a, b)),
+        _ => 0,
+    }
+}
+
+extern "C" fn get_method_id(_e: u64, clazz: u64, name_p: u64, sig_p: u64) -> u64 {
+    find_method_id(clazz, name_p, sig_p)
+}
+extern "C" fn get_static_method_id(_e: u64, clazz: u64, name_p: u64, sig_p: u64) -> u64 {
+    find_method_id(clazz, name_p, sig_p)
+}
+extern "C" fn get_field_id(_e: u64, clazz: u64, name_p: u64, sig_p: u64) -> u64 {
+    find_field_id(clazz, name_p, sig_p, false)
+}
+extern "C" fn get_static_field_id(_e: u64, clazz: u64, name_p: u64, sig_p: u64) -> u64 {
+    find_field_id(clazz, name_p, sig_p, true)
+}
+
+fn jargs(params: &[String], jvalues: u64) -> Vec<V> {
+    params
+        .iter()
+        .enumerate()
+        .map(|(i, d)| jval(unsafe { ((jvalues + 8 * i as u64) as *const u64).read() }, d))
+        .collect()
+}
+
+macro_rules! call_a {
+    ($name:ident, $wrap:expr) => {
+        extern "C" fn $name(_e: u64, obj: u64, mid: u64, jvalues: u64) -> u64 {
+            let Some(g) = mid_of(mid) else { return 0 };
+            let (_, params, _) = method_params(g);
+            let args = jargs(&params, jvalues);
+            call_obj(obj, mid, &args, false).map($wrap).unwrap_or(0)
+        }
+    };
+}
+call_a!(call_object_method_a, |v: V| v_to_u64(v));
+call_a!(call_boolean_method_a, |v: V| v_to_u64(v));
+call_a!(call_byte_method_a, |v: V| v_to_u64(v));
+call_a!(call_char_method_a, |v: V| v_to_u64(v));
+call_a!(call_short_method_a, |v: V| v_to_u64(v));
+call_a!(call_int_method_a, |v: V| v_to_u64(v));
+call_a!(call_long_method_a, |v: V| v_to_u64(v));
+call_a!(call_float_method_a, |v: V| v_to_u64(v));
+call_a!(call_double_method_a, |v: V| v_to_u64(v));
+extern "C" fn call_void_method_a(_e: u64, obj: u64, mid_: u64, jvalues: u64) -> u64 {
+    let Some(g) = mid_of(mid_) else { return 0 };
+    let (_, params, _) = method_params(g);
+    let args = jargs(&params, jvalues);
+    call_obj(obj, mid_, &args, false);
+    0
+}
+
+macro_rules! call_static_a {
+    ($name:ident) => {
+        extern "C" fn $name(_e: u64, _clazz: u64, mid: u64, jvalues: u64) -> u64 {
+            let Some(g) = mid_of(mid) else { return 0 };
+            let (_, params, _) = method_params(g);
+            let args = jargs(&params, jvalues);
+            call_obj(0, mid, &args, true).map(v_to_u64).unwrap_or(0)
+        }
+    };
+}
+call_static_a!(call_static_object_method_a);
+call_static_a!(call_static_boolean_method_a);
+call_static_a!(call_static_byte_method_a);
+call_static_a!(call_static_char_method_a);
+call_static_a!(call_static_short_method_a);
+call_static_a!(call_static_int_method_a);
+call_static_a!(call_static_long_method_a);
+call_static_a!(call_static_float_method_a);
+call_static_a!(call_static_double_method_a);
+call_static_a!(call_static_void_method_a);
+
+fn field_get_v(obj: u64, id: u64) -> V {
+    let Some(g) = fid_of(id) else { return V::I32(0) };
+    let v = vm();
+    let f = v.canon_field(g);
+    match v.heap.get(obj as u32) {
+        Some(Obj::Instance { fields, .. }) | Some(Obj::Host { fields, .. }) => {
+            fields.get(&f).copied().unwrap_or(V::I32(0))
+        }
+        _ => V::I32(0),
+    }
+}
+fn field_set_v(obj: u64, id: u64, val: u64) {
+    let Some(g) = fid_of(id) else { return };
+    let v = vm();
+    let f = v.canon_field(g);
+    if let Some(Obj::Instance { fields, .. }) | Some(Obj::Host { fields, .. }) =
+        v.heap.get_mut(obj as u32)
+    {
+        fields.insert(f, V::I64(val as i64));
+    }
+}
+fn static_get_v(_clazz: u64, id: u64) -> V {
+    let Some(g) = fid_of(id) else { return V::I32(0) };
+    vm().sget_pub(g).unwrap_or(V::I32(0))
+}
+fn static_set_v(_clazz: u64, id: u64, val: u64) {
+    let Some(g) = fid_of(id) else { return };
+    vm().sput_pub(g, V::I64(val as i64));
+}
+
+macro_rules! getf {
+    ($n:ident) => {
+        extern "C" fn $n(_e: u64, obj: u64, id: u64) -> u64 {
+            v_to_u64(field_get_v(obj, id))
+        }
+    };
+}
+getf!(get_object_field);
+getf!(get_boolean_field);
+getf!(get_byte_field);
+getf!(get_char_field);
+getf!(get_short_field);
+getf!(get_int_field);
+getf!(get_long_field);
+getf!(get_float_field);
+getf!(get_double_field);
+
+macro_rules! setf {
+    ($n:ident) => {
+        extern "C" fn $n(_e: u64, obj: u64, id: u64, val: u64) {
+            field_set_v(obj, id, val)
+        }
+    };
+}
+setf!(set_object_field);
+setf!(set_boolean_field);
+setf!(set_byte_field);
+setf!(set_char_field);
+setf!(set_short_field);
+setf!(set_int_field);
+setf!(set_long_field);
+setf!(set_float_field);
+setf!(set_double_field);
+
+macro_rules! gets {
+    ($n:ident) => {
+        extern "C" fn $n(_e: u64, clazz: u64, id: u64) -> u64 {
+            v_to_u64(static_get_v(clazz, id))
+        }
+    };
+}
+gets!(get_static_object_field);
+gets!(get_static_boolean_field);
+gets!(get_static_byte_field);
+gets!(get_static_char_field);
+gets!(get_static_short_field);
+gets!(get_static_int_field);
+gets!(get_static_long_field);
+gets!(get_static_float_field);
+gets!(get_static_double_field);
+
+macro_rules! sets {
+    ($n:ident) => {
+        extern "C" fn $n(_e: u64, clazz: u64, id: u64, val: u64) {
+            static_set_v(clazz, id, val)
+        }
+    };
+}
+sets!(set_static_object_field);
+sets!(set_static_boolean_field);
+sets!(set_static_byte_field);
+sets!(set_static_char_field);
+sets!(set_static_short_field);
+sets!(set_static_int_field);
+sets!(set_static_long_field);
+sets!(set_static_float_field);
+sets!(set_static_double_field);
+
+// ---------- strings ----------
+
+extern "C" fn new_string_utf(_e: u64, p: u64) -> u64 {
+    let s = cstr_ro(p);
+    vm().heap.intern_str(&s) as u64
+}
+extern "C" fn new_string(_e: u64, _p: u64, _len: u64) -> u64 {
+    0
+}
+extern "C" fn get_string_length(_e: u64, s: u64) -> u64 {
+    vm().heap
+        .str_val(s as u32)
+        .map(|x| x.chars().count() as u64)
+        .unwrap_or(0)
+}
+extern "C" fn get_string_utf_length(_e: u64, s: u64) -> u64 {
+    vm().heap.str_val(s as u32).map(|x| x.len() as u64).unwrap_or(0)
+}
+extern "C" fn get_string_utf_chars(_e: u64, s: u64, _copy: u64) -> u64 {
+    let Some(x) = vm().heap.str_val(s as u32).map(|x| x.to_string()) else {
+        return 0;
+    };
+    let c = CString::new(x).unwrap_or_default();
+    c.into_raw() as u64
+}
+extern "C" fn release_string_utf_chars(_e: u64, _s: u64, p: u64) -> u64 {
+    if p != 0 {
+        unsafe { drop(CString::from_raw(p as *mut i8)) };
+    }
+    0
+}
+
+// ---------- arrays ----------
+
+fn arr_data(h: u32) -> Option<Vec<V>> {
+    match vm().heap.get(h) {
+        Some(Obj::Array { data, .. }) => Some(data.clone()),
+        _ => None,
+    }
+}
+
+extern "C" fn get_array_length(_e: u64, a: u64) -> u64 {
+    arr_data(a as u32).map(|d| d.len() as u64).unwrap_or(0)
+}
+extern "C" fn new_object_array(_e: u64, len: u64, _clazz: u64, init: u64) -> u64 {
+    let v = vm();
+    let h = v.heap.alloc(Obj::Array {
+        elem: "Ljava/lang/Object;".into(),
+        data: vec![V::Ref(init as u32); len as usize],
+    });
+    h as u64
+}
+extern "C" fn get_object_array_element(_e: u64, a: u64, i: u64) -> u64 {
+    arr_data(a as u32)
+        .and_then(|d| d.get(i as usize).copied())
+        .map(v_to_u64)
+        .unwrap_or(0)
+}
+extern "C" fn set_object_array_element(_e: u64, a: u64, i: u64, v: u64) {
+    if let Some(Obj::Array { data, .. }) = vm().heap.get_mut(a as u32) {
+        if let Some(slot) = data.get_mut(i as usize) {
+            *slot = V::Ref(v as u32);
+        }
+    }
+}
+
+macro_rules! new_arr {
+    ($n:ident, $elem:expr, $v:expr) => {
+        extern "C" fn $n(_e: u64, len: u64) -> u64 {
+            let v = vm();
+            let h = v.heap.alloc(Obj::Array {
+                elem: $elem.into(),
+                data: vec![$v; len as usize],
+            });
+            h as u64
+        }
+    };
+}
+new_arr!(new_boolean_array, "Z", V::I32(0));
+new_arr!(new_byte_array, "B", V::I32(0));
+new_arr!(new_char_array, "C", V::I32(0));
+new_arr!(new_short_array, "S", V::I32(0));
+new_arr!(new_int_array, "I", V::I32(0));
+new_arr!(new_long_array, "J", V::I64(0));
+new_arr!(new_float_array, "F", V::F32(0.0));
+new_arr!(new_double_array, "D", V::F64(0.0));
+
+/// element byte width for the typed array accessors
+fn elem_size(h: u32) -> usize {
+    match vm().heap.get(h) {
+        Some(Obj::Array { elem, .. }) => match elem.as_str() {
+            "J" | "D" => 8,
+            "I" | "F" | "C" | "S" => match elem.as_str() {
+                "C" | "S" => 2,
+                _ => 4,
+            },
+            "Z" | "B" => 1,
+            _ => 8,
+        },
+        _ => 8,
+    }
+}
+fn elem_bits(v: V, size: usize) -> u64 {
+    match (v, size) {
+        (V::Ref(h), _) => h as u64,
+        (V::I64(i), _) => i as u64,
+        (V::F64(f), _) => f.to_bits(),
+        (V::F32(f), _) => f.to_bits() as u64,
+        (V::I32(i), 8) => i as u32 as u64,
+        (V::I32(i), _) => i as u32 as u64 & ((1u64 << (size * 8)) - 1),
+    }
+}
+fn bits_elem(bits: u64, elem: &str) -> V {
+    match elem {
+        "J" => V::I64(bits as i64),
+        "D" => V::F64(f64::from_bits(bits)),
+        "F" => V::F32(f32::from_bits(bits as u32)),
+        _ => V::I32(bits as u32 as i32),
+    }
+}
+
+// Elements are packed at their native width — a jint array hands the
+// native a contiguous `int32_t*`, not an array of 8-byte slots.
+fn get_elems(a: u64, _copy: u64) -> u64 {
+    let h = a as u32;
+    let Some(d) = arr_data(h) else { return 0 };
+    let sz = elem_size(h);
+    let buf = libc_malloc(d.len() * sz + 8) as u64;
+    for (i, v) in d.iter().enumerate() {
+        unsafe { ((buf + (i * sz) as u64) as *mut u64).write(elem_bits(*v, sz)) };
+    }
+    buf
+}
+fn release_elems(a: u64, buf: u64, mode: u64) {
+    let h = a as u32;
+    if mode != 2 {
+        let sz = elem_size(h);
+        if let Some(Obj::Array { data, elem }) = vm().heap.get_mut(h) {
+            let e = elem.clone();
+            for (i, slot) in data.iter_mut().enumerate() {
+                let bits = unsafe { ((buf + (i * sz) as u64) as *const u64).read() };
+                *slot = bits_elem(bits & (u64::MAX >> (64 - sz * 8).min(63)), &e);
+            }
+        }
+    }
+    if mode != 1 && buf != 0 {
+        libc_free(buf as usize);
+    }
+}
+
+extern "C" {
+    fn malloc(n: usize) -> *mut c_void;
+    fn free(p: *mut c_void);
+}
+fn libc_malloc(n: usize) -> usize {
+    unsafe { malloc(n) as usize }
+}
+fn libc_free(p: usize) {
+    unsafe { free(p as *mut c_void) }
+}
+
+macro_rules! ga {
+    ($n:ident) => {
+        extern "C" fn $n(_e: u64, a: u64, copy: u64) -> u64 {
+            get_elems(a, copy)
+        }
+    };
+}
+ga!(get_boolean_array_elements);
+ga!(get_byte_array_elements);
+ga!(get_char_array_elements);
+ga!(get_short_array_elements);
+ga!(get_int_array_elements);
+ga!(get_long_array_elements);
+ga!(get_float_array_elements);
+ga!(get_double_array_elements);
+
+macro_rules! ra {
+    ($n:ident) => {
+        extern "C" fn $n(_e: u64, a: u64, buf: u64, mode: u64) {
+            release_elems(a, buf, mode)
+        }
+    };
+}
+ra!(release_boolean_array_elements);
+ra!(release_byte_array_elements);
+ra!(release_char_array_elements);
+ra!(release_short_array_elements);
+ra!(release_int_array_elements);
+ra!(release_long_array_elements);
+ra!(release_float_array_elements);
+ra!(release_double_array_elements);
+
+fn get_region(a: u64, start: u64, len: u64, out: u64) {
+    let h = a as u32;
+    let Some(d) = arr_data(h) else { return };
+    let sz = elem_size(h);
+    for i in 0..len as usize {
+        let v = d.get(start as usize + i).copied().unwrap_or(V::I32(0));
+        unsafe {
+            ((out + (i * sz) as u64) as *mut u64).write(elem_bits(v, sz));
+        }
+    }
+}
+fn set_region(a: u64, start: u64, len: u64, inp: u64) {
+    let h = a as u32;
+    let sz = elem_size(h);
+    if let Some(Obj::Array { data, elem }) = vm().heap.get_mut(h) {
+        let e = elem.clone();
+        for i in 0..len as usize {
+            let bits = unsafe { ((inp + (i * sz) as u64) as *const u64).read() };
+            if let Some(slot) = data.get_mut(start as usize + i) {
+                *slot = bits_elem(bits & (u64::MAX >> (64 - sz * 8).min(63)), &e);
+            }
+        }
+    }
+}
+
+macro_rules! gr {
+    ($n:ident) => {
+        extern "C" fn $n(_e: u64, a: u64, start: u64, len: u64, out: u64) {
+            get_region(a, start, len, out)
+        }
+    };
+}
+gr!(get_boolean_array_region);
+gr!(get_byte_array_region);
+gr!(get_char_array_region);
+gr!(get_short_array_region);
+gr!(get_int_array_region);
+gr!(get_long_array_region);
+gr!(get_float_array_region);
+gr!(get_double_array_region);
+
+macro_rules! sr {
+    ($n:ident) => {
+        extern "C" fn $n(_e: u64, a: u64, start: u64, len: u64, inp: u64) {
+            set_region(a, start, len, inp)
+        }
+    };
+}
+sr!(set_boolean_array_region);
+sr!(set_byte_array_region);
+sr!(set_char_array_region);
+sr!(set_short_array_region);
+sr!(set_int_array_region);
+sr!(set_long_array_region);
+sr!(set_float_array_region);
+sr!(set_double_array_region);
+
+// ---------- misc ----------
+
+extern "C" fn register_natives(_e: u64, clazz: u64, methods: u64, n: u64) -> u64 {
+    let v = vm();
+    let desc = v
+        .heap
+        .class_of(clazz as u32)
+        .and_then(|ci| v.type_desc_of(ci).ok())
+        .unwrap_or_default();
+    // RegisterNatives applies to the most recently loaded lib — the one
+    // whose JNI_OnLoad is running.
+    let Some(lib) = v.natives.last_mut() else {
+        return 0;
+    };
+    for i in 0..n as usize {
+        let (name_p, sig_p, fn_p) = unsafe {
+            (
+                ((methods + 24 * i as u64) as *const u64).read(),
+                ((methods + 24 * i as u64 + 8) as *const u64).read(),
+                ((methods + 24 * i as u64 + 16) as *const u64).read(),
+            )
+        };
+        let name = cstr_ro(name_p);
+        let sig = cstr_ro(sig_p);
+        lib.registered.insert((desc.clone(), name, sig), fn_p as usize);
+    }
+    0
+}
+
+extern "C" fn get_java_vm(_e: u64, _out: u64) -> u64 {
+    0
+}
+extern "C" fn vm_get_env(_vm: u64, _out: u64, _ver: u64) -> u64 {
+    0
+}
+extern "C" fn vm_attach(_vm: u64, _a: u64, _b: u64) -> u64 {
+    0
+}
+
+extern "C" fn new_direct_byte_buffer(_e: u64, addr: u64, cap: u64) -> u64 {
+    let v = vm();
+    let ci = v.type_index_of("Ljava/nio/ByteBuffer;").unwrap_or(crate::GX_NONE);
+    let mut fields = std::collections::HashMap::new();
+    fields.insert(jdk::P_DATA as u64, V::I64(addr as i64));
+    fields.insert(jdk::P_FLAGS as u64, V::I64(cap as i64));
+    let h = v.heap.alloc(Obj::Host {
+        class_idx: ci,
+        desc: "Ljava/nio/ByteBuffer;".into(),
+        fields,
+        state: HostState::Empty,
+    });
+    h as u64
+}
+extern "C" fn get_direct_buffer_address(_e: u64, buf: u64) -> u64 {
+    jdk::pseudo_get(vm(), buf as u32, jdk::P_DATA)
+        .map(v_to_u64)
+        .unwrap_or(0)
+}
+extern "C" fn get_direct_buffer_capacity(_e: u64, buf: u64) -> u64 {
+    jdk::pseudo_get(vm(), buf as u32, jdk::P_FLAGS)
+        .map(v_to_u64)
+        .unwrap_or(0)
+}
+
+// ---------- Java → native dispatch ----------
+
+/// JNI name mangling per spec (short and long forms).
+fn mangle(s: &str) -> String {
+    let mut out = String::new();
+    for c in s.chars() {
+        match c {
+            '/' | '.' => out.push('_'),
+            '_' => out.push_str("_1"),
+            ';' => out.push_str("_2"),
+            '[' => out.push_str("_3"),
+            c if c.is_alphanumeric() => out.push(c),
+            c => out.push_str(&format!("_0{:04x}", c as u32)),
+        }
+    }
+    out
+}
+
+/// Find the native implementation of a dex method in loaded libs:
+/// `Java_` symbol first, then the RegisterNatives table.
+pub(crate) fn native_addr(vm: &Vm, class: &str, name: &str, sig: &str) -> Option<usize> {
+    let cls = class.trim_start_matches('L').trim_end_matches(';');
+    let short = format!("Java_{}_{}", mangle(cls), mangle(name));
+    let params = split_params(sig).concat();
+    let long = format!("{short}__{}", mangle(&params));
+    for lib in &vm.natives {
+        if let Some(&a) = lib.exports.get(&short).or_else(|| lib.exports.get(&long)) {
+            return Some(a);
+        }
+        if let Some(&a) = lib.registered.get(&(class.to_string(), name.to_string(), sig.to_string())) {
+            return Some(a);
+        }
+    }
+    None
+}
+
+/// `System.loadLibrary(name)` / `Runtime.load(path)`: pull the arm64
+/// `.so` out of the APK, map it, run initializers, then `JNI_OnLoad`.
+/// libGDX's loader tries `lib<name>arm64.so` before `lib<name>.so`, so
+/// both spellings are candidates; `load()`'s absolute path reduces to
+/// its basename inside `lib/arm64-v8a/`.
+pub(crate) fn load_native_lib(vm: &mut Vm, arg: &str, absolute: bool) {
+    init_tables();
+    let cands: Vec<String> = if absolute {
+        let base = arg.rsplit('/').next().unwrap_or(arg);
+        vec![format!("lib/arm64-v8a/{base}")]
+    } else {
+        let stripped = arg.strip_suffix("arm64").unwrap_or(arg);
+        vec![
+            format!("lib/arm64-v8a/lib{arg}.so"),
+            format!("lib/arm64-v8a/lib{stripped}.so"),
+        ]
+    };
+    let found = vm
+        .apk_res
+        .as_ref()
+        .and_then(|r| cands.iter().find_map(|p| r.read(p).map(|b| (p.clone(), b))));
+    let Some((path, bytes)) = found else {
+        eprintln!("[jni] loadLibrary {arg}: no arm64 .so in apk");
+        return;
+    };
+    let lib = match crate::native::load_so(&path, &bytes) {
+        Ok(l) => l,
+        Err(e) => {
+            eprintln!("[jni] load_so {path}: {e}");
+            return;
+        }
+    };
+    let onload = lib.exports.get("JNI_OnLoad").copied();
+    eprintln!(
+        "[jni] loaded {path} exports={} onload={onload:?}",
+        lib.exports.len()
+    );
+    vm.natives.push(lib);
+    if let Some(addr) = onload {
+        let iargs = [vm_ptr() as u64, 0, 0, 0, 0, 0, 0, 0];
+        let fargs = [0f64; 8];
+        let (rc, _) = with_vm(vm, |_| call_native(addr, &iargs, &fargs));
+        eprintln!("[jni] JNI_OnLoad -> {rc:#x}");
+    }
+}
+
+/// Marshal dex args and call the native function. `iargs[0..2]` are the
+/// env + receiver/class — params occupy int regs x2-x7 (≤6) and float
+/// regs d0-d7 (≤8). Long/double are single 64-bit slots each.
+pub(crate) fn dispatch_native(
+    vm: &mut Vm,
+    addr: usize,
+    class: &str,
+    ret: &str,
+    is_static: bool,
+    args: &[V],
+) -> Rt<Option<V>> {
+    let mut iargs = [0u64; 8];
+    let mut fargs = [0f64; 8];
+    iargs[0] = env_ptr() as u64;
+    iargs[1] = if is_static {
+        vm.type_index_of(class)
+            .map(|ci| vm.class_mirror(ci) as u64)
+            .unwrap_or(0)
+    } else {
+        match args.first() {
+            Some(V::Ref(h)) => *h as u64,
+            _ => 0,
+        }
+    };
+    let mut ii = 2usize;
+    let mut fi = 0usize;
+    let params = if is_static { args } else { &args[1.min(args.len())..] };
+    for v in params {
+        match v {
+            V::F32(f) => {
+                if fi >= 8 {
+                    return Err(E::Vm(crate::errd(
+                        "dexrt.jni.args",
+                        "float args > 8".to_string(),
+                    )));
+                }
+                fargs[fi] = *f as f64;
+                fi += 1;
+            }
+            V::F64(f) => {
+                if fi >= 8 {
+                    return Err(E::Vm(crate::errd(
+                        "dexrt.jni.args",
+                        "float args > 8".to_string(),
+                    )));
+                }
+                fargs[fi] = *f;
+                fi += 1;
+            }
+            other => {
+                if ii >= 8 {
+                    return Err(E::Vm(crate::errd(
+                        "dexrt.jni.args",
+                        "int args > 6".to_string(),
+                    )));
+                }
+                iargs[ii] = v_to_u64(*other);
+                ii += 1;
+            }
+        }
+    }
+    let (x0, d0) = with_vm(vm, |_| call_native(addr, &iargs, &fargs));
+    Ok(Some(match ret {
+        "V" => return Ok(None),
+        "Z" | "B" | "C" | "S" | "I" => V::I32(x0 as u32 as i32),
+        "J" => V::I64(x0 as i64),
+        "F" => V::F32(f64::from_bits(d0) as f32),
+        "D" => V::F64(f64::from_bits(d0)),
+        _ => V::Ref(x0 as u32),
+    }))
+}

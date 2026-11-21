@@ -176,11 +176,76 @@ fn print_call(vm: &mut Vm, name: &str, _sig: &str, args: &[V]) -> Option<Option<
 }
 
 fn stream_call(vm: &mut Vm, name: &str, args: &[V]) -> Option<Option<V>> {
+    let this = match args.first() {
+        Some(&V::Ref(h)) => h,
+        _ => 0,
+    };
+    // Byte-backed streams (raw resources, assets): real reads.
+    if let Some(Obj::Host {
+        state: HostState::Bytes(data, pos),
+        ..
+    }) = vm.heap.get_mut(this)
+    {
+        match name {
+            "read" => {
+                if args.len() == 1 {
+                    return Some(Some(if *pos < data.len() {
+                        let b = data[*pos] as i32;
+                        *pos += 1;
+                        V::I32(b)
+                    } else {
+                        V::I32(-1)
+                    }));
+                }
+                // read(byte[]) / read(byte[], off, len)
+                let buf = match args.get(1) {
+                    Some(&V::Ref(h)) => h,
+                    _ => 0,
+                };
+                let (mut off, mut want) = (0usize, usize::MAX);
+                if args.len() > 3 {
+                    off = i64v(args[2]).max(0) as usize;
+                    want = i64v(args[3]).max(0) as usize;
+                }
+                let avail = data.len() - *pos;
+                if avail == 0 && want != 0 {
+                    return Some(Some(V::I32(-1)));
+                }
+                let n = want.min(avail);
+                let chunk: Vec<u8> = data[*pos..*pos + n].to_vec();
+                *pos += n;
+                if let Some(Obj::Array { data: dst, .. }) = vm.heap.get_mut(buf) {
+                    for (i, b) in chunk.iter().enumerate() {
+                        if let Some(slot) = dst.get_mut(off + i) {
+                            *slot = V::I32(*b as i8 as i32);
+                        }
+                    }
+                }
+                return Some(Some(V::I32(n as i32)));
+            }
+            "available" => {
+                return Some(Some(V::I32((data.len() - *pos) as i32)));
+            }
+            "skip" => {
+                let n = i64v(args.get(1).copied().unwrap_or(V::I64(0))).max(0) as usize;
+                let took = n.min(data.len() - *pos);
+                *pos += took;
+                return Some(Some(V::I64(took as i64)));
+            }
+            "reset" => {
+                *pos = 0;
+                return Some(None);
+            }
+            "mark" | "close" => return Some(None),
+            "markSupported" => return Some(Some(V::I32(1))),
+            _ => {}
+        }
+    }
     let _ = vm;
     match name {
         "read" => {
-            // ByteArrayInputStream over a stored byte array would need real
-            // buffering; report EOF so callers exit loops cleanly.
+            // Streams without a byte payload report EOF so callers exit
+            // loops cleanly.
             Some(Some(V::I32(-1)))
         }
         "available" => Some(Some(V::I32(0))),

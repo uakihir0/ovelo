@@ -39,7 +39,7 @@ pub(crate) fn call(
         threadlocal_call(vm, name, args)
     } else if desc_is_a(class, THROWABLE) {
         throwable_call(vm, name, sig, args)?
-    } else if class == "Ljava/lang/Enum;" || desc_is_a(class, "Ljava/lang/Enum;") {
+    } else if class == "Ljava/lang/Enum;" || vm.assignable_desc(class, "Ljava/lang/Enum;") {
         enum_call(vm, class, name, args)?
     } else if class == "Lsun/misc/Unsafe;" {
         unsafe_call(vm, name, args)?
@@ -1235,8 +1235,18 @@ fn system_call(vm: &mut Vm, name: &str, _sig: &str, args: &[V]) -> Rt<Option<Opt
                 "os.arch" => "aarch64",
                 "os.version" => "ovelo",
                 "user.home" | "user.dir" => "/data/local/ovelo",
-                "user.name" | "java.vendor" | "http.agent" => "ovelo",
+                "user.name" | "http.agent" => "ovelo",
+                "java.vendor" => "The Android Project",
                 "java.version" => "17",
+                // Android identity — gdx's SharedLibraryLoader picks the
+                // System.loadLibrary path only when the runtime reports
+                // Android; desktop identity sends it down the file
+                // extraction path we don't implement.
+                "java.runtime.name" => "Android Runtime",
+                "java.vm.name" => "Dalvik",
+                "java.vm.version" => "2.1.0",
+                "java.vm.vendor" | "java.specification.vendor"
+                | "java.vm.specification.vendor" => "The Android Project",
                 "java.io.tmpdir" => "/data/local/ovelo/tmp",
                 "file.encoding"
                 | "sun.jnu.encoding"
@@ -1253,7 +1263,12 @@ fn system_call(vm: &mut Vm, name: &str, _sig: &str, args: &[V]) -> Rt<Option<Opt
         }
         "setProperty" | "clearProperty" => Some(Some(V::Ref(0))),
         "lineSeparator" => Some(Some(jstr(vm, "\n"))),
-        "gc" | "runFinalization" | "exit" | "halt" | "loadLibrary" | "load" | "setIn"
+        "loadLibrary" | "load" => {
+            let arg = sv(vm, args[0]).unwrap_or_default();
+            crate::jni::load_native_lib(vm, &arg, name == "load");
+            Some(None)
+        }
+        "gc" | "runFinalization" | "exit" | "halt" | "setIn"
         | "setOut" | "setErr" | "setProperties" | "setSecurityManager" => Some(None),
         "mapLibraryName" => {
             let n = sv(vm, args[0]).unwrap_or_default();
@@ -1274,8 +1289,12 @@ fn runtime_call(vm: &mut Vm, name: &str, args: &[V]) -> Option<Option<V>> {
         "totalMemory" => Some(Some(V::I64(256 << 20))),
         "maxMemory" => Some(Some(V::I64(512 << 20))),
         "exec" => Some(Some(V::Ref(0))),
-        "exit" | "halt" | "gc" | "runFinalization" | "addShutdownHook" | "removeShutdownHook"
-        | "loadLibrary" | "load" => {
+        "loadLibrary" | "load" => {
+            let arg = sv(vm, args[0]).unwrap_or_default();
+            crate::jni::load_native_lib(vm, &arg, name == "load");
+            Some(None)
+        }
+        "exit" | "halt" | "gc" | "runFinalization" | "addShutdownHook" | "removeShutdownHook" => {
             let _ = args;
             Some(None)
         }

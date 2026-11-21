@@ -106,6 +106,9 @@ pub enum HostState {
     Path(String),
     /// A regex pattern string (`java.util.regex.Pattern`).
     Regex(String),
+    /// A readable byte stream (`InputStream` over real bytes — raw
+    /// resources, asset files): buffer + read cursor.
+    Bytes(std::rc::Rc<Vec<u8>>, usize),
     /// An `XmlResourceParser`: binary-XML elements plus a precomputed
     /// pull-parser event stream and the cursor into it.
     Xml {

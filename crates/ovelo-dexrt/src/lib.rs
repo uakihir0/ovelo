@@ -9,6 +9,8 @@
 
 mod aot;
 mod jdk;
+mod jni;
+mod native;
 pub mod res;
 mod res_attrs;
 mod value;
@@ -309,6 +311,16 @@ pub struct Vm {
     pub media_ids: HashMap<String, i64>,
     /// next MediaStore `_id` to hand out (see `media_ids`).
     pub next_media_id: i64,
+    /// Native `.so` images loaded through `System.loadLibrary` — the
+    /// real JNI path for games (libGDX/Box2D) and other native libs.
+    pub natives: Vec<native::NativeLib>,
+    /// JNI jmethodID table — id = index+1 → dex method GIdx.
+    pub jni_mids: Vec<GIdx>,
+    /// JNI jfieldID table — id = index+1 → field GIdx.
+    pub jni_fids: Vec<GIdx>,
+    /// Exception a native call left pending (Throw/ThrowNew); 0 = none,
+    /// `u32::MAX` = thrown without an object handle.
+    pub jni_pending_exc: u32,
     /// Permission names currently granted to the guest package —
     /// seeded from the manifest's normal-level `<uses-permission>`
     /// entries and grown by `requestPermissions` (user grants all).
@@ -409,6 +421,10 @@ impl Vm {
             parked_runnables: HashMap::new(),
             media_ids: HashMap::new(),
             next_media_id: 0,
+            natives: Vec::new(),
+            jni_mids: Vec::new(),
+            jni_fids: Vec::new(),
+            jni_pending_exc: 0,
             field_idx_cache: std::cell::RefCell::new(HashMap::new()),
             type_idx_cache: std::cell::RefCell::new(HashMap::new()),
             fields_named_cache: std::cell::RefCell::new(None),
@@ -528,7 +544,7 @@ impl Vm {
     /// (canonical GIdx of the class itself, its &ClassDef) — `def`
     /// fields (`superclass_idx`, `interfaces_off`, …) are local to the
     /// DEFINING dex, whose index is `gd(canon_g)`.
-    fn def_loc_of(&self, class_idx: GIdx) -> Option<(GIdx, &ClassDef)> {
+    pub(crate) fn def_loc_of(&self, class_idx: GIdx) -> Option<(GIdx, &ClassDef)> {
         let desc = self.type_desc_of(class_idx).ok()?;
         let &(di, i) = self.defs.get(&desc)?;
         let def = &self.dexes[di].class_defs()[i];
@@ -536,7 +552,7 @@ impl Vm {
     }
 
     /// The dex a global index belongs to.
-    fn dex_of(&self, g: GIdx) -> Option<&DexFile> {
+    pub(crate) fn dex_of(&self, g: GIdx) -> Option<&DexFile> {
         self.dexes.get(gd(g))
     }
 
@@ -2158,7 +2174,7 @@ impl Vm {
 
     /// Descriptor-level assignability for host objects whose class_idx is
     /// absent from the DEX: consults the builtin super tables.
-    fn assignable_desc(&self, sub: &str, sup: &str) -> bool {
+    pub(crate) fn assignable_desc(&self, sub: &str, sup: &str) -> bool {
         if sub == sup || sup == "Ljava/lang/Object;" {
             return true;
         }
@@ -2786,12 +2802,97 @@ impl Vm {
             if let Some(r) = jdk::call(self, &class, &name, &sig, &args)? {
                 return Ok(r);
             }
+            // A dex `native` method resolves to a loaded `.so`: the
+            // `Java_<cls>_<name>` symbol or a RegisterNatives binding.
+            if let Some(addr) = jni::native_addr(self, &class, &name, &sig) {
+                return jni::dispatch_native(
+                    self,
+                    addr,
+                    &class,
+                    &ret_desc,
+                    matches!(kind, InvokeKind::Static),
+                    &args,
+                );
+            }
             return self.stub_placeholder(loc.midx, &ret_desc, &name, &class, &args);
         }
         if let Some(f) = self.aot.as_ref().and_then(|a| a.get(loc.midx)) {
             return self.run_native(f, loc.midx, loc.em.code_off, args);
         }
         self.exec(loc, args)
+    }
+
+    /// JNI-facing wrappers — the `jni` module sits outside `Vm` but
+    /// needs the same interpreter surface the opcodes use.
+    pub(crate) fn invoke_pub(&mut self, midx: GIdx, args: Vec<V>, kind: InvokeKind) -> Rt<Option<V>> {
+        self.invoke(midx, args, kind)
+    }
+
+    /// Read a static like the `sget` opcode: guest-encoded value,
+    /// builtin table for host classes, field-type default last.
+    pub(crate) fn sget_pub(&mut self, f: GIdx) -> Option<V> {
+        let f = self.canon_field(f);
+        let owner = self
+            .dex_of(f)
+            .and_then(|d| d.field(gl(f)).ok())
+            .map(|fi| self.canon(gx(gd(f), fi.class_idx as u32)))
+            .unwrap_or(f);
+        self.ensure_init(owner).ok()?;
+        if let Some(v) = self.classes.get(&owner).and_then(|c| c.statics.get(&f)) {
+            return Some(*v);
+        }
+        let v = if self.def_of(owner).is_none() {
+            self.builtin_sfield(f).or_else(|| self.field_default(f))
+        } else {
+            self.encoded_static(owner, f).or_else(|| self.field_default(f))
+        }?;
+        if matches!(v, V::Ref(h) if h != 0) {
+            self.classes.entry(owner).or_default().statics.insert(f, v);
+        }
+        Some(v)
+    }
+
+    /// Write a static like the `sput` opcode.
+    pub(crate) fn sput_pub(&mut self, f: GIdx, v: V) {
+        let f = self.canon_field(f);
+        let owner = self
+            .dex_of(f)
+            .and_then(|d| d.field(gl(f)).ok())
+            .map(|fi| self.canon(gx(gd(f), fi.class_idx as u32)))
+            .unwrap_or(f);
+        self.classes.entry(owner).or_default().statics.insert(f, v);
+    }
+
+    /// Walk `class_idx`'s chain for a field by name (static when
+    /// `is_static`, instance otherwise) → global field idx.
+    pub(crate) fn find_field_by_name(
+        &self,
+        mut class_idx: GIdx,
+        name: &str,
+        is_static: bool,
+    ) -> Option<GIdx> {
+        for _ in 0..64 {
+            let (cg, def) = self.def_loc_of(class_idx)?;
+            let d = self.dex_of(cg)?;
+            let cd = d.class_data_rc(def).ok()?;
+            let it = if is_static {
+                &cd.static_fields
+            } else {
+                &cd.instance_fields
+            };
+            for f in it {
+                if let Ok(fi) = d.field(f.field_idx) {
+                    if d.string(fi.name_idx).ok()? == name {
+                        return Some(gx(gd(cg), f.field_idx));
+                    }
+                }
+            }
+            if def.superclass_idx == u32::MAX {
+                return None;
+            }
+            class_idx = gx(gd(cg), def.superclass_idx);
+        }
+        None
     }
 
     /// Run a compiled method under the shared register/ABI contract

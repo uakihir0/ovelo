@@ -1815,6 +1815,7 @@ fn context_call(
         | "setResult"
         | "setRequestedOrientation"
         | "setTaskDescription"
+        | "setVolumeControlStream"
         | "registerActivityLifecycleCallbacks"
         | "unregisterActivityLifecycleCallbacks"
         | "invalidateOptionsMenu"
@@ -2536,6 +2537,24 @@ fn resources_call(vm: &mut Vm, name: &str, args: &[V]) -> Rt<Option<Option<V>>> 
                 vm,
                 i64v(args.get(1).copied().unwrap_or(V::I32(0))) as u32,
             ))),
+            "openRawResource" | "getRawResource" => {
+                let id = i64v(args.get(1).copied().unwrap_or(V::I32(0))) as u32;
+                let bytes = vm
+                    .apk_res
+                    .as_ref()
+                    .and_then(|r| r.file_path(id).map(str::to_string))
+                    .and_then(|p| vm.apk_res.as_ref().and_then(|r| r.read(&p)));
+                Some(Some(match bytes {
+                    Some(b) => {
+                        let h = vm.alloc_host(
+                            "Ljava/io/ByteArrayInputStream;",
+                            HostState::Bytes(std::rc::Rc::new(b), 0),
+                        );
+                        V::Ref(h)
+                    }
+                    None => V::Ref(0),
+                }))
+            }
             "getDisplayMetrics" => Some(Some(host(
                 vm,
                 "Landroid/util/DisplayMetrics;",
@@ -2925,10 +2944,25 @@ fn res_misc(vm: &mut Vm, class: &str, name: &str, args: &[V]) -> Rt<Option<Optio
             "open" | "openFd" | "openNonAssetFd" | "openXmlResourceParser" | "list",
         ) => {
             if name == "list" {
-                Some(Some(arr(vm, STRING, vec![])))
-            } else {
-                Some(Some(V::Ref(0)))
+                return Ok(Some(Some(arr(vm, STRING, vec![]))));
             }
+            // Asset reads serve real bytes out of the APK's assets/ dir.
+            let fname = sv(vm, args.get(1).copied().unwrap_or(V::I32(0)))
+                .unwrap_or_default();
+            let bytes = vm.apk_res.as_ref().and_then(|r| {
+                r.read(&format!("assets/{fname}"))
+                    .or_else(|| r.read(&fname))
+            });
+            Some(Some(match bytes {
+                Some(b) => {
+                    let h = vm.alloc_host(
+                        "Ljava/io/ByteArrayInputStream;",
+                        HostState::Bytes(std::rc::Rc::new(b), 0),
+                    );
+                    V::Ref(h)
+                }
+                None => V::Ref(0),
+            }))
         }
         (
             "Landroid/content/res/AssetManager;",
