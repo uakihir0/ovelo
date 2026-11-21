@@ -108,6 +108,7 @@ pub(crate) fn vm_lock() -> VmLock {
 /// interpreter cannot touch `Vm` while blocked inside guest machine
 /// code, and threads the `.so` spawns need JNI — and so the lock —
 /// during exactly that window.
+#[cfg_attr(not(target_arch = "aarch64"), allow(dead_code))]
 pub(crate) fn without_vm_lock<R>(f: impl FnOnce() -> R) -> R {
     let n = VM_DEPTH.with(|d| d.replace(0));
     let m = vm_mtx();

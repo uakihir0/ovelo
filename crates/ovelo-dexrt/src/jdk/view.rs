@@ -456,7 +456,16 @@ pub(crate) fn dex_view_info(vm: &Vm, h: u32) -> Option<DexViewInfo> {
 fn image_drawable(vm: &mut Vm, this: u32) -> V {
     let raw = pseudo_get(vm, this, P_IMAGE).unwrap_or(V::Ref(0));
     if is_null(raw) {
-        return raw;
+        // No image was ever set (icon plumbing not wired). Android
+        // allows null here, but Kotlin `!!`/mutate() chains NPE on
+        // it — hand back a stable placeholder drawable instead.
+        let d = host(
+            vm,
+            "Landroid/graphics/drawable/BitmapDrawable;",
+            HostState::Empty,
+        );
+        pseudo_set(vm, this, P_IMAGE, d);
+        return d;
     }
     let bare = match raw {
         V::I32(_) => true,
