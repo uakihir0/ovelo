@@ -1086,11 +1086,22 @@ fn run_app(store: &InstallStore, package: &str) -> Result<(), OveloError> {
             // fills all live on this queue after the lifecycle drains
             // end. Without it they stall once the window opens.
             if dex_frame.is_multiple_of(30) {
-                vm.drain_runnables(64);
+                let work = vm.drain_runnables(64);
+                // Drive the expensive layout pass only on real change:
+                // runnable work done this tick, guest view state
+                // mutated since the last pass, or a periodic catch-all
+                // for fills that don't bump view_gen (adapter attaches
+                // do). Idle trees converge and stop paying interpreter
+                // cost + RSS growth every half second.
+                if work > 0
+                    || vm.view_gen != vm.layout_gen_done.get()
+                    || dex_frame.is_multiple_of(600)
+                {
+                    // Run adapter containers' layout pass OUTSIDE the ui
+                    // borrow — guest code re-enters bridged view methods.
+                    ovelo_framework::drive_dex_layout_pass(vm, *this, dex_frame);
+                }
             }
-            // Run adapter containers' layout pass OUTSIDE the ui borrow —
-            // guest code re-enters bridged view methods.
-            ovelo_framework::drive_dex_layout_pass(vm, *this, dex_frame);
             ui2.borrow_mut().refresh_dex_tree(vm, *this);
         }
         let mut u = ui2.borrow_mut();

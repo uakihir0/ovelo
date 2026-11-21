@@ -1353,12 +1353,14 @@ impl Vm {
     /// Run enqueued async work FIFO — `Thread.start`/`Executor.execute`
     /// jobs on a worker thread, `Handler.post*` on the main one.
     /// Reentrant-safe; `max` bounds total runnables per drain so a
-    /// self-rescheduling queue can't wedge the caller forever.
-    pub fn drain_runnables(&mut self, max: usize) {
+    /// self-rescheduling queue can't wedge the caller forever. Returns
+    /// how many runnables completed — re-parked workers don't count.
+    pub fn drain_runnables(&mut self, max: usize) -> usize {
         if self.draining {
-            return;
+            return 0;
         }
         self.draining = true;
+        let mut ran = 0usize;
         let dbg = std::env::var_os("OVELO_DRAINDBG").is_some();
         for _ in 0..max {
             let Some((r, on_main)) = self.pending_runnables.pop_front() else {
@@ -1399,6 +1401,7 @@ impl Vm {
                     }
                 }
                 _ => {
+                    ran += 1;
                     self.reparked.remove(&r);
                     self.repark_counts.remove(&r);
                     self.park_spins = 0;
@@ -1406,6 +1409,7 @@ impl Vm {
             }
         }
         self.draining = false;
+        ran
     }
 
     /// Attach `child` under `parent` in the inflated-view tree — used
