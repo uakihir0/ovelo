@@ -1472,9 +1472,16 @@ impl Vm {
                 jdk::run_on_worker(self, r)
             };
             if dbg {
+                let cls = self
+                    .heap
+                    .class_of(r)
+                    .and_then(|ci| self.type_desc_of(ci).ok())
+                    .unwrap_or_default();
                 match &out {
-                    Ok(_) => eprintln!("[drain] ran h={r} main={on_main}"),
-                    Err(e) => eprintln!("[drain] h={r} main={on_main} err={:?}", e),
+                    Ok(_) => eprintln!("[drain] ran h={r} {cls} main={on_main}"),
+                    Err(e) => {
+                        eprintln!("[drain] h={r} {cls} main={on_main} err={:?}", e)
+                    }
                 }
             }
             match &out {

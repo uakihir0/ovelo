@@ -540,6 +540,12 @@ pub(crate) fn call(
                 Some(Some(args.get(2).copied().unwrap_or(V::I32(0))))
             }
             "putString" | "putInt" | "putLong" | "putFloat" => Some(Some(V::I32(1))),
+            // `Telephony$Sms.getDefaultSmsPackage` — report ourselves as
+            // the default SMS app so SMS apps don't bail to a setup UI.
+            "getDefaultSmsPackage" if class.contains("Telephony") => {
+                let pkg = vm.guest_package.clone().unwrap_or_else(|| "app".into());
+                Some(Some(jstr(vm, &pkg)))
+            }
             _ => Some(Some(V::Ref(0))),
         }
     } else if class == "Landroid/util/LruCache;" {
@@ -599,6 +605,19 @@ pub(crate) fn call(
                 HostState::Empty,
             ))),
             _ => Some(None),
+        }
+    } else if class == "Landroid/app/role/RoleManager;" {
+        // SMS-role gate: fossify messages finishes when ROLE_SMS is
+        // unavailable or not held — report both so the app proceeds as
+        // the default SMS handler.
+        match name {
+            "isRoleAvailable" | "isRoleHeld" => Some(Some(V::I32(1))),
+            "createRequestRoleIntent" => Some(Some(host(
+                vm,
+                "Landroid/content/Intent;",
+                HostState::Empty,
+            ))),
+            _ => None,
         }
     } else if class == "Landroid/view/View$MeasureSpec;" {
         measurespec_call(vm, name, args)
