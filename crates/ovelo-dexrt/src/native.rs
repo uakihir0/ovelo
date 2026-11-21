@@ -39,6 +39,164 @@ extern "C" {
     fn strcpy(d: *mut i8, s: *const i8) -> *mut i8;
     #[cfg(target_os = "macos")]
     fn sys_icache_invalidate(start: *mut c_void, len: usize);
+    fn sigaction(sig: i32, act: *const Sigaction, old: *mut Sigaction) -> i32;
+    fn _exit(code: i32) -> !;
+    fn write(fd: i32, buf: *const c_void, n: usize) -> isize;
+    fn dladdr(addr: *const c_void, info: *mut DlInfo) -> i32;
+}
+
+#[repr(C)]
+struct Sigaction {
+    sa_sigaction: usize,
+    sa_mask: u32,
+    sa_flags: i32,
+}
+#[repr(C)]
+struct DlInfo {
+    dli_fname: *const i8,
+    dli_fbase: *mut c_void,
+    dli_sname: *const i8,
+    dli_saddr: *mut c_void,
+}
+
+/// (map_base, span) of every guest image — lets the crash handler say
+/// whether the faulting PC is inside a loaded `.so`.
+pub(crate) static LOADED_RANGES: Mutex<Vec<(usize, usize)>> = Mutex::new(Vec::new());
+
+/// Fake Bionic TCB. Guest `.so`s read Bionic TLS slots off TPIDR_EL0 —
+/// most visibly the `__stack_chk_guard` slot at +0x28 that
+/// `-fstack-protector` emits into every function prologue/epilogue.
+/// Darwin leaves TPIDR_EL0 = 0 (it keeps its own TLS in TPIDRRO_EL0),
+/// so without a swap every protected guest function faults on its
+/// first TLS read. The block is zeroed apart from a self pointer
+/// (slot 0) and a fixed stack-guard cookie (slot 5, +0x28) — the same
+/// value reads back at function exit, so the check passes.
+#[cfg(target_arch = "aarch64")]
+static mut GUEST_TCB: [u64; 64] = {
+    let mut t = [0u64; 64];
+    t[5] = 0x9e3779b97f4a7c15; // arbitrary but nonzero stack guard
+    t
+};
+
+/// Run `f` with TPIDR_EL0 pointing at [`GUEST_TCB`], then restore the
+/// host thread pointer. Must wrap every entry into guest-native code
+/// (JNI_OnLoad, DT_INIT*, exported natives).
+#[cfg(target_arch = "aarch64")]
+pub(crate) fn with_guest_tls<R>(f: impl FnOnce() -> R) -> R {
+    unsafe {
+        let tcb = std::ptr::addr_of_mut!(GUEST_TCB);
+        (*tcb)[0] = tcb as usize as u64; // TLS_SLOT_SELF
+        let mut old: usize;
+        core::arch::asm!("mrs {}, tpidr_el0", out(reg) old);
+        core::arch::asm!("msr tpidr_el0, {}", in(reg) tcb as usize);
+        let r = f();
+        core::arch::asm!("msr tpidr_el0, {}", in(reg) old);
+        r
+    }
+}
+
+#[cfg(not(target_arch = "aarch64"))]
+pub(crate) fn with_guest_tls<R>(f: impl FnOnce() -> R) -> R {
+    f()
+}
+
+/// Debug crash dump: guest `.so`s run REAL arm64 code — a guest
+/// SIGSEGV kills the process silently. A SIG_INFO handler prints the
+/// fault address + PC (dladdr-resolved when possible) to stderr so
+/// crashes inside loaded libraries are diagnosable. Async-signal-safe
+/// ops only (write/dladdr/_exit); installed once per process.
+pub fn install_crash_dump() {
+    #[cfg(target_os = "macos")]
+    unsafe {
+        // macOS arm64: ucontext_t → uc_mcontext → mcontext64.
+        extern "C" fn on_segv(_sig: i32, _info: *mut c_void, ctx: *mut c_void) {
+            unsafe {
+                // ucontext_t: uc_mcontext at offset 48 → mcontext64:
+                // es(16) then ss: x[0..28](232) fp lr sp pc — so
+                // sp=+264, pc=+272 from uc_mcontext.
+                let mc = *(ctx as *const usize).add(6) as *const u8;
+                let pc = *(mc.add(272) as *const usize);
+                let sp = *(mc.add(264) as *const usize);
+                // siginfo_t: si_addr at offset 24 on 64-bit macOS.
+                let si = *(_info as *const usize).add(3);
+                // ss.x[] at +16: x0=+16, x8=+80, x20=+176, x30/lr=+256.
+                let x0 = *(mc.add(16) as *const usize);
+                let x8 = *(mc.add(80) as *const usize);
+                let x20 = *(mc.add(176) as *const usize);
+                let x30 = *(mc.add(256) as *const usize);
+                let fp = *(mc.add(248) as *const usize); // x29
+                let inlib = LOADED_RANGES
+                    .lock()
+                    .map(|v| v.iter().any(|(b, s)| pc >= *b && pc < b + s))
+                    .unwrap_or(false);
+                let insn = if inlib { *(pc as *const u32) } else { 0 };
+                let mut msg = [0u8; 512];
+                let s = b"[segv] pc=";
+                msg[..s.len()].copy_from_slice(s);
+                let mut n = s.len();
+                for v in [pc, si, sp, x0, x8, x20, x30, insn as usize, inlib as usize] {
+                    for i in (0..16).rev() {
+                        msg[n] = b"0123456789abcdef"[(v >> (i * 4)) & 0xf];
+                        n += 1;
+                    }
+                    msg[n] = b' ';
+                    n += 1;
+                }
+                // Guest frame chain: fp → [prev_fp, saved_lr] — best-effort
+                // backtrace of the guest/native call path. Each lr is
+                // dladdr-resolved to <image>+<off> so the owning module
+                // (our binary vs a guest .so) is unambiguous.
+                let mut f = fp;
+                for _ in 0..6 {
+                    if f == 0 || !f.is_multiple_of(8) {
+                        break;
+                    }
+                    let nf = *(f as *const usize);
+                    let lr = *((f + 8) as *const usize);
+                    let mut di: DlInfo = std::mem::zeroed();
+                    if dladdr(lr as *const c_void, &mut di) != 0 && !di.dli_fname.is_null() {
+                        let off = lr - di.dli_fbase as usize;
+                        let mut p = di.dli_fname;
+                        let mut end = p;
+                        while *end != 0 { end = end.add(1) }
+                        let mut last = p;
+                        while p != end { if *p == b'/' as i8 { last = p.add(1) } p = p.add(1) }
+                        msg[n] = b'<'; n += 1;
+                        let l = (end as usize - last as usize).min(40);
+                        std::ptr::copy_nonoverlapping(last as *const u8, msg.as_mut_ptr().add(n), l);
+                        n += l;
+                        msg[n] = b'+'; n += 1;
+                        for i in (0..8).rev() {
+                            msg[n] = b"0123456789abcdef"[(off >> (i * 4)) & 0xf];
+                            n += 1;
+                        }
+                    } else {
+                        for i in (0..16).rev() {
+                            msg[n] = b"0123456789abcdef"[(lr >> (i * 4)) & 0xf];
+                            n += 1;
+                        }
+                    }
+                    msg[n] = b' ';
+                    n += 1;
+                    if nf <= f {
+                        break;
+                    }
+                    f = nf;
+                }
+                msg[n] = b'\n';
+                write(2, msg.as_ptr() as *const c_void, n + 1);
+                _exit(139);
+            }
+        }
+        let sa = Sigaction {
+            sa_sigaction: on_segv as *const () as usize,
+            sa_mask: 0,
+            sa_flags: 0x40, // SA_SIGINFO
+        };
+        sigaction(11, &sa, std::ptr::null_mut());
+        sigaction(10, &sa, std::ptr::null_mut()); // SIGBUS — writes to non-writable guest pages
+        let _ = dladdr as *const (); // keep decl referenced
+    }
 }
 
 /// Flush the instruction cache over a freshly-written code region.
@@ -119,6 +277,10 @@ impl Drop for NativeLib {
         // Unregister first — later dl_iterate_phdr walks must not
         // report this lib's phdrs after the image is unmapped.
         PHDR_LIBS.lock().unwrap().retain(|l| l.bias != self.bias);
+        LOADED_RANGES
+            .lock()
+            .unwrap()
+            .retain(|(b, _)| *b != self.map as usize);
         unsafe { munmap(self.map as *mut c_void, self.span) };
     }
 }
@@ -452,6 +614,7 @@ struct Dyn {
 
 /// Parse + map + relocate an ELF64 ET_DYN aarch64 image.
 pub fn load_so(name: &str, elf: &[u8]) -> Result<NativeLib> {
+    install_crash_dump();
     if elf.len() < 64 || &elf[0..4] != b"\x7fELF" || elf[4] != 2 || elf[5] != 1 {
         return Err(err("elf.bad"));
     }
@@ -771,6 +934,7 @@ pub fn load_so(name: &str, elf: &[u8]) -> Result<NativeLib> {
         start = end;
     }
     unsafe { icache_flush(map.cast(), span) };
+    LOADED_RANGES.lock().unwrap().push((map as usize, span));
 
     // Initializers: DT_INIT then DT_INIT_ARRAY — both guest-vaddr
     // derived, both checked against the mapping before they can branch
@@ -796,7 +960,7 @@ pub fn load_so(name: &str, elf: &[u8]) -> Result<NativeLib> {
 
     if d.init != 0 {
         let f: extern "C" fn() = unsafe { std::mem::transmute(d.init) };
-        f();
+        with_guest_tls(|| f());
     }
     let n_init = if in_img(d.init_array, d.init_array_sz) {
         d.init_array_sz / 8
@@ -805,7 +969,7 @@ pub fn load_so(name: &str, elf: &[u8]) -> Result<NativeLib> {
     };
     for k in 0..n_init {
         let f: extern "C" fn() = unsafe { std::mem::transmute(((d.init_array + k * 8) as *const u64).read()) };
-        f();
+        with_guest_tls(|| f());
     }
 
     Ok(NativeLib {

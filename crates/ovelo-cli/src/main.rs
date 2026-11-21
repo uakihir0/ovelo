@@ -1087,9 +1087,10 @@ fn run_app(store: &InstallStore, package: &str) -> Result<(), OveloError> {
             // end. Without it they stall once the window opens.
             if dex_frame.is_multiple_of(30) {
                 let work = vm.drain_runnables(64);
-                // Periodic GC between dex activations — interpreter
-                // churn otherwise grows the heap unboundedly.
-                if dex_frame.is_multiple_of(120) {
+                // GC when the heap passes its growth mark — interpreter
+                // churn otherwise grows the heap unboundedly. Only runs
+                // between dex activations (collect_garbage gates itself).
+                if vm.heap.len() >= vm.gc_mark {
                     let mut roots = ui2.borrow().guest_handles().into_iter();
                     vm.collect_garbage(&mut roots);
                 }

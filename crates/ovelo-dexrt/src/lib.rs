@@ -267,6 +267,9 @@ pub struct Vm {
     /// `view_gen` value the last driven layout walk ran against —
     /// `u64::MAX` until the first pass so it always runs once.
     pub layout_gen_done: std::cell::Cell<u64>,
+    /// Heap size (slots) that triggers the next GC at a quiescent
+    /// point; doubles after each collection.
+    pub gc_mark: usize,
     /// Deferred async work — `(runnable, on_main)`. `Thread.start`,
     /// `Executor.execute`/`submit` and `Handler.post*` enqueue here
     /// instead of running inline (AOSP is async; inline execution
@@ -443,6 +446,7 @@ impl Vm {
             assignable_cache: std::cell::RefCell::new(HashMap::new()),
             view_gen: 0,
             layout_gen_done: std::cell::Cell::new(u64::MAX),
+            gc_mark: 65_536,
             class_mirrors: HashMap::new(),
             granted_permissions: std::collections::HashSet::new(),
         };
@@ -639,6 +643,16 @@ impl Vm {
     }
 
     /// Descriptor for a global `type_idx`.
+    /// Class index a `jclass` handle refers to: `Obj::Class` mirrors
+    /// report their `type_idx`; ordinary objects report their own
+    /// class via `class_of`.
+    pub fn class_for_jclass(&self, h: u32) -> Option<u64> {
+        match self.heap.get(h) {
+            Some(Obj::Class { type_idx }) => Some(*type_idx),
+            _ => self.heap.class_of(h),
+        }
+    }
+
     /// Descriptor of a class referenced by a `java.lang.Class` handle —
     /// `Obj::Class` mirror or a host mirror holding a descriptor string.
     pub fn class_descriptor_of(&self, h: u32) -> Option<String> {
@@ -1379,6 +1393,34 @@ impl Vm {
         roots.extend(self.vto_listeners.values().flatten().copied());
         roots.extend(self.class_mirrors.values().copied());
         roots.push(self.jni_pending_exc);
+        // Runtime-held singletons and registries — Application, thread
+        // and looper objects, the current activity, view/db/prefs
+        // tables, thrown-object diagnostics.
+        roots.extend([
+            self.main_thread_h,
+            self.cur_thread,
+            self.worker_thread_h,
+            self.main_looper_h,
+            self.app_h,
+            self.cur_activity,
+        ]);
+        roots.extend(self.view_roots.iter().copied());
+        roots.extend(self.prefs_files.values().copied());
+        roots.extend(self.content_views.keys().copied());
+        roots.extend(self.content_views.values().copied());
+        roots.extend(self.decor_roots.keys().copied());
+        roots.extend(self.decor_roots.values().copied());
+        roots.extend(self.db_handles.values().copied());
+        roots.extend(self.obj_db.keys().copied());
+        roots.extend(self.throw_sites.keys().copied());
+        // Unsafe opaque-offset fields live outside the heap — root both
+        // the owner (stale values mustn't bleed into a recycled handle)
+        // and any reference stored there.
+        roots.extend(self.unsafe_offsets.keys().map(|(h, _)| *h));
+        roots.extend(self.unsafe_offsets.values().filter_map(|v| match v {
+            V::Ref(h) if *h != 0 => Some(*h),
+            _ => None,
+        }));
         if let Some((_, V::Ref(h))) = &self.pending_activity {
             if *h != 0 {
                 roots.push(*h);
@@ -1386,8 +1428,10 @@ impl Vm {
         }
         roots.extend(extra_roots);
         let freed = self.heap.collect(roots);
+        // Next collection when the heap grows another ~50%.
+        self.gc_mark = (self.heap.len() * 3 / 2).max(65_536);
         if std::env::var_os("OVELO_MEMDBG").is_some() {
-            eprintln!("[gc] freed {freed} slots={}", self.heap.len());
+            eprintln!("[gc] freed {freed} slots={} mark={}", self.heap.len(), self.gc_mark);
         }
         freed
     }

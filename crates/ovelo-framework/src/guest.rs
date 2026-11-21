@@ -235,6 +235,9 @@ pub struct GuestUi {
     pub fonts: Rc<FontSet>,
     /// Deferred onClick dispatches.
     clicks: ClickQueue,
+    /// View handle → registered OnClickListener handle — the closure
+    /// captures it opaquely, so GC needs this to keep listeners alive.
+    click_listeners: HashMap<u32, u32>,
     /// Dex-view-tree handles → materialized host view. Persistent so
     /// per-view state (pressed, listeners) survives frame rebuilds.
     dex_views: HashMap<u32, Rc<RefCell<GuestView>>>,
@@ -380,6 +383,7 @@ impl GuestUi {
             views: HashMap::new(),
             fonts,
             clicks: Rc::new(RefCell::new(VecDeque::new())),
+            click_listeners: HashMap::new(),
             dex_views: HashMap::new(),
             dex_kids: HashMap::new(),
             dex_root: 0,
@@ -406,6 +410,8 @@ impl GuestUi {
         v.extend(self.dex_kids.values().flatten().copied());
         v.push(self.dex_root);
         v.extend(self.clicks.borrow().iter().flat_map(|(a, b)| [*a, *b]));
+        v.extend(self.click_listeners.keys().copied());
+        v.extend(self.click_listeners.values().copied());
         v
     }
 
@@ -554,6 +560,11 @@ impl GuestUi {
                         // Not a GuestView (dex-inflated) — setters no-op.
                         return Ok(None);
                     };
+                    if listener == 0 {
+                        ui.click_listeners.remove(&this);
+                    } else {
+                        ui.click_listeners.insert(this, listener);
+                    }
                     rc.borrow_mut().view_mut().on_click = if listener == 0 {
                         None
                     } else {
@@ -761,6 +772,7 @@ impl GuestUi {
         }
         if info.listener != 0 {
             let listener = info.listener;
+            self.click_listeners.insert(h, listener);
             let q = self.clicks.clone();
             g.view_mut().on_click = Some(Box::new(move || {
                 q.borrow_mut().push_back((listener, h));

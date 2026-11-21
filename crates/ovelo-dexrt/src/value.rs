@@ -245,6 +245,25 @@ impl Heap {
                 _ => {}
             }
         }
+        if std::env::var_os("OVELO_MEMDBG").is_some() {
+            let mut kinds: HashMap<&'static str, usize> = HashMap::new();
+            for (i, slot) in self.objs.iter().enumerate() {
+                if marked[i] {
+                    *kinds
+                        .entry(match slot {
+                            Some(Obj::Instance { .. }) => "instance",
+                            Some(Obj::Array { .. }) => "array",
+                            Some(Obj::Str(_)) => "str",
+                            Some(Obj::Class { .. }) => "class",
+                            Some(Obj::Throwable { .. }) => "throwable",
+                            Some(Obj::Host { .. }) => "host",
+                            None => "none",
+                        })
+                        .or_default() += 1;
+                }
+            }
+            eprintln!("[gc-kinds] {kinds:?} interned={}", self.interned.len());
+        }
         let mut freed = 0;
         for (i, slot) in self.objs.iter_mut().enumerate() {
             if slot.is_some() && !marked[i] {

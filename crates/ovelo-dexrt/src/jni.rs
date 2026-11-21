@@ -79,7 +79,9 @@ extern "C" {
 #[cfg(target_arch = "aarch64")]
 pub(crate) fn call_native(fnptr: usize, iargs: &[u64; 8], fargs: &[f64; 8]) -> (u64, u64) {
     let mut out = [0u64; 2];
-    unsafe { ovelo_jni_call(fnptr, iargs.as_ptr(), fargs.as_ptr(), out.as_mut_ptr()) };
+    crate::native::with_guest_tls(|| unsafe {
+        ovelo_jni_call(fnptr, iargs.as_ptr(), fargs.as_ptr(), out.as_mut_ptr())
+    });
     (out[0], out[1])
 }
 
@@ -398,11 +400,12 @@ fn call_obj(obj: u64, mid: u64, args: &[V], is_static: bool) -> Option<V> {
 fn find_method_id(clazz: u64, name_p: u64, sig_p: u64) -> u64 {
     let name = cstr_ro(name_p);
     let sig = cstr_ro(sig_p);
+    if std::env::var("OVELO_JNIDBG").is_ok() { eprintln!("[jni] GetMethodID {name}{sig} clazz={clazz:#x}"); }
     let params = split_params(&sig);
     let pref: Vec<&str> = params.iter().map(String::as_str).collect();
     let v = vm();
     let Some(ci) = (match clazz {
-        h if h != 0 => v.heap.class_of(h as u32),
+        h if h != 0 => v.class_for_jclass(h as u32),
         _ => None,
     }) else {
         return 0;
@@ -421,9 +424,10 @@ fn find_method_id(clazz: u64, name_p: u64, sig_p: u64) -> u64 {
 
 fn find_field_id(clazz: u64, name_p: u64, _sig_p: u64, is_static: bool) -> u64 {
     let name = cstr_ro(name_p);
+    if std::env::var("OVELO_JNIDBG").is_ok() { eprintln!("[jni] GetFieldID {name} clazz={clazz:#x}"); }
     let v = vm();
     let Some(ci) = (match clazz {
-        h if h != 0 => v.heap.class_of(h as u32),
+        h if h != 0 => v.class_for_jclass(h as u32),
         _ => None,
     }) else {
         return 0;
@@ -432,6 +436,7 @@ fn find_field_id(clazz: u64, name_p: u64, _sig_p: u64, is_static: bool) -> u64 {
         v.jni_fids.push(g);
         return v.jni_fids.len() as u64;
     }
+    eprintln!("[jni] GetFieldID miss {name}");
     0
 }
 
@@ -443,10 +448,19 @@ extern "C" fn get_version(_e: u64) -> u64 {
 
 extern "C" fn find_class(_e: u64, name_p: u64) -> u64 {
     let name = cstr_ro(name_p);
+    let dbg = std::env::var("OVELO_JNIDBG").is_ok();
+    if dbg { eprintln!("[jni] FindClass {name}"); }
     let desc = format!("L{};", name.replace('.', "/"));
     let v = vm();
-    match v.type_index_of(&desc) {
-        Some(ci) => v.class_mirror(ci) as u64,
+    if dbg { eprintln!("[jni]   type_index_of.."); }
+    let ci = v.type_index_of(&desc);
+    if dbg { eprintln!("[jni]   ci={ci:?} -> mirror.."); }
+    match ci {
+        Some(ci) => {
+            let h = v.class_mirror(ci) as u64;
+            if dbg { eprintln!("[jni]   mirror={h:#x}"); }
+            h
+        }
         None => {
             eprintln!("[jni] FindClass miss {desc}");
             0
@@ -972,10 +986,10 @@ sr!(set_double_array_region);
 // ---------- misc ----------
 
 extern "C" fn register_natives(_e: u64, clazz: u64, methods: u64, n: u64) -> u64 {
+    if std::env::var("OVELO_JNIDBG").is_ok() { eprintln!("[jni] RegisterNatives clazz={clazz:#x} n={n}"); }
     let v = vm();
     let desc = v
-        .heap
-        .class_of(clazz as u32)
+        .class_for_jclass(clazz as u32)
         .and_then(|ci| v.type_desc_of(ci).ok())
         .unwrap_or_default();
     // RegisterNatives applies to the most recently loaded lib — the one
@@ -998,13 +1012,25 @@ extern "C" fn register_natives(_e: u64, clazz: u64, methods: u64, n: u64) -> u64
     0
 }
 
-extern "C" fn get_java_vm(_e: u64, _out: u64) -> u64 {
+extern "C" fn get_java_vm(_e: u64, out: u64) -> u64 {
+    if out != 0 {
+        unsafe { *(out as *mut usize) = vm_ptr() };
+    }
     0
 }
-extern "C" fn vm_get_env(_vm: u64, _out: u64, _ver: u64) -> u64 {
+extern "C" fn vm_get_env(_vm: u64, out: u64, _ver: u64) -> u64 {
+    // (*penv) = the JNIEnv handle (cell holding the function table).
+    if out != 0 {
+        unsafe { *(out as *mut usize) = env_ptr() };
+    }
     0
 }
-extern "C" fn vm_attach(_vm: u64, _a: u64, _b: u64) -> u64 {
+extern "C" fn vm_attach(_vm: u64, a: u64, _b: u64) -> u64 {
+    // AttachCurrentThread(vm, &env, args) — single-threaded VM:
+    // every thread is the main thread, so just hand back JNIEnv*.
+    if a != 0 {
+        unsafe { *(a as *mut usize) = env_ptr() };
+    }
     0
 }
 
