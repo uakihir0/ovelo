@@ -964,8 +964,19 @@ impl Vm {
         let midx = self
             .find_method_by_name(class_desc, name, args.len())?
             .ok_or_else(|| errd("dexrt.method.missing", format!("{class_desc}.{name}")))?;
+        // invoke reports a resolved void method as Some(null) — translate
+        // back to the documented contract (None = void return).
+        let ret_void = self
+            .dex_of(midx)
+            .and_then(|d| {
+                d.method(gl(midx))
+                    .ok()
+                    .and_then(|m| d.proto(m.proto_idx as u32).ok().map(|p| p.return_type_idx))
+                    .and_then(|t| d.type_descriptor(t).ok())
+            })
+            .is_some_and(|r| r == "V");
         match self.invoke(midx, args.to_vec(), InvokeKind::Static) {
-            Ok(v) => Ok(v),
+            Ok(v) => Ok(if ret_void { None } else { v }),
             Err(E::Vm(e)) => Err(e),
             Err(E::Throw(r)) => {
                 let d = self.describe_throw(r);
