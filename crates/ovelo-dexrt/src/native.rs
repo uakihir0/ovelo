@@ -811,6 +811,54 @@ extern "C" fn sh_atoi(s: *const i8) -> i32 {
     }
 }
 
+/// Bionic data symbols (STT_OBJECT) — storage is guest-zone memory so
+/// the guest reads real bytes. `_ctype_` is indexed by signed char
+/// (-128..=255): the export points 128 entries into a 384-byte table.
+fn data_shim(name: &str) -> Option<usize> {
+    match name {
+        "_ctype_" => Some(ctype_table()),
+        _ => None,
+    }
+}
+
+#[cfg(target_os = "macos")]
+fn ctype_table() -> usize {
+    static T: OnceLock<usize> = OnceLock::new();
+    *T.get_or_init(|| unsafe {
+        // Bionic bits/ctype.h flags.
+        const U: u8 = 0x01;
+        const L: u8 = 0x02;
+        const N: u8 = 0x04;
+        const S: u8 = 0x08;
+        const P: u8 = 0x10;
+        const C: u8 = 0x20;
+        const X: u8 = 0x40;
+        const B: u8 = 0x80;
+        let p = malloc_zone_calloc(guest_zone(), 384, 1) as *mut u8;
+        for c in 0..=127u8 {
+            let f = match c {
+                9 => C | S | B,
+                10..=13 => C | S,
+                0..=8 | 14..=31 | 127 => C,
+                32 => S | B,
+                b'0'..=b'9' => N | X,
+                b'A'..=b'F' => U | X,
+                b'G'..=b'Z' => U,
+                b'a'..=b'f' => L | X,
+                b'g'..=b'z' => L,
+                _ => P, // ASCII punctuation runs
+            };
+            *p.add(c as usize + 128) = f;
+        }
+        p.add(128) as usize
+    })
+}
+
+#[cfg(not(target_os = "macos"))]
+fn ctype_table() -> usize {
+    0
+}
+
 fn builtin_shim(name: &str) -> Option<usize> {
     Some(match name {
         "__cxa_pure_virtual" => sh_pure_virtual as *const () as usize,
@@ -1103,6 +1151,9 @@ pub fn load_so(name: &str, elf: &[u8]) -> Result<NativeLib> {
             return Ok(a);
         }
         if let Some(a) = builtin_shim(&name) {
+            return Ok(a);
+        }
+        if let Some(a) = data_shim(&name) {
             return Ok(a);
         }
         if let Some(a) = host_dlsym(&name) {
