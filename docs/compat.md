@@ -21,8 +21,9 @@ Legend:
 | Fossify File Manager | `org.fossify.filemanager` | 🟡 | **Renders real data**: lifecycle completes, RecyclerView rows bind actual filenames from the seeded external root (Pictures/Download/Documents/readme.md). Row layout positions are still rough |
 | Fossify Notes | `org.fossify.notes` | 🟡 | Full lifecycle + window render; toolbar and search menu draw; note list rows bind real SQLite data (Burmese text renders with fallback fonts) |
 | Fossify Gallery | `org.fossify.gallery` | 🟡 | Lifecycle completes end-to-end (Splash → MainActivity, no crashes); window opens; RecyclerView waits for its adapter (media-query data path pending) |
-| Fossify Calendar | `org.fossify.calendar` | 🟡 | Launches, layout passes run; adapter-attach path pending |
-| Fossify Messages | `org.fossify.messages` | 🟡 | Launches, layout passes run; adapter-attach path pending |
+| Fossify Calendar | `org.fossify.calendar` | 🟡 | Launches and renders the search/toolbar UI; month-view adapter attach path pending |
+| Fossify Messages | `org.fossify.messages` | 🟡 | Launches and renders the search/toolbar UI; conversation-list adapter attach path pending |
+| Bouncy (pinball, libGDX) | `com.dozingcatsoftware.bouncy` | 🟡 | Full lifecycle; menu screen renders with real resource strings ("Cambiar tablero"/"INICIAR"); GL game surface not wired yet |
 | Tiny Weather Forecast Germany | `de.kaffeemitkoffein.tinyweatherforecastgermany` | 🟡 | `WelcomeActivity` renders to the window (first real APK first frame) |
 | NewPipe | `org.schabi.newpipe` | 🟡 | `MainActivity` full lifecycle; WorkManager runs real SQLite queries; error screen renders (no network layer yet) |
 | F-Droid | `org.fdroid.fdroid` | 🟡 | Multi-dex + Hilt init runs without crashing; UI is Compose — no render path yet |
@@ -49,7 +50,7 @@ by how much new work they imply.
 
 | Engine | Status | What's missing |
 |--------|--------|----------------|
-| libGDX | ❌ | GLES surface wiring (ANativeWindow → EGL) exists as object model; no live GL context yet |
+| libGDX | 🟡 | View-layer menu renders (Bouncy verified); GLES surface wiring (ANativeWindow → EGL) exists as object model, no live GL context yet |
 | Godot | ❌ | Same + native engine `.so` needs real JNI |
 | Unity | ❌ | Same + native engine `.so` needs real JNI |
 
