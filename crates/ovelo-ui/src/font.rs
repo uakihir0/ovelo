@@ -80,10 +80,12 @@ pub struct GlyphBmp {
 /// A TTF/OTF face kept as owned bytes; `ttf_parser::Face` is rebuilt per call
 /// (cheap table lookup, no self-referential struct needed).
 pub struct TtfFont {
-    bytes: Vec<u8>,
+    bytes: std::sync::Arc<Vec<u8>>,
     name: String,
-    /// Rasterizer face (fontdue), built once at load.
-    fd: Option<fontdue::Font>,
+    /// Rasterizer face (fontdue) — built lazily on first use: fontdue
+    /// eagerly parses every glyph outline at construction, which
+    /// multi-GBs the process when a font directory is scanned.
+    fd: std::sync::OnceLock<Option<fontdue::Font>>,
     /// Face index inside a `.ttc` collection (0 for plain `ttf`/`otf`).
     index: u32,
 }
@@ -97,7 +99,14 @@ impl TtfFont {
 
     /// Parse face `index` of a font file or TrueType collection.
     pub fn from_bytes_at(bytes: &[u8], index: u32) -> Result<Self> {
-        let face = ttf_parser::Face::parse(bytes, index).map_err(|e| err("ui.font.parse", e))?;
+        Self::from_arc(std::sync::Arc::new(bytes.to_vec()), index)
+    }
+
+    /// Same as [`Self::from_bytes_at`] but shares the file bytes
+    /// between faces — a `.ttc` registered per-face otherwise carries
+    /// one full copy of the collection each.
+    fn from_arc(bytes: std::sync::Arc<Vec<u8>>, index: u32) -> Result<Self> {
+        let face = ttf_parser::Face::parse(&bytes[..], index).map_err(|e| err("ui.font.parse", e))?;
         if face.is_variable() {
             // Variable fonts need instance pinning for deterministic layout;
             // reject until pinning is implemented.
@@ -116,21 +125,29 @@ impl TtfFont {
             .find(|n| n.name_id == ttf_parser::name_id::FAMILY)
             .and_then(|n| n.to_string())
             .unwrap_or_else(|| "unnamed".into());
-        let fd = fontdue::Font::from_bytes(
-            bytes,
-            fontdue::FontSettings {
-                scale: 100.0,
-                collection_index: index,
-                ..fontdue::FontSettings::default()
-            },
-        )
-        .ok();
         Ok(Self {
-            bytes: bytes.to_vec(),
+            bytes,
             name,
-            fd,
+            fd: std::sync::OnceLock::new(),
             index,
         })
+    }
+
+    /// fontdue rasterizer face, built on first call.
+    fn fd(&self) -> Option<&fontdue::Font> {
+        self.fd
+            .get_or_init(|| {
+                fontdue::Font::from_bytes(
+                    &self.bytes[..],
+                    fontdue::FontSettings {
+                        scale: 100.0,
+                        collection_index: self.index,
+                        ..fontdue::FontSettings::default()
+                    },
+                )
+                .ok()
+            })
+            .as_ref()
     }
 
     fn face(&self) -> ttf_parser::Face<'_> {
@@ -186,7 +203,7 @@ impl GlyphSource for TtfFont {
         // fontdue falls back to .notdef for missing chars — check coverage
         // first so FontSet::raster can continue down the fallback chain.
         self.face().glyph_index(c)?;
-        let (m, cov) = self.fd.as_ref()?.rasterize(c, size_px);
+        let (m, cov) = self.fd()?.rasterize(c, size_px);
         Some(GlyphBmp {
             xmin: m.xmin,
             ymin: m.ymin,
@@ -196,7 +213,7 @@ impl GlyphSource for TtfFont {
         })
     }
     fn shaped_glyphs(&self, text: &str, rtl: bool, size_px: f32) -> Option<Vec<ShapedGlyph>> {
-        let fd = self.fd.as_ref()?;
+        let fd = self.fd()?;
         let upm = self.face().units_per_em() as f32;
         let scale = size_px / upm;
         let rb_face = rustybuzz::Face::from_slice(&self.bytes, self.index)
@@ -233,7 +250,7 @@ impl GlyphSource for TtfFont {
     }
 
     fn can_shape_glyphs(&self) -> bool {
-        self.fd.is_some()
+        self.fd().is_some()
     }
 }
 
@@ -315,8 +332,9 @@ impl FontSet {
                     continue;
                 };
                 let faces = ttf_parser::fonts_in_collection(&bytes).unwrap_or(1).max(1);
+                let shared = std::sync::Arc::new(bytes);
                 for i in 0..faces {
-                    if let Ok(f) = TtfFont::from_bytes_at(&bytes, i) {
+                    if let Ok(f) = TtfFont::from_arc(shared.clone(), i) {
                         // ".LastResort" (macOS placeholder font) claims
                         // coverage for every char and draws tofu boxes —
                         // never let it win the fallback race.
