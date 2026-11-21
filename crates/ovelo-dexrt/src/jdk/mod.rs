@@ -382,8 +382,16 @@ pub(crate) fn pseudo_get(vm: &Vm, h: u32, key: impl Into<u64>) -> Option<V> {
 }
 
 pub(crate) fn pseudo_set(vm: &mut Vm, h: u32, key: impl Into<u64>, v: V) {
+    let key = key.into();
     if let Some(f) = fields_mut(vm, h) {
-        f.insert(key.into(), v);
+        // Re-writing the same value (deterministic layout passes do this
+        // every pass) must not dirty the tree — the render/layout
+        // drivers key their "did anything change" check off view_gen.
+        if f.get(&key) == Some(&v) {
+            return;
+        }
+        f.insert(key, v);
+        vm.view_gen = vm.view_gen.wrapping_add(1);
     }
 }
 

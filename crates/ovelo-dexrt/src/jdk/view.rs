@@ -213,6 +213,8 @@ pub struct DexViewInfo {
     /// Dex-assigned frame `(l, t, r, b)` relative to the parent, once
     /// `layout`/`setFrame` ran (None before first layout pass).
     pub frame: Option<(i32, i32, i32, i32)>,
+    /// Parent view handle (0 = detached/root).
+    pub parent: u32,
     /// Child view handles, in z-order.
     pub children: Vec<u32>,
 }
@@ -411,6 +413,10 @@ pub(crate) fn dex_view_info(vm: &Vm, h: u32) -> Option<DexViewInfo> {
         visible,
         listener,
         frame,
+        parent: match pseudo_get(vm, h, P_PARENT) {
+            Some(V::Ref(p)) => p,
+            _ => 0,
+        },
         children: kids,
     })
 }

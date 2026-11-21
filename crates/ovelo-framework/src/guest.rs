@@ -246,6 +246,9 @@ pub struct GuestUi {
     /// The host view currently mounted as content — remount only when
     /// it differs (a bridge view may replace the materialized one).
     dex_mounted: Option<Rc<RefCell<GuestView>>>,
+    /// `vm.view_gen` the mounted tree was materialized against —
+    /// re-materialize only when the view store actually changed.
+    dex_gen_seen: u64,
     /// True once the guest set a real `GuestView` content view — the
     /// dex-tree renderer must not clobber it.
     guest_content_set: bool,
@@ -370,6 +373,7 @@ impl GuestUi {
             dex_kids: HashMap::new(),
             dex_root: 0,
             dex_mounted: None,
+            dex_gen_seen: u64::MAX,
             guest_content_set: false,
         }))
     }
@@ -620,12 +624,21 @@ impl GuestUi {
         let Some(root) = vm.activity_content(activity) else {
             return false;
         };
+        // Tree unchanged since the mounted materialize — skip the
+        // per-node info build (the per-frame dominant cost).
+        if self.dex_root == root
+            && self.dex_mounted.is_some()
+            && self.dex_gen_seen == vm.view_gen
+        {
+            return true;
+        }
         let Some(rc) = self.materialize_dex(vm, root) else {
             // Content root went GONE/INVISIBLE: swap in an empty group
             // so the stale tree stops drawing and answering touches.
             if self.dex_root != 0 {
                 self.dex_root = 0;
                 self.dex_mounted = None;
+                self.dex_gen_seen = u64::MAX;
                 self.root.set_content_view(Box::new(ViewGroup::new(
                     Length::MatchParent,
                     Length::MatchParent,
@@ -647,12 +660,13 @@ impl GuestUi {
             self.dex_mounted = Some(rc.clone());
             self.root.set_content_view(Box::new(SharedView(rc)));
         }
+        self.dex_gen_seen = vm.view_gen;
         true
     }
 
     fn materialize_dex(&mut self, vm: &mut Vm, h: u32) -> Option<Rc<RefCell<GuestView>>> {
         let info = vm.dex_view(h)?;
-        if std::env::var_os("OVELO_VIEWDBG").is_some() {
+        if viewdbg() {
             eprintln!(
                 "[viewdbg] node {} h{h} vis={} kids={} text={:?}",
                 info.desc,
@@ -690,7 +704,7 @@ impl GuestUi {
                     // the child exactly where its `setFrame` put it.
                     let view: Box<dyn Drawable> = match vm.dex_view(*ch).and_then(|i| i.frame) {
                         Some(rect) => {
-                            if std::env::var_os("OVELO_VIEWDBG").is_some() {
+                            if viewdbg() {
                                 eprintln!("[viewdbg] frame h{ch} = {rect:?}");
                             }
                             Box::new(AbsView {
@@ -790,6 +804,11 @@ impl GuestUi {
 /// to bound interpreter work. `populate()` is idempotent on existing
 /// pages, and adapters filling asynchronously get picked up on later
 /// passes.
+fn viewdbg() -> bool {
+    static V: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *V.get_or_init(|| std::env::var_os("OVELO_VIEWDBG").is_some())
+}
+
 pub fn drive_dex_layout_pass(vm: &mut Vm, activity: u32, frame: u32) {
     if !frame.is_multiple_of(30) {
         return;
@@ -806,12 +825,12 @@ pub fn drive_dex_layout_pass(vm: &mut Vm, activity: u32, frame: u32) {
             return;
         }
         let Some(info) = vm.dex_view(h) else {
-            if std::env::var_os("OVELO_VIEWDBG").is_some() {
+            if viewdbg() {
                 eprintln!("[viewdbg] walk h{h} not a dex view");
             }
             return;
         };
-        if std::env::var_os("OVELO_VIEWDBG").is_some() {
+        if viewdbg() {
             eprintln!("[viewdbg] walk h{h} {} group={}", info.desc, info.is_group);
         }
         // Drive the real traversal: `measure`/`layout` (not bare
@@ -820,12 +839,16 @@ pub fn drive_dex_layout_pass(vm: &mut Vm, activity: u32, frame: u32) {
         // get stored. Containers that size themselves in layout
         // (RecyclerView's `fill` reads `OrientationHelper` totals)
         // see a 0×0 rect and lay out nothing otherwise.
-        // Drive every group each pass — adapters that fill after the
-        // first traversal (host `requestLayout` is a no-op here) must
-        // re-measure/re-layout or lists stay empty. Keep the view's
-        // existing rect when it has one: re-driving `layout` with a
-        // full-screen rect would overwrite parent-computed bounds.
-        if info.is_group {
+        // Drive measure/layout only at dex-subtree roots — a dex
+        // parent's own traversal already measures and lays out its
+        // children through normal invoke dispatch, so driving every
+        // node re-ran each subtree's solver once per ancestor
+        // (quadratic on real trees: minutes of interpreter time).
+        // Keep the view's existing rect when it has one: re-driving
+        // `layout` with a full-screen rect would overwrite
+        // parent-computed bounds.
+        let parent_is_dex = info.parent != 0 && vm.is_dex_view(info.parent);
+        if info.is_group && !parent_is_dex {
             let (w, hgt) = info
                 .frame
                 .map(|f| (f.2 - f.0, f.3 - f.1))
@@ -835,7 +858,7 @@ pub fn drive_dex_layout_pass(vm: &mut Vm, activity: u32, frame: u32) {
                 "measure",
                 &[V::I32(MS_EXACTLY | w), V::I32(MS_EXACTLY | hgt)],
             ) {
-                if std::env::var_os("OVELO_VIEWDBG").is_some() {
+                if viewdbg() {
                     eprintln!("[viewdbg] measure {} err {e}", info.desc);
                 }
             }
@@ -845,11 +868,11 @@ pub fn drive_dex_layout_pass(vm: &mut Vm, activity: u32, frame: u32) {
                 "layout",
                 &[V::I32(l), V::I32(t), V::I32(l + w), V::I32(t + hgt)],
             ) {
-                if std::env::var_os("OVELO_VIEWDBG").is_some() {
+                if viewdbg() {
                     eprintln!("[viewdbg] layout {} err {e}", info.desc);
                 }
             }
-            if std::env::var_os("OVELO_VIEWDBG").is_some() && info.desc.contains("ViewPager") {
+            if viewdbg() && info.desc.contains("ViewPager") {
                 let fields: Vec<String> = match vm.heap().get(h) {
                     Some(ovelo_dexrt::Obj::Instance { fields, .. })
                     | Some(ovelo_dexrt::Obj::Host { fields, .. }) => fields
@@ -890,7 +913,7 @@ pub fn drive_dex_layout_pass(vm: &mut Vm, activity: u32, frame: u32) {
                 };
                 eprintln!("[viewdbg] pager {h} ref-fields: {fields:?}");
             }
-            if std::env::var_os("OVELO_VIEWDBG").is_some() && info.desc.contains("RecyclerView") {
+            if viewdbg() && info.desc.contains("RecyclerView") {
                 match vm.call_virtual(h, "getAdapter", &[]) {
                     Ok(Some(V::Ref(ad))) if ad != 0 => {
                         let n = vm
@@ -953,6 +976,7 @@ pub fn drive_dex_layout_pass(vm: &mut Vm, activity: u32, frame: u32) {
     // guests defer init work there (fossify's initFileManager runs its
     // first openPath inside one).
     ovelo_dexrt::fire_global_layout(vm, root);
+    vm.layout_gen_done.set(vm.view_gen);
 }
 
 #[cfg(test)]
