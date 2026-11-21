@@ -3943,6 +3943,20 @@ impl Vm {
                 } else {
                     Vec::new()
                 };
+                if let Some(p) = self.trace_call.as_deref() {
+                    let callee = self.describe_method(midx);
+                    if p.split(',').any(|one| !one.is_empty() && callee.contains(one)) {
+                        let caller = self.describe_method(fr.loc.midx);
+                        eprintln!(
+                            "[call>] {} +{pc:04x} -> {callee} this={} args={argfmt:?}",
+                            caller,
+                            match this_arg {
+                                Some(V::Ref(0)) | None => "null".into(),
+                                other => format!("{other:?}"),
+                            }
+                        );
+                    }
+                }
                 let res = self.invoke(midx, args, kind).map_err(|e| match e {
                     E::Vm(v) => {
                         let d = format!("{v} in {}", self.describe_method(fr.loc.midx));
