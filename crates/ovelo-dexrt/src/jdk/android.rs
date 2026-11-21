@@ -1041,7 +1041,12 @@ fn uri_call(vm: &mut Vm, name: &str, args: &[V]) -> Rt<Option<Option<V>>> {
             Some(Some(jstr(vm, &t)))
         }
         "getScheme" => {
-            let sc = text.split("://").next().unwrap_or("").to_string();
+            // Opaque uris ("scheme:ssp") have no "//" after the scheme; a
+            // bare path has no scheme at all.
+            let sc = match text.split_once(':') {
+                Some((s, _)) if !s.is_empty() && !s.contains('/') => s.to_string(),
+                _ => String::new(),
+            };
             Some(Some(jstr(vm, &sc)))
         }
         "getHost" | "getAuthority" | "getEncodedAuthority" => {
@@ -1095,7 +1100,7 @@ fn uri_call(vm: &mut Vm, name: &str, args: &[V]) -> Rt<Option<Option<V>>> {
         "getPort" => Some(Some(V::I32(-1))),
         "isRelative" | "isAbsolute" | "isHierarchical" | "isOpaque" => {
             let r = match name {
-                "isAbsolute" => text.contains("://"),
+                "isAbsolute" => text.contains(':'),
                 "isRelative" => !text.contains("://"),
                 "isHierarchical" => true,
                 _ => false,
@@ -1164,19 +1169,36 @@ fn uri_call(vm: &mut Vm, name: &str, args: &[V]) -> Rt<Option<Option<V>>> {
                 },
             )
             .unwrap_or_default();
-            let p = if p.is_empty() { p } else { format!("file://{p}") };
+            let p = if p.is_empty() {
+                p
+            } else {
+                // Escape characters that would cut the path short when the
+                // Uri is parsed back ('#'/'?' end the path component).
+                let mut enc = String::with_capacity(p.len());
+                for c in p.chars() {
+                    match c {
+                        '#' => enc.push_str("%23"),
+                        '?' => enc.push_str("%3F"),
+                        '%' => enc.push_str("%25"),
+                        _ => enc.push(c),
+                    }
+                }
+                format!("file://{enc}")
+            };
             Some(Some(host(vm, "Landroid/net/Uri;", HostState::StrBuf(p))))
         }
         "fromParts" => {
-            // (scheme, authority, path) -> scheme://authority/path
-            let sc = sv(vm, args.get(1).copied().unwrap_or(V::I32(0))).unwrap_or_default();
-            let au = sv(vm, args.get(2).copied().unwrap_or(V::I32(0))).unwrap_or_default();
-            let pa = sv(vm, args.get(3).copied().unwrap_or(V::I32(0))).unwrap_or_default();
-            Some(Some(host(
-                vm,
-                "Landroid/net/Uri;",
-                HostState::StrBuf(format!("{sc}://{au}{pa}")),
-            )))
+            // (scheme, ssp, fragment) -> scheme:ssp[#fragment]; the ssp keeps
+            // authority+path verbatim in an opaque URI.
+            let sc = sv(vm, args.first().copied().unwrap_or(V::I32(0))).unwrap_or_default();
+            let ssp = sv(vm, args.get(1).copied().unwrap_or(V::I32(0))).unwrap_or_default();
+            let frag = sv(vm, args.get(2).copied().unwrap_or(V::I32(0)));
+            let mut u = format!("{sc}:{ssp}");
+            if let Some(f) = frag.filter(|f| !f.is_empty()) {
+                u.push('#');
+                u.push_str(&f);
+            }
+            Some(Some(host(vm, "Landroid/net/Uri;", HostState::StrBuf(u))))
         }
         "fromBundle" => Some(Some(host(
             vm,
