@@ -13,6 +13,53 @@ pub(crate) fn call(
     Ok(
         if desc_is_a(class, "Ljava/io/PrintStream;") || desc_is_a(class, "Ljava/io/PrintWriter;") {
             print_call(vm, name, sig, args)
+        } else if class.ends_with("FileInputStream;") && name == "<init>" {
+            // Open the real file: arg is a File (Path host) or a String.
+            let path = stream_arg_path(vm, args.get(1).copied().unwrap_or(V::Ref(0)));
+            let bytes = path
+                .and_then(|p| std::fs::read(fspath(vm, &p)).ok())
+                .unwrap_or_default();
+            if let Some(V::Ref(this)) = args.first() {
+                let (ci, d, fs) = match vm.heap.get(*this) {
+                    Some(Obj::Host {
+                        class_idx,
+                        desc,
+                        fields,
+                        ..
+                    }) => (*class_idx, desc.clone(), fields.clone()),
+                    Some(Obj::Instance { class_idx, fields }) => {
+                        (*class_idx, class.to_string(), fields.clone())
+                    }
+                    _ => (u64::MAX, class.to_string(), Default::default()),
+                };
+                if let Some(o) = vm.heap.get_mut(*this) {
+                    *o = Obj::Host {
+                        class_idx: ci,
+                        desc: d,
+                        fields: fs,
+                        state: HostState::Bytes(std::rc::Rc::new(bytes), 0),
+                    };
+                }
+            }
+            Some(None)
+        } else if class.ends_with("FileInputStream;") && name == "getFD" {
+            // The descriptor keeps the byte payload so decodeFileDescriptor
+            // can read it without a second open.
+            let (bytes, pos) = match args.first() {
+                Some(V::Ref(h)) => match vm.heap.get(*h) {
+                    Some(Obj::Host {
+                        state: HostState::Bytes(b, p),
+                        ..
+                    }) => (b.clone(), *p),
+                    _ => (std::rc::Rc::new(vec![]), 0),
+                },
+                _ => (std::rc::Rc::new(vec![]), 0),
+            };
+            Some(Some(host(
+                vm,
+                "Ljava/io/FileDescriptor;",
+                HostState::Bytes(bytes, pos),
+            )))
         } else if desc_is_a(class, "Ljava/io/InputStream;")
             || class.ends_with("InputStream;")
             || class.ends_with("Reader;")
@@ -1577,4 +1624,20 @@ fn misc_fmt(vm: &mut Vm, class: &str, name: &str, args: &[V]) -> Option<Option<V
     }
     let _ = (class, name, args);
     None
+}
+
+/// The guest path a stream ctor argument points at: `File` (Path host),
+/// `String`, or `Uri`/`file:` string. None for other objects.
+fn stream_arg_path(vm: &Vm, v: V) -> Option<String> {
+    let V::Ref(h) = v else { return None };
+    let raw = match vm.heap.get(h) {
+        Some(Obj::Str(s)) => s.clone(),
+        Some(Obj::Host {
+            state:
+                HostState::Path(s) | HostState::StrBuf(s) | HostState::Regex(s),
+            ..
+        }) => s.clone(),
+        _ => return None,
+    };
+    Some(raw.strip_prefix("file://").unwrap_or(&raw).to_string())
 }

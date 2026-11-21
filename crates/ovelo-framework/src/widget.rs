@@ -92,9 +92,20 @@ impl Drawable for View {
         self.layout(left, top)
     }
     fn draw(&mut self, c: &mut Canvas) {
+        let s = self.measured;
         if let Some(bg) = self.background {
-            let s = self.measured;
             c.draw_rect(Rect::new(self.left, self.top, s.w, s.h), Paint::color(bg));
+        }
+        if let Some((iw, ih, px)) = &self.image {
+            c.draw_image(
+                self.left,
+                self.top,
+                s.w.max(0) as usize,
+                s.h.max(0) as usize,
+                *iw as usize,
+                *ih as usize,
+                px,
+            );
         }
     }
     fn invalidate(&mut self) {

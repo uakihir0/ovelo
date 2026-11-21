@@ -50,6 +50,9 @@ const P_PROG_DRAW: u32 = u32::MAX - 23;
 const P_WIN_OWNER: u32 = u32::MAX - 24;
 /// View -> its lazily minted ViewTreeObserver object.
 const P_VTO: u32 = u32::MAX - 25;
+/// `ImageView`'s current image: a `Bitmap` handle, a `Drawable`
+/// handle, or a `Uri`/res-id the renderer resolves.
+const P_IMAGE: u32 = u32::MAX - 27;
 /// Pseudo key: a view's lazily-minted `Menu` (Toolbar.getMenu() etc.) /
 /// the menuish marker on the Menu itself (`I32(1)`).
 const P_MENU: u32 = 0xFFFD_FFF8;
@@ -225,6 +228,9 @@ pub struct DexViewInfo {
     /// Dex-assigned frame `(l, t, r, b)` relative to the parent, once
     /// `layout`/`setFrame` ran (None before first layout pass).
     pub frame: Option<(i32, i32, i32, i32)>,
+    /// `setImage*`-attached pixels (`w`, `h`, RGBA8) after resolving
+    /// Bitmap hosts, drawable field chains, res-ids and file/Uri paths.
+    pub image: Option<(u32, u32, std::rc::Rc<Vec<u8>>)>,
     /// Parent view handle (0 = detached/root).
     pub parent: u32,
     /// Child view handles, in z-order.
@@ -434,12 +440,59 @@ pub(crate) fn dex_view_info(vm: &Vm, h: u32) -> Option<DexViewInfo> {
         visible,
         listener,
         frame,
+        image: pseudo_get(vm, h, P_IMAGE).and_then(|v| image_pixels(vm, v)),
         parent: match pseudo_get(vm, h, P_PARENT) {
             Some(V::Ref(p)) => p,
             _ => 0,
         },
         children: kids,
     })
+}
+
+/// Resolve an `ImageView` image value to pixels: a Bitmap host, an
+/// object holding a bitmap in any ref field (BitmapDrawable, Glide
+/// drawables), a res-id, or a file/Uri path the runtime can open.
+fn image_pixels(vm: &Vm, v: V) -> Option<(u32, u32, std::rc::Rc<Vec<u8>>)> {
+    match v {
+        V::I32(res) if res > 0 => {
+            let bytes = vm
+                .apk_res
+                .as_ref()
+                .and_then(|r| r.file_path(res as u32).and_then(|p| r.read(p)))?;
+            decode_image(&bytes)
+        }
+        V::Ref(_) => super::android::bitmap_pixels(vm, v).or_else(|| {
+            let path = image_source_path(vm, v)?;
+            decode_image(&std::fs::read(io::fspath(vm, &path)).ok()?)
+        }),
+        _ => None,
+    }
+}
+
+/// The guest filesystem path behind a Uri/File/string image source:
+/// `file:///x`, `content://media/.../<id>` (via the media id map) or a
+/// raw path. None for non-path objects (Bitmap/Drawable instances).
+fn image_source_path(vm: &Vm, v: V) -> Option<String> {
+    let raw = match v {
+        V::Ref(h) => match vm.heap.get(h) {
+            Some(Obj::Str(s)) => s.clone(),
+            Some(Obj::Host {
+                state: HostState::StrBuf(s) | HostState::Path(s) | HostState::Regex(s),
+                ..
+            }) => s.clone(),
+            _ => return None,
+        },
+        _ => return None,
+    };
+    super::android::media_uri_path(vm, &raw)
+}
+
+/// RGBA8 decode of packaged/encoded image bytes (PNG/JPEG).
+fn decode_image(bytes: &[u8]) -> Option<(u32, u32, std::rc::Rc<Vec<u8>>)> {
+    let img = image::load_from_memory(bytes).ok()?;
+    let rgba = img.to_rgba8();
+    let (w, h) = rgba.dimensions();
+    Some((w, h, std::rc::Rc::new(rgba.into_raw())))
 }
 
 /// Whether `class`'s methods route here. Any class may produce a view
@@ -1070,6 +1123,14 @@ pub(crate) fn call(
         "getText" | "getTitle" | "getContentDescription" => Some(Some(
             pseudo_get(vm, this, P_TEXT).unwrap_or_else(|| jstr(vm, "")),
         )),
+        "setImageBitmap" | "setImageDrawable" | "setImageURI" | "setImageIcon"
+        | "setImageResource" => {
+            pseudo_set(vm, this, P_IMAGE, args.get(1).copied().unwrap_or(V::I32(0)));
+            Some(None)
+        }
+        "getDrawable" => Some(Some(
+            pseudo_get(vm, this, P_IMAGE).unwrap_or(V::Ref(0)),
+        )),
         "setOnClickListener"
         | "setOnLongClickListener"
         | "setOnTouchListener"
@@ -1364,11 +1425,6 @@ pub(crate) fn call(
         | "setImportantForAccessibility"
         | "setAccessibilityLiveRegion"
         | "setBackground"
-        | "setImageResource"
-        | "setImageDrawable"
-        | "setImageBitmap"
-        | "setImageURI"
-        | "setImageIcon"
         | "setTextColor"
         | "setTextSize"
         | "setTypeface"

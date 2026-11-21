@@ -335,6 +335,15 @@ fn update_dex_view(g: &mut GuestView, info: &ovelo_dexrt::DexViewInfo) {
             v.background = bg;
             changed = true;
         }
+        let img_changed = match (&v.image, &info.image) {
+            (None, None) => false,
+            (Some((w, h, _)), Some((w2, h2, _))) => w != w2 || h != h2,
+            _ => true,
+        };
+        if img_changed {
+            v.image = info.image.clone();
+            changed = true;
+        }
     }
     if let Some(tv) = g.text_mut() {
         if let Some(t) = &info.text {

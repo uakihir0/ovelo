@@ -237,6 +237,48 @@ impl Surface {
         Ok(())
     }
 
+    /// Nearest-neighbor scaled blit: `src` (RGBA8, `src_w`×`src_h`) fills
+    /// the `dw`×`dh` rect at `(dx,dy)`, clipped to the clip stack.
+    #[allow(clippy::too_many_arguments)]
+    pub fn blit_scaled(
+        &mut self,
+        dx: i32,
+        dy: i32,
+        dw: usize,
+        dh: usize,
+        src_w: usize,
+        src_h: usize,
+        src: &[u8],
+    ) {
+        if dw == 0 || dh == 0 || src_w == 0 || src_h == 0
+            || src.len() != src_w * src_h * 4
+        {
+            return;
+        }
+        let clip = *self.clips.last().unwrap();
+        let x0 = dx.max(clip.x);
+        let y0 = dy.max(clip.y);
+        let x1 = (dx + dw as i32).min(clip.x1);
+        let y1 = (dy + dh as i32).min(clip.y1);
+        for y in y0..y1 {
+            let sy = (y - dy) as usize * src_h / dh;
+            for x in x0..x1 {
+                let sx = (x - dx) as usize * src_w / dw;
+                let i = (sy * src_w + sx) * 4;
+                self.src_over(
+                    x,
+                    y,
+                    Color {
+                        r: src[i],
+                        g: src[i + 1],
+                        b: src[i + 2],
+                        a: src[i + 3],
+                    },
+                );
+            }
+        }
+    }
+
     /// Blend one coverage-weighted source pixel (`src-over`, premul space).
     /// `cov` scales `c`'s alpha (0..=255).
     pub(crate) fn blend_pixel(&mut self, x: i32, y: i32, c: Color, cov: u8) {

@@ -122,6 +122,23 @@ impl<'a> Canvas<'a> {
         );
     }
 
+    /// `drawBitmap`-style blit: `src` (RGBA8, `src_w`×`src_h`) scaled
+    /// nearest into the `w`×`h` rect at `(x, y)` — translated + clipped.
+    #[allow(clippy::too_many_arguments)]
+    pub fn draw_image(
+        &mut self,
+        x: i32,
+        y: i32,
+        w: usize,
+        h: usize,
+        src_w: usize,
+        src_h: usize,
+        src: &[u8],
+    ) {
+        self.surf
+            .blit_scaled(x + self.dx, y + self.dy, w, h, src_w, src_h, src);
+    }
+
     /// `drawText` — run of text with the pen at `(x, baseline)`.
     ///
     /// When one font covers the whole text the shaper produces the run:

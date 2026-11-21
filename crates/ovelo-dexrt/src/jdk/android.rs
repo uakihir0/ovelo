@@ -158,11 +158,31 @@ pub(crate) fn call(
                     Some(Some(host(vm, "Landroid/database/Cursor;", HostState::Empty)))
                 }
             }
+            "openFileDescriptor" | "openAssetFileDescriptor" | "openTypedAssetFileDescriptor" => {
+                // Glide's local-uri fetcher reads the pixels through a
+                // parcelled descriptor — hand it the file's real bytes.
+                let uri = sv(vm, args.get(1).copied().unwrap_or(V::Ref(0)))
+                    .unwrap_or_default();
+                let bytes = media_uri_path(vm, &uri)
+                    .and_then(|p| std::fs::read(io::fspath(vm, &p)).ok())
+                    .unwrap_or_default();
+                if bytes.is_empty() {
+                    Some(Some(V::Ref(0)))
+                } else {
+                    let d = if name == "openFileDescriptor" {
+                        "Landroid/os/ParcelFileDescriptor;"
+                    } else {
+                        "Landroid/content/res/AssetFileDescriptor;"
+                    };
+                    Some(Some(host(
+                        vm,
+                        d,
+                        HostState::Bytes(std::rc::Rc::new(bytes), 0),
+                    )))
+                }
+            }
             "insert"
             | "call"
-            | "openFileDescriptor"
-            | "openAssetFileDescriptor"
-            | "openTypedAssetFileDescriptor"
             | "openFile"
             | "getType"
             | "getStreamTypes"
@@ -179,11 +199,18 @@ pub(crate) fn call(
             "getSyncAdapterTypes" => {
                 Some(Some(arr(vm, "Landroid/content/SyncAdapterType;", vec![])))
             }
-            "openInputStream" => Some(Some(host(
-                vm,
-                "Ljava/io/FileInputStream;",
-                HostState::Empty,
-            ))),
+            "openInputStream" => {
+                let uri = sv(vm, args.get(1).copied().unwrap_or(V::Ref(0)))
+                    .unwrap_or_default();
+                let bytes = media_uri_path(vm, &uri)
+                    .and_then(|p| std::fs::read(io::fspath(vm, &p)).ok())
+                    .unwrap_or_default();
+                Some(Some(host(
+                    vm,
+                    "Ljava/io/FileInputStream;",
+                    HostState::Bytes(std::rc::Rc::new(bytes), 0),
+                )))
+            }
             "openOutputStream" => Some(Some(host(
                 vm,
                 "Ljava/io/FileOutputStream;",
@@ -389,6 +416,48 @@ pub(crate) fn call(
             "isCancelled" => Some(Some(V::I32(0))),
             "getStatus" => Some(Some(V::Ref(0))),
             "get" => Some(Some(V::Ref(0))),
+            _ => None,
+        }
+    } else if class.ends_with("ParcelFileDescriptor;")
+        || class == "Landroid/content/res/AssetFileDescriptor;"
+    {
+        match name {
+            "getFileDescriptor" => {
+                let (b, p) = match args.first().copied() {
+                    Some(V::Ref(h)) => match vm.heap.get(h) {
+                        Some(Obj::Host {
+                            state: HostState::Bytes(b, p),
+                            ..
+                        }) => (b.clone(), *p),
+                        _ => (std::rc::Rc::new(vec![]), 0),
+                    },
+                    _ => (std::rc::Rc::new(vec![]), 0),
+                };
+                Some(Some(host(
+                    vm,
+                    "Ljava/io/FileDescriptor;",
+                    HostState::Bytes(b, p),
+                )))
+            }
+            "getStatSize" | "getLength" | "getDeclaredLength" => {
+                let n = match args.first().copied() {
+                    Some(V::Ref(h)) => match vm.heap.get(h) {
+                        Some(Obj::Host {
+                            state: HostState::Bytes(b, _),
+                            ..
+                        }) => b.len() as i64,
+                        _ => 0,
+                    },
+                    _ => 0,
+                };
+                Some(Some(V::I64(n)))
+            }
+            "getParcelFileDescriptor" => Some(Some(args[0])),
+            "close" | "detachFd" | "dup" | "canDetectErrors" => match name {
+                "canDetectErrors" => Some(Some(V::I32(0))),
+                "dup" => Some(Some(args[0])),
+                _ => Some(None),
+            },
             _ => None,
         }
     } else if class == "Landroid/os/Binder;"
@@ -3391,6 +3460,135 @@ fn graphics_call(vm: &mut Vm, class: &str, name: &str, args: &[V]) -> Rt<Option<
         }
         ("Landroid/util/Patterns;", _) => Some(Some(V::Ref(0))),
         ("Landroid/util/Size;", "getWidth" | "getHeight") => Some(Some(V::I32(0))),
+        ("Landroid/graphics/drawable/BitmapDrawable;", "<init>") => {
+            // Keep the Bitmap arg discoverable: the renderer walks an
+            // ImageView's drawable fields for pixels (and getBitmap
+            // reads them back). Signatures: (Resources, Bitmap),
+            // (Bitmap), (Resources, Bitmap, Paint), (Resources,
+            // DisplayMetrics, Bitmap, Paint).
+            if let Some(V::Ref(this)) = args.first() {
+                let bm = args[1..]
+                    .iter()
+                    .find(|a| bitmap_dims(vm, **a) != (0, 0))
+                    .copied();
+                if let Some(bm) = bm {
+                    pseudo_set(vm, *this, P_BITMAP_SLOT, bm);
+                }
+            }
+            Some(None)
+        }
+        ("Landroid/graphics/drawable/BitmapDrawable;", "getBitmap") => Some(Some(
+            match args.first() {
+                Some(V::Ref(h)) => pseudo_get(vm, *h, P_BITMAP_SLOT).unwrap_or(V::Ref(0)),
+                _ => V::Ref(0),
+            },
+        )),
+        ("Landroid/graphics/BitmapFactory;", "decodeFile") => {
+            let path = sv(vm, args[0]).unwrap_or_default();
+            let bytes = std::fs::read(io::fspath(vm, &path)).unwrap_or_default();
+            Some(bitmap_decode(vm, &bytes))
+        }
+        ("Landroid/graphics/BitmapFactory;", "decodeByteArray") => {
+            let data = match args.first().copied() {
+                Some(V::Ref(h)) => match vm.heap.get(h) {
+                    Some(Obj::Array { data, .. }) => data
+                        .iter()
+                        .map(|v| i32v(*v) as u8)
+                        .collect::<Vec<u8>>(),
+                    _ => vec![],
+                },
+                _ => vec![],
+            };
+            let off = i32v(args.get(1).copied().unwrap_or(V::I32(0))).max(0) as usize;
+            let len = i32v(args.get(2).copied().unwrap_or(V::I32(data.len() as i32)))
+                .max(0) as usize;
+            let bytes = &data[off.min(data.len())..(off + len).min(data.len())];
+            Some(bitmap_decode(vm, bytes))
+        }
+        ("Landroid/graphics/BitmapFactory;", "decodeStream") => {
+            let bytes = match args.first().copied() {
+                Some(V::Ref(h)) => match vm.heap.get(h) {
+                    Some(Obj::Host {
+                        state: HostState::Bytes(b, pos),
+                        ..
+                    }) => b[*pos..].to_vec(),
+                    _ => vec![],
+                },
+                _ => vec![],
+            };
+            Some(bitmap_decode(vm, &bytes))
+        }
+        ("Landroid/graphics/BitmapFactory;", "decodeFileDescriptor") => {
+            let bytes = match args.first().copied() {
+                Some(V::Ref(h)) => match vm.heap.get(h) {
+                    Some(Obj::Host {
+                        state: HostState::Bytes(b, pos),
+                        ..
+                    }) => b[*pos..].to_vec(),
+                    Some(Obj::Host {
+                        state: HostState::Path(p),
+                        ..
+                    }) => std::fs::read(io::fspath(vm, p)).unwrap_or_default(),
+                    _ => vec![],
+                },
+                _ => vec![],
+            };
+            Some(bitmap_decode(vm, &bytes))
+        }
+        ("Landroid/graphics/BitmapFactory;", "decodeResource") => {
+            // (Resources, resId): resolve to the packaged file and decode.
+            let res_id = i32v(*args.get(1).unwrap_or(args.first().unwrap_or(&V::I32(0))))
+                as u32;
+            let bytes = vm
+                .apk_res
+                .as_ref()
+                .and_then(|r| r.file_path(res_id).and_then(|p| r.read(p)))
+                .unwrap_or_default();
+            Some(bitmap_decode(vm, &bytes))
+        }
+        ("Landroid/graphics/Bitmap;", "getWidth" | "getHeight" | "getByteCount"
+        | "getRowBytes" | "hasAlpha" | "isRecycled" | "getDensity"
+        | "getGenerationId") => {
+            let (w, h) = bitmap_dims(vm, args[0]);
+            Some(Some(match name {
+                "getWidth" => V::I32(w as i32),
+                "getHeight" => V::I32(h as i32),
+                "getByteCount" => V::I32((w * h * 4) as i32),
+                "getRowBytes" => V::I32((w * 4) as i32),
+                "getDensity" => V::I32(160),
+                "isRecycled" => V::I32(0),
+                _ => V::I32(1), // hasAlpha / getGenerationId
+            }))
+        }
+        ("Landroid/graphics/Bitmap;", "createBitmap" | "createScaledBitmap") => {
+            // createBitmap(w, h, Config, ...) / createScaledBitmap(src, w, h, filter)
+            let (w, h, src) = if name == "createScaledBitmap" {
+                (
+                    i32v(args.get(1).copied().unwrap_or(V::I32(0))).max(0) as u32,
+                    i32v(args.get(2).copied().unwrap_or(V::I32(0))).max(0) as u32,
+                    Some(args[0]),
+                )
+            } else {
+                (
+                    i32v(args[0]).max(0) as u32,
+                    i32v(args.get(1).copied().unwrap_or(V::I32(0))).max(0) as u32,
+                    None,
+                )
+            };
+            let rgba = match src.and_then(|s| bitmap_pixels(vm, s)) {
+                Some((sw, sh, px)) => scale_rgba(sw, sh, &px, w, h),
+                None => vec![0u8; (w * h * 4) as usize],
+            };
+            Some(Some(host(
+                vm,
+                "Landroid/graphics/Bitmap;",
+                HostState::Bitmap {
+                    w,
+                    h,
+                    rgba: std::rc::Rc::new(rgba),
+                },
+            )))
+        }
         ("Landroid/util/SizeF;", "getWidth" | "getHeight") => Some(Some(V::F32(0.0))),
         (
             _,
@@ -3609,4 +3807,101 @@ fn bounds_rect(vm: &mut Vm, h: u32) -> V {
     let rh = host(vm, "Landroid/graphics/Rect;", HostState::Empty);
     pseudo_set(vm, h, P_BOUNDS, rh);
     rh
+}
+
+// ---------------------------------------------------------------------
+// Bitmap decode / scale
+//
+
+/// Decode real image bytes into a `Bitmap` host object. Empty or
+/// undecodable input -> null, matching `BitmapFactory` returning null.
+fn bitmap_decode(vm: &mut Vm, bytes: &[u8]) -> Option<V> {
+    if bytes.is_empty() {
+        return Some(V::Ref(0));
+    }
+    let img = image::load_from_memory(bytes).ok()?;
+    let rgba = img.to_rgba8();
+    let (w, h) = rgba.dimensions();
+    Some(host(
+        vm,
+        "Landroid/graphics/Bitmap;",
+        HostState::Bitmap {
+            w,
+            h,
+            rgba: std::rc::Rc::new(rgba.into_raw()),
+        },
+    ))
+}
+
+/// (w, h) of a Bitmap host; (0, 0) for anything else.
+fn bitmap_dims(vm: &Vm, v: V) -> (u32, u32) {
+    match v {
+        V::Ref(h) => match vm.heap.get(h) {
+            Some(Obj::Host {
+                state: HostState::Bitmap { w, h, .. },
+                ..
+            }) => (*w, *h),
+            _ => (0, 0),
+        },
+        _ => (0, 0),
+    }
+}
+
+/// (w, h, pixels) of a Bitmap host — or of a `Drawable`/`ImageView`-
+/// like object holding a bitmap in any ref field (BitmapDrawable.mBitmapState.mBitmap,
+/// Glide's BitmapDrawable, …).
+pub(crate) fn bitmap_pixels(vm: &Vm, v: V) -> Option<(u32, u32, std::rc::Rc<Vec<u8>>)> {
+    let V::Ref(h) = v else { return None };
+    match vm.heap.get(h) {
+        Some(Obj::Host {
+            state: HostState::Bitmap { w, h, rgba },
+            ..
+        }) => Some((*w, *h, rgba.clone())),
+        Some(Obj::Instance { fields, .. }) | Some(Obj::Host { fields, .. }) => fields
+            .values()
+            .find_map(|f| bitmap_pixels(vm, *f)),
+        _ => None,
+    }
+}
+
+/// Nearest-neighbor RGBA8 scale.
+fn scale_rgba(sw: u32, sh: u32, src: &[u8], dw: u32, dh: u32) -> Vec<u8> {
+    let mut out = vec![0u8; (dw * dh * 4) as usize];
+    if sw == 0 || sh == 0 || dw == 0 || dh == 0 {
+        return out;
+    }
+    for y in 0..dh {
+        for x in 0..dw {
+            let sx = (x * sw / dw).min(sw - 1);
+            let sy = (y * sh / dh).min(sh - 1);
+            let s = ((sy * sw + sx) * 4) as usize;
+            let d = ((y * dw + x) * 4) as usize;
+            out[d..d + 4].copy_from_slice(&src[s..s + 4]);
+        }
+    }
+    out
+}
+
+/// Guest filesystem path behind a `content://media/.../<id>` uri (via the
+/// runtime's media id table), a `file://` uri, or a raw absolute path.
+pub(crate) fn media_uri_path(vm: &Vm, uri: &str) -> Option<String> {
+    if uri.is_empty() {
+        return None;
+    }
+    if let Some(rest) = uri.strip_prefix("file://") {
+        return Some(rest.to_string());
+    }
+    if uri.starts_with('/') {
+        return Some(uri.to_string());
+    }
+    if uri.starts_with("content://media/") {
+        if let Some(id) = uri.rsplit('/').next().and_then(|t| t.parse::<i64>().ok()) {
+            for (data, i) in &vm.media_ids {
+                if *i == id {
+                    return Some(data.clone());
+                }
+            }
+        }
+    }
+    None
 }

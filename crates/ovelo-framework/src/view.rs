@@ -70,6 +70,9 @@ pub struct View {
     pub top: i32,
     /// `setBackgroundColor` — drawn under `draw` when set.
     pub background: Option<Color>,
+    /// `setImage*` — decoded pixels (w, h, RGBA8), scaled into the
+    /// measured rect at draw.
+    pub image: Option<(u32, u32, std::rc::Rc<Vec<u8>>)>,
     /// `setOnClickListener` — fired on tap inside the laid-out rect.
     pub on_click: Option<Box<dyn FnMut()>>,
     /// Pressed while the pointer that went down on this view is still
@@ -89,6 +92,7 @@ impl View {
             left: 0,
             top: 0,
             background: None,
+            image: None,
             on_click: None,
             pressed: false,
             dirty: true,

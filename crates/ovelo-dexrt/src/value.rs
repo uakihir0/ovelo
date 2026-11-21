@@ -109,6 +109,15 @@ pub enum HostState {
     /// A readable byte stream (`InputStream` over real bytes — raw
     /// resources, asset files): buffer + read cursor.
     Bytes(std::rc::Rc<Vec<u8>>, usize),
+    /// A decoded image (`Bitmap`).
+    Bitmap {
+        /// Width in pixels.
+        w: u32,
+        /// Height in pixels.
+        h: u32,
+        /// Straight (non-premultiplied) RGBA8 pixel buffer.
+        rgba: std::rc::Rc<Vec<u8>>,
+    },
     /// An `XmlResourceParser`: binary-XML elements plus a precomputed
     /// pull-parser event stream and the cursor into it.
     Xml {
