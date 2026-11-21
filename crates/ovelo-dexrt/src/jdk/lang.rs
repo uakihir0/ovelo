@@ -1957,7 +1957,7 @@ pub(crate) fn enum_value_list(vm: &mut Vm, class: &str) -> Vec<V> {
             if d.type_descriptor(cd.class_idx).ok().as_deref() != Some(class) {
                 continue;
             }
-            let Ok(data) = d.class_data(cd) else { continue };
+            let Ok(data) = d.class_data_rc(cd) else { continue };
             for ef in &data.static_fields {
                 let is_const = d
                     .field(ef.field_idx)

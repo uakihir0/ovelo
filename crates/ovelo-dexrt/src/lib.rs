@@ -84,7 +84,7 @@ struct ClassRt {
 }
 
 /// A resolved method: where it is declared plus its code.
-#[derive(Clone)]
+#[derive(Clone, Copy)]
 struct Loc {
     /// Owning class (global `type_idx`) the method was found on.
     class_idx: GIdx,
@@ -215,6 +215,11 @@ pub struct Vm {
     /// strings and updater-style guests (`AtomicReferenceFieldUpdater`,
     /// `Unsafe`) issue thousands of lookups.
     field_idx_cache: std::cell::RefCell<HashMap<(String, String), Option<GIdx>>>,
+    /// class descriptor → global type_idx. `type_index_of` walks every
+    /// dex's whole type table per call (each entry is a MUTF-8 decode);
+    /// assignability checks and `canon` issue it per dispatch, so
+    /// misses are cached too.
+    type_idx_cache: std::cell::RefCell<HashMap<String, Option<GIdx>>>,
     /// `(field_name, field_type)` → canonical field GIdxs across all
     /// dexes, built lazily — lets host code write fields on dex
     /// instances under every owner a reader's field ref might name
@@ -224,6 +229,32 @@ pub struct Vm {
     /// re-reads half the dex tables per call; layout/measure passes
     /// issue it tens of thousands of times on the same methods.
     method_sig_cache: std::cell::RefCell<HashMap<GIdx, (String, String, String)>>,
+    /// `midx` → parsed `code_item` — `exec_frame` re-parsed registers,
+    /// tries and handlers on every single call of a method.
+    code_cache: std::cell::RefCell<HashMap<GIdx, std::rc::Rc<ovelo_dex::CodeItem>>>,
+    /// `midx` → decoded instruction table — `exec_frame` re-decoded
+    /// every instruction of a method on every call into it.
+    insn_cache: std::cell::RefCell<HashMap<GIdx, std::rc::Rc<Vec<Insn>>>>,
+    /// `midx` → display name `Lcls;.name(sig)ret` — `last_call` was
+    /// formatting one per invoke.
+    method_desc_cache: std::cell::RefCell<HashMap<GIdx, std::rc::Rc<str>>>,
+    /// `(referenced midx, receiver class, defined-fallback?)` → resolved
+    /// dispatch `Loc` — `resolve_virtual` re-walked the superclass chain
+    /// decoding every candidate's name+proto on every invoke.
+    resolve_cache: std::cell::RefCell<HashMap<(GIdx, GIdx, bool), Option<Loc>>>,
+    /// `field GIdx` → canonical `field GIdx` — `canon_field` rebuilt the
+    /// `(owner,name,type)` sig strings for every iget/iput.
+    canon_field_cache: std::cell::RefCell<HashMap<GIdx, GIdx>>,
+    /// `midx` → registered host impl — `host_named` decoded the ref's
+    /// name+proto and re-ran assignability on every unresolved invoke.
+    host_named_cache: std::cell::RefCell<HashMap<GIdx, Option<HostCall>>>,
+    /// `(class GIdx, method name, arg slots)` → method GIdx — host→guest
+    /// `call_virtual` (measure/layout/onViewAdded per node per pass)
+    /// re-walked the superclass chain per call.
+    named_chain_cache: std::cell::RefCell<HashMap<(GIdx, String, usize), Option<GIdx>>>,
+    /// `(sub GIdx, sup GIdx)` → is-assignable — the chain+interface walk
+    /// ran per check-cast / host registration probe.
+    assignable_cache: std::cell::RefCell<HashMap<(GIdx, GIdx), bool>>,
     /// Deferred async work — `(runnable, on_main)`. `Thread.start`,
     /// `Executor.execute`/`submit` and `Handler.post*` enqueue here
     /// instead of running inline (AOSP is async; inline execution
@@ -352,8 +383,17 @@ impl Vm {
             reparked: std::collections::HashSet::new(),
             park_spins: 0,
             field_idx_cache: std::cell::RefCell::new(HashMap::new()),
+            type_idx_cache: std::cell::RefCell::new(HashMap::new()),
             fields_named_cache: std::cell::RefCell::new(None),
             method_sig_cache: std::cell::RefCell::new(HashMap::new()),
+            code_cache: std::cell::RefCell::new(HashMap::new()),
+            insn_cache: std::cell::RefCell::new(HashMap::new()),
+            method_desc_cache: std::cell::RefCell::new(HashMap::new()),
+            resolve_cache: std::cell::RefCell::new(HashMap::new()),
+            canon_field_cache: std::cell::RefCell::new(HashMap::new()),
+            host_named_cache: std::cell::RefCell::new(HashMap::new()),
+            named_chain_cache: std::cell::RefCell::new(HashMap::new()),
+            assignable_cache: std::cell::RefCell::new(HashMap::new()),
             class_mirrors: HashMap::new(),
             granted_permissions: std::collections::HashSet::new(),
         };
@@ -378,8 +418,17 @@ impl Vm {
     pub fn add_dex(&mut self, dex: DexFile) -> Result<()> {
         // A new dex can resolve names previous lookups missed.
         self.field_idx_cache.borrow_mut().clear();
+        self.type_idx_cache.borrow_mut().clear();
         self.fields_named_cache.borrow_mut().take();
         self.method_sig_cache.borrow_mut().clear();
+        self.code_cache.borrow_mut().clear();
+        self.insn_cache.borrow_mut().clear();
+        self.method_desc_cache.borrow_mut().clear();
+        self.resolve_cache.borrow_mut().clear();
+        self.canon_field_cache.borrow_mut().clear();
+        self.host_named_cache.borrow_mut().clear();
+        self.named_chain_cache.borrow_mut().clear();
+        self.assignable_cache.borrow_mut().clear();
         let di = self.dexes.len();
         for (class_idx, em) in dex.methods()? {
             self.defined
@@ -430,18 +479,22 @@ impl Vm {
     /// Canonical field identity: `(owner, name, type)` first-seen key,
     /// so a field written via dex M's ref reads back through dex N's.
     pub(crate) fn canon_field(&self, g: GIdx) -> GIdx {
-        let Some(d) = self.dex_of(g) else {
-            return g;
-        };
-        let Ok(f) = d.field(gl(g)) else {
-            return g;
-        };
-        let sig = (
-            d.type_descriptor(f.class_idx as u32).unwrap_or_default(),
-            d.string(f.name_idx).unwrap_or_default(),
-            d.type_descriptor(f.type_idx as u32).unwrap_or_default(),
-        );
-        self.fields_by_sig.get(&sig).copied().unwrap_or(g)
+        if let Some(hit) = self.canon_field_cache.borrow().get(&g) {
+            return *hit;
+        }
+        let out = (|| {
+            let d = self.dex_of(g)?;
+            let f = d.field(gl(g)).ok()?;
+            let sig = (
+                d.type_descriptor(f.class_idx as u32).unwrap_or_default(),
+                d.string(f.name_idx).unwrap_or_default(),
+                d.type_descriptor(f.type_idx as u32).unwrap_or_default(),
+            );
+            Some(self.fields_by_sig.get(&sig).copied().unwrap_or(g))
+        })()
+        .unwrap_or(g);
+        self.canon_field_cache.borrow_mut().insert(g, out);
+        out
     }
 
     /// (canonical GIdx of the class itself, its &ClassDef) — `def`
@@ -466,13 +519,22 @@ impl Vm {
     }
 
     /// `type_idx` lookup across every loaded dex (global result).
+    /// Memoized — dex type tables don't change after `add_dex`.
     pub(crate) fn type_index_of(&self, desc: &str) -> Option<GIdx> {
+        if let Some(hit) = self.type_idx_cache.borrow().get(desc) {
+            return *hit;
+        }
+        let mut out = None;
         for (di, d) in self.dexes.iter().enumerate() {
             if let Ok(Some(i)) = d.type_index_of(desc) {
-                return Some(gx(di, i));
+                out = Some(gx(di, i));
+                break;
             }
         }
-        None
+        self.type_idx_cache
+            .borrow_mut()
+            .insert(desc.to_string(), out);
+        out
     }
 
     /// `field_idx` lookup across every loaded dex (global result).
@@ -708,7 +770,7 @@ impl Vm {
                 if desc != class_desc {
                     continue;
                 }
-                let Ok(cd) = d.class_data(def) else {
+                let Ok(cd) = d.class_data_rc(def) else {
                     continue;
                 };
                 for m in cd.direct_methods.iter().chain(cd.virtual_methods.iter()) {
@@ -923,7 +985,7 @@ impl Vm {
                 if d.type_descriptor(def.class_idx).ok().as_deref() != Some(class_desc) {
                     continue;
                 }
-                let Ok(cd) = d.class_data(def) else {
+                let Ok(cd) = d.class_data_rc(def) else {
                     return out;
                 };
                 for m in cd.direct_methods.iter() {
@@ -1378,10 +1440,19 @@ impl Vm {
 
     /// `Lcls;.name(params)ret` for error details — an unresolved call
     /// must name the API it needed (compat reports key off this).
-    fn describe_method(&self, midx: GIdx) -> String {
-        self.method_sig(midx)
+    fn describe_method(&self, midx: GIdx) -> std::rc::Rc<str> {
+        if let Some(hit) = self.method_desc_cache.borrow().get(&midx) {
+            return hit.clone();
+        }
+        let s: std::rc::Rc<str> = self
+            .method_sig(midx)
             .map(|(class, name, sig)| format!("{class}.{name}{sig}"))
             .unwrap_or_else(|_| format!("method@{midx}"))
+            .into();
+        self.method_desc_cache
+            .borrow_mut()
+            .insert(midx, s.clone());
+        s
     }
 
     /// Live call stack as `Lcls;.name(sig)ret` strings, newest frame
@@ -1389,7 +1460,7 @@ impl Vm {
     pub(crate) fn describe_stack(&self) -> Vec<String> {
         self.stack
             .iter()
-            .map(|&m| self.describe_method(m))
+            .map(|&m| self.describe_method(m).to_string())
             .collect()
     }
 
@@ -1413,21 +1484,28 @@ impl Vm {
         name: &str,
         nslots: usize,
     ) -> Result<Option<GIdx>> {
+        let key = (class_idx, name.to_string(), nslots);
+        if let Some(hit) = self.named_chain_cache.borrow().get(&key) {
+            return Ok(*hit);
+        }
+        let mut out = None;
         for _ in 0..64 {
             let Some((cg, def)) = self.def_loc_of(class_idx) else {
-                return Ok(None);
+                break;
             };
             let sup = def.superclass_idx;
             let desc = self.type_desc_of(cg)?;
             if let Some(m) = self.find_method_by_name(&desc, name, nslots)? {
-                return Ok(Some(m));
+                out = Some(m);
+                break;
             }
             if sup == u32::MAX {
-                return Ok(None);
+                break;
             }
             class_idx = gx(gd(cg), sup);
         }
-        Ok(None)
+        self.named_chain_cache.borrow_mut().insert(key, out);
+        Ok(out)
     }
 
     /// First method `name` on `class_desc` whose params occupy exactly
@@ -1439,31 +1517,25 @@ impl Vm {
         name: &str,
         nslots: usize,
     ) -> Result<Option<GIdx>> {
-        for (di, d) in self.dexes.iter().enumerate() {
-            for def in d.class_defs() {
-                if d.type_descriptor(def.class_idx)? != class_desc {
-                    continue;
-                }
-                let cd = d.class_data(def)?;
-                for m in cd.direct_methods.iter().chain(cd.virtual_methods.iter()) {
-                    let mid = d.method(m.method_idx)?;
-                    if d.string(mid.name_idx)? != name {
-                        continue;
-                    }
-                    let p = d.proto(mid.proto_idx as u32)?;
-                    let mut slots = 0usize;
-                    for t in d.proto_params(p)? {
-                        let ty = d.type_descriptor(t as u32)?;
-                        slots += if ty.starts_with('J') || ty.starts_with('D') {
-                            2
-                        } else {
-                            1
-                        };
-                    }
-                    if slots == nslots {
-                        return Ok(Some(gx(di, m.method_idx)));
-                    }
-                }
+        let Some(&(di, def_i)) = self.defs.get(class_desc) else {
+            return Ok(None);
+        };
+        let d = &self.dexes[di];
+        let def = &d.class_defs()[def_i];
+        let cd = d.class_data_rc(def)?;
+        for m in cd.direct_methods.iter().chain(cd.virtual_methods.iter()) {
+            let mid = d.method(m.method_idx)?;
+            if d.string(mid.name_idx)? != name {
+                continue;
+            }
+            let p = d.proto(mid.proto_idx as u32)?;
+            let mut slots = 0usize;
+            for t in d.proto_params(p)? {
+                let ty = d.type_descriptor(t as u32)?;
+                slots += if ty.starts_with('J') || ty.starts_with('D') { 2 } else { 1 };
+            }
+            if slots == nslots {
+                return Ok(Some(gx(di, m.method_idx)));
             }
         }
         Ok(None)
@@ -1484,27 +1556,25 @@ impl Vm {
         class_desc: &str,
         params: &[String],
     ) -> Result<Option<GIdx>> {
-        for (di, d) in self.dexes.iter().enumerate() {
-            for def in d.class_defs() {
-                if d.type_descriptor(def.class_idx)? != class_desc {
-                    continue;
-                }
-                let cd = d.class_data(def)?;
-                for m in cd.direct_methods.iter().chain(cd.virtual_methods.iter()) {
-                    let mid = d.method(m.method_idx)?;
-                    if d.string(mid.name_idx)? != "<init>" {
-                        continue;
-                    }
-                    let p = d.proto(mid.proto_idx as u32)?;
-                    let got: Vec<String> = d
-                        .proto_params(p)?
-                        .iter()
-                        .filter_map(|t| d.type_descriptor(*t as u32).ok())
-                        .collect();
-                    if got == params {
-                        return Ok(Some(gx(di, m.method_idx)));
-                    }
-                }
+        let Some(&(di, def_i)) = self.defs.get(class_desc) else {
+            return Ok(None);
+        };
+        let d = &self.dexes[di];
+        let def = &d.class_defs()[def_i];
+        let cd = d.class_data_rc(def)?;
+        for m in cd.direct_methods.iter().chain(cd.virtual_methods.iter()) {
+            let mid = d.method(m.method_idx)?;
+            if d.string(mid.name_idx)? != "<init>" {
+                continue;
+            }
+            let p = d.proto(mid.proto_idx as u32)?;
+            let got: Vec<String> = d
+                .proto_params(p)?
+                .iter()
+                .filter_map(|t| d.type_descriptor(*t as u32).ok())
+                .collect();
+            if got == params {
+                return Ok(Some(gx(di, m.method_idx)));
             }
         }
         Ok(None)
@@ -1520,27 +1590,25 @@ impl Vm {
         name: &str,
         params: &[&str],
     ) -> Result<Option<GIdx>> {
-        for (di, d) in self.dexes.iter().enumerate() {
-            for def in d.class_defs() {
-                if d.type_descriptor(def.class_idx)? != class_desc {
-                    continue;
-                }
-                let cd = d.class_data(def)?;
-                for m in cd.direct_methods.iter().chain(cd.virtual_methods.iter()) {
-                    let mid = d.method(m.method_idx)?;
-                    if d.string(mid.name_idx)? != name {
-                        continue;
-                    }
-                    let p = d.proto(mid.proto_idx as u32)?;
-                    let got: Vec<String> = d
-                        .proto_params(p)?
-                        .iter()
-                        .filter_map(|t| d.type_descriptor(*t as u32).ok())
-                        .collect();
-                    if got.iter().map(String::as_str).eq(params.iter().copied()) {
-                        return Ok(Some(gx(di, m.method_idx)));
-                    }
-                }
+        let Some(&(di, def_i)) = self.defs.get(class_desc) else {
+            return Ok(None);
+        };
+        let d = &self.dexes[di];
+        let def = &d.class_defs()[def_i];
+        let cd = d.class_data_rc(def)?;
+        for m in cd.direct_methods.iter().chain(cd.virtual_methods.iter()) {
+            let mid = d.method(m.method_idx)?;
+            if d.string(mid.name_idx)? != name {
+                continue;
+            }
+            let p = d.proto(mid.proto_idx as u32)?;
+            let got: Vec<String> = d
+                .proto_params(p)?
+                .iter()
+                .filter_map(|t| d.type_descriptor(*t as u32).ok())
+                .collect();
+            if got.iter().map(String::as_str).eq(params.iter().copied()) {
+                return Ok(Some(gx(di, m.method_idx)));
             }
         }
         Ok(None)
@@ -1557,7 +1625,7 @@ impl Vm {
     ) -> Result<Option<GIdx>> {
         for _ in 0..64 {
             let Some((cg, def)) = self.def_loc_of(class_idx) else {
-                return Ok(None);
+                break;
             };
             let sup = def.superclass_idx;
             let desc = self.type_desc_of(cg)?;
@@ -1642,12 +1710,12 @@ impl Vm {
         self.def_loc_of(class_idx).map(|(_, d)| d)
     }
 
-    fn class_data_of(&self, class_idx: GIdx) -> Result<Option<ClassData>> {
+    fn class_data_of(&self, class_idx: GIdx) -> Result<Option<std::rc::Rc<ClassData>>> {
         match self.def_loc_of(class_idx) {
             Some((cg, d)) => Ok(Some(
                 self.dex_of(cg)
                     .ok_or_else(|| err("dexrt.dex.idx"))?
-                    .class_data(d)?,
+                    .class_data_rc(d)?,
             )),
             None => Ok(None),
         }
@@ -1657,6 +1725,15 @@ impl Vm {
     /// interfaces walked transitively (a class may implement a
     /// sub-interface of `sup` or reach `sup` through another interface).
     pub(crate) fn assignable(&self, sub: GIdx, sup: GIdx) -> bool {
+        if let Some(hit) = self.assignable_cache.borrow().get(&(sub, sup)) {
+            return *hit;
+        }
+        let out = self.assignable_uncached(sub, sup);
+        self.assignable_cache.borrow_mut().insert((sub, sup), out);
+        out
+    }
+
+    fn assignable_uncached(&self, sub: GIdx, sup: GIdx) -> bool {
         // Cross-dex identity is by descriptor: the same class may be a
         // different GIdx in every dex that references it.
         let sup_desc = self.type_desc_of(sup).unwrap_or_default();
@@ -2105,7 +2182,7 @@ impl Vm {
         // frame that produced it so diagnostics name the method.
         if let Some(&midx) = self.stack.last() {
             let site = self.describe_method(midx);
-            self.throw_sites.insert(h, site);
+            self.throw_sites.insert(h, site.to_string());
         }
         E::Throw(h)
     }
@@ -2209,6 +2286,23 @@ impl Vm {
     /// virtual table matching the target's (name, proto). Name and proto
     /// indexes are dex-local — compare descriptors, never raw indexes.
     fn resolve_virtual(&self, midx: GIdx, start_class: GIdx, fallback: bool) -> Rt<Loc> {
+        let key = (midx, start_class, fallback);
+        if let Some(hit) = self.resolve_cache.borrow().get(&key) {
+            return hit.ok_or_else(|| E::Vm(err("dexrt.invoke.unresolved")));
+        }
+        let out = self
+            .resolve_virtual_uncached(midx, start_class, fallback)
+            .ok();
+        self.resolve_cache.borrow_mut().insert(key, out);
+        out.ok_or_else(|| E::Vm(err("dexrt.invoke.unresolved")))
+    }
+
+    fn resolve_virtual_uncached(
+        &self,
+        midx: GIdx,
+        start_class: GIdx,
+        fallback: bool,
+    ) -> Rt<Loc> {
         let Ok((_, name, sig)) = self.method_sig(midx) else {
             return Err(E::Vm(err("dexrt.invoke.unresolved")));
         };
@@ -2219,7 +2313,7 @@ impl Vm {
                 break;
             };
             let Some(d) = self.dex_of(cg) else { break };
-            if let Ok(cd) = d.class_data(def) {
+            if let Ok(cd) = d.class_data_rc(def) {
                 for m in &cd.virtual_methods {
                     let Ok(om) = d.method(m.method_idx) else {
                         continue;
@@ -2252,6 +2346,15 @@ impl Vm {
     /// framework method through a subclass descriptor the exact-midx
     /// registration doesn't cover (e.g. `LSubAct;.setContentView`).
     fn host_named(&self, midx: GIdx) -> Rt<Option<HostCall>> {
+        if let Some(hit) = self.host_named_cache.borrow().get(&midx) {
+            return Ok(hit.clone());
+        }
+        let out = self.host_named_uncached(midx)?;
+        self.host_named_cache.borrow_mut().insert(midx, out.clone());
+        Ok(out)
+    }
+
+    fn host_named_uncached(&self, midx: GIdx) -> Rt<Option<HostCall>> {
         let Some(d) = self.dex_of(midx) else {
             return Ok(None);
         };
@@ -2384,7 +2487,7 @@ impl Vm {
                     self.stub_placeholder(midx, &ret_desc, &name, &class, args)
                 } else {
                     vm("dexrt.invoke.unresolved").map_err(|e| match e {
-                        E::Vm(v) => E::Vm(v.with_detail(self.describe_method(midx))),
+                        E::Vm(v) => E::Vm(v.with_detail(self.describe_method(midx).to_string())),
                         t => t,
                     })
                 }
@@ -2409,7 +2512,7 @@ impl Vm {
         if self.stub_trace.len() >= 32 {
             self.stub_trace.remove(0);
         }
-        self.stub_trace.push(trace);
+        self.stub_trace.push(trace.to_string());
         // Throwable.<init>(message): keep the message on the
         // host object so describe_throw can report *why*.
         if name == "<init>"
@@ -2581,7 +2684,7 @@ impl Vm {
                 descriptor: "Ljava/lang/ArithmeticException;".into(),
                 detail: desc.into(),
             });
-            v.throw_sites.insert(h, site.clone());
+            v.throw_sites.insert(h, site.to_string());
             Err(E::Throw(h))
         };
         match trap {
@@ -2619,19 +2722,35 @@ impl Vm {
     }
 
     fn exec_frame(&mut self, loc: Loc, args: Vec<V>) -> Rt<Option<V>> {
-        let code = self
-            .dex_of(loc.midx)
-            .ok_or_else(|| E::Vm(err("dexrt.dex.idx")))?
-            .code_item(loc.em.code_off)
-            .map_err(E::Vm)?
-            .ok_or_else(|| E::Vm(err("dexrt.method.no_code")))?;
+        let code_hit = self.code_cache.borrow().get(&loc.midx).cloned();
+        let code = if let Some(c) = code_hit {
+            c
+        } else {
+            let c = std::rc::Rc::new(
+                self.dex_of(loc.midx)
+                    .ok_or_else(|| E::Vm(err("dexrt.dex.idx")))?
+                    .code_item(loc.em.code_off)
+                    .map_err(E::Vm)?
+                    .ok_or_else(|| E::Vm(err("dexrt.method.no_code")))?,
+            );
+            self.code_cache.borrow_mut().insert(loc.midx, c.clone());
+            c
+        };
+        let table_hit = self.insn_cache.borrow().get(&loc.midx).cloned();
+        let table = if let Some(t) = table_hit {
+            t
+        } else {
+            let t = std::rc::Rc::new(decode_all(&code.insns).map_err(E::Vm)?);
+            self.insn_cache.borrow_mut().insert(loc.midx, t.clone());
+            t
+        };
         let nregs = code.registers_size as usize;
         let mut fr = Frame {
             regs: vec![V::I32(0); nregs],
             result: None,
-            last_call: String::new(),
+            last_call: "".into(),
             exc: None,
-            table: decode_all(&code.insns).map_err(E::Vm)?,
+            table,
             loc,
             code,
         };
@@ -2759,13 +2878,13 @@ struct Frame {
     result: Option<Option<V>>,
     /// Method the last invoke targeted — names the callee when a
     /// `move-result` reads a void result.
-    last_call: String,
+    last_call: std::rc::Rc<str>,
     /// Pending exception for `move-exception`.
     exc: Option<u32>,
     loc: Loc,
-    code: ovelo_dex::CodeItem,
+    code: std::rc::Rc<ovelo_dex::CodeItem>,
     /// Decoded instructions (payloads included), in offset order.
-    table: Vec<Insn>,
+    table: std::rc::Rc<Vec<Insn>>,
 }
 
 #[derive(Clone, Copy)]
@@ -3045,7 +3164,7 @@ impl Vm {
                     );
                 }
                 let site = self.describe_method(fr.loc.midx);
-                self.throw_sites.insert(h, site);
+                self.throw_sites.insert(h, site.to_string());
                 return Err(E::Throw(h));
             }
             // ---- branches ----
@@ -3459,7 +3578,7 @@ impl Vm {
                     d.type_descriptor(f.type_idx as u32).ok()?,
                 ))
             })?;
-            let cd = self.dex_of(cg)?.class_data(def).ok()?;
+            let cd = self.dex_of(cg)?.class_data_rc(def).ok()?;
             let mut found = None;
             for f in &cd.static_fields {
                 let Ok(fr) = self.dex_of(cg)?.field(f.field_idx) else {

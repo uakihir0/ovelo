@@ -14,7 +14,9 @@ pub use insn::{decode_all, Format, Insn};
 
 use ovelo_error::Result;
 use read::{err, mutf8, R};
-use std::collections::HashSet;
+use std::cell::RefCell;
+use std::collections::{HashMap, HashSet};
+use std::rc::Rc;
 
 const HEADER_SIZE: usize = 0x70;
 
@@ -32,6 +34,13 @@ pub struct DexFile {
     /// Map list — validated at parse, kept for diagnostics.
     #[allow(dead_code)]
     map: Vec<MapItem>,
+    /// MUTF-8 decode cache, parallel to `string_ids` — the interpreter
+    /// decodes the same name/signature strings on every dispatch, and
+    /// decode dominated the CPU profile of a real-app layout pass.
+    strings: RefCell<Vec<Option<Rc<str>>>>,
+    /// `class_data_off` → decoded `class_data_item` — vtable walks
+    /// re-parse a class's whole member list on every dispatch.
+    class_datas: RefCell<HashMap<u32, Rc<ClassData>>>,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -260,6 +269,7 @@ impl DexFile {
             })
         })?;
 
+        let string_cache = vec![None; string_ids.len()];
         Ok(Self {
             bytes,
             version,
@@ -270,6 +280,8 @@ impl DexFile {
             methods,
             class_defs,
             map,
+            strings: RefCell::new(string_cache),
+            class_datas: RefCell::new(HashMap::new()),
         })
     }
 
@@ -284,6 +296,15 @@ impl DexFile {
 
     /// String at `string_ids[idx]` (MUTF-8 decoded).
     pub fn string(&self, idx: u32) -> Result<String> {
+        Ok(self.string_rc(idx)?.to_string())
+    }
+
+    /// Interned form of [`DexFile::string`] — the decode happens once
+    /// per index, hits clone the `Rc`.
+    pub fn string_rc(&self, idx: u32) -> Result<Rc<str>> {
+        if let Some(Some(s)) = self.strings.borrow().get(idx as usize) {
+            return Ok(s.clone());
+        }
         let off = *self
             .string_ids
             .get(idx as usize)
@@ -295,7 +316,11 @@ impl DexFile {
         while end < self.bytes.len() && self.bytes[end] != 0 {
             end += 1;
         }
-        mutf8(&self.bytes[start..end])
+        let s: Rc<str> = mutf8(&self.bytes[start..end])?.into();
+        if let Some(slot) = self.strings.borrow_mut().get_mut(idx as usize) {
+            *slot = Some(s.clone());
+        }
+        Ok(s)
     }
 
     /// Type descriptor at `type_ids[idx]` (e.g. `Ljava/lang/String;`).
@@ -399,25 +424,40 @@ impl DexFile {
 
     /// Decode `class_data_item` for a class def (empty when `class_data_off==0`).
     pub fn class_data(&self, def: &ClassDef) -> Result<ClassData> {
-        if def.class_data_off == 0 {
-            return Ok(ClassData {
+        Ok((*self.class_data_rc(def)?).clone())
+    }
+
+    /// Interned form of [`DexFile::class_data`] — parsed once per
+    /// `class_data_off`, hits clone the `Rc`.
+    pub fn class_data_rc(&self, def: &ClassDef) -> Result<Rc<ClassData>> {
+        if let Some(hit) = self.class_datas.borrow().get(&def.class_data_off) {
+            return Ok(hit.clone());
+        }
+        let data = if def.class_data_off == 0 {
+            ClassData {
                 static_fields: vec![],
                 instance_fields: vec![],
                 direct_methods: vec![],
                 virtual_methods: vec![],
-            });
-        }
-        let mut r = R::at(&self.bytes, def.class_data_off as usize);
-        let ns = r.uleb128()? as usize;
-        let ni = r.uleb128()? as usize;
-        let nd = r.uleb128()? as usize;
-        let nv = r.uleb128()? as usize;
-        Ok(ClassData {
-            static_fields: read_encoded_fields(&mut r, ns)?,
-            instance_fields: read_encoded_fields(&mut r, ni)?,
-            direct_methods: read_encoded_methods(&mut r, nd)?,
-            virtual_methods: read_encoded_methods(&mut r, nv)?,
-        })
+            }
+        } else {
+            let mut r = R::at(&self.bytes, def.class_data_off as usize);
+            let ns = r.uleb128()? as usize;
+            let ni = r.uleb128()? as usize;
+            let nd = r.uleb128()? as usize;
+            let nv = r.uleb128()? as usize;
+            ClassData {
+                static_fields: read_encoded_fields(&mut r, ns)?,
+                instance_fields: read_encoded_fields(&mut r, ni)?,
+                direct_methods: read_encoded_methods(&mut r, nd)?,
+                virtual_methods: read_encoded_methods(&mut r, nv)?,
+            }
+        };
+        let rc = Rc::new(data);
+        self.class_datas
+            .borrow_mut()
+            .insert(def.class_data_off, rc.clone());
+        Ok(rc)
     }
 
     /// Initial value of a static field, from the class's
