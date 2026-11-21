@@ -2881,8 +2881,11 @@ fn group_measure_fallback(vm: &mut Vm, this: u32, pw: i32, ph: i32) {
             chh = chh.max(hh + mv);
         }
     }
-    let self_w = resolve_size(cw + pad_w, pw, true);
-    let self_h = resolve_size(chh + pad_h, ph, true);
+    let self_w = resolve_size(cw + pad_w, pw, true).max(0);
+    let self_h = resolve_size(chh + pad_h, ph, true).max(0);
+    // Negative extents (e.g. 0-height child with negative margins)
+    // must not be stored — getMeasuredHeight masks to 24 bits and a
+    // negative would read back as ~16M px.
     pseudo_set(vm, this, P_MEAS_W, V::I32(self_w));
     pseudo_set(vm, this, P_MEAS_H, V::I32(self_h));
     // AOSP ViewGroup#measureMatchParentChildren: under a non-EXACTLY
