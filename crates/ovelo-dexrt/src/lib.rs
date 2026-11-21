@@ -57,6 +57,10 @@ fn proto_sig(d: &DexFile, pidx: u32) -> Result<String> {
 /// are per-DEX; the VM merges all loaded dexes into one index space so a
 /// class defined in classes2.dex resolves from an invoke in classes.dex.
 pub(crate) type GIdx = u64;
+
+/// `(field_name, type_desc)` → every canonical field key across loaded
+/// dexes (owners differ under R8; the name+type is what identifies it).
+pub(crate) type FieldsByName = HashMap<(String, String), Vec<GIdx>>;
 /// `class_idx`/`type_idx` sentinel for descriptors absent from every dex.
 pub(crate) const GX_NONE: GIdx = u64::MAX;
 pub(crate) fn gx(di: usize, i: u32) -> GIdx {
@@ -214,7 +218,7 @@ pub struct Vm {
     /// dexes, built lazily — lets host code write fields on dex
     /// instances under every owner a reader's field ref might name
     /// (R8 renames owners like `ViewGroup$LayoutParams` arbitrarily).
-    fields_named_cache: std::cell::RefCell<Option<HashMap<(String, String), Vec<GIdx>>>>,
+    fields_named_cache: std::cell::RefCell<Option<FieldsByName>>,
     /// Deferred async work — `(runnable, on_main)`. `Thread.start`,
     /// `Executor.execute`/`submit` and `Handler.post*` enqueue here
     /// instead of running inline (AOSP is async; inline execution
@@ -493,7 +497,7 @@ impl Vm {
                 .cloned()
                 .unwrap_or_default();
         }
-        let mut m: HashMap<(String, String), Vec<GIdx>> = HashMap::new();
+        let mut m: FieldsByName = HashMap::new();
         for (di, d) in self.dexes.iter().enumerate() {
             for i in 0..d.field_ids_len() {
                 let Ok(f) = d.field(i as u32) else { continue };
