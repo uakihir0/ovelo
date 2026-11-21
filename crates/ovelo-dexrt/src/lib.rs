@@ -2602,6 +2602,10 @@ impl Vm {
             // path. Strings come back empty — a placeholder
             // would break the String builtins.
             "Ljava/lang/String;" => Ok(Some(V::Ref(self.heap.intern_str("")))),
+            // CharSequence-typed returns must carry real text — a typed
+            // placeholder stringifies as "java/lang/CharSequence@xxxx"
+            // and leaks into TextViews.
+            "Ljava/lang/CharSequence;" => Ok(Some(V::Ref(self.heap.intern_str("")))),
             r if r.starts_with('[') => {
                 // Array return: must be a real Obj::Array or
                 // array-length/a*get on the value type-checks.
