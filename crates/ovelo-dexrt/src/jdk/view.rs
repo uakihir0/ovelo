@@ -2856,13 +2856,29 @@ fn group_measure_fallback(vm: &mut Vm, this: u32, pw: i32, ph: i32) {
         measure_child(vm, this, ch, pw, 0, ph, if linear { chh } else { 0 }, true);
         let w = pint(vm, ch, P_MEAS_W) & 0x00FF_FFFF;
         let hh = pint(vm, ch, P_MEAS_H) & 0x00FF_FFFF;
+        // AOSP's mTotalLength / FrameLayout maxHeight fold in the
+        // child's vertical margins — omitting them under-reports the
+        // group's own height and starves the match_parent re-measure
+        // below of space that was never accounted for.
+        let lp_obj = match pseudo_get(vm, ch, P_LP) {
+            Some(V::Ref(l)) => l,
+            _ => 0,
+        };
+        let mv = lp_field(vm, lp_obj, "topMargin")
+            .and_then(|v| lp_px(vm, v))
+            .or_else(|| attr_find(vm, ch, "layout_marginTop").map(|v| len_v(vm, v)))
+            .unwrap_or(0)
+            + lp_field(vm, lp_obj, "bottomMargin")
+                .and_then(|v| lp_px(vm, v))
+                .or_else(|| attr_find(vm, ch, "layout_marginBottom").map(|v| len_v(vm, v)))
+                .unwrap_or(0);
         cw = cw.max(w);
         // LinearLayout stacks: consumed height accumulates; the rest
         // report their tallest child (FrameLayout semantics).
         if linear {
-            chh += hh;
+            chh += hh + mv;
         } else {
-            chh = chh.max(hh);
+            chh = chh.max(hh + mv);
         }
     }
     let self_w = resolve_size(cw + pad_w, pw, true);
