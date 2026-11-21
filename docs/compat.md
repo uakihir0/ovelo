@@ -18,10 +18,14 @@ Legend:
 
 | App | Package | Status | Current blocker / notes |
 |-----|---------|--------|-------------------------|
-| Tiny Weather Forecast Germany | `de.kaffeemitkoffein.tinyweatherforecastgermany` | 🟡 | Launcher `MainActivity` finishes on first launch and `startActivity` correctly launches `WelcomeActivity`; crashes in `onResume` on framework gaps |
-| Fossify Notes | `org.fossify.notes` | 🟡 | `SplashActivity.onCreate` → appcompat drawable path (VectorDrawableCompat) |
-| F-Droid | `org.fdroid.fdroid` | 🟡 | Hilt DI in `App.onCreate` → `SettingsManager` → preference flow init |
-| NewPipe | `org.schabi.newpipe` | 🟡 | `MainActivity` instantiates; WorkManager init runs; `onResume` menu handling gaps |
+| Fossify File Manager | `org.fossify.filemanager` | 🟡 | **Renders real data**: lifecycle completes, RecyclerView rows bind actual filenames from the seeded external root (Pictures/Download/Documents/readme.md). Row layout positions are still rough |
+| Fossify Notes | `org.fossify.notes` | 🟡 | Full lifecycle + window render; toolbar and search menu draw; note list rows bind real SQLite data (Burmese text renders with fallback fonts) |
+| Fossify Gallery | `org.fossify.gallery` | 🟡 | Lifecycle completes end-to-end (Splash → MainActivity, no crashes); window opens; RecyclerView waits for its adapter (media-query data path pending) |
+| Fossify Calendar | `org.fossify.calendar` | 🟡 | Launches, layout passes run; adapter-attach path pending |
+| Fossify Messages | `org.fossify.messages` | 🟡 | Launches, layout passes run; adapter-attach path pending |
+| Tiny Weather Forecast Germany | `de.kaffeemitkoffein.tinyweatherforecastgermany` | 🟡 | `WelcomeActivity` renders to the window (first real APK first frame) |
+| NewPipe | `org.schabi.newpipe` | 🟡 | `MainActivity` full lifecycle; WorkManager runs real SQLite queries; error screen renders (no network layer yet) |
+| F-Droid | `org.fdroid.fdroid` | 🟡 | Multi-dex + Hilt init runs without crashing; UI is Compose — no render path yet |
 
 ## Famous apps — assessment
 
