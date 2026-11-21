@@ -745,7 +745,12 @@ extern "C" fn sh_strndup(s: *const i8, n: usize) -> *mut i8 {
         return std::ptr::null_mut();
     }
     unsafe {
-        let len = strlen(s).min(n);
+        // strnlen semantics: stop at n even without a terminator —
+        // strlen could read past the caller's bounded buffer.
+        let mut len = 0;
+        while len < n && *s.add(len) != 0 {
+            len += 1;
+        }
         let p = malloc_zone_malloc(guest_zone(), len + 1) as *mut i8;
         if !p.is_null() {
             memcpy(p.cast(), s.cast(), len);
@@ -778,6 +783,17 @@ extern "C" fn sh_guest_new_aligned(size: usize, align: usize) -> *mut c_void {
     p
 }
 
+/// nothrow new variants must return null on failure, never abort.
+#[cfg(target_os = "macos")]
+extern "C" fn sh_guest_new_nothrow(size: usize) -> *mut c_void {
+    unsafe { malloc_zone_malloc(guest_zone(), size.max(1)) }
+}
+
+#[cfg(target_os = "macos")]
+extern "C" fn sh_guest_new_aligned_nothrow(size: usize, align: usize) -> *mut c_void {
+    unsafe { malloc_zone_memalign(guest_zone(), align.max(16), size.max(1)) }
+}
+
 #[cfg(target_os = "macos")]
 extern "C" fn sh_guest_delete(ptr: *mut c_void) {
     sh_free(ptr)
@@ -805,12 +821,19 @@ fn builtin_shim(name: &str) -> Option<usize> {
         #[cfg(target_os = "macos")]
         "malloc" => sh_malloc as *const () as usize,
         #[cfg(target_os = "macos")]
-        "_Znwm" | "_Znam" | "_ZnwmRKSt9nothrow_t" | "_ZnamRKSt9nothrow_t" => {
-            sh_guest_new as *const () as usize
+        "_Znwm" | "_Znam" => sh_guest_new as *const () as usize,
+        #[cfg(target_os = "macos")]
+        "_ZnwmRKSt9nothrow_t" | "_ZnamRKSt9nothrow_t" => {
+            sh_guest_new_nothrow as *const () as usize
         }
         #[cfg(target_os = "macos")]
-        "_ZnwmSt11align_val_t" | "_ZnamSt11align_val_t" | "_ZnwmSt11align_val_tRKSt9nothrow_t"
-        | "_ZnamSt11align_val_tRKSt9nothrow_t" => sh_guest_new_aligned as *const () as usize,
+        "_ZnwmSt11align_val_t" | "_ZnamSt11align_val_t" => {
+            sh_guest_new_aligned as *const () as usize
+        }
+        #[cfg(target_os = "macos")]
+        "_ZnwmSt11align_val_tRKSt9nothrow_t" | "_ZnamSt11align_val_tRKSt9nothrow_t" => {
+            sh_guest_new_aligned_nothrow as *const () as usize
+        }
         #[cfg(target_os = "macos")]
         "free" | "_ZdlPv" | "_ZdaPv" | "_ZdlPvm" | "_ZdaPvm" | "_ZdlPvRKSt9nothrow_t"
         | "_ZdaPvRKSt9nothrow_t" | "_ZdlPvSt11align_val_t" | "_ZdaPvSt11align_val_t"

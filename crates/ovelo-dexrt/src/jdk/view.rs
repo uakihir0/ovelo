@@ -1276,14 +1276,16 @@ pub(crate) fn call(
             None
         }),
         "dispatchOnPreDraw" => {
+            // AOSP contract: returns true when a listener CANCELLED the
+            // draw (any onPreDraw returned false) — not "proceed".
             let ls: Vec<u32> = vm.vto_predraw.get(&this).cloned().unwrap_or_default();
-            let mut proceed = true;
+            let mut cancel = false;
             for l in ls {
                 if let Ok(Some(V::I32(0))) = vm.call_virtual(l, "onPreDraw", &[]) {
-                    proceed = false;
+                    cancel = true;
                 }
             }
-            Some(Some(V::I32(proceed as i32)))
+            Some(Some(V::I32(cancel as i32)))
         }
         "getParent" => Some(Some(pseudo_get(vm, this, P_PARENT).unwrap_or(V::Ref(0)))),
         "getRootView" => {
