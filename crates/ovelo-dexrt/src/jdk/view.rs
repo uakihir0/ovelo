@@ -449,10 +449,53 @@ pub(crate) fn dex_view_info(vm: &Vm, h: u32) -> Option<DexViewInfo> {
     })
 }
 
+/// `ImageView.getDrawable()` — the stored image source normalized to a
+/// Drawable-typed object: guest Drawable instances pass through; bare
+/// values (Bitmap host, res-id int, Uri/path object) get wrapped in a
+/// `BitmapDrawable` that also carries them for the renderer's field walk.
+fn image_drawable(vm: &mut Vm, this: u32) -> V {
+    let raw = pseudo_get(vm, this, P_IMAGE).unwrap_or(V::Ref(0));
+    if is_null(raw) {
+        return raw;
+    }
+    let bare = match raw {
+        V::I32(_) => true,
+        V::Ref(h) => !matches!(vm.heap.get(h), Some(Obj::Instance { .. })),
+        _ => false,
+    };
+    if !bare {
+        return raw;
+    }
+    let d = host(
+        vm,
+        "Landroid/graphics/drawable/BitmapDrawable;",
+        HostState::Empty,
+    );
+    if let V::Ref(dh) = d {
+        pseudo_set(vm, dh, P_BITMAP_SLOT, raw);
+    }
+    // Normalize the stored value so repeated getDrawable() calls return
+    // the same drawable object.
+    pseudo_set(vm, this, P_IMAGE, d);
+    d
+}
+
 /// Resolve an `ImageView` image value to pixels: a Bitmap host, an
 /// object holding a bitmap in any ref field (BitmapDrawable, Glide
 /// drawables), a res-id, or a file/Uri path the runtime can open.
 fn image_pixels(vm: &Vm, v: V) -> Option<(u32, u32, std::rc::Rc<Vec<u8>>)> {
+    image_pixels_at(vm, v, 0)
+}
+
+fn image_pixels_at(
+    vm: &Vm,
+    v: V,
+    depth: u32,
+) -> Option<(u32, u32, std::rc::Rc<Vec<u8>>)> {
+    // Depth bound: drawable graphs can be cyclic.
+    if depth > 8 {
+        return None;
+    }
     match v {
         V::I32(res) if res > 0 => {
             let bytes = vm
@@ -461,10 +504,19 @@ fn image_pixels(vm: &Vm, v: V) -> Option<(u32, u32, std::rc::Rc<Vec<u8>>)> {
                 .and_then(|r| r.file_path(res as u32).and_then(|p| r.read(p)))?;
             decode_image(&bytes)
         }
-        V::Ref(_) => super::android::bitmap_pixels(vm, v).or_else(|| {
-            let path = image_source_path(vm, v)?;
-            decode_image(&std::fs::read(io::fspath(vm, &path)).ok()?)
-        }),
+        V::Ref(h) => super::android::bitmap_pixels(vm, v)
+            .or_else(|| {
+                let path = image_source_path(vm, v)?;
+                decode_image(&std::fs::read(io::fspath(vm, &path)).ok()?)
+            })
+            .or_else(|| match vm.heap.get(h) {
+                Some(Obj::Instance { fields, .. }) | Some(Obj::Host { fields, .. }) => {
+                    fields
+                        .values()
+                        .find_map(|f| image_pixels_at(vm, *f, depth + 1))
+                }
+                _ => None,
+            }),
         _ => None,
     }
 }
@@ -1128,9 +1180,7 @@ pub(crate) fn call(
             pseudo_set(vm, this, P_IMAGE, args.get(1).copied().unwrap_or(V::I32(0)));
             Some(None)
         }
-        "getDrawable" => Some(Some(
-            pseudo_get(vm, this, P_IMAGE).unwrap_or(V::Ref(0)),
-        )),
+        "getDrawable" => Some(Some(image_drawable(vm, this))),
         "setOnClickListener"
         | "setOnLongClickListener"
         | "setOnTouchListener"
