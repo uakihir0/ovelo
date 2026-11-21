@@ -32,6 +32,10 @@ extern "C" {
     fn mprotect(addr: *mut c_void, len: usize, prot: i32) -> i32;
     fn munmap(addr: *mut c_void, len: usize) -> i32;
     fn dlsym(handle: *mut c_void, symbol: *const i8) -> *mut c_void;
+    fn strlen(s: *const i8) -> usize;
+    fn memcpy(d: *mut c_void, s: *const c_void, n: usize) -> *mut c_void;
+    fn memset(d: *mut c_void, c: i32, n: usize) -> *mut c_void;
+    fn strcpy(d: *mut i8, s: *const i8) -> *mut i8;
     #[cfg(target_os = "macos")]
     fn sys_icache_invalidate(start: *mut c_void, len: usize);
 }
@@ -175,6 +179,21 @@ extern "C" fn sh_sincos(x: f64, s: *mut f64, c: *mut f64) {
         *c = x.cos();
     }
 }
+// FORTIFY `_chk` variants — guest image memory is real host memory, so the
+// libc bodies apply directly; the object-size argument is ignored.
+extern "C" fn sh_strlen_chk(s: *const i8, _slen: usize) -> usize {
+    unsafe { strlen(s) }
+}
+extern "C" fn sh_strcpy_chk(d: *mut i8, s: *const i8, _dlen: usize) -> *mut i8 {
+    unsafe { strcpy(d, s) }
+}
+extern "C" fn sh_memcpy_chk(d: *mut c_void, s: *const c_void, n: usize, _dlen: usize) -> *mut c_void {
+    unsafe { memcpy(d, s, n) }
+}
+extern "C" fn sh_memset_chk(d: *mut c_void, c: i32, n: usize, _dlen: usize) -> *mut c_void {
+    unsafe { memset(d, c, n) }
+}
+
 extern "C" fn sh_atoi(s: *const i8) -> i32 {
     unsafe {
         let mut n = 0i32;
@@ -196,6 +215,10 @@ fn builtin_shim(name: &str) -> Option<usize> {
         "atoi" | "strtol" => sh_atoi as *const () as usize,
         "sincosf" => sh_sincosf as *const () as usize,
         "sincos" => sh_sincos as *const () as usize,
+        "__strlen_chk" => sh_strlen_chk as *const () as usize,
+        "__strcpy_chk" => sh_strcpy_chk as *const () as usize,
+        "__memcpy_chk" => sh_memcpy_chk as *const () as usize,
+        "__memset_chk" => sh_memset_chk as *const () as usize,
         "__emutls_get_address" => 0, // TLS unimplemented — signal caller
         _ => return None,
     })
