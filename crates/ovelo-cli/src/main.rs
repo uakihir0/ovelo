@@ -1080,6 +1080,14 @@ fn run_app(store: &InstallStore, package: &str) -> Result<(), OveloError> {
         // VM's dex view tree — materialize it into drawable host views.
         if let Some((vm, this)) = &mut guest {
             dex_frame = dex_frame.wrapping_add(1);
+            // Drain queued background work (`Thread.start`/
+            // `Executor.execute`/`Handler.post*`) on the same cadence
+            // as the layout pass — media scans, DB loads and adapter
+            // fills all live on this queue after the lifecycle drains
+            // end. Without it they stall once the window opens.
+            if dex_frame.is_multiple_of(30) {
+                vm.drain_runnables(64);
+            }
             // Run adapter containers' layout pass OUTSIDE the ui borrow —
             // guest code re-enters bridged view methods.
             ovelo_framework::drive_dex_layout_pass(vm, *this, dex_frame);
