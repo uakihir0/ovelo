@@ -3214,6 +3214,15 @@ fn looper_call(vm: &mut Vm, name: &str, _args: &[V]) -> Rt<Option<Option<V>>> {
 // android.graphics — Rect/Point/Color/Bitmap stubs
 
 fn graphics_call(vm: &mut Vm, class: &str, name: &str, args: &[V]) -> Rt<Option<Option<V>>> {
+    // Canvas/Paint fall through to jdk::gfx's recording model — the
+    // generic set*/draw* stubs below would silently eat every call.
+    if matches!(
+        class,
+        "Landroid/graphics/Canvas;" | "Landroid/graphics/Paint;"
+            | "Landroid/text/TextPaint;"
+    ) {
+        return Ok(None);
+    }
     Ok(match (class, name) {
         ("Landroid/graphics/Color;", "argb") | ("Landroid/graphics/Color;", "rgb") => {
             let (a, r, g, b) = if name == "argb" && args.len() >= 4 {
