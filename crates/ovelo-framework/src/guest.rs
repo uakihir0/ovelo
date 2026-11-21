@@ -814,10 +814,12 @@ pub fn drive_dex_layout_pass(vm: &mut Vm, activity: u32, frame: u32) {
         // get stored. Containers that size themselves in layout
         // (RecyclerView's `fill` reads `OrientationHelper` totals)
         // see a 0×0 rect and lay out nothing otherwise.
-        // Only drive where no frame exists yet: once a parent's own
-        // dex `onLayout` has placed the child, re-driving `layout`
-        // with a full-screen rect would overwrite the real bounds.
-        if info.is_group && (depth == 0 || info.frame.is_none()) {
+        // Drive every group each pass — adapters that fill after the
+        // first traversal (host `requestLayout` is a no-op here) must
+        // re-measure/re-layout or lists stay empty. Keep the view's
+        // existing rect when it has one: re-driving `layout` with a
+        // full-screen rect would overwrite parent-computed bounds.
+        if info.is_group {
             let (w, hgt) = info
                 .frame
                 .map(|f| (f.2 - f.0, f.3 - f.1))
