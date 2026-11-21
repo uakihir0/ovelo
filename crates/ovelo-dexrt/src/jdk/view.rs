@@ -1009,6 +1009,11 @@ pub(crate) fn call(
         | "addFocusables"
         | "addChildrenForAccessibility" => {
             if let Some(&child @ V::Ref(_)) = args.get(1) {
+                if std::env::var_os("OVELO_VIEWDBG").is_some() {
+                    if let V::Ref(ch) = child {
+                        eprintln!("[viewdbg] {name} h{this} <- h{ch} {}", vm.dbg_class_of(ch));
+                    }
+                }
                 // Positional overloads (addView(v,i), attachViewToParent
                 // (v,i,lp), addViewInLayout(v,i,lp)) carry a child index;
                 // addView(v,w,h)'s ints are dimensions, not a position.
@@ -1264,6 +1269,14 @@ pub(crate) fn call(
         | "isInEditMode"
         | "isHardwareAccelerated" => Some(Some(V::I32(0))),
         "getVisibility0" => Some(Some(V::I32(0))),
+        // Nullable view getters must hand back a real null, not a
+        // stub: androidx calls getFocusedChild() during
+        // onLayoutChildren's anchor pass and immediately reads
+        // getLayoutParams().mViewHolder on whatever comes back — a
+        // fresh host View has neither and NPEs inside dex code.
+        "getFocusedChild" | "getFocus" | "findFocus" | "getFocused" | "getHoveredChild" => {
+            Some(Some(V::Ref(0)))
+        }
         "getResources" => Some(Some(host(
             vm,
             "Landroid/content/res/Resources;",
@@ -2996,6 +3009,12 @@ pub(crate) fn attach_at(
         let mut cur = parent;
         for _ in 0..64 {
             if cur == ch {
+                if std::env::var_os("OVELO_VIEWDBG").is_some() {
+                    eprintln!(
+                        "[viewdbg] attach REFUSED h{ch} -> parent h{parent} (cycle) class={}",
+                        vm.dbg_class_of(ch)
+                    );
+                }
                 return;
             }
             match pseudo_get(vm, cur, P_PARENT) {
@@ -3005,7 +3024,18 @@ pub(crate) fn attach_at(
         }
     }
     if let Some(a) = children_arr(vm, parent) {
+        // Re-attaching the same child (dex scrap/attach flows do this)
+        // must move it, not duplicate it: a later detach removes one
+        // copy and clears its parent, leaving a parent-less duplicate
+        // the dex ChildHelper still hands to the layout manager.
+        let old = match vm.heap.get(a) {
+            Some(Obj::Array { data, .. }) => data.iter().position(|&c| value_eq(vm, c, child)),
+            _ => None,
+        };
         if let Some(Obj::Array { data, .. }) = vm.heap.get_mut(a) {
+            if let Some(old) = old {
+                data.remove(old);
+            }
             match idx {
                 Some(i) if i <= data.len() => data.insert(i, child),
                 _ => data.push(child),
