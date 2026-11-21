@@ -3734,7 +3734,7 @@ impl Vm {
                                     s.push_str(&format!("[{}]", els.join(",")));
                                 }
                                 if let Some(Obj::Str(t)) = self.heap.get(*h) {
-                                    s.push_str(&format!("=\"{}\"", &t[..t.len().min(80)]));
+                                    s.push_str(&format!("=\"{}\"", t.chars().take(80).collect::<String>()));
                                 }
                                 s
                             }
@@ -3770,7 +3770,7 @@ impl Vm {
                         let thisfmt = match this_arg {
                             Some(V::Ref(h)) => match self.heap.get(h) {
                                 Some(Obj::Str(t)) => {
-                                    format!("h{h}:String=\"{}\"", &t[..t.len().min(80)])
+                                    format!("h{h}:String=\"{}\"", t.chars().take(80).collect::<String>())
                                 }
                                 _ => format!("{:?}", this_arg.unwrap()),
                             },
@@ -3779,7 +3779,7 @@ impl Vm {
                         let resfmt = match res {
                             Some(V::Ref(h)) if h != 0 => match self.heap.get(h) {
                                 Some(Obj::Str(t)) => {
-                                    format!("Some(h{h}:String=\"{}\")", &t[..t.len().min(80)])
+                                    format!("Some(h{h}:String=\"{}\")", t.chars().take(80).collect::<String>())
                                 }
                                 _ => format!("{res:?}"),
                             },
