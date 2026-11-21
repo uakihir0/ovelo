@@ -595,21 +595,24 @@ fn paint_call(vm: &mut Vm, name: &str, _sig: &str, args: &[V]) -> Rt<Option<Opti
             } else {
                 "Landroid/graphics/Paint$FontMetricsInt;"
             };
-            // With a metrics argument: fill it and return the ascent as
-            // the API specifies (float for FontMetrics, int for the Int
-            // variant). Without one (getFontMetrics()/
-            // getFontMetricsInt()): a fresh metrics object for the
-            // former, a bare int for the latter.
+            // The signature — not the arg value — picks the overload: a
+            // null metrics arg can arrive as V::I32(0), which looks
+            // identical to "no argument". (FontMetrics)F fills the
+            // object and returns -ascent; ()L...FontMetrics; creates
+            // and returns a fresh filled object.
+            let has_arg = _sig.contains("FontMetrics");
             let fh = match arg(args, 1) {
-                V::Ref(fh) if fh != 0 => Some(fh),
+                V::Ref(fh) if fh != 0 && has_arg => Some(fh),
                 _ => None,
             };
-            let fh = match (fh, name) {
-                (Some(fh), _) => Some(fh),
-                (None, "getFontMetrics") => match host(vm, desc, HostState::Empty) {
-                    V::Ref(fh) => Some(fh),
-                    _ => None,
-                },
+            let fh = match (fh, name, has_arg) {
+                (Some(fh), _, _) => Some(fh),
+                (None, "getFontMetrics", false) => {
+                    match host(vm, desc, HostState::Empty) {
+                        V::Ref(fh) => Some(fh),
+                        _ => None,
+                    }
+                }
                 _ => None,
             };
             if let Some(fh) = fh {
@@ -637,7 +640,7 @@ fn paint_call(vm: &mut Vm, name: &str, _sig: &str, args: &[V]) -> Rt<Option<Opti
                     }
                 }
             }
-            if matches!(arg(args, 1), V::Ref(_)) {
+            if has_arg {
                 // metrics-arg overloads: recommended spacing above the
                 // baseline (-ascent) in the declared return type.
                 if name == "getFontMetrics" {
