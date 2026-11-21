@@ -337,7 +337,9 @@ fn update_dex_view(g: &mut GuestView, info: &ovelo_dexrt::DexViewInfo) {
         }
         let img_changed = match (&v.image, &info.image) {
             (None, None) => false,
-            (Some((w, h, _)), Some((w2, h2, _))) => w != w2 || h != h2,
+            (Some((w, h, px)), Some((w2, h2, px2))) => {
+                w != w2 || h != h2 || !std::rc::Rc::ptr_eq(px, px2)
+            }
             _ => true,
         };
         if img_changed {
