@@ -505,20 +505,44 @@ pub fn load_so(name: &str, elf: &[u8]) -> Result<NativeLib> {
 
     // Apply each segment's declared permissions — writable data and
     // bss must stay writable after relocation, executable pages go RX.
+    // Two segments can share one 16 KiB OS page at the boundary, so
+    // permissions are merged per page first: a boundary page touched
+    // by both an RX and an RW segment keeps both bits.
+    let n_pages = span / PAGE;
+    let mut page_prot = vec![0i32; n_pages];
     for &(va, memsz, flags) in &segs {
         if memsz == 0 {
             continue;
         }
-        let base = (bias + va) & !(PAGE - 1);
-        let end = (bias + va + memsz + PAGE - 1) & !(PAGE - 1);
         let prot = (if flags & 4 != 0 { PROT_READ } else { 0 })
             | (if flags & 2 != 0 { PROT_WRITE } else { 0 })
             | (if flags & 1 != 0 { PROT_EXEC } else { 0 });
-        if unsafe { mprotect(base as *mut c_void, end - base, prot) } != 0 {
+        let first = ((va - lo as usize) & !(PAGE - 1)) / PAGE;
+        let last = ((va - lo as usize + memsz + PAGE - 1) & !(PAGE - 1)) / PAGE;
+        for p in page_prot.iter_mut().take(last.min(n_pages)).skip(first) {
+            *p |= prot;
+        }
+    }
+    let mut start = 0;
+    while start < n_pages {
+        let mut end = start + 1;
+        while end < n_pages && page_prot[end] == page_prot[start] {
+            end += 1;
+        }
+        if page_prot[start] != 0
+            && unsafe {
+                mprotect(
+                    (map as usize + start * PAGE) as *mut c_void,
+                    (end - start) * PAGE,
+                    page_prot[start],
+                )
+            } != 0
+        {
             let e = std::io::Error::last_os_error();
             unsafe { munmap(map, span) };
             return Err(errd("elf.mprotect", format!("{e}")));
         }
+        start = end;
     }
     unsafe { icache_flush(map.cast(), span) };
 
