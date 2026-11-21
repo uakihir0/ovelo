@@ -228,6 +228,30 @@ impl Surface {
         Ok(())
     }
 
+    /// Blit already-premultiplied RGBA8 pixels (`src_w`×`src_h`) at
+    /// (dx,dy) — BufferQueue surfaces and other internally-composited
+    /// layers carry premultiplied pixels; running them through `blit`
+    /// would apply alpha twice.
+    pub fn blit_premultiplied(
+        &mut self,
+        dx: i32,
+        dy: i32,
+        src_w: usize,
+        src_h: usize,
+        src: &[u8],
+    ) -> Result<()> {
+        if src.len() != src_w * src_h * 4 {
+            return Err(err("ui.blit.size"));
+        }
+        for sy in 0..src_h {
+            for sx in 0..src_w {
+                let i = (sy * src_w + sx) * 4;
+                self.src_over(dx + sx as i32, dy + sy as i32, rgba(&src[i..i + 4]));
+            }
+        }
+        Ok(())
+    }
+
     /// Nearest-neighbor scaled blit: `src` (RGBA8, `src_w`×`src_h`) fills
     /// the `dw`×`dh` rect at `(dx,dy)`, clipped to the clip stack.
     #[allow(clippy::too_many_arguments)]
@@ -293,6 +317,17 @@ impl Surface {
             b: self.px[i + 2],
             a: self.px[i + 3],
         }
+    }
+}
+
+/// Raw RGBA8 → `Color` with no alpha conversion (input already
+/// premultiplied).
+fn rgba(px: &[u8]) -> Color {
+    Color {
+        r: px[0],
+        g: px[1],
+        b: px[2],
+        a: px[3],
     }
 }
 

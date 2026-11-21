@@ -140,7 +140,9 @@ impl Presenter {
                     .queue()
                     .read(id)
                     .ok_or_else(|| err("host.frame.missing"))?;
-                out.blit(l.x, l.y, px.width(), px.height(), px.pixels())?;
+                // Queue pixels are already premultiplied — blit would
+                // apply alpha a second time.
+                out.blit_premultiplied(l.x, l.y, px.width(), px.height(), px.pixels())?;
             }
             win.queue_mut().release(id)?;
             any = true;
