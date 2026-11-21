@@ -9,9 +9,16 @@
 
 mod aot;
 mod jdk;
+mod jni;
+mod native;
+pub mod res;
+mod res_attrs;
 mod value;
 
 pub use aot::Aot;
+pub use jdk::view::{fire_global_layout, DexViewInfo, P_TCOLOR, P_TEXT, P_TSIZE};
+pub use value::{CanvasOp, PaintState};
+pub use jdk::{pseudo_get, pseudo_set};
 pub use value::{Heap, HostState, Obj, V};
 
 use aot::{AotFn, TRAP_DIV_ZERO, TRAP_REM_ZERO};
@@ -24,8 +31,7 @@ fn err(cause: &str) -> OveloError {
     OveloError::new(ErrorCategory::DexUnsupported, Phase::DexExec, cause)
 }
 fn errd(cause: &str, detail: String) -> OveloError {
-    OveloError::new(ErrorCategory::DexUnsupported, Phase::DexExec, cause)
-        .with_detail(detail)
+    OveloError::new(ErrorCategory::DexUnsupported, Phase::DexExec, cause).with_detail(detail)
 }
 
 /// Internal control flow: a guest `throw` carries a heap handle, VM faults
@@ -39,49 +45,93 @@ fn vm<T>(c: &'static str) -> Rt<T> {
     Err(E::Vm(err(c)))
 }
 
+/// `(params)ret` descriptor for a proto index local to `d`.
+fn proto_sig(d: &DexFile, pidx: u32) -> Result<String> {
+    let p = d.proto(pidx)?;
+    let mut sig = String::from("(");
+    for t in d.proto_params(p)? {
+        sig.push_str(&d.type_descriptor(t as u32)?);
+    }
+    sig.push(')');
+    sig.push_str(&d.type_descriptor(p.return_type_idx)?);
+    Ok(sig)
+}
+
+/// Global index: `(dex_i << 32) | local_idx`. Type/method/field indexes
+/// are per-DEX; the VM merges all loaded dexes into one index space so a
+/// class defined in classes2.dex resolves from an invoke in classes.dex.
+pub(crate) type GIdx = u64;
+
+/// `(field_name, type_desc)` → `(owner_desc, canon key)` for every
+/// field across loaded dexes (owners differ under R8; the name+type is
+/// what identifies the logical field).
+pub(crate) type FieldsByName = HashMap<(String, String), Vec<(String, GIdx)>>;
+/// `class_idx`/`type_idx` sentinel for descriptors absent from every dex.
+pub(crate) const GX_NONE: GIdx = u64::MAX;
+pub(crate) fn gx(di: usize, i: u32) -> GIdx {
+    ((di as u64) << 32) | i as u64
+}
+pub(crate) fn gd(g: GIdx) -> usize {
+    (g >> 32) as usize
+}
+pub(crate) fn gl(g: GIdx) -> u32 {
+    g as u32
+}
+
 /// Runtime state of one loaded class.
 #[derive(Default)]
 struct ClassRt {
-    /// Class statics by field-id index — enum constants live here.
-    statics: HashMap<u32, V>,
+    /// Class statics by global field index — enum constants live here.
+    statics: HashMap<GIdx, V>,
     /// 0 = pending, 1 = running (reentrancy guard), 2 = done.
     clinit: u8,
 }
 
 /// A resolved method: where it is declared plus its code.
-#[derive(Clone)]
+#[derive(Clone, Copy)]
 struct Loc {
-    /// Owning class (`type_idx`) the method was found on.
-    class_idx: u32,
-    /// The method table entry.
+    /// Owning class (global `type_idx`) the method was found on.
+    class_idx: GIdx,
+    /// The method's global `method_idx`.
+    midx: GIdx,
+    /// The method table entry (`method_idx` inside stays dex-local).
     em: EncodedMethod,
 }
 
 /// A host-implemented framework method. Registered per `method_idx`;
 /// `call_builtin` consults this table before the builtin stubs.
-/// Single-threaded: the shared RefCell lets a callback path (e.g. a
-/// deferred onClick) re-enter the same table entry safely.
-pub type HostCall = std::rc::Rc<
-    std::cell::RefCell<dyn FnMut(&mut Vm, &[V]) -> Result<Option<V>>>,
->;
+/// Single-threaded. A host callback may itself dispatch guest code that
+/// re-enters the *same* registered callback (e.g. an initializer's
+/// `create` calling `initializeComponent`) — the dispatcher answers a
+/// `dexrt.host.reentrant` error there instead of panicking on the
+/// RefCell's second mutable borrow.
+pub type HostCall = std::rc::Rc<std::cell::RefCell<dyn FnMut(&mut Vm, &[V]) -> Result<Option<V>>>>;
 
-/// DEX interpreter over a single [`DexFile`].
+/// DEX interpreter over one or more [`DexFile`]s (multi-dex apps).
 pub struct Vm {
-    dex: DexFile,
+    dexes: Vec<DexFile>,
     /// Object heap (public for tests / host plumbing).
     pub heap: Heap,
-    classes: HashMap<u32, ClassRt>,
-    /// method_idx → defining (class_idx, EncodedMethod).
-    defined: HashMap<u32, (u32, EncodedMethod)>,
-    /// class type_idx → class_def index.
-    defs: HashMap<u32, usize>,
-    /// method_idx → host implementation (framework bridge).
-    hosts: HashMap<u32, HostCall>,
-    /// (name, sig) → candidate host fns with the class idx they were
-    /// registered on; used when the DEX references a framework method
-    /// through a subclass descriptor. Only a reference whose class is
-    /// the owner or a subclass of it may resolve — see `host_named`.
-    hosts_named: HashMap<(String, String), Vec<(u32, HostCall)>>,
+    classes: HashMap<GIdx, ClassRt>,
+    /// Global method_idx → defining (global class_idx, EncodedMethod).
+    defined: HashMap<GIdx, (GIdx, EncodedMethod)>,
+    /// Class descriptor → (dex_i, class_def index) — a type_idx in dex N
+    /// may name a class defined in dex M, so defs key off descriptors.
+    defs: HashMap<String, (usize, usize)>,
+    /// `(owner desc, name, sig)` → global method_idx of the definition —
+    /// cross-dex invoke resolution (a ref in dex N, def in dex M).
+    methods_by_sig: HashMap<(String, String, String), GIdx>,
+    /// `(owner desc, name, type desc)` → first-seen global field_idx —
+    /// canonical key for instance/static field storage across dexes.
+    fields_by_sig: HashMap<(String, String, String), GIdx>,
+    /// Global method_idx → host implementation (framework bridge).
+    hosts: HashMap<GIdx, HostCall>,
+    /// (name, sig) → candidate host fns with the global class idx they
+    /// were registered on; used when the DEX references a framework
+    /// method through a subclass descriptor. Only a reference whose
+    /// class is the owner or a subclass of it may resolve — see
+    /// `host_named`.
+    hosts_named: HashMap<(String, String), Vec<(GIdx, HostCall)>>,
     /// AOT-compiled method bodies (`None` until `enable_aot`).
     aot: Option<Aot>,
     /// Package name of the guest app, set by the launcher so
@@ -90,11 +140,14 @@ pub struct Vm {
     /// Guest-visible filesystem root: `java.io.File` paths resolve
     /// under this directory, never onto the host fs directly.
     pub guest_root: std::path::PathBuf,
+    /// Root `/storage/emulated/0` (and its `/sdcard` aliases) maps to —
+    /// shared external storage, distinct from the app-private guest_root.
+    pub external_root: std::path::PathBuf,
     /// Live interpreter call depth — unbounded guest or builtin
     /// recursion would overflow the native stack; cap it instead.
     depth: u32,
     /// Method refs of live frames, for recursion diagnosis.
-    stack: Vec<u32>,
+    stack: Vec<GIdx>,
     /// handle → guest method that `athrow`ed it (for uncaught reports).
     throw_sites: HashMap<u32, String>,
     /// Last framework stub calls (callee only), for uncaught reports —
@@ -103,52 +156,649 @@ pub struct Vm {
     /// Interned main-thread object — `Thread.currentThread()` and
     /// `Looper.getThread()` must compare equal (androidx checks `==`).
     pub(crate) main_thread_h: u32,
+    /// Thread handle `Thread.currentThread()` returns right now — the
+    /// worker handle while an executor job runs, main otherwise.
+    pub(crate) cur_thread: u32,
+    /// The background thread object (see `worker_thread`).
+    pub(crate) worker_thread_h: u32,
+    /// Interned main `Looper` — `Looper.myLooper()` and
+    /// `Handler.getLooper()` must return the same handle.
+    pub(crate) main_looper_h: u32,
+    /// Interned `Application` — `getApplication[Context]` must return a
+    /// real Application-typed object (callers `check-cast` it).
+    pub(crate) app_h: u32,
     /// sun.misc.Unsafe model: offset tokens minted by `objectFieldOffset`,
     /// `(object handle, offset)` -> stored value (CAS/volatile get/put).
     pub(crate) unsafe_offsets: HashMap<(u32, i64), V>,
     pub(crate) unsafe_next_offset: i64,
+    /// `OVELO_TRACE_FIELD` — debug-only iget/iput tracing for a field
+    /// name substring (e.g. `readyAsyncCalls`).
+    trace_field: Option<String>,
+    /// `OVELO_TRACE_THROW` — log every thrown/caught throwable with the
+    /// throwing method and pc (debug aid for swallowed guest errors).
+    trace_throw: bool,
+    /// `OVELO_TRACE_CALL` — log invoke sites whose resolved method name
+    /// contains this substring (debug aid).
+    trace_call: Option<String>,
+    /// `OVELO_TRACE_FROM` — with `OVELO_TRACE_CALL`, additionally require
+    /// the *caller* method name to contain this substring.
+    trace_from: Option<String>,
+    /// Roots of every inflated view tree — `findViewById` falls back to
+    /// them when the receiver's own subtree misses (appcompat decor is
+    /// built dex-side, outside our synthetic window decor).
+    pub(crate) view_roots: Vec<u32>,
+    /// `SharedPreferences` are file-backed: every `getSharedPreferences`
+    /// call for the same file must see the same map, so intern the host
+    /// objects per file name.
+    pub(crate) prefs_files: HashMap<String, u32>,
+    /// Activity currently being dispatched — owns any content/decor
+    /// roots attached while it runs, so a second activity's trees
+    /// never leak into the first's lookups.
+    pub(crate) cur_activity: u32,
+    /// The view attached under `android.R.id.content` per activity —
+    /// the app's real content root no matter which path installed it.
+    pub(crate) content_views: HashMap<u32, u32>,
+    /// Root of the tree that owns each activity's content frame —
+    /// appcompat's real decor when it built one dex-side.
+    pub(crate) decor_roots: HashMap<u32, u32>,
+    /// Installed-APK resource index for `LayoutInflater.inflate` — `None`
+    /// degrades inflation to bare placeholder views.
+    pub apk_res: Option<res::ApkResources>,
+    /// Guest SQLite connections by database name
+    /// (`android.database.sqlite` — see `jdk::db`).
+    pub(crate) dbs: HashMap<String, std::rc::Rc<std::cell::RefCell<jdk::db::Db>>>,
+    /// Database name -> its `SQLiteDatabase` object handle.
+    pub(crate) db_handles: HashMap<String, u32>,
+    /// Object handle (db or statement) -> database name it talks to.
+    pub(crate) obj_db: HashMap<u32, String>,
+    /// The Activity/theme res id (`android:theme` from the manifest) that
+    /// theme-scoped `obtainStyledAttributes` resolves attributes against.
+    pub theme_id: u32,
+    /// Total interpreter steps across all `run()` calls — `OVELO_STALLDBG`
+    /// uses it to distinguish a still-running guest from a host-side loop.
+    pub total_steps: u64,
+    /// `(owner_descriptor, field_name)` → global field idx — memoized
+    /// because `DexFile::field_index_of` re-decodes every field's
+    /// strings and updater-style guests (`AtomicReferenceFieldUpdater`,
+    /// `Unsafe`) issue thousands of lookups.
+    field_idx_cache: std::cell::RefCell<HashMap<(String, String), Option<GIdx>>>,
+    /// class descriptor → global type_idx. `type_index_of` walks every
+    /// dex's whole type table per call (each entry is a MUTF-8 decode);
+    /// assignability checks and `canon` issue it per dispatch, so
+    /// misses are cached too.
+    type_idx_cache: std::cell::RefCell<HashMap<String, Option<GIdx>>>,
+    /// `(field_name, field_type)` → canonical field GIdxs across all
+    /// dexes, built lazily — lets host code write fields on dex
+    /// instances under every owner a reader's field ref might name
+    /// (R8 renames owners like `ViewGroup$LayoutParams` arbitrarily).
+    fields_named_cache: std::cell::RefCell<Option<FieldsByName>>,
+    /// `midx` → `(class, name, proto_sig)` — decoding the proto string
+    /// re-reads half the dex tables per call; layout/measure passes
+    /// issue it tens of thousands of times on the same methods.
+    method_sig_cache: std::cell::RefCell<HashMap<GIdx, (String, String, String)>>,
+    /// `midx` → parsed `code_item` — `exec_frame` re-parsed registers,
+    /// tries and handlers on every single call of a method.
+    code_cache: std::cell::RefCell<HashMap<GIdx, std::rc::Rc<ovelo_dex::CodeItem>>>,
+    /// `midx` → decoded instruction table — `exec_frame` re-decoded
+    /// every instruction of a method on every call into it.
+    insn_cache: std::cell::RefCell<HashMap<GIdx, std::rc::Rc<Vec<Insn>>>>,
+    /// `midx` → display name `Lcls;.name(sig)ret` — `last_call` was
+    /// formatting one per invoke.
+    method_desc_cache: std::cell::RefCell<HashMap<GIdx, std::rc::Rc<str>>>,
+    /// `(referenced midx, receiver class, defined-fallback?)` → resolved
+    /// dispatch `Loc` — `resolve_virtual` re-walked the superclass chain
+    /// decoding every candidate's name+proto on every invoke.
+    resolve_cache: std::cell::RefCell<HashMap<(GIdx, GIdx, bool), Option<Loc>>>,
+    /// `field GIdx` → canonical `field GIdx` — `canon_field` rebuilt the
+    /// `(owner,name,type)` sig strings for every iget/iput.
+    canon_field_cache: std::cell::RefCell<HashMap<GIdx, GIdx>>,
+    /// `midx` → registered host impl — `host_named` decoded the ref's
+    /// name+proto and re-ran assignability on every unresolved invoke.
+    host_named_cache: std::cell::RefCell<HashMap<GIdx, Option<HostCall>>>,
+    /// `(class GIdx, method name, arg slots)` → method GIdx — host→guest
+    /// `call_virtual` (measure/layout/onViewAdded per node per pass)
+    /// re-walked the superclass chain per call.
+    named_chain_cache: std::cell::RefCell<HashMap<(GIdx, String, usize), Option<GIdx>>>,
+    /// `(sub GIdx, sup GIdx)` → is-assignable — the chain+interface walk
+    /// ran per check-cast / host registration probe.
+    assignable_cache: std::cell::RefCell<HashMap<(GIdx, GIdx), bool>>,
+    /// Bumped by every `pseudo_set` — lets the host render/layout
+    /// passes skip rebuilding the dex-view tree when nothing changed.
+    pub view_gen: u64,
+    /// `view_gen` value the last driven layout walk ran against —
+    /// `u64::MAX` until the first pass so it always runs once.
+    pub layout_gen_done: std::cell::Cell<u64>,
+    /// Heap size (slots) that triggers the next GC at a quiescent
+    /// point; doubles after each collection.
+    pub gc_mark: usize,
+    /// Deferred async work — `(runnable, on_main)`. `Thread.start`,
+    /// `Executor.execute`/`submit` and `Handler.post*` enqueue here
+    /// instead of running inline (AOSP is async; inline execution
+    /// deadlocks on self-rescheduling executors). Drained at the
+    /// outermost `call_virtual` boundary.
+    pub pending_runnables: std::collections::VecDeque<(u32, bool)>,
+    /// ViewTreeObserver handle -> registered onGlobalLayout listeners.
+    pub(crate) vto_listeners: HashMap<u32, Vec<u32>>,
+    /// Reentrancy guard for `drain_runnables`.
+    pub(crate) draining: bool,
+    /// Nesting depth of inline drains issued from `park` — bounds the
+    /// recursion when a task inside such a drain parks again.
+    pub(crate) park_depth: u32,
+    /// Runnables that re-parked inside a drain — when the queue holds
+    /// only these, draining them again just makes two waiting workers
+    /// hand the slot back and forth until the instruction budget
+    /// kills one (and its task is lost). Cleared whenever fresh work
+    /// is enqueued — it may target those workers' internal queues.
+    reparked: std::collections::HashSet<u32>,
+    /// Consecutive `park_drain` calls that drained only re-parked
+    /// workers — bounded so mutual waiters yield to the outer drain
+    /// (which re-runs them with a fresh budget) instead of spinning
+    /// inside one `run()` until the budget kills the task.
+    park_spins: u32,
+    /// Consecutive park→requeue cycles per runnable handle — bounds
+    /// the spin where a worker parks on a queue nothing can ever feed
+    /// (e.g. `ReferenceQueue.remove` under our immediate-return stub):
+    /// past the cap the requeue is dropped instead of re-running
+    /// `run()` from the top each drain.
+    repark_counts: HashMap<u32, u32>,
+    /// Runnables that parked out of the live queue (dropped after the
+    /// repark bound). Re-armed when fresh work is posted or `unpark`
+    /// fires — either may feed a dropped worker's internal queue.
+    parked_runnables: HashMap<u32, bool>,
+    /// Activity a guest `startActivity` asked to launch — (class
+    /// descriptor, the Intent the caller passed). The runner drains
+    /// it into a real second-Activity dispatch.
+    pub pending_activity: Option<(String, V)>,
+    /// canonical class_idx → `java.lang.Class` mirror handle — Class
+    /// objects are singletons (`Foo.class == x.getClass()`).
+    class_mirrors: HashMap<GIdx, u32>,
+    /// MediaStore `_id` per `_data` path — ids persist for the
+    /// runtime's life so adding/removing other files never reshuffles
+    /// a file's id (real MediaStore rowid semantics).
+    pub media_ids: HashMap<String, i64>,
+    /// next MediaStore `_id` to hand out (see `media_ids`).
+    pub next_media_id: i64,
+    /// Native `.so` images loaded through `System.loadLibrary` — the
+    /// real JNI path for games (libGDX/Box2D) and other native libs.
+    pub natives: Vec<native::NativeLib>,
+    /// JNI jmethodID table — id = index+1 → dex method GIdx.
+    pub jni_mids: Vec<GIdx>,
+    /// JNI jfieldID table — id = index+1 → field GIdx.
+    pub jni_fids: Vec<GIdx>,
+    /// Exception a native call left pending (Throw/ThrowNew); 0 = none,
+    /// `u32::MAX` = thrown without an object handle.
+    pub jni_pending_exc: u32,
+    /// Permission names currently granted to the guest package —
+    /// seeded from the manifest's normal-level `<uses-permission>`
+    /// entries and grown by `requestPermissions` (user grants all).
+    pub granted_permissions: std::collections::HashSet<String>,
+}
+
+/// Permissions Android grants automatically at install time
+/// (`PROTECTION_NORMAL`). Dangerous/signature permissions start denied
+/// even when declared — they need `requestPermissions` or a grant the
+/// runtime cannot infer.
+pub const NORMAL_PERMISSIONS: &[&str] = &[
+    "android.permission.INTERNET",
+    "android.permission.ACCESS_NETWORK_STATE",
+    "android.permission.ACCESS_WIFI_STATE",
+    "android.permission.CHANGE_NETWORK_STATE",
+    "android.permission.CHANGE_WIFI_STATE",
+    "android.permission.CHANGE_WIFI_MULTICAST_STATE",
+    "android.permission.VIBRATE",
+    "android.permission.WAKE_LOCK",
+    "android.permission.RECEIVE_BOOT_COMPLETED",
+    "android.permission.FOREGROUND_SERVICE",
+    "android.permission.FOREGROUND_SERVICE_DATA_SYNC",
+    "android.permission.FOREGROUND_SERVICE_SPECIAL_USE",
+    "android.permission.SCHEDULE_EXACT_ALARM",
+    "android.permission.USE_EXACT_ALARM",
+    "android.permission.REORDER_TASKS",
+    "android.permission.SET_WALLPAPER",
+    "android.permission.SET_WALLPAPER_HINTS",
+    "android.permission.EXPAND_STATUS_BAR",
+    "android.permission.MODIFY_AUDIO_SETTINGS",
+    "android.permission.NFC",
+    "android.permission.BLUETOOTH",
+    "android.permission.BLUETOOTH_ADMIN",
+];
+
+/// Hold the VM's recursive mutex for a batch of driver-side work.
+/// `invoke` self-locks, but the driver also touches `&mut Vm` between
+/// invokes (runnable-drain bookkeeping, GC, dex-tree refresh) — wrap
+/// those batches so guest-pthread JNI calls can't alias them.
+pub fn lock_vm() -> impl Drop {
+    jni::vm_lock()
 }
 
 impl Vm {
     /// Static field value stored on class `class_idx` (`None` when the
     /// class is unloaded or the field unset). Used by `Enum.values()`.
-    pub(crate) fn static_of(&self, class_idx: u32, field_idx: u32) -> Option<V> {
+    pub(crate) fn static_of(&self, class_idx: GIdx, field_idx: GIdx) -> Option<V> {
         self.classes
-            .get(&class_idx)
-            .and_then(|cr| cr.statics.get(&field_idx).copied())
+            .get(&self.canon(class_idx))
+            .and_then(|cr| cr.statics.get(&self.canon_field(field_idx)).copied())
     }
 
-    /// Wrap a verified DEX file.
+    /// Wrap a verified DEX file; add more with [`Vm::add_dex`].
     pub fn new(dex: DexFile) -> Result<Self> {
-        let mut defined = HashMap::new();
-        for (class_idx, em) in dex.methods()? {
-            defined.insert(em.method_idx, (class_idx, em));
-        }
-        let defs = dex
-            .class_defs()
-            .iter()
-            .enumerate()
-            .map(|(i, d)| (d.class_idx, i))
-            .collect();
-        Ok(Self {
-            dex,
+        let mut v = Self {
+            dexes: Vec::new(),
             heap: Heap::default(),
             classes: HashMap::new(),
-            defined,
-            defs,
+            defined: HashMap::new(),
+            defs: HashMap::new(),
+            methods_by_sig: HashMap::new(),
+            fields_by_sig: HashMap::new(),
             hosts: HashMap::new(),
             hosts_named: HashMap::new(),
             aot: None,
             guest_package: None,
             guest_root: std::env::temp_dir().join("ovelo-guest"),
+            external_root: std::env::temp_dir()
+                .join("ovelo-guest")
+                .join("storage")
+                .join("emulated")
+                .join("0"),
             depth: 0,
             stack: Vec::new(),
             throw_sites: HashMap::new(),
             stub_trace: Vec::new(),
             main_thread_h: 0,
+            cur_thread: 0,
+            worker_thread_h: 0,
+            main_looper_h: 0,
+            app_h: 0,
             unsafe_offsets: HashMap::new(),
             unsafe_next_offset: 0,
-        })
+            trace_field: std::env::var("OVELO_TRACE_FIELD").ok(),
+            trace_throw: std::env::var_os("OVELO_TRACE_THROW").is_some(),
+            trace_call: std::env::var("OVELO_TRACE_CALL").ok(),
+            trace_from: std::env::var("OVELO_TRACE_FROM").ok(),
+            view_roots: Vec::new(),
+            prefs_files: HashMap::new(),
+            cur_activity: 0,
+            content_views: HashMap::new(),
+            decor_roots: HashMap::new(),
+            apk_res: None,
+            dbs: HashMap::new(),
+            db_handles: HashMap::new(),
+            obj_db: HashMap::new(),
+            theme_id: 0,
+            total_steps: 0,
+            pending_activity: None,
+            pending_runnables: std::collections::VecDeque::new(),
+            vto_listeners: HashMap::new(),
+            draining: false,
+            park_depth: 0,
+            reparked: std::collections::HashSet::new(),
+            park_spins: 0,
+            repark_counts: HashMap::new(),
+            parked_runnables: HashMap::new(),
+            media_ids: HashMap::new(),
+            next_media_id: 0,
+            natives: Vec::new(),
+            jni_mids: Vec::new(),
+            jni_fids: Vec::new(),
+            jni_pending_exc: 0,
+            field_idx_cache: std::cell::RefCell::new(HashMap::new()),
+            type_idx_cache: std::cell::RefCell::new(HashMap::new()),
+            fields_named_cache: std::cell::RefCell::new(None),
+            method_sig_cache: std::cell::RefCell::new(HashMap::new()),
+            code_cache: std::cell::RefCell::new(HashMap::new()),
+            insn_cache: std::cell::RefCell::new(HashMap::new()),
+            method_desc_cache: std::cell::RefCell::new(HashMap::new()),
+            resolve_cache: std::cell::RefCell::new(HashMap::new()),
+            canon_field_cache: std::cell::RefCell::new(HashMap::new()),
+            host_named_cache: std::cell::RefCell::new(HashMap::new()),
+            named_chain_cache: std::cell::RefCell::new(HashMap::new()),
+            assignable_cache: std::cell::RefCell::new(HashMap::new()),
+            view_gen: 0,
+            layout_gen_done: std::cell::Cell::new(u64::MAX),
+            gc_mark: 65_536,
+            class_mirrors: HashMap::new(),
+            granted_permissions: std::collections::HashSet::new(),
+        };
+        v.add_dex(dex)?;
+        Ok(v)
+    }
+
+    /// Seed install-time grants: every declared `<uses-permission>` is
+    /// granted — the runtime has no permission UI, and apps that check
+    /// `hasPermission` before requesting (fossify, …) would otherwise
+    /// park on a grant screen forever.
+    pub fn grant_manifest_permissions(&mut self, declared: &[String]) {
+        for p in declared {
+            self.granted_permissions.insert(p.clone());
+        }
+    }
+
+    /// Merge another DEX (classes2.dex, …) into the shared index space.
+    /// A class defined in a later dex resolves from invokes in earlier
+    /// ones — same semantics as ART's unified class path.
+    pub fn add_dex(&mut self, dex: DexFile) -> Result<()> {
+        // A new dex can resolve names previous lookups missed.
+        self.field_idx_cache.borrow_mut().clear();
+        self.type_idx_cache.borrow_mut().clear();
+        self.fields_named_cache.borrow_mut().take();
+        self.method_sig_cache.borrow_mut().clear();
+        self.code_cache.borrow_mut().clear();
+        self.insn_cache.borrow_mut().clear();
+        self.method_desc_cache.borrow_mut().clear();
+        self.resolve_cache.borrow_mut().clear();
+        self.canon_field_cache.borrow_mut().clear();
+        self.host_named_cache.borrow_mut().clear();
+        self.named_chain_cache.borrow_mut().clear();
+        self.assignable_cache.borrow_mut().clear();
+        let di = self.dexes.len();
+        for (class_idx, em) in dex.methods()? {
+            self.defined
+                .insert(gx(di, em.method_idx), (gx(di, class_idx), em));
+            if let Ok(mid) = dex.method(em.method_idx) {
+                if let (Ok(owner), Ok(name), Ok(sig)) = (
+                    dex.type_descriptor(mid.class_idx as u32),
+                    dex.string(mid.name_idx),
+                    proto_sig(&dex, mid.proto_idx as u32),
+                ) {
+                    self.methods_by_sig
+                        .entry((owner, name, sig))
+                        .or_insert(gx(di, em.method_idx));
+                }
+            }
+        }
+        for (i, def) in dex.class_defs().iter().enumerate() {
+            if let Ok(desc) = dex.type_descriptor(def.class_idx) {
+                self.defs.insert(desc, (di, i));
+            }
+        }
+        for fidx in 0..dex.field_ids_len() as u32 {
+            let Ok(f) = dex.field(fidx) else { continue };
+            if let (Ok(owner), Ok(name), Ok(ty)) = (
+                dex.type_descriptor(f.class_idx as u32),
+                dex.string(f.name_idx),
+                dex.type_descriptor(f.type_idx as u32),
+            ) {
+                self.fields_by_sig
+                    .entry((owner, name, ty))
+                    .or_insert(gx(di, fidx));
+            }
+        }
+        self.dexes.push(dex);
+        Ok(())
+    }
+
+    /// Canonical class identity: same descriptor ⇒ same GIdx (first dex
+    /// that names it). `classes` runtime state and object `class_idx`
+    /// keys must agree regardless of which dex referenced the class.
+    fn canon(&self, g: GIdx) -> GIdx {
+        match self.type_desc_of(g) {
+            Ok(desc) => self.type_index_of(&desc).unwrap_or(g),
+            Err(_) => g,
+        }
+    }
+
+    /// Canonical field identity: `(owner, name, type)` first-seen key,
+    /// so a field written via dex M's ref reads back through dex N's.
+    pub(crate) fn canon_field(&self, g: GIdx) -> GIdx {
+        if let Some(hit) = self.canon_field_cache.borrow().get(&g) {
+            return *hit;
+        }
+        let out = (|| {
+            let d = self.dex_of(g)?;
+            let f = d.field(gl(g)).ok()?;
+            let sig = (
+                d.type_descriptor(f.class_idx as u32).unwrap_or_default(),
+                d.string(f.name_idx).unwrap_or_default(),
+                d.type_descriptor(f.type_idx as u32).unwrap_or_default(),
+            );
+            Some(self.fields_by_sig.get(&sig).copied().unwrap_or(g))
+        })()
+        .unwrap_or(g);
+        self.canon_field_cache.borrow_mut().insert(g, out);
+        out
+    }
+
+    /// (canonical GIdx of the class itself, its &ClassDef) — `def`
+    /// fields (`superclass_idx`, `interfaces_off`, …) are local to the
+    /// DEFINING dex, whose index is `gd(canon_g)`.
+    pub(crate) fn def_loc_of(&self, class_idx: GIdx) -> Option<(GIdx, &ClassDef)> {
+        let desc = self.type_desc_of(class_idx).ok()?;
+        let &(di, i) = self.defs.get(&desc)?;
+        let def = &self.dexes[di].class_defs()[i];
+        Some((gx(di, def.class_idx), def))
+    }
+
+    /// The dex a global index belongs to.
+    pub(crate) fn dex_of(&self, g: GIdx) -> Option<&DexFile> {
+        self.dexes.get(gd(g))
+    }
+
+    /// Loaded dexes, in index order (dex 0 first — same order `add_dex`
+    /// received them).
+    pub(crate) fn all_dexes(&self) -> &[DexFile] {
+        &self.dexes
+    }
+
+    /// `type_idx` lookup across every loaded dex (global result).
+    /// Memoized — dex type tables don't change after `add_dex`.
+    pub(crate) fn type_index_of(&self, desc: &str) -> Option<GIdx> {
+        if let Some(hit) = self.type_idx_cache.borrow().get(desc) {
+            return *hit;
+        }
+        let mut out = None;
+        for (di, d) in self.dexes.iter().enumerate() {
+            if let Ok(Some(i)) = d.type_index_of(desc) {
+                out = Some(gx(di, i));
+                break;
+            }
+        }
+        self.type_idx_cache
+            .borrow_mut()
+            .insert(desc.to_string(), out);
+        out
+    }
+
+    /// `field_idx` lookup across every loaded dex (global result).
+    /// Memoized — dex field tables don't change after `add_dex`.
+    pub(crate) fn field_index_of(&self, owner: &str, name: &str) -> Option<GIdx> {
+        let key = (owner.to_string(), name.to_string());
+        if let Some(hit) = self.field_idx_cache.borrow().get(&key) {
+            return *hit;
+        }
+        let mut out = None;
+        for (di, d) in self.dexes.iter().enumerate() {
+            if let Some(i) = d.field_index_of(owner, name) {
+                out = Some(gx(di, i));
+                break;
+            }
+        }
+        self.field_idx_cache.borrow_mut().insert(key, out);
+        out
+    }
+
+    /// Canonical field keys for `(name, type)` across every loaded dex,
+    /// regardless of declaring owner — used when host code must write a
+    /// field on a dex instance that readers reach through arbitrarily
+    /// (R8-)named owner references. Each entry carries its declaring
+    /// owner so callers can filter to a receiver's own hierarchy.
+    pub(crate) fn field_keys_named(&self, name: &str, ty: &str) -> Vec<(String, GIdx)> {
+        if let Some(m) = self.fields_named_cache.borrow().as_ref() {
+            return m
+                .get(&(name.to_string(), ty.to_string()))
+                .cloned()
+                .unwrap_or_default();
+        }
+        let mut m: FieldsByName = HashMap::new();
+        for (di, d) in self.dexes.iter().enumerate() {
+            for i in 0..d.field_ids_len() {
+                let Ok(f) = d.field(i as u32) else { continue };
+                let (Ok(n), Ok(t), Ok(owner)) = (
+                    d.string(f.name_idx),
+                    d.type_descriptor(f.type_idx as u32),
+                    d.type_descriptor(f.class_idx as u32),
+                ) else {
+                    continue;
+                };
+                let g = self.canon_field(gx(di, i as u32));
+                m.entry((n, t)).or_default().push((owner, g));
+            }
+        }
+        let out = m
+            .get(&(name.to_string(), ty.to_string()))
+            .cloned()
+            .unwrap_or_default();
+        *self.fields_named_cache.borrow_mut() = Some(m);
+        out
+    }
+
+    /// Descriptor for a global `type_idx`.
+    /// Class index a `jclass` handle refers to: `Obj::Class` mirrors
+    /// report their `type_idx`; ordinary objects report their own
+    /// class via `class_of`.
+    pub fn class_for_jclass(&self, h: u32) -> Option<u64> {
+        match self.heap.get(h) {
+            Some(Obj::Class { type_idx }) => Some(*type_idx),
+            _ => self.heap.class_of(h),
+        }
+    }
+
+    /// Descriptor of a class referenced by a `java.lang.Class` handle —
+    /// `Obj::Class` mirror or a host mirror holding a descriptor string.
+    pub fn class_descriptor_of(&self, h: u32) -> Option<String> {
+        match self.heap.get(h) {
+            Some(Obj::Class { type_idx }) => self.type_desc_of(*type_idx).ok(),
+            Some(Obj::Host {
+                state: HostState::StrBuf(d),
+                ..
+            }) => Some(d.clone()),
+            _ => None,
+        }
+    }
+
+    /// Runtime class descriptor for any heap object handle (debug use).
+    pub fn dbg_class_of(&self, h: u32) -> String {
+        jdk::class_of(self, V::Ref(h))
+    }
+
+    /// Debug: the `Class.field` name for a canonical global field index.
+    pub fn dbg_field_name(&self, g: u64) -> String {
+        self.dex_of(g)
+            .and_then(|d| {
+                let f = d.field(gl(g)).ok()?;
+                let name = d.string(f.name_idx).ok()?;
+                let owner = d.type_descriptor(f.class_idx as u32).ok()?;
+                Some(format!("{owner}.{name}"))
+            })
+            .unwrap_or_else(|| format!("g{g}"))
+    }
+
+    /// Debug: the superclass chain of `desc`, used by view debugging.
+    pub fn dbg_super_chain(&self, desc: &str) -> Vec<String> {
+        let mut out = Vec::new();
+        let mut cur = desc.to_string();
+        for _ in 0..16 {
+            let Some(s) = self.super_desc(&cur) else {
+                break;
+            };
+            if s == cur {
+                break;
+            }
+            out.push(s.clone());
+            cur = s;
+        }
+        out
+    }
+
+    /// True when `h` is (a subclass of) a `java.util.Collection` guest
+    /// object — wrappers around a host collection whose elements are
+    /// copied out by `list_snapshot`.
+    pub(crate) fn is_guest_collection(&self, h: u32) -> bool {
+        let Some(Obj::Instance { class_idx, .. }) = self.heap.get(h) else {
+            return false;
+        };
+        // No `java.util.Collection` in the dex type pool at all → the
+        // app never names the interface, so a guest object can still be
+        // a collection wrapper. Be permissive there; the backing-field
+        // search is the real test.
+        self.type_index_of("Ljava/util/Collection;")
+            .map(|t| self.assignable(*class_idx, t))
+            .unwrap_or(true)
+    }
+
+    /// A `java.lang.Class` mirror handle for `desc` (`Ljava/lang/Foo;`).
+    /// Mirrors are interned — the same class returns the same handle.
+    pub fn class_handle(&mut self, desc: &str) -> u32 {
+        let t = self.type_index_of(desc).unwrap_or(GX_NONE);
+        self.class_mirror(t)
+    }
+
+    /// Interned `Obj::Class` handle for a (possibly non-canonical)
+    /// type_idx — canonicalized so `const-class` from dex N and
+    /// `getClass` on an instance defined in dex M coincide.
+    pub(crate) fn class_mirror(&mut self, type_idx: GIdx) -> u32 {
+        let c = self.canon(type_idx);
+        if let Some(&h) = self.class_mirrors.get(&c) {
+            if self.heap.get(h).is_some() {
+                return h;
+            }
+        }
+        let h = self.heap.alloc(Obj::Class { type_idx: c });
+        self.class_mirrors.insert(c, h);
+        h
+    }
+
+    /// Write `v` into a guest-visible named field of a host/instance
+    /// object — the same channel `iget` reads through.
+    pub fn set_object_field(&mut self, h: u32, owner: &str, name: &str, v: V) {
+        if let Some(g) = self.field_index_of(owner, name) {
+            let f = self.canon_field(g);
+            if let Some(m) = jdk::fields_mut(self, h) {
+                m.insert(f, v);
+            }
+        }
+    }
+
+    /// Companion to `set_object_field` — resolves the canonical field
+    /// id and reads it off the object's field map.
+    pub fn get_object_field(&self, h: u32, owner: &str, name: &str) -> Option<V> {
+        let f = self.canon_field(self.field_index_of(owner, name)?);
+        match self.heap.get(h) {
+            Some(Obj::Instance { fields, .. }) | Some(Obj::Host { fields, .. }) => {
+                fields.get(&f).copied()
+            }
+            _ => None,
+        }
+    }
+
+    pub(crate) fn type_desc_of(&self, g: GIdx) -> Result<String> {
+        self.dex_of(g)
+            .ok_or_else(|| err("dexrt.dex.idx"))?
+            .type_descriptor(gl(g))
+    }
+
+    /// `Lowner;.name(params)ret` for a global method ref, or None when
+    /// the index doesn't resolve (sentinel).
+    fn method_sig(&self, midx: GIdx) -> Result<(String, String, String)> {
+        if let Some(hit) = self.method_sig_cache.borrow().get(&midx) {
+            return Ok(hit.clone());
+        }
+        let d = self.dex_of(midx).ok_or_else(|| err("dexrt.method.id"))?;
+        let mid = d.method(gl(midx))?;
+        let class = d.type_descriptor(mid.class_idx as u32)?;
+        let name = d.string(mid.name_idx)?;
+        let p = d.proto(mid.proto_idx as u32)?;
+        let mut sig = String::from("(");
+        for t in d.proto_params(p)? {
+            sig.push_str(&d.type_descriptor(t as u32)?);
+        }
+        sig.push(')');
+        let ret = d.type_descriptor(p.return_type_idx)?;
+        sig.push_str(&ret);
+        let out = (class, name, sig);
+        self.method_sig_cache
+            .borrow_mut()
+            .insert(midx, out.clone());
+        Ok(out)
     }
 
     /// Register a host implementation for the method reference
@@ -164,31 +814,58 @@ impl Vm {
         f: HostCall,
     ) -> Result<bool> {
         let mut found = false;
-        for midx in 0..self.dex.method_ids_len() as u32 {
-            let mid = self.dex.method(midx)?;
-            let class = self.dex.type_descriptor(mid.class_idx as u32)?;
-            if class != class_desc {
-                continue;
+        for (di, d) in self.dexes.iter().enumerate() {
+            for midx in 0..d.method_ids_len() as u32 {
+                let mid = d.method(midx)?;
+                let class = d.type_descriptor(mid.class_idx as u32)?;
+                if class != class_desc {
+                    continue;
+                }
+                if d.string(mid.name_idx)? != name {
+                    continue;
+                }
+                if proto_sig(d, mid.proto_idx as u32)? == proto_desc {
+                    self.hosts.insert(gx(di, midx), f.clone());
+                    found = true;
+                }
             }
-            if self.dex.string(mid.name_idx)? != name {
-                continue;
-            }
-            let p = self.dex.proto(mid.proto_idx as u32)?;
-            let mut sig = String::from("(");
-            for t in self.dex.proto_params(p)? {
-                sig.push_str(&self.dex.type_descriptor(t as u32)?);
-            }
-            sig.push(')');
-            sig.push_str(&self.dex.type_descriptor(p.return_type_idx)?);
-            if sig == proto_desc {
-                self.hosts.insert(midx, f.clone());
-                found = true;
+            // Defined methods too: a call may reference only the base
+            // class's descriptor (`MenuInflater.inflate`) while virtual
+            // resolution lands on the dex-defined override
+            // (`SupportMenuInflater.inflate`) that nothing references.
+            // Best-effort: one unparseable class must not abort the scan.
+            for def in d.class_defs() {
+                let Ok(desc) = d.type_descriptor(def.class_idx) else {
+                    continue;
+                };
+                if desc != class_desc {
+                    continue;
+                }
+                let Ok(cd) = d.class_data_rc(def) else {
+                    continue;
+                };
+                for m in cd.direct_methods.iter().chain(cd.virtual_methods.iter()) {
+                    let Ok(mid) = d.method(m.method_idx) else {
+                        continue;
+                    };
+                    if d.string(mid.name_idx).map(|n| n == name).unwrap_or(false)
+                        && proto_sig(d, mid.proto_idx as u32)
+                            .map(|s| s == proto_desc)
+                            .unwrap_or(false)
+                    {
+                        self.hosts.insert(gx(di, m.method_idx), f.clone());
+                        found = true;
+                    }
+                }
             }
         }
         if found {
+            // Misses are memoized — a subclass-named call resolved to
+            // None before this registration must see the new impl.
+            self.host_named_cache.borrow_mut().clear();
             // A DEX may reference the same method through a subclass
             // descriptor; fall back to (name, sig) in call_builtin.
-            let owner = self.dex.type_index_of(class_desc)?.unwrap_or(u32::MAX);
+            let owner = self.type_index_of(class_desc).unwrap_or(GX_NONE);
             self.hosts_named
                 .entry((name.to_string(), proto_desc.to_string()))
                 .or_default()
@@ -209,13 +886,17 @@ impl Vm {
         let Some(mut aot) = Aot::new() else {
             return 0;
         };
-        let mids: Vec<u32> = self.defined.keys().copied().collect();
+        let mids: Vec<GIdx> = self.defined.keys().copied().collect();
         for midx in mids {
             if !self.sig_int_typed(midx) {
                 continue;
             }
             let em = &self.defined[&midx].1;
-            let Ok(Some(code)) = self.dex.code_item(em.code_off) else {
+            let Ok(Some(code)) = self
+                .dex_of(midx)
+                .ok_or_else(|| err("dexrt.dex.idx"))
+                .and_then(|d| d.code_item(em.code_off))
+            else {
                 continue;
             };
             aot.compile(midx, &code);
@@ -232,25 +913,27 @@ impl Vm {
 
     /// Signature gate for AOT: every param and the return must be
     /// integer-typed so the i64-slot ABI matches `V`.
-    fn sig_int_typed(&self, midx: u32) -> bool {
-        let Ok(mid) = self.dex.method(midx) else {
+    fn sig_int_typed(&self, midx: GIdx) -> bool {
+        let Some(d) = self.dex_of(midx) else {
             return false;
         };
-        let Ok(p) = self.dex.proto(mid.proto_idx as u32) else {
+        let Ok(mid) = d.method(gl(midx)) else {
             return false;
         };
-        let Ok(ret) = self.dex.type_descriptor(p.return_type_idx) else {
+        let Ok(p) = d.proto(mid.proto_idx as u32) else {
+            return false;
+        };
+        let Ok(ret) = d.type_descriptor(p.return_type_idx) else {
             return false;
         };
         if !aot::int_typed(&ret) {
             return false;
         }
-        let Ok(params) = self.dex.proto_params(p) else {
+        let Ok(params) = d.proto_params(p) else {
             return false;
         };
         params.iter().all(|t| {
-            self.dex
-                .type_descriptor(*t as u32)
+            d.type_descriptor(*t as u32)
                 .map(|d| aot::int_typed(&d))
                 .unwrap_or(false)
         })
@@ -278,8 +961,7 @@ impl Vm {
     /// Returns the heap handle.
     pub fn instantiate(&mut self, class_desc: &str) -> Result<u32> {
         let ty = self
-            .dex
-            .type_index_of(class_desc)?
+            .type_index_of(class_desc)
             .ok_or_else(|| errd("dexrt.class.missing", class_desc.to_string()))?;
         if self.def_of(ty).is_none() {
             return Err(errd("dexrt.class.missing", class_desc.to_string()));
@@ -293,9 +975,18 @@ impl Vm {
             }
         }
         let h = self.heap.alloc(Obj::Instance {
-            class_idx: ty,
+            class_idx: self.canon(ty),
             fields: HashMap::new(),
         });
+        // A real guest Application subclass IS the app object —
+        // `getApplication[Context]` must hand it back so onCreate state
+        // and custom methods are reachable. Overrides the interned
+        // placeholder `app_object` may have minted earlier.
+        if let Some(app_ty) = self.type_index_of("Landroid/app/Application;") {
+            if self.assignable(ty, app_ty) {
+                self.app_h = h;
+            }
+        }
         if let Some(midx) = self.find_method_by_name(class_desc, "<init>", 0)? {
             match self.invoke(midx, vec![V::Ref(h)], InvokeKind::Direct) {
                 Ok(_) => {}
@@ -309,12 +1000,185 @@ impl Vm {
         Ok(h)
     }
 
+    /// Allocate an instance and run the `<init>` overload matching
+    /// `args`' slot count. Used by the layout inflater: custom view
+    /// classes (and bundled libs like material's NavigationView) get
+    /// real constructor state, not an opaque host stub.
+    pub(crate) fn instantiate_with(&mut self, class_desc: &str, args: &[V]) -> Result<u32> {
+        let ty = self
+            .type_index_of(class_desc)
+            .ok_or_else(|| errd("dexrt.class.missing", class_desc.to_string()))?;
+        if self.def_of(ty).is_none() {
+            return Err(errd("dexrt.class.missing", class_desc.to_string()));
+        }
+        match self.ensure_init(ty) {
+            Ok(()) => {}
+            Err(E::Vm(e)) => return Err(e),
+            Err(E::Throw(r)) => {
+                let d = self.describe_throw(r);
+                return Err(errd("dexrt.exception.uncaught", d));
+            }
+        }
+        let h = self.heap.alloc(Obj::Instance {
+            class_idx: self.canon(ty),
+            fields: HashMap::new(),
+        });
+        let slots: usize = args
+            .iter()
+            .map(|a| {
+                if matches!(a, V::I64(_) | V::F64(_)) {
+                    2
+                } else {
+                    1
+                }
+            })
+            .sum();
+        if let Some(midx) = self.find_method_by_name(class_desc, "<init>", slots)? {
+            let mut a = Vec::with_capacity(args.len() + 1);
+            a.push(V::Ref(h));
+            a.extend_from_slice(args);
+            match self.invoke(midx, a, InvokeKind::Direct) {
+                Ok(_) => {}
+                Err(E::Vm(e)) => return Err(e),
+                Err(E::Throw(r)) => {
+                    let d = self.describe_throw(r);
+                    return Err(errd("dexrt.exception.uncaught", d));
+                }
+            }
+        }
+        Ok(h)
+    }
+
+    /// Every `<init>` overload declared on `class_desc` as
+    /// `(method ref, param type descriptors)` — the inflater scores them
+    /// to pick the best-fit view constructor.
+    pub(crate) fn ctor_list(&self, class_desc: &str) -> Vec<(GIdx, Vec<String>)> {
+        let mut out = Vec::new();
+        for (di, d) in self.dexes.iter().enumerate() {
+            for def in d.class_defs() {
+                if d.type_descriptor(def.class_idx).ok().as_deref() != Some(class_desc) {
+                    continue;
+                }
+                let Ok(cd) = d.class_data_rc(def) else {
+                    return out;
+                };
+                for m in cd.direct_methods.iter() {
+                    let Ok(mid) = d.method(m.method_idx) else {
+                        continue;
+                    };
+                    if d.string(mid.name_idx).ok().as_deref() != Some("<init>") {
+                        continue;
+                    }
+                    let params: Vec<String> = d
+                        .proto(mid.proto_idx as u32)
+                        .and_then(|p| d.proto_params(p))
+                        .map(|list| {
+                            list.iter()
+                                .filter_map(|t| d.type_descriptor(*t as u32).ok())
+                                .collect()
+                        })
+                        .unwrap_or_default();
+                    out.push((gx(di, m.method_idx), params));
+                }
+                return out;
+            }
+        }
+        out
+    }
+
+    /// Allocate an instance and run the specific `<init>` from
+    /// [`Vm::ctor_list`] — proto-aware construction when several
+    /// overloads share a slot count.
+    pub(crate) fn instantiate_ctor(
+        &mut self,
+        class_desc: &str,
+        midx: GIdx,
+        args: &[V],
+    ) -> Result<u32> {
+        let ty = self
+            .type_index_of(class_desc)
+            .ok_or_else(|| errd("dexrt.class.missing", class_desc.to_string()))?;
+        match self.ensure_init(ty) {
+            Ok(()) => {}
+            Err(E::Vm(e)) => return Err(e),
+            Err(E::Throw(r)) => {
+                let d = self.describe_throw(r);
+                return Err(errd("dexrt.exception.uncaught", d));
+            }
+        }
+        let h = self.heap.alloc(Obj::Instance {
+            class_idx: self.canon(ty),
+            fields: HashMap::new(),
+        });
+        let mut a = Vec::with_capacity(args.len() + 1);
+        a.push(V::Ref(h));
+        a.extend_from_slice(args);
+        match self.invoke(midx, a, InvokeKind::Direct) {
+            Ok(_) => Ok(h),
+            Err(E::Vm(e)) => Err(e),
+            Err(E::Throw(r)) => {
+                let d = self.describe_throw(r);
+                Err(errd("dexrt.exception.uncaught", d))
+            }
+        }
+    }
+
+    /// `field_index_of` walking the superclass chain — atomic field
+    /// updaters resolve against the target's runtime class, but the
+    /// field is usually declared on a base class (JobSupport's
+    /// `_state`); missing it reads a fallback slot that's always null.
+    pub(crate) fn field_index_on_chain(&self, owner: &str, name: &str) -> Option<GIdx> {
+        let mut cur = Some(owner.to_string());
+        for _ in 0..32 {
+            let d = cur?;
+            if let Some(g) = self.field_index_of(&d, name) {
+                return Some(g);
+            }
+            cur = self.super_desc(&d);
+        }
+        None
+    }
+
+    /// Superclass descriptor for a class by name — the dex class def
+    /// when present, else the framework `host_supers` table.
+    pub(crate) fn super_desc(&self, desc: &str) -> Option<String> {
+        if let Some(ty) = self.type_index_of(desc) {
+            if let Some((cg, def)) = self.def_loc_of(ty) {
+                if def.superclass_idx == u32::MAX {
+                    return None;
+                }
+                return self.type_desc_of(gx(gd(cg), def.superclass_idx)).ok();
+            }
+        }
+        jdk::host_supers(desc).first().map(|s| (*s).to_string())
+    }
+
+    /// Whether `desc` is, or descends from, a class whose simple name is
+    /// `simple` — `extends_named("Lorg/foo/MainPager;", "ViewPager")` is
+    /// true when `MainPager extends ViewPager`. Walks dex class_defs
+    /// first, then the host_supers chain (via `super_desc`).
+    pub fn extends_named(&self, desc: &str, simple: &str) -> bool {
+        let mut d = desc.to_string();
+        for _ in 0..32 {
+            if d.rsplit('/').next().unwrap_or(&d).trim_end_matches(';') == simple {
+                return true;
+            }
+            let Some(next) = self.super_desc(&d) else {
+                return false;
+            };
+            if next == d {
+                return false;
+            }
+            d = next;
+        }
+        false
+    }
+
     /// Allocate an instance without running its `<init>` — for
     /// `Unsafe.allocateInstance`, which must not execute constructors.
     pub(crate) fn alloc_instance_raw(&mut self, class_desc: &str) -> Result<u32> {
         let ty = self
-            .dex
-            .type_index_of(class_desc)?
+            .type_index_of(class_desc)
             .ok_or_else(|| errd("dexrt.class.missing", class_desc.to_string()))?;
         match self.ensure_init(ty) {
             Ok(()) => {}
@@ -325,13 +1189,14 @@ impl Vm {
             }
         }
         Ok(self.heap.alloc(Obj::Instance {
-            class_idx: ty,
+            class_idx: self.canon(ty),
             fields: HashMap::new(),
         }))
     }
 
     /// `clinit` reached state 2 (done), or the class needs no init.
-    pub(crate) fn class_initialized(&self, class_idx: u32) -> bool {
+    pub(crate) fn class_initialized(&self, class_idx: GIdx) -> bool {
+        let class_idx = self.canon(class_idx);
         self.classes
             .get(&class_idx)
             .map(|c| c.clinit == 2)
@@ -339,50 +1204,406 @@ impl Vm {
     }
 
     /// pub(crate) gate for jdk builtins (Unsafe.ensureClassInitialized).
-    pub(crate) fn ensure_class_init(&mut self, class_idx: u32) -> Rt<()> {
+    pub(crate) fn ensure_class_init(&mut self, class_idx: GIdx) -> Rt<()> {
         self.ensure_init(class_idx)
     }
 
     /// Read/write a class's static table (Unsafe staticFieldBase model).
-    pub(crate) fn static_read(&self, class_idx: u32, field_idx: u32) -> Option<V> {
+    pub(crate) fn static_read(&self, class_idx: GIdx, field_idx: GIdx) -> Option<V> {
         self.classes
-            .get(&class_idx)
-            .and_then(|c| c.statics.get(&field_idx).copied())
+            .get(&self.canon(class_idx))
+            .and_then(|c| c.statics.get(&self.canon_field(field_idx)).copied())
     }
 
-    pub(crate) fn static_write(&mut self, class_idx: u32, field_idx: u32, v: V) {
-        self.classes
-            .entry(class_idx)
-            .or_default()
-            .statics
-            .insert(field_idx, v);
+    pub(crate) fn static_write(&mut self, class_idx: GIdx, field_idx: GIdx, v: V) {
+        let k = self.canon(class_idx);
+        let f = self.canon_field(field_idx);
+        self.classes.entry(k).or_default().statics.insert(f, v);
     }
 
-    /// Invoke the virtual method `name` on `this`, with `args` after the
-    /// receiver. `Ok(None)` when the object's class doesn't declare it —
-    /// the platform base class (not in this DEX) provides the default.
+    /// Mark which activity's code is dispatching — content/decor roots
+    /// attached while it runs are recorded under it.
+    pub fn set_activity(&mut self, activity: u32) {
+        self.cur_activity = activity;
+    }
+
+    /// Invoke `name` on the object at `this` — resolves the method on
+    /// its class chain by name and arg count. `Ok(None)` when the
+    /// object's class doesn't declare it — the platform base class
+    /// (not in this DEX) provides the default.
     pub fn call_virtual(&mut self, this: u32, name: &str, args: &[V]) -> Result<Option<V>> {
         let ci = self
             .heap
             .class_of(this)
             .ok_or_else(|| errd("dexrt.bad_this", name.to_string()))?;
         let Some(midx) = self.find_method_on_chain(ci, name, args.len())? else {
-            return Ok(None);
+            // No dex override — a framework method (`View.layout`,
+            // `View.measure`, …). Route it through the builtin
+            // dispatcher so host arms still apply when the caller is
+            // the host itself rather than a dex invoke site.
+            let desc = self.type_desc_of(ci).unwrap_or_default();
+            let mut a = Vec::with_capacity(args.len() + 1);
+            a.push(V::Ref(this));
+            a.extend_from_slice(args);
+            let r = jdk::call(self, &desc, name, "", &a).map_err(|e| match e {
+                E::Vm(v) => v,
+                E::Throw(t) => {
+                    let d = self.describe_throw(t);
+                    errd("dexrt.exception.uncaught", d)
+                }
+            })?;
+            return Ok(r.flatten());
         };
+        if std::env::var_os("OVELO_VIEWDBG").is_some() && (name == "layout" || name == "measure") {
+            let d = self.describe_method(midx);
+            eprintln!("[viewdbg] dex layout h{this} -> {d}");
+        }
         let mut a = Vec::with_capacity(args.len() + 1);
         a.push(V::Ref(this));
         a.extend_from_slice(args);
-        match self.invoke(midx, a, InvokeKind::Virtual) {
+        let out = match self.invoke(midx, a, InvokeKind::Virtual) {
             Ok(v) => Ok(v),
             Err(E::Vm(e)) => Err(e),
             Err(E::Throw(r)) => {
                 let d = self.describe_throw(r);
                 Err(errd("dexrt.exception.uncaught", d))
             }
+        };
+        if self.depth == 0 {
+            self.drain_runnables(500);
+        }
+        out
+    }
+
+    /// `call_virtual` for dispatch that happens INSIDE guest code
+    /// (builtin callbacks like `SQLiteOpenHelper.onCreate`): a guest
+    /// throw propagates as `E::Throw` so the app's own catch/finally
+    /// sees it, instead of becoming a fatal VM error.
+    pub(crate) fn call_virtual_rt(&mut self, this: u32, name: &str, args: &[V]) -> Rt<Option<V>> {
+        let ci = self
+            .heap
+            .class_of(this)
+            .ok_or_else(|| E::Vm(errd("dexrt.bad_this", name.to_string())))?;
+        let Some(midx) = self
+            .find_method_on_chain(ci, name, args.len())
+            .map_err(E::Vm)?
+        else {
+            if std::env::var_os("OVELO_VIEWDBG").is_some()
+                && matches!(name, "onMeasure" | "onLayout")
+            {
+                let d = self.type_desc_of(ci).unwrap_or_default();
+                eprintln!("[viewdbg] onChain miss {name} ci_desc={d}");
+            }
+            return Ok(None);
+        };
+        let mut a = Vec::with_capacity(args.len() + 1);
+        a.push(V::Ref(this));
+        a.extend_from_slice(args);
+        let out = self.invoke(midx, a, InvokeKind::Virtual);
+        if self.depth == 0 {
+            self.drain_runnables(500);
+        }
+        out
+    }
+
+    /// `LockSupport.park` semantics on a single shared queue: the
+    /// parked Java frame can't resume later, so run queued work
+    /// inline (the task that completes the wait unparks / stores the
+    /// result) and let the caller's event loop re-check its own
+    /// queue. Nested drains are bounded by `park_depth`; past the cap
+    /// we fall back to the preempt-and-requeue unwind, which is
+    /// correct for queue-scanning worker loops (they re-scan on
+    /// re-entry) but makes runBlock-style callers redo work — hence
+    /// the generous cap.
+    pub(crate) fn park_drain(&mut self) -> std::result::Result<(), E> {
+        // Nothing queued anywhere: an inline drain can't complete the
+        // wait, so yield by unwinding — the drain loop requeues the
+        // runnable (queue-scanning workers rescan on re-entry).
+        if self.pending_runnables.is_empty() || self.park_depth >= 8 {
+            return Err(E::Vm(err("ovelo.park")));
+        }
+        // Every queued runnable already re-parked — draining them
+        // makes no progress when two waiting workers just requeue each
+        // other. Allow a few retries (fresh work may have reached a
+        // reparked worker's internal queue), then yield to the outer
+        // drain instead of burning this run()'s whole budget spinning.
+        if !self
+            .pending_runnables
+            .iter()
+            .any(|(r, _)| !self.reparked.contains(r))
+        {
+            self.park_spins += 1;
+            if self.park_spins > 4 {
+                return Err(E::Vm(err("ovelo.park")));
+            }
+        } else {
+            self.park_spins = 0;
+        }
+        self.park_depth += 1;
+        let was = self.draining;
+        self.draining = false;
+        self.drain_runnables(64);
+        self.draining = was;
+        self.park_depth -= 1;
+        Ok(())
+    }
+
+    /// Enqueue a runnable (`Thread.start`/`Executor.execute`/
+    /// `Handler.post*`). Fresh work may target a re-parked worker's
+    /// internal queue, so all `reparked` tags are cleared — a waiting
+    /// parker must retry those workers rather than assume they are
+    /// still idle.
+    pub(crate) fn enqueue_runnable(&mut self, r: u32, on_main: bool) {
+        self.reparked.clear();
+        // The newly posted work may feed a worker that parked out of
+        // the live queue — re-arm dropped parkers so they rescan.
+        self.parked_runnables.remove(&r);
+        self.wake_parked();
+        self.pending_runnables.push_back((r, on_main));
+    }
+
+    /// Re-arm runnables that parked out of the live queue — called
+    /// from `enqueue_runnable` (fresh work may feed a dropped worker's
+    /// internal queue) and `LockSupport.unpark`.
+    pub(crate) fn wake_parked(&mut self) {
+        for (r, on_main) in self.parked_runnables.drain() {
+            self.repark_counts.remove(&r);
+            self.reparked.remove(&r);
+            self.pending_runnables.push_back((r, on_main));
         }
     }
 
+    /// Run enqueued async work FIFO — `Thread.start`/`Executor.execute`
+    /// jobs on a worker thread, `Handler.post*` on the main one.
+    /// Reentrant-safe; `max` bounds total runnables per drain so a
+    /// self-rescheduling queue can't wedge the caller forever. Returns
+    /// how many runnables completed — re-parked workers don't count.
+    /// Stop-the-world mark-sweep GC. Only safe between dex activations —
+    /// live interpreter frames hold their refs in Rust locals, so this
+    /// no-ops while dex code is in flight (`depth`/`stack`/`draining`).
+    /// `extra_roots` are guest handles held by callers (e.g. the UI's
+    /// bound-view tables) that the VM cannot see itself.
+    pub fn collect_garbage(&mut self, extra_roots: &mut dyn Iterator<Item = u32>) -> usize {
+        if self.depth != 0 || !self.stack.is_empty() || self.draining {
+            return 0;
+        }
+        let mut roots: Vec<u32> = Vec::new();
+        for c in self.classes.values() {
+            roots.extend(c.statics.values().filter_map(|v| match v {
+                V::Ref(h) if *h != 0 => Some(*h),
+                _ => None,
+            }));
+        }
+        roots.extend(self.pending_runnables.iter().map(|(h, _)| *h));
+        roots.extend(self.parked_runnables.keys().copied());
+        roots.extend(self.reparked.iter().copied());
+        roots.extend(self.repark_counts.keys().copied());
+        roots.extend(self.vto_listeners.keys().copied());
+        roots.extend(self.vto_listeners.values().flatten().copied());
+        roots.extend(self.class_mirrors.values().copied());
+        roots.push(self.jni_pending_exc);
+        // Runtime-held singletons and registries — Application, thread
+        // and looper objects, the current activity, view/db/prefs
+        // tables, thrown-object diagnostics.
+        roots.extend([
+            self.main_thread_h,
+            self.cur_thread,
+            self.worker_thread_h,
+            self.main_looper_h,
+            self.app_h,
+            self.cur_activity,
+        ]);
+        roots.extend(self.view_roots.iter().copied());
+        roots.extend(self.prefs_files.values().copied());
+        roots.extend(self.content_views.keys().copied());
+        roots.extend(self.content_views.values().copied());
+        roots.extend(self.decor_roots.keys().copied());
+        roots.extend(self.decor_roots.values().copied());
+        roots.extend(self.db_handles.values().copied());
+        // obj_db/throw_sites/unsafe_offsets are NOT rooted: entries whose
+        // owner object is dead are pruned after the sweep instead, so the
+        // registries can't grow forever or keep stale values alive.
+        // unsafe_offsets values stay rooted for entries whose owner is
+        // still live (a dead owner's entry is dropped below, releasing
+        // its value on the next collect).
+        roots.extend(self.unsafe_offsets.values().filter_map(|v| match v {
+            V::Ref(h) if *h != 0 => Some(*h),
+            _ => None,
+        }));
+        if let Some((_, V::Ref(h))) = &self.pending_activity {
+            if *h != 0 {
+                roots.push(*h);
+            }
+        }
+        roots.extend(extra_roots);
+        let freed = self.heap.collect(roots);
+        // Evict bookkeeping for objects this collect just reclaimed —
+        // keeps the maps bounded and stops dead entries pointing at
+        // recycled handles.
+        self.unsafe_offsets
+            .retain(|(h, _), _| self.heap.get(*h).is_some());
+        self.obj_db.retain(|h, _| self.heap.get(*h).is_some());
+        self.throw_sites
+            .retain(|h, _| self.heap.get(*h).is_some());
+        // Next collection when the heap grows another ~50%.
+        self.gc_mark = (self.heap.len() * 3 / 2).max(65_536);
+        if std::env::var_os("OVELO_MEMDBG").is_some() {
+            eprintln!("[gc] freed {freed} slots={} mark={}", self.heap.len(), self.gc_mark);
+        }
+        freed
+    }
+
+    /// Run up to `max` queued runnables (main + worker queues).
+    /// Returns how many completed — re-parked workers don't count.
+    pub fn drain_runnables(&mut self, max: usize) -> usize {
+        if self.draining {
+            return 0;
+        }
+        self.draining = true;
+        let mut ran = 0usize;
+        let dbg = std::env::var_os("OVELO_DRAINDBG").is_some();
+        for _ in 0..max {
+            let Some((r, on_main)) = self.pending_runnables.pop_front() else {
+                break;
+            };
+            let out = if on_main {
+                jdk::run_on_main(self, r)
+            } else {
+                jdk::run_on_worker(self, r)
+            };
+            if dbg {
+                match &out {
+                    Ok(_) => eprintln!("[drain] ran h={r} main={on_main}"),
+                    Err(e) => eprintln!("[drain] h={r} main={on_main} err={:?}", e),
+                }
+            }
+            match &out {
+                Err(e) if e.cause() == "ovelo.park" => {
+                    // A parked worker yields its slot and reschedules —
+                    // the runnable re-enters `run()` on a later drain
+                    // and re-scans its own work queue. A worker that
+                    // can never be woken (nothing feeds its queue)
+                    // spins repark→re-run forever, so after enough
+                    // consecutive parks stop requeueing it: it is
+                    // dropped, not killed — a later `enqueue_runnable`
+                    // of the same handle still runs it afresh.
+                    let n = self.repark_counts.entry(r).or_insert(0);
+                    *n += 1;
+                    if *n <= 64 {
+                        self.reparked.insert(r);
+                        self.pending_runnables.push_back((r, on_main));
+                    } else {
+                        self.reparked.remove(&r);
+                        // Parked out of the live queue — not gone: a
+                        // later `enqueue_runnable`/`unpark` re-arms it
+                        // so work posted to its queue still resumes it.
+                        self.parked_runnables.insert(r, on_main);
+                    }
+                }
+                _ => {
+                    ran += 1;
+                    self.reparked.remove(&r);
+                    self.repark_counts.remove(&r);
+                    self.park_spins = 0;
+                }
+            }
+        }
+        self.draining = false;
+        ran
+    }
+
+    /// Attach `child` under `parent` in the inflated-view tree — used
+    /// by the framework guest bridge when a `ViewGroup.addView` call
+    /// lands on a dex-inflated view rather than a host `GuestView`.
+    pub fn view_tree_add(&mut self, parent: u32, child: u32) {
+        if parent != 0 && child != 0 {
+            jdk::view::attach(self, parent, V::Ref(child));
+        }
+    }
+
+    /// Record `content` as `activity`'s content view in the view-tree
+    /// model (fallback for content the guest bridge doesn't map).
+    pub fn view_set_content(&mut self, activity: u32, content: u32) {
+        jdk::view::set_content_view(self, activity, V::Ref(content));
+    }
+
+    /// The handle `activity` last set as its content view, if any.
+    pub fn activity_content(&self, activity: u32) -> Option<u32> {
+        jdk::view::activity_content(self, activity)
+    }
+
+    /// Snapshot one node of the dex view tree for host rendering —
+    /// text, colors, layout params, visibility, listener, children.
+    pub fn dex_view(&self, h: u32) -> Option<jdk::view::DexViewInfo> {
+        jdk::view::dex_view_info(self, h)
+    }
+
+    /// Run the view's guest `onDraw(Canvas)` over a recording canvas
+    /// sized `(w, h)` and return the ops for host replay. Empty when
+    /// no class in the chain overrides `onDraw` or the call fails.
+    pub fn guest_draw_ops(&mut self, view: u32, w: i32, h: i32) -> Vec<crate::value::CanvasOp> {
+        jdk::gfx::guest_draw_ops(self, view, w, h)
+    }
+
+    /// Cheap P_IS_VIEW probe — `dex_view` builds full node info
+    /// (attrs, children, strings) and costs far more than callers
+    /// that only need to know whether a handle is a view.
+    pub fn is_dex_view(&self, h: u32) -> bool {
+        h != 0 && jdk::pseudo_get(self, h, jdk::view::P_IS_VIEW).is_some()
+    }
+
+    /// Does `h` have a dex-defined override of `name(params)` on its
+    /// class chain? Framework containers (RelativeLayout,
+    /// FrameLayout, LinearLayout) arrive as skeleton classes with no
+    /// methods, so a virtual call misses — builtins use this to pick
+    /// between the dex method and a generic framework fallback.
+    pub(crate) fn has_dex_virtual(&self, h: u32, name: &str, params: &[&str]) -> bool {
+        let Some(ci) = self.heap.class_of(h) else {
+            return false;
+        };
+        matches!(
+            self.find_method_on_chain_sig(ci, name, params),
+            Ok(Some(_))
+        )
+    }
+
+    /// The options `Menu` attached to an Activity — the runner hands it
+    /// to `onCreateOptionsMenu`/`onPrepareOptionsMenu` so guest menu
+    /// code lands on the same store `getMenu`/`findItem` reach.
+    pub fn menu_for(&mut self, activity: u32) -> V {
+        jdk::view::menu_of(self, activity)
+    }
+
+    /// Route the androidx `MenuBuilder`/`SubMenuBuilder` and
+    /// `MenuInflater.inflate` surface through the host menu model —
+    /// they ship in the APK as dex classes, so without overrides their
+    /// methods run guest code against fields the host never populated
+    /// (`findItem` returning null, `size` 0).
+    pub fn register_menu_overrides(&mut self) {
+        jdk::view::register_menu_overrides(self);
+    }
+
+    /// Whether the guest called `finish()` on this Activity — remaining
+    /// lifecycle callbacks (onStart/onResume/…) should be skipped.
+    pub fn is_finishing(&self, activity: u32) -> bool {
+        jdk::view::is_finishing(self, activity)
+    }
+    /// Record the launch Intent on an Activity the runner is about to
+    /// start — `Activity.getIntent` hands it back to guest code.
+    pub fn set_activity_intent(&mut self, activity: u32, intent: V) {
+        jdk::view::set_activity_intent(self, activity, intent);
+    }
+
     fn describe_throw(&self, h: u32) -> String {
+        self.describe_throw_inner(h, &mut std::collections::HashSet::new())
+    }
+
+    fn describe_throw_inner(&self, h: u32, seen: &mut std::collections::HashSet<u32>) -> String {
+        // Guest exceptions sometimes store themselves (or a cycle of
+        // wrappers) as their own cause — bound the walk.
+        if !seen.insert(h) {
+            return format!("object #{h}");
+        }
         let site = self
             .throw_sites
             .get(&h)
@@ -392,12 +1613,27 @@ impl Vm {
             Some(Obj::Throwable { descriptor, detail }) => {
                 format!("{descriptor}: {detail}{site}")
             }
-            Some(Obj::Instance { class_idx, .. }) => {
+            Some(Obj::Instance { class_idx, fields }) => {
                 let base = self
-                    .dex
-                    .type_descriptor(*class_idx)
+                    .type_desc_of(*class_idx)
                     .unwrap_or_else(|_| format!("object #{h}"));
-                format!("guest throwable {base}{site}")
+                // Guest wrappers (RuntimeException(cause)) bury the real
+                // failure — surface stored messages and wrapped throwables.
+                let mut extra = String::new();
+                for v in fields.values() {
+                    if let V::Ref(fh) = v {
+                        match self.heap.get(*fh) {
+                            Some(Obj::Str(t)) if !t.is_empty() => {
+                                extra.push_str(&format!(": {t}"));
+                            }
+                            Some(Obj::Throwable { descriptor, detail }) => {
+                                extra.push_str(&format!(" caused by {descriptor}: {detail}"));
+                            }
+                            _ => {}
+                        }
+                    }
+                }
+                format!("guest throwable {base}{extra}{site}")
             }
             Some(Obj::Host { desc, .. }) => {
                 let msg = jdk::pseudo_get(self, h, jdk::P_DATA)
@@ -407,7 +1643,13 @@ impl Vm {
                     })
                     .map(|t| format!(": {t}"))
                     .unwrap_or_default();
-                format!("host throwable {desc}{msg}{site}")
+                let cause = match jdk::pseudo_get(self, h, jdk::P_TARGET) {
+                    Some(V::Ref(c)) if c != 0 && c != h => {
+                        format!(" caused by {}", self.describe_throw_inner(c, seen))
+                    }
+                    _ => String::new(),
+                };
+                format!("host throwable {desc}{msg}{cause}{site}")
             }
             _ => format!("object #{h}"),
         };
@@ -423,29 +1665,61 @@ impl Vm {
 
     /// `Lcls;.name(params)ret` for error details — an unresolved call
     /// must name the API it needed (compat reports key off this).
-    fn describe_method(&self, midx: u32) -> String {
-        let fmt = || -> Result<String> {
-            let mid = self.dex.method(midx)?;
-            let class = self.dex.type_descriptor(mid.class_idx as u32)?;
-            let name = self.dex.string(mid.name_idx)?;
-            let p = self.dex.proto(mid.proto_idx as u32)?;
-            let mut sig = String::from("(");
-            for t in self.dex.proto_params(p)? {
-                sig.push_str(&self.dex.type_descriptor(t as u32)?);
+    fn describe_method(&self, midx: GIdx) -> std::rc::Rc<str> {
+        if let Some(hit) = self.method_desc_cache.borrow().get(&midx) {
+            return hit.clone();
+        }
+        let s: std::rc::Rc<str> = self
+            .method_sig(midx)
+            .map(|(class, name, sig)| format!("{class}.{name}{sig}"))
+            .unwrap_or_else(|_| format!("method@{midx}"))
+            .into();
+        self.method_desc_cache
+            .borrow_mut()
+            .insert(midx, s.clone());
+        s
+    }
+
+    /// Innermost-first chain of live guest frames for throw-site
+    /// diagnostics — `Luv0;.t <- DateTimeFormatter;.parseDateTime <-
+    /// Lgt1;.g0`. Consecutive repeats collapse (recursion) and the
+    /// string is length-capped so recursive call paths stay readable.
+    fn throw_site_desc(&self) -> String {
+        let mut out = String::new();
+        let mut prev = None;
+        for &midx in self.stack.iter().rev() {
+            if Some(midx) == prev {
+                continue;
             }
-            sig.push(')');
-            sig.push_str(&self.dex.type_descriptor(p.return_type_idx)?);
-            Ok(format!("{class}.{name}{sig}"))
-        };
-        fmt().unwrap_or_else(|_| format!("method@{midx}"))
+            prev = Some(midx);
+            if !out.is_empty() {
+                out.push_str(" <- ");
+            }
+            out.push_str(&self.describe_method(midx));
+            if out.len() > 700 {
+                out.push_str(" <- ...");
+                break;
+            }
+        }
+        out
+    }
+
+    /// Live call stack as `Lcls;.name(sig)ret` strings, newest frame
+    /// last — jdk shims read it to build guest stack traces.
+    pub(crate) fn describe_stack(&self) -> Vec<String> {
+        self.stack
+            .iter()
+            .map(|&m| self.describe_method(m).to_string())
+            .collect()
     }
 
     /// `Lcls;.name` for a field ref — error details identify the field.
-    fn describe_field(&self, fidx: u32) -> String {
+    fn describe_field(&self, fidx: GIdx) -> String {
         let fmt = || -> Result<String> {
-            let f = self.dex.field(fidx)?;
-            let class = self.dex.type_descriptor(f.class_idx as u32)?;
-            let name = self.dex.string(f.name_idx)?;
+            let d = self.dex_of(fidx).ok_or_else(|| err("dexrt.field.id"))?;
+            let f = d.field(gl(fidx))?;
+            let class = d.type_descriptor(f.class_idx as u32)?;
+            let name = d.string(f.name_idx)?;
             Ok(format!("{class}.{name}"))
         };
         fmt().unwrap_or_else(|_| format!("field@{fidx}"))
@@ -455,24 +1729,32 @@ impl Vm {
     /// inherited callback (e.g. onCreate on a DEX parent) still runs.
     fn find_method_on_chain(
         &self,
-        mut class_idx: u32,
+        mut class_idx: GIdx,
         name: &str,
         nslots: usize,
-    ) -> Result<Option<u32>> {
-        for _ in 0..64 {
-            let Some(def) = self.def_of(class_idx) else {
-                return Ok(None);
-            };
-            let desc = self.dex.type_descriptor(def.class_idx)?;
-            if let Some(m) = self.find_method_by_name(&desc, name, nslots)? {
-                return Ok(Some(m));
-            }
-            if def.superclass_idx == u32::MAX {
-                return Ok(None);
-            }
-            class_idx = def.superclass_idx;
+    ) -> Result<Option<GIdx>> {
+        let key = (class_idx, name.to_string(), nslots);
+        if let Some(hit) = self.named_chain_cache.borrow().get(&key) {
+            return Ok(*hit);
         }
-        Ok(None)
+        let mut out = None;
+        for _ in 0..64 {
+            let Some((cg, def)) = self.def_loc_of(class_idx) else {
+                break;
+            };
+            let sup = def.superclass_idx;
+            let desc = self.type_desc_of(cg)?;
+            if let Some(m) = self.find_method_by_name(&desc, name, nslots)? {
+                out = Some(m);
+                break;
+            }
+            if sup == u32::MAX {
+                break;
+            }
+            class_idx = gx(gd(cg), sup);
+        }
+        self.named_chain_cache.borrow_mut().insert(key, out);
+        Ok(out)
     }
 
     /// First method `name` on `class_desc` whose params occupy exactly
@@ -483,64 +1765,261 @@ impl Vm {
         class_desc: &str,
         name: &str,
         nslots: usize,
-    ) -> Result<Option<u32>> {
-        for (i, def) in self.dex.class_defs().iter().enumerate() {
-            let _ = i;
-            if self.dex.type_descriptor(def.class_idx)? != class_desc {
+    ) -> Result<Option<GIdx>> {
+        let Some(&(di, def_i)) = self.defs.get(class_desc) else {
+            return Ok(None);
+        };
+        let d = &self.dexes[di];
+        let def = &d.class_defs()[def_i];
+        let cd = d.class_data_rc(def)?;
+        for m in cd.direct_methods.iter().chain(cd.virtual_methods.iter()) {
+            let mid = d.method(m.method_idx)?;
+            if d.string(mid.name_idx)? != name {
                 continue;
             }
-            let cd = self.dex.class_data(def)?;
-            for m in cd.direct_methods.iter().chain(cd.virtual_methods.iter()) {
-                let mid = self.dex.method(m.method_idx)?;
-                if self.dex.string(mid.name_idx)? != name {
-                    continue;
-                }
-                let p = self.dex.proto(mid.proto_idx as u32)?;
-                let mut slots = 0usize;
-                for t in self.dex.proto_params(p)? {
-                    let d = self.dex.type_descriptor(t as u32)?;
-                    slots += if d.starts_with('J') || d.starts_with('D') { 2 } else { 1 };
-                }
-                if slots == nslots {
-                    return Ok(Some(m.method_idx));
-                }
+            let p = d.proto(mid.proto_idx as u32)?;
+            let mut slots = 0usize;
+            for t in d.proto_params(p)? {
+                let ty = d.type_descriptor(t as u32)?;
+                slots += if ty.starts_with('J') || ty.starts_with('D') { 2 } else { 1 };
+            }
+            if slots == nslots {
+                return Ok(Some(gx(di, m.method_idx)));
             }
         }
         Ok(None)
     }
 
-    fn def_of(&self, class_idx: u32) -> Option<&ClassDef> {
-        self.defs.get(&class_idx).map(|&i| &self.dex.class_defs()[i])
+    /// Whether `desc` names a class defined by a loaded dex — host
+    /// classes (`Ljava/lang/String;`, `Landroid/view/View;`, …) have
+    /// no def, so signature-based lookups can't apply to them.
+    pub(crate) fn is_dex_class(&self, class_desc: &str) -> bool {
+        self.defs.contains_key(class_desc)
     }
 
-    fn class_data_of(&self, class_idx: u32) -> Result<Option<ClassData>> {
-        match self.def_of(class_idx) {
-            Some(d) => Ok(Some(self.dex.class_data(d)?)),
+    /// `<init>` on `class_desc` whose declared parameter descriptors
+    /// equal `params` exactly — what `Class.getConstructor(sig)`
+    /// resolves by signature rather than slot count.
+    pub(crate) fn find_ctor_sig(
+        &self,
+        class_desc: &str,
+        params: &[String],
+    ) -> Result<Option<GIdx>> {
+        let Some(&(di, def_i)) = self.defs.get(class_desc) else {
+            return Ok(None);
+        };
+        let d = &self.dexes[di];
+        let def = &d.class_defs()[def_i];
+        let cd = d.class_data_rc(def)?;
+        for m in cd.direct_methods.iter().chain(cd.virtual_methods.iter()) {
+            let mid = d.method(m.method_idx)?;
+            if d.string(mid.name_idx)? != "<init>" {
+                continue;
+            }
+            let p = d.proto(mid.proto_idx as u32)?;
+            let got: Vec<String> = d
+                .proto_params(p)?
+                .iter()
+                .filter_map(|t| d.type_descriptor(*t as u32).ok())
+                .collect();
+            if got == params {
+                return Ok(Some(gx(di, m.method_idx)));
+            }
+        }
+        Ok(None)
+    }
+
+    /// Method `name` on `class_desc` whose declared params equal
+    /// `params` exactly — overloads sharing a slot count (like
+    /// `generateLayoutParams(AttributeSet)` vs `(LayoutParams)`)
+    /// need the signature, not just arity.
+    pub(crate) fn find_method_by_sig(
+        &self,
+        class_desc: &str,
+        name: &str,
+        params: &[&str],
+    ) -> Result<Option<GIdx>> {
+        let Some(&(di, def_i)) = self.defs.get(class_desc) else {
+            return Ok(None);
+        };
+        let d = &self.dexes[di];
+        let def = &d.class_defs()[def_i];
+        let cd = d.class_data_rc(def)?;
+        for m in cd.direct_methods.iter().chain(cd.virtual_methods.iter()) {
+            let mid = d.method(m.method_idx)?;
+            if d.string(mid.name_idx)? != name {
+                continue;
+            }
+            let p = d.proto(mid.proto_idx as u32)?;
+            let got: Vec<String> = d
+                .proto_params(p)?
+                .iter()
+                .filter_map(|t| d.type_descriptor(*t as u32).ok())
+                .collect();
+            if got.iter().map(String::as_str).eq(params.iter().copied()) {
+                return Ok(Some(gx(di, m.method_idx)));
+            }
+        }
+        Ok(None)
+    }
+
+    /// Walk `class_idx`'s superclass chain for a signature-exact
+    /// `name(params)` — like [`find_method_on_chain`] but resolved by
+    /// signature rather than slot count.
+    pub(crate) fn find_method_on_chain_sig(
+        &self,
+        mut class_idx: GIdx,
+        name: &str,
+        params: &[&str],
+    ) -> Result<Option<GIdx>> {
+        for _ in 0..64 {
+            let Some((cg, def)) = self.def_loc_of(class_idx) else {
+                break;
+            };
+            let sup = def.superclass_idx;
+            let desc = self.type_desc_of(cg)?;
+            if let Some(m) = self.find_method_by_sig(&desc, name, params)? {
+                return Ok(Some(m));
+            }
+            if sup == u32::MAX {
+                return Ok(None);
+            }
+            class_idx = gx(gd(cg), sup);
+        }
+        Ok(None)
+    }
+
+    /// [`call_virtual`] resolved by exact parameter descriptors —
+    /// host callers that know the overload signature (framework
+    /// contract methods like `generateLayoutParams(AttributeSet)`).
+    /// Falls back to the builtin dispatcher when no dex override exists.
+    pub fn call_virtual_sig(
+        &mut self,
+        this: u32,
+        name: &str,
+        params: &[&str],
+        args: &[V],
+    ) -> Result<Option<V>> {
+        let ci = self
+            .heap
+            .class_of(this)
+            .ok_or_else(|| errd("dexrt.bad_this", name.to_string()))?;
+        let Some(midx) = self.find_method_on_chain_sig(ci, name, params)? else {
+            let desc = self.type_desc_of(ci).unwrap_or_default();
+            let mut a = Vec::with_capacity(args.len() + 1);
+            a.push(V::Ref(this));
+            a.extend_from_slice(args);
+            let r = jdk::call(self, &desc, name, "", &a).map_err(|e| match e {
+                E::Vm(v) => v,
+                E::Throw(t) => {
+                    let d = self.describe_throw(t);
+                    errd("dexrt.exception.uncaught", d)
+                }
+            })?;
+            return Ok(r.flatten());
+        };
+        let mut a = Vec::with_capacity(args.len() + 1);
+        a.push(V::Ref(this));
+        a.extend_from_slice(args);
+        let out = match self.invoke(midx, a, InvokeKind::Virtual) {
+            Ok(v) => Ok(v),
+            Err(E::Vm(e)) => Err(e),
+            Err(E::Throw(r)) => {
+                let d = self.describe_throw(r);
+                Err(errd("dexrt.exception.uncaught", d))
+            }
+        };
+        if self.depth == 0 {
+            self.drain_runnables(500);
+        }
+        out
+    }
+
+    /// Declared parameter descriptors of the method `midx` names.
+    pub(crate) fn method_params(&self, midx: GIdx) -> Vec<String> {
+        let Some(d) = self.dex_of(midx) else {
+            return Vec::new();
+        };
+        let Ok(mid) = d.method(gl(midx)) else {
+            return Vec::new();
+        };
+        let Ok(p) = d.proto(mid.proto_idx as u32) else {
+            return Vec::new();
+        };
+        d.proto_params(p)
+            .map(|list| {
+                list.iter()
+                    .filter_map(|t| d.type_descriptor(*t as u32).ok())
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
+
+    fn def_of(&self, class_idx: GIdx) -> Option<&ClassDef> {
+        self.def_loc_of(class_idx).map(|(_, d)| d)
+    }
+
+    fn class_data_of(&self, class_idx: GIdx) -> Result<Option<std::rc::Rc<ClassData>>> {
+        match self.def_loc_of(class_idx) {
+            Some((cg, d)) => Ok(Some(
+                self.dex_of(cg)
+                    .ok_or_else(|| err("dexrt.dex.idx"))?
+                    .class_data_rc(d)?,
+            )),
             None => Ok(None),
         }
     }
 
-    /// `sub` assignable to `sup` through the superclass chain (interfaces are
-    /// matched at each level but not walked — P1 scope).
-    fn assignable(&self, sub: u32, sup: u32) -> bool {
-        if sub == sup {
+    /// `sub` assignable to `sup` through the superclass chain, with
+    /// interfaces walked transitively (a class may implement a
+    /// sub-interface of `sup` or reach `sup` through another interface).
+    pub(crate) fn assignable(&self, sub: GIdx, sup: GIdx) -> bool {
+        if let Some(hit) = self.assignable_cache.borrow().get(&(sub, sup)) {
+            return *hit;
+        }
+        let out = self.assignable_uncached(sub, sup);
+        self.assignable_cache.borrow_mut().insert((sub, sup), out);
+        out
+    }
+
+    fn assignable_uncached(&self, sub: GIdx, sup: GIdx) -> bool {
+        // Cross-dex identity is by descriptor: the same class may be a
+        // different GIdx in every dex that references it.
+        let sup_desc = self.type_desc_of(sup).unwrap_or_default();
+        let same = |g: GIdx| -> bool {
+            match self.type_desc_of(g) {
+                Ok(d) => d == sup_desc,
+                Err(_) => g == sup,
+            }
+        };
+        if same(sub) {
             return true;
         }
+        let mut ifaces: Vec<GIdx> = Vec::new();
+        let mut seen: Vec<String> = Vec::new();
         let mut cur = sub;
-        for _ in 0..64 {
-            match self.def_of(cur) {
-                Some(def) => {
+        'cls: for _ in 0..64 {
+            match self.def_loc_of(cur) {
+                Some((cg, def)) => {
                     if def.interfaces_off != 0 {
-                        if let Ok(list) = self.dex.type_list(def.interfaces_off) {
-                            if list.contains(&(sup as u16)) {
-                                return true;
+                        if let Some(d) = self.dex_of(cg) {
+                            if let Ok(list) = d.type_list(def.interfaces_off) {
+                                for i in list {
+                                    let gi = gx(gd(cg), i as u32);
+                                    let id = self.type_desc_of(gi).unwrap_or_default();
+                                    if !seen.contains(&id) {
+                                        seen.push(id);
+                                        ifaces.push(gi);
+                                    }
+                                }
                             }
                         }
                     }
-                    cur = def.superclass_idx;
-                    if cur == u32::MAX {
+                    let sup_l = def.superclass_idx;
+                    if sup_l == u32::MAX {
                         break;
                     }
+                    cur = gx(gd(cg), sup_l);
                 }
                 None => {
                     // Host framework class — no class_def; walk the
@@ -548,17 +2027,25 @@ impl Vm {
                     // classes may be absent from the DEX's type table
                     // (e.g. CustomButton extends Button but never names
                     // TextView), so keep going until `sup` or a dead end.
-                    let Ok(mut d) = self.dex.type_descriptor(cur) else { break };
-                    let sup_desc = self.dex.type_descriptor(sup).unwrap_or_default();
+                    let Ok(mut d) = self.type_desc_of(cur) else {
+                        break;
+                    };
                     loop {
-                        if d == sup_desc {
+                        if d == sup_desc || jdk::host_supers(&d).iter().any(|s| *s == sup_desc) {
                             return true;
                         }
                         let Some(next) = Self::framework_super(&d) else {
-                            return false;
+                            // Dead end on the host side — the collected
+                            // interfaces may still satisfy `sup`.
+                            break 'cls;
                         };
-                        match self.dex.type_index_of(next) {
-                            Ok(Some(next)) => {
+                        if next == d {
+                            // Self-referential supers entry would loop
+                            // forever — treat as a dead end.
+                            break 'cls;
+                        }
+                        match self.type_index_of(next) {
+                            Some(next) => {
                                 cur = next;
                                 break;
                             }
@@ -567,8 +2054,38 @@ impl Vm {
                     }
                 }
             }
-            if cur == sup {
+            if same(cur) {
                 return true;
+            }
+        }
+        // Transitive interface walk: an interface's own `interfaces_off`
+        // lists its super-interfaces.
+        while let Some(i) = ifaces.pop() {
+            if same(i) {
+                return true;
+            }
+            if let Some((cg, def)) = self.def_loc_of(i) {
+                if def.interfaces_off != 0 {
+                    if let Some(d) = self.dex_of(cg) {
+                        if let Ok(list) = d.type_list(def.interfaces_off) {
+                            for j in list {
+                                let gj = gx(gd(cg), j as u32);
+                                let id = self.type_desc_of(gj).unwrap_or_default();
+                                if !seen.contains(&id) {
+                                    seen.push(id);
+                                    ifaces.push(gj);
+                                }
+                            }
+                        }
+                    }
+                }
+            } else if let Ok(id) = self.type_desc_of(i) {
+                // JDK interface absent from the dex (java.util.Set,
+                // Iterable, …) — its super-interfaces live in the
+                // builtin/host tables.
+                if self.assignable_desc(&id, &sup_desc) {
+                    return true;
+                }
             }
         }
         false
@@ -588,7 +2105,8 @@ impl Vm {
             | "Ljava/lang/IndexOutOfBoundsException;"
             | "Ljava/lang/ArithmeticException;"
             | "Ljava/lang/ClassCastException;"
-            | "Ljava/lang/NegativeArraySizeException;" => &[
+            | "Ljava/lang/NegativeArraySizeException;"
+            | "Ljava/util/NoSuchElementException;" => &[
                 "Ljava/lang/RuntimeException;",
                 "Ljava/lang/Exception;",
                 "Ljava/lang/Throwable;",
@@ -616,24 +2134,18 @@ impl Vm {
                 "Ljava/lang/Throwable;",
                 "Ljava/lang/Object;",
             ],
-            "Ljava/lang/Exception;" | "Ljava/lang/Error;" => &[
-                "Ljava/lang/Throwable;",
-                "Ljava/lang/Object;",
-            ],
+            "Ljava/lang/Exception;" | "Ljava/lang/Error;" => {
+                &["Ljava/lang/Throwable;", "Ljava/lang/Object;"]
+            }
             "Ljava/lang/Throwable;" => &["Ljava/lang/Object;"],
             _ => &[],
         }
     }
 
-    /// Allocate a host-provided object: `class_idx` is `u32::MAX` when the
-    /// DEX never references the type (builtin-created helpers).
+    /// Allocate a host-provided object: `class_idx` is `GX_NONE` when no
+    /// dex references the type (builtin-created helpers).
     pub(crate) fn alloc_host(&mut self, desc: &str, state: HostState) -> u32 {
-        let class_idx = self
-            .dex
-            .type_index_of(desc)
-            .ok()
-            .flatten()
-            .unwrap_or(u32::MAX);
+        let class_idx = self.type_index_of(desc).unwrap_or(GX_NONE);
         self.heap.alloc(Obj::Host {
             class_idx,
             desc: desc.to_string(),
@@ -648,18 +2160,38 @@ impl Vm {
             .duration_since(std::time::UNIX_EPOCH)
             .map(|d| d.as_millis() as i64)
             .unwrap_or(0);
+        // Desugared `j$.*` collections mirror the `java.util` family.
+        let canon;
+        let desc = if desc.starts_with("Lj$/util/") {
+            canon = desc.replacen("Lj$/util/", "Ljava/util/", 1);
+            canon.as_str()
+        } else {
+            desc
+        };
         match desc {
             "Ljava/lang/StringBuilder;" | "Ljava/lang/StringBuffer;" => {
                 HostState::StrBuf(String::new())
             }
-            "Ljava/util/ArrayList;" | "Ljava/util/LinkedList;" | "Ljava/util/Vector;"
-            | "Ljava/util/Stack;" | "Ljava/util/HashSet;" | "Ljava/util/LinkedHashSet;"
-            | "Ljava/util/TreeSet;" | "Ljava/util/ArrayDeque;" | "Ljava/util/BitSet;"
-            | "Ljava/util/PriorityQueue;" | "Ljava/util/AbstractCollection;"
-            | "Ljava/util/AbstractList;" | "Ljava/util/AbstractSet;"
-            | "Ljava/util/AbstractQueue;" | "Ljava/util/AbstractSequentialList;"
-            | "Ljava/util/Arrays$ArrayList;" | "Ljava/util/Collections$EmptyList;"
-            | "Ljava/util/Collections$EmptySet;" | "Ljava/util/Collections$SingletonList;"
+            "Ljava/util/ArrayList;"
+            | "Ljava/util/LinkedList;"
+            | "Ljava/util/Vector;"
+            | "Ljava/util/Stack;"
+            | "Ljava/util/HashSet;"
+            | "Ljava/util/EnumSet;"
+            | "Ljava/util/LinkedHashSet;"
+            | "Ljava/util/TreeSet;"
+            | "Ljava/util/ArrayDeque;"
+            | "Ljava/util/BitSet;"
+            | "Ljava/util/PriorityQueue;"
+            | "Ljava/util/AbstractCollection;"
+            | "Ljava/util/AbstractList;"
+            | "Ljava/util/AbstractSet;"
+            | "Ljava/util/AbstractQueue;"
+            | "Ljava/util/AbstractSequentialList;"
+            | "Ljava/util/Arrays$ArrayList;"
+            | "Ljava/util/Collections$EmptyList;"
+            | "Ljava/util/Collections$EmptySet;"
+            | "Ljava/util/Collections$SingletonList;"
             | "Ljava/util/Collections$SingletonSet;"
             | "Ljava/util/concurrent/CopyOnWriteArrayList;"
             | "Ljava/util/concurrent/CopyOnWriteArraySet;"
@@ -668,36 +2200,65 @@ impl Vm {
             | "Ljava/util/concurrent/LinkedBlockingQueue;"
             | "Ljava/util/concurrent/LinkedBlockingDeque;"
             | "Ljava/util/concurrent/ArrayBlockingQueue;"
-            | "Ljava/util/concurrent/PriorityBlockingQueue;" | "Landroid/util/ArraySet;" => {
-                HostState::List(Vec::new())
-            }
-            "Ljava/util/HashMap;" | "Ljava/util/LinkedHashMap;" | "Ljava/util/Hashtable;"
-            | "Ljava/util/TreeMap;" | "Ljava/util/WeakHashMap;" | "Ljava/util/IdentityHashMap;"
-            | "Ljava/util/EnumMap;" | "Ljava/util/Properties;" | "Ljava/util/AbstractMap;"
-            | "Ljava/util/Collections$EmptyMap;" | "Ljava/util/Collections$SingletonMap;"
+            | "Ljava/util/concurrent/PriorityBlockingQueue;"
+            | "Landroid/util/ArraySet;" => HostState::List(Vec::new()),
+            "Ljava/util/HashMap;"
+            | "Ljava/util/LinkedHashMap;"
+            | "Ljava/util/Hashtable;"
+            | "Ljava/util/TreeMap;"
+            | "Ljava/util/WeakHashMap;"
+            | "Ljava/util/IdentityHashMap;"
+            | "Ljava/util/EnumMap;"
+            | "Ljava/util/Properties;"
+            | "Ljava/util/AbstractMap;"
+            | "Ljava/util/Collections$EmptyMap;"
+            | "Ljava/util/Collections$SingletonMap;"
             | "Ljava/util/concurrent/ConcurrentHashMap;"
-            | "Ljava/util/concurrent/ConcurrentSkipListMap;" | "Landroid/util/ArrayMap;"
-            | "Landroid/util/SparseArray;" | "Landroid/util/SparseIntArray;"
-            | "Landroid/util/SparseBooleanArray;" | "Landroid/util/LongSparseArray;"
-            | "Landroid/util/LruCache;" | "Landroid/os/Bundle;" | "Landroid/os/BaseBundle;"
-            | "Landroid/os/PersistableBundle;" | "Landroid/content/Intent;" => {
-                HostState::Map(Vec::new())
-            }
-            "Ljava/util/Calendar;" | "Ljava/util/GregorianCalendar;" | "Ljava/util/Date;"
-            | "Ljava/time/Instant;" | "Ljava/sql/Date;" | "Ljava/sql/Timestamp;"
+            | "Ljava/util/concurrent/ConcurrentSkipListMap;"
+            | "Landroid/util/ArrayMap;"
+            | "Landroid/util/SparseArray;"
+            | "Landroid/util/SparseIntArray;"
+            | "Landroid/util/SparseBooleanArray;"
+            | "Landroid/util/LongSparseArray;"
+            | "Landroid/util/LruCache;"
+            | "Landroid/os/Bundle;"
+            | "Landroid/os/BaseBundle;"
+            | "Landroid/os/PersistableBundle;"
+            | "Landroid/content/Intent;" => HostState::Map(Vec::new()),
+            "Ljava/util/Calendar;"
+            | "Ljava/util/GregorianCalendar;"
+            | "Ljava/util/Date;"
+            | "Ljava/time/Instant;"
+            | "Ljava/sql/Date;"
+            | "Ljava/sql/Timestamp;"
             | "Ljava/sql/Time;" => HostState::Millis(now_ms),
-            "Ljava/util/Random;" | "Ljava/security/SecureRandom;"
-            | "Ljava/util/concurrent/ThreadLocalRandom;" | "Ljava/util/SplittableRandom;" => {
+            "Ljava/util/Random;"
+            | "Ljava/security/SecureRandom;"
+            | "Ljava/util/concurrent/ThreadLocalRandom;"
+            | "Ljava/util/SplittableRandom;" => {
                 HostState::Slot(V::I64(0x9E3779B97F4A7C15_u64 as i64))
             }
-            "Ljava/lang/Integer;" | "Ljava/lang/Long;" | "Ljava/lang/Short;"
-            | "Ljava/lang/Byte;" | "Ljava/lang/Float;" | "Ljava/lang/Double;"
-            | "Ljava/lang/Boolean;" | "Ljava/lang/Character;" | "Ljava/lang/Void;"
-            | "Ljava/lang/Thread;" | "Ljava/lang/ThreadLocal;"
-            | "Ljava/lang/InheritableThreadLocal;" | "Ljava/lang/ref/WeakReference;"
-            | "Ljava/lang/ref/SoftReference;" | "Ljava/lang/ref/PhantomReference;"
-            | "Ljava/util/Optional;" | "Ljava/util/OptionalInt;" | "Ljava/util/OptionalLong;"
-            | "Ljava/util/OptionalDouble;" | "Landroid/util/Pair;" | "Landroid/util/MutableInt;"
+            "Ljava/lang/Integer;"
+            | "Ljava/lang/Long;"
+            | "Ljava/lang/Short;"
+            | "Ljava/lang/Byte;"
+            | "Ljava/lang/Float;"
+            | "Ljava/lang/Double;"
+            | "Ljava/lang/Boolean;"
+            | "Ljava/lang/Character;"
+            | "Ljava/lang/Void;"
+            | "Ljava/lang/Thread;"
+            | "Ljava/lang/ThreadLocal;"
+            | "Ljava/lang/InheritableThreadLocal;"
+            | "Ljava/lang/ref/WeakReference;"
+            | "Ljava/lang/ref/SoftReference;"
+            | "Ljava/lang/ref/PhantomReference;"
+            | "Ljava/util/Optional;"
+            | "Ljava/util/OptionalInt;"
+            | "Ljava/util/OptionalLong;"
+            | "Ljava/util/OptionalDouble;"
+            | "Landroid/util/Pair;"
+            | "Landroid/util/MutableInt;"
             | "Ljava/util/concurrent/atomic/AtomicReference;"
             | "Ljava/util/concurrent/atomic/AtomicInteger;"
             | "Ljava/util/concurrent/atomic/AtomicLong;"
@@ -707,17 +2268,20 @@ impl Vm {
             | "Ljava/util/concurrent/atomic/AtomicReferenceFieldUpdater;"
             | "Ljava/util/concurrent/atomic/AtomicIntegerFieldUpdater;"
             | "Ljava/util/concurrent/atomic/AtomicLongFieldUpdater;"
-            | "Ljava/util/concurrent/CountDownLatch;" | "Ljava/util/concurrent/Semaphore;"
+            | "Ljava/util/concurrent/CountDownLatch;"
+            | "Ljava/util/concurrent/Semaphore;"
             | "Landroid/os/Message;" => HostState::Slot(V::I32(0)),
             "Ljava/io/File;" => HostState::Path(String::new()),
             "Lorg/json/JSONObject;" => HostState::Map(Vec::new()),
             "Lorg/json/JSONArray;" => HostState::List(Vec::new()),
-            "Ljava/util/regex/Pattern;" | "Ljava/util/regex/Matcher;"
-            | "Ljava/text/SimpleDateFormat;" | "Ljava/text/DateFormat;"
-            | "Ljava/text/DecimalFormat;" | "Ljava/text/NumberFormat;"
-            | "Ljava/text/MessageFormat;" | "Ljava/time/format/DateTimeFormatter;" => {
-                HostState::Regex(String::new())
-            }
+            "Ljava/util/regex/Pattern;"
+            | "Ljava/util/regex/Matcher;"
+            | "Ljava/text/SimpleDateFormat;"
+            | "Ljava/text/DateFormat;"
+            | "Ljava/text/DecimalFormat;"
+            | "Ljava/text/NumberFormat;"
+            | "Ljava/text/MessageFormat;"
+            | "Ljava/time/format/DateTimeFormatter;" => HostState::Regex(String::new()),
             _ => HostState::Empty,
         }
     }
@@ -725,65 +2289,123 @@ impl Vm {
     /// A static field on a host-provided class (called when the owner has
     /// no class_def and no stored value — `Build.VERSION.SDK_INT`,
     /// `StandardCharsets.UTF_8`, `Boolean.TRUE`, …).
-    fn builtin_sfield(&mut self, f: u32) -> Option<V> {
-        let fd = self.dex.field(f).ok()?;
-        let owner = self.dex.type_descriptor(fd.class_idx as u32).ok()?;
-        let name = self.dex.string(fd.name_idx).ok()?;
-        jdk::sfield(self, &owner, &name)
+    fn builtin_sfield(&mut self, f: GIdx) -> Option<V> {
+        let d = self.dex_of(f)?;
+        let fd = d.field(gl(f)).ok()?;
+        let owner = d.type_descriptor(fd.class_idx as u32).ok()?;
+        let name = d.string(fd.name_idx).ok()?;
+        let fty = d.type_descriptor(fd.type_idx as u32).unwrap_or_default();
+        jdk::sfield(self, &owner, &name, &fty)
     }
 
     /// A named field exposed by a host object (`PackageInfo.versionCode`,
     /// `Message.what`, `Pair.first`…) — read when `iget` misses `fields`.
-    fn builtin_ifield(&self, h: u32, f: u32) -> Option<V> {
+    fn builtin_ifield(&self, h: u32, f: GIdx) -> Option<V> {
         let Some(Obj::Host { .. }) = self.heap.get(h) else {
             return None;
         };
-        let fd = self.dex.field(f).ok()?;
-        let owner = self.dex.type_descriptor(fd.class_idx as u32).ok()?;
-        let name = self.dex.string(fd.name_idx).ok()?;
+        let d = self.dex_of(f)?;
+        let fd = d.field(gl(f)).ok()?;
+        let owner = d.type_descriptor(fd.class_idx as u32).ok()?;
+        let name = d.string(fd.name_idx).ok()?;
         jdk::ifield(self, h, &owner, &name)
     }
 
     /// Descriptor-level assignability for host objects whose class_idx is
     /// absent from the DEX: consults the builtin super tables.
-    fn assignable_desc(&self, sub: &str, sup: &str) -> bool {
+    pub(crate) fn assignable_desc(&self, sub: &str, sup: &str) -> bool {
         if sub == sup || sup == "Ljava/lang/Object;" {
             return true;
         }
         if Self::builtin_supers(sub).contains(&sup) || jdk::host_supers(sub).contains(&sup) {
             return true;
         }
+        // `super_desc` resolves dex class_defs first, then host_supers —
+        // a dex ViewGroup subclass (custom RecyclerView etc.) walks
+        // through androidx up to the framework class.
         let mut d = sub.to_string();
         for _ in 0..32 {
-            let Some(next) = Self::framework_super(&d) else {
+            let Some(next) = self.super_desc(&d) else {
                 return false;
             };
             if next == sup {
                 return true;
             }
-            d = next.to_string();
+            if next == d {
+                return false;
+            }
+            d = next;
         }
         false
     }
 
+    /// Element-type assignability for array covariance: `sub[]` casts to
+    /// `sup[]` when each element of `sub` is assignable to `sup`. Only
+    /// reference types are covariant — `[I` never matches `[J` or
+    /// `[Ljava/lang/Object;`.
+    fn elem_assignable(&self, sub: &str, sup: &str) -> bool {
+        if sub == sup {
+            return true;
+        }
+        match (sub.strip_prefix('['), sup.strip_prefix('[')) {
+            (Some(s), Some(p)) => self.elem_assignable(s, p),
+            (Some(_), None) | (None, Some(_)) => false,
+            (None, None) => {
+                if !sub.starts_with('L') || !sup.starts_with('L') {
+                    return false; // primitive element: equality only
+                }
+                if sup == "Ljava/lang/Object;"
+                    || sup == "Ljava/lang/Cloneable;"
+                    || sup == "Ljava/io/Serializable;"
+                {
+                    return true;
+                }
+                // Dex-class element → walk its hierarchy for the sup.
+                if let (Some(a), Some(b)) = (self.type_index_of(sub), self.type_index_of(sup)) {
+                    if self.assignable(a, b) {
+                        return true;
+                    }
+                }
+                self.assignable_desc(sub, sup)
+            }
+        }
+    }
+
     /// Is `h` (non-null) an instance of `type_idx`'s descriptor?
-    fn is_instance(&self, h: u32, type_idx: u32) -> bool {
-        let Ok(sup) = self.dex.type_descriptor(type_idx) else {
+    fn is_instance(&self, h: u32, type_idx: GIdx) -> bool {
+        let Ok(sup) = self.type_desc_of(type_idx) else {
             return false;
         };
         match self.heap.get(h) {
             Some(Obj::Instance { class_idx, .. }) => self.assignable(*class_idx, type_idx),
             Some(Obj::Host {
-                class_idx, desc, ..
+                class_idx,
+                desc,
+                fields,
+                ..
             }) => {
-                (*class_idx != u32::MAX && self.assignable(*class_idx, type_idx))
+                // Inflated views may carry a class the hierarchy model
+                // can't trace (custom tags, unknown androidx widgets); the
+                // inflater marks their real kind on pseudo fields.
+                let marked = |key: u32| fields.contains_key(&(key as u64));
+                (*class_idx != GX_NONE && self.assignable(*class_idx, type_idx))
                     || self.assignable_desc(desc, &sup)
+                    || (sup == "Landroid/view/View;" && marked(jdk::view::P_IS_VIEW))
+                    || (sup == "Landroid/view/ViewGroup;" && marked(jdk::view::P_IS_GROUP))
             }
             Some(Obj::Throwable { descriptor, .. }) => {
                 if descriptor == &sup {
                     return true;
                 }
+                // builtin_supers is the java.* table — framework
+                // exception hierarchies (android.database.*) live in
+                // host_supers and are reachable via assignable_desc.
+                // Framework exception classes absent from the dex can't
+                // be traced at all; their names still imply the family.
                 Self::builtin_supers(descriptor).contains(&sup.as_str())
+                    || self.assignable_desc(descriptor, &sup)
+                    || (sup == "Ljava/lang/Exception;" && descriptor.ends_with("Exception;"))
+                    || (sup == "Ljava/lang/Throwable;" && descriptor.starts_with('L'))
             }
             Some(Obj::Str(_)) => {
                 sup == "Ljava/lang/String;"
@@ -793,12 +2415,20 @@ impl Vm {
                     || sup == "Ljava/io/Serializable;"
             }
             Some(Obj::Class { .. }) => {
-                sup == "Ljava/lang/Class;" || sup == "Ljava/lang/Object;"
+                // java.lang.Class implements Type, GenericDeclaration,
+                // AnnotatedElement, Serializable.
+                sup == "Ljava/lang/Class;"
+                    || sup == "Ljava/lang/Object;"
+                    || sup == "Ljava/lang/reflect/Type;"
+                    || sup == "Ljava/lang/reflect/GenericDeclaration;"
+                    || sup == "Ljava/lang/reflect/AnnotatedElement;"
+                    || sup == "Ljava/io/Serializable;"
             }
             Some(Obj::Array { elem, .. }) => {
                 sup == "Ljava/lang/Object;"
-                    || sup == format!("[{elem}")
-                    || sup.starts_with('[') && sup.ends_with(&elem[..])
+                    || sup == "Ljava/lang/Cloneable;"
+                    || sup == "Ljava/io/Serializable;"
+                    || (sup.starts_with('[') && self.elem_assignable(elem, &sup[1..]))
             }
             None => false,
         }
@@ -812,8 +2442,8 @@ impl Vm {
         });
         // Runtime-generated throws carry no `throw` insn — credit the
         // frame that produced it so diagnostics name the method.
-        if let Some(&midx) = self.stack.last() {
-            let site = self.describe_method(midx);
+        if !self.stack.is_empty() {
+            let site = self.throw_site_desc();
             self.throw_sites.insert(h, site);
         }
         E::Throw(h)
@@ -821,7 +2451,8 @@ impl Vm {
 
     /// Run `<clinit>` once per class, superclass first (reentrancy-safe).
     /// `clinit` states: 0 = new, 1 = running, 2 = done, 3 = failed.
-    fn ensure_init(&mut self, class_idx: u32) -> Rt<()> {
+    fn ensure_init(&mut self, class_idx: GIdx) -> Rt<()> {
+        let class_idx = self.canon(class_idx);
         let rt = self.classes.entry(class_idx).or_default();
         match rt.clinit {
             2 => return Ok(()),
@@ -839,12 +2470,15 @@ impl Vm {
             this.classes.get_mut(&class_idx).unwrap().clinit = 3;
             Err(e)
         };
-        // Superclasses initialize before their subclasses.
+        // Superclasses initialize before their subclasses. `sup` is a
+        // type_idx local to the defining dex — canon resolves it across
+        // dexes by descriptor.
         let sup = self
-            .def_of(class_idx)
-            .map(|d| d.superclass_idx)
-            .unwrap_or(u32::MAX);
-        if sup != u32::MAX && sup != class_idx {
+            .def_loc_of(class_idx)
+            .map(|(cg, d)| gx(gd(cg), d.superclass_idx))
+            .filter(|&s| gl(s) != u32::MAX)
+            .map(|s| self.canon(s));
+        if let Some(sup) = sup.filter(|&s| s != class_idx) {
             if let Err(e) = self.ensure_init(sup) {
                 return fail(self, e);
             }
@@ -857,13 +2491,25 @@ impl Vm {
             }
         };
         if let Some(cd) = cd {
+            let di = self
+                .def_loc_of(class_idx)
+                .map(|(cg, _)| gd(cg))
+                .unwrap_or(usize::MAX);
+            let Some(d) = self.dexes.get(di) else {
+                self.classes.get_mut(&class_idx).unwrap().clinit = 2;
+                return Ok(());
+            };
             for m in &cd.direct_methods {
-                let mid = self.dex.method(m.method_idx).map_err(E::Vm)?;
-                if self.dex.string(mid.name_idx).map_err(E::Vm)? == "<clinit>" {
-                    if let Err(e) = self.exec(Loc {
-                        class_idx,
-                        em: *m,
-                    }, Vec::new()) {
+                let mid = d.method(m.method_idx).map_err(E::Vm)?;
+                if d.string(mid.name_idx).map_err(E::Vm)? == "<clinit>" {
+                    if let Err(e) = self.exec(
+                        Loc {
+                            class_idx,
+                            midx: gx(di, m.method_idx),
+                            em: *m,
+                        },
+                        Vec::new(),
+                    ) {
                         return fail(self, e);
                     }
                     break;
@@ -874,41 +2520,78 @@ impl Vm {
         Ok(())
     }
 
-    /// Method lookup by method table index (must be defined in this DEX).
-    fn resolve_defined(&self, midx: u32) -> Rt<Loc> {
-        self.defined
-            .get(&midx)
-            .map(|&(c, em)| Loc {
+    /// Method lookup by method table index. The ref's dex and the
+    /// defining dex may differ: fall back to `(class, name, sig)` match.
+    fn resolve_defined(&self, midx: GIdx) -> Rt<Loc> {
+        if let Some(&(c, em)) = self.defined.get(&midx) {
+            return Ok(Loc {
                 class_idx: c,
+                midx,
                 em,
-            })
-            .ok_or_else(|| E::Vm(err("dexrt.invoke.unresolved")))
+            });
+        }
+        if let Ok((class, name, sig)) = self.method_sig(midx) {
+            if let Some(&g) = self.methods_by_sig.get(&(class, name, sig)) {
+                if let Some(&(c, em)) = self.defined.get(&g) {
+                    return Ok(Loc {
+                        class_idx: c,
+                        midx: g,
+                        em,
+                    });
+                }
+            }
+        }
+        Err(E::Vm(err("dexrt.invoke.unresolved")))
     }
 
     /// Virtual/interface dispatch: find the override in `start_class`'s
-    /// virtual table matching the target's (name, proto).
-    fn resolve_virtual(&self, midx: u32, start_class: u32, fallback: bool) -> Rt<Loc> {
-        let mid = *self.dex.method(midx).map_err(E::Vm)?;
+    /// virtual table matching the target's (name, proto). Name and proto
+    /// indexes are dex-local — compare descriptors, never raw indexes.
+    fn resolve_virtual(&self, midx: GIdx, start_class: GIdx, fallback: bool) -> Rt<Loc> {
+        let key = (midx, start_class, fallback);
+        if let Some(hit) = self.resolve_cache.borrow().get(&key) {
+            return hit.ok_or_else(|| E::Vm(err("dexrt.invoke.unresolved")));
+        }
+        let out = self
+            .resolve_virtual_uncached(midx, start_class, fallback)
+            .ok();
+        self.resolve_cache.borrow_mut().insert(key, out);
+        out.ok_or_else(|| E::Vm(err("dexrt.invoke.unresolved")))
+    }
+
+    fn resolve_virtual_uncached(
+        &self,
+        midx: GIdx,
+        start_class: GIdx,
+        fallback: bool,
+    ) -> Rt<Loc> {
+        let Ok((_, name, sig)) = self.method_sig(midx) else {
+            return Err(E::Vm(err("dexrt.invoke.unresolved")));
+        };
         let mut cur = Some(start_class);
         for _ in 0..64 {
             let Some(ci) = cur else { break };
-            if let Some(cd) = self.class_data_of(ci).map_err(E::Vm)? {
+            let Some((cg, def)) = self.def_loc_of(ci) else {
+                break;
+            };
+            let Some(d) = self.dex_of(cg) else { break };
+            if let Ok(cd) = d.class_data_rc(def) {
                 for m in &cd.virtual_methods {
-                    let om = self.dex.method(m.method_idx).map_err(E::Vm)?;
-                    if om.name_idx == mid.name_idx && om.proto_idx == mid.proto_idx {
+                    let Ok(om) = d.method(m.method_idx) else {
+                        continue;
+                    };
+                    let oname = d.string(om.name_idx).unwrap_or_default();
+                    if oname == name && proto_sig(d, om.proto_idx as u32).unwrap_or_default() == sig
+                    {
                         return Ok(Loc {
-                            class_idx: ci,
+                            class_idx: cg,
+                            midx: gx(gd(cg), m.method_idx),
                             em: *m,
                         });
                     }
                 }
-                cur = self
-                    .def_of(ci)
-                    .map(|d| d.superclass_idx)
-                    .filter(|&s| s != u32::MAX);
-            } else {
-                break;
             }
+            cur = (def.superclass_idx != u32::MAX).then(|| gx(gd(cg), def.superclass_idx));
         }
         // Fall back to the declared method itself (e.g. dispatch target is the
         // declared class — a class that doesn't override).
@@ -924,25 +2607,30 @@ impl Vm {
     /// Host stub lookup by `(name, proto)` — the DEX may reference a
     /// framework method through a subclass descriptor the exact-midx
     /// registration doesn't cover (e.g. `LSubAct;.setContentView`).
-    fn host_named(&self, midx: u32) -> Rt<Option<HostCall>> {
-        let mid = *self.dex.method(midx).map_err(E::Vm)?;
-        let name = self.dex.string(mid.name_idx).map_err(E::Vm)?;
-        let p = self.dex.proto(mid.proto_idx as u32).map_err(E::Vm)?;
-        let mut sig = String::from("(");
-        for t in self.dex.proto_params(p).map_err(E::Vm)? {
-            sig.push_str(&self.dex.type_descriptor(t as u32).map_err(E::Vm)?);
+    fn host_named(&self, midx: GIdx) -> Rt<Option<HostCall>> {
+        if let Some(hit) = self.host_named_cache.borrow().get(&midx) {
+            return Ok(hit.clone());
         }
-        sig.push(')');
-        sig.push_str(&self.dex.type_descriptor(p.return_type_idx).map_err(E::Vm)?);
+        let out = self.host_named_uncached(midx)?;
+        self.host_named_cache.borrow_mut().insert(midx, out.clone());
+        Ok(out)
+    }
+
+    fn host_named_uncached(&self, midx: GIdx) -> Rt<Option<HostCall>> {
+        let Some(d) = self.dex_of(midx) else {
+            return Ok(None);
+        };
+        let mid = *d.method(gl(midx)).map_err(E::Vm)?;
+        let name = d.string(mid.name_idx).map_err(E::Vm)?;
+        let sig = proto_sig(d, mid.proto_idx as u32).map_err(E::Vm)?;
         // The reference's declaring class must be the registered owner
         // or a subclass of it — otherwise an unrelated class naming the
         // same method (e.g. `Dialog.setContentView` when only
         // `Activity.setContentView` is bridged) would steal the call.
         let key = (name.to_string(), sig);
+        let owner_ref = gx(gd(midx), mid.class_idx as u32);
         for (owner, f) in self.hosts_named.get(&key).into_iter().flatten() {
-            if *owner == mid.class_idx as u32
-                || self.assignable(mid.class_idx as u32, *owner)
-            {
+            if *owner == owner_ref || self.assignable(owner_ref, *owner) {
                 return Ok(Some(f.clone()));
             }
         }
@@ -953,24 +2641,27 @@ impl Vm {
     /// two mirrored register slots, and float bits arrive as `I32`.
     /// Builtins index args per declared parameter, so rebuild the
     /// list walking the proto — receiver first when present.
-    fn compact_args(&self, midx: u32, args: &[V], has_receiver: bool) -> Vec<V> {
+    fn compact_args(&self, midx: GIdx, args: &[V], has_receiver: bool) -> Vec<V> {
         let mut out: Vec<V> = Vec::with_capacity(args.len());
         let mut i = 0;
         if has_receiver {
             out.push(args.first().copied().unwrap_or(V::Ref(0)));
             i = 1;
         }
-        let Ok(mid) = self.dex.method(midx) else {
+        let Some(d) = self.dex_of(midx) else {
             return args.to_vec();
         };
-        let Ok(p) = self.dex.proto(mid.proto_idx as u32) else {
+        let Ok(mid) = d.method(gl(midx)) else {
             return args.to_vec();
         };
-        let Ok(ps) = self.dex.proto_params(p) else {
+        let Ok(p) = d.proto(mid.proto_idx as u32) else {
+            return args.to_vec();
+        };
+        let Ok(ps) = d.proto_params(p) else {
             return args.to_vec();
         };
         for ty in ps {
-            let Ok(desc) = self.dex.type_descriptor(ty as u32) else {
+            let Ok(desc) = d.type_descriptor(ty as u32) else {
                 return args.to_vec();
             };
             let v = args.get(i).copied().unwrap_or(V::I32(0));
@@ -1001,20 +2692,27 @@ impl Vm {
         out
     }
 
-    fn call_builtin(&mut self, midx: u32, args: &[V], has_receiver: bool) -> Rt<Option<V>> {
+    fn call_builtin(&mut self, midx: GIdx, args: &[V], has_receiver: bool) -> Rt<Option<V>> {
+        if std::env::var_os("OVELO_VIEWDBG").is_some()
+            && self.describe_method(midx).contains("setText")
+        {
+            eprintln!("[viewdbg] call_builtin {} args={args:?}", self.describe_method(midx));
+        }
         let args = self.compact_args(midx, args, has_receiver);
         let args = args.as_slice();
-        let host = self
-            .hosts
-            .get(&midx)
-            .cloned()
-            .or(self.host_named(midx)?);
+        let host = self.hosts.get(&midx).cloned().or(self.host_named(midx)?);
         if let Some(f) = host {
-            return f.borrow_mut()(self, args).map_err(E::Vm);
+            let Ok(mut g) = f.try_borrow_mut() else {
+                return vm("dexrt.host.reentrant");
+            };
+            return g(self, args).map_err(E::Vm);
         }
-        let mid = *self.dex.method(midx).map_err(E::Vm)?;
-        let class = self.dex.type_descriptor(mid.class_idx as u32).map_err(E::Vm)?;
-        let name = self.dex.string(mid.name_idx).map_err(E::Vm)?;
+        let Some(d) = self.dex_of(midx) else {
+            return vm("dexrt.invoke.unresolved");
+        };
+        let mid = *d.method(gl(midx)).map_err(E::Vm)?;
+        let class = d.type_descriptor(mid.class_idx as u32).map_err(E::Vm)?;
+        let name = d.string(mid.name_idx).map_err(E::Vm)?;
         match (class.as_str(), name.as_str()) {
             ("Ljava/lang/Object;", "<init>") => Ok(None),
             ("Ljava/lang/Object;", "getClass") => {
@@ -1023,33 +2721,68 @@ impl Vm {
                     V::Ref(h) if h != 0 => self.heap.class_of(h).unwrap_or(0),
                     _ => 0,
                 };
-                let h = self.heap.alloc(Obj::Class { type_idx: ci });
-                Ok(Some(V::Ref(h)))
+                Ok(Some(V::Ref(self.class_mirror(ci))))
             }
             ("Ljava/lang/String;", "length") => {
                 if let V::Ref(h) = args.first().copied().unwrap_or(V::Ref(0)) {
-                    if let Some(s) = self.heap.str_val(h) {
+                    if let Some(s) = self.heap.str_val(h).map(|x| x.to_string()).or_else(|| {
+                        jdk::pseudo_get(self, h, jdk::P_DATA)
+                            .and_then(|v| jdk::sv(self, v))
+                    }) {
                         return Ok(Some(V::I32(s.chars().count() as i32)));
                     }
                 }
                 Err(self.throw_builtin("Ljava/lang/NullPointerException;", "String.length"))
             }
+            // `new String(x)` on a non-dex class: capture the source
+            // text into P_DATA so the Instance behaves like the
+            // interned Obj::Str everywhere s()/str_val read strings.
+            ("Ljava/lang/String;", "<init>") => {
+                if let V::Ref(this) = args.first().copied().unwrap_or(V::Ref(0)) {
+                    if this != 0 {
+                        let t = args
+                            .get(1)
+                            .and_then(|v| jdk::sv(self, *v))
+                            .unwrap_or_default();
+                        let r = self.heap.intern_str(&t);
+                        jdk::pseudo_set(self, this, jdk::P_DATA, V::Ref(r));
+                    }
+                }
+                Ok(None)
+            }
             _ => {
-                let mut sig = String::from("(");
                 let ret_desc;
                 {
-                    let p = self.dex.proto(mid.proto_idx as u32).map_err(E::Vm)?;
-                    for t in self.dex.proto_params(p).map_err(E::Vm)? {
-                        sig.push_str(&self.dex.type_descriptor(t as u32).map_err(E::Vm)?);
-                    }
-                    sig.push(')');
-                    ret_desc = self.dex.type_descriptor(p.return_type_idx).map_err(E::Vm)?;
+                    let p = d.proto(mid.proto_idx as u32).map_err(E::Vm)?;
+                    ret_desc = d.type_descriptor(p.return_type_idx).map_err(E::Vm)?;
                 }
-                sig.push_str(&ret_desc);
+                let sig = proto_sig(d, mid.proto_idx as u32).map_err(E::Vm)?;
                 // JDK/framework builtins cover real behavior for the
                 // common java.* / android.* surface.
                 if let Some(r) = jdk::call(self, &class, &name, &sig, args)? {
                     return Ok(r);
+                }
+                // Interface dispatch names the interface ref
+                // (Appendable.append) while the implementation is
+                // registered under the receiver's concrete class
+                // (StringBuilder.append). Retry `jdk::call` against the
+                // receiver's runtime descriptor before stubbing.
+                if has_receiver {
+                    if let Some(&V::Ref(h)) = args.first() {
+                        let rc = match self.heap.get(h) {
+                            Some(Obj::Host { desc, .. }) => Some(desc.clone()),
+                            Some(Obj::Instance { class_idx, .. }) => {
+                                self.type_desc_of(*class_idx).ok()
+                            }
+                            Some(Obj::Str(_)) => Some("Ljava/lang/String;".to_string()),
+                            _ => None,
+                        };
+                        if let Some(rc) = rc.filter(|c| *c != class) {
+                            if let Some(r) = jdk::call(self, &rc, &name, &sig, args)? {
+                                return Ok(r);
+                            }
+                        }
+                    }
                 }
                 // A method whose class isn't in this DEX is a framework
                 // stub: the host models the base behavior, so return the
@@ -1058,69 +2791,11 @@ impl Vm {
                 // Only constructors and void methods on non-DEX classes are
                 // host no-ops — a value-returning stub (Math.abs) answering
                 // with a default would let the app compute on a lie.
-                if self.def_of(mid.class_idx as u32).is_none() {
-                    let ret = ret_desc.clone();
-                    let trace = self.describe_method(midx);
-                    if self.stub_trace.len() >= 32 {
-                        self.stub_trace.remove(0);
-                    }
-                    self.stub_trace.push(trace);
-                    // Throwable.<init>(message): keep the message on the
-                    // host object so describe_throw can report *why*.
-                    if name == "<init>"
-                        && (class.ends_with("Exception;")
-                            || class.ends_with("Error;")
-                            || class.ends_with("Throwable;"))
-                    {
-                        if let (V::Ref(this), Some(&msg)) =
-                            (args.first().copied().unwrap_or(V::Ref(0)), args.get(1))
-                        {
-                            jdk::pseudo_set(self, this, jdk::P_DATA, msg);
-                        }
-                    }
-                    match ret.as_str() {
-                        "V" => Ok(None),
-                        // Object/array returns get a typed placeholder so
-                        // chained framework calls cascade (`getLogger(x)
-                        // .info(y)`); methods on it hit this same stub
-                        // path. Strings come back empty — a placeholder
-                        // would break the String builtins.
-                        "Ljava/lang/String;" => {
-                            Ok(Some(V::Ref(self.heap.intern_str(""))))
-                        }
-                        r if r.starts_with('[') => {
-                            // Array return: must be a real Obj::Array or
-                            // array-length/a*get on the value type-checks.
-                            let h = self.heap.alloc(Obj::Array {
-                                elem: r[1..].to_string(),
-                                data: Vec::new(),
-                            });
-                            Ok(Some(V::Ref(h)))
-                        }
-                        r if r.starts_with('L') => {
-                            let desc = r.to_string();
-                            let ci = self
-                                .dex
-                                .type_index_of(&desc)
-                                .ok()
-                                .flatten()
-                                .unwrap_or(u32::MAX);
-                            let h = self.heap.alloc(Obj::Host {
-                                class_idx: ci,
-                                desc,
-                                fields: HashMap::new(),
-                                state: HostState::Empty,
-                            });
-                            Ok(Some(V::Ref(h)))
-                        }
-                        _ => vm("dexrt.invoke.unresolved").map_err(|e| match e {
-                            E::Vm(v) => E::Vm(v.with_detail(self.describe_method(midx))),
-                            t => t,
-                        }),
-                    }
+                if self.def_of(gx(gd(midx), mid.class_idx as u32)).is_none() {
+                    self.stub_placeholder(midx, &ret_desc, &name, &class, args)
                 } else {
                     vm("dexrt.invoke.unresolved").map_err(|e| match e {
-                        E::Vm(v) => E::Vm(v.with_detail(self.describe_method(midx))),
+                        E::Vm(v) => E::Vm(v.with_detail(self.describe_method(midx).to_string())),
                         t => t,
                     })
                 }
@@ -1128,28 +2803,115 @@ impl Vm {
         }
     }
 
+    /// Placeholder return for a call that cannot produce a real result —
+    /// an unresolved non-dex method or a bodiless declaration (native /
+    /// external / abstract decl invoked statically). Same rules either
+    /// way: void → None, refs get a typed host/array placeholder,
+    /// primitives a typed zero.
+    fn stub_placeholder(
+        &mut self,
+        midx: GIdx,
+        ret: &str,
+        name: &str,
+        class: &str,
+        args: &[V],
+    ) -> Rt<Option<V>> {
+        let trace = self.describe_method(midx);
+        if self.stub_trace.len() >= 32 {
+            self.stub_trace.remove(0);
+        }
+        self.stub_trace.push(trace.to_string());
+        // Throwable.<init>(message): keep the message on the
+        // host object so describe_throw can report *why*.
+        if name == "<init>"
+            && (class.ends_with("Exception;")
+                || class.ends_with("Error;")
+                || class.ends_with("Throwable;"))
+        {
+            if let (V::Ref(this), Some(&msg)) =
+                (args.first().copied().unwrap_or(V::Ref(0)), args.get(1))
+            {
+                jdk::pseudo_set(self, this, jdk::P_DATA, msg);
+            }
+        }
+        match ret {
+            "V" => Ok(None),
+            // Object/array returns get a typed placeholder so
+            // chained framework calls cascade (`getLogger(x)
+            // .info(y)`); methods on it hit this same stub
+            // path. Strings come back empty — a placeholder
+            // would break the String builtins.
+            "Ljava/lang/String;" => Ok(Some(V::Ref(self.heap.intern_str("")))),
+            // CharSequence-typed returns must carry real text — a typed
+            // placeholder stringifies as "java/lang/CharSequence@xxxx"
+            // and leaks into TextViews.
+            "Ljava/lang/CharSequence;" => Ok(Some(V::Ref(self.heap.intern_str("")))),
+            r if r.starts_with('[') => {
+                // Array return: must be a real Obj::Array or
+                // array-length/a*get on the value type-checks.
+                let h = self.heap.alloc(Obj::Array {
+                    elem: r[1..].to_string(),
+                    data: Vec::new(),
+                });
+                Ok(Some(V::Ref(h)))
+            }
+            r if r.starts_with('L') => {
+                let desc = r.to_string();
+                let ci = self.type_index_of(&desc).unwrap_or(GX_NONE);
+                let h = self.heap.alloc(Obj::Host {
+                    class_idx: ci,
+                    desc,
+                    fields: HashMap::new(),
+                    state: HostState::Empty,
+                });
+                Ok(Some(V::Ref(h)))
+            }
+            // Primitive returns answer a typed zero — service
+            // getters like `areNotificationsEnabled()` read as
+            // "not enabled", which is honest here.
+            "J" => Ok(Some(V::I64(0))),
+            "F" => Ok(Some(V::F32(0.0))),
+            "D" => Ok(Some(V::F64(0.0))),
+            _ => Ok(Some(V::I32(0))),
+        }
+    }
+
     /// Invoke `midx` per `kind`; `args` includes the receiver for non-static.
-    fn invoke(&mut self, midx: u32, args: Vec<V>, kind: InvokeKind) -> Rt<Option<V>> {
-        let loc = match kind {
-            InvokeKind::Static | InvokeKind::Direct => {
-                match self.resolve_defined(midx) {
-                    Ok(l) => l,
-                    Err(_) => {
-                        return self.call_builtin(midx, &args, matches!(kind, InvokeKind::Direct));
+    fn invoke(&mut self, midx: GIdx, args: Vec<V>, kind: InvokeKind) -> Rt<Option<V>> {
+        // Serialize with JNI entry points: guest `.so`s spawn real
+        // pthreads whose env calls must not alias the interpreter's
+        // heap access (recursive mutex — nested invoke/JNI re-enters
+        // fine, call_native drops all levels while guest code runs).
+        let _vmlock = jni::vm_lock();
+        if std::env::var_os("OVELO_VIEWDBG").is_some() {
+            if let Some(d) = self.dex_of(midx) {
+                if let Ok(m) = d.method(gl(midx)) {
+                    if let Ok(n) = d.string(m.name_idx) {
+                        if matches!(n.as_str(), "measure" | "measureChild" | "measureChildWithMargins" | "onMeasureChild") {
+                            eprintln!("[viewdbg] invoke {} recv={:?}", self.describe_method(midx), args.first());
+                        }
                     }
                 }
             }
+        }
+        let loc = match kind {
+            InvokeKind::Static | InvokeKind::Direct => match self.resolve_defined(midx) {
+                Ok(l) => l,
+                Err(_) => {
+                    return self.call_builtin(midx, &args, matches!(kind, InvokeKind::Direct));
+                }
+            },
             InvokeKind::Virtual | InvokeKind::Interface => {
                 let recv = match args.first() {
                     Some(&V::Ref(h)) if h != 0 => h,
                     _ => {
                         return Err(self.throw_builtin(
                             "Ljava/lang/NullPointerException;",
-                            "null receiver",
+                            &format!("null receiver calling {}", self.describe_method(midx)),
                         ))
                     }
                 };
-                let ci = self.heap.class_of(recv).unwrap_or(u32::MAX);
+                let ci = self.heap.class_of(recv).unwrap_or(GX_NONE);
                 match self.resolve_virtual(midx, ci, true) {
                     Ok(l) => l,
                     Err(_) => return self.call_builtin(midx, &args, true),
@@ -1157,9 +2919,10 @@ impl Vm {
             }
             InvokeKind::Super { caller_class } => {
                 let sup = self
-                    .def_of(caller_class)
-                    .map(|d| d.superclass_idx)
-                    .unwrap_or(u32::MAX);
+                    .def_loc_of(caller_class)
+                    .map(|(cg, d)| gx(gd(cg), d.superclass_idx))
+                    .filter(|&s| gl(s) != u32::MAX)
+                    .unwrap_or(GX_NONE);
                 // No defined-method fallback: an operand that names the
                 // caller's own method would recurse forever.
                 match self.resolve_virtual(midx, sup, false) {
@@ -1168,28 +2931,143 @@ impl Vm {
                 }
             }
         };
-        if loc.em.code_off == 0 {
-            return vm("dexrt.method.no_code");
+        // A registered host override short-circuits even a dex-defined
+        // method — used for compat shims on library code that can't run
+        // here (e.g. appcompat's vector-drawable path).
+        if let Some(f) = self.hosts.get(&loc.midx).cloned() {
+            let has_recv = !matches!(kind, InvokeKind::Static);
+            let args = self.compact_args(loc.midx, &args, has_recv);
+            let Ok(mut g) = f.try_borrow_mut() else {
+                return vm("dexrt.host.reentrant");
+            };
+            return g(self, &args).map_err(E::Vm);
         }
         if matches!(kind, InvokeKind::Static) {
             self.ensure_init(loc.class_idx)?;
         }
-        if let Some(f) = self
-            .aot
-            .as_ref()
-            .and_then(|a| a.get(loc.em.method_idx))
-        {
-            return self.run_native(f, loc.em.method_idx, loc.em.code_off, args);
+        if loc.em.code_off == 0 {
+            // Bodiless declaration (native / external / abstract decl):
+            // jdk shims may still answer it; otherwise a typed
+            // placeholder keeps a compat run moving — real JNI bridging
+            // arrives with the native stack.
+            let (class, name, sig, ret_desc) = {
+                let d = self
+                    .dex_of(loc.midx)
+                    .ok_or_else(|| E::Vm(err("dexrt.dex.idx")))?;
+                let mid = *d.method(gl(loc.midx)).map_err(E::Vm)?;
+                (
+                    d.type_descriptor(mid.class_idx as u32).map_err(E::Vm)?,
+                    d.string(mid.name_idx).map_err(E::Vm)?,
+                    proto_sig(d, mid.proto_idx as u32).map_err(E::Vm)?,
+                    d.proto(mid.proto_idx as u32)
+                        .and_then(|p| d.type_descriptor(p.return_type_idx))
+                        .map_err(E::Vm)?,
+                )
+            };
+            let args = self.compact_args(loc.midx, &args, !matches!(kind, InvokeKind::Static));
+            if let Some(r) = jdk::call(self, &class, &name, &sig, &args)? {
+                return Ok(r);
+            }
+            // A dex `native` method resolves to a loaded `.so`: the
+            // `Java_<cls>_<name>` symbol or a RegisterNatives binding.
+            if let Some(addr) = jni::native_addr(self, &class, &name, &sig) {
+                return jni::dispatch_native(
+                    self,
+                    addr,
+                    &class,
+                    &ret_desc,
+                    matches!(kind, InvokeKind::Static),
+                    &args,
+                );
+            }
+            return self.stub_placeholder(loc.midx, &ret_desc, &name, &class, &args);
+        }
+        if let Some(f) = self.aot.as_ref().and_then(|a| a.get(loc.midx)) {
+            return self.run_native(f, loc.midx, loc.em.code_off, args);
         }
         self.exec(loc, args)
+    }
+
+    /// JNI-facing wrappers — the `jni` module sits outside `Vm` but
+    /// needs the same interpreter surface the opcodes use.
+    pub(crate) fn invoke_pub(&mut self, midx: GIdx, args: Vec<V>, kind: InvokeKind) -> Rt<Option<V>> {
+        self.invoke(midx, args, kind)
+    }
+
+    /// Read a static like the `sget` opcode: guest-encoded value,
+    /// builtin table for host classes, field-type default last.
+    pub(crate) fn sget_pub(&mut self, f: GIdx) -> Option<V> {
+        let f = self.canon_field(f);
+        let owner = self
+            .dex_of(f)
+            .and_then(|d| d.field(gl(f)).ok())
+            .map(|fi| self.canon(gx(gd(f), fi.class_idx as u32)))
+            .unwrap_or(f);
+        self.ensure_init(owner).ok()?;
+        if let Some(v) = self.classes.get(&owner).and_then(|c| c.statics.get(&f)) {
+            return Some(*v);
+        }
+        let v = if self.def_of(owner).is_none() {
+            self.builtin_sfield(f).or_else(|| self.field_default(f))
+        } else {
+            self.encoded_static(owner, f).or_else(|| self.field_default(f))
+        }?;
+        if matches!(v, V::Ref(h) if h != 0) {
+            self.classes.entry(owner).or_default().statics.insert(f, v);
+        }
+        Some(v)
+    }
+
+    /// Write a static like the `sput` opcode.
+    pub(crate) fn sput_pub(&mut self, f: GIdx, v: V) {
+        let f = self.canon_field(f);
+        let owner = self
+            .dex_of(f)
+            .and_then(|d| d.field(gl(f)).ok())
+            .map(|fi| self.canon(gx(gd(f), fi.class_idx as u32)))
+            .unwrap_or(f);
+        self.classes.entry(owner).or_default().statics.insert(f, v);
+    }
+
+    /// Walk `class_idx`'s chain for a field by name (static when
+    /// `is_static`, instance otherwise) → global field idx.
+    pub(crate) fn find_field_by_name(
+        &self,
+        mut class_idx: GIdx,
+        name: &str,
+        is_static: bool,
+    ) -> Option<GIdx> {
+        for _ in 0..64 {
+            let (cg, def) = self.def_loc_of(class_idx)?;
+            let d = self.dex_of(cg)?;
+            let cd = d.class_data_rc(def).ok()?;
+            let it = if is_static {
+                &cd.static_fields
+            } else {
+                &cd.instance_fields
+            };
+            for f in it {
+                if let Ok(fi) = d.field(f.field_idx) {
+                    if d.string(fi.name_idx).ok()? == name {
+                        return Some(gx(gd(cg), f.field_idx));
+                    }
+                }
+            }
+            if def.superclass_idx == u32::MAX {
+                return None;
+            }
+            class_idx = gx(gd(cg), def.superclass_idx);
+        }
+        None
     }
 
     /// Run a compiled method under the shared register/ABI contract
     /// (see `aot` module docs). A `TRAP_DIV_ZERO` flag becomes the same
     /// `ArithmeticException` the interpreter raises.
-    fn run_native(&mut self, f: AotFn, midx: u32, code_off: u32, args: Vec<V>) -> Rt<Option<V>> {
+    fn run_native(&mut self, f: AotFn, midx: GIdx, code_off: u32, args: Vec<V>) -> Rt<Option<V>> {
         let code = self
-            .dex
+            .dex_of(midx)
+            .ok_or_else(|| E::Vm(err("dexrt.dex.idx")))?
             .code_item(code_off)
             .map_err(E::Vm)?
             .ok_or_else(|| E::Vm(err("dexrt.method.no_code")))?;
@@ -1213,7 +3091,7 @@ impl Vm {
         #[allow(unsafe_code)]
         let ret = unsafe { f(regs.as_mut_ptr(), &mut trap) };
         self.stack.pop();
-        let site = self.describe_method(midx);
+        let site = self.describe_method(midx).to_string();
         let trap_throw = |v: &mut Self, desc: &str| {
             let h = v.heap.alloc(crate::value::Obj::Throwable {
                 descriptor: "Ljava/lang/ArithmeticException;".into(),
@@ -1228,11 +3106,13 @@ impl Vm {
             _ => {}
         }
         let ret_desc = self
-            .dex
-            .method(midx)
-            .ok()
-            .and_then(|m| self.dex.proto(m.proto_idx as u32).ok().map(|p| p.return_type_idx))
-            .and_then(|t| self.dex.type_descriptor(t).ok())
+            .dex_of(midx)
+            .and_then(|d| {
+                d.method(gl(midx))
+                    .ok()
+                    .and_then(|m| d.proto(m.proto_idx as u32).ok().map(|p| p.return_type_idx))
+                    .and_then(|t| d.type_descriptor(t).ok())
+            })
             .unwrap_or_else(|| "V".into());
         Ok(match ret_desc.as_str() {
             "V" => None,
@@ -1243,14 +3123,11 @@ impl Vm {
 
     /// Execute one frame to return or throw.
     fn exec(&mut self, loc: Loc, args: Vec<V>) -> Rt<Option<V>> {
-        if self.depth >= 96 {
-            return Err(self.throw_builtin(
-                "Ljava/lang/StackOverflowError;",
-                "call depth exceeded",
-            ));
+        if self.depth >= 512 {
+            return Err(self.throw_builtin("Ljava/lang/StackOverflowError;", "call depth exceeded"));
         }
         self.depth += 1;
-        self.stack.push(loc.em.method_idx);
+        self.stack.push(loc.midx);
         let r = self.exec_frame(loc, args);
         self.stack.pop();
         self.depth -= 1;
@@ -1258,17 +3135,35 @@ impl Vm {
     }
 
     fn exec_frame(&mut self, loc: Loc, args: Vec<V>) -> Rt<Option<V>> {
-        let code = self
-            .dex
-            .code_item(loc.em.code_off)
-            .map_err(E::Vm)?
-            .ok_or_else(|| E::Vm(err("dexrt.method.no_code")))?;
+        let code_hit = self.code_cache.borrow().get(&loc.midx).cloned();
+        let code = if let Some(c) = code_hit {
+            c
+        } else {
+            let c = std::rc::Rc::new(
+                self.dex_of(loc.midx)
+                    .ok_or_else(|| E::Vm(err("dexrt.dex.idx")))?
+                    .code_item(loc.em.code_off)
+                    .map_err(E::Vm)?
+                    .ok_or_else(|| E::Vm(err("dexrt.method.no_code")))?,
+            );
+            self.code_cache.borrow_mut().insert(loc.midx, c.clone());
+            c
+        };
+        let table_hit = self.insn_cache.borrow().get(&loc.midx).cloned();
+        let table = if let Some(t) = table_hit {
+            t
+        } else {
+            let t = std::rc::Rc::new(decode_all(&code.insns).map_err(E::Vm)?);
+            self.insn_cache.borrow_mut().insert(loc.midx, t.clone());
+            t
+        };
         let nregs = code.registers_size as usize;
         let mut fr = Frame {
             regs: vec![V::I32(0); nregs],
             result: None,
+            last_call: "".into(),
             exc: None,
-            table: decode_all(&code.insns).map_err(E::Vm)?,
+            table,
             loc,
             code,
         };
@@ -1283,9 +3178,24 @@ impl Vm {
         let mut pc: usize = 0;
         // Instruction budget — a guest (or stub-driven) loop that never
         // terminates must fail loudly, not hang the host process.
+        let stalldbg = std::env::var_os("OVELO_STALLDBG").is_some();
         let mut steps: u64 = 0;
         loop {
             steps += 1;
+            if stalldbg && steps.is_multiple_of(5_000_000) {
+                eprintln!(
+                    "[stall] {} +{pc:04x} steps={steps}",
+                    self.describe_method(fr.loc.midx)
+                );
+            }
+            self.total_steps += 1;
+            if stalldbg && self.total_steps.is_multiple_of(1_000_000) {
+                eprintln!(
+                    "[stall-total] {} +{pc:04x} total={}",
+                    self.describe_method(fr.loc.midx),
+                    self.total_steps
+                );
+            }
             if steps > 20_000_000 {
                 return Err(self.throw_builtin(
                     "Ljava/lang/InternalError;",
@@ -1296,8 +3206,39 @@ impl Vm {
             match res {
                 Ok(Out::Next(n)) => pc = n,
                 Ok(Out::Return(v)) => return Ok(v),
-                Err(E::Vm(e)) => return Err(E::Vm(e)),
+                Err(E::Vm(e)) => {
+                    if self.trace_throw {
+                        eprintln!(
+                            "[vmerr] {} +{pc:04x}: {e}",
+                            self.describe_method(fr.loc.midx)
+                        );
+                    }
+                    return Err(E::Vm(e));
+                }
                 Err(E::Throw(r)) => match self.find_handler(&fr, pc, r) {
+                    _ if self.trace_throw => {
+                        let d = match self.heap.get(r) {
+                            Some(Obj::Throwable { descriptor, detail }) => {
+                                format!("{descriptor} {detail}")
+                            }
+                            Some(Obj::Host { desc, .. }) => desc.clone(),
+                            Some(Obj::Instance { class_idx, .. }) => self
+                                .type_desc_of(*class_idx)
+                                .unwrap_or_else(|_| format!("instance(class_idx={class_idx})")),
+                            _ => format!("h{r}"),
+                        };
+                        eprintln!(
+                            "[throw] {} +{pc:04x} -> {d}",
+                            self.describe_method(fr.loc.midx)
+                        );
+                        match self.find_handler(&fr, pc, r) {
+                            Some(addr) => {
+                                pc = addr as usize;
+                                fr.exc = Some(r);
+                            }
+                            None => return Err(E::Throw(r)),
+                        }
+                    }
                     Some(addr) => {
                         pc = addr as usize;
                         fr.exc = Some(r);
@@ -1321,8 +3262,10 @@ impl Vm {
                 continue;
             }
             let hnd = fr.code.handlers.get(handler_idx)?;
+            // Handler type indexes are local to the frame's dex.
+            let di = gd(fr.loc.midx);
             for (ty, addr) in &hnd.handlers {
-                if self.is_instance(h, *ty) {
+                if self.is_instance(h, gx(di, *ty)) {
                     return Some(*addr);
                 }
             }
@@ -1346,12 +3289,15 @@ struct Frame {
     regs: Vec<V>,
     /// `move-result` source: set by the last invoke.
     result: Option<Option<V>>,
+    /// Method the last invoke targeted — names the callee when a
+    /// `move-result` reads a void result.
+    last_call: std::rc::Rc<str>,
     /// Pending exception for `move-exception`.
     exc: Option<u32>,
     loc: Loc,
-    code: ovelo_dex::CodeItem,
+    code: std::rc::Rc<ovelo_dex::CodeItem>,
     /// Decoded instructions (payloads included), in offset order.
-    table: Vec<Insn>,
+    table: std::rc::Rc<Vec<Insn>>,
 }
 
 #[derive(Clone, Copy)]
@@ -1361,7 +3307,9 @@ enum InvokeKind {
     Virtual,
     Interface,
     /// Dispatch begins at the caller's superclass.
-    Super { caller_class: u32 },
+    Super {
+        caller_class: GIdx,
+    },
 }
 
 impl Vm {
@@ -1443,6 +3391,9 @@ impl Vm {
         let op = ins.opcode;
         let regs = &ins.regs;
         let r = |i: usize| Self::reg(fr, regs.get(i).copied().unwrap_or(0) as usize);
+        // Instruction indexes are dex-local; `di` is the frame's dex.
+        let di = gd(fr.loc.midx);
+        let gi = |i: u32| gx(di, i);
 
         // helpers for typed results
         macro_rules! set {
@@ -1469,7 +3420,7 @@ impl Vm {
                     .result
                     .take()
                     .ok_or_else(|| E::Vm(err("dexrt.result.missing")))?
-                    .ok_or_else(|| E::Vm(err("dexrt.result.void")))?;
+                    .ok_or_else(|| E::Vm(err(&format!("dexrt.result.void {}", fr.last_call))))?;
                 set!(regs[0], v);
             }
             0x0d => {
@@ -1488,14 +3439,12 @@ impl Vm {
             0x16..=0x18 => set!(regs[0], V::I64(ins.lit.unwrap_or(0))),
             0x19 => set!(regs[0], V::I64(ins.lit.unwrap_or(0) << 48)),
             0x1a | 0x1b => {
-                let s = self.dex.string(ins.idx.unwrap_or(0)).map_err(E::Vm)?;
+                let s = self.dexes[di].string(ins.idx.unwrap_or(0)).map_err(E::Vm)?;
                 let h = self.heap.intern_str(&s);
                 set!(regs[0], V::Ref(h));
             }
             0x1c => {
-                let h = self.heap.alloc(Obj::Class {
-                    type_idx: ins.idx.unwrap_or(0),
-                });
+                let h = self.class_mirror(gi(ins.idx.unwrap_or(0)));
                 set!(regs[0], V::Ref(h));
             }
             // ---- monitors: single-threaded no-ops (null still faults) ----
@@ -1516,7 +3465,7 @@ impl Vm {
                         ..
                     })
                 );
-                if h != 0 && !opaque_stub && !self.is_instance(h, ins.idx.unwrap_or(0)) {
+                if h != 0 && !opaque_stub && !self.is_instance(h, gi(ins.idx.unwrap_or(0))) {
                     let have = match self.heap.get(h) {
                         Some(Obj::Array { elem, .. }) => format!("[{elem}"),
                         Some(Obj::Host { desc, .. }) => desc.clone(),
@@ -1524,14 +3473,12 @@ impl Vm {
                         Some(Obj::Str(_)) => "Ljava/lang/String;".to_string(),
                         Some(Obj::Class { .. }) => "Ljava/lang/Class;".to_string(),
                         Some(Obj::Instance { class_idx, .. }) => self
-                            .dex
-                            .type_descriptor(*class_idx)
+                            .type_desc_of(*class_idx)
                             .unwrap_or_else(|_| "?".to_string()),
                         _ => "?".to_string(),
                     };
                     let want = self
-                        .dex
-                        .type_descriptor(ins.idx.unwrap_or(0))
+                        .type_desc_of(gi(ins.idx.unwrap_or(0)))
                         .unwrap_or_else(|_| "?".to_string());
                     return Err(self.throw_builtin(
                         "Ljava/lang/ClassCastException;",
@@ -1541,7 +3488,7 @@ impl Vm {
             }
             0x20 => {
                 let h = Self::refv(r(1)?)?;
-                let res = h != 0 && self.is_instance(h, ins.idx.unwrap_or(0));
+                let res = h != 0 && self.is_instance(h, gi(ins.idx.unwrap_or(0)));
                 set!(regs[0], V::I32(res as i32));
             }
             0x21 => {
@@ -1554,24 +3501,24 @@ impl Vm {
                 set!(regs[0], V::I32(n));
             }
             0x22 => {
-                let ty = ins.idx.unwrap_or(0);
+                let ty = gi(ins.idx.unwrap_or(0));
                 self.ensure_init(ty)?;
                 // A type with no class_def is a host-provided framework/JDK
                 // class: allocate a Host object whose builtin state matches
                 // the descriptor (StringBuilder buffer, collection, …) —
                 // methods dispatch to builtins via call_builtin.
                 let h = if self.def_of(ty).is_none() {
-                    let desc = self.dex.type_descriptor(ty).map_err(E::Vm)?;
+                    let desc = self.type_desc_of(ty).map_err(E::Vm)?;
                     let state = Self::host_state_for(&desc);
                     self.heap.alloc(Obj::Host {
-                        class_idx: ty,
+                        class_idx: self.canon(ty),
                         desc,
                         fields: HashMap::new(),
                         state,
                     })
                 } else {
                     self.heap.alloc(Obj::Instance {
-                        class_idx: ty,
+                        class_idx: self.canon(ty),
                         fields: HashMap::new(),
                     })
                 };
@@ -1580,13 +3527,11 @@ impl Vm {
             0x23 => {
                 let len = Self::i32v(r(1)?)?;
                 if len < 0 {
-                    return Err(self.throw_builtin(
-                        "Ljava/lang/NegativeArraySizeException;",
-                        "new-array",
-                    ));
+                    return Err(
+                        self.throw_builtin("Ljava/lang/NegativeArraySizeException;", "new-array")
+                    );
                 }
-                let desc = self
-                    .dex
+                let desc = self.dexes[di]
                     .type_descriptor(ins.idx.unwrap_or(0))
                     .map_err(E::Vm)?;
                 let elem = desc.trim_start_matches('[').to_string();
@@ -1599,8 +3544,7 @@ impl Vm {
             0x24 | 0x25 => {
                 // filled-new-array {args}, type@idx — `/range` carries
                 // (count, first_reg), the 35c form lists registers.
-                let desc = self
-                    .dex
+                let desc = self.dexes[di]
                     .type_descriptor(ins.idx.unwrap_or(0))
                     .map_err(E::Vm)?;
                 let elem = desc.trim_start_matches('[').to_string();
@@ -1628,13 +3572,20 @@ impl Vm {
             0x27 => {
                 let h = Self::refv(r(0)?)?;
                 if h == 0 {
-                    return Err(self.throw_builtin(
-                        "Ljava/lang/NullPointerException;",
-                        "throw null",
-                    ));
+                    return Err(
+                        self.throw_builtin("Ljava/lang/NullPointerException;", "throw null")
+                    );
                 }
-                let site = self.describe_method(fr.loc.em.method_idx);
-                self.throw_sites.insert(h, site);
+                // First-throw wins: a catch-all `throw` at the top of a
+                // helper (FragmentManager force-complete & co) would
+                // otherwise clobber the real origin site.
+                if !self.stack.is_empty() {
+                    let site = self.throw_site_desc();
+                    self.throw_sites.entry(h).or_insert(site);
+                } else {
+                    let site = self.describe_method(fr.loc.midx).to_string();
+                    self.throw_sites.entry(h).or_insert(site);
+                }
                 return Err(E::Throw(h));
             }
             // ---- branches ----
@@ -1649,8 +3600,7 @@ impl Vm {
                 let tgt = self.switch_target(&fr.table, toff, v, op == 0x2b)?;
                 // Payload targets are relative to the switch insn's offset.
                 return Ok(Out::Next(
-                    tgt.map(|t| (pc as i64 + t as i64) as usize)
-                        .unwrap_or(next),
+                    tgt.map(|t| (pc as i64 + t as i64) as usize).unwrap_or(next),
                 ));
             }
             0x2d..=0x30 => {
@@ -1661,7 +3611,11 @@ impl Vm {
                 };
                 let less_bias = op == 0x2d || op == 0x2f; // cmpl → NaN is -1
                 let c = if a.is_nan() || b.is_nan() {
-                    if less_bias { -1 } else { 1 }
+                    if less_bias {
+                        -1
+                    } else {
+                        1
+                    }
                 } else if a < b {
                     -1
                 } else if a > b {
@@ -1680,8 +3634,15 @@ impl Vm {
                 let t = match op {
                     // if-eq/if-ne also compare references by identity.
                     0x32 | 0x33 => {
-                        let eq = match (va, vb) {
-                            (V::Ref(a), V::Ref(b)) => a == b,
+                        // `const/4 v, 0` puts a null reference in a register,
+                        // so Ref may be compared against I32(0).
+                        let refv = |v: V| match v {
+                            V::Ref(h) => Some(h),
+                            V::I32(0) => Some(0),
+                            _ => None,
+                        };
+                        let eq = match (refv(va), refv(vb)) {
+                            (Some(a), Some(b)) => a == b,
                             _ => Self::i32v(va)? == Self::i32v(vb)?,
                         };
                         if op == 0x32 {
@@ -1740,22 +3701,68 @@ impl Vm {
             // ---- instance fields ----
             0x52..=0x58 => {
                 let h = Self::refv(r(1)?)?;
-                self.null_check(h, "iget")?;
-                let f = ins.idx.unwrap_or(0);
+                if h == 0 {
+                    let d = format!(
+                        "iget {} in {}",
+                        self.describe_field(gi(ins.idx.unwrap_or(0))),
+                        self.describe_method(fr.loc.midx),
+                    );
+                    return Err(self.throw_builtin("Ljava/lang/NullPointerException;", &d));
+                }
+                let f = self.canon_field(gi(ins.idx.unwrap_or(0)));
                 let stored = match self.heap.get(h) {
                     Some(Obj::Instance { fields, .. }) | Some(Obj::Host { fields, .. }) => {
                         fields.get(&f).copied()
                     }
-                    _ => return vm("dexrt.type"),
+                    other => {
+                        if std::env::var_os("OVELO_VIEWDBG").is_some() {
+                            let kind = match other {
+                                Some(Obj::Array { .. }) => "array",
+                                Some(Obj::Str(_)) => "string",
+                                Some(Obj::Throwable { .. }) => "throwable",
+                                Some(Obj::Class { .. }) => "class",
+                                Some(Obj::Instance { .. }) | Some(Obj::Host { .. }) => "obj",
+                                None => "freed",
+                            };
+                            eprintln!(
+                                "[viewdbg] iget.type h{h} {kind} field={} in {}",
+                                self.describe_field(gi(ins.idx.unwrap_or(0))),
+                                self.describe_method(fr.loc.midx)
+                            );
+                        }
+                        return vm("dexrt.type");
+                    }
                 };
+                if self
+                    .trace_field
+                    .as_deref()
+                    .is_some_and(|t| self.describe_field(gi(ins.idx.unwrap_or(0))).contains(t))
+                {
+                    eprintln!(
+                        "[ftrace] iget {} obj={} -> {:?} in {}",
+                        self.describe_field(gi(ins.idx.unwrap_or(0))),
+                        h,
+                        stored,
+                        self.describe_method(fr.loc.midx)
+                    );
+                }
                 let v = match stored {
                     Some(v) => v,
                     // Host objects expose named fields through builtins
                     // (PackageInfo.versionCode, ApplicationInfo.dataDir);
                     // guest objects fall back to the field's type default.
-                    None => self
-                        .builtin_ifield(h, f)
-                        .unwrap_or_else(|| self.field_default(f).unwrap_or(V::I32(0))),
+                    None => match self.builtin_ifield(h, f) {
+                        Some(b) => b,
+                        // A host placeholder's ctor never ran — ref-typed
+                        // fields stay null and the next iget/iput on them
+                        // NPEs (RecyclerView lp.mDecorInsets.top). Give
+                        // them a stub of the declared type, stored so the
+                        // same object comes back on later reads.
+                        None => match self.ref_field_stub(h, f) {
+                            Some(v) => v,
+                            None => self.field_default(f).unwrap_or(V::I32(0)),
+                        },
+                    },
                 };
                 set!(regs[0], v);
             }
@@ -1764,12 +3771,25 @@ impl Vm {
                 if h == 0 {
                     let d = format!(
                         "iput {} in {}",
-                        self.describe_field(ins.idx.unwrap_or(0)),
-                        self.describe_method(fr.loc.em.method_idx),
+                        self.describe_field(gi(ins.idx.unwrap_or(0))),
+                        self.describe_method(fr.loc.midx),
                     );
                     return Err(self.throw_builtin("Ljava/lang/NullPointerException;", &d));
                 }
-                let f = ins.idx.unwrap_or(0);
+                let f = self.canon_field(gi(ins.idx.unwrap_or(0)));
+                if self
+                    .trace_field
+                    .as_deref()
+                    .is_some_and(|t| self.describe_field(gi(ins.idx.unwrap_or(0))).contains(t))
+                {
+                    eprintln!(
+                        "[ftrace] iput {} obj={} <- {:?} in {}",
+                        self.describe_field(gi(ins.idx.unwrap_or(0))),
+                        h,
+                        r(0).ok(),
+                        self.describe_method(fr.loc.midx)
+                    );
+                }
                 match self.heap.get_mut(h) {
                     Some(Obj::Instance { fields, .. }) | Some(Obj::Host { fields, .. }) => {
                         fields.insert(f, r(0)?);
@@ -1779,8 +3799,10 @@ impl Vm {
             }
             // ---- static fields ----
             0x60..=0x66 => {
-                let f = ins.idx.unwrap_or(0);
-                let owner = self.dex.field(f).map_err(E::Vm)?.class_idx as u32;
+                let fl = ins.idx.unwrap_or(0);
+                let f = self.canon_field(gi(fl));
+                let owner =
+                    self.canon(gi(self.dexes[di].field(fl).map_err(E::Vm)?.class_idx as u32));
                 self.ensure_init(owner)?;
                 let stored = self
                     .classes
@@ -1795,16 +3817,37 @@ impl Vm {
                     // Charset constants) comes from the builtin table —
                     // the type default would silently lie (SDK_INT == 0
                     // flips every `>= O` gate to the legacy path).
-                    None if self.def_of(owner).is_none() => self
-                        .builtin_sfield(f)
-                        .unwrap_or_else(|| self.field_default(f).unwrap_or(V::I32(0))),
-                    None => self.field_default(f).unwrap_or(V::I32(0)),
+                    None if self.def_of(owner).is_none() => {
+                        let v = self
+                            .builtin_sfield(f)
+                            .unwrap_or_else(|| self.field_default(f).unwrap_or(V::I32(0)));
+                        // Cache reference constants — enum singletons and
+                        // Charset/Locale objects rely on `==` identity.
+                        if matches!(v, V::Ref(h) if h != 0) {
+                            self.classes.entry(owner).or_default().statics.insert(f, v);
+                        }
+                        v
+                    }
+                    None => {
+                        // A static on a guest class carries its
+                        // initializer in the dex `static_values` array —
+                        // that's where every `R.*` constant lives.
+                        let v = self
+                            .encoded_static(owner, f)
+                            .unwrap_or_else(|| self.field_default(f).unwrap_or(V::I32(0)));
+                        if matches!(v, V::Ref(h) if h != 0) {
+                            self.classes.entry(owner).or_default().statics.insert(f, v);
+                        }
+                        v
+                    }
                 };
                 set!(regs[0], v);
             }
             0x67..=0x6d => {
-                let f = ins.idx.unwrap_or(0);
-                let owner = self.dex.field(f).map_err(E::Vm)?.class_idx as u32;
+                let fl = ins.idx.unwrap_or(0);
+                let f = self.canon_field(gi(fl));
+                let owner =
+                    self.canon(gi(self.dexes[di].field(fl).map_err(E::Vm)?.class_idx as u32));
                 self.ensure_init(owner)?;
                 self.classes
                     .entry(owner)
@@ -1823,7 +3866,7 @@ impl Vm {
                     0x71 | 0x77 => InvokeKind::Static,
                     _ => InvokeKind::Interface,
                 };
-                let midx = ins.idx.unwrap_or(0);
+                let midx = gi(ins.idx.unwrap_or(0));
                 let arg_regs: Vec<u16> = if ins.format == ovelo_dex::Format::F3rc {
                     // {vCCCC..+AA}: `regs`=[range start], `lit`=reg count
                     let (first, n) = (regs[0] as usize, ins.lit.unwrap_or(0) as usize);
@@ -1835,19 +3878,90 @@ impl Vm {
                     .iter()
                     .map(|&i| Self::reg(fr, i as usize))
                     .collect::<Rt<_>>()?;
+                let this_arg = args.first().copied();
+                let argfmt: Vec<String> = if self.trace_call.is_some() {
+                    args.iter()
+                        .skip(1)
+                        .map(|v| match v {
+                            V::Ref(h) if *h != 0 => {
+                                let mut s = format!("h{h}:{}", self.dbg_class_of(*h));
+                                if let Some(Obj::Host {
+                                    state: HostState::List(l),
+                                    ..
+                                }) = self.heap.get(*h)
+                                {
+                                    s.push_str(&format!("(n={})", l.len()));
+                                    let els: Vec<String> = l
+                                        .iter()
+                                        .take(12)
+                                        .map(|e| match e {
+                                            V::Ref(eh) => {
+                                                format!("h{eh}:{}", self.dbg_class_of(*eh))
+                                            }
+                                            other => format!("{other:?}"),
+                                        })
+                                        .collect();
+                                    s.push_str(&format!("[{}]", els.join(",")));
+                                }
+                                if let Some(Obj::Str(t)) = self.heap.get(*h) {
+                                    s.push_str(&format!("=\"{}\"", t.chars().take(80).collect::<String>()));
+                                }
+                                s
+                            }
+                            V::Ref(_) => "null".into(),
+                            other => format!("{other:?}"),
+                        })
+                        .collect()
+                } else {
+                    Vec::new()
+                };
                 let res = self.invoke(midx, args, kind).map_err(|e| match e {
                     E::Vm(v) => {
-                        let d = format!("{v} in {}", self.describe_method(fr.loc.em.method_idx));
+                        let d = format!("{v} in {}", self.describe_method(fr.loc.midx));
                         E::Vm(v.with_detail(d))
                     }
                     E::Throw(h) => {
-                        let caller = self.describe_method(fr.loc.em.method_idx);
+                        let caller = self.describe_method(fr.loc.midx);
                         if let Some(Obj::Throwable { detail, .. }) = self.heap.get_mut(h) {
                             *detail = format!("{} in {}", detail, caller);
                         }
                         E::Throw(h)
                     }
                 })?;
+                fr.last_call = self.describe_method(midx);
+                if let Some(p) = self.trace_call.as_deref() {
+                    let caller = self.describe_method(fr.loc.midx);
+                    if p.split(',')
+                        .any(|one| !one.is_empty() && fr.last_call.contains(one))
+                        && self
+                            .trace_from
+                            .as_deref()
+                            .is_none_or(|f| caller.contains(f))
+                    {
+                        let thisfmt = match this_arg {
+                            Some(V::Ref(h)) => match self.heap.get(h) {
+                                Some(Obj::Str(t)) => {
+                                    format!("h{h}:String=\"{}\"", t.chars().take(80).collect::<String>())
+                                }
+                                _ => format!("{:?}", this_arg.unwrap()),
+                            },
+                            _ => format!("{:?}", this_arg),
+                        };
+                        let resfmt = match res {
+                            Some(V::Ref(h)) if h != 0 => match self.heap.get(h) {
+                                Some(Obj::Str(t)) => {
+                                    format!("Some(h{h}:String=\"{}\")", t.chars().take(80).collect::<String>())
+                                }
+                                _ => format!("{res:?}"),
+                            },
+                            _ => format!("{res:?}"),
+                        };
+                        eprintln!(
+                            "[call] {} +{pc:04x} -> {} this={} args={argfmt:?} ({})",
+                            caller, fr.last_call, thisfmt, resfmt
+                        );
+                    }
+                }
                 fr.result = Some(res);
             }
             // ---- unary ops ----
@@ -1912,10 +4026,121 @@ impl Vm {
         Ok(Out::Next(next))
     }
 
-    fn field_default(&self, field_idx: u32) -> Option<V> {
-        let f = self.dex.field(field_idx).ok()?;
-        let desc = self.dex.type_descriptor(f.type_idx as u32).ok()?;
+    /// Host placeholders have no ctor, so ref-typed fields that dex
+    /// never explicitly wrote stay null; mint a stub of the field's
+    /// declared type and remember it on the object.
+    fn ref_field_stub(&mut self, h: u32, field_idx: GIdx) -> Option<V> {
+        if !matches!(self.heap.get(h), Some(Obj::Host { .. })) {
+            return None;
+        }
+        let d = self.dex_of(field_idx)?;
+        let f = d.field(gl(field_idx)).ok()?;
+        let ty = d.type_descriptor(f.type_idx as u32).ok()?;
+        // Only eagerly-allocated value holders (AOSP ctors `new` these
+        // up front — LayoutParams.mDecorInsets is the motivating case):
+        // minting a stub for an ordinary ref field fakes `x != null`
+        // and corrupts guest null checks (Message.obj, payloads).
+        const REF_FIELD_STUB_TYPES: &[&str] = &[
+            "Landroid/graphics/Rect;",
+            "Landroid/graphics/RectF;",
+            "Landroid/graphics/Point;",
+            "Landroid/graphics/PointF;",
+            "Landroid/graphics/Insets;",
+            "Landroid/graphics/Region;",
+        ];
+        if !REF_FIELD_STUB_TYPES.contains(&ty.as_str()) {
+            return None;
+        }
+        let v = jdk::host(self, &ty, HostState::Empty);
+        if let Some(Obj::Host { fields, .. }) = self.heap.get_mut(h) {
+            fields.insert(field_idx, v);
+        }
+        Some(v)
+    }
+
+    fn field_default(&self, field_idx: GIdx) -> Option<V> {
+        let d = self.dex_of(field_idx)?;
+        let f = d.field(gl(field_idx)).ok()?;
+        let desc = d.type_descriptor(f.type_idx as u32).ok()?;
         Some(V::default_for(&desc))
+    }
+
+    /// A static field's `static_values` initial value (the constants
+    /// `R.*` classes carry) mapped to a V, or `None` when the field
+    /// has no encoded value or one we can't materialize.
+    fn encoded_static(&mut self, owner: GIdx, field: GIdx) -> Option<V> {
+        let (cg, def) = self.def_loc_of(owner)?;
+        // The encoded array lives in the dex that DEFINES the class,
+        // indexed by that dex's local field ids. When the canonical
+        // index belongs to a referencing dex (multi-dex apps), match
+        // the static field by name instead of the raw index.
+        let local_idx = if gd(field) == gd(cg) {
+            gl(field)
+        } else {
+            let (name, ty) = self.dex_of(field).and_then(|d| {
+                let f = d.field(gl(field)).ok()?;
+                Some((
+                    d.string(f.name_idx).ok()?,
+                    d.type_descriptor(f.type_idx as u32).ok()?,
+                ))
+            })?;
+            let cd = self.dex_of(cg)?.class_data_rc(def).ok()?;
+            let mut found = None;
+            for f in &cd.static_fields {
+                let Ok(fr) = self.dex_of(cg)?.field(f.field_idx) else {
+                    continue;
+                };
+                let Ok(n) = self.dex_of(cg)?.string(fr.name_idx) else {
+                    continue;
+                };
+                let Ok(t) = self.dex_of(cg)?.type_descriptor(fr.type_idx as u32) else {
+                    continue;
+                };
+                if n == name && t == ty {
+                    found = Some(f.field_idx);
+                    break;
+                }
+            }
+            found?
+        };
+        let v = self
+            .dex_of(cg)?
+            .static_value(def, local_idx)
+            .ok()
+            .flatten()?;
+        use ovelo_dex::EncodedValue as EV;
+        match v {
+            EV::Byte(x) => Some(V::I32(x as i32)),
+            EV::Short(x) => Some(V::I32(x as i32)),
+            EV::Char(x) => Some(V::I32(x as i32)),
+            EV::Int(x) => Some(V::I32(x)),
+            EV::Bool(b) => Some(V::I32(b as i32)),
+            EV::Long(x) => Some(V::I64(x)),
+            EV::Float(x) => Some(V::F32(x)),
+            EV::Double(x) => Some(V::F64(x)),
+            EV::String(i) => {
+                let s = self.dex_of(cg)?.string(i).ok()?;
+                Some(jdk::jstr(self, &s))
+            }
+            EV::Type(i) => Some(V::Ref(self.class_mirror(gx(gd(cg), i)))),
+            EV::Array(items) => {
+                let vals: Vec<V> = items
+                    .iter()
+                    .map(|it| match it {
+                        EV::Int(x) => V::I32(*x),
+                        EV::Long(x) => V::I64(*x),
+                        EV::Bool(b) => V::I32(*b as i32),
+                        _ => V::Ref(0),
+                    })
+                    .collect();
+                let h = self.heap.alloc(Obj::Array {
+                    elem: "Ljava/lang/Object;".to_string(),
+                    data: vals,
+                });
+                Some(V::Ref(h))
+            }
+            _ => None,
+        }
     }
 
     fn aget(&mut self, h: u32, i: i32) -> Rt<V> {
@@ -1924,10 +4149,9 @@ impl Vm {
             Some(Obj::Array { data, .. }) => {
                 let i = i as usize;
                 if i >= data.len() {
-                    return Err(self.throw_builtin(
-                        "Ljava/lang/ArrayIndexOutOfBoundsException;",
-                        "aget",
-                    ));
+                    return Err(
+                        self.throw_builtin("Ljava/lang/ArrayIndexOutOfBoundsException;", "aget")
+                    );
                 }
                 Ok(data[i])
             }
@@ -1941,10 +4165,9 @@ impl Vm {
             Some(Obj::Array { data, .. }) => {
                 if i < 0 || i as usize >= data.len() {
                     let d = format!("aput idx {i} len {}", data.len());
-                    return Err(self.throw_builtin(
-                        "Ljava/lang/ArrayIndexOutOfBoundsException;",
-                        &d,
-                    ));
+                    return Err(
+                        self.throw_builtin("Ljava/lang/ArrayIndexOutOfBoundsException;", &d)
+                    );
                 }
                 data[i as usize] = v;
                 Ok(())
@@ -1989,9 +4212,10 @@ impl Vm {
                 *data = vals;
                 Ok(())
             }
-            Some(Obj::Array { .. }) => {
-                Err(self.throw_builtin("Ljava/lang/ArrayIndexOutOfBoundsException;", "fill-array-data"))
-            }
+            Some(Obj::Array { .. }) => Err(self.throw_builtin(
+                "Ljava/lang/ArrayIndexOutOfBoundsException;",
+                "fill-array-data",
+            )),
             _ => vm("dexrt.type"),
         }
     }
@@ -2014,9 +4238,7 @@ impl Vm {
                 return Ok(None);
             }
             let i = 4 + k as usize * 2;
-            return Ok(Some(
-                (((raw[i + 1] as i32) << 16) | raw[i] as i32) as u32,
-            ));
+            return Ok(Some((((raw[i + 1] as i32) << 16) | raw[i] as i32) as u32));
         }
         if raw.len() < 2 || raw[0] != 0x0200 {
             return vm("dexrt.payload");
@@ -2027,9 +4249,7 @@ impl Vm {
             let key = ((raw[ki + 1] as i32) << 16) | raw[ki] as i32;
             if key == v {
                 let ti = 2 + size * 2 + k * 2;
-                return Ok(Some(
-                    (((raw[ti + 1] as i32) << 16) | raw[ti] as i32) as u32,
-                ));
+                return Ok(Some((((raw[ti + 1] as i32) << 16) | raw[ti] as i32) as u32));
             }
             if key > v {
                 break;
@@ -2046,19 +4266,17 @@ impl Vm {
             0xd2 | 0xda => b.wrapping_mul(lit),
             0xd3 | 0xdb => {
                 if lit == 0 {
-                    return Err(self.throw_builtin(
-                        "Ljava/lang/ArithmeticException;",
-                        "divide by zero",
-                    ));
+                    return Err(
+                        self.throw_builtin("Ljava/lang/ArithmeticException;", "divide by zero")
+                    );
                 }
                 b.wrapping_div(lit)
             }
             0xd4 | 0xdc => {
                 if lit == 0 {
-                    return Err(self.throw_builtin(
-                        "Ljava/lang/ArithmeticException;",
-                        "rem by zero",
-                    ));
+                    return Err(
+                        self.throw_builtin("Ljava/lang/ArithmeticException;", "rem by zero")
+                    );
                 }
                 b.wrapping_rem(lit)
             }
@@ -2082,20 +4300,18 @@ impl Vm {
             0x93 => {
                 let (x, y) = (Self::i32v(b)?, Self::i32v(c)?);
                 if y == 0 {
-                    return Err(self.throw_builtin(
-                        "Ljava/lang/ArithmeticException;",
-                        "divide by zero",
-                    ));
+                    return Err(
+                        self.throw_builtin("Ljava/lang/ArithmeticException;", "divide by zero")
+                    );
                 }
                 V::I32(x.wrapping_div(y))
             }
             0x94 => {
                 let (x, y) = (Self::i32v(b)?, Self::i32v(c)?);
                 if y == 0 {
-                    return Err(self.throw_builtin(
-                        "Ljava/lang/ArithmeticException;",
-                        "rem by zero",
-                    ));
+                    return Err(
+                        self.throw_builtin("Ljava/lang/ArithmeticException;", "rem by zero")
+                    );
                 }
                 V::I32(x.wrapping_rem(y))
             }
@@ -2104,9 +4320,9 @@ impl Vm {
             0x97 => V::I32(Self::i32v(b)? ^ Self::i32v(c)?),
             0x98 => V::I32(Self::i32v(b)?.wrapping_shl(Self::i32v(c)? as u32 & 0x1f)),
             0x99 => V::I32(Self::i32v(b)?.wrapping_shr(Self::i32v(c)? as u32 & 0x1f)),
-            0x9a => V::I32(
-                (Self::i32v(b)? as u32).wrapping_shr(Self::i32v(c)? as u32 & 0x1f) as i32,
-            ),
+            0x9a => {
+                V::I32((Self::i32v(b)? as u32).wrapping_shr(Self::i32v(c)? as u32 & 0x1f) as i32)
+            }
             // long
             0x9b => V::I64(Self::i64v(b)?.wrapping_add(Self::i64v(c)?)),
             0x9c => V::I64(Self::i64v(b)?.wrapping_sub(Self::i64v(c)?)),
@@ -2114,20 +4330,18 @@ impl Vm {
             0x9e => {
                 let (x, y) = (Self::i64v(b)?, Self::i64v(c)?);
                 if y == 0 {
-                    return Err(self.throw_builtin(
-                        "Ljava/lang/ArithmeticException;",
-                        "divide by zero",
-                    ));
+                    return Err(
+                        self.throw_builtin("Ljava/lang/ArithmeticException;", "divide by zero")
+                    );
                 }
                 V::I64(x.wrapping_div(y))
             }
             0x9f => {
                 let (x, y) = (Self::i64v(b)?, Self::i64v(c)?);
                 if y == 0 {
-                    return Err(self.throw_builtin(
-                        "Ljava/lang/ArithmeticException;",
-                        "rem by zero",
-                    ));
+                    return Err(
+                        self.throw_builtin("Ljava/lang/ArithmeticException;", "rem by zero")
+                    );
                 }
                 V::I64(x.wrapping_rem(y))
             }
@@ -2136,9 +4350,9 @@ impl Vm {
             0xa2 => V::I64(Self::i64v(b)? ^ Self::i64v(c)?),
             0xa3 => V::I64(Self::i64v(b)?.wrapping_shl(Self::i32v(c)? as u32 & 0x3f)),
             0xa4 => V::I64(Self::i64v(b)?.wrapping_shr(Self::i32v(c)? as u32 & 0x3f)),
-            0xa5 => V::I64(
-                (Self::i64v(b)? as u64).wrapping_shr(Self::i32v(c)? as u32 & 0x3f) as i64,
-            ),
+            0xa5 => {
+                V::I64((Self::i64v(b)? as u64).wrapping_shr(Self::i32v(c)? as u32 & 0x3f) as i64)
+            }
             // float / double
             0xa6 => V::F32(Self::f32v(b)? + Self::f32v(c)?),
             0xa7 => V::F32(Self::f32v(b)? - Self::f32v(c)?),
@@ -2155,13 +4369,11 @@ impl Vm {
     }
 }
 
-
 #[cfg(test)]
 mod tests {
     use super::*;
 
     use ovelo_dex::testdex::*;
-
 
     fn vm(bytes: Vec<u8>) -> Vm {
         Vm::new(DexFile::open(bytes).unwrap()).unwrap()
@@ -2255,14 +4467,18 @@ mod tests {
     #[test]
     fn div_by_zero_caught_by_handler() {
         // try units 1..3: div-int v0,v0,v0 -> handler @4 returns -1.
-        let mut m = dir("f", 0, vec![
-            0x0012, // const/4 v0,0
-            0x0093, 0x0000, // div-int v0,v0,v0
-            0x000f, // return v0
-            0x020d, // move-exception v2
-            0xf112, // const/4 v1,-1
-            0x010f, // return v1
-        ]);
+        let mut m = dir(
+            "f",
+            0,
+            vec![
+                0x0012, // const/4 v0,0
+                0x0093, 0x0000, // div-int v0,v0,v0
+                0x000f, // return v0
+                0x020d, // move-exception v2
+                0xf112, // const/4 v1,-1
+                0x010f, // return v1
+            ],
+        );
         m.tries = vec![(1, 2, vec![], Some(4))];
         let (b, _ix) = build(&[cls("LT;", vec![m])]);
         let mut v = vm(b);
@@ -2275,13 +4491,17 @@ mod tests {
             class: "LT;",
             // forces "I" into the type table
             sfields: &[("I", "unused")],
-            methods: vec![dir("f", 0, vec![
-                0x1112,             // const/4 v1,1
-                0x1023, 0x0000,     // new-array v0,v1,type@I (patched)
-                0x2212,             // const/4 v2,2
-                0x0044, 0x0200,     // aget v0,v0,v2
-                0x000f,
-            ])],
+            methods: vec![dir(
+                "f",
+                0,
+                vec![
+                    0x1112, // const/4 v1,1
+                    0x1023, 0x0000, // new-array v0,v1,type@I (patched)
+                    0x2212, // const/4 v2,2
+                    0x0044, 0x0200, // aget v0,v0,v2
+                    0x000f,
+                ],
+            )],
             ..cls("LT;", vec![])
         };
         let (mut b, ix) = build(&[c]);
@@ -2311,12 +4531,16 @@ mod tests {
         };
         let entry = cls(
             "LT;",
-            vec![dir("main", 0, vec![
-                0x0022, 0x0000,           // new-instance v0,LC (patched)
-                0x106e, 0x0000, 0x0000,   // invoke-virtual {v0},LB.who (patched)
-                0x010a,                   // move-result v1
-                0x010f,                   // return v1
-            ])],
+            vec![dir(
+                "main",
+                0,
+                vec![
+                    0x0022, 0x0000, // new-instance v0,LC (patched)
+                    0x106e, 0x0000, 0x0000, // invoke-virtual {v0},LB.who (patched)
+                    0x010a, // move-result v1
+                    0x010f, // return v1
+                ],
+            )],
         );
         let (mut b, ix) = build(&[base, child, entry]);
         let tc = ix.t("LC;");
@@ -2350,19 +4574,23 @@ mod tests {
                     ins: 0,
                     outs: 0,
                     insns: vec![
-                        0x1112,         // const/4 v1,1
+                        0x1112, // const/4 v1,1
                         0x0169, 0x0000, // sput v1,LT.x (patched)
-                        0x000e,         // return-void
+                        0x000e, // return-void
                     ],
                     tries: vec![],
                     lits: &[],
                 },
-                dir("main", 0, vec![
-                    0x0060, 0x0000, // sget v0,LT.x
-                    0x0160, 0x0000, // sget v1,LT.x
-                    0x0090, 0x0100, // add-int v0,v0,v1
-                    0x000f,
-                ]),
+                dir(
+                    "main",
+                    0,
+                    vec![
+                        0x0060, 0x0000, // sget v0,LT.x
+                        0x0160, 0x0000, // sget v1,LT.x
+                        0x0090, 0x0100, // add-int v0,v0,v1
+                        0x000f,
+                    ],
+                ),
             ],
             ..cls("LT;", vec![])
         };
@@ -2377,8 +4605,6 @@ mod tests {
         let mut v = vm(b);
         assert_eq!(v.run("LT;", "main", &[]).unwrap(), Some(V::I32(2)));
     }
-
-
 
     #[test]
     fn const_string_and_builtin_length() {
@@ -2450,13 +4676,13 @@ mod tests {
         ]);
         let v = vm(b);
         assert!(v.assignable(
-            ix.t("LCustomBtn;"),
-            ix.t("Landroid/view/View;")
+            ix.t("LCustomBtn;") as u64,
+            ix.t("Landroid/view/View;") as u64
         ));
         // …and an unrelated class is still rejected.
         assert!(!v.assignable(
-            ix.t("Landroid/widget/Button;"),
-            ix.t("LCustomBtn;")
+            ix.t("Landroid/widget/Button;") as u64,
+            ix.t("LCustomBtn;") as u64
         ));
     }
 
@@ -2470,18 +4696,22 @@ mod tests {
         //       (case0 abs 4 -> +3, case1 abs 6 -> +5)
         let c = cls(
             "LT;",
-            vec![dir("f", 0, vec![
-                0x1012,                 // const/4 v0,1
-                0x002b, 0x0008, 0x0000, // packed-switch v0,+8 -> @9
-                0xa112,                 // const/4 v1,10
-                0x010f,                 // return v1
-                0x0113, 0x0014,         // const/16 v1,20
-                0x010f,                 // return v1
-                0x0100, 0x0002,         // payload: packed, size 2
-                0x0000, 0x0000,         // first_key = 0
-                0x0003, 0x0000,         // target[0] = +3 -> @4
-                0x0005, 0x0000,         // target[1] = +5 -> @6
-            ])],
+            vec![dir(
+                "f",
+                0,
+                vec![
+                    0x1012, // const/4 v0,1
+                    0x002b, 0x0008, 0x0000, // packed-switch v0,+8 -> @9
+                    0xa112, // const/4 v1,10
+                    0x010f, // return v1
+                    0x0113, 0x0014, // const/16 v1,20
+                    0x010f, // return v1
+                    0x0100, 0x0002, // payload: packed, size 2
+                    0x0000, 0x0000, // first_key = 0
+                    0x0003, 0x0000, // target[0] = +3 -> @4
+                    0x0005, 0x0000, // target[1] = +5 -> @6
+                ],
+            )],
         );
         let (b, _ix) = build(&[c]);
         let mut v = vm(b);
@@ -2637,14 +4867,18 @@ mod tests {
         // try/catch (non-empty tries) is outside the compile whitelist:
         // enable_aot must leave it to the interpreter, which still runs
         // the handler.
-        let mut m = dir("f", 0, vec![
-            0x0012, // const/4 v0,0
-            0x0093, 0x0000, // div-int v0,v0,v0
-            0x000f, // return v0
-            0x020d, // move-exception v2
-            0xf112, // const/4 v1,-1
-            0x010f, // return v1
-        ]);
+        let mut m = dir(
+            "f",
+            0,
+            vec![
+                0x0012, // const/4 v0,0
+                0x0093, 0x0000, // div-int v0,v0,v0
+                0x000f, // return v0
+                0x020d, // move-exception v2
+                0xf112, // const/4 v1,-1
+                0x010f, // return v1
+            ],
+        );
         m.tries = vec![(1, 2, vec![], Some(4))];
         let (b, _ix) = build(&[cls("LT;", vec![m])]);
         let mut v = vm(b);

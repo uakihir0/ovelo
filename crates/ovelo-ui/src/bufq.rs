@@ -187,7 +187,10 @@ impl BufferQueue {
 
     /// Producer: borrow the slot's buffer for rendering.
     pub fn buffer_mut(&mut self, slot: usize) -> Result<&mut Surface, OveloError> {
-        let e = self.slots.get_mut(slot).ok_or_else(|| err("ui.bufq.slot"))?;
+        let e = self
+            .slots
+            .get_mut(slot)
+            .ok_or_else(|| err("ui.bufq.slot"))?;
         if e.state != Slot::Dequeued {
             return Err(err("ui.bufq.not_dequeued"));
         }
@@ -197,7 +200,10 @@ impl BufferQueue {
     /// Producer: writing finished — hand the frame to the consumer.
     /// Frames produced in an older generation are discarded instead.
     pub fn queue(&mut self, slot: usize) -> Result<FrameId, OveloError> {
-        let e = self.slots.get_mut(slot).ok_or_else(|| err("ui.bufq.slot"))?;
+        let e = self
+            .slots
+            .get_mut(slot)
+            .ok_or_else(|| err("ui.bufq.slot"))?;
         if e.state != Slot::Dequeued {
             return Err(err("ui.bufq.not_dequeued"));
         }
@@ -222,7 +228,10 @@ impl BufferQueue {
 
     /// Producer: cancel a checked-out slot (no frame produced).
     pub fn cancel(&mut self, slot: usize) -> Result<(), OveloError> {
-        let e = self.slots.get_mut(slot).ok_or_else(|| err("ui.bufq.slot"))?;
+        let e = self
+            .slots
+            .get_mut(slot)
+            .ok_or_else(|| err("ui.bufq.slot"))?;
         if e.state != Slot::Dequeued {
             return Err(err("ui.bufq.not_dequeued"));
         }
@@ -267,7 +276,10 @@ impl BufferQueue {
 
     /// Consumer: reading finished — the slot is reusable by the producer.
     pub fn release(&mut self, id: FrameId) -> Result<(), OveloError> {
-        let e = self.slots.get_mut(id.slot).ok_or_else(|| err("ui.bufq.slot"))?;
+        let e = self
+            .slots
+            .get_mut(id.slot)
+            .ok_or_else(|| err("ui.bufq.slot"))?;
         if e.state != Slot::Acquired || e.frame != id.frame {
             return Err(err("ui.bufq.not_acquired"));
         }
@@ -303,10 +315,7 @@ pub struct ANativeWindow {
 impl ANativeWindow {
     /// Wrap a queue.
     pub fn new(queue: BufferQueue) -> Self {
-        Self {
-            queue,
-            held: None,
-        }
+        Self { queue, held: None }
     }
 
     /// The underlying queue, read-only (consumer latch/read).
@@ -331,13 +340,19 @@ impl ANativeWindow {
 
     /// `ANativeWindow_unlockAndPost` — queue the written frame.
     pub fn unlock_and_post(&mut self) -> Result<FrameId, OveloError> {
-        let s = self.held.take().ok_or_else(|| err("ui.nwindow.not_locked"))?;
+        let s = self
+            .held
+            .take()
+            .ok_or_else(|| err("ui.nwindow.not_locked"))?;
         self.queue.queue(s)
     }
 
     /// `ANativeWindow_cancelBuffer`.
     pub fn cancel_lock(&mut self) -> Result<(), OveloError> {
-        let s = self.held.take().ok_or_else(|| err("ui.nwindow.not_locked"))?;
+        let s = self
+            .held
+            .take()
+            .ok_or_else(|| err("ui.nwindow.not_locked"))?;
         self.queue.cancel(s)
     }
 }
@@ -399,8 +414,8 @@ mod tests {
         assert!(q.resize(0, 8).is_err());
         assert!(q.acquire().is_some()); // queued frame survived
         q.acquire(); // (no second acquire needed; acquired already)
-        // Mid-draw resize: the drawn frame is discarded at queue time,
-        // the freed slot comes back reallocated at the next dequeue.
+                     // Mid-draw resize: the drawn frame is discarded at queue time,
+                     // the freed slot comes back reallocated at the next dequeue.
         let mut q = BufferQueue::new(2, 2, 2).unwrap();
         let s = q.dequeue().unwrap();
         q.resize(8, 8).unwrap();

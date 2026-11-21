@@ -29,6 +29,13 @@ pub trait Drawable {
     fn origin(&self) -> (i32, i32);
     /// Requested layout params (for the parent's `for_child` spec).
     fn lp(&self) -> (Length, Length);
+    /// Dex-assigned frame `(l, t, r, b)` relative to the parent, when
+    /// the guest already laid this node out — the parent's `layout`
+    /// positions the child at `(left + l, top + t)` instead of its
+    /// own stacking/overlay heuristic.
+    fn dex_frame(&self) -> Option<(i32, i32, i32, i32)> {
+        None
+    }
     /// `dispatchTouchEvent` (tap): `down` presses the topmost clickable
     /// view under the point, `!down` releases it — a click only fires
     /// when press and release land on the same view (Android's
@@ -85,9 +92,28 @@ impl Drawable for View {
         self.layout(left, top)
     }
     fn draw(&mut self, c: &mut Canvas) {
+        let s = self.measured;
         if let Some(bg) = self.background {
-            let s = self.measured;
             c.draw_rect(Rect::new(self.left, self.top, s.w, s.h), Paint::color(bg));
+        }
+        if let Some((iw, ih, px)) = &self.image {
+            c.draw_image(
+                self.left,
+                self.top,
+                s.w.max(0) as usize,
+                s.h.max(0) as usize,
+                *iw as usize,
+                *ih as usize,
+                px,
+            );
+        }
+        if let Some(ops) = self.custom_ops.clone() {
+            // Guest `onDraw` ops are view-local — translate into the
+            // view's absolute origin before replaying.
+            c.save();
+            c.translate(self.left, self.top);
+            replay_guest_ops(c, &ops);
+            c.restore();
         }
     }
     fn invalidate(&mut self) {
@@ -136,7 +162,10 @@ impl Drawable for ViewGroup {
     fn draw(&mut self, c: &mut Canvas) {
         let s = self.view.measured;
         if let Some(bg) = self.view.background {
-            c.draw_rect(Rect::new(self.view.left, self.view.top, s.w, s.h), Paint::color(bg));
+            c.draw_rect(
+                Rect::new(self.view.left, self.view.top, s.w, s.h),
+                Paint::color(bg),
+            );
         }
         // Children draw at their own laid-out origins (absolute coords).
         for ch in &mut self.children {
@@ -240,7 +269,10 @@ impl Drawable for TextView {
     fn draw(&mut self, c: &mut Canvas) {
         let s = self.view.measured;
         if let Some(bg) = self.view.background {
-            c.draw_rect(Rect::new(self.view.left, self.view.top, s.w, s.h), Paint::color(bg));
+            c.draw_rect(
+                Rect::new(self.view.left, self.view.top, s.w, s.h),
+                Paint::color(bg),
+            );
         }
         let t = ovelo_ui::layout(
             &self.text,
@@ -369,5 +401,143 @@ impl Drawable for Button {
     }
     fn lp(&self) -> (Length, Length) {
         self.tv.lp()
+    }
+}
+
+/// Replay a guest `onDraw` recording: each [`ovelo_dexrt::CanvasOp`]
+/// maps onto the `Canvas` subset (already translated to the view's
+/// absolute origin by the caller). Stroke-styled shapes approximate
+/// as outlines via `draw_line`; `drawText` honors LEFT/CENTER/RIGHT
+/// alignment using the shared font metrics.
+fn replay_guest_ops(c: &mut Canvas, ops: &[ovelo_dexrt::CanvasOp]) {
+    use ovelo_dexrt::CanvasOp as O;
+    let paint = |p: &ovelo_dexrt::PaintState| Paint {
+        color: Color::from_srgb8(
+            (p.argb >> 16) as u8,
+            (p.argb >> 8) as u8,
+            p.argb as u8,
+            (p.argb >> 24) as u8,
+        ),
+        text_size: p.text_size.max(1.0),
+    };
+    let stroke_or_fill = |c: &mut Canvas, r: Rect, p: &ovelo_dexrt::PaintState, rad: i32| {
+        let col = paint(p);
+        if p.style == 1 {
+            // STROKE — outline via edge lines at the stroke width.
+            let w = (p.stroke_w.max(1.0)) as i32;
+            c.draw_line(r.x, r.y, r.x1, r.y, w, col);
+            c.draw_line(r.x1, r.y, r.x1, r.y1, w, col);
+            c.draw_line(r.x1, r.y1, r.x, r.y1, w, col);
+            c.draw_line(r.x, r.y1, r.x, r.y, w, col);
+        } else if rad > 0 {
+            c.draw_round_rect(r, rad, col);
+        } else {
+            c.draw_rect(r, col);
+        }
+    };
+    for op in ops {
+        match op {
+            O::Save => c.save(),
+            O::Restore => c.restore(),
+            O::Translate { dx, dy } => c.translate(*dx as i32, *dy as i32),
+            O::ClipRect { l, t, r, b } => c.clip_rect(Rect::new(
+                *l as i32,
+                *t as i32,
+                (*r - *l) as i32,
+                (*b - *t) as i32,
+            )),
+            O::Color { argb } => c.draw_color(Color::from_srgb8(
+                (argb >> 16) as u8,
+                (argb >> 8) as u8,
+                *argb as u8,
+                (argb >> 24) as u8,
+            )),
+            O::Rect { l, t, r, b, paint: p } => {
+                let r = Rect::new(*l as i32, *t as i32, (*r - *l) as i32, (*b - *t) as i32);
+                stroke_or_fill(c, r, p, 0);
+            }
+            O::RoundRect {
+                l,
+                t,
+                r,
+                b,
+                rx,
+                ry,
+                paint: p,
+            } => {
+                let r = Rect::new(*l as i32, *t as i32, (*r - *l) as i32, (*b - *t) as i32);
+                stroke_or_fill(c, r, p, rx.max(*ry) as i32);
+            }
+            O::Oval { l, t, r, b, paint: p } => {
+                let r = Rect::new(*l as i32, *t as i32, (*r - *l) as i32, (*b - *t) as i32);
+                let rad = (r.x1 - r.x).min(r.y1 - r.y) / 2;
+                stroke_or_fill(c, r, p, rad);
+            }
+            O::Circle {
+                cx,
+                cy,
+                r,
+                paint: p,
+            } => {
+                let rect = Rect::new(
+                    (*cx - *r) as i32,
+                    (*cy - *r) as i32,
+                    (*r * 2.0) as i32,
+                    (*r * 2.0) as i32,
+                );
+                stroke_or_fill(c, rect, p, *r as i32);
+            }
+            O::Line {
+                x0,
+                y0,
+                x1,
+                y1,
+                paint: p,
+            } => {
+                c.draw_line(
+                    *x0 as i32,
+                    *y0 as i32,
+                    *x1 as i32,
+                    *y1 as i32,
+                    p.stroke_w.max(1.0) as i32,
+                    paint(p),
+                );
+            }
+            O::Text { text, x, y, paint: p } => {
+                let mut px = *x;
+                if p.align == 1 {
+                    px -= c.measure(text, p.text_size.max(1.0)) / 2.0;
+                } else if p.align == 2 {
+                    px -= c.measure(text, p.text_size.max(1.0));
+                }
+                c.draw_text(text, px as i32, *y as i32, paint(p));
+            }
+            O::Bitmap {
+                x,
+                y,
+                w,
+                h,
+                src_w,
+                src_h,
+                rgba,
+            } => {
+                let (dw, dh) = if *w == 0 || *h == 0 {
+                    (*src_w as usize, *src_h as usize)
+                } else {
+                    (*w as usize, *h as usize)
+                };
+                if dw > 0 && dh > 0 && !rgba.is_empty() {
+                    c.draw_image(
+                        *x as i32,
+                        *y as i32,
+                        dw,
+                        dh,
+                        *src_w as usize,
+                        *src_h as usize,
+                        rgba,
+                    );
+                }
+            }
+        }
     }
 }

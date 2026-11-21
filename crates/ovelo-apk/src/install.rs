@@ -18,8 +18,12 @@ fn err(cause: impl Into<String>) -> OveloError {
 }
 
 fn io_err(op: &str, e: std::io::Error) -> OveloError {
-    OveloError::new(ErrorCategory::HostCrash, Phase::Install, format!("install.io.{op}"))
-        .with_detail(e.to_string())
+    OveloError::new(
+        ErrorCategory::HostCrash,
+        Phase::Install,
+        format!("install.io.{op}"),
+    )
+    .with_detail(e.to_string())
 }
 
 /// The installed-app identity: package name + signer fingerprint.
@@ -37,7 +41,13 @@ impl AppId {
         let pkg: String = self
             .package
             .chars()
-            .map(|c| if c.is_ascii_alphanumeric() || c == '.' || c == '_' || c == '-' { c } else { '_' })
+            .map(|c| {
+                if c.is_ascii_alphanumeric() || c == '.' || c == '_' || c == '-' {
+                    c
+                } else {
+                    '_'
+                }
+            })
             .collect();
         if self.signer.contains('+') {
             // Multi-signer: hash so distinct signer sets cannot collide.
@@ -135,12 +145,25 @@ impl InstallStore {
     /// `signer` is the verified signer fingerprint of this APK. When a record
     /// already exists it must have the same signer; a different signer is a
     /// `PKG_SIGNATURE` rejection and the previous version stays active.
-    pub fn commit(&self, app: &AppId, version_code: i64, apk_sha256: &str, signer: &str) -> Result<InstallRecord> {
+    pub fn commit(
+        &self,
+        app: &AppId,
+        version_code: i64,
+        apk_sha256: &str,
+        signer: &str,
+    ) -> Result<InstallRecord> {
         self.commit_splits(app, version_code, apk_sha256, signer, &[])
     }
 
     /// `commit` with the resolved split set recorded alongside the base.
-    pub fn commit_splits(&self, app: &AppId, version_code: i64, apk_sha256: &str, signer: &str, splits: &[StoredSplit]) -> Result<InstallRecord> {
+    pub fn commit_splits(
+        &self,
+        app: &AppId,
+        version_code: i64,
+        apk_sha256: &str,
+        signer: &str,
+        splits: &[StoredSplit],
+    ) -> Result<InstallRecord> {
         for s in splits {
             if !self.root.join("apks").join(&s.sha256).exists() {
                 return Err(err("install.split.absent").with_detail(s.sha256.clone()));
@@ -313,9 +336,7 @@ mod tests {
         let dir = tempfile_dir();
         let store = InstallStore::open(&dir).unwrap();
         let hash = store.store_apk(b"apk-bytes-v1").unwrap();
-        let rec = store
-            .commit(&app(), 1, &hash, &"aa".repeat(32))
-            .unwrap();
+        let rec = store.commit(&app(), 1, &hash, &"aa".repeat(32)).unwrap();
         assert_eq!(rec.version_code, 1);
         let loaded = store.current(&app()).unwrap().unwrap();
         assert_eq!(loaded.apk_sha256, hash);
@@ -327,16 +348,14 @@ mod tests {
         let dir = tempfile_dir();
         let store = InstallStore::open(&dir).unwrap();
         let hash = store.store_apk(b"v1").unwrap();
-        store
-            .commit(&app(), 1, &hash, &"aa".repeat(32))
-            .unwrap();
+        store.commit(&app(), 1, &hash, &"aa".repeat(32)).unwrap();
         // Different app.signer → rejected, and the identity lookup itself is keyed by signer.
         let other = AppId {
             package: "com.test.app".into(),
             signer: "bb".repeat(32),
         };
         assert!(store.commit(&other, 2, &hash, &"bb".repeat(32)).is_ok()); // different identity is a separate app
-        // Same identity dir but mismatched caller arg → reject
+                                                                           // Same identity dir but mismatched caller arg → reject
         let e = store
             .commit(&app(), 2, &hash, &"bb".repeat(32))
             .unwrap_err();
@@ -356,8 +375,11 @@ mod tests {
 
     fn tempfile_dir() -> PathBuf {
         static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-        let d = std::env::temp_dir().join(format!("ovelo-apk-test-{}-{}", std::process::id(),
-            NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed)));
+        let d = std::env::temp_dir().join(format!(
+            "ovelo-apk-test-{}-{}",
+            std::process::id(),
+            NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+        ));
         std::fs::create_dir_all(&d).unwrap();
         d
     }
@@ -397,13 +419,19 @@ mod split_tests {
                 1,
                 &base,
                 &"aa".repeat(32),
-                &[StoredSplit { name: "config.arm64-v8a".into(), sha256: abi }],
+                &[StoredSplit {
+                    name: "config.arm64-v8a".into(),
+                    sha256: abi,
+                }],
             )
             .unwrap();
         let loaded = store.current(&sapp()).unwrap().unwrap();
         assert_eq!(loaded.splits.len(), 1);
         assert_eq!(store.split_bytes(&loaded, "").unwrap(), b"base");
-        assert_eq!(store.split_bytes(&loaded, "config.arm64-v8a").unwrap(), b"abi");
+        assert_eq!(
+            store.split_bytes(&loaded, "config.arm64-v8a").unwrap(),
+            b"abi"
+        );
         assert!(store.split_bytes(&loaded, "config.en").is_err());
         drop(rec);
     }
@@ -419,7 +447,10 @@ mod split_tests {
                 1,
                 &base,
                 &"aa".repeat(32),
-                &[StoredSplit { name: "config.en".into(), sha256: "cd".repeat(32) }],
+                &[StoredSplit {
+                    name: "config.en".into(),
+                    sha256: "cd".repeat(32)
+                }],
             )
             .is_err());
     }

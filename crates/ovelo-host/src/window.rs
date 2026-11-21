@@ -75,7 +75,6 @@ impl HostApp {
             .resize((surface_px.0 as f64, surface_px.1 as f64), (0.0, 0.0));
         Ok(gen)
     }
-
 }
 
 #[cfg(test)]
@@ -98,10 +97,7 @@ mod tests {
             Some(HostKey::Paste)
         );
         assert_eq!(map_host_key(&Key::Character("c".into()), false), None);
-        assert_eq!(
-            map_host_key(&Key::Named(NamedKey::Space), false),
-            None
-        );
+        assert_eq!(map_host_key(&Key::Named(NamedKey::Space), false), None);
     }
 
     #[test]

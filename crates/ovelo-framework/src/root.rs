@@ -7,8 +7,8 @@
 //! lands on the next presented frame (design doc §06 "Interaction and
 //! Scope").
 
-use crate::widget::Drawable;
 use crate::view::{Length, MeasureSpec};
+use crate::widget::Drawable;
 use ovelo_error::Result;
 use ovelo_ui::{ANativeWindow, Canvas, Color, FontSet, FrameId, Rect};
 use std::rc::Rc;
@@ -209,9 +209,7 @@ mod tests {
             Color::srgb(0, 0, 0),
             root.fonts.clone(),
         )));
-        let mut win = ANativeWindow::new(
-            ovelo_ui::BufferQueue::new(2, 64, 64).expect("queue"),
-        );
+        let mut win = ANativeWindow::new(ovelo_ui::BufferQueue::new(2, 64, 64).expect("queue"));
         assert!(root.perform_traversals(&mut win).unwrap().is_some());
         assert!(root.perform_traversals(&mut win).unwrap().is_none());
     }

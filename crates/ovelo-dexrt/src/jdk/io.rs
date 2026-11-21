@@ -10,79 +10,184 @@ pub(crate) fn call(
     sig: &str,
     args: &[V],
 ) -> Rt<Option<Option<V>>> {
-    Ok(if desc_is_a(class, "Ljava/io/PrintStream;") || desc_is_a(class, "Ljava/io/PrintWriter;") {
-        print_call(vm, name, sig, args)
-    } else if desc_is_a(class, "Ljava/io/InputStream;")
-        || class.ends_with("InputStream;")
-        || class.ends_with("Reader;")
-        || class.ends_with("OutputStream;")
-        || class.ends_with("Writer;")
-    {
-        stream_call(vm, name, args)
-    } else if class == "Ljava/io/File;" {
-        file_call(vm, name, args)
-    } else if class == "Ljava/util/regex/Pattern;" {
-        pattern_call(vm, name, args)
-    } else if class == "Ljava/util/regex/Matcher;" {
-        matcher_call(vm, name, args)?
-    } else if desc_is_a(class, "Ljava/text/SimpleDateFormat;")
-        || desc_is_a(class, "Ljava/text/DateFormat;")
-        || class == "Ljava/text/NumberFormat;" || class == "Ljava/text/DecimalFormat;"
-    {
-        format_call(vm, name, args)
-    } else if class == "Lorg/json/JSONObject;" {
-        json_obj(vm, name, args)
-    } else if class == "Lorg/json/JSONArray;" {
-        json_arr(vm, name, args)
-    } else if class == "Ljava/net/URLEncoder;" || class == "Ljava/net/URLDecoder;" {
-        url_codec(vm, name, args)
-    } else if class == "Ljava/net/URL;" || class == "Ljava/net/URI;" {
-        url_call(vm, name, args)?
-    } else if class == "Ljava/net/URLConnection;" || desc_is_a(class, "Ljava/net/URLConnection;") {
-        match name {
-            "connect" | "disconnect" | "setRequestProperty" | "setDoInput"
-            | "setDoOutput" | "setConnectTimeout" | "setReadTimeout"
-            | "setRequestMethod" | "setChunkedStreamingMode"
-            | "setFixedLengthStreamingMode" | "setInstanceFollowRedirects" => {
-                Some(None)
+    Ok(
+        if desc_is_a(class, "Ljava/io/PrintStream;") || desc_is_a(class, "Ljava/io/PrintWriter;") {
+            print_call(vm, name, sig, args)
+        } else if class.ends_with("FileInputStream;") && name == "<init>" {
+            // Open the real file: arg is a File (Path host), a String, or a
+            // FileDescriptor already carrying bytes (`getFD`/ParcelFileDescriptor).
+            let arg = args.get(1).copied().unwrap_or(V::Ref(0));
+            let fd_bytes = match arg {
+                V::Ref(h) => match vm.heap.get(h) {
+                    Some(Obj::Host {
+                        state: HostState::Bytes(b, p),
+                        ..
+                    }) => Some(b[*p..].to_vec()),
+                    _ => None,
+                },
+                _ => None,
+            };
+            let bytes = fd_bytes.unwrap_or_else(|| {
+                stream_arg_path(vm, arg)
+                    .and_then(|p| std::fs::read(fspath(vm, &p)).ok())
+                    .unwrap_or_default()
+            });
+            if let Some(V::Ref(this)) = args.first() {
+                let (ci, d, fs) = match vm.heap.get(*this) {
+                    Some(Obj::Host {
+                        class_idx,
+                        desc,
+                        fields,
+                        ..
+                    }) => (*class_idx, desc.clone(), fields.clone()),
+                    Some(Obj::Instance { class_idx, fields }) => {
+                        (*class_idx, class.to_string(), fields.clone())
+                    }
+                    _ => (u64::MAX, class.to_string(), Default::default()),
+                };
+                if let Some(o) = vm.heap.get_mut(*this) {
+                    *o = Obj::Host {
+                        class_idx: ci,
+                        desc: d,
+                        fields: fs,
+                        state: HostState::Bytes(std::rc::Rc::new(bytes), 0),
+                    };
+                }
             }
-            "getResponseCode" => Some(Some(V::I32(200))),
-            "getResponseMessage" | "getContentType" | "getContentEncoding"
-            | "getHeaderField" | "getRequestProperty" | "getURL" => {
-                Some(Some(V::Ref(0)))
+            Some(None)
+        } else if class.ends_with("FileInputStream;") && name == "getFD" {
+            // The descriptor keeps the byte payload so decodeFileDescriptor
+            // can read it without a second open.
+            let (bytes, pos) = match args.first() {
+                Some(V::Ref(h)) => match vm.heap.get(*h) {
+                    Some(Obj::Host {
+                        state: HostState::Bytes(b, p),
+                        ..
+                    }) => (b.clone(), *p),
+                    _ => (std::rc::Rc::new(vec![]), 0),
+                },
+                _ => (std::rc::Rc::new(vec![]), 0),
+            };
+            Some(Some(host(
+                vm,
+                "Ljava/io/FileDescriptor;",
+                HostState::Bytes(bytes, pos),
+            )))
+        } else if desc_is_a(class, "Ljava/io/InputStream;")
+            || class.ends_with("InputStream;")
+            || class.ends_with("Reader;")
+            || class.ends_with("OutputStream;")
+            || class.ends_with("Writer;")
+        {
+            stream_call(vm, name, args)
+        } else if class == "Ljava/io/File;" {
+            file_call(vm, name, args)
+        } else if class == "Ljava/util/regex/Pattern;" {
+            pattern_call(vm, name, args)
+        } else if class == "Ljava/util/regex/Matcher;" {
+            matcher_call(vm, name, args)?
+        } else if desc_is_a(class, "Ljava/text/SimpleDateFormat;")
+            || desc_is_a(class, "Ljava/text/DateFormat;")
+            || class == "Ljava/text/NumberFormat;"
+            || class == "Ljava/text/DecimalFormat;"
+        {
+            format_call(vm, name, args)
+        } else if class == "Lorg/json/JSONObject;" {
+            json_obj(vm, name, args)
+        } else if class == "Lorg/json/JSONArray;" {
+            json_arr(vm, name, args)
+        } else if class == "Ljavax/net/ssl/TrustManagerFactory;" {
+            match name {
+                // OkHttp's Platform requires exactly one default trust
+                // manager — answer a single X509TrustManager placeholder.
+                "getTrustManagers" => {
+                    let tm = host(vm, "Ljavax/net/ssl/X509TrustManager;", HostState::Empty);
+                    Some(Some(arr(vm, "Ljavax/net/ssl/TrustManager;", vec![tm])))
+                }
+                "getDefaultAlgorithm" => Some(Some(jstr(vm, "PKIX"))),
+                _ => Some(Some(stub_ret(vm, sig))),
             }
-            "getContentLength" | "getContentLengthLong" | "getDate"
-            | "getExpiration" | "getLastModified" | "getHeaderFieldInt"
-            | "getHeaderFieldLong" => Some(Some(V::I64(0))),
-            "getInputStream" => {
-                Some(Some(host(vm, "Ljava/io/InputStream;", HostState::Empty)))
+        } else if class == "Ljavax/net/ssl/X509TrustManager;"
+            || class == "Ljavax/net/ssl/TrustManager;"
+            || class == "Ljavax/net/ssl/SSLSocketFactory;"
+            || class == "Ljavax/net/ssl/SSLContext;"
+        {
+            match name {
+                "getAcceptedIssuers" => Some(Some(arr(
+                    vm,
+                    "Ljava/security/cert/X509Certificate;",
+                    vec![],
+                ))),
+                "init" | "checkClientTrusted" | "checkServerTrusted" => Some(None),
+                "getSocketFactory" | "getDefault" => Some(Some(host(
+                    vm,
+                    "Ljavax/net/ssl/SSLSocketFactory;",
+                    HostState::Empty,
+                ))),
+                "getInstance" => Some(Some(host(vm, class, HostState::Empty))),
+                _ => Some(Some(stub_ret(vm, sig))),
             }
-            "getOutputStream" => {
-                Some(Some(host(vm, "Ljava/io/OutputStream;", HostState::Empty)))
+        } else if class == "Ljava/net/URLEncoder;" || class == "Ljava/net/URLDecoder;" {
+            url_codec(vm, name, args)
+        } else if class == "Ljava/net/URL;" || class == "Ljava/net/URI;" {
+            url_call(vm, name, args)?
+        } else if class == "Ljava/net/URLConnection;"
+            || desc_is_a(class, "Ljava/net/URLConnection;")
+        {
+            match name {
+                "connect"
+                | "disconnect"
+                | "setRequestProperty"
+                | "setDoInput"
+                | "setDoOutput"
+                | "setConnectTimeout"
+                | "setReadTimeout"
+                | "setRequestMethod"
+                | "setChunkedStreamingMode"
+                | "setFixedLengthStreamingMode"
+                | "setInstanceFollowRedirects" => Some(None),
+                "getResponseCode" => Some(Some(V::I32(200))),
+                "getResponseMessage" | "getContentType" | "getContentEncoding"
+                | "getHeaderField" | "getRequestProperty" | "getURL" => Some(Some(V::Ref(0))),
+                "getContentLength"
+                | "getContentLengthLong"
+                | "getDate"
+                | "getExpiration"
+                | "getLastModified"
+                | "getHeaderFieldInt"
+                | "getHeaderFieldLong" => Some(Some(V::I64(0))),
+                "getInputStream" => Some(Some(host(vm, "Ljava/io/InputStream;", HostState::Empty))),
+                "getOutputStream" => {
+                    Some(Some(host(vm, "Ljava/io/OutputStream;", HostState::Empty)))
+                }
+                "getHeaderFields" => {
+                    Some(Some(host(vm, "Ljava/util/Map;", HostState::Map(vec![]))))
+                }
+                _ => None,
             }
-            "getHeaderFields" => {
-                Some(Some(host(vm, "Ljava/util/Map;", HostState::Map(vec![]))))
-            }
-            _ => None,
-        }
-    } else if desc_is_a(class, "Ljava/nio/charset/Charset;")
-        || class == "Ljava/nio/charset/StandardCharsets;"
-    {
-        charset_call(vm, name, args)
-    } else if desc_is_a(class, "Ljava/nio/Buffer;") || class.starts_with("Ljava/nio/") {
-        nio_call(vm, name, args)
-    } else if class == "Ljava/util/Base64;" || class == "Ljava/util/Base64$Encoder;"
-        || class == "Ljava/util/Base64$Decoder;" || class == "Landroid/util/Base64;"
-    {
-        base64_call(vm, name, args)
-    } else if class == "Ljava/util/Formatter;" || class == "Ljava/util/Scanner;"
-        || class == "Ljava/util/Locale;" || class == "Ljava/text/MessageFormat;"
-        || class.starts_with("Ljava/text/")
-    {
-        misc_fmt(vm, class, name, args)
-    } else {
-        return Ok(None);
-    })
+        } else if desc_is_a(class, "Ljava/nio/charset/Charset;")
+            || class == "Ljava/nio/charset/StandardCharsets;"
+        {
+            charset_call(vm, name, args)
+        } else if desc_is_a(class, "Ljava/nio/Buffer;") || class.starts_with("Ljava/nio/") {
+            nio_call(vm, name, args)
+        } else if class == "Ljava/util/Base64;"
+            || class == "Ljava/util/Base64$Encoder;"
+            || class == "Ljava/util/Base64$Decoder;"
+            || class == "Landroid/util/Base64;"
+        {
+            base64_call(vm, name, args)
+        } else if class == "Ljava/util/Formatter;"
+            || class == "Ljava/util/Scanner;"
+            || class == "Ljava/util/Locale;"
+            || class == "Ljava/text/MessageFormat;"
+            || class.starts_with("Ljava/text/")
+        {
+            misc_fmt(vm, class, name, args)
+        } else {
+            return Ok(None);
+        },
+    )
 }
 
 // ---------------------------------------------------------------------
@@ -131,11 +236,76 @@ fn print_call(vm: &mut Vm, name: &str, _sig: &str, args: &[V]) -> Option<Option<
 }
 
 fn stream_call(vm: &mut Vm, name: &str, args: &[V]) -> Option<Option<V>> {
+    let this = match args.first() {
+        Some(&V::Ref(h)) => h,
+        _ => 0,
+    };
+    // Byte-backed streams (raw resources, assets): real reads.
+    if let Some(Obj::Host {
+        state: HostState::Bytes(data, pos),
+        ..
+    }) = vm.heap.get_mut(this)
+    {
+        match name {
+            "read" => {
+                if args.len() == 1 {
+                    return Some(Some(if *pos < data.len() {
+                        let b = data[*pos] as i32;
+                        *pos += 1;
+                        V::I32(b)
+                    } else {
+                        V::I32(-1)
+                    }));
+                }
+                // read(byte[]) / read(byte[], off, len)
+                let buf = match args.get(1) {
+                    Some(&V::Ref(h)) => h,
+                    _ => 0,
+                };
+                let (mut off, mut want) = (0usize, usize::MAX);
+                if args.len() > 3 {
+                    off = i64v(args[2]).max(0) as usize;
+                    want = i64v(args[3]).max(0) as usize;
+                }
+                let avail = data.len() - *pos;
+                if avail == 0 && want != 0 {
+                    return Some(Some(V::I32(-1)));
+                }
+                let n = want.min(avail);
+                let chunk: Vec<u8> = data[*pos..*pos + n].to_vec();
+                *pos += n;
+                if let Some(Obj::Array { data: dst, .. }) = vm.heap.get_mut(buf) {
+                    for (i, b) in chunk.iter().enumerate() {
+                        if let Some(slot) = dst.get_mut(off + i) {
+                            *slot = V::I32(*b as i8 as i32);
+                        }
+                    }
+                }
+                return Some(Some(V::I32(n as i32)));
+            }
+            "available" => {
+                return Some(Some(V::I32((data.len() - *pos) as i32)));
+            }
+            "skip" => {
+                let n = i64v(args.get(1).copied().unwrap_or(V::I64(0))).max(0) as usize;
+                let took = n.min(data.len() - *pos);
+                *pos += took;
+                return Some(Some(V::I64(took as i64)));
+            }
+            "reset" => {
+                *pos = 0;
+                return Some(None);
+            }
+            "mark" | "close" => return Some(None),
+            "markSupported" => return Some(Some(V::I32(1))),
+            _ => {}
+        }
+    }
     let _ = vm;
     match name {
         "read" => {
-            // ByteArrayInputStream over a stored byte array would need real
-            // buffering; report EOF so callers exit loops cleanly.
+            // Streams without a byte payload report EOF so callers exit
+            // loops cleanly.
             Some(Some(V::I32(-1)))
         }
         "available" => Some(Some(V::I32(0))),
@@ -159,9 +329,30 @@ fn stream_call(vm: &mut Vm, name: &str, args: &[V]) -> Option<Option<V>> {
 /// Guest-visible path -> host path under `vm.guest_root`. Absolute
 /// guest paths and `..` can never escape the sandbox: root/prefix
 /// components are dropped and `..` above the root is discarded.
-fn fspath(vm: &Vm, guest: &str) -> std::path::PathBuf {
+pub(crate) fn fspath(vm: &Vm, guest: &str) -> std::path::PathBuf {
+    // External-storage aliases resolve against external_root — shared
+    // media the app-private guest_root has no business holding.
+    for pre in [
+        "/storage/emulated/0",
+        "/storage/self/primary",
+        "/mnt/sdcard",
+        "/sdcard",
+    ] {
+        if guest == pre {
+            return vm.external_root.clone();
+        }
+        if let Some(rest) = guest.strip_prefix(&format!("{pre}/")) {
+            return under(&vm.external_root, rest);
+        }
+    }
+    under(&vm.guest_root, guest)
+}
+
+/// Sanitized join: `..` can't climb above `root`, absolute/CurDir parts
+/// are ignored. Used for both guest_root and external_root mappings.
+fn under(root: &std::path::Path, guest: &str) -> std::path::PathBuf {
     use std::path::Component as C;
-    let mut out = vm.guest_root.clone();
+    let mut out = root.to_path_buf();
     let mut depth = 0usize;
     for c in std::path::Path::new(guest).components() {
         match c {
@@ -182,7 +373,14 @@ fn fspath(vm: &Vm, guest: &str) -> std::path::PathBuf {
 }
 
 fn file_call(vm: &mut Vm, name: &str, args: &[V]) -> Option<Option<V>> {
-    let path = s(vm, match args[0] { V::Ref(h) => h, _ => 0 }).unwrap_or_default();
+    let path = s(
+        vm,
+        match args[0] {
+            V::Ref(h) => h,
+            _ => 0,
+        },
+    )
+    .unwrap_or_default();
     let std_path = fspath(vm, &path);
     match name {
         "<init>" => {
@@ -246,14 +444,12 @@ fn file_call(vm: &mut Vm, name: &str, args: &[V]) -> Option<Option<V>> {
                 .map(|d| d.as_millis() as i64)
                 .unwrap_or(0),
         )),
-        "mkdir" | "mkdirs" => Some(V::I32(
-            std::fs::create_dir_all(&std_path).is_ok() as i32,
-        )),
+        "mkdir" | "mkdirs" => Some(V::I32(std::fs::create_dir_all(&std_path).is_ok() as i32)),
         "delete" => {
             // `new File("")` maps onto the storage root — deleting it
             // would wipe the whole sandbox, which a failed delete must
             // never do.
-            let guarded = std_path == vm.guest_root;
+            let guarded = std_path == vm.guest_root || std_path == vm.external_root;
             Some(V::I32(
                 (!guarded
                     && (std::fs::remove_file(&std_path)
@@ -269,9 +465,16 @@ fn file_call(vm: &mut Vm, name: &str, args: &[V]) -> Option<Option<V>> {
                 .is_ok() as i32,
         )),
         "renameTo" => {
-            let to = s(vm, match args[1] { V::Ref(h) => h, _ => 0 }).unwrap_or_default();
+            let to = s(
+                vm,
+                match args[1] {
+                    V::Ref(h) => h,
+                    _ => 0,
+                },
+            )
+            .unwrap_or_default();
             Some(V::I32(
-                std::fs::rename(&std_path, fspath(vm, &to)).is_ok() as i32,
+                std::fs::rename(&std_path, fspath(vm, &to)).is_ok() as i32
             ))
         }
         "list" | "listFiles" => {
@@ -282,6 +485,13 @@ fn file_call(vm: &mut Vm, name: &str, args: &[V]) -> Option<Option<V>> {
                         .collect()
                 })
                 .unwrap_or_default();
+            if std::env::var_os("OVELO_VIEWDBG").is_some() {
+                eprintln!(
+                    "[viewdbg] {name} {path} -> {} ({} entries)",
+                    std_path.display(),
+                    names.len()
+                );
+            }
             if name == "list" {
                 let vs: Vec<V> = names.iter().map(|n| jstr(vm, n)).collect();
                 Some(arr(vm, STRING, vs))
@@ -294,12 +504,19 @@ fn file_call(vm: &mut Vm, name: &str, args: &[V]) -> Option<Option<V>> {
                 Some(arr(vm, "Ljava/io/File;", out))
             }
         }
-        "getFreeSpace" | "getTotalSpace" | "getUsableSpace" => {
-            Some(V::I64(1i64 << 32))
-        }
-        "setReadable" | "setWritable" | "setExecutable" | "setReadOnly"
-        | "setLastModified" | "deleteOnExit" | "toPath" | "toURI" | "toURL"
-        | "listRoots" | "createTempFile" | "isHidden" | "compareTo" => {
+        "getFreeSpace" | "getTotalSpace" | "getUsableSpace" => Some(V::I64(1i64 << 32)),
+        // Hidden on Android == getName() starts with '.' — Java's
+        // getName is the raw last segment, so "." and ".." count too
+        // (std::path's file_name would normalize them away).
+        "isHidden" => Some(V::I32(
+            path.trim_end_matches('/')
+                .rsplit('/')
+                .next()
+                .is_some_and(|n| n.starts_with('.')) as i32,
+        )),
+        "setReadable" | "setWritable" | "setExecutable" | "setReadOnly" | "setLastModified"
+        | "deleteOnExit" | "toPath" | "toURI" | "toURL" | "listRoots" | "createTempFile"
+        | "compareTo" => {
             if name == "listRoots" || name == "createTempFile" {
                 Some(host(vm, "Ljava/io/File;", HostState::Path("/tmp/x".into())))
             } else if matches!(name, "toPath" | "toURI" | "toURL") {
@@ -327,9 +544,97 @@ pub(crate) fn literal_match(pat: &str, text: &str) -> bool {
         return true;
     }
     // Very small recursive matcher for common metachars.
+    fn class_ok(spec: &[char], c: char) -> bool {
+        let (neg, spec) = match spec.first() {
+            Some('^') => (true, &spec[1..]),
+            _ => (false, spec),
+        };
+        let mut hit = false;
+        let mut i = 0;
+        while i < spec.len() {
+            let lo = if spec[i] == '\\' && i + 1 < spec.len() {
+                i += 1;
+                match spec[i] {
+                    'n' => '\n',
+                    'r' => '\r',
+                    't' => '\t',
+                    'd' | 'w' | 's' => {
+                        // \d \w \s inside a class — set membership, no range
+                        let ok = match spec[i] {
+                            'd' => c.is_ascii_digit(),
+                            'w' => c.is_alphanumeric() || c == '_',
+                            _ => c.is_whitespace(),
+                        };
+                        hit |= ok;
+                        i += 1;
+                        continue;
+                    }
+                    x => x,
+                }
+            } else {
+                spec[i]
+            };
+            if i + 2 < spec.len() && spec[i + 1] == '-' {
+                hit |= (lo..=spec[i + 2]).contains(&c);
+                i += 3;
+            } else {
+                hit |= lo == c;
+                i += 1;
+            }
+        }
+        hit != neg
+    }
+    // Position of the `]` that closes a class starting at p[0]='['.
+    fn class_end(p: &[char]) -> Option<usize> {
+        let mut i = 1;
+        while i < p.len() {
+            match p[i] {
+                '\\' => i += 1,
+                ']' if i > 1 => return Some(i),
+                _ => {}
+            }
+            i += 1;
+        }
+        None
+    }
     fn m(p: &[char], t: &[char]) -> bool {
         if p.is_empty() {
             return t.is_empty();
+        }
+        // [...] with an optional *, + or ? quantifier.
+        if p[0] == '[' {
+            if let Some(end) = class_end(p) {
+                let spec = &p[1..end];
+                let after = &p[end + 1..];
+                let (quant, rest): (char, &[char]) = match after.first() {
+                    Some('*') => ('*', &after[1..]),
+                    Some('+') => ('+', &after[1..]),
+                    Some('?') => ('?', &after[1..]),
+                    _ => ('\0', after),
+                };
+                return match quant {
+                    '*' | '+' => {
+                        let mut max = 0;
+                        while max < t.len() && class_ok(spec, t[max]) {
+                            max += 1;
+                        }
+                        // `+` requires at least one consumed char;
+                        // `*` may consume none.
+                        let lo = usize::from(quant == '+');
+                        for skip in (lo..=max).rev() {
+                            if m(rest, &t[skip..]) {
+                                return true;
+                            }
+                        }
+                        false
+                    }
+                    '?' => {
+                        (!t.is_empty() && class_ok(spec, t[0]) && m(rest, &t[1..]))
+                            || m(rest, t)
+                    }
+                    _ => !t.is_empty() && class_ok(spec, t[0]) && m(rest, &t[1..]),
+                };
+            }
         }
         match p[0] {
             '*' => false, // stray star
@@ -408,10 +713,7 @@ fn pattern_call(vm: &mut Vm, name: &str, args: &[V]) -> Option<Option<V>> {
             Some(Some(V::I32(literal_match(&pat, &t) as i32)))
         }
         "matcher" => {
-            let h = vm.alloc_host(
-                "Ljava/util/regex/Matcher;",
-                HostState::Slot(args[1]),
-            );
+            let h = vm.alloc_host("Ljava/util/regex/Matcher;", HostState::Slot(args[1]));
             if let V::Ref(ph) = args[0] {
                 if let Some(pat) = s(vm, ph) {
                     let pv = jstr(vm, &pat);
@@ -421,11 +723,25 @@ fn pattern_call(vm: &mut Vm, name: &str, args: &[V]) -> Option<Option<V>> {
             Some(Some(V::Ref(h)))
         }
         "pattern" | "toString" => {
-            let t = s(vm, match args[0] { V::Ref(h) => h, _ => 0 }).unwrap_or_default();
+            let t = s(
+                vm,
+                match args[0] {
+                    V::Ref(h) => h,
+                    _ => 0,
+                },
+            )
+            .unwrap_or_default();
             Some(Some(jstr(vm, &t)))
         }
         "split" => {
-            let pat = s(vm, match args[0] { V::Ref(h) => h, _ => 0 }).unwrap_or_default();
+            let pat = s(
+                vm,
+                match args[0] {
+                    V::Ref(h) => h,
+                    _ => 0,
+                },
+            )
+            .unwrap_or_default();
             let t = sv(vm, args[1]).unwrap_or_default();
             let parts: Vec<V> = t.split(&pat).map(|x| jstr(vm, x)).collect();
             Some(Some(arr(vm, STRING, parts)))
@@ -446,8 +762,7 @@ fn matcher_call(vm: &mut Vm, name: &str, args: &[V]) -> Rt<Option<Option<V>>> {
     Ok(match name {
         "matches" => Some(Some(V::I32(literal_match(&pat, &text) as i32))),
         "lookingAt" | "find" => {
-            let found = literal_match(&pat, &text)
-                || (!pat.is_empty() && text.contains(&pat));
+            let found = literal_match(&pat, &text) || (!pat.is_empty() && text.contains(&pat));
             Some(Some(V::I32(found as i32)))
         }
         "group" => {
@@ -470,13 +785,14 @@ fn matcher_call(vm: &mut Vm, name: &str, args: &[V]) -> Rt<Option<Option<V>>> {
         "quoteReplacement" => Some(args.first().copied()),
         "start" | "end" => Some(Some(V::I32(0))),
         "reset" => Some(Some(args[0])),
-        "region" | "useAnchoringBounds" | "useTransparentBounds"
-        | "usePattern" | "appendReplacement" => Some(Some(args[0])),
+        "region"
+        | "useAnchoringBounds"
+        | "useTransparentBounds"
+        | "usePattern"
+        | "appendReplacement" => Some(Some(args[0])),
         "appendTail" => Some(Some(args[1])),
         "pattern" => Some(Some(args[0])),
-        "requireEnd" | "hasAnchoringBounds" | "hasTransparentBounds" => {
-            Some(Some(V::I32(0)))
-        }
+        "requireEnd" | "hasAnchoringBounds" | "hasTransparentBounds" => Some(Some(V::I32(0))),
         "namedGroups" => Some(Some(host(vm, "Ljava/util/Set;", HostState::List(vec![])))),
         _ => None,
     })
@@ -600,8 +916,12 @@ fn format_call(vm: &mut Vm, name: &str, args: &[V]) -> Option<Option<V>> {
                 HostState::Millis(crate::jdk::time::parse_date(&t)),
             )))
         }
-        "applyPattern" | "applyLocalizedPattern" | "setLenient"
-        | "setTimeZone" | "setCalendar" | "setNumberFormat"
+        "applyPattern"
+        | "applyLocalizedPattern"
+        | "setLenient"
+        | "setTimeZone"
+        | "setCalendar"
+        | "setNumberFormat"
         | "setDateFormatSymbols" => Some(None),
         "toPattern" | "toLocalizedPattern" => Some(Some(jstr(vm, ""))),
         "getTimeZone" => Some(Some(host(
@@ -611,11 +931,18 @@ fn format_call(vm: &mut Vm, name: &str, args: &[V]) -> Option<Option<V>> {
         ))),
         "getCalendar" | "clone" => Some(Some(args[0])),
         "isLenient" => Some(Some(V::I32(1))),
-        "getDateInstance" | "getTimeInstance" | "getDateTimeInstance"
-        | "getInstance" | "getNumberInstance" | "getIntegerInstance"
-        | "getCurrencyInstance" | "getPercentInstance" => {
-            Some(Some(host(vm, "Ljava/text/SimpleDateFormat;", HostState::Empty)))
-        }
+        "getDateInstance"
+        | "getTimeInstance"
+        | "getDateTimeInstance"
+        | "getInstance"
+        | "getNumberInstance"
+        | "getIntegerInstance"
+        | "getCurrencyInstance"
+        | "getPercentInstance" => Some(Some(host(
+            vm,
+            "Ljava/text/SimpleDateFormat;",
+            HostState::Empty,
+        ))),
         "getAvailableLocales" => Some(Some(arr(vm, "Ljava/util/Locale;", vec![]))),
         "get2DigitYearStart" | "set2DigitYearStart" => Some(Some(V::Ref(0))),
         "parseObject" => Some(Some(V::Ref(0))),
@@ -827,8 +1154,8 @@ fn json_obj(vm: &mut Vm, name: &str, args: &[V]) -> Option<Option<V>> {
                 ),
             })
         }
-        "getInt" | "optInt" | "getLong" | "optLong" | "getDouble"
-        | "optDouble" | "getBoolean" | "optBoolean" => {
+        "getInt" | "optInt" | "getLong" | "optLong" | "getDouble" | "optDouble" | "getBoolean"
+        | "optBoolean" => {
             let dflt = args.get(1 + (name.starts_with('o') as usize));
             match map_get(vm, h, args[1]) {
                 Some(v) if !matches!(v, V::Ref(0)) => Some(v),
@@ -868,10 +1195,9 @@ fn json_obj(vm: &mut Vm, name: &str, args: &[V]) -> Option<Option<V>> {
                 }) => m.iter().map(|(k, _)| *k).collect(),
                 _ => vec![],
             };
-            Some(V::Ref(vm.alloc_host(
-                "Lorg/json/JSONArray;",
-                HostState::List(ks),
-            )))
+            Some(V::Ref(
+                vm.alloc_host("Lorg/json/JSONArray;", HostState::List(ks)),
+            ))
         }
         "toString" | "toStringInt" => Some(jstr(vm, &json_dump_v(vm, V::Ref(h)))),
         _ => return None,
@@ -885,6 +1211,47 @@ fn json_arr(vm: &mut Vm, name: &str, args: &[V]) -> Option<Option<V>> {
         _ => return None,
     };
     match name {
+        "<init>" => {
+            // JSONArray(String) parses the source; JSONArray(Collection)
+            // copies elements. Both land in the object's List state.
+            match args.get(1).copied() {
+                Some(v) if !matches!(v, V::Ref(0)) => {
+                    if let Some(src) = sv(vm, v) {
+                        let b: Vec<char> = src.chars().collect();
+                        let mut i = 0;
+                        if let Some(V::Ref(parsed)) = json_value(vm, &b, &mut i, 0) {
+                            let elems = match vm.heap.get(parsed) {
+                                Some(Obj::Host {
+                                    state: HostState::List(l),
+                                    ..
+                                }) => l.clone(),
+                                _ => vec![],
+                            };
+                            if let Some(l) = list_mut(vm, h) {
+                                *l = elems;
+                            }
+                        }
+                    } else {
+                        let rh = match v {
+                            V::Ref(r) => r,
+                            _ => 0,
+                        };
+                        let elems = match vm.heap.get(rh) {
+                            Some(Obj::Host {
+                                state: HostState::List(l),
+                                ..
+                            }) => l.clone(),
+                            _ => vec![],
+                        };
+                        if let Some(l) = list_mut(vm, h) {
+                            *l = elems;
+                        }
+                    }
+                }
+                _ => {}
+            }
+            None
+        }
         "put" => {
             if let Some(l) = list_mut(vm, h) {
                 l.push(args.get(1).copied().unwrap_or(V::Ref(0)));
@@ -913,8 +1280,8 @@ fn json_arr(vm: &mut Vm, name: &str, args: &[V]) -> Option<Option<V>> {
                 ),
             })
         }
-        "getInt" | "optInt" | "getLong" | "optLong" | "getDouble"
-        | "optDouble" | "getBoolean" | "optBoolean" => {
+        "getInt" | "optInt" | "getLong" | "optLong" | "getDouble" | "optDouble" | "getBoolean"
+        | "optBoolean" => {
             let i = i32v(args[1]) as usize;
             Some(
                 list_ref(vm, h)
@@ -922,9 +1289,7 @@ fn json_arr(vm: &mut Vm, name: &str, args: &[V]) -> Option<Option<V>> {
                     .unwrap_or_else(|| args.get(2).copied().unwrap_or(V::I32(0))),
             )
         }
-        "length" => Some(V::I32(
-            list_ref(vm, h).map(|l| l.len() as i32).unwrap_or(0),
-        )),
+        "length" => Some(V::I32(list_ref(vm, h).map(|l| l.len() as i32).unwrap_or(0))),
         "remove" => {
             let i = i32v(args[1]) as usize;
             let v = list_mut(vm, h)
@@ -982,10 +1347,16 @@ fn url_call(vm: &mut Vm, name: &str, args: &[V]) -> Rt<Option<Option<V>>> {
         "openConnection" | "openStream" | "getContent" | "toURI" | "toURL" => {
             Some(Some(host(vm, "Ljava/net/URLConnection;", HostState::Empty)))
         }
-        "getProtocol" | "getHost" | "getPath" | "getFile" | "getQuery"
-        | "getAuthority" | "getUserInfo" | "getRef" | "toExternalForm"
-        | "toString" => {
-            let t = s(vm, match args[0] { V::Ref(h) => h, _ => 0 }).unwrap_or_default();
+        "getProtocol" | "getHost" | "getPath" | "getFile" | "getQuery" | "getAuthority"
+        | "getUserInfo" | "getRef" | "toExternalForm" | "toString" => {
+            let t = s(
+                vm,
+                match args[0] {
+                    V::Ref(h) => h,
+                    _ => 0,
+                },
+            )
+            .unwrap_or_default();
             Some(Some(jstr(vm, &t)))
         }
         "getPort" | "getDefaultPort" => Some(Some(V::I32(-1))),
@@ -1005,8 +1376,14 @@ fn charset_call(vm: &mut Vm, name: &str, args: &[V]) -> Option<Option<V>> {
             )))
         }
         "name" | "displayName" | "toString" => {
-            let n = s(vm, match args[0] { V::Ref(h) => h, _ => 0 })
-                .unwrap_or_else(|| "UTF-8".into());
+            let n = s(
+                vm,
+                match args[0] {
+                    V::Ref(h) => h,
+                    _ => 0,
+                },
+            )
+            .unwrap_or_else(|| "UTF-8".into());
             Some(Some(jstr(vm, &n)))
         }
         "defaultCharset" => Some(Some(host(
@@ -1014,8 +1391,8 @@ fn charset_call(vm: &mut Vm, name: &str, args: &[V]) -> Option<Option<V>> {
             "Ljava/nio/charset/Charset;",
             HostState::StrBuf("UTF-8".into()),
         ))),
-        "encode" | "decode" | "newEncoder" | "newDecoder" | "aliases"
-        | "availableCharsets" | "isSupported" | "contains" | "canEncode" => {
+        "encode" | "decode" | "newEncoder" | "newDecoder" | "aliases" | "availableCharsets"
+        | "isSupported" | "contains" | "canEncode" => {
             if name == "isSupported" || name == "canEncode" || name == "contains" {
                 Some(Some(V::I32(1)))
             } else if name == "availableCharsets" {
@@ -1048,11 +1425,13 @@ fn nio_call(vm: &mut Vm, name: &str, args: &[V]) -> Option<Option<V>> {
             };
             Some(Some(V::I32(n as i32)))
         }
-        "get" | "put" | "flip" | "clear" | "rewind" | "mark" | "reset"
-        | "compact" | "slice" | "duplicate" | "asReadOnlyBuffer" | "array"
-        | "hasArray" | "arrayOffset" | "isDirect" | "isReadOnly" | "hasRemaining" => {
+        "get" | "put" | "flip" | "clear" | "rewind" | "mark" | "reset" | "compact" | "slice"
+        | "duplicate" | "asReadOnlyBuffer" | "array" | "hasArray" | "arrayOffset" | "isDirect"
+        | "isReadOnly" | "hasRemaining" => {
             if name.starts_with("is") || name == "hasArray" || name == "hasRemaining" {
-                Some(Some(V::I32((name == "hasRemaining" || name == "hasArray") as i32)))
+                Some(Some(V::I32(
+                    (name == "hasRemaining" || name == "hasArray") as i32,
+                )))
             } else if name == "array" {
                 Some(Some(V::Ref(0)))
             } else {
@@ -1112,8 +1491,8 @@ fn b64_decode(s: &str) -> Vec<u8> {
 
 fn base64_call(vm: &mut Vm, name: &str, args: &[V]) -> Option<Option<V>> {
     match name {
-        "getEncoder" | "getUrlEncoder" | "getMimeEncoder" | "getDecoder"
-        | "getUrlDecoder" | "getMimeDecoder" => {
+        "getEncoder" | "getUrlEncoder" | "getMimeEncoder" | "getDecoder" | "getUrlDecoder"
+        | "getMimeDecoder" => {
             let d = if name.contains("Decoder") {
                 "Ljava/util/Base64$Decoder;"
             } else {
@@ -1124,9 +1503,7 @@ fn base64_call(vm: &mut Vm, name: &str, args: &[V]) -> Option<Option<V>> {
         "encode" | "encodeToString" | "encodeToByteArray" => {
             let data = match args[0] {
                 V::Ref(h) => match vm.heap.get(h) {
-                    Some(Obj::Array { data, .. }) => {
-                        data.iter().map(|v| i32v(*v) as u8).collect()
-                    }
+                    Some(Obj::Array { data, .. }) => data.iter().map(|v| i32v(*v) as u8).collect(),
                     Some(Obj::Str(t)) => t.bytes().collect(),
                     Some(Obj::Host {
                         state: HostState::StrBuf(t),
@@ -1161,19 +1538,23 @@ fn base64_call(vm: &mut Vm, name: &str, args: &[V]) -> Option<Option<V>> {
 fn misc_fmt(vm: &mut Vm, class: &str, name: &str, args: &[V]) -> Option<Option<V>> {
     if class == "Ljava/util/Locale;" {
         return match name {
-            "getDefault" | "getDefault0" | "forLanguageTag" | "ROOT" => {
-                Some(host(
-                    vm,
-                    "Ljava/util/Locale;",
-                    HostState::StrBuf("en-US".into()),
-                ))
-            }
+            "getDefault" | "getDefault0" | "forLanguageTag" | "ROOT" => Some(host(
+                vm,
+                "Ljava/util/Locale;",
+                HostState::StrBuf("en-US".into()),
+            )),
             "getLanguage" => Some(jstr(vm, "en")),
             "getCountry" | "getVariant" | "getScript" => Some(jstr(vm, "US")),
-            "toString" | "toLanguageTag" | "getDisplayName"
-            | "getDisplayLanguage" | "getDisplayCountry" => {
-                let t = s(vm, match args[0] { V::Ref(h) => h, _ => 0 })
-                    .unwrap_or_else(|| "en-US".into());
+            "toString" | "toLanguageTag" | "getDisplayName" | "getDisplayLanguage"
+            | "getDisplayCountry" => {
+                let t = s(
+                    vm,
+                    match args[0] {
+                        V::Ref(h) => h,
+                        _ => 0,
+                    },
+                )
+                .unwrap_or_else(|| "en-US".into());
                 Some(jstr(vm, &t))
             }
             "getAvailableLocales" | "getISOCountries" | "getISOLanguages" => {
@@ -1201,8 +1582,14 @@ fn misc_fmt(vm: &mut Vm, class: &str, name: &str, args: &[V]) -> Option<Option<V
                 Some(args[0])
             }
             "toString" | "out" => {
-                let t = s(vm, match args[0] { V::Ref(h) => h, _ => 0 })
-                    .unwrap_or_default();
+                let t = s(
+                    vm,
+                    match args[0] {
+                        V::Ref(h) => h,
+                        _ => 0,
+                    },
+                )
+                .unwrap_or_default();
                 Some(jstr(vm, &t))
             }
             "flush" | "close" | "locale" => Some(args[0]),
@@ -1213,21 +1600,20 @@ fn misc_fmt(vm: &mut Vm, class: &str, name: &str, args: &[V]) -> Option<Option<V
     if class == "Ljava/util/Scanner;" {
         return match name {
             "next" | "nextLine" => Some(V::Ref(0)),
-            "hasNext" | "hasNextLine" | "hasNextInt" | "hasNextLong"
-            | "hasNextDouble" | "hasNextBoolean" => Some(V::I32(0)),
-            "nextInt" | "nextLong" | "nextDouble" | "nextFloat" | "nextShort"
-            | "nextByte" => Some(V::I64(0)),
-            "useDelimiter" | "useLocale" | "useRadix" | "reset" | "close"
-            | "skip" | "findInLine" | "findWithinHorizon" => {
+            "hasNext" | "hasNextLine" | "hasNextInt" | "hasNextLong" | "hasNextDouble"
+            | "hasNextBoolean" => Some(V::I32(0)),
+            "nextInt" | "nextLong" | "nextDouble" | "nextFloat" | "nextShort" | "nextByte" => {
+                Some(V::I64(0))
+            }
+            "useDelimiter" | "useLocale" | "useRadix" | "reset" | "close" | "skip"
+            | "findInLine" | "findWithinHorizon" => {
                 if matches!(name, "skip" | "findInLine" | "findWithinHorizon") {
                     Some(V::Ref(0))
                 } else {
                     Some(args[0])
                 }
             }
-            "delimiter" | "locale" | "radix" | "match" | "ioException" => {
-                Some(V::Ref(0))
-            }
+            "delimiter" | "locale" | "radix" | "match" | "ioException" => Some(V::Ref(0)),
             "tokens" => Some(host(vm, "Ljava/util/stream/Stream;", HostState::Empty)),
             "remove" => None,
             _ => return None,
@@ -1251,4 +1637,20 @@ fn misc_fmt(vm: &mut Vm, class: &str, name: &str, args: &[V]) -> Option<Option<V
     }
     let _ = (class, name, args);
     None
+}
+
+/// The guest path a stream ctor argument points at: `File` (Path host),
+/// `String`, or `Uri`/`file:` string. None for other objects.
+fn stream_arg_path(vm: &Vm, v: V) -> Option<String> {
+    let V::Ref(h) = v else { return None };
+    let raw = match vm.heap.get(h) {
+        Some(Obj::Str(s)) => s.clone(),
+        Some(Obj::Host {
+            state:
+                HostState::Path(s) | HostState::StrBuf(s) | HostState::Regex(s),
+            ..
+        }) => s.clone(),
+        _ => return None,
+    };
+    Some(raw.strip_prefix("file://").unwrap_or(&raw).to_string())
 }

@@ -4,8 +4,8 @@
 //! The signing block: `u64 size | pairs | u64 size | "APK Sig Block 42"`.
 //! v2 pair id = 0x7109871a, v3 = 0xf05368c0.
 
-use sha2::{Digest, Sha256, Sha512};
 use ovelo_error::{ErrorCategory, OveloError, Phase, Result};
+use sha2::{Digest, Sha256, Sha512};
 use x509_parser::prelude::FromDer;
 
 use crate::zip::{find_central_directory, CentralDirectory};
@@ -260,9 +260,17 @@ fn verify_signature_bytes(
             let key = rsa::RsaPublicKey::from_public_key_der(public_key_der)
                 .map_err(|_| sig_err("sig.key.rsa"))?;
             let res = if alg == SigAlg::RsaPkcs1Sha256 {
-                key.verify(rsa::Pkcs1v15Sign::new::<Sha256>(), &sha256(signed_data), signature)
+                key.verify(
+                    rsa::Pkcs1v15Sign::new::<Sha256>(),
+                    &sha256(signed_data),
+                    signature,
+                )
             } else {
-                key.verify(rsa::Pkcs1v15Sign::new::<Sha512>(), &sha512(signed_data), signature)
+                key.verify(
+                    rsa::Pkcs1v15Sign::new::<Sha512>(),
+                    &sha512(signed_data),
+                    signature,
+                )
             };
             res.map_err(|_| sig_err("sig.verify.failed"))
         }
@@ -270,9 +278,23 @@ fn verify_signature_bytes(
             use p256::ecdsa::{signature::Verifier, Signature, VerifyingKey};
             let key = VerifyingKey::from_public_key_der(public_key_der)
                 .map_err(|_| sig_err("sig.key.ec"))?;
-            let sig = Signature::from_der(signature)
-                .map_err(|_| sig_err("sig.signature.malformed"))?;
+            let sig =
+                Signature::from_der(signature).map_err(|_| sig_err("sig.signature.malformed"))?;
             key.verify(signed_data, &sig)
+                .map_err(|_| sig_err("sig.verify.failed"))
+        }
+        SigAlg::EcdsaSha512 => {
+            use p384::ecdsa::{Signature, VerifyingKey};
+            let key = VerifyingKey::from_public_key_der(public_key_der)
+                .map_err(|_| sig_err("sig.key.ec"))?;
+            let sig =
+                Signature::from_der(signature).map_err(|_| sig_err("sig.signature.malformed"))?;
+            // ECDSA-with-SHA-512: the verifier hashes with the key's
+            // paired digest (sha384 for p384), but the APK signature
+            // scheme signs a SHA-512 digest — verify the pre-hashed
+            // message via the PrehashVerifier.
+            use p384::ecdsa::signature::hazmat::PrehashVerifier;
+            key.verify_prehash(&sha512(signed_data), &sig)
                 .map_err(|_| sig_err("sig.verify.failed"))
         }
         _ => Err(sig_err("sig.alg.unsupported")),
@@ -317,15 +339,12 @@ fn parse_signers(v2_value: &[u8]) -> Result<Vec<Signer>> {
         let mut sig_list = Vec::new();
         let mut sp = 0usize;
         while sp + 12 <= signatures.len() {
-            let rlen =
-                u32::from_le_bytes(signatures[sp..sp + 4].try_into().unwrap()) as usize;
+            let rlen = u32::from_le_bytes(signatures[sp..sp + 4].try_into().unwrap()) as usize;
             if rlen < 8 || sp + 4 + rlen > signatures.len() {
                 return Err(sig_err("sig.record.truncated"));
             }
-            let alg =
-                u32::from_le_bytes(signatures[sp + 4..sp + 8].try_into().unwrap());
-            let slen =
-                u32::from_le_bytes(signatures[sp + 8..sp + 12].try_into().unwrap()) as usize;
+            let alg = u32::from_le_bytes(signatures[sp + 4..sp + 8].try_into().unwrap());
+            let slen = u32::from_le_bytes(signatures[sp + 8..sp + 12].try_into().unwrap()) as usize;
             if slen + 8 != rlen {
                 return Err(sig_err("sig.record.len"));
             }
@@ -347,25 +366,27 @@ fn parse_signers(v2_value: &[u8]) -> Result<Vec<Signer>> {
         let mut digests = Vec::new();
         let mut dp = 0usize;
         while dp + 12 <= digests_seq.len() {
-            let rlen =
-                u32::from_le_bytes(digests_seq[dp..dp + 4].try_into().unwrap()) as usize;
+            let rlen = u32::from_le_bytes(digests_seq[dp..dp + 4].try_into().unwrap()) as usize;
             if rlen < 8 || dp + 4 + rlen > digests_seq.len() {
                 return Err(sig_err("sig.record.truncated"));
             }
-            let alg =
-                u32::from_le_bytes(digests_seq[dp + 4..dp + 8].try_into().unwrap());
+            let alg = u32::from_le_bytes(digests_seq[dp + 4..dp + 8].try_into().unwrap());
             let dlen =
                 u32::from_le_bytes(digests_seq[dp + 8..dp + 12].try_into().unwrap()) as usize;
             if dlen + 8 != rlen {
                 return Err(sig_err("sig.record.len"));
             }
-            let expected = match SigAlg::from_id(alg) {
-                Some(a) => match a.digest_alg() {
-                    1 => 32,
-                    2 => 64,
-                    _ => return Err(sig_err("sig.digest_alg.unsupported")),
-                },
-                None => return Err(sig_err("sig.alg.unsupported")),
+            // Digest records exist for every alg the signer used — AOSP
+            // ignores algs it doesn't support as long as the alg chosen
+            // for verification has one, so skip unknown ids.
+            let Some(a) = SigAlg::from_id(alg) else {
+                dp += 4 + rlen;
+                continue;
+            };
+            let expected = match a.digest_alg() {
+                1 => 32,
+                2 => 64,
+                _ => return Err(sig_err("sig.digest_alg.unsupported")),
             };
             if dlen != expected {
                 return Err(sig_err("sig.digest.len"));
@@ -465,9 +486,17 @@ pub fn verify_v2(bytes: &[u8]) -> Result<Vec<SignerInfo>> {
         if actual != expected {
             return Err(sig_err("sig.digest.mismatch").with_detail(format!(
                 "expected={} actual={} block_start={} cd={}+{}",
-                expected.iter().map(|b| format!("{b:02x}")).collect::<String>(),
-                actual.iter().map(|b| format!("{b:02x}")).collect::<String>(),
-                block_start, cd.offset, cd.size
+                expected
+                    .iter()
+                    .map(|b| format!("{b:02x}"))
+                    .collect::<String>(),
+                actual
+                    .iter()
+                    .map(|b| format!("{b:02x}"))
+                    .collect::<String>(),
+                block_start,
+                cd.offset,
+                cd.size
             )));
         }
 
@@ -491,8 +520,8 @@ pub fn verify_v2(bytes: &[u8]) -> Result<Vec<SignerInfo>> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::zip::ZipLimits;
     use crate::zip::parse_central_directory;
+    use crate::zip::ZipLimits;
 
     fn lp(body: &[u8]) -> Vec<u8> {
         let mut v = (body.len() as u32).to_le_bytes().to_vec();
@@ -579,12 +608,10 @@ mod tests {
 
     /// Build a signed test APK using ECDSA P-256 (rcgen self-signed cert).
     fn build_signed_apk() -> (Vec<u8>, String) {
-        let certified =
-            rcgen::generate_simple_self_signed(vec!["Ovelo Test".to_string()]).unwrap();
+        let certified = rcgen::generate_simple_self_signed(vec!["Ovelo Test".to_string()]).unwrap();
         let cert_der = certified.cert.der().to_vec();
         // SPKI bytes exactly as the verifier reads them from the cert.
-        let (_, parsed) =
-            x509_parser::prelude::X509Certificate::from_der(&cert_der).unwrap();
+        let (_, parsed) = x509_parser::prelude::X509Certificate::from_der(&cert_der).unwrap();
         let pubkey_der = parsed.tbs_certificate.subject_pki.raw.to_vec();
 
         let zip = build_zip_stored("classes.dex", b"fake dex bytes");
@@ -603,12 +630,7 @@ mod tests {
         let digests_seq = digest_rec.clone();
         let certs_seq = lp(&cert_der);
         let attrs_seq: Vec<u8> = Vec::new();
-        let signed_data = [
-            lp(&digests_seq),
-            lp(&certs_seq),
-            lp(&attrs_seq),
-        ]
-        .concat();
+        let signed_data = [lp(&digests_seq), lp(&certs_seq), lp(&attrs_seq)].concat();
 
         use p256::ecdsa::{signature::Signer, Signature, SigningKey};
         use p256::pkcs8::DecodePrivateKey;
@@ -642,8 +664,7 @@ mod tests {
         assert_eq!(infos[0].sig_alg, 0x0201);
         assert!(!infos[0].subject.is_empty());
         // Zip still parses.
-        let (_cd, entries) =
-            parse_central_directory(&apk, &ZipLimits::default()).unwrap();
+        let (_cd, entries) = parse_central_directory(&apk, &ZipLimits::default()).unwrap();
         assert_eq!(entries.len(), 1);
     }
 

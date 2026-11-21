@@ -98,9 +98,7 @@ impl Reloc {
         // unmapped space); `write_raw` bypasses page perms, so the check
         // here is the only ownership guard.
         let in_own = elf.phdrs.iter().any(|p| {
-            p.p_type == PT_LOAD
-                && self.offset >= p.vaddr
-                && self.offset + 8 <= p.vaddr + p.memsz
+            p.p_type == PT_LOAD && self.offset >= p.vaddr && self.offset + 8 <= p.vaddr + p.memsz
         });
         if !in_own {
             return Err(errd(

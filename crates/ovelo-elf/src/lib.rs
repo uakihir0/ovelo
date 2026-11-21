@@ -108,17 +108,26 @@ pub struct ElfFile<'a> {
 
 fn u16at(b: &[u8], p: usize) -> Result<u16> {
     Ok(u16::from_le_bytes(
-        b.get(p..p + 2).ok_or_else(|| err("elf.truncated"))?.try_into().unwrap(),
+        b.get(p..p + 2)
+            .ok_or_else(|| err("elf.truncated"))?
+            .try_into()
+            .unwrap(),
     ))
 }
 fn u32at(b: &[u8], p: usize) -> Result<u32> {
     Ok(u32::from_le_bytes(
-        b.get(p..p + 4).ok_or_else(|| err("elf.truncated"))?.try_into().unwrap(),
+        b.get(p..p + 4)
+            .ok_or_else(|| err("elf.truncated"))?
+            .try_into()
+            .unwrap(),
     ))
 }
 fn u64at(b: &[u8], p: usize) -> Result<u64> {
     Ok(u64::from_le_bytes(
-        b.get(p..p + 8).ok_or_else(|| err("elf.truncated"))?.try_into().unwrap(),
+        b.get(p..p + 8)
+            .ok_or_else(|| err("elf.truncated"))?
+            .try_into()
+            .unwrap(),
     ))
 }
 
@@ -309,7 +318,10 @@ impl<'a> ElfFile<'a> {
             if tag == DT_NULL {
                 break; // bytes past DT_NULL are padding, not entries
             }
-            if matches!(tag, DT_ANDROID_REL | DT_ANDROID_RELA | DT_ANDROID_RELSZ | DT_ANDROID_RELASZ) {
+            if matches!(
+                tag,
+                DT_ANDROID_REL | DT_ANDROID_RELA | DT_ANDROID_RELSZ | DT_ANDROID_RELASZ
+            ) {
                 return Err(err("elf.reloc.packed"));
             }
         }
@@ -391,14 +403,22 @@ impl<'a> ElfFile<'a> {
         let st = self
             .phdrs
             .iter()
-            .find(|p| p.p_type == PT_LOAD && self.symtab.0 >= p.vaddr && self.symtab.0 < p.vaddr + p.filesz)
+            .find(|p| {
+                p.p_type == PT_LOAD
+                    && self.symtab.0 >= p.vaddr
+                    && self.symtab.0 < p.vaddr + p.filesz
+            })
             .ok_or_else(|| err("elf.symtab.bounds"))?;
         let base = (st.offset + (self.symtab.0 - st.vaddr)) as usize;
         let name_off = u32at(self.data, base + index as usize * self.symtab.1 as usize)?;
         let s = self
             .phdrs
             .iter()
-            .find(|p| p.p_type == PT_LOAD && self.strtab.0 >= p.vaddr && self.strtab.0 < p.vaddr + p.filesz)
+            .find(|p| {
+                p.p_type == PT_LOAD
+                    && self.strtab.0 >= p.vaddr
+                    && self.strtab.0 < p.vaddr + p.filesz
+            })
             .ok_or_else(|| err("elf.strtab.bounds"))?;
         let str_off = (s.offset + (self.strtab.0 - s.vaddr)) as usize;
         let str_end = str_off + self.strtab.1 as usize;
@@ -451,9 +471,7 @@ pub fn symbol_count(elf: &ElfFile<'_>, strtab_vaddr: u64) -> usize {
         elf.phdrs
             .iter()
             .find(|p| {
-                p.p_type == PT_LOAD
-                    && strtab_vaddr >= p.vaddr
-                    && strtab_vaddr < p.vaddr + p.filesz
+                p.p_type == PT_LOAD && strtab_vaddr >= p.vaddr && strtab_vaddr < p.vaddr + p.filesz
             })
             .map(|p| (p.offset + (strtab_vaddr - p.vaddr)) as usize)
             .unwrap_or(elf.data.len())
@@ -500,10 +518,8 @@ pub fn load_chain<'a>(
         std::collections::HashMap::new();
     let mut parsed: std::collections::HashMap<String, ElfFile<'a>> =
         std::collections::HashMap::new();
-    let mut visiting: std::collections::HashSet<String> =
-        std::collections::HashSet::new();
-    let mut ordered: std::collections::HashSet<String> =
-        std::collections::HashSet::new();
+    let mut visiting: std::collections::HashSet<String> = std::collections::HashSet::new();
+    let mut ordered: std::collections::HashSet<String> = std::collections::HashSet::new();
     let mut stack = vec![soname.to_string()];
     // DFS so dependencies load before their dependents; `visiting` marks the
     // in-progress path so cyclic DT_NEEDED graphs terminate (the cycle edge
@@ -544,9 +560,7 @@ pub fn load_chain<'a>(
             .needed
             .iter()
             .filter(|d| {
-                provided.contains_key(*d)
-                    && !ordered.contains(*d)
-                    && !visiting.contains(*d)
+                provided.contains_key(*d) && !ordered.contains(*d) && !visiting.contains(*d)
             })
             .cloned()
             .collect();
@@ -563,8 +577,7 @@ pub fn load_chain<'a>(
     // Phase 2 — map every object and build the merged export table before
     // any relocation runs: ld.so semantics. Cyclic DT_NEEDED graphs resolve
     // fully because every export is visible to every object.
-    let mut global: std::collections::HashMap<String, u64> =
-        std::collections::HashMap::new();
+    let mut global: std::collections::HashMap<String, u64> = std::collections::HashMap::new();
     for name in &order {
         let elf = parsed.remove(name).unwrap();
         let so = map_segments(image, name.clone(), elf, next_base)?;
@@ -594,7 +607,10 @@ pub fn load_chain<'a>(
             }
         }
     }
-    Ok(order.into_iter().map(|n| loaded.remove(&n).unwrap()).collect())
+    Ok(order
+        .into_iter()
+        .map(|n| loaded.remove(&n).unwrap())
+        .collect())
 }
 
 fn map_segments<'a>(
@@ -640,10 +656,9 @@ fn map_segments<'a>(
     let mut exports = std::collections::HashMap::new();
     let sym_count = symbol_count(&elf, elf.strtab.0);
     if elf.symtab.0 != 0 && sym_count > 0 {
-        let st = elf
-            .phdrs
-            .iter()
-            .find(|p| p.p_type == PT_LOAD && elf.symtab.0 >= p.vaddr && elf.symtab.0 < p.vaddr + p.filesz);
+        let st = elf.phdrs.iter().find(|p| {
+            p.p_type == PT_LOAD && elf.symtab.0 >= p.vaddr && elf.symtab.0 < p.vaddr + p.filesz
+        });
         if let Some(st) = st {
             let base_off = (st.offset + (elf.symtab.0 - st.vaddr)) as usize;
             let data = elf.data();
@@ -728,11 +743,7 @@ mod tests {
             strtab.push(0);
             o
         };
-        let needed_off: Vec<u64> = s
-            .needed
-            .iter()
-            .map(|n| str_off(&mut strtab, n))
-            .collect();
+        let needed_off: Vec<u64> = s.needed.iter().map(|n| str_off(&mut strtab, n)).collect();
         let sym_name_off: Vec<u64> = s
             .syms
             .iter()
@@ -863,10 +874,7 @@ mod tests {
     fn rejects_wrong_machine() {
         let (mut b, ..) = build(&Spec::default());
         b[18..20].copy_from_slice(&62u16.to_le_bytes()); // x86-64
-        assert_eq!(
-            ElfFile::parse(&b).unwrap_err().cause(),
-            "elf.machine"
-        );
+        assert_eq!(ElfFile::parse(&b).unwrap_err().cause(), "elf.machine");
     }
 
     #[test]
@@ -877,8 +885,7 @@ mod tests {
         });
         let mut img = Image::new();
         let mut next = 0x4000_0000;
-        let e = load_chain(&mut img, "a.so", &b, Default::default(), &[], &mut next)
-            .unwrap_err();
+        let e = load_chain(&mut img, "a.so", &b, Default::default(), &[], &mut next).unwrap_err();
         assert_eq!(e.cause(), "elf.reloc.unsupported");
     }
 
@@ -894,9 +901,9 @@ mod tests {
             needed: vec!["b.so".into()],
             syms: vec![("ext".into(), 0)],
             relas: vec![
-                (slot, 1027, 0, 0x40),   // RELATIVE: bias + 0x40
-                (slot + 8, 1025, 1, 0),  // GLOB_DAT: ext
-                (ia, 1027, 0, 0x200),    // init_array[0] := bias + 0x200
+                (slot, 1027, 0, 0x40),  // RELATIVE: bias + 0x40
+                (slot + 8, 1025, 1, 0), // GLOB_DAT: ext
+                (ia, 1027, 0, 0x200),   // init_array[0] := bias + 0x200
             ],
             init_array: Some(0),
             ..Default::default()
@@ -982,8 +989,10 @@ mod tests {
         let mut img = Image::new();
         let mut next = 0x4000_0000;
         let sos = load_chain(&mut img, "a.so", &a, provided, &[], &mut next).unwrap();
-        let (a_so, b_so) = (sos.iter().find(|s| s.soname == "a.so").unwrap(),
-                            sos.iter().find(|s| s.soname == "b.so").unwrap());
+        let (a_so, b_so) = (
+            sos.iter().find(|s| s.soname == "a.so").unwrap(),
+            sos.iter().find(|s| s.soname == "b.so").unwrap(),
+        );
         assert_eq!(img.read_u64(a_so.bias + slot0).unwrap(), b_so.bias + 0x2340);
     }
 

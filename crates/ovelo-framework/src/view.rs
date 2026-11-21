@@ -6,6 +6,7 @@
 
 use crate::widget::Drawable;
 use ovelo_ui::Color;
+use std::rc::Rc;
 
 /// A dimension from `LayoutParams`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -70,8 +71,14 @@ pub struct View {
     pub top: i32,
     /// `setBackgroundColor` — drawn under `draw` when set.
     pub background: Option<Color>,
+    /// `setImage*` — decoded pixels (w, h, RGBA8), scaled into the
+    /// measured rect at draw.
+    pub image: Option<(u32, u32, std::rc::Rc<Vec<u8>>)>,
     /// `setOnClickListener` — fired on tap inside the laid-out rect.
     pub on_click: Option<Box<dyn FnMut()>>,
+    /// Guest `onDraw(Canvas)` ops recorded by the dexrt materializer —
+    /// replayed view-locally after background/image in `draw`.
+    pub custom_ops: Option<Rc<Vec<ovelo_dexrt::CanvasOp>>>,
     /// Pressed while the pointer that went down on this view is still
     /// down; a click only fires when the release also lands inside.
     pub pressed: bool,
@@ -89,7 +96,9 @@ impl View {
             left: 0,
             top: 0,
             background: None,
+            image: None,
             on_click: None,
+            custom_ops: None,
             pressed: false,
             dirty: true,
         }
@@ -133,6 +142,8 @@ fn resolve(desired: i32, spec: MeasureSpec) -> i32 {
 
 /// A vertical linear container (`LinearLayout`, vertical orientation):
 /// children stacked top-to-bottom, width = widest child.
+/// `overlay` flips it to FrameLayout-style: every child at the same
+/// origin (RelativeLayout/CoordinatorLayout/DrawerLayout/…).
 pub struct ViewGroup {
     /// The group's own params and measured size.
     pub view: View,
@@ -141,6 +152,8 @@ pub struct ViewGroup {
     /// Child that consumed the current pointer-down (for routing the
     /// release back to the same pressed view).
     pub pressed_child: Option<usize>,
+    /// Overlay (frame) layout instead of vertical stacking.
+    pub overlay: bool,
 }
 
 impl ViewGroup {
@@ -150,11 +163,20 @@ impl ViewGroup {
             view: View::new(lp_w, lp_h, Size::default()),
             children: Vec::new(),
             pressed_child: None,
+            overlay: false,
         }
     }
 
+    /// FrameLayout-style group: children overlay at the same origin.
+    pub fn overlay(lp_w: Length, lp_h: Length) -> Self {
+        let mut g = Self::new(lp_w, lp_h);
+        g.overlay = true;
+        g
+    }
+
     /// Vertical linear measure: width = max child width, height = sum of
-    /// child heights, each resolved against the child spec.
+    /// child heights, each resolved against the child spec. Overlay
+    /// measure: height = max child height.
     pub fn measure(&mut self, w: MeasureSpec, h: MeasureSpec) -> Size {
         let mut mw = 0;
         let mut mh = 0;
@@ -165,19 +187,32 @@ impl ViewGroup {
                 MeasureSpec::for_child(h, lp_h),
             );
             mw = mw.max(cs.w);
-            mh += cs.h;
+            if self.overlay {
+                mh = mh.max(cs.h);
+            } else {
+                mh += cs.h;
+            }
         }
         self.view.desired = Size { w: mw, h: mh };
         self.view.measure(w, h)
     }
 
-    /// Layout children stacked from (left, top).
+    /// Layout children stacked from (left, top), or all at (left, top)
+    /// for an overlay group.
     pub fn layout(&mut self, left: i32, top: i32) {
         self.view.layout(left, top);
         let mut y = top;
         for c in &mut self.children {
-            c.layout(left, y);
-            y += c.measured().h;
+            // A guest-laid-out child carries its own rect relative to
+            // this parent — stack offsets would double-position it.
+            let (cl, ct) = match c.dex_frame() {
+                Some((fl, ft, _, _)) => (left + fl, top + ft),
+                None => (left, y),
+            };
+            c.layout(cl, ct);
+            if !self.overlay {
+                y += c.measured().h;
+            }
         }
     }
 }

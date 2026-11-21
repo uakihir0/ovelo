@@ -100,6 +100,12 @@ impl<'a> Canvas<'a> {
         self.surf.clear(c);
     }
 
+    /// Shaped advance width of `text` at `size_px` — for callers that
+    /// center text (Paint.Align.CENTER) before `draw_text`.
+    pub fn measure(&self, text: &str, size_px: f32) -> f32 {
+        self.fonts.char_advances(text, size_px).iter().sum()
+    }
+
     /// `drawRect` — fill a rect (translated).
     pub fn draw_rect(&mut self, r: Rect, p: Paint) {
         self.surf.fill_rect(self.tr(r), p.color);
@@ -120,6 +126,23 @@ impl<'a> Canvas<'a> {
             w,
             p.color,
         );
+    }
+
+    /// `drawBitmap`-style blit: `src` (RGBA8, `src_w`×`src_h`) scaled
+    /// nearest into the `w`×`h` rect at `(x, y)` — translated + clipped.
+    #[allow(clippy::too_many_arguments)]
+    pub fn draw_image(
+        &mut self,
+        x: i32,
+        y: i32,
+        w: usize,
+        h: usize,
+        src_w: usize,
+        src_h: usize,
+        src: &[u8],
+    ) {
+        self.surf
+            .blit_scaled(x + self.dx, y + self.dy, w, h, src_w, src_h, src);
     }
 
     /// `drawText` — run of text with the pen at `(x, baseline)`.
@@ -166,7 +189,8 @@ impl<'a> Canvas<'a> {
         for row in 0..g.h {
             for col in 0..g.w {
                 let cov = g.cov[row * g.w + col];
-                self.surf.blend_pixel(gx + col as i32, gy + row as i32, c, cov);
+                self.surf
+                    .blend_pixel(gx + col as i32, gy + row as i32, c, cov);
             }
         }
     }

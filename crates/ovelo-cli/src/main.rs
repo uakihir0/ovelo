@@ -78,11 +78,24 @@ mod ledger;
 mod worker;
 
 enum Cmd {
-    Inspect { apk: PathBuf, json: bool },
-    Install { apks: Vec<PathBuf>, json: bool },
-    Run { app: String },
-    Diagnose { apk: PathBuf, json: bool },
-    Gate { path: PathBuf },
+    Inspect {
+        apk: PathBuf,
+        json: bool,
+    },
+    Install {
+        apks: Vec<PathBuf>,
+        json: bool,
+    },
+    Run {
+        app: String,
+    },
+    Diagnose {
+        apk: PathBuf,
+        json: bool,
+    },
+    Gate {
+        path: PathBuf,
+    },
     /// Disassemble a dex method for debugging (`apk class.method?`).
     Disas {
         apk: PathBuf,
@@ -163,9 +176,7 @@ USAGE:
 ";
 
 fn read_apk(p: &Path) -> Result<Vec<u8>, OveloError> {
-    std::fs::read(p).map_err(|e| {
-        err("cli.apk.read").with_detail(format!("{}: {e}", p.display()))
-    })
+    std::fs::read(p).map_err(|e| err("cli.apk.read").with_detail(format!("{}: {e}", p.display())))
 }
 
 /// Escape control characters before printing untrusted APK fields to a
@@ -211,16 +222,39 @@ fn print_inspect(info: &ApkInfo, json: bool) {
         println!("}}");
     } else {
         println!("package       {}", disp(&m.package));
-        println!("version       {} ({})", m.version_code, m.version_name.as_deref().map(disp).unwrap_or_else(|| "-".into()));
-        println!("minSdk        {}", m.min_sdk.map(|v| v.to_string()).unwrap_or_else(|| "-".into()));
-        println!("targetSdk     {}", m.target_sdk.map(|v| v.to_string()).unwrap_or_else(|| "-".into()));
+        println!(
+            "version       {} ({})",
+            m.version_code,
+            m.version_name
+                .as_deref()
+                .map(disp)
+                .unwrap_or_else(|| "-".into())
+        );
+        println!(
+            "minSdk        {}",
+            m.min_sdk
+                .map(|v| v.to_string())
+                .unwrap_or_else(|| "-".into())
+        );
+        println!(
+            "targetSdk     {}",
+            m.target_sdk
+                .map(|v| v.to_string())
+                .unwrap_or_else(|| "-".into())
+        );
         println!("activities    {}", disp(&m.activities.join(", ")));
         println!("features      {}", disp(&m.features.join(", ")));
         println!("permissions   {}", disp(&m.permissions.join(", ")));
         println!("abis          {}", info.abis.join(", "));
         println!("dex           {}", info.dex_entries.join(", "));
-        println!("resources     {}", if info.has_resources { "yes" } else { "no" });
-        println!("signed v2/v3  {}", if info.signed_v2_or_v3 { "yes" } else { "no" });
+        println!(
+            "resources     {}",
+            if info.has_resources { "yes" } else { "no" }
+        );
+        println!(
+            "signed v2/v3  {}",
+            if info.signed_v2_or_v3 { "yes" } else { "no" }
+        );
         println!("sha256        {}", info.sha256);
     }
 }
@@ -271,7 +305,26 @@ fn disas(apk: &[u8], class: &str, method: Option<&str>) -> Result<(), OveloError
                     continue;
                 }
             }
-            println!("{class}.{name} [{e_name}]", e_name = e.name);
+            let proto = dex
+                .proto(mid.proto_idx as u32)
+                .and_then(|p| {
+                    let ps = dex
+                        .proto_params(p)?
+                        .iter()
+                        .filter_map(|&t| dex.type_descriptor(t as u32).ok())
+                        .collect::<Vec<_>>()
+                        .join("");
+                    let ret = dex
+                        .type_descriptor(p.return_type_idx)
+                        .unwrap_or_else(|_| "?".into());
+                    Ok(format!("({ps}){ret}"))
+                })
+                .unwrap_or_else(|_| "(?)".into());
+            println!(
+                "{class}.{name}{proto} [#{midx} {e_name}]",
+                midx = em.method_idx,
+                e_name = e.name
+            );
             let Some(code) = dex.code_item(em.code_off)? else {
                 continue;
             };
@@ -279,11 +332,7 @@ fn disas(apk: &[u8], class: &str, method: Option<&str>) -> Result<(), OveloError
                 if i.is_payload() {
                     continue;
                 }
-                let mut line = format!(
-                    "  {:04x} {:<22}",
-                    i.offset,
-                    i.name
-                );
+                let mut line = format!("  {:04x} {:<22}", i.offset, i.name);
                 if !i.regs.is_empty() {
                     line.push_str(&format!(" v{:?}", i.regs));
                 }
@@ -356,13 +405,353 @@ fn find_record(store: &InstallStore, package: &str) -> Result<InstallRecord, Ove
     Err(err("cli.app.not_installed").with_detail(package))
 }
 
+/// Host overrides on dex-defined library methods that can't run in the
+/// runtime — appcompat's vector-drawable inflation, whose full path
+/// needs a working XmlResourceParser + Drawable backend we don't have
+/// yet. `getDrawable` answers a placeholder so menu/icon inflation
+/// keeps going.
+fn register_compat_shims(
+    v: &mut ovelo_dexrt::Vm,
+    initializers: &[String],
+    components: std::rc::Rc<std::cell::RefCell<std::collections::HashMap<String, ovelo_dexrt::V>>>,
+) {
+    use ovelo_dexrt::{HostState, Obj, V};
+    use std::cell::RefCell;
+    use std::collections::HashMap;
+    use std::rc::Rc;
+
+    // androidx menus (MenuBuilder/SubMenuBuilder/MenuInflater) share
+    // the host menu model — see Vm::register_menu_overrides.
+    v.register_menu_overrides();
+
+    let drawable = |vm: &mut ovelo_dexrt::Vm| -> V {
+        V::Ref(vm.heap.alloc(Obj::Host {
+            class_idx: u64::MAX,
+            desc: "Landroid/graphics/drawable/Drawable;".to_string(),
+            fields: HashMap::new(),
+            state: HostState::Empty,
+        }))
+    };
+    for (class, name, sig) in [
+        (
+            "Landroidx/appcompat/widget/ResourceManagerInternal;",
+            "getDrawable",
+            "(Landroid/content/Context;I)Landroid/graphics/drawable/Drawable;",
+        ),
+        (
+            "Landroidx/appcompat/widget/ResourceManagerInternal;",
+            "getDrawable",
+            "(Landroid/content/Context;IZ)Landroid/graphics/drawable/Drawable;",
+        ),
+        (
+            "Landroidx/appcompat/content/res/AppCompatResources;",
+            "getDrawable",
+            "(Landroid/content/Context;I)Landroid/graphics/drawable/Drawable;",
+        ),
+        (
+            "Landroidx/appcompat/widget/TintTypedArray;",
+            "getDrawable",
+            "(I)Landroid/graphics/drawable/Drawable;",
+        ),
+        (
+            "Landroidx/appcompat/widget/TintTypedArray;",
+            "getDrawableIfKnown",
+            "(I)Landroid/graphics/drawable/Drawable;",
+        ),
+    ] {
+        let _ = v.register_host(
+            class,
+            name,
+            sig,
+            Rc::new(RefCell::new(move |vm: &mut ovelo_dexrt::Vm, _a: &[V]| {
+                Ok(Some(drawable(vm)))
+            })) as ovelo_dexrt::HostCall,
+        );
+    }
+    // kotlinx-coroutines: `Dispatchers.getMain()` discovers the Android
+    // main dispatcher through ServiceLoader (empty here) and throws
+    // "Module with the Main dispatcher is missing". Hand out a host
+    // dispatcher — coroutine dispatch calls on it resolve to stubs and
+    // silently no-op until a real main-loop pump exists.
+    for (class, name, sig) in [
+        (
+            "Lkotlinx/coroutines/Dispatchers;",
+            "getMain",
+            "()Lkotlinx/coroutines/MainCoroutineDispatcher;",
+        ),
+        (
+            "Lkotlinx/coroutines/Dispatchers;",
+            "getDefault",
+            "()Lkotlinx/coroutines/CoroutineDispatcher;",
+        ),
+        (
+            "Lkotlinx/coroutines/Dispatchers;",
+            "getIO",
+            "()Lkotlinx/coroutines/CoroutineDispatcher;",
+        ),
+        (
+            "Lkotlinx/coroutines/Dispatchers;",
+            "getUnconfined",
+            "()Lkotlinx/coroutines/CoroutineDispatcher;",
+        ),
+        (
+            "Lkotlinx/coroutines/internal/MainDispatcherLoader;",
+            "loadMainDispatcher",
+            "()Lkotlinx/coroutines/MainCoroutineDispatcher;",
+        ),
+    ] {
+        let _ = v.register_host(
+            class,
+            name,
+            sig,
+            Rc::new(RefCell::new(move |vm: &mut ovelo_dexrt::Vm, _a: &[V]| {
+                Ok(Some(V::Ref(vm.heap.alloc(Obj::Host {
+                    class_idx: u64::MAX,
+                    desc: "Lkotlinx/coroutines/MainCoroutineDispatcher;".to_string(),
+                    fields: HashMap::new(),
+                    state: HostState::Empty,
+                }))))
+            })) as ovelo_dexrt::HostCall,
+        );
+    }
+    // androidx.startup: `initializeComponent` enforces that the
+    // initializer was discovered via manifest meta-data — our runtime
+    // runs discovered initializers itself (see startup_initializers),
+    // so the check is satisfied by construction; make it a no-op.
+    for sig in [
+        "(Ljava/lang/Class;)Ljava/lang/Object;",
+        "(Ljava/lang/Class;Ljava/util/Set;)Ljava/lang/Object;",
+    ] {
+        let components2 = components.clone();
+        let _ = v.register_host(
+            "Landroidx/startup/AppInitializer;",
+            "initializeComponent",
+            sig,
+            Rc::new(RefCell::new(move |vm: &mut ovelo_dexrt::Vm, a: &[V]| {
+                // Answer the component instance the caller expects:
+                // instantiate the Initializer named by the Class argument
+                // and return its `create(context)` result, the way AOSP's
+                // AppInitializer.initializeComponent does. Results are
+                // cached — AOSP returns the same component per class and
+                // never runs create twice.
+                let desc = match a.get(1).copied() {
+                    Some(V::Ref(h)) => vm.class_descriptor_of(h),
+                    _ => None,
+                };
+                if let Some(d) = desc {
+                    if let Some(v) = components2.borrow().get(&d).copied() {
+                        return Ok(Some(v));
+                    }
+                    if let Ok(ih) = vm.instantiate(&d) {
+                        let ctx = match a.first().copied() {
+                            Some(V::Ref(ai)) => vm
+                                .get_object_field(
+                                    ai,
+                                    "Landroidx/startup/AppInitializer;",
+                                    "mContext",
+                                )
+                                .unwrap_or(V::Ref(0)),
+                            _ => V::Ref(0),
+                        };
+                        if let Ok(Some(v)) = vm.call_virtual(ih, "create", &[ctx]) {
+                            components2.borrow_mut().insert(d, v);
+                            return Ok(Some(v));
+                        }
+                        return Ok(Some(V::Ref(ih)));
+                    }
+                }
+                Ok(Some(V::Ref(0)))
+            })) as ovelo_dexrt::HostCall,
+        );
+    }
+    // `AppInitializer.getInstance(context).mDiscovered` holds the
+    // Class mirrors of manifest-discovered initializers — lazily
+    // invoked initializers (ProcessLifecycleInitializer) check
+    // membership before initializing.
+    let discovered: Vec<String> = initializers
+        .iter()
+        .map(|i| format!("L{};", i.replace('.', "/")))
+        .collect();
+    let _ = v.register_host(
+        "Landroidx/startup/AppInitializer;",
+        "getInstance",
+        "(Landroid/content/Context;)Landroidx/startup/AppInitializer;",
+        Rc::new(RefCell::new(move |vm: &mut ovelo_dexrt::Vm, a: &[V]| {
+            let set = discovered
+                .iter()
+                .map(|d| V::Ref(vm.class_handle(d)))
+                .collect::<Vec<_>>();
+            let hs = V::Ref(vm.heap.alloc(Obj::Host {
+                class_idx: u64::MAX,
+                desc: "Ljava/util/HashSet;".to_string(),
+                fields: HashMap::new(),
+                state: HostState::List(set),
+            }));
+            let ai = V::Ref(vm.heap.alloc(Obj::Host {
+                class_idx: u64::MAX,
+                desc: "Landroidx/startup/AppInitializer;".to_string(),
+                fields: HashMap::new(),
+                state: HostState::Empty,
+            }));
+            if let V::Ref(h) = ai {
+                vm.set_object_field(h, "Landroidx/startup/AppInitializer;", "mDiscovered", hs);
+                // `doInitialize(class, set)` reads mContext for the
+                // initializer's create() argument.
+                vm.set_object_field(
+                    h,
+                    "Landroidx/startup/AppInitializer;",
+                    "mContext",
+                    a.first().copied().unwrap_or(V::Ref(0)),
+                );
+                let init = V::Ref(vm.heap.alloc(Obj::Host {
+                    class_idx: u64::MAX,
+                    desc: "Ljava/util/HashMap;".to_string(),
+                    fields: HashMap::new(),
+                    state: HostState::Map(vec![]),
+                }));
+                vm.set_object_field(h, "Landroidx/startup/AppInitializer;", "mInitialized", init);
+            }
+            Ok(Some(ai))
+        })) as ovelo_dexrt::HostCall,
+    );
+}
+
+/// Launch any Activity a guest queued via `startActivity` (component
+/// Intent) — the target replaces the finished one on the same VM and
+/// window (single-task model). Its own `android:theme` and the caller's
+/// Intent come along. Bounded: a chain of redirects still terminates.
+fn drain_pending_activity(
+    vm: &mut ovelo_dexrt::Vm,
+    this: &mut u32,
+    callbacks: &[String],
+    manifest: &ovelo_apk::manifest::ManifestInfo,
+) {
+    for _ in 0..4 {
+        let Some((next, intent)) = vm.pending_activity.take() else {
+            break;
+        };
+        // Resolve the target's own theme before instantiation — theme-
+        // scoped obtainStyledAttributes reads vm.theme_id. Restore it
+        // when the launch fails: the previous Activity keeps running
+        // under its own theme.
+        let qualified = next
+            .trim_start_matches('L')
+            .trim_end_matches(';')
+            .replace('/', ".");
+        let prev_theme = vm.theme_id;
+        vm.theme_id = manifest
+            .activity_themes
+            .get(&qualified)
+            .copied()
+            .or(manifest.theme)
+            .unwrap_or(0);
+        match vm.instantiate(&next) {
+            Ok(h2) => {
+                println!("activity {} (started)", disp(&next));
+                vm.set_activity_intent(h2, intent);
+                *this = h2;
+                run_activity_cbs(vm, *this, callbacks);
+            }
+            Err(e) => {
+                println!("activity {} not launched: {e}", disp(&next));
+                vm.theme_id = prev_theme;
+                break;
+            }
+        }
+    }
+}
+
+/// Deliver the queued lifecycle callbacks to a guest Activity:
+/// `finish()` stops the sequence, and the options menu is prepared
+/// before `onResume` the way AOSP lazily creates it on first use.
+fn run_activity_cbs(vm: &mut ovelo_dexrt::Vm, this: u32, callbacks: &[String]) {
+    // Content/decor roots attach under the running activity — keep
+    // each activity's trees scoped to itself for lookups and render.
+    vm.set_activity(this);
+    for cb in callbacks {
+        if vm.is_finishing(this) {
+            break;
+        }
+        if cb == "onResume" {
+            let menu = vm.menu_for(this);
+            for menu_cb in ["onCreateOptionsMenu", "onPrepareOptionsMenu"] {
+                vm.call_virtual(this, menu_cb, &[menu])
+                    .inspect_err(|e| println!("callback {menu_cb} crashed: {e}"))
+                    .ok();
+            }
+        }
+        let r = vm
+            .call_virtual(this, cb, &[])
+            .and_then(|v| match v {
+                s @ Some(_) => Ok(s),
+                None => vm.call_virtual(this, cb, &[ovelo_dexrt::V::Ref(0)]),
+            })
+            .inspect_err(|e| println!("callback {cb} crashed: {e}"));
+        let ran = matches!(r, Ok(Some(_)));
+        println!(
+            "callback {} ({})",
+            cb,
+            if ran { "dex" } else { "framework" }
+        );
+    }
+}
+
+/// AOSP `AppInitializer.doInitialize`: an initializer's `dependencies()`
+/// run before its own `create`. The `seen` set guards manifest/dex
+/// dependency cycles and dedupes shared deps.
+fn run_initializer(
+    v: &mut ovelo_dexrt::Vm,
+    desc: &str,
+    ctx: ovelo_dexrt::V,
+    seen: &mut std::collections::HashSet<String>,
+    components: &std::rc::Rc<std::cell::RefCell<std::collections::HashMap<String, ovelo_dexrt::V>>>,
+) {
+    if !seen.insert(desc.to_string()) {
+        return;
+    }
+    let Ok(ih) = v.instantiate(desc) else {
+        println!("initializer {desc} not instantiated");
+        return;
+    };
+    let mut deps: Vec<String> = Vec::new();
+    if let Ok(Some(ovelo_dexrt::V::Ref(lh))) = v.call_virtual(ih, "dependencies", &[]) {
+        if let Some(ovelo_dexrt::Obj::Host {
+            state: ovelo_dexrt::HostState::List(items),
+            ..
+        }) = v.heap.get(lh)
+        {
+            deps = items
+                .iter()
+                .filter_map(|x| match x {
+                    ovelo_dexrt::V::Ref(ch) => v.class_descriptor_of(*ch),
+                    _ => None,
+                })
+                .collect();
+        }
+    }
+    for d in deps {
+        run_initializer(v, &d, ctx, seen, components);
+    }
+    match v.call_virtual(ih, "create", &[ctx]) {
+        Ok(Some(out)) => {
+            components.borrow_mut().insert(desc.to_string(), out);
+        }
+        Ok(None) => {}
+        Err(e) => println!("initializer {desc} create failed: {e}"),
+    }
+}
+
 fn run_app(store: &InstallStore, package: &str) -> Result<(), OveloError> {
     let rec = find_record(store, package)?;
     let bytes = store.apk_bytes(&rec)?;
     let info = inspect_apk(&bytes)?;
     // Launch pipeline pieces that exist today: dex parse + verify.
     let dexes = verify_dexes(&bytes, &info)?;
-    let bad: Vec<&str> = dexes.iter().filter(|d| !d.ok).map(|d| d.name.as_str()).collect();
+    let bad: Vec<&str> = dexes
+        .iter()
+        .filter(|d| !d.ok)
+        .map(|d| d.name.as_str())
+        .collect();
     if !bad.is_empty() {
         return Err(OveloError::new(
             ErrorCategory::DexUnsupported,
@@ -386,9 +775,14 @@ fn run_app(store: &InstallStore, package: &str) -> Result<(), OveloError> {
     let data_dir = store.app_dir(&rec.app).join("data");
     let _ctx = ovelo_framework::Context::new(rec.app.package.clone(), &data_dir);
     let mut activity = ovelo_framework::Activity::new();
-    activity
-        .launch()
-        .map_err(|e| OveloError::new(ErrorCategory::ServiceMissing, Phase::Service, "cli.run.lifecycle").with_detail(e.to_string()))?;
+    activity.launch().map_err(|e| {
+        OveloError::new(
+            ErrorCategory::ServiceMissing,
+            Phase::Service,
+            "cli.run.lifecycle",
+        )
+        .with_detail(e.to_string())
+    })?;
     let callbacks: Vec<String> = {
         let mut v = Vec::new();
         while let Some(cb) = activity.delivered() {
@@ -409,7 +803,10 @@ fn run_app(store: &InstallStore, package: &str) -> Result<(), OveloError> {
     // into the VM. Registered BEFORE instantiate so a constructor that
     // builds views in <init>/onCreate hits live stubs.
     let mut fonts = ovelo_ui::FontSet::new();
-    fonts.load_dirs(&["/System/Library/Fonts", "/System/Library/Fonts/Supplemental"]);
+    fonts.load_dirs(&[
+        "/System/Library/Fonts",
+        "/System/Library/Fonts/Supplemental",
+    ]);
     let fonts = std::rc::Rc::new(fonts);
     // P3 worker supervision: the whole guest dispatch (VM build → register
     // → instantiate → lifecycle callbacks) runs under catch_unwind. A panic
@@ -422,13 +819,26 @@ fn run_app(store: &InstallStore, package: &str) -> Result<(), OveloError> {
     let (mut guest, ui) = loop {
         let fonts2 = fonts.clone();
         let out = sup.supervise("guest-dispatch", || {
+            // VM mutex for the whole dispatch — serializes every
+            // interpreter step + driver-side heap touch against JNI
+            // calls from guest-spawned pthreads (call_native releases
+            // all levels so .so threads can reach JNI while it runs).
+            let _vmg = ovelo_dexrt::lock_vm();
             let ui = ovelo_framework::GuestUi::new(720, 1280, fonts2);
+            // Components returned by initializer `create()` — shared
+            // between the startup pass and `initializeComponent` so a
+            // component initializes once per run.
+            let components =
+                std::rc::Rc::new(std::cell::RefCell::new(std::collections::HashMap::<
+                    String,
+                    ovelo_dexrt::V,
+                >::new()));
             let vm = (|| -> Result<_, OveloError> {
-                let (_cd, entries) =
-                    parse_central_directory(&bytes, &ZipLimits::default())?;
-                // Multi-dex: until the Vm merges dexes, run on the dex
-                // that defines the launcher Activity — fdroid puts it in
-                // classes2.dex, so a fixed `classes.dex` can't dispatch it.
+                let (_cd, entries) = parse_central_directory(&bytes, &ZipLimits::default())?;
+                // Multi-dex: the Vm merges every classes*.dex into one
+                // index space — a method defined in classes2.dex resolves
+                // from an invoke in classes.dex. Put the launcher-defining
+                // dex first so its refs become canonical identities.
                 let mut dex_files: Vec<DexFile> = Vec::new();
                 for e in entries
                     .iter()
@@ -446,19 +856,102 @@ fn run_app(store: &InstallStore, package: &str) -> Result<(), OveloError> {
                     .iter()
                     .position(|d| {
                         d.class_defs().iter().any(|cd| {
-                            d.type_descriptor(cd.class_idx).ok().as_deref()
-                                == Some(desc.as_str())
+                            d.type_descriptor(cd.class_idx).ok().as_deref() == Some(desc.as_str())
                         })
                     })
                     .unwrap_or(0);
                 let mut v = ovelo_dexrt::Vm::new(dex_files.swap_remove(pos))?;
+                for d in dex_files {
+                    v.add_dex(d)?;
+                }
                 v.guest_root = data_dir.join("files");
+                // Seed shared external storage once so file managers
+                // have something to list (safe: only fills what's absent).
+                let ext = &v.external_root;
+                for d in ["Documents", "Download", "Pictures"] {
+                    let _ = std::fs::create_dir_all(ext.join(d));
+                }
+                for (f, body) in [
+                    ("readme.md", "ovelo guest storage\n".as_bytes().to_vec()),
+                    ("Documents/notes.txt", "hello from ovelo\n".as_bytes().to_vec()),
+                    (
+                        "Pictures/sunset.png",
+                        include_bytes!("../assets/seed-sunset.png").to_vec(),
+                    ),
+                    (
+                        "Pictures/mountain.png",
+                        include_bytes!("../assets/seed-mountain.png").to_vec(),
+                    ),
+                    (
+                        "Pictures/forest.png",
+                        include_bytes!("../assets/seed-forest.png").to_vec(),
+                    ),
+                    (
+                        "Pictures/ocean.png",
+                        include_bytes!("../assets/seed-ocean.png").to_vec(),
+                    ),
+                ] {
+                    let p = ext.join(f);
+                    if !p.exists() {
+                        let _ = std::fs::write(p, body);
+                    }
+                }
+                v.apk_res = ovelo_dexrt::res::ApkResources::open(bytes.clone());
+                v.theme_id = info
+                    .manifest
+                    .activity_themes
+                    .get(&launcher)
+                    .copied()
+                    .or(info.manifest.theme)
+                    .unwrap_or(0);
+                // Install-time grants: manifest <uses-permission> ∩
+                // normal-level; the rest stay denied until the app
+                // calls requestPermissions.
+                v.grant_manifest_permissions(&info.manifest.permissions);
                 v.enable_aot();
+                register_compat_shims(
+                    &mut v,
+                    &info.manifest.startup_initializers,
+                    components.clone(),
+                );
                 Ok(v)
             })();
             let mut g = vm
                 .and_then(|mut v| {
                     ovelo_framework::GuestUi::register(&ui, &mut v);
+                    // Android startup order: androidx.startup initializers
+                    // run *before* Application.onCreate — regardless of
+                    // whether the manifest names an Application subclass.
+                    let app_h = info
+                        .manifest
+                        .application_class
+                        .as_ref()
+                        .and_then(|app| v.instantiate(&format!("L{};", app.replace('.', "/"))).ok())
+                        .unwrap_or_else(|| {
+                            v.heap.alloc(ovelo_dexrt::Obj::Host {
+                                class_idx: u64::MAX,
+                                desc: "Landroid/app/Application;".to_string(),
+                                fields: std::collections::HashMap::new(),
+                                state: ovelo_dexrt::HostState::Empty,
+                            })
+                        });
+                    {
+                        let mut seen = std::collections::HashSet::new();
+                        for init in &info.manifest.startup_initializers {
+                            run_initializer(
+                                &mut v,
+                                &format!("L{};", init.replace('.', "/")),
+                                ovelo_dexrt::V::Ref(app_h),
+                                &mut seen,
+                                &components,
+                            );
+                        }
+                    }
+                    if let Some(app) = &info.manifest.application_class {
+                        if let Err(e) = v.call_virtual(app_h, "onCreate", &[]) {
+                            println!("application {app} onCreate failed: {e}");
+                        }
+                    }
                     v.instantiate(&desc).map(|h| (v, h))
                 })
                 .map_err(|e| {
@@ -466,17 +959,8 @@ fn run_app(store: &InstallStore, package: &str) -> Result<(), OveloError> {
                 })
                 .ok();
             if let Some((vm, this)) = &mut g {
-                for cb in &callbacks {
-                    let r = vm
-                        .call_virtual(*this, cb, &[])
-                        .and_then(|v| match v {
-                            s @ Some(_) => Ok(s),
-                            None => vm.call_virtual(*this, cb, &[ovelo_dexrt::V::Ref(0)]),
-                        })
-                        .inspect_err(|e| println!("callback {cb} crashed: {e}"));
-                    let ran = matches!(r, Ok(Some(_)));
-                    println!("callback {} ({})", cb, if ran { "dex" } else { "framework" });
-                }
+                run_activity_cbs(vm, *this, &callbacks);
+                drain_pending_activity(vm, this, &callbacks, &info.manifest);
             }
             (g, ui)
         });
@@ -490,10 +974,14 @@ fn run_app(store: &InstallStore, package: &str) -> Result<(), OveloError> {
                     continue;
                 }
                 // Still need a ui for the fallback demo tree.
-                break (None, ovelo_framework::GuestUi::new(720, 1280, fonts.clone()));
+                break (
+                    None,
+                    ovelo_framework::GuestUi::new(720, 1280, fonts.clone()),
+                );
             }
         }
     };
+    println!("dispatch done — opening window");
     let mut presenter = ovelo_host::Presenter::new();
     let sid = presenter.attach(3, 720, 1280)?;
     let win = ovelo_host::HostWindow::new(&disp(&rec.app.package), sid, presenter);
@@ -531,6 +1019,7 @@ fn run_app(store: &InstallStore, package: &str) -> Result<(), OveloError> {
         ui.borrow_mut().root.set_content_view(Box::new(col));
     }
     let ui2 = ui.clone();
+    let mut dex_frame = 0u32;
     ovelo_host::run(win, move |w| {
         {
             let mut u = ui2.borrow_mut();
@@ -554,7 +1043,7 @@ fn run_app(store: &InstallStore, package: &str) -> Result<(), OveloError> {
         // the same views (RefCell re-entrancy avoided).
         let pending = ui2.borrow().drain_clicks();
         let mut dead = false;
-        if let Some((vm, _this)) = &mut guest {
+        if let Some((vm, this)) = &mut guest {
             for (l, vh) in pending {
                 match sup.supervise("onClick", || {
                     vm.call_virtual(l, "onClick", &[ovelo_dexrt::V::Ref(vh)])
@@ -570,12 +1059,73 @@ fn run_app(store: &InstallStore, package: &str) -> Result<(), OveloError> {
                     }
                 }
             }
+            // A click handler may call startActivity — launch the target
+            // the same way the initial-lifecycle drain does. The drain
+            // runs guest code (ctor + lifecycle), so it stays under
+            // supervision like every other guest dispatch.
+            if !dead && vm.pending_activity.is_some() {
+                match sup.supervise("activity-start", || {
+                    drain_pending_activity(vm, this, &callbacks, &info.manifest);
+                }) {
+                    worker::Outcome::Ok(_) => {}
+                    worker::Outcome::Crashed(p) => {
+                        println!("activity-start panic -> {}", p.display());
+                        dead = true;
+                    }
+                }
+            }
         }
         // Panicked worker: drop its surface generation so no stale frame
         // displays, and never dispatch into the dead VM again.
         if dead {
             w.presenter().stop_worker(sid);
             guest = None;
+        }
+        // Apps that inflate layout xml (setContentView(res)) live in the
+        // VM's dex view tree — materialize it into drawable host views.
+        if let Some((vm, this)) = &mut guest {
+            // One lock for the whole tick — drain_runnables, GC and
+            // the layout pass all touch the heap between invokes, and
+            // guest-pthread JNI calls must not alias them.
+            let _vmg = ovelo_dexrt::lock_vm();
+            dex_frame = dex_frame.wrapping_add(1);
+            // Drain queued background work (`Thread.start`/
+            // `Executor.execute`/`Handler.post*`) on the same cadence
+            // as the layout pass — media scans, DB loads and adapter
+            // fills all live on this queue after the lifecycle drains
+            // end. Without it they stall once the window opens.
+            if dex_frame.is_multiple_of(30) {
+                let work = vm.drain_runnables(64);
+                // GC when the heap passes its growth mark — interpreter
+                // churn otherwise grows the heap unboundedly. Only runs
+                // between dex activations (collect_garbage gates itself).
+                if std::env::var_os("OVELO_MEMDBG").is_some() {
+                    eprintln!(
+                        "[mem] frame={dex_frame} heap={} mark={}",
+                        vm.heap.len(),
+                        vm.gc_mark
+                    );
+                }
+                if vm.heap.len() >= vm.gc_mark {
+                    let mut roots = ui2.borrow().guest_handles().into_iter();
+                    vm.collect_garbage(&mut roots);
+                }
+                // Drive the expensive layout pass only on real change:
+                // runnable work done this tick, guest view state
+                // mutated since the last pass, or a periodic catch-all
+                // for fills that don't bump view_gen (adapter attaches
+                // do). Idle trees converge and stop paying interpreter
+                // cost + RSS growth every half second.
+                if work > 0
+                    || vm.view_gen != vm.layout_gen_done.get()
+                    || dex_frame.is_multiple_of(600)
+                {
+                    // Run adapter containers' layout pass OUTSIDE the ui
+                    // borrow — guest code re-enters bridged view methods.
+                    ovelo_framework::drive_dex_layout_pass(vm, *this, dex_frame);
+                }
+            }
+            ui2.borrow_mut().refresh_dex_tree(vm, *this);
         }
         let mut u = ui2.borrow_mut();
         if let Ok(prod) = w.presenter().producer(sid) {
@@ -585,7 +1135,16 @@ fn run_app(store: &InstallStore, package: &str) -> Result<(), OveloError> {
             if (bw, bh) != (u.root.w, u.root.h) {
                 u.root.resize(bw, bh);
             }
-            let _ = u.root.perform_traversals(prod);
+            let posted = u.root.perform_traversals(prod);
+            if std::env::var_os("OVELO_VIEWDBG").is_some() && posted.ok().flatten().is_some() {
+                if let Some(c) = &u.root.content {
+                    eprintln!(
+                        "[viewdbg] drew root measured={:?} lp={:?}",
+                        c.measured(),
+                        c.lp()
+                    );
+                }
+            }
         }
     })
 }
@@ -639,11 +1198,7 @@ fn cmd() -> Result<(), OveloError> {
             Ok(())
         }
         Cmd::Run { app } => run_app(&default_store()?, &app),
-        Cmd::Disas {
-            apk,
-            class,
-            method,
-        } => disas(&read_apk(&apk)?, &class, method.as_deref()),
+        Cmd::Disas { apk, class, method } => disas(&read_apk(&apk)?, &class, method.as_deref()),
         Cmd::Gate { path } => {
             let items = gate::evaluate(&path)?;
             for i in &items {
@@ -658,18 +1213,31 @@ fn cmd() -> Result<(), OveloError> {
             if gate::passed(&items) {
                 Ok(())
             } else {
-                Err(OveloError::new(ErrorCategory::PkgInvalid, Phase::Install, "gate.failed"))
+                Err(OveloError::new(
+                    ErrorCategory::PkgInvalid,
+                    Phase::Install,
+                    "gate.failed",
+                ))
             }
         }
         Cmd::Diagnose { apk, json } => {
             let bytes = read_apk(&apk)?;
             let info = inspect_apk(&bytes)?;
             let dexes = verify_dexes(&bytes, &info)?;
-            let sig = if info.signed_v2_or_v3 { "v2/v3" } else { "v1-or-none" };
+            let sig = if info.signed_v2_or_v3 {
+                "v2/v3"
+            } else {
+                "v1-or-none"
+            };
             if json {
                 let dx: Vec<String> = dexes
                     .iter()
-                    .map(|d| format!("{{\"name\":{:?},\"ok\":{},\"cause\":{:?}}}", d.name, d.ok, d.cause))
+                    .map(|d| {
+                        format!(
+                            "{{\"name\":{:?},\"ok\":{},\"cause\":{:?}}}",
+                            d.name, d.ok, d.cause
+                        )
+                    })
                     .collect();
                 println!(
                     "{{\n  \"package\": {:?},\n  \"signature\": {:?},\n  \"abis\": {:?},\n  \"dexes\": [{}],\n  \"sha256\": {:?}\n}}",

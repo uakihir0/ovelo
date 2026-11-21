@@ -11,8 +11,12 @@ cranelift-frontend = "0.137"
 cranelift-jit = "0.137"
 cranelift-module = "0.137"
 cranelift-native = "0.137"
+ovelo-apk = { path = "../ovelo-apk" }
 ovelo-dex = { path = "../ovelo-dex" }
 ovelo-error = { path = "../ovelo-error" }
+image = { version = "0.25", default-features = false, features = ["png", "jpeg"] }
+rusqlite = { version = "0.32", features = ["bundled", "hooks", "collation"] }
+unicode-normalization = "0.1"
 
 [dev-dependencies]
 ovelo-dex = { path = "../ovelo-dex", features = ["testkit"] }

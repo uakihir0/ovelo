@@ -383,9 +383,7 @@ pub fn parse_axml(b: &[u8]) -> Result<Vec<Element>> {
                             .or_else(|| {
                                 // Fall back to the resource map id name, which
                                 // AOSP manifests encode for android: attrs.
-                                res_map
-                                    .get(aname as usize)
-                                    .map(|id| format!("@0x{id:08x}"))
+                                res_map.get(aname as usize).map(|id| format!("@0x{id:08x}"))
                             })
                             .ok_or_else(|| err("axml.attr.name_oob"))?
                     };
@@ -401,17 +399,11 @@ pub fn parse_axml(b: &[u8]) -> Result<Vec<Element>> {
                         value,
                     });
                 }
-                elements.push(Element {
-                    name,
-                    attrs,
-                    depth,
-                });
+                elements.push(Element { name, attrs, depth });
                 depth += 1;
             }
             RES_XML_END_ELEMENT_TYPE => depth = depth.saturating_sub(1),
-            RES_XML_START_NAMESPACE_TYPE
-            | RES_XML_END_NAMESPACE_TYPE
-            | RES_XML_CDATA_TYPE => {}
+            RES_XML_START_NAMESPACE_TYPE | RES_XML_END_NAMESPACE_TYPE | RES_XML_CDATA_TYPE => {}
             _ => {} // ignore unknown chunk types
         }
     }
@@ -475,6 +467,18 @@ pub struct ManifestInfo {
     pub config_for_split: Option<String>,
     /// `isFeatureSplit` — a dynamic-feature split.
     pub is_feature_split: bool,
+    /// `application/@android:name` — the custom Application class.
+    pub application_class: Option<String>,
+    /// `application/@android:theme` resource id.
+    pub theme: Option<u32>,
+    /// `activity/@android:theme` resource ids by qualified activity name.
+    pub activity_themes: std::collections::HashMap<String, u32>,
+    /// androidx.startup initializers: `meta-data` names under the
+    /// `androidx.startup.InitializationProvider` whose value is
+    /// `androidx.startup` (e.g. `androidx.work.WorkManagerInitializer`).
+    /// Android runs each Initializer's `create(context)` before
+    /// `Application.onCreate`.
+    pub startup_initializers: Vec<String>,
 }
 
 /// Parse a binary manifest into `ManifestInfo`.
@@ -486,6 +490,10 @@ pub fn parse_manifest(b: &[u8]) -> Result<ManifestInfo> {
     let mut filter_main = false;
     let mut filter_launcher = false;
     let mut in_filter = false;
+    // Name of the provider element currently open, if any — meta-data
+    // children of androidx.startup.InitializationProvider declare the
+    // app's Initializer classes.
+    let mut cur_provider: Option<String> = None;
 
     // We only have start-elements with depths; reconstruct the tree path by
     // consuming elements in document order, maintaining a stack via depth.
@@ -505,6 +513,9 @@ pub fn parse_manifest(b: &[u8]) -> Result<ManifestInfo> {
                 in_filter = false;
                 filter_main = false;
                 filter_launcher = false;
+            }
+            if popped == "provider" {
+                cur_provider = None;
             }
         }
 
@@ -529,14 +540,14 @@ pub fn parse_manifest(b: &[u8]) -> Result<ManifestInfo> {
                             _ => None,
                         })
                         .unwrap_or(0);
-                    info.version_name = el
-                        .attrs
-                        .iter()
-                        .find(|a| a.name == "versionName")
-                        .and_then(|a| match &a.value {
-                            Value::Str(s) => Some(s.clone()),
-                            _ => None,
-                        });
+                    info.version_name =
+                        el.attrs
+                            .iter()
+                            .find(|a| a.name == "versionName")
+                            .and_then(|a| match &a.value {
+                                Value::Str(s) => Some(s.clone()),
+                                _ => None,
+                            });
                     info.split = el
                         .attrs
                         .iter()
@@ -565,6 +576,13 @@ pub fn parse_manifest(b: &[u8]) -> Result<ManifestInfo> {
                         .unwrap_or(false);
                 }
             }
+            "application" => {
+                info.application_class = el.android_str("name").map(|n| qualify(&info.package, n));
+                info.theme = match el.android("theme") {
+                    Some(Value::Reference(r)) => Some(*r),
+                    _ => None,
+                };
+            }
             "uses-sdk" => {
                 info.min_sdk = el.android_int("minSdkVersion");
                 info.target_sdk = el.android_int("targetSdkVersion");
@@ -584,15 +602,16 @@ pub fn parse_manifest(b: &[u8]) -> Result<ManifestInfo> {
                     let q = qualify(&info.package, n);
                     info.activities.push(q.clone());
                     // An alias launches its targetActivity, not itself.
-                    cur_activity_for_filter = Some(
-                        if el.name == "activity-alias" {
-                            el.android_str("targetActivity")
-                                .map(|t| qualify(&info.package, t))
-                                .unwrap_or(q)
-                        } else {
-                            q
-                        },
-                    );
+                    cur_activity_for_filter = Some(if el.name == "activity-alias" {
+                        el.android_str("targetActivity")
+                            .map(|t| qualify(&info.package, t))
+                            .unwrap_or_else(|| q.clone())
+                    } else {
+                        q.clone()
+                    });
+                    if let Some(Value::Reference(t)) = el.android("theme") {
+                        info.activity_themes.insert(q, *t);
+                    }
                 }
             }
             "service" => {
@@ -607,7 +626,17 @@ pub fn parse_manifest(b: &[u8]) -> Result<ManifestInfo> {
             }
             "provider" => {
                 if let Some(n) = el.android_str("name") {
-                    info.providers.push(qualify(&info.package, n));
+                    let q = qualify(&info.package, n);
+                    info.providers.push(q.clone());
+                    cur_provider = Some(q);
+                }
+            }
+            "meta-data"
+                if cur_provider.as_deref() == Some("androidx.startup.InitializationProvider")
+                    && el.android_str("value") == Some("androidx.startup") =>
+            {
+                if let Some(n) = el.android_str("name") {
+                    info.startup_initializers.push(n.to_string());
                 }
             }
             "intent-filter" => {
@@ -616,8 +645,7 @@ pub fn parse_manifest(b: &[u8]) -> Result<ManifestInfo> {
                 filter_launcher = false;
             }
             "action"
-                if in_filter
-                    && el.android_str("name") == Some("android.intent.action.MAIN") =>
+                if in_filter && el.android_str("name") == Some("android.intent.action.MAIN") =>
             {
                 filter_main = true;
             }

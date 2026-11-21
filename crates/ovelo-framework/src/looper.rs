@@ -122,13 +122,7 @@ impl Handler {
     }
 
     /// `sendEmptyMessageDelayed(what, delay)` — due at `now + delay`.
-    pub fn send_empty_delayed(
-        &self,
-        q: &mut MessageQueue,
-        what: i32,
-        delay_ms: u64,
-        now_ms: u64,
-    ) {
+    pub fn send_empty_delayed(&self, q: &mut MessageQueue, what: i32, delay_ms: u64, now_ms: u64) {
         q.push(Message::new(self.id, what, now_ms + delay_ms));
     }
 

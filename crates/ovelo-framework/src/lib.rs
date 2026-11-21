@@ -13,9 +13,9 @@ pub mod choreographer;
 pub mod context;
 pub mod guest;
 pub mod looper;
-pub mod root;
 pub mod prefs;
 pub mod resolver;
+pub mod root;
 pub mod sqlite;
 pub mod view;
 pub mod widget;
@@ -24,7 +24,7 @@ pub use activity::{Activity, ActivityError, Lifecycle};
 pub use bundle::{BValue, Bundle};
 pub use choreographer::{CallbackType, Choreographer, FrameCallback};
 pub use context::Context;
-pub use guest::{ClickQueue, GuestUi, GuestView, SharedView};
+pub use guest::{drive_dex_layout_pass, ClickQueue, GuestUi, GuestView, SharedView};
 pub use looper::{Handler, Looper, Message, MessageQueue};
 pub use prefs::{PrefValue, SharedPreferences};
 pub use resolver::{ContentProvider, ContentResolver, ContentUri};
@@ -130,7 +130,10 @@ mod tests {
     fn context_dirs() {
         let mut c = Context::new("com.example.app", "/data/com.example.app");
         assert_eq!(c.package_name(), "com.example.app");
-        assert_eq!(c.files_dir().to_str().unwrap(), "/data/com.example.app/files");
+        assert_eq!(
+            c.files_dir().to_str().unwrap(),
+            "/data/com.example.app/files"
+        );
         let p = c.shared_prefs("main");
         assert!(p.lock().unwrap().path().ends_with("shared_prefs/main.xml"));
     }

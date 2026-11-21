@@ -15,7 +15,11 @@ pub struct R<'a> {
 
 impl<'a> R<'a> {
     pub fn new(b: &'a [u8]) -> Self {
-        Self { b, p: 0, end: b.len() }
+        Self {
+            b,
+            p: 0,
+            end: b.len(),
+        }
     }
 
     pub fn at(b: &'a [u8], p: usize) -> Self {
@@ -135,10 +139,7 @@ pub fn mutf8(bytes: &[u8]) -> Result<String> {
             units.push(v);
             i += 2;
         } else if b & 0xf0 == 0xe0 {
-            if i + 2 >= bytes.len()
-                || bytes[i + 1] & 0xc0 != 0x80
-                || bytes[i + 2] & 0xc0 != 0x80
-            {
+            if i + 2 >= bytes.len() || bytes[i + 1] & 0xc0 != 0x80 || bytes[i + 2] & 0xc0 != 0x80 {
                 return Err(err("dex.mutf8.truncated"));
             }
             let v = (((b & 0x0f) as u16) << 12)

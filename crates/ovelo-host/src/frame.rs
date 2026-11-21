@@ -78,7 +78,10 @@ impl SurfaceRegistry {
 
     /// Whether the surface's worker is alive (layers gate on this too).
     pub fn is_alive(&self, surface_id: u64) -> bool {
-        self.surfaces.get(&surface_id).map(|s| s.alive).unwrap_or(false)
+        self.surfaces
+            .get(&surface_id)
+            .map(|s| s.alive)
+            .unwrap_or(false)
     }
 
     /// Worker stopped/died: its frames must never display again.
@@ -157,10 +160,7 @@ mod tests {
         // incomplete frame rejected
         let mut bad = frame(1, 4, 4);
         bad.buffer.truncate(10);
-        assert_eq!(
-            r.present(bad).unwrap_err().cause(),
-            "host.frame.incomplete"
-        );
+        assert_eq!(r.present(bad).unwrap_err().cause(), "host.frame.incomplete");
         // stopped worker never displays
         r.stop_worker(1);
         assert_eq!(

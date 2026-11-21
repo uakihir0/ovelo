@@ -178,9 +178,8 @@ impl SharedPreferences {
 
     fn write(&self) -> Result<(), OveloError> {
         if let Some(dir) = self.path.parent() {
-            std::fs::create_dir_all(dir).map_err(|e| {
-                err("framework.prefs.io").with_detail(e.to_string())
-            })?;
+            std::fs::create_dir_all(dir)
+                .map_err(|e| err("framework.prefs.io").with_detail(e.to_string()))?;
         }
         if self.map.len() > MAX_PREFS_ENTRIES {
             return Err(err("framework.prefs.too_large"));
@@ -194,12 +193,9 @@ impl SharedPreferences {
         // The temp name carries this instance's id: two stores opened on
         // sibling paths (settings.xml vs settings.bak) would otherwise
         // share `settings.xml.tmp` and corrupt each other's writes.
-        let tmp = self
-            .path
-            .with_extension(format!("xml.tmp-{}", self.tmp_id));
-        std::fs::write(&tmp, doc).map_err(|e| {
-            err("framework.prefs.io").with_detail(e.to_string())
-        })?;
+        let tmp = self.path.with_extension(format!("xml.tmp-{}", self.tmp_id));
+        std::fs::write(&tmp, doc)
+            .map_err(|e| err("framework.prefs.io").with_detail(e.to_string()))?;
         std::fs::rename(&tmp, &self.path).map_err(|e| {
             let _ = std::fs::remove_file(&tmp);
             err("framework.prefs.io").with_detail(e.to_string())
@@ -210,8 +206,7 @@ impl SharedPreferences {
 /// Process-wide store cache, like `ContextImpl.sSharedPrefsCache`: one live
 /// store per backing file, shared by every `Context` in the app.
 fn registry() -> &'static Mutex<HashMap<PathBuf, Arc<Mutex<SharedPreferences>>>> {
-    static R: OnceLock<Mutex<HashMap<PathBuf, Arc<Mutex<SharedPreferences>>>>> =
-        OnceLock::new();
+    static R: OnceLock<Mutex<HashMap<PathBuf, Arc<Mutex<SharedPreferences>>>>> = OnceLock::new();
     R.get_or_init(|| Mutex::new(HashMap::new()))
 }
 

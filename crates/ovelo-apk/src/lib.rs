@@ -17,8 +17,8 @@ pub use install::{AppId, InstallRecord, InstallStore, StoredSplit};
 pub use manifest::{parse_manifest, Element, ManifestInfo, Value};
 pub use sig::{has_v2_signature, has_v3_signature, verify_v2, SignerInfo};
 pub use splits::{
-    install_split_set, resolve_splits, split_kind, validate_split_set, DeviceProfile,
-    SplitInput, SplitKind, SplitMember,
+    install_split_set, resolve_splits, split_kind, validate_split_set, DeviceProfile, SplitInput,
+    SplitKind, SplitMember,
 };
 pub use zip::{parse_central_directory, read_entry, CentralEntry, ZipLimits};
 
@@ -55,7 +55,11 @@ pub fn inspect_apk(bytes: &[u8]) -> Result<ApkInfo> {
         }
     }
     let manifest = manifest.ok_or_else(|| {
-        OveloError::new(ErrorCategory::PkgInvalid, Phase::Install, "apk.manifest.absent")
+        OveloError::new(
+            ErrorCategory::PkgInvalid,
+            Phase::Install,
+            "apk.manifest.absent",
+        )
     })?;
 
     let names: Vec<String> = entries.iter().map(|e| e.name.clone()).collect();

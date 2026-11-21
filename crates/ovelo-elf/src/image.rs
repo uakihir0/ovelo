@@ -173,10 +173,7 @@ impl Image {
             .checked_add(len as u64)
             .ok_or_else(|| err("elf.mem.bounds"))?;
         while a < end {
-            let page = self
-                .pages
-                .get(&a)
-                .ok_or_else(|| err("elf.mem.unmapped"))?;
+            let page = self.pages.get(&a).ok_or_else(|| err("elf.mem.unmapped"))?;
             if !page.perm.contains(needed) {
                 return Err(errd("elf.mem.perm", format!("page {a:#x}")));
             }

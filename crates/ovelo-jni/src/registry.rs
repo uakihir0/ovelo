@@ -37,18 +37,16 @@ pub fn parse_sig(sig: &str) -> Result<JniSig, OveloError> {
     let mut i = 1;
     let mut args = Vec::new();
     while i < b.len() && b[i] != b')' {
-        let (t, next) = parse_type(b, i, false).ok_or_else(|| {
-            err("jni.sig.malformed").with_detail(sig)
-        })?;
+        let (t, next) =
+            parse_type(b, i, false).ok_or_else(|| err("jni.sig.malformed").with_detail(sig))?;
         args.push(t);
         i = next;
     }
     if i >= b.len() || b[i] != b')' {
         return Err(err("jni.sig.malformed").with_detail(sig));
     }
-    let (ret, end) = parse_type(b, i + 1, true).ok_or_else(|| {
-        err("jni.sig.malformed").with_detail(sig)
-    })?;
+    let (ret, end) =
+        parse_type(b, i + 1, true).ok_or_else(|| err("jni.sig.malformed").with_detail(sig))?;
     if end != b.len() {
         return Err(err("jni.sig.malformed").with_detail(sig));
     }
@@ -118,18 +116,11 @@ impl NativeRegistry {
 
     /// Resolve a `native` method call. Err = unbound (the interpreter
     /// surfaces this as a VM error, per the no-silent-fallback rule).
-    pub fn resolve(
-        &self,
-        class: &str,
-        name: &str,
-        sig: &str,
-    ) -> Result<NativeMethod, OveloError> {
+    pub fn resolve(&self, class: &str, name: &str, sig: &str) -> Result<NativeMethod, OveloError> {
         self.map
             .get(&(class.to_string(), name.to_string(), sig.to_string()))
             .copied()
-            .ok_or_else(|| {
-                err("jni.native.unbound").with_detail(format!("{class}.{name}{sig}"))
-            })
+            .ok_or_else(|| err("jni.native.unbound").with_detail(format!("{class}.{name}{sig}")))
     }
 
     /// Binding count (diagnostics).

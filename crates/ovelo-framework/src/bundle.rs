@@ -140,9 +140,7 @@ fn encode(v: &BValue) -> (u8, Vec<u8>) {
 
 fn decode(tag: u8, raw: &[u8]) -> Result<BValue, OveloError> {
     let bad = || err("framework.bundle.decode");
-    let utf = |b: &[u8]| {
-        String::from_utf8(b.to_vec()).map_err(|_| err("framework.bundle.utf8"))
-    };
+    let utf = |b: &[u8]| String::from_utf8(b.to_vec()).map_err(|_| err("framework.bundle.utf8"));
     Ok(match tag {
         1 => BValue::Int(i32::from_le_bytes(raw.try_into().map_err(|_| bad())?)),
         2 => BValue::Long(i64::from_le_bytes(raw.try_into().map_err(|_| bad())?)),

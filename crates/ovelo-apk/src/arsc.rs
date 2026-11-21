@@ -50,6 +50,10 @@ impl StringPool {
     pub fn len(&self) -> usize {
         self.strings.len()
     }
+    /// All strings, in pool order.
+    pub fn to_vec(&self) -> Vec<String> {
+        self.strings.clone()
+    }
     /// Whether the pool is empty.
     pub fn is_empty(&self) -> bool {
         self.strings.is_empty()
@@ -165,6 +169,10 @@ pub struct ResourceEntry {
     pub public: bool,
     /// Simple value (None for complex/map entries).
     pub value: Option<EntryValue>,
+    /// Parent resource id for complex entries (style parents; 0 if none).
+    pub parent: u32,
+    /// Item map for complex entries (style attribute values).
+    pub items: Vec<(u32, EntryValue)>,
     /// Config description (e.g. "default", "ja", "xxhdpi").
     pub config: String,
 }
@@ -189,6 +197,9 @@ pub struct ResourcePackage {
     pub name: String,
     /// Types in this package.
     pub types: Vec<ResourceType>,
+    /// The package's key string pool — item keys of complex entries
+    /// (`<plurals>` quantity names) index into it.
+    pub key_strings: Vec<String>,
 }
 
 /// Parse `resources.arsc` into packages and entries.
@@ -220,7 +231,13 @@ pub fn parse_arsc(b: &[u8]) -> Result<Vec<ResourcePackage>> {
                 global_strings = pool;
             }
             RES_TABLE_PACKAGE_TYPE => {
-                packages.push(parse_package(b, pos, chunk_header, chunk_size, &global_strings)?);
+                packages.push(parse_package(
+                    b,
+                    pos,
+                    chunk_header,
+                    chunk_size,
+                    &global_strings,
+                )?);
                 seen_packages += 1;
             }
             _ => {}
@@ -387,7 +404,11 @@ fn parse_package(
                             return Err(err("arsc.entry.bounds"));
                         }
                         let rel = u32at(b, p + hsz + i * 4)? as usize;
-                        Ok(if rel == 0xffff_ffff { None } else { Some((i, rel)) })
+                        Ok(if rel == 0xffff_ffff {
+                            None
+                        } else {
+                            Some((i, rel))
+                        })
                     }
                 };
                 // ResTable_config sits inside the header right after the fixed
@@ -419,6 +440,8 @@ fn parse_package(
                     let eflags = u16at(b, eoff + 2)?;
                     let key_idx = u32at(b, eoff + 4)?;
                     let key = key_strings.get(key_idx).unwrap_or("?").to_string();
+                    let mut parent = 0u32;
+                    let mut items: Vec<(u32, EntryValue)> = Vec::new();
                     let value = if eflags & ENTRY_FLAG_COMPLEX == 0 {
                         if eoff + 8 + 8 > end {
                             return Err(err("arsc.value.bounds"));
@@ -436,6 +459,35 @@ fn parse_package(
                             string,
                         })
                     } else {
+                        // ResTable_entry complex form: parent + count +
+                        // count ResTable_map_entry{name, Res_value}.
+                        if eoff + 16 > end {
+                            return Err(err("arsc.value.bounds"));
+                        }
+                        parent = u32at(b, eoff + 8)?;
+                        let count = u32at(b, eoff + 12)? as usize;
+                        if eoff + 16 + count * 12 > end {
+                            return Err(err("arsc.value.bounds"));
+                        }
+                        for i in 0..count {
+                            let m = eoff + 16 + i * 12;
+                            let item_key = u32at(b, m)?;
+                            let data_type = b[m + 4 + 3];
+                            let data = u32at(b, m + 8)?;
+                            let string = if data_type == 0x03 {
+                                global.get(data).map(|s| s.to_string())
+                            } else {
+                                None
+                            };
+                            items.push((
+                                item_key,
+                                EntryValue {
+                                    data_type,
+                                    data,
+                                    string,
+                                },
+                            ));
+                        }
                         None
                     };
                     let public = flags
@@ -454,6 +506,8 @@ fn parse_package(
                                     | entry_id as u32,
                                 public,
                                 value: value.clone(),
+                                parent,
+                                items: items.clone(),
                                 config: config.clone(),
                             })
                         })
@@ -468,6 +522,8 @@ fn parse_package(
                                         | entry_id as u32,
                                     public,
                                     value,
+                                    parent,
+                                    items,
                                     config: config.clone(),
                                 }],
                             })
@@ -483,6 +539,7 @@ fn parse_package(
         package_id,
         name,
         types,
+        key_strings: key_strings.to_vec(),
     })
 }
 
@@ -561,7 +618,7 @@ mod tests {
         typ.extend(16u32.to_le_bytes()); // config size
         typ.extend([0u8; 12]); // minimal config body
         typ.extend(0u32.to_le_bytes()); // entry 0 offset = 0
-        // entry: size=8, flags=0, key=0; value: size=8 res0=0 type=3 data=0
+                                        // entry: size=8, flags=0, key=0; value: size=8 res0=0 type=3 data=0
         typ.extend(8u16.to_le_bytes());
         typ.extend(0u16.to_le_bytes());
         typ.extend(0u32.to_le_bytes());
