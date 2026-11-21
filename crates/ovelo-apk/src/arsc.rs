@@ -263,11 +263,11 @@ fn config_name(b: &[u8], off: usize, size: usize) -> String {
         // byte0 is the HIGH byte of the packed u16 (layout is big-endian
         // regardless of host arch): bit15 is the marker, chars sit in
         // 5-bit groups first→last as `c - base`.
-        let first = base.wrapping_add(c1 & 0x1f);
+        let first = base.wrapping_add(c1 & 0x1f) as char;
         let second = base
             .wrapping_add((c1 & 0xe0) >> 5)
-            .wrapping_add((c0 & 0x03) << 3);
-        let third = base.wrapping_add((c0 & 0x7c) >> 2);
+            .wrapping_add((c0 & 0x03) << 3) as char;
+        let third = base.wrapping_add((c0 & 0x7c) >> 2) as char;
         format!("{first}{second}{third}")
     };
     if size >= 12 {
@@ -303,6 +303,8 @@ fn config_name(b: &[u8], off: usize, size: usize) -> String {
             320 => parts.push("xhdpi".into()),
             480 => parts.push("xxhdpi".into()),
             640 => parts.push("xxxhdpi".into()),
+            0xfffe => parts.push("anydpi".into()),
+            0xffff => parts.push("nodpi".into()),
             d => parts.push(format!("{d}dpi")),
         }
     }
