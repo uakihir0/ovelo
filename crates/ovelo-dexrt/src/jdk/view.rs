@@ -565,13 +565,7 @@ fn image_pixels_at(
         return None;
     }
     match v {
-        V::I32(res) if res > 0 => {
-            let bytes = vm
-                .apk_res
-                .as_ref()
-                .and_then(|r| r.file_path(res as u32).and_then(|p| r.read(p)))?;
-            decode_image(&bytes)
-        }
+        V::I32(res) if res > 0 => super::vector::drawable_bitmap(vm, res as u32),
         V::Ref(h) => super::android::bitmap_pixels(vm, v)
             .or_else(|| {
                 let path = image_source_path(vm, v)?;
@@ -2099,6 +2093,12 @@ pub(crate) fn ta_attrs(vm: &Vm, h: u32) -> Vec<i32> {
 /// resolution chain for theme-scoped arrays and unset attrs.
 /// `None` when the value can't be resolved anywhere.
 pub(crate) fn ta_lookup(vm: &mut Vm, h: u32, index: usize) -> Option<V> {
+    if ta_attrs(vm, h).get(index).is_none()
+        && std::env::var_os("OVELO_VIEWDBG").is_some()
+    {
+        let n = ta_attrs(vm, h).len();
+        eprintln!("[viewdbg] ta_lookup[{index}] out-of-range attrs_len={n} h={h}");
+    }
     let attr_id = *ta_attrs(vm, h).get(index)? as u32;
     if std::env::var_os("OVELO_VIEWDBG").is_some() {
         eprintln!(
@@ -2157,7 +2157,11 @@ pub(crate) fn ta_lookup(vm: &mut Vm, h: u32, index: usize) -> Option<V> {
                     return Some(v);
                 }
                 if std::env::var_os("OVELO_VIEWDBG").is_some() {
-                    eprintln!("[viewdbg]   ta_map_miss {name} set={set_h}");
+                    let keys: Vec<String> = m
+                        .iter()
+                        .filter_map(|(k, _)| sv(vm, *k))
+                        .collect();
+                    eprintln!("[viewdbg]   ta_map_miss {name} set={set_h} keys={keys:?}");
                 }
             }
         }

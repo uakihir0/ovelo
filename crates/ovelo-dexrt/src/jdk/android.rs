@@ -2,7 +2,7 @@
 //! SharedPreferences, Resources, Handler/Looper (inline), PackageManager.
 
 use super::*;
-use crate::value::{HostState, Obj, V};
+use crate::value::{CanvasOp, HostState, Obj, PaintState, V};
 
 pub(crate) fn call(
     vm: &mut Vm,
@@ -2599,27 +2599,33 @@ fn resources_call(vm: &mut Vm, name: &str, args: &[V]) -> Rt<Option<Option<V>>> 
             Some(Some(V::I32(hit as i32)))
         }
         "getDrawable" | "getDrawableForDensity" => {
-            // AppCompat's ResourceManagerInternal throws when the
-            // drawable is not a bundled VectorDrawableCompat AND its
-            // class is literally `android.graphics.drawable.VectorDrawable`
-            // ("configure your build for VectorDrawableCompat"). When the
-            // APK bundles androidx vectordrawable, hand back a guest
-            // instance so the instanceof check passes; otherwise a plain
-            // framework Drawable — any other class name passes through to
-            // the normal inflate path.
-            let d = [
-                "Landroidx/vectordrawable/graphics/drawable/VectorDrawableCompat;",
-                "Landroid/support/graphics/drawable/VectorDrawableCompat;",
-            ]
-            .iter()
-            .find_map(|c| vm.instantiate(c).ok().map(V::Ref))
-            .unwrap_or_else(|| {
-                host(
-                    vm,
-                    "Landroid/graphics/drawable/VectorDrawable;",
-                    HostState::Empty,
-                )
-            });
+            // Rasterize the resource when it is an image (vector AXML or
+            // PNG/JPEG): a BitmapDrawable host whose bitmap the renderer's
+            // field walk finds. Otherwise AppCompat's ResourceManagerInternal
+            // throws when the drawable is not a bundled VectorDrawableCompat
+            // AND its class is literally
+            // `android.graphics.drawable.VectorDrawable` ("configure your
+            // build for VectorDrawableCompat") — hand back a guest
+            // VectorDrawableCompat so the instanceof check passes, or a
+            // plain Drawable host for anything else.
+            let res_id = i64v(args.get(1).copied().unwrap_or(V::I32(0))) as u32;
+            let d = if res_id > 0 && super::vector::drawable_bitmap(vm, res_id).is_some() {
+                super::vector::drawable_for_res(vm, res_id)
+            } else {
+                [
+                    "Landroidx/vectordrawable/graphics/drawable/VectorDrawableCompat;",
+                    "Landroid/support/graphics/drawable/VectorDrawableCompat;",
+                ]
+                .iter()
+                .find_map(|c| vm.instantiate(c).ok().map(V::Ref))
+                .unwrap_or_else(|| {
+                    host(
+                        vm,
+                        "Landroid/graphics/drawable/VectorDrawable;",
+                        HostState::Empty,
+                    )
+                })
+            };
             Some(Some(d))
         }
         "getColorStateList" => Some(Some(host(
@@ -2950,7 +2956,22 @@ fn res_misc(vm: &mut Vm, class: &str, name: &str, args: &[V]) -> Rt<Option<Optio
             };
             Some(Some(arr(vm, OBJ, vals)))
         }
-        ("Landroid/content/res/TypedArray;", "getDrawable" | "getFont" | "getColorStateList") => {
+        ("Landroid/content/res/TypedArray;", "getDrawable") => {
+            // Drawable-typed styleable attrs resolve to a res id; render
+            // vectors/bitmaps into a BitmapDrawable callers can draw.
+            // `TintTypedArray` delegates to the wrapped TypedArray and
+            // lands here too.
+            let d = match ta_index(vm, args)
+                .and_then(|(h, i)| view::ta_lookup(vm, h, i))
+            {
+                Some(V::I32(res)) if res > 0 => {
+                    super::vector::drawable_for_res(vm, res as u32)
+                }
+                _ => V::Ref(0),
+            };
+            Some(Some(d))
+        }
+        ("Landroid/content/res/TypedArray;", "getFont" | "getColorStateList") => {
             Some(Some(V::Ref(0)))
         }
         ("Landroid/content/res/TypedArray;", "hasValue" | "hasValueOrEmpty") => {
@@ -3452,10 +3473,18 @@ fn graphics_call(vm: &mut Vm, class: &str, name: &str, args: &[V]) -> Rt<Option<
                 }
                 "mutate" => Some(Some(V::Ref(h))),
                 "getIntrinsicWidth" => {
+                    // BitmapDrawable: intrinsic size is the bitmap's;
+                    // bounds and -1 (unspecified) come after that.
+                    if let Some((w, ..)) = bitmap_pixels(vm, V::Ref(h)) {
+                        return Ok(Some(Some(V::I32(w as i32))));
+                    }
                     let (l, _, r, _) = rect_edges(vm, bounds_h(vm, h).unwrap_or(0));
                     Some(Some(V::I32(r - l)))
                 }
                 "getIntrinsicHeight" => {
+                    if let Some((_, hgt, _)) = bitmap_pixels(vm, V::Ref(h)) {
+                        return Ok(Some(Some(V::I32(hgt as i32))));
+                    }
                     let (_, t, _, b) = rect_edges(vm, bounds_h(vm, h).unwrap_or(0));
                     Some(Some(V::I32(b - t)))
                 }
@@ -3463,6 +3492,80 @@ fn graphics_call(vm: &mut Vm, class: &str, name: &str, args: &[V]) -> Rt<Option<
                 "setVisible" => Some(Some(V::I32(0))),
                 _ => Some(None),
             }
+        }
+        // `Drawable.draw(Canvas)` — guest views (ImageView/FAB onDraw)
+        // paint their drawable through this call; it must emit a bitmap
+        // op into the recording canvas or the icon is invisible.
+        (c, "draw") if c.ends_with("Drawable;") => {
+            let Some(canvas) = args.get(1).copied() else {
+                return Ok(Some(None));
+            };
+            let px = bitmap_pixels(vm, args[0]);
+            if std::env::var_os("OVELO_DRAWDBG").is_some() {
+                eprintln!(
+                    "[drawdbg] {c}.draw px={} canvas_arg={:?}",
+                    px.as_ref().map(|(w, h, _)| format!("{w}x{h}")).unwrap_or_else(|| "-".into()),
+                    args.get(1)
+                );
+            }
+            // ColorDrawable: fill the drawable's bounds.
+            if px.is_none() {
+                if let (V::Ref(dh), Some(V::I32(argb))) = (
+                    args.first().copied().unwrap_or(V::I32(0)),
+                    args.first()
+                        .and_then(|a| match a {
+                            V::Ref(h) => pseudo_get(vm, *h, P_DRAW_COLOR),
+                            _ => None,
+                        }),
+                ) {
+                    let (l, t, r, b) = rect_edges(vm, bounds_h(vm, dh).unwrap_or(0));
+                    if r > l && b > t {
+                        gfx::rec(
+                            vm,
+                            canvas,
+                            CanvasOp::Rect {
+                                l: l as f32,
+                                t: t as f32,
+                                r: r as f32,
+                                b: b as f32,
+                                paint: PaintState {
+                                    argb,
+                                    ..PaintState::default()
+                                },
+                            },
+                        );
+                    }
+                }
+            }
+            if let Some((sw, sh, rgba)) = px {
+                let rect_h = args
+                    .first()
+                    .and_then(|a| match a {
+                        V::Ref(h) => bounds_h(vm, *h),
+                        _ => None,
+                    })
+                    .unwrap_or(0);
+                let (l, t, r, b) = rect_edges(vm, rect_h);
+                let (x, y, dw, dh) = if r > l && b > t {
+                    (l as f32, t as f32, (r - l) as f32, (b - t) as f32)
+                } else {
+                    (0.0, 0.0, sw as f32, sh as f32)
+                };
+                gfx::rec(
+                    vm,
+                    canvas,
+                    CanvasOp::Bitmap {
+                        x,
+                        y,
+                        w: dw.max(0.0) as u32,
+                        h: dh.max(0.0) as u32,
+                        src_w: sw,
+                        src_h: sh,
+                        rgba,
+                    },
+                );
+            }
+            Some(None)
         }
         ("Landroid/graphics/RectF;", n) => {
             let _ = n;
@@ -3594,15 +3697,24 @@ fn graphics_call(vm: &mut Vm, class: &str, name: &str, args: &[V]) -> Rt<Option<
             Some(bitmap_decode(vm, &bytes))
         }
         ("Landroid/graphics/BitmapFactory;", "decodeResource") => {
-            // (Resources, resId): resolve to the packaged file and decode.
+            // (Resources, resId): vector drawables rasterize too, then
+            // fall back to the packaged file's PNG/JPEG decode.
             let res_id = i32v(*args.get(1).unwrap_or(args.first().unwrap_or(&V::I32(0))))
                 as u32;
-            let bytes = vm
-                .apk_res
-                .as_ref()
-                .and_then(|r| r.file_path(res_id).and_then(|p| r.read(p)))
-                .unwrap_or_default();
-            Some(bitmap_decode(vm, &bytes))
+            Some(match super::vector::drawable_bitmap(vm, res_id) {
+                Some((w, h, rgba)) => Some(V::Ref(vm.alloc_host(
+                    "Landroid/graphics/Bitmap;",
+                    HostState::Bitmap { w, h, rgba },
+                ))),
+                None => {
+                    let bytes = vm
+                        .apk_res
+                        .as_ref()
+                        .and_then(|r| r.file_path(res_id).and_then(|p| r.read(p)))
+                        .unwrap_or_default();
+                    bitmap_decode(vm, &bytes)
+                }
+            })
         }
         ("Landroid/graphics/Bitmap;", "getWidth" | "getHeight" | "getByteCount"
         | "getRowBytes" | "hasAlpha" | "isRecycled" | "getDensity"

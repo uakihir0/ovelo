@@ -1561,6 +1561,10 @@ impl Vm {
         let Some(ci) = self.heap.class_of(h) else {
             return false;
         };
+        if std::env::var_os("OVELO_VIEWDBG").is_some() {
+            let d = self.type_desc_of(ci).unwrap_or_else(|_| "?".into());
+            eprintln!("[viewdbg] hdv h{h} ci={ci} desc={d} {name} -> {:?}", self.find_method_on_chain_sig(ci, name, params));
+        }
         matches!(
             self.find_method_on_chain_sig(ci, name, params),
             Ok(Some(_))
@@ -1581,6 +1585,23 @@ impl Vm {
     /// (`findItem` returning null, `size` 0).
     pub fn register_menu_overrides(&mut self) {
         jdk::view::register_menu_overrides(self);
+    }
+
+    /// `getDrawable(resId)` for host-side shims: a `BitmapDrawable`
+    /// carrying the rasterized bitmap when the resource is an image
+    /// (vector AXML or PNG/JPEG), else a plain `Drawable` placeholder.
+    pub fn drawable_for_res(&mut self, res_id: u32) -> V {
+        jdk::vector::drawable_for_res(self, res_id)
+    }
+
+    /// Drawable at styleable `index` of a `TypedArray` handle — host
+    /// `TintTypedArray` shims resolve through the wrapped array.
+    /// `None` when the index resolves to no drawable resource.
+    pub fn typed_array_drawable(&mut self, ta_h: u32, index: usize) -> Option<V> {
+        match jdk::view::ta_lookup(self, ta_h, index) {
+            Some(V::I32(res)) if res > 0 => Some(self.drawable_for_res(res as u32)),
+            _ => None,
+        }
     }
 
     /// Whether the guest called `finish()` on this Activity — remaining

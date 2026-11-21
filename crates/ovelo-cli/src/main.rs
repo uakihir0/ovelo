@@ -424,7 +424,12 @@ fn register_compat_shims(
     // the host menu model — see Vm::register_menu_overrides.
     v.register_menu_overrides();
 
-    let drawable = |vm: &mut ovelo_dexrt::Vm| -> V {
+    let drawable = |vm: &mut ovelo_dexrt::Vm, res_id: i64| -> V {
+        if res_id > 0 {
+            // Real pixels when the resource is a vector or bitmap;
+            // a bare Drawable placeholder otherwise.
+            return vm.drawable_for_res(res_id as u32);
+        }
         V::Ref(vm.heap.alloc(Obj::Host {
             class_idx: u64::MAX,
             desc: "Landroid/graphics/drawable/Drawable;".to_string(),
@@ -432,39 +437,77 @@ fn register_compat_shims(
             state: HostState::Empty,
         }))
     };
-    for (class, name, sig) in [
+    for (class, name, sig, arg_idx) in [
         (
             "Landroidx/appcompat/widget/ResourceManagerInternal;",
             "getDrawable",
             "(Landroid/content/Context;I)Landroid/graphics/drawable/Drawable;",
+            1usize,
         ),
         (
             "Landroidx/appcompat/widget/ResourceManagerInternal;",
             "getDrawable",
             "(Landroid/content/Context;IZ)Landroid/graphics/drawable/Drawable;",
+            1,
         ),
         (
             "Landroidx/appcompat/content/res/AppCompatResources;",
             "getDrawable",
             "(Landroid/content/Context;I)Landroid/graphics/drawable/Drawable;",
+            1,
         ),
         (
             "Landroidx/appcompat/widget/TintTypedArray;",
             "getDrawable",
             "(I)Landroid/graphics/drawable/Drawable;",
+            1,
         ),
         (
             "Landroidx/appcompat/widget/TintTypedArray;",
             "getDrawableIfKnown",
             "(I)Landroid/graphics/drawable/Drawable;",
+            1,
         ),
     ] {
         let _ = v.register_host(
             class,
             name,
             sig,
-            Rc::new(RefCell::new(move |vm: &mut ovelo_dexrt::Vm, _a: &[V]| {
-                Ok(Some(drawable(vm)))
+            Rc::new(RefCell::new(move |vm: &mut ovelo_dexrt::Vm, a: &[V]| {
+                let res_id = match a.get(arg_idx).copied().unwrap_or(V::I32(0)) {
+                    V::I32(i) => i as i64,
+                    V::I64(i) => i,
+                    _ => 0,
+                };
+                // TintTypedArray's arg is a styleable index into the wrapped
+                // TypedArray — resolve it there for real drawable pixels.
+                if class.contains("TintTypedArray") {
+                    let ta_h = match a.first() {
+                        Some(V::Ref(h)) => *h,
+                        _ => 0,
+                    };
+                    let inner = vm
+                        .get_object_field(
+                            ta_h,
+                            "Landroidx/appcompat/widget/TintTypedArray;",
+                            "mWrapped",
+                        )
+                        .and_then(|v| match v {
+                            V::Ref(h) if h != 0 => Some(h),
+                            _ => None,
+                        })
+                        .unwrap_or(ta_h);
+                    if let Some(d) = vm.typed_array_drawable(inner, res_id as usize) {
+                        return Ok(Some(d));
+                    }
+                    return Ok(Some(V::Ref(vm.heap.alloc(Obj::Host {
+                        class_idx: u64::MAX,
+                        desc: "Landroid/graphics/drawable/Drawable;".to_string(),
+                        fields: HashMap::new(),
+                        state: HostState::Empty,
+                    }))));
+                }
+                Ok(Some(drawable(vm, res_id)))
             })) as ovelo_dexrt::HostCall,
         );
     }

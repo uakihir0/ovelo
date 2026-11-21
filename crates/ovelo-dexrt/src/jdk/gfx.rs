@@ -72,7 +72,7 @@ fn paint_state(vm: &Vm, v: V) -> PaintState {
 }
 
 /// Append an op to a recording canvas handle.
-fn rec(vm: &mut Vm, canvas: V, op: CanvasOp) {
+pub(crate) fn rec(vm: &mut Vm, canvas: V, op: CanvasOp) {
     let V::Ref(h) = canvas else { return };
     if let Some(Obj::Host {
         state: HostState::CanvasOps(ops),

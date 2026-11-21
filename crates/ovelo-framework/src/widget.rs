@@ -400,8 +400,25 @@ impl Drawable for Button {
         c.draw_round_rect(
             Rect::new(self.tv.view.left, self.tv.view.top, s.w, s.h),
             self.radius,
-            Paint::color(self.bg),
+            Paint::color(self.tv.view.background.unwrap_or(self.bg)),
         );
+        // An ImageView-style src (FAB icon, ImageButton) draws centered
+        // inside the bounds, fit-center scaled down when larger.
+        if let Some((iw, ih, px)) = &self.tv.view.image {
+            let fit = ((s.w as f32 / *iw as f32).min(s.h as f32 / *ih as f32)).min(1.0);
+            let (dw, dh) = ((*iw as f32 * fit) as i32, (*ih as f32 * fit) as i32);
+            let x = self.tv.view.left + (s.w - dw) / 2;
+            let y = self.tv.view.top + (s.h - dh) / 2;
+            c.draw_image(
+                x,
+                y,
+                dw.max(0) as usize,
+                dh.max(0) as usize,
+                *iw as usize,
+                *ih as usize,
+                px,
+            );
+        }
         // The label draws inside the bg; skip tv's own background pass.
         let keep = self.tv.view.background.take();
         self.tv.draw(c);
