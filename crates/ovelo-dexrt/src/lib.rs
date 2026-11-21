@@ -2754,6 +2754,28 @@ impl Vm {
                 if let Some(r) = jdk::call(self, &class, &name, &sig, args)? {
                     return Ok(r);
                 }
+                // Interface dispatch names the interface ref
+                // (Appendable.append) while the implementation is
+                // registered under the receiver's concrete class
+                // (StringBuilder.append). Retry `jdk::call` against the
+                // receiver's runtime descriptor before stubbing.
+                if has_receiver {
+                    if let Some(&V::Ref(h)) = args.first() {
+                        let rc = match self.heap.get(h) {
+                            Some(Obj::Host { desc, .. }) => Some(desc.clone()),
+                            Some(Obj::Instance { class_idx, .. }) => {
+                                self.type_desc_of(*class_idx).ok()
+                            }
+                            Some(Obj::Str(_)) => Some("Ljava/lang/String;".to_string()),
+                            _ => None,
+                        };
+                        if let Some(rc) = rc.filter(|c| *c != class) {
+                            if let Some(r) = jdk::call(self, &rc, &name, &sig, args)? {
+                                return Ok(r);
+                            }
+                        }
+                    }
+                }
                 // A method whose class isn't in this DEX is a framework
                 // stub: the host models the base behavior, so return the
                 // proto's default (None for void) instead of failing —

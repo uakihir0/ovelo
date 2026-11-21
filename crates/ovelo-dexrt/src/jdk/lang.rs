@@ -1149,7 +1149,12 @@ fn math_call(name: &str, args: &[V]) -> Option<Option<V>> {
         "hypot" => V::F64(f64v(args[0]).hypot(f64v(args[1]))),
         "toRadians" => V::F64(f64v(args[0]).to_radians()),
         "toDegrees" => V::F64(f64v(args[0]).to_degrees()),
-        "signum" => V::F64(f64v(args[0]).signum()),
+        "signum" => match args[0] {
+            // signum(float) must return a float — cmpl-float on the
+            // caller side rejects an F64.
+            V::F32(f) => V::F32(f.signum()),
+            _ => V::F64(f64v(args[0]).signum()),
+        },
         "floorDiv" | "floorMod" => match args[0] {
             V::I64(a) => {
                 let b = i64v(args[1]).max(1);
