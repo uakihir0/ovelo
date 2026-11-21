@@ -2278,9 +2278,14 @@ fn layout_params(vm: &mut Vm, this: u32) -> V {
         "Landroid/view/ViewGroup$LayoutParams;",
         HostState::Empty,
     );
+    pseudo_set(vm, this, P_LP, v);
     if std::env::var_os("OVELO_VIEWDBG").is_some() {
+        let p = match pseudo_get(vm, this, P_PARENT) {
+            Some(V::Ref(h)) if h != 0 => class_of(vm, V::Ref(h)),
+            _ => "none".into(),
+        };
         eprintln!(
-            "[viewdbg] layout_params h{this} {} -> host placeholder",
+            "[viewdbg] layout_params h{this} {} parent={p} -> host placeholder",
             class_of(vm, V::Ref(this))
         );
     }

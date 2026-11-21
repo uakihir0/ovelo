@@ -3931,7 +3931,8 @@ impl Vm {
                 fr.last_call = self.describe_method(midx);
                 if let Some(p) = self.trace_call.as_deref() {
                     let caller = self.describe_method(fr.loc.midx);
-                    if fr.last_call.contains(p)
+                    if p.split(',')
+                        .any(|one| !one.is_empty() && fr.last_call.contains(one))
                         && self
                             .trace_from
                             .as_deref()
