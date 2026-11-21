@@ -305,10 +305,22 @@ impl ApkResources {
 
     /// res_id → decoded `TYPE_DIMENSION`/`TYPE_FRACTION` value scaled to
     /// px (density 2.0, matching the `scaledDensity` stub), or plain
-    /// numeric data for int/float values.
+    /// numeric data for int/float values. `TYPE_REFERENCE` aliases are
+    /// chased — a `<dimen>` may point at another entry; a chain that
+    /// lands on a non-numeric type means the id isn't a dimension and
+    /// must not be read as one (its raw id would pass through as px).
     pub fn dimen(&self, res_id: u32) -> Option<f32> {
-        let v = self.entry_value(res_id)?;
-        Some(typed_px(v))
+        let mut cur = res_id;
+        for _ in 0..8 {
+            let v = self.entry_value(cur)?;
+            match v.data_type {
+                0x01 => cur = v.data, // TYPE_REFERENCE
+                0x02 => return None,  // TYPE_ATTRIBUTE — theme ref
+                0x03 => return None,  // TYPE_STRING
+                _ => return Some(typed_px(v)),
+            }
+        }
+        None
     }
 
     /// Read a file out of the APK zip by its stored path.

@@ -1326,6 +1326,12 @@ pub(crate) fn call(
             // View.measure(wSpec, hSpec): the EXACTLY/AT_MOST size is
             // what getMeasured* reports until the dex onMeasure calls
             // setMeasuredDimension (which many custom views do).
+            if std::env::var_os("OVELO_MEASDBG").is_some() {
+                let (ws, hs) = (vint(args.get(1)), vint(args.get(2)));
+                if hs > 8192 || ws > 8192 {
+                    eprintln!("[measdbg] measure h{this} spec={ws:#x},{hs:#x}");
+                }
+            }
             pseudo_set(vm, this, P_MEAS_W, V::I32(spec_size(args.get(1).copied())));
             pseudo_set(vm, this, P_MEAS_H, V::I32(spec_size(args.get(2).copied())));
             // Guest exceptions must reach the guest's try/catch —
@@ -1359,6 +1365,12 @@ pub(crate) fn call(
         "setMeasuredDimension" => {
             // AOSP masks the stored dims to MEASURED_SIZE_MASK
             // (0x00FF_FFFF); the state bits ride the AndState variant.
+            if std::env::var_os("OVELO_MEASDBG").is_some() {
+                let (w, h) = (vint(args.get(1)), vint(args.get(2)));
+                if h > 8192 || w > 8192 {
+                    eprintln!("[measdbg] setMeasured h{this} {w}x{h}");
+                }
+            }
             pseudo_set(vm, this, P_MEAS_W, V::I32(vint(args.get(1)) & 0x00FF_FFFF));
             pseudo_set(vm, this, P_MEAS_H, V::I32(vint(args.get(2)) & 0x00FF_FFFF));
             Some(None)
@@ -2424,10 +2436,17 @@ fn lp_px(vm: &Vm, v: V) -> Option<i32> {
         V::F64(f) => return Some(f as i32),
         _ => return None,
     };
-    if i > 0 {
-        if let Some(px) = vm.apk_res.as_ref().and_then(|r| r.dimen(i as u32)) {
-            return Some(px as i32);
-        }
+    if i >= 0x0100_0000 {
+        // A resource id, not a px value — resolve it through the arsc
+        // dimen table. An unresolved id must NOT pass through as a
+        // literal px dim: it lands in `getChildMeasureSpec` as
+        // `EXACTLY|0x7fxxxxxx`, producing ~1e9-px measured heights
+        // that push the whole content subtree off-screen.
+        return vm
+            .apk_res
+            .as_ref()
+            .and_then(|r| r.dimen(i as u32))
+            .map(|d| d as i32);
     }
     Some(i)
 }
