@@ -55,6 +55,14 @@ pub(crate) fn call(
                 }
             }
             Some(None)
+        } else if desc_is_a(class, "Ljava/io/FilterInputStream;") && name == "<init>" {
+            // Guest subclasses read the wrapped stream straight out of the
+            // `in` field — the java ctor would have stored it.
+            if let Some(V::Ref(this)) = args.first() {
+                let wrapped = args.get(1).copied().unwrap_or(V::Ref(0));
+                field_set(vm, *this, "Ljava/io/FilterInputStream;", "in", wrapped);
+            }
+            Some(None)
         } else if class.ends_with("FileInputStream;") && name == "getFD" {
             // The descriptor keeps the byte payload so decodeFileDescriptor
             // can read it without a second open.

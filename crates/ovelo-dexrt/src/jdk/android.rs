@@ -314,6 +314,29 @@ pub(crate) fn call(
             | "isIsolated" => Some(Some(V::I32((name == "is64Bit") as i32))),
             _ => None,
         }
+    } else if class.starts_with("Landroid/os/StrictMode$") {
+        // ThreadPolicy/VmPolicy and their Builders: builder mutators
+        // return the builder; build() mints the matching policy.
+        match name {
+            "build" => Some(Some(host(
+                vm,
+                if class.contains("VmPolicy") {
+                    "Landroid/os/StrictMode$VmPolicy;"
+                } else {
+                    "Landroid/os/StrictMode$ThreadPolicy;"
+                },
+                HostState::Empty,
+            ))),
+            "toString" | "hashCode" => {
+                if name == "hashCode" {
+                    Some(Some(V::I32(0)))
+                } else {
+                    Some(Some(jstr(vm, class)))
+                }
+            }
+            "<init>" => Some(None),
+            _ => Some(Some(args[0])),
+        }
     } else if class == "Landroid/os/Trace;"
         || class == "Landroid/os/StrictMode;"
         || class == "Landroid/os/Debug;"
@@ -327,16 +350,19 @@ pub(crate) fn call(
                     Some(None)
                 }
             }
-            "allowThreadDiskWrites"
-            | "allowThreadDiskReads"
-            | "detectAll"
+            "allowThreadDiskWrites" | "allowThreadDiskReads" | "getThreadPolicy" => Some(
+                Some(host(vm, "Landroid/os/StrictMode$ThreadPolicy;", HostState::Empty)),
+            ),
+            "getVmPolicy" | "build" => Some(Some(host(
+                vm,
+                "Landroid/os/StrictMode$VmPolicy;",
+                HostState::Empty,
+            ))),
+            "detectAll"
             | "penaltyLog"
             | "penaltyDeath"
-            | "build"
             | "setVmPolicy"
             | "setThreadPolicy"
-            | "getVmPolicy"
-            | "getThreadPolicy"
             | "noteSlowCall"
             | "noteUntaggedSocket"
             | "noteDiskRead"
@@ -452,7 +478,22 @@ pub(crate) fn call(
                 };
                 Some(Some(V::I64(n)))
             }
-            "getParcelFileDescriptor" => Some(Some(args[0])),
+            "getParcelFileDescriptor" => {
+                // AssetFileDescriptor carries an inner ParcelFileDescriptor
+                // over the same bytes — minting a correctly-typed host keeps
+                // later `check-cast ParcelFileDescriptor` honest.
+                let st = match args.first().copied() {
+                    Some(V::Ref(h)) => match vm.heap.get(h) {
+                        Some(Obj::Host {
+                            state: HostState::Bytes(b, p),
+                            ..
+                        }) => HostState::Bytes(b.clone(), *p),
+                        _ => HostState::Empty,
+                    },
+                    _ => HostState::Empty,
+                };
+                Some(Some(host(vm, "Landroid/os/ParcelFileDescriptor;", st)))
+            }
             "close" | "detachFd" | "dup" | "canDetectErrors" => match name {
                 "canDetectErrors" => Some(Some(V::I32(0))),
                 "dup" => Some(Some(args[0])),
@@ -1112,7 +1153,32 @@ fn uri_call(vm: &mut Vm, name: &str, args: &[V]) -> Rt<Option<Option<V>>> {
             .unwrap_or_default();
             Some(Some(host(vm, "Landroid/net/Uri;", HostState::StrBuf(t))))
         }
-        "fromFile" | "fromParts" | "fromBundle" => Some(Some(host(
+        "fromFile" => {
+            // File arg -> "file://<absolute path>" Uri text; an empty
+            // buffer makes every later getScheme()/getPath() lie.
+            let p = s(
+                vm,
+                match args[0] {
+                    V::Ref(h) => h,
+                    _ => 0,
+                },
+            )
+            .unwrap_or_default();
+            let p = if p.is_empty() { p } else { format!("file://{p}") };
+            Some(Some(host(vm, "Landroid/net/Uri;", HostState::StrBuf(p))))
+        }
+        "fromParts" => {
+            // (scheme, authority, path) -> scheme://authority/path
+            let sc = sv(vm, args.get(1).copied().unwrap_or(V::I32(0))).unwrap_or_default();
+            let au = sv(vm, args.get(2).copied().unwrap_or(V::I32(0))).unwrap_or_default();
+            let pa = sv(vm, args.get(3).copied().unwrap_or(V::I32(0))).unwrap_or_default();
+            Some(Some(host(
+                vm,
+                "Landroid/net/Uri;",
+                HostState::StrBuf(format!("{sc}://{au}{pa}")),
+            )))
+        }
+        "fromBundle" => Some(Some(host(
             vm,
             "Landroid/net/Uri;",
             HostState::StrBuf("".into()),

@@ -3977,6 +3977,7 @@ impl Vm {
                             "[call>] {caller} +{pc:04x} -> {callee} this={} args={argfmt:?}",
                             match this_arg {
                                 Some(V::Ref(0)) | None => "null".into(),
+                                Some(V::Ref(h)) => format!("h{h}:{}", self.dbg_class_of(h)),
                                 other => format!("{other:?}"),
                             }
                         );
