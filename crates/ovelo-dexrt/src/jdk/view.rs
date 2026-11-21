@@ -798,11 +798,11 @@ pub(crate) fn call(
         }
         "detachViewFromParent" => {
             match args.get(1).copied() {
-                Some(child @ V::Ref(_)) => detach(vm, this, child),
+                Some(child @ V::Ref(_)) => detach(vm, this, child, false),
                 Some(V::I32(i)) if i >= 0 => {
                     let child = children(vm, this).get(i as usize).copied();
                     if let Some(c) = child {
-                        detach(vm, this, c);
+                        detach(vm, this, c, false);
                     }
                 }
                 _ => {}
@@ -851,7 +851,11 @@ pub(crate) fn call(
                 } else {
                     None
                 };
-                attach_at(vm, this, child, idx);
+                let notify = !matches!(
+                    name,
+                    "attachViewToParent" | "attachViewToParentInLayout"
+                );
+                attach_at(vm, this, child, idx, notify);
             }
             Some(match ret(sig) {
                 "V" => None,
@@ -859,33 +863,20 @@ pub(crate) fn call(
             })
         }
         "removeView" | "removeViewInLayout" => {
-            detach(vm, this, args.get(1).copied().unwrap_or(V::Ref(0)));
+            detach(vm, this, args.get(1).copied().unwrap_or(V::Ref(0)), true);
             Some(None)
         }
         "removeViewAt" => {
             let i = i32v(args.get(1).copied().unwrap_or(V::I32(0))) as usize;
-            if let Some(arrh) = children_arr(vm, this) {
-                if let Some(Obj::Array { data, .. }) = vm.heap.get_mut(arrh) {
-                    if i < data.len() {
-                        let gone = data.remove(i);
-                        if let V::Ref(ch) = gone {
-                            pseudo_set(vm, ch, P_PARENT, V::Ref(0));
-                        }
-                    }
-                }
+            let child = children(vm, this).get(i).copied();
+            if let Some(c) = child {
+                detach(vm, this, c, true);
             }
             Some(None)
         }
         "removeAllViews" => {
             for c in children(vm, this) {
-                if let V::Ref(ch) = c {
-                    pseudo_set(vm, ch, P_PARENT, V::Ref(0));
-                }
-            }
-            if let Some(arrh) = children_arr(vm, this) {
-                if let Some(Obj::Array { data, .. }) = vm.heap.get_mut(arrh) {
-                    data.clear();
-                }
+                detach(vm, this, c, true);
             }
             Some(None)
         }
@@ -2160,9 +2151,13 @@ fn lp_ctor(vm: &mut Vm, class: &str, sig: &str, args: &[V]) {
             for (_, fields) in LP_ATTRS {
                 for f in *fields {
                     let ty = if *f == "weight" { "F" } else { "I" };
-                    if let Some(v) = lp_keys(vm, f, ty)
+                    // Read under every owner the SOURCE may have used —
+                    // lp_keys (the receiver's hierarchy) would miss dims
+                    // stored under the source's own obfuscated class.
+                    if let Some(v) = vm
+                        .field_keys_named(f, ty)
                         .iter()
-                        .find_map(|g| src_fields.get(g).copied())
+                        .find_map(|(_, g)| src_fields.get(g).copied())
                     {
                         writes.push((f.to_string(), ty.to_string(), v));
                     }
@@ -2426,12 +2421,14 @@ fn view_id(vm: &Vm, h: u32) -> i32 {
 }
 
 pub(crate) fn attach(vm: &mut Vm, parent: u32, child: V) {
-    attach_at(vm, parent, child, None)
+    attach_at(vm, parent, child, None, true)
 }
 
 /// `idx` mirrors ViewGroup's positional add/attach: absent or past-the-
-/// end appends, otherwise the child lands at that child index.
-pub(crate) fn attach_at(vm: &mut Vm, parent: u32, child: V, idx: Option<usize>) {
+/// end appends, otherwise the child lands at that child index. `notify`
+/// fires the dex `onViewAdded` callback — real `addView` paths only;
+/// AOSP's transient `attachViewToParent` never notifies.
+pub(crate) fn attach_at(vm: &mut Vm, parent: u32, child: V, idx: Option<usize>, notify: bool) {
     if parent == 0 {
         return;
     }
@@ -2497,7 +2494,9 @@ pub(crate) fn attach_at(vm: &mut Vm, parent: u32, child: V, idx: Option<usize>) 
         // (ConstraintLayout) use it to arm mDirtyHierarchy and register
         // the child in mChildrenById; without it updateHierarchy skips
         // the child and the solver leaves its widget at 0,0,0,0.
-        let _ = vm.call_virtual_rt(parent, "onViewAdded", &[V::Ref(ch)]);
+        if notify {
+            let _ = vm.call_virtual_rt(parent, "onViewAdded", &[V::Ref(ch)]);
+        }
         // App content lands under the `android.R.id.content` frame —
         // whether via our Window.setContentView or appcompat's dex-side
         // ensureSubDecor — so remember it as the running activity's
@@ -2529,7 +2528,10 @@ pub(crate) fn attach_at(vm: &mut Vm, parent: u32, child: V, idx: Option<usize>) 
     }
 }
 
-fn detach(vm: &mut Vm, parent: u32, child: V) {
+/// `notify` fires `onViewRemoved` — real `removeView*` paths only;
+/// the ChildHelper's transient `detachViewFromParent` never notifies
+/// (the child is coming right back).
+fn detach(vm: &mut Vm, parent: u32, child: V, notify: bool) {
     let Some(a) = children_arr(vm, parent) else {
         return;
     };
@@ -2547,7 +2549,9 @@ fn detach(vm: &mut Vm, parent: u32, child: V) {
             // (ConstraintLayout drops it from mChildrenById; adapters
             // recycle through detach and stale registrations would keep
             // dead views in subsequent passes).
-            let _ = vm.call_virtual_rt(parent, "onViewRemoved", &[V::Ref(ch)]);
+            if notify {
+                let _ = vm.call_virtual_rt(parent, "onViewRemoved", &[V::Ref(ch)]);
+            }
         }
     }
 }

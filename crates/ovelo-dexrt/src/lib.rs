@@ -220,6 +220,10 @@ pub struct Vm {
     /// instances under every owner a reader's field ref might name
     /// (R8 renames owners like `ViewGroup$LayoutParams` arbitrarily).
     fields_named_cache: std::cell::RefCell<Option<FieldsByName>>,
+    /// `midx` → `(class, name, proto_sig)` — decoding the proto string
+    /// re-reads half the dex tables per call; layout/measure passes
+    /// issue it tens of thousands of times on the same methods.
+    method_sig_cache: std::cell::RefCell<HashMap<GIdx, (String, String, String)>>,
     /// Deferred async work — `(runnable, on_main)`. `Thread.start`,
     /// `Executor.execute`/`submit` and `Handler.post*` enqueue here
     /// instead of running inline (AOSP is async; inline execution
@@ -349,6 +353,7 @@ impl Vm {
             park_spins: 0,
             field_idx_cache: std::cell::RefCell::new(HashMap::new()),
             fields_named_cache: std::cell::RefCell::new(None),
+            method_sig_cache: std::cell::RefCell::new(HashMap::new()),
             class_mirrors: HashMap::new(),
             granted_permissions: std::collections::HashSet::new(),
         };
@@ -374,6 +379,7 @@ impl Vm {
         // A new dex can resolve names previous lookups missed.
         self.field_idx_cache.borrow_mut().clear();
         self.fields_named_cache.borrow_mut().take();
+        self.method_sig_cache.borrow_mut().clear();
         let di = self.dexes.len();
         for (class_idx, em) in dex.methods()? {
             self.defined
@@ -640,6 +646,9 @@ impl Vm {
     /// `Lowner;.name(params)ret` for a global method ref, or None when
     /// the index doesn't resolve (sentinel).
     fn method_sig(&self, midx: GIdx) -> Result<(String, String, String)> {
+        if let Some(hit) = self.method_sig_cache.borrow().get(&midx) {
+            return Ok(hit.clone());
+        }
         let d = self.dex_of(midx).ok_or_else(|| err("dexrt.method.id"))?;
         let mid = d.method(gl(midx))?;
         let class = d.type_descriptor(mid.class_idx as u32)?;
@@ -652,7 +661,11 @@ impl Vm {
         sig.push(')');
         let ret = d.type_descriptor(p.return_type_idx)?;
         sig.push_str(&ret);
-        Ok((class, name, sig))
+        let out = (class, name, sig);
+        self.method_sig_cache
+            .borrow_mut()
+            .insert(midx, out.clone());
+        Ok(out)
     }
 
     /// Register a host implementation for the method reference
