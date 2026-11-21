@@ -261,8 +261,8 @@ fn string_call(vm: &mut Vm, name: &str, sig: &str, args: &[V]) -> Option<Option<
             let b: Vec<char> = n.chars().skip(oo).take(len).collect();
             let eq = if ic {
                 a.iter()
-                    .map(|c| c.to_ascii_lowercase())
-                    .eq(b.iter().map(|c| c.to_ascii_lowercase()))
+                    .flat_map(|c| c.to_lowercase())
+                    .eq(b.iter().flat_map(|c| c.to_lowercase()))
             } else {
                 a == b
             };
