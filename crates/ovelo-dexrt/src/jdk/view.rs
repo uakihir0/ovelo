@@ -454,8 +454,7 @@ pub(crate) fn dex_view_info(vm: &Vm, h: u32) -> Option<DexViewInfo> {
 /// values (Bitmap host, res-id int, Uri/path object) get wrapped in a
 /// `BitmapDrawable` that also carries them for the renderer's field walk.
 fn image_drawable(vm: &mut Vm, this: u32) -> V {
-    let raw = pseudo_get(vm, this, P_IMAGE).unwrap_or(V::Ref(0));
-    if is_null(raw) {
+    let Some(raw) = pseudo_get(vm, this, P_IMAGE) else {
         // No image was ever set (icon plumbing not wired). Android
         // allows null here, but Kotlin `!!`/mutate() chains NPE on
         // it — hand back a stable placeholder drawable instead.
@@ -466,6 +465,12 @@ fn image_drawable(vm: &mut Vm, this: u32) -> V {
         );
         pseudo_set(vm, this, P_IMAGE, d);
         return d;
+    };
+    if is_null(raw) || raw == V::I32(0) {
+        // setImage*(null)/setImageResource(0) cleared the image:
+        // getDrawable must stay null so `drawable == null` checks
+        // keep working.
+        return V::Ref(0);
     }
     let bare = match raw {
         V::I32(_) => true,
