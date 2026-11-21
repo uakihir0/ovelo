@@ -1411,12 +1411,12 @@ impl Vm {
         roots.extend(self.decor_roots.keys().copied());
         roots.extend(self.decor_roots.values().copied());
         roots.extend(self.db_handles.values().copied());
-        roots.extend(self.obj_db.keys().copied());
-        roots.extend(self.throw_sites.keys().copied());
-        // Unsafe opaque-offset fields live outside the heap — root both
-        // the owner (stale values mustn't bleed into a recycled handle)
-        // and any reference stored there.
-        roots.extend(self.unsafe_offsets.keys().map(|(h, _)| *h));
+        // obj_db/throw_sites/unsafe_offsets are NOT rooted: entries whose
+        // owner object is dead are pruned after the sweep instead, so the
+        // registries can't grow forever or keep stale values alive.
+        // unsafe_offsets values stay rooted for entries whose owner is
+        // still live (a dead owner's entry is dropped below, releasing
+        // its value on the next collect).
         roots.extend(self.unsafe_offsets.values().filter_map(|v| match v {
             V::Ref(h) if *h != 0 => Some(*h),
             _ => None,
@@ -1428,6 +1428,14 @@ impl Vm {
         }
         roots.extend(extra_roots);
         let freed = self.heap.collect(roots);
+        // Evict bookkeeping for objects this collect just reclaimed —
+        // keeps the maps bounded and stops dead entries pointing at
+        // recycled handles.
+        self.unsafe_offsets
+            .retain(|(h, _), _| self.heap.get(*h).is_some());
+        self.obj_db.retain(|h, _| self.heap.get(*h).is_some());
+        self.throw_sites
+            .retain(|h, _| self.heap.get(*h).is_some());
         // Next collection when the heap grows another ~50%.
         self.gc_mark = (self.heap.len() * 3 / 2).max(65_536);
         if std::env::var_os("OVELO_MEMDBG").is_some() {
