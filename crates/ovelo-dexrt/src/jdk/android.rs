@@ -2543,7 +2543,7 @@ fn resources_call(vm: &mut Vm, name: &str, args: &[V]) -> Rt<Option<Option<V>>> 
             // Chase @color/@mipmap refs and ?attr indirections so a
             // `?attr/colorPrimary`-style entry yields the real color int
             // instead of leaking the raw attr res-id as the color value.
-            let mut id = res_id() as u32;
+            let mut id = res_id();
             // Unresolvable `?attr` colors land here — opaque black keeps
             // text visible instead of alpha-0 invisible.
             let mut data = 0xFF00_0000u32;
