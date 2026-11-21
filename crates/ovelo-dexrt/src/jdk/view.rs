@@ -2986,12 +2986,20 @@ fn relative_layout_fallback(vm: &mut Vm, this: u32, w: i32, h: i32) {
         // of the unconstrained measurement.
         let (rw, rh) = (cr - cl, cb - ct);
         if rw != ks[i].w || rh != ks[i].h {
-            const AT_MOST: i32 = 2 << 30;
-            let _ = vm.call_virtual(
-                ch,
-                "measure",
-                &[V::I32(AT_MOST | rw.max(0)), V::I32(AT_MOST | rh.max(0))],
-            );
+            const EXACTLY: i32 = 1 << 30;
+            // The child's own lp picks the spec per axis — a flat
+            // AT_MOST would shrink match_parent descendants to their
+            // (often 0) content size; EXACTLY|extent + lp yields
+            // EXACTLY for match_parent, AT_MOST for wrap.
+            let dw = attr_find(vm, ch, "layout_width")
+                .map(|v| len_v(vm, v))
+                .unwrap_or(-2);
+            let dh = attr_find(vm, ch, "layout_height")
+                .map(|v| len_v(vm, v))
+                .unwrap_or(-2);
+            let ws = child_measure_spec(EXACTLY | rw.max(0), 0, dw);
+            let hs = child_measure_spec(EXACTLY | rh.max(0), 0, dh);
+            let _ = vm.call_virtual(ch, "measure", &[V::I32(ws), V::I32(hs)]);
         }
         if std::env::var_os("OVELO_VIEWDBG").is_some() {
             let rules: Vec<String> = [
