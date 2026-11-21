@@ -312,6 +312,7 @@ pub(crate) fn media_cursor(vm: &mut Vm, uri: &str, projection: &[String]) -> V {
     let video = uri.contains("/video/");
     let audio = uri.contains("/audio/");
     let mut rows: Vec<Vec<V>> = Vec::new();
+    let mut files: Vec<(std::path::PathBuf, &str, i64)> = Vec::new();
     let mut dirs = vec![vm.external_root.clone()];
     while let Some(d) = dirs.pop() {
         let Ok(rd) = std::fs::read_dir(&d) else {
@@ -345,6 +346,11 @@ pub(crate) fn media_cursor(vm: &mut Vm, uri: &str, projection: &[String]) -> V {
                 "wav" => ("audio/x-wav", 2),
                 _ => continue,
             };
+            files.push((p, mime, mtype));
+        }
+    }
+    files.sort_by(|a, b| a.0.cmp(&b.0));
+    for (idx, (p, mime, mtype)) in files.into_iter().enumerate() {
             // A scoped volume (images/video/audio) filters by media
             // type; "file"/"media" volumes accept everything.
             let wanted = if images {
@@ -393,11 +399,12 @@ pub(crate) fn media_cursor(vm: &mut Vm, uri: &str, projection: &[String]) -> V {
                 .unwrap_or(0);
             let (w, h) = img_dims(&p);
             let data = format!("/storage/emulated/0/{rel}");
-            // Stable ids: the same file carries the same `_id`
-            // however the query filtered, and `bucket_id` follows
-            // MediaStore's parent-path hashCode so distinct folders
-            // can't collide on name length.
-            let row_id = (java_hash(&data) as i64 & 0x3fff_ffff) + 1;
+            // `_id` is the file's position in the sorted full scan —
+            // unique and stable however the volume filter narrows the
+            // rows, like a real MediaStore rowid. `bucket_id` follows
+            // MediaStore's parent-path hashCode (AOSP collides there
+            // too, so keep it).
+            let row_id = idx as i64 + 1;
             let bucket_id = java_hash(&rel_dir.to_lowercase()) as i64;
             rows.push(vec![
                 V::I64(row_id),
@@ -420,7 +427,6 @@ pub(crate) fn media_cursor(vm: &mut Vm, uri: &str, projection: &[String]) -> V {
                 V::I64(0),
                 jstr(vm, "external"),
             ]);
-        }
     }
     if std::env::var_os("OVELO_DRAINDBG").is_some() {
         eprintln!("[media_cursor] {uri} rows={}", rows.len());
@@ -1174,6 +1180,10 @@ fn cursor_call(vm: &mut Vm, name: &str, args: &[V]) -> Rt<Option<Option<V>>> {
     };
     let n_rows = cur_rows(vm, h).len() as i32;
     let col_arg = i32v(*args.get(1).unwrap_or(&V::I32(0)));
+    let dbg = std::env::var_os("OVELO_CURDBG").is_some();
+    if dbg && matches!(name, "getCount") {
+        eprintln!("[cur] h={h} getCount -> {n_rows} cols={:?}", cur_cols(vm, h));
+    }
     Ok(match name {
         "getCount" => Some(Some(V::I32(n_rows))),
         "getPosition" => Some(Some(V::I32(cur_pos(vm, h)))),
@@ -1261,6 +1271,13 @@ fn cursor_call(vm: &mut Vm, name: &str, args: &[V]) -> Rt<Option<Option<V>>> {
         "getColumnCount" => Some(Some(V::I32(cur_cols(vm, h).len() as i32))),
         "getString" => {
             let v = cur_cell(vm, h, col_arg);
+            if dbg {
+                eprintln!(
+                    "[cur] h={h} getString pos={} col={col_arg} -> {}",
+                    cur_pos(vm, h),
+                    sv(vm, v).unwrap_or_else(|| format!("{v:?}")).chars().take(60).collect::<String>()
+                );
+            }
             Some(Some(match v {
                 V::Ref(_) => v,
                 V::I32(i) => jstr(vm, &i.to_string()),

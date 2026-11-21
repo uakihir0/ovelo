@@ -3601,7 +3601,15 @@ impl Vm {
                         .skip(1)
                         .map(|v| match v {
                             V::Ref(h) if *h != 0 => {
-                                format!("h{h}:{}", self.dbg_class_of(*h))
+                                let mut s = format!("h{h}:{}", self.dbg_class_of(*h));
+                                if let Some(Obj::Host {
+                                    state: HostState::List(l),
+                                    ..
+                                }) = self.heap.get(*h)
+                                {
+                                    s.push_str(&format!("(n={})", l.len()));
+                                }
+                                s
                             }
                             V::Ref(_) => "null".into(),
                             other => format!("{other:?}"),
