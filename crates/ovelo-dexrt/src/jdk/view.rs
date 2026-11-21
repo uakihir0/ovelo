@@ -122,6 +122,9 @@ const P_MEAS_H: u32 = 0xFFFD_FFE4;
 pub const P_TCOLOR: u32 = 0xFFFD_FFE3;
 /// Live `setTextSize` px — same fallthrough path as [`P_TCOLOR`].
 pub const P_TSIZE: u32 = 0xFFFD_FFE2;
+/// Resolved layout direction stored on a `*LayoutParams` by
+/// `resolveLayoutDirection` (AOSP `mLayoutDirection`).
+const P_LP_DIR: u32 = u32::MAX - 29;
 
 /// Lazily mint a per-view `ViewTreeObserver` — guests register
 /// `OnGlobalLayoutListener`s on it; `fire_global_layout` (called from
@@ -655,6 +658,20 @@ pub(crate) fn call(
         "<init>" if class.ends_with("LayoutParams;") => {
             lp_ctor(vm, class, sig, args);
             Some(None)
+        }
+        // AOSP `MarginLayoutParams.resolveLayoutDirection` — the
+        // ConstraintLayout dex override resolves the start/end anchors
+        // into its resolved* fields and invoke-supers here for the
+        // margin fold. Store the direction (a pseudo — `mLayoutDirection`
+        // has no dex field ref) and fold relative margins into left/right.
+        "resolveLayoutDirection" if class.ends_with("LayoutParams;") => {
+            lp_resolve_dir(vm, this, i32v(args.get(1).copied().unwrap_or(V::I32(0))));
+            Some(None)
+        }
+        "getLayoutDirection" if class.ends_with("LayoutParams;") => {
+            Some(Some(
+                pseudo_get(vm, this, P_LP_DIR).unwrap_or(V::I32(0)),
+            ))
         }
         "inflate" if class.contains("MenuInflater") => {
             // MenuInflater.inflate(menuRes, Menu)
@@ -1387,7 +1404,9 @@ pub(crate) fn call(
                     class_of(vm, V::Ref(this))
                 );
             }
-            pseudo_set(vm, this, P_LP, args.get(1).copied().unwrap_or(V::Ref(0)));
+            let lp = args.get(1).copied().unwrap_or(V::Ref(0));
+            pseudo_set(vm, this, P_LP, lp);
+            lp_resolve_dir_dex(vm, lp);
             // AOSP View.setLayoutParams ends in requestLayout() —
             // ConstraintLayout only rebuilds its widget list while a
             // child reports isLayoutRequested.
@@ -2498,6 +2517,53 @@ fn child_measure_spec(spec: i32, padding: i32, child_dim: i32) -> i32 {
     (out & !MODE_MASK) | (mode & MODE_MASK)
 }
 
+/// AOSP `MarginLayoutParams.resolveLayoutDirection`: record the
+/// resolved direction and fold relative (start/end) margins into
+/// left/right under every canon key a reader can name.
+fn lp_resolve_dir(vm: &mut Vm, lp: u32, dir: i32) {
+    if lp == 0 {
+        return;
+    }
+    pseudo_set(vm, lp, P_LP_DIR, V::I32(dir));
+    // DEFAULT_MARGIN_RELATIVE — "no relative margin set".
+    const UNSET: i32 = i32::MIN;
+    let start = lp_field(vm, lp, "startMargin").map(i32v).unwrap_or(UNSET);
+    let end = lp_field(vm, lp, "endMargin").map(i32v).unwrap_or(UNSET);
+    if start == UNSET && end == UNSET {
+        return;
+    }
+    let rtl = dir == 1;
+    let left = if rtl { end } else { start };
+    let right = if rtl { start } else { end };
+    for (name, v) in [("leftMargin", left), ("rightMargin", right)] {
+        if v == UNSET {
+            continue;
+        }
+        let keys: Vec<GIdx> = vm
+            .field_keys_named(name, "I")
+            .into_iter()
+            .map(|(_, g)| g)
+            .collect();
+        if let Some(f) = fields_mut(vm, lp) {
+            for g in keys {
+                f.insert(g, V::I32(v));
+            }
+        }
+    }
+}
+
+/// Run the dex `LayoutParams.resolveLayoutDirection` override when the
+/// LP class has one (ConstraintLayout resolves its anchors there).
+/// No-op for LP classes without the override.
+fn lp_resolve_dir_dex(vm: &mut Vm, lp: V) {
+    let V::Ref(h) = lp else { return };
+    if h == 0 {
+        return;
+    }
+    // Host layout direction is LTR (getLayoutDirection → 0).
+    let _ = vm.call_virtual_sig(h, "resolveLayoutDirection", &["I"], &[V::I32(0)]);
+}
+
 /// Read an int field off a LayoutParams object under every canon key
 /// a writer could have used (owner obfuscation, LP subclasses).
 fn lp_field(vm: &Vm, lp: u32, name: &str) -> Option<V> {
@@ -3491,6 +3557,14 @@ pub(crate) fn attach_at(
                     pseudo_set(vm, ch, P_LP, v);
                 }
             }
+        }
+        // AOSP resolves LP direction in resolveLayoutParams during the
+        // layout pass; ConstraintLayout$LayoutParams.resolveLayoutDirection
+        // is what turns `endToEnd=parent` into the resolvedRightToRight
+        // anchor the solver reads — without it start/end constraints
+        // silently drop and the child lands at x=0.
+        if let Some(lp @ V::Ref(_)) = pseudo_get(vm, ch, P_LP) {
+            lp_resolve_dir_dex(vm, lp);
         }
         // AOSP ViewGroup.addViewInner notifies onViewAdded — dex parents
         // (ConstraintLayout) use it to arm mDirtyHierarchy and register
