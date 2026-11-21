@@ -985,6 +985,30 @@ pub(crate) fn sfield(vm: &mut Vm, owner: &str, name: &str, ftype: &str) -> Optio
         ("Lorg/json/JSONObject;", "NULL") => {
             return Some(host(vm, "Lorg/json/JSONObject$Null;", HostState::Empty))
         }
+        // MediaStore$Images$Media.EXTERNAL_CONTENT_URI & friends —
+        // content-provider base URIs guests parse/query on. Null here
+        // NPEs inside <clinit> (fossify gallery NewPhotoFetcher).
+        (o, "EXTERNAL_CONTENT_URI" | "INTERNAL_CONTENT_URI" | "CONTENT_URI")
+            if o.starts_with("Landroid/provider/MediaStore") =>
+        {
+            let media = o
+                .trim_start_matches("Landroid/provider/MediaStore$")
+                .trim_end_matches(';')
+                .split('$')
+                .next()
+                .unwrap_or("media")
+                .to_lowercase();
+            let vol = if name.starts_with("EXTERNAL") {
+                "external"
+            } else {
+                "internal"
+            };
+            return Some(host(
+                vm,
+                "Landroid/net/Uri;",
+                HostState::StrBuf(format!("content://media/{vol}/{media}")),
+            ));
+        }
         _ if ftype == owner => {
             // Self-typed constant on a host class: an enum constant
             // (TimeUnit.SECONDS, TimeUnit.MILLISECONDS, …). The pseudo
