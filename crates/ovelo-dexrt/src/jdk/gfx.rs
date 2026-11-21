@@ -496,7 +496,7 @@ fn paint_call(vm: &mut Vm, name: &str, _sig: &str, args: &[V]) -> Rt<Option<Opti
                 n,
             )))
         }
-        "measureText" | "breakText" => {
+        "measureText" => {
             let size = match pseudo_get(vm, h, PK_TSIZE) {
                 Some(V::F32(f)) => f,
                 Some(v) => f64v(v) as f32,
@@ -504,6 +504,49 @@ fn paint_call(vm: &mut Vm, name: &str, _sig: &str, args: &[V]) -> Rt<Option<Opti
             };
             let text = sv(vm, arg(args, 1)).unwrap_or_default();
             Some(Some(V::F32(measure_text(&text, size))))
+        }
+        // `breakText` returns the NUMBER OF CHARS that fit maxWidth —
+        // int, not float; a float return trips the int-register check
+        // and kills the guest call. Variants:
+        //   (CharSequence, boolean, float maxWidth, float[] measured)
+        //   (CharSequence, int start, int end, boolean, float, float[])
+        //   (char[], int index, int count, float maxWidth, float[])
+        "breakText" => {
+            let size = match pseudo_get(vm, h, PK_TSIZE) {
+                Some(V::F32(f)) => f,
+                Some(v) => f64v(v) as f32,
+                None => 12.0,
+            };
+            let text = sv(vm, arg(args, 1)).unwrap_or_default();
+            let mut len = text.chars().count() as i32;
+            // char[] overload: explicit count at args[3].
+            if len == 0 {
+                if let Some(V::I32(c)) = args.get(3) {
+                    len = (*c).max(0);
+                }
+            }
+            // maxWidth is the last F32 argument.
+            let maxw = args
+                .iter()
+                .rev()
+                .find_map(|a| match a {
+                    V::F32(f) => Some(*f),
+                    _ => None,
+                })
+                .unwrap_or(f32::MAX);
+            let per = size * 0.55;
+            let count = if per > 0.0 {
+                ((maxw / per).floor() as i32).clamp(0, len)
+            } else {
+                len
+            };
+            // Optional trailing float[] receives the measured width.
+            if let Some(V::Ref(mh)) = args.last() {
+                if *mh != 0 {
+                    let _ = vm.aput(*mh, 0, V::F32(count as f32 * per));
+                }
+            }
+            Some(Some(V::I32(count)))
         }
         "getTextBounds" => {
             let text = sv(vm, arg(args, 1)).unwrap_or_default();
@@ -545,42 +588,72 @@ fn paint_call(vm: &mut Vm, name: &str, _sig: &str, args: &[V]) -> Rt<Option<Opti
                 Some(v) => f64v(v) as f32,
                 None => 12.0,
             };
-            if let V::Ref(fh) = arg(args, 1) {
-                if fh != 0 {
-                    let (top, asc, des, bot) =
-                        (size * -0.95, size * -0.8, size * 0.25, size * 0.35);
-                    let desc = if name == "getFontMetrics" {
-                        "Landroid/graphics/Paint$FontMetrics;"
-                    } else {
-                        "Landroid/graphics/Paint$FontMetricsInt;"
-                    };
-                    for (n, v) in [
-                        ("top", top),
-                        ("ascent", asc),
-                        ("descent", des),
-                        ("bottom", bot),
-                        ("leading", 0.0),
-                    ] {
-                        if let Some(g) = vm.field_index_of(desc, n) {
-                            let g = vm.canon_field(g);
-                            if let Some(Obj::Instance { fields, .. }
-                            | Obj::Host { fields, .. }) = vm.heap.get_mut(fh)
-                            {
-                                fields.insert(
-                                    g,
-                                    if name == "getFontMetrics" {
-                                        V::F32(v)
-                                    } else {
-                                        V::I32(v as i32)
-                                    },
-                                );
-                            }
+            let (top, asc, des, bot) =
+                (size * -0.95, size * -0.8, size * 0.25, size * 0.35);
+            let desc = if name == "getFontMetrics" {
+                "Landroid/graphics/Paint$FontMetrics;"
+            } else {
+                "Landroid/graphics/Paint$FontMetricsInt;"
+            };
+            // With a metrics argument: fill it and return the ascent as
+            // the API specifies (float for FontMetrics, int for the Int
+            // variant). Without one (getFontMetrics()/
+            // getFontMetricsInt()): a fresh metrics object for the
+            // former, a bare int for the latter.
+            let fh = match arg(args, 1) {
+                V::Ref(fh) if fh != 0 => Some(fh),
+                _ => None,
+            };
+            let fh = match (fh, name) {
+                (Some(fh), _) => Some(fh),
+                (None, "getFontMetrics") => match host(vm, desc, HostState::Empty) {
+                    V::Ref(fh) => Some(fh),
+                    _ => None,
+                },
+                _ => None,
+            };
+            if let Some(fh) = fh {
+                for (n, v) in [
+                    ("top", top),
+                    ("ascent", asc),
+                    ("descent", des),
+                    ("bottom", bot),
+                    ("leading", 0.0),
+                ] {
+                    if let Some(g) = vm.field_index_of(desc, n) {
+                        let g = vm.canon_field(g);
+                        if let Some(Obj::Instance { fields, .. }
+                        | Obj::Host { fields, .. }) = vm.heap.get_mut(fh)
+                        {
+                            fields.insert(
+                                g,
+                                if name == "getFontMetrics" {
+                                    V::F32(v)
+                                } else {
+                                    V::I32(v as i32)
+                                },
+                            );
                         }
                     }
-                    return Ok(Some(Some(V::F32(-asc))));
                 }
             }
-            Some(Some(V::F32(size * 0.8)))
+            if matches!(arg(args, 1), V::Ref(_)) {
+                // metrics-arg overloads: recommended spacing above the
+                // baseline (-ascent) in the declared return type.
+                if name == "getFontMetrics" {
+                    Some(Some(V::F32(-asc)))
+                } else {
+                    Some(Some(V::I32(-asc as i32)))
+                }
+            } else if name == "getFontMetrics" {
+                // No-arg overload returns a fresh FontMetrics object.
+                match fh {
+                    Some(fh) => Some(Some(V::Ref(fh))),
+                    None => Some(Some(V::F32(-asc))),
+                }
+            } else {
+                Some(Some(V::I32(-asc as i32)))
+            }
         }
         // Mutators we accept but don't model: typeface, AA, filters,
         // effects, flags, spacing, skew, cap/join, hinting, variants.
