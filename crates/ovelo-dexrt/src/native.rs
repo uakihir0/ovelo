@@ -10,6 +10,7 @@
 
 use std::collections::HashMap;
 use std::ffi::{c_void, CString};
+use std::sync::Mutex;
 
 use ovelo_error::{ErrorCategory, OveloError, Phase, Result};
 
@@ -215,6 +216,70 @@ extern "C" fn sh_memset_chk(d: *mut c_void, c: i32, n: usize, dlen: usize) -> *m
     unsafe { memset(d, c, n) }
 }
 
+// dl_iterate_phdr: libunwind-style users (glide-webp's crash handler,
+// exception tables) walk the loaded objects' program headers. The shim
+// reports every guest `.so` loaded so far with a leaked copy of its
+// phdrs — guest memory is real memory, so the callback is a plain
+// function-pointer call.
+struct PhdrLib {
+    bias: usize,
+    name: CString,
+    phdrs: Box<[u8]>,
+    phnum: u16,
+}
+unsafe impl Send for PhdrLib {}
+static PHDR_LIBS: Mutex<Vec<PhdrLib>> = Mutex::new(Vec::new());
+
+#[repr(C)]
+struct DlPhdrInfo {
+    dlpi_addr: u64,
+    dlpi_name: *const i8,
+    dlpi_phdr: *const c_void,
+    dlpi_phnum: u16,
+    // Bionic extends the struct over releases (adds/subs/tls); report
+    // the full modern size with the tail zeroed so callbacks that size
+    // their reads by `size` don't touch garbage.
+    _pad: [u8; 6],
+    dlpi_adds: u64,
+    dlpi_subs: u64,
+    dlpi_tls_modid: u64,
+    dlpi_tls_data: u64,
+}
+
+type PhdrCb = unsafe extern "C" fn(*mut c_void, usize, *mut c_void) -> i32;
+
+extern "C" fn sh_dl_iterate_phdr(cb: *const c_void, data: *mut c_void) -> i32 {
+    if cb.is_null() {
+        return -1;
+    }
+    let cb: PhdrCb = unsafe { std::mem::transmute(cb) };
+    let libs = PHDR_LIBS.lock().unwrap();
+    for l in libs.iter() {
+        let mut info = DlPhdrInfo {
+            dlpi_addr: l.bias as u64,
+            dlpi_name: l.name.as_ptr(),
+            dlpi_phdr: l.phdrs.as_ptr().cast(),
+            dlpi_phnum: l.phnum,
+            _pad: [0; 6],
+            dlpi_adds: 0,
+            dlpi_subs: 0,
+            dlpi_tls_modid: 0,
+            dlpi_tls_data: 0,
+        };
+        let r = unsafe {
+            cb(
+                &mut info as *mut _ as *mut c_void,
+                std::mem::size_of::<DlPhdrInfo>(),
+                data,
+            )
+        };
+        if r != 0 {
+            return r;
+        }
+    }
+    0
+}
+
 extern "C" fn sh_atoi(s: *const i8) -> i32 {
     unsafe {
         let mut n = 0i32;
@@ -240,6 +305,7 @@ fn builtin_shim(name: &str) -> Option<usize> {
         "__strcpy_chk" => sh_strcpy_chk as *const () as usize,
         "__memcpy_chk" => sh_memcpy_chk as *const () as usize,
         "__memset_chk" => sh_memset_chk as *const () as usize,
+        "dl_iterate_phdr" => sh_dl_iterate_phdr as *const () as usize,
         "__emutls_get_address" => 0, // TLS unimplemented — signal caller
         _ => return None,
     })
@@ -609,6 +675,19 @@ pub fn load_so(name: &str, elf: &[u8]) -> Result<NativeLib> {
     for k in 0..n_init {
         let f: extern "C" fn() = unsafe { std::mem::transmute(((d.init_array + k * 8) as *const u64).read()) };
         f();
+    }
+
+    // Register with dl_iterate_phdr: leak a copy of the phdrs so the
+    // reported pointer stays valid for the process lifetime.
+    if let Ok(name_c) = CString::new(name) {
+        if let Some(raw) = elf.get(phoff..phoff + phentsize * phnum) {
+            PHDR_LIBS.lock().unwrap().push(PhdrLib {
+                bias,
+                name: name_c,
+                phdrs: raw.into(),
+                phnum: phnum.try_into().unwrap_or(u16::MAX),
+            });
+        }
     }
 
     Ok(NativeLib {
