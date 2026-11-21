@@ -1386,7 +1386,12 @@ pub(crate) fn load_native_lib(vm: &mut Vm, arg: &str, absolute: bool) {
     // skipping loses nothing; OVELO_SKIP_LIBS adds more lib names
     // (comma-separated substring match), OVELO_NO_SKIP_LIBS=1 disables.
     let skip: Vec<String> = std::env::var("OVELO_SKIP_LIBS")
-        .map(|s| s.split(',').map(|t| t.trim().to_string()).collect())
+        .map(|s| {
+            s.split(',')
+                .map(|t| t.trim().to_string())
+                .filter(|t| !t.is_empty())
+                .collect()
+        })
         .unwrap_or_default();
     let denied = if std::env::var_os("OVELO_NO_SKIP_LIBS").is_some() {
         skip.iter().any(|n| path.contains(n.as_str()))
