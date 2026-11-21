@@ -272,6 +272,16 @@ impl Heap {
                 freed += 1;
             }
         }
+        // Trailing free slots keep len() (and the memory behind it)
+        // pinned at the all-time high-water mark — drop them so the
+        // vector tracks live objects instead.
+        while self.objs.last().is_some_and(Option::is_none) {
+            self.objs.pop();
+        }
+        self.free.retain(|&h| (h as usize) <= self.objs.len());
+        if self.objs.capacity() > (1 << 16) && self.objs.len() < self.objs.capacity() / 4 {
+            self.objs.shrink_to_fit();
+        }
         freed
     }
 
