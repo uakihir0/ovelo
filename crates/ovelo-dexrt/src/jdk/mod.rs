@@ -66,6 +66,13 @@ pub(crate) const P_MSG_WHAT: u64 = 0xFFFD_FEE8;
 /// a fields entry so the renderer's bitmap field-walk reaches the
 /// wrapped drawables (Glide's TransitionDrawable).
 pub(crate) const P_LAYERS: u64 = 0xFFFD_FEE9;
+/// `Message.arg1`/`arg2` int payloads — separate keys so they don't
+/// alias `what`.
+pub(crate) const P_MSG_ARG1: u64 = 0xFFFD_FEEA;
+pub(crate) const P_MSG_ARG2: u64 = 0xFFFD_FEEB;
+/// Marks a `TreeMap` view created by `descendingMap()` — key navigation
+/// (`firstKey`, `ceilingKey`, `subMap` bounds, …) inverts.
+pub(crate) const P_NAV_DESC: u64 = 0xFFFD_FEEC;
 
 pub(crate) fn now_ms() -> i64 {
     std::time::SystemTime::now()
@@ -207,7 +214,14 @@ fn dispatch_message(
         if h != 0 {
             if let Some(V::Ref(cbh)) = pseudo_get(vm, h, P_HANDLER_CB) {
                 if cbh != 0 {
-                    return vm.call_virtual(cbh, "handleMessage", &[V::Ref(msg)]);
+                    // Handler.Callback.handleMessage returning false means
+                    // "not handled" — the Handler's own handleMessage must
+                    // still see the message.
+                    match vm.call_virtual(cbh, "handleMessage", &[V::Ref(msg)]) {
+                        Ok(Some(v)) if i32v(v) != 0 => return Ok(Some(v)),
+                        Err(e) => return Err(e),
+                        _ => {}
+                    }
                 }
             }
             // Host Handler with no callback: `call_virtual` resolves a
@@ -1348,8 +1362,14 @@ pub(crate) fn ifield(vm: &Vm, h: u32, owner: &str, name: &str) -> Option<V> {
         ("Landroid/content/pm/ApplicationInfo;", "targetSdkVersion") => Some(V::I32(35)),
         ("Landroid/content/pm/ApplicationInfo;", "minSdkVersion") => Some(V::I32(21)),
         ("Landroid/content/pm/ApplicationInfo;", "flags") => Some(V::I32(0)),
-        ("Landroid/os/Message;", "what" | "arg1" | "arg2") => {
+        ("Landroid/os/Message;", "what") => {
             Some(pseudo_get(vm, h, P_MSG_WHAT).unwrap_or(V::I32(0)))
+        }
+        ("Landroid/os/Message;", "arg1") => {
+            Some(pseudo_get(vm, h, P_MSG_ARG1).unwrap_or(V::I32(0)))
+        }
+        ("Landroid/os/Message;", "arg2") => {
+            Some(pseudo_get(vm, h, P_MSG_ARG2).unwrap_or(V::I32(0)))
         }
         ("Landroid/os/Message;", "obj") => {
             Some(pseudo_get(vm, h, P_MSG_OBJ).unwrap_or(V::Ref(0)))

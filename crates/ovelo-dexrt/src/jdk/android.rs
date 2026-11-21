@@ -294,14 +294,23 @@ pub(crate) fn call(
                             pseudo_set(vm, mh, P_MSG_OBJ, V::Ref(o));
                         }
                     }
-                    // First int arg after the target is `what`.
+                    // Int args after the target are what/arg1/arg2.
                     let after_target = args
                         .iter()
                         .position(|a| matches!(a, V::Ref(_)))
                         .map(|i| &args[i + 1..])
                         .unwrap_or(&[]);
-                    if let Some(&w) = after_target.iter().find(|a| matches!(a, V::I32(_))) {
+                    let mut ints = after_target
+                        .iter()
+                        .filter(|a| matches!(a, V::I32(_) | V::I64(_)));
+                    if let Some(&w) = ints.next() {
                         pseudo_set(vm, mh, P_MSG_WHAT, w);
+                    }
+                    if let Some(&a1) = ints.next() {
+                        pseudo_set(vm, mh, P_MSG_ARG1, a1);
+                    }
+                    if let Some(&a2) = ints.next() {
+                        pseudo_set(vm, mh, P_MSG_ARG2, a2);
                     }
                 }
                 Some(Some(m))
@@ -3434,8 +3443,18 @@ fn handler_call(vm: &mut Vm, name: &str, args: &[V]) -> Rt<Option<Option<V>>> {
             let m = host(vm, "Landroid/os/Message;", HostState::Empty);
             if let (V::Ref(mh), Some(&V::Ref(h))) = (m, args.first()) {
                 pseudo_set(vm, mh, P_MSG_TARGET, V::Ref(h));
-                if let Some(&w) = args.iter().skip(1).find(|a| matches!(a, V::I32(_))) {
+                let mut ints = args
+                    .iter()
+                    .skip(1)
+                    .filter(|a| matches!(a, V::I32(_) | V::I64(_)));
+                if let Some(&w) = ints.next() {
                     pseudo_set(vm, mh, P_MSG_WHAT, w);
+                }
+                if let Some(&a1) = ints.next() {
+                    pseudo_set(vm, mh, P_MSG_ARG1, a1);
+                }
+                if let Some(&a2) = ints.next() {
+                    pseudo_set(vm, mh, P_MSG_ARG2, a2);
                 }
                 if let Some(&V::Ref(o)) = args.iter().skip(1).find(|a| matches!(a, V::Ref(_))) {
                     pseudo_set(vm, mh, P_MSG_OBJ, V::Ref(o));
