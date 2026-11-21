@@ -58,9 +58,10 @@ fn proto_sig(d: &DexFile, pidx: u32) -> Result<String> {
 /// class defined in classes2.dex resolves from an invoke in classes.dex.
 pub(crate) type GIdx = u64;
 
-/// `(field_name, type_desc)` → every canonical field key across loaded
-/// dexes (owners differ under R8; the name+type is what identifies it).
-pub(crate) type FieldsByName = HashMap<(String, String), Vec<GIdx>>;
+/// `(field_name, type_desc)` → `(owner_desc, canon key)` for every
+/// field across loaded dexes (owners differ under R8; the name+type is
+/// what identifies the logical field).
+pub(crate) type FieldsByName = HashMap<(String, String), Vec<(String, GIdx)>>;
 /// `class_idx`/`type_idx` sentinel for descriptors absent from every dex.
 pub(crate) const GX_NONE: GIdx = u64::MAX;
 pub(crate) fn gx(di: usize, i: u32) -> GIdx {
@@ -489,8 +490,9 @@ impl Vm {
     /// Canonical field keys for `(name, type)` across every loaded dex,
     /// regardless of declaring owner — used when host code must write a
     /// field on a dex instance that readers reach through arbitrarily
-    /// (R8-)named owner references.
-    pub(crate) fn field_keys_named(&self, name: &str, ty: &str) -> Vec<GIdx> {
+    /// (R8-)named owner references. Each entry carries its declaring
+    /// owner so callers can filter to a receiver's own hierarchy.
+    pub(crate) fn field_keys_named(&self, name: &str, ty: &str) -> Vec<(String, GIdx)> {
         if let Some(m) = self.fields_named_cache.borrow().as_ref() {
             return m
                 .get(&(name.to_string(), ty.to_string()))
@@ -501,14 +503,15 @@ impl Vm {
         for (di, d) in self.dexes.iter().enumerate() {
             for i in 0..d.field_ids_len() {
                 let Ok(f) = d.field(i as u32) else { continue };
-                let (Ok(n), Ok(t)) = (
+                let (Ok(n), Ok(t), Ok(owner)) = (
                     d.string(f.name_idx),
                     d.type_descriptor(f.type_idx as u32),
+                    d.type_descriptor(f.class_idx as u32),
                 ) else {
                     continue;
                 };
                 let g = self.canon_field(gx(di, i as u32));
-                m.entry((n, t)).or_default().push(g);
+                m.entry((n, t)).or_default().push((owner, g));
             }
         }
         let out = m

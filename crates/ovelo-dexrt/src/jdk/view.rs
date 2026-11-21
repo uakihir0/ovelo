@@ -7,7 +7,7 @@
 //! `findChildViewById` walk real structure instead of nulls.
 
 use super::*;
-use crate::HostCall;
+use crate::{GIdx, HostCall};
 use ovelo_apk::manifest::{Attribute, Element, Value};
 
 const VIEW: &str = "Landroid/view/View;";
@@ -800,14 +800,9 @@ pub(crate) fn call(
             match args.get(1).copied() {
                 Some(child @ V::Ref(_)) => detach(vm, this, child),
                 Some(V::I32(i)) if i >= 0 => {
-                    if let Some(arrh) = children_arr(vm, this) {
-                        if let Some(Obj::Array { data, .. }) = vm.heap.get_mut(arrh) {
-                            if (i as usize) < data.len() {
-                                if let V::Ref(ch) = data.remove(i as usize) {
-                                    pseudo_set(vm, ch, P_PARENT, V::Ref(0));
-                                }
-                            }
-                        }
+                    let child = children(vm, this).get(i as usize).copied();
+                    if let Some(c) = child {
+                        detach(vm, this, c);
                     }
                 }
                 _ => {}
@@ -2104,6 +2099,27 @@ fn lp_ctor(vm: &mut Vm, class: &str, sig: &str, args: &[V]) {
         Some(V::Ref(h)) => *h,
         _ => return,
     };
+    // Field keys are written under every owner the app's readers can
+    // name — but only owners inside THIS object's own class hierarchy:
+    // an unrelated class declaring its own `width` must not get a
+    // LayoutParams value.
+    let mut hier = std::collections::HashSet::new();
+    let mut d = class_of(vm, V::Ref(this));
+    for _ in 0..32 {
+        if !hier.insert(d.clone()) {
+            break;
+        }
+        let Some(next) = vm.super_desc(&d) else { break };
+        d = next;
+    }
+    hier.insert(class.to_string());
+    let lp_keys = |vm: &Vm, name: &str, ty: &str| -> Vec<GIdx> {
+        vm.field_keys_named(name, ty)
+            .into_iter()
+            .filter(|(owner, _)| hier.contains(owner) || owner.ends_with("LayoutParams;"))
+            .map(|(_, g)| g)
+            .collect()
+    };
     let mut writes: Vec<(String, String, V)> = Vec::new();
     if sig.contains("AttributeSet") {
         for (attr, fields) in LP_ATTRS {
@@ -2144,8 +2160,7 @@ fn lp_ctor(vm: &mut Vm, class: &str, sig: &str, args: &[V]) {
             for (_, fields) in LP_ATTRS {
                 for f in *fields {
                     let ty = if *f == "weight" { "F" } else { "I" };
-                    if let Some(v) = vm
-                        .field_keys_named(f, ty)
+                    if let Some(v) = lp_keys(vm, f, ty)
                         .iter()
                         .find_map(|g| src_fields.get(g).copied())
                     {
@@ -2156,7 +2171,7 @@ fn lp_ctor(vm: &mut Vm, class: &str, sig: &str, args: &[V]) {
         }
     }
     for (name, ty, v) in writes {
-        for g in vm.field_keys_named(&name, &ty) {
+        for g in lp_keys(vm, &name, &ty) {
             if let Some(Obj::Instance { fields, .. }) | Some(Obj::Host { fields, .. }) =
                 vm.heap.get_mut(this)
             {
@@ -2528,6 +2543,11 @@ fn detach(vm: &mut Vm, parent: u32, child: V) {
         }
         if let V::Ref(ch) = child {
             pseudo_set(vm, ch, P_PARENT, V::Ref(0));
+            // Mirror onViewAdded: dex parents unregister the child here
+            // (ConstraintLayout drops it from mChildrenById; adapters
+            // recycle through detach and stale registrations would keep
+            // dead views in subsequent passes).
+            let _ = vm.call_virtual_rt(parent, "onViewRemoved", &[V::Ref(ch)]);
         }
     }
 }
