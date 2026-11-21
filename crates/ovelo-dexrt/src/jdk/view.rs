@@ -174,6 +174,24 @@ pub fn fire_global_layout(vm: &mut Vm, root: u32) {
         }
         false
     }
+    // OnPreDraw fires before OnGlobalLayout in a real VTO pass —
+    // Glide's ViewTarget derives the view size here and kicks the
+    // request engine, which only then calls onSizeReady.
+    let predraw: Vec<u32> = vm
+        .vto_predraw
+        .iter()
+        .filter(|(obs, _)| match pseudo_get(vm, **obs, P_TARGET) {
+            Some(V::Ref(v)) => attached(vm, v, root),
+            _ => false,
+        })
+        .flat_map(|(_, ls)| ls.iter().copied())
+        .collect();
+    for l in predraw {
+        if std::env::var_os("OVELO_VIEWDBG").is_some() {
+            eprintln!("[viewdbg] onPreDraw h{l} {}", vm.dbg_class_of(l));
+        }
+        let _ = vm.call_virtual(l, "onPreDraw", &[]);
+    }
     let all: Vec<u32> = vm
         .vto_listeners
         .iter()
@@ -1222,15 +1240,28 @@ pub(crate) fn call(
             }
             Some(None)
         }
-        // Other observer listener kinds are accepted but never fired
-        // (preDraw returning false would suppress drawing).
-        "addOnPreDrawListener"
-        | "addOnDrawListener"
+        "addOnPreDrawListener" => {
+            if let Some(&V::Ref(l)) = args.get(1) {
+                if l != 0 {
+                    vm.vto_predraw.entry(this).or_default().push(l);
+                }
+            }
+            Some(None)
+        }
+        "removeOnPreDrawListener" => {
+            if let Some(&V::Ref(l)) = args.get(1) {
+                if let Some(ls) = vm.vto_predraw.get_mut(&this) {
+                    ls.retain(|x| *x != l);
+                }
+            }
+            Some(None)
+        }
+        // Other observer listener kinds are accepted but never fired.
+        "addOnDrawListener"
         | "addOnScrollChangedListener"
         | "addOnTouchModeChangeListener"
         | "addOnWindowAttachListener"
         | "addOnWindowFocusChangeListener"
-        | "removeOnPreDrawListener"
         | "removeOnDrawListener"
         | "removeOnScrollChangedListener"
         | "removeOnTouchModeChangeListener"
@@ -1239,12 +1270,21 @@ pub(crate) fn call(
         | "addOnWindowShownListener"
         | "removeOnWindowShownListener"
         | "dispatchOnGlobalLayout"
-        | "dispatchOnPreDraw"
-        | "isAlive" => Some(if name == "isAlive" || name == "dispatchOnPreDraw" {
+        | "isAlive" => Some(if name == "isAlive" {
             Some(V::I32(1))
         } else {
             None
         }),
+        "dispatchOnPreDraw" => {
+            let ls: Vec<u32> = vm.vto_predraw.get(&this).cloned().unwrap_or_default();
+            let mut proceed = true;
+            for l in ls {
+                if let Ok(Some(V::I32(0))) = vm.call_virtual(l, "onPreDraw", &[]) {
+                    proceed = false;
+                }
+            }
+            Some(Some(V::I32(proceed as i32)))
+        }
         "getParent" => Some(Some(pseudo_get(vm, this, P_PARENT).unwrap_or(V::Ref(0)))),
         "getRootView" => {
             let mut cur = this;

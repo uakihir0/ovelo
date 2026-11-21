@@ -11,6 +11,8 @@
 use std::collections::HashMap;
 use std::ffi::{c_void, CString};
 use std::sync::{Arc, Mutex};
+#[cfg(target_os = "macos")]
+use std::sync::OnceLock;
 
 use ovelo_error::{ErrorCategory, OveloError, Phase, Result};
 
@@ -47,6 +49,24 @@ extern "C" {
     fn write(fd: i32, buf: *const c_void, n: usize) -> isize;
     #[cfg(target_os = "macos")]
     fn dladdr(addr: *const c_void, info: *mut DlInfo) -> i32;
+    #[cfg(target_os = "macos")]
+    fn malloc_create_zone(start_size: usize, flags: u32) -> *mut c_void;
+    #[cfg(target_os = "macos")]
+    fn malloc_zone_malloc(zone: *mut c_void, size: usize) -> *mut c_void;
+    #[cfg(target_os = "macos")]
+    fn malloc_zone_calloc(zone: *mut c_void, n: usize, size: usize) -> *mut c_void;
+    #[cfg(target_os = "macos")]
+    fn malloc_zone_realloc(zone: *mut c_void, ptr: *mut c_void, size: usize) -> *mut c_void;
+    #[cfg(target_os = "macos")]
+    fn malloc_zone_free(zone: *mut c_void, ptr: *mut c_void);
+    #[cfg(target_os = "macos")]
+    fn malloc_zone_memalign(zone: *mut c_void, align: usize, size: usize) -> *mut c_void;
+    #[cfg(target_os = "macos")]
+    fn malloc_zone_from_ptr(ptr: *const c_void) -> *mut c_void;
+    #[cfg(target_os = "macos")]
+    fn malloc_size(ptr: *const c_void) -> usize;
+    #[cfg(target_os = "macos")]
+    fn free(ptr: *mut c_void);
 }
 
 #[cfg(target_os = "macos")]
@@ -606,6 +626,163 @@ extern "C" fn sh_log_print(
 extern "C" fn sh_log_write(prio: i32, tag: *const i8, text: *const i8) -> i32 {
     sh_log_print(prio, tag, text, 0, 0, 0, 0)
 }
+/// Guest-private malloc zone. Guest `.so` code runs in this address
+/// space and its imports resolve to real host functions — if `malloc`
+/// resolved straight to libSystem's default zone, a guest heap bug
+/// (overflow, double free) would corrupt the *host* heap and kill an
+/// unrelated allocation later (observed as nondeterministic segvs in
+/// `format!`/cstr_ro while loading libglide-webp). Routing all guest
+/// allocation through its own zone confines that damage to the guest
+/// heap: host code keeps running and a real bug surfaces as a crash
+/// inside zone functions with `[so]` frames pointing at the culprit.
+#[cfg(target_os = "macos")]
+fn guest_zone() -> *mut c_void {
+    static ZONE: OnceLock<usize> = OnceLock::new();
+    *ZONE.get_or_init(|| unsafe { malloc_create_zone(0, 0) as usize }) as *mut c_void
+}
+
+#[cfg(target_os = "macos")]
+extern "C" fn sh_malloc(size: usize) -> *mut c_void {
+    unsafe { malloc_zone_malloc(guest_zone(), size.max(1)) }
+}
+
+/// Route the free to whichever zone owns the pointer — covers the
+/// (intentional or accidental) case of a guest freeing memory that a
+/// shim or a host-resolved libc call (strdup, realpath) returned from
+/// the default zone.
+#[cfg(target_os = "macos")]
+extern "C" fn sh_free(ptr: *mut c_void) {
+    if ptr.is_null() {
+        return;
+    }
+    unsafe {
+        let zone = malloc_zone_from_ptr(ptr);
+        if zone.is_null() {
+            // Not a malloc-family pointer — let real free() abort at
+            // this call site so the guest frame is the one that faults.
+            eprintln!("[shim] free() of non-malloc pointer {ptr:p}");
+            free(ptr);
+            return;
+        }
+        malloc_zone_free(zone, ptr);
+    }
+}
+
+#[cfg(target_os = "macos")]
+extern "C" fn sh_calloc(n: usize, size: usize) -> *mut c_void {
+    unsafe { malloc_zone_calloc(guest_zone(), n, size) }
+}
+
+#[cfg(target_os = "macos")]
+extern "C" fn sh_realloc(ptr: *mut c_void, size: usize) -> *mut c_void {
+    unsafe {
+        if ptr.is_null() {
+            malloc_zone_malloc(guest_zone(), size)
+        } else {
+            let zone = malloc_zone_from_ptr(ptr);
+            let zone = if zone.is_null() { guest_zone() } else { zone };
+            malloc_zone_realloc(zone, ptr, size)
+        }
+    }
+}
+
+#[cfg(target_os = "macos")]
+extern "C" fn sh_memalign(align: usize, size: usize) -> *mut c_void {
+    unsafe { malloc_zone_memalign(guest_zone(), align.max(16), size) }
+}
+
+#[cfg(target_os = "macos")]
+extern "C" fn sh_valloc(size: usize) -> *mut c_void {
+    unsafe { malloc_zone_memalign(guest_zone(), PAGE, size) }
+}
+
+#[cfg(target_os = "macos")]
+extern "C" fn sh_pvalloc(size: usize) -> *mut c_void {
+    unsafe { malloc_zone_memalign(guest_zone(), PAGE, size.div_ceil(PAGE) * PAGE) }
+}
+
+#[cfg(target_os = "macos")]
+extern "C" fn sh_posix_memalign(out: *mut *mut c_void, align: usize, size: usize) -> i32 {
+    if out.is_null() || align < 8 || !align.is_power_of_two() {
+        return 22; // EINVAL
+    }
+    unsafe {
+        *out = malloc_zone_memalign(guest_zone(), align, size);
+        if (*out).is_null() {
+            12 // ENOMEM
+        } else {
+            0
+        }
+    }
+}
+
+#[cfg(target_os = "macos")]
+extern "C" fn sh_malloc_usable_size(ptr: *const c_void) -> usize {
+    if ptr.is_null() {
+        return 0;
+    }
+    unsafe { malloc_size(ptr) }
+}
+
+#[cfg(target_os = "macos")]
+extern "C" fn sh_strdup(s: *const i8) -> *mut i8 {
+    if s.is_null() {
+        return std::ptr::null_mut();
+    }
+    unsafe {
+        let n = strlen(s) + 1;
+        let p = malloc_zone_malloc(guest_zone(), n) as *mut i8;
+        if !p.is_null() {
+            memcpy(p.cast(), s.cast(), n);
+        }
+        p
+    }
+}
+
+#[cfg(target_os = "macos")]
+extern "C" fn sh_strndup(s: *const i8, n: usize) -> *mut i8 {
+    if s.is_null() {
+        return std::ptr::null_mut();
+    }
+    unsafe {
+        let len = strlen(s).min(n);
+        let p = malloc_zone_malloc(guest_zone(), len + 1) as *mut i8;
+        if !p.is_null() {
+            memcpy(p.cast(), s.cast(), len);
+            *p.add(len) = 0;
+        }
+        p
+    }
+}
+
+#[cfg(target_os = "macos")]
+extern "C" fn sh_guest_new(size: usize) -> *mut c_void {
+    // operator new must not return null — spin until it succeeds is
+    // what libc++ does under -fno-exceptions; for us a null means the
+    // guest heap is genuinely exhausted, so abort loudly instead.
+    let p = unsafe { malloc_zone_malloc(guest_zone(), size.max(1)) };
+    if p.is_null() {
+        eprintln!("[shim] guest operator new({size}) failed");
+        std::process::abort();
+    }
+    p
+}
+
+#[cfg(target_os = "macos")]
+extern "C" fn sh_guest_new_aligned(size: usize, align: usize) -> *mut c_void {
+    let p = unsafe { malloc_zone_memalign(guest_zone(), align.max(16), size.max(1)) };
+    if p.is_null() {
+        eprintln!("[shim] guest aligned operator new({size},{align}) failed");
+        std::process::abort();
+    }
+    p
+}
+
+#[cfg(target_os = "macos")]
+extern "C" fn sh_guest_delete(ptr: *mut c_void) {
+    sh_free(ptr)
+}
+
 extern "C" fn sh_atoi(s: *const i8) -> i32 {
     unsafe {
         let mut n = 0i32;
@@ -625,6 +802,40 @@ fn builtin_shim(name: &str) -> Option<usize> {
         "__cxa_finalize" => sh_cxa_finalize as *const () as usize,
         "__cxa_atexit" => sh_cxa_atexit as *const () as usize,
         "atoi" | "strtol" => sh_atoi as *const () as usize,
+        #[cfg(target_os = "macos")]
+        "malloc" => sh_malloc as *const () as usize,
+        #[cfg(target_os = "macos")]
+        "_Znwm" | "_Znam" | "_ZnwmRKSt9nothrow_t" | "_ZnamRKSt9nothrow_t" => {
+            sh_guest_new as *const () as usize
+        }
+        #[cfg(target_os = "macos")]
+        "_ZnwmSt11align_val_t" | "_ZnamSt11align_val_t" | "_ZnwmSt11align_val_tRKSt9nothrow_t"
+        | "_ZnamSt11align_val_tRKSt9nothrow_t" => sh_guest_new_aligned as *const () as usize,
+        #[cfg(target_os = "macos")]
+        "free" | "_ZdlPv" | "_ZdaPv" | "_ZdlPvm" | "_ZdaPvm" | "_ZdlPvRKSt9nothrow_t"
+        | "_ZdaPvRKSt9nothrow_t" | "_ZdlPvSt11align_val_t" | "_ZdaPvSt11align_val_t"
+        | "_ZdlPvmSt11align_val_t" | "_ZdaPvmSt11align_val_t"
+        | "_ZdlPvSt11align_val_tRKSt9nothrow_t" | "_ZdaPvSt11align_val_tRKSt9nothrow_t" => {
+            sh_guest_delete as *const () as usize
+        }
+        #[cfg(target_os = "macos")]
+        "calloc" => sh_calloc as *const () as usize,
+        #[cfg(target_os = "macos")]
+        "realloc" => sh_realloc as *const () as usize,
+        #[cfg(target_os = "macos")]
+        "memalign" | "aligned_alloc" => sh_memalign as *const () as usize,
+        #[cfg(target_os = "macos")]
+        "valloc" => sh_valloc as *const () as usize,
+        #[cfg(target_os = "macos")]
+        "pvalloc" => sh_pvalloc as *const () as usize,
+        #[cfg(target_os = "macos")]
+        "posix_memalign" => sh_posix_memalign as *const () as usize,
+        #[cfg(target_os = "macos")]
+        "malloc_usable_size" | "malloc_size" => sh_malloc_usable_size as *const () as usize,
+        #[cfg(target_os = "macos")]
+        "strdup" => sh_strdup as *const () as usize,
+        #[cfg(target_os = "macos")]
+        "strndup" => sh_strndup as *const () as usize,
         "sincosf" => sh_sincosf as *const () as usize,
         "sincos" => sh_sincos as *const () as usize,
         "__strlen_chk" => sh_strlen_chk as *const () as usize,

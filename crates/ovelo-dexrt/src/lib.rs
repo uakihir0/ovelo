@@ -279,6 +279,10 @@ pub struct Vm {
     pub pending_runnables: std::collections::VecDeque<(u32, bool)>,
     /// ViewTreeObserver handle -> registered onGlobalLayout listeners.
     pub(crate) vto_listeners: HashMap<u32, Vec<u32>>,
+    /// ViewTreeObserver handle -> `OnPreDrawListener` handles — Glide's
+    /// ViewTarget waits on onPreDraw to learn the view's real size
+    /// before kicking off the decode.
+    pub(crate) vto_predraw: HashMap<u32, Vec<u32>>,
     /// Reentrancy guard for `drain_runnables`.
     pub(crate) draining: bool,
     /// Nesting depth of inline drains issued from `park` — bounds the
@@ -429,6 +433,7 @@ impl Vm {
             pending_activity: None,
             pending_runnables: std::collections::VecDeque::new(),
             vto_listeners: HashMap::new(),
+            vto_predraw: HashMap::new(),
             draining: false,
             park_depth: 0,
             reparked: std::collections::HashSet::new(),
@@ -1400,6 +1405,8 @@ impl Vm {
         roots.extend(self.repark_counts.keys().copied());
         roots.extend(self.vto_listeners.keys().copied());
         roots.extend(self.vto_listeners.values().flatten().copied());
+        roots.extend(self.vto_predraw.keys().copied());
+        roots.extend(self.vto_predraw.values().flatten().copied());
         roots.extend(self.class_mirrors.values().copied());
         roots.push(self.jni_pending_exc);
         // Runtime-held singletons and registries — Application, thread
