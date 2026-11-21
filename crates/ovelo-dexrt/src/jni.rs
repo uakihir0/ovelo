@@ -48,8 +48,11 @@ core::arch::global_asm!(
     ".p2align 2",
     "_ovelo_jni_call:",
     // x0=fnptr, x1=iargs[8], x2=fargs[8], x3=out[2]
+    // x19 keeps `out` across the call (callee-saved); lr is clobbered
+    // by blr so it rides the stack beside it (sp stays 16-aligned).
+    "stp x19, lr, [sp, #-16]!",
+    "mov x19, x3",
     "mov x9, x0",
-    "mov x10, x3",
     "ldp d0, d1, [x2]",
     "ldp d2, d3, [x2, #16]",
     "ldp d4, d5, [x2, #32]",
@@ -59,8 +62,9 @@ core::arch::global_asm!(
     "ldp x6, x7, [x1, #48]",
     "ldp x0, x1, [x1]",
     "blr x9",
-    "str x0, [x10]",
-    "str d0, [x10, #8]",
+    "str x0, [x19]",
+    "str d0, [x19, #8]",
+    "ldp x19, lr, [sp], #16",
     "ret",
 );
 
@@ -94,12 +98,18 @@ pub(crate) fn call_native(
 
 static mut JNI_TABLE: [u64; 240] = [0; 240];
 static mut JAVAVM_TABLE: [u64; 8] = [0; 8];
+// JNIEnv*/JavaVM* are one more level of indirection: the guest
+// dereferences the handle to get the function table address, so the
+// handle must point at a cell HOLDING the table pointer, not at the
+// table itself.
+static mut JNI_ENV: usize = 0;
+static mut JAVA_VM: usize = 0;
 
 pub(crate) fn env_ptr() -> usize {
-    unsafe { JNI_TABLE.as_ptr() as usize }
+    std::ptr::addr_of!(JNI_ENV) as usize
 }
 pub(crate) fn vm_ptr() -> usize {
-    unsafe { JAVAVM_TABLE.as_ptr() as usize }
+    std::ptr::addr_of!(JAVA_VM) as usize
 }
 
 extern "C" fn unimpl() -> u64 {
@@ -118,6 +128,8 @@ pub(crate) fn init_tables() {
     use std::sync::Once;
     static ONCE: Once = Once::new();
     ONCE.call_once(|| unsafe {
+        JNI_ENV = JNI_TABLE.as_ptr() as usize;
+        JAVA_VM = JAVAVM_TABLE.as_ptr() as usize;
         for s in JNI_TABLE.iter_mut() {
             *s = ef!(unimpl as *const ());
         }
@@ -800,9 +812,18 @@ fn get_elems(a: u64, _copy: u64) -> u64 {
     let h = a as u32;
     let Some(d) = arr_data(h) else { return 0 };
     let sz = elem_size(h);
-    let buf = libc_malloc(d.len() * sz + 8) as u64;
+    let buf = libc_malloc(d.len() * sz) as u64;
     for (i, v) in d.iter().enumerate() {
-        unsafe { ((buf + (i * sz) as u64) as *mut u64).write(elem_bits(*v, sz)) };
+        // Exactly `sz` bytes per element — a u64 store would run past
+        // the malloc'd block.
+        unsafe {
+            let bytes = elem_bits(*v, sz).to_le_bytes();
+            std::ptr::copy_nonoverlapping(
+                bytes.as_ptr(),
+                (buf + (i * sz) as u64) as *mut u8,
+                sz,
+            );
+        }
     }
     buf
 }
@@ -813,7 +834,17 @@ fn release_elems(a: u64, buf: u64, mode: u64) {
         if let Some(Obj::Array { data, elem }) = vm().heap.get_mut(h) {
             let e = elem.clone();
             for (i, slot) in data.iter_mut().enumerate() {
-                let bits = unsafe { ((buf + (i * sz) as u64) as *const u64).read() };
+                // Read exactly `sz` bytes — a u64 read at a narrow
+                // stride would touch memory past the buffer's end.
+                let bits = unsafe {
+                    let mut b = [0u8; 8];
+                    std::ptr::copy_nonoverlapping(
+                        (buf + (i * sz) as u64) as *const u8,
+                        b.as_mut_ptr(),
+                        sz,
+                    );
+                    u64::from_le_bytes(b)
+                };
                 *slot = bits_elem(bits & (u64::MAX >> (64 - sz * 8).min(63)), &e);
             }
         }
@@ -872,8 +903,15 @@ fn get_region(a: u64, start: u64, len: u64, out: u64) {
     let sz = elem_size(h);
     for i in 0..len as usize {
         let v = d.get(start as usize + i).copied().unwrap_or(V::I32(0));
+        // Write exactly `sz` bytes — a full u64 store at a narrower
+        // stride spills into the caller's buffer past the last element.
         unsafe {
-            ((out + (i * sz) as u64) as *mut u64).write(elem_bits(v, sz));
+            let bytes = elem_bits(v, sz).to_le_bytes();
+            std::ptr::copy_nonoverlapping(
+                bytes.as_ptr(),
+                (out + (i * sz) as u64) as *mut u8,
+                sz,
+            );
         }
     }
 }
@@ -883,7 +921,15 @@ fn set_region(a: u64, start: u64, len: u64, inp: u64) {
     if let Some(Obj::Array { data, elem }) = vm().heap.get_mut(h) {
         let e = elem.clone();
         for i in 0..len as usize {
-            let bits = unsafe { ((inp + (i * sz) as u64) as *const u64).read() };
+            let bits = unsafe {
+                let mut b = [0u8; 8];
+                std::ptr::copy_nonoverlapping(
+                    (inp + (i * sz) as u64) as *const u8,
+                    b.as_mut_ptr(),
+                    sz,
+                );
+                u64::from_le_bytes(b)
+            };
             if let Some(slot) = data.get_mut(start as usize + i) {
                 *slot = bits_elem(bits & (u64::MAX >> (64 - sz * 8).min(63)), &e);
             }
