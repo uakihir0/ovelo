@@ -47,6 +47,52 @@ pub(crate) fn call(
         stacktrace_call(vm, name, args)
     } else if class.starts_with("Ljava/lang/reflect/") {
         reflect_call(vm, class, name, sig, args)?
+    } else if class == "Ljava/lang/ref/ReferenceQueue;" {
+        match name {
+            // Nothing ever enqueues references (the host GC feeds no
+            // queue), so `remove()` is an unbounded block we can't
+            // truly suspend. Unwinding the caller with ovelo.park
+            // burned the repark budget of loaders that legitimately
+            // loop on take-style calls, so return one cached empty
+            // Reference per queue instead — the watcher spins on a
+            // single recycled object instead of minting millions.
+            "poll" => Some(Some(V::Ref(0))),
+            "remove" => {
+                let this = args.first().copied().unwrap_or(V::Ref(0));
+                let cached = if let V::Ref(q) = this {
+                    match vm.heap.get(q) {
+                        Some(Obj::Host {
+                            state: HostState::Slot(v),
+                            ..
+                        }) if !matches!(v, V::Ref(0) | V::I32(0)) => Some(*v),
+                        Some(Obj::Host { .. }) => {
+                            let r = vm.alloc_host(
+                                "Ljava/lang/ref/Reference;",
+                                HostState::Slot(V::Ref(0)),
+                            );
+                            if let Some(Obj::Host { state, .. }) = vm.heap.get_mut(q) {
+                                *state = HostState::Slot(V::Ref(r));
+                            }
+                            Some(V::Ref(r))
+                        }
+                        _ => None,
+                    }
+                } else {
+                    None
+                };
+                match cached {
+                    Some(v) => Some(Some(v)),
+                    _ => {
+                        let r = vm.alloc_host(
+                            "Ljava/lang/ref/Reference;",
+                            HostState::Slot(V::Ref(0)),
+                        );
+                        Some(Some(V::Ref(r)))
+                    }
+                }
+            }
+            _ => None,
+        }
     } else if class == "Ljava/lang/ref/WeakReference;"
         || class == "Ljava/lang/ref/SoftReference;"
         || class == "Ljava/lang/ref/Reference;"

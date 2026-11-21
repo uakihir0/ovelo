@@ -1099,6 +1099,13 @@ fn run_app(store: &InstallStore, package: &str) -> Result<(), OveloError> {
                 // GC when the heap passes its growth mark — interpreter
                 // churn otherwise grows the heap unboundedly. Only runs
                 // between dex activations (collect_garbage gates itself).
+                if std::env::var_os("OVELO_MEMDBG").is_some() {
+                    eprintln!(
+                        "[mem] frame={dex_frame} heap={} mark={}",
+                        vm.heap.len(),
+                        vm.gc_mark
+                    );
+                }
                 if vm.heap.len() >= vm.gc_mark {
                     let mut roots = ui2.borrow().guest_handles().into_iter();
                     vm.collect_garbage(&mut roots);
