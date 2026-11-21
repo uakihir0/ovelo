@@ -866,11 +866,23 @@ fn sqlite_call(vm: &mut Vm, name: &str, args: &[V]) -> Rt<Option<Option<V>>> {
                     if let Some(n) = db_name_of(vm, this) {
                         vm.obj_db.insert(prog, n);
                     }
-                    let _ = vm.call_virtual(
-                        factory,
-                        "newInstance",
-                        &[V::Ref(this), V::Ref(0), V::Ref(0), V::Ref(prog)],
-                    );
+                    // androidx's generated factory is a `CursorFactory`
+                    // — `newCursor` binds the query onto the program.
+                    // `newInstance` covers the alternate driver shape.
+                    if vm
+                        .call_virtual(
+                            factory,
+                            "newCursor",
+                            &[V::Ref(this), V::Ref(0), V::Ref(0), V::Ref(prog)],
+                        )
+                        .is_err()
+                    {
+                        let _ = vm.call_virtual(
+                            factory,
+                            "newInstance",
+                            &[V::Ref(this), V::Ref(0), V::Ref(0), V::Ref(prog)],
+                        );
+                    }
                     if matches!(
                         vm.heap.get(prog),
                         Some(Obj::Host {
