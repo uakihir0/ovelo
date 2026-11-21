@@ -271,12 +271,22 @@ fn first_string(vm: &Vm, args: &[V]) -> Option<String> {
     args.iter().find_map(|a| sv(vm, *a))
 }
 
+/// Java `String.hashCode` — MediaStore's `bucket_id` is the lowercase
+/// parent path's hashCode, and a stable per-file id keeps `_id`
+/// consistent across filtered projections.
+fn java_hash(s: &str) -> i32 {
+    s.chars()
+        .fold(0i32, |h, c| h.wrapping_mul(31).wrapping_add(c as i32))
+}
+
 /// `ContentResolver.query(content://media/...)` — scan `external_root`
 /// into a Cursor carrying the MediaStore column set. `external/images/
 /// media`, `external/images/thumbnails` (same rows), `external/file`
 /// and friends all share the on-disk scan; a `selection`/`selectionArgs`
-/// narrowing isn't applied.
-pub(crate) fn media_cursor(vm: &mut Vm, uri: &str) -> V {
+/// narrowing isn't applied. `projection` is the caller's requested
+/// column list — positional reads (`getString(0)`) must return the
+/// requested column, not the full-schema first column.
+pub(crate) fn media_cursor(vm: &mut Vm, uri: &str, projection: &[String]) -> V {
     const COLS: &[&str] = &[
         "_id",
         "_data",
@@ -303,7 +313,6 @@ pub(crate) fn media_cursor(vm: &mut Vm, uri: &str) -> V {
     let audio = uri.contains("/audio/");
     let mut rows: Vec<Vec<V>> = Vec::new();
     let mut dirs = vec![vm.external_root.clone()];
-    let mut id = 1i64;
     while let Some(d) = dirs.pop() {
         let Ok(rd) = std::fs::read_dir(&d) else {
             continue;
@@ -368,6 +377,13 @@ pub(crate) fn media_cursor(vm: &mut Vm, uri: &str) -> V {
                 .and_then(|x| x.file_name())
                 .map(|n| n.to_string_lossy().to_string())
                 .unwrap_or_default();
+            // Full parent path relative to the storage root, with a
+            // trailing slash — nested folders keep their ancestors
+            // (DCIM/Camera/ → "DCIM/Camera/", root files → "").
+            let rel_dir = rel
+                .rsplit_once('/')
+                .map(|(d, _)| format!("{d}/"))
+                .unwrap_or_default();
             let meta = std::fs::metadata(&p).ok();
             let size = meta.as_ref().map(|m| m.len() as i64).unwrap_or(0);
             let mtime = meta
@@ -376,9 +392,16 @@ pub(crate) fn media_cursor(vm: &mut Vm, uri: &str) -> V {
                 .map(|d| d.as_secs() as i64)
                 .unwrap_or(0);
             let (w, h) = img_dims(&p);
+            let data = format!("/storage/emulated/0/{rel}");
+            // Stable ids: the same file carries the same `_id`
+            // however the query filtered, and `bucket_id` follows
+            // MediaStore's parent-path hashCode so distinct folders
+            // can't collide on name length.
+            let row_id = (java_hash(&data) as i64 & 0x3fff_ffff) + 1;
+            let bucket_id = java_hash(&rel_dir.to_lowercase()) as i64;
             rows.push(vec![
-                V::I64(id),
-                jstr(vm, &format!("/storage/emulated/0/{rel}")),
+                V::I64(row_id),
+                jstr(vm, &data),
                 jstr(vm, &name),
                 jstr(vm, &title),
                 V::I64(size),
@@ -387,9 +410,9 @@ pub(crate) fn media_cursor(vm: &mut Vm, uri: &str) -> V {
                 V::I64(mtime * 1000),
                 jstr(vm, mime),
                 V::I64(mtype),
-                V::I64(bucket.as_str().len() as i64), // stable-ish bucket id
+                V::I64(bucket_id),
                 jstr(vm, &bucket),
-                jstr(vm, &format!("{bucket}/")),
+                jstr(vm, &rel_dir),
                 V::I64(w),
                 V::I64(h),
                 V::I64(0),
@@ -397,10 +420,36 @@ pub(crate) fn media_cursor(vm: &mut Vm, uri: &str) -> V {
                 V::I64(0),
                 jstr(vm, "external"),
             ]);
-            id += 1;
         }
     }
-    let col_v: Vec<V> = COLS.iter().map(|c| jstr(vm, c)).collect();
+    if std::env::var_os("OVELO_DRAINDBG").is_some() {
+        eprintln!("[media_cursor] {uri} rows={}", rows.len());
+    }
+    // Honor the projection: the cursor's column set is exactly the
+    // requested names, in the requested order — positional reads must
+    // land on the right column. Unknown names yield null cells.
+    let (cols, rows) = if projection.is_empty() || projection.iter().any(|c| c == "*") {
+        (COLS.iter().map(|c| c.to_string()).collect(), rows)
+    } else {
+        let idxs: Vec<Option<usize>> = projection
+            .iter()
+            .map(|name| {
+                COLS.iter()
+                    .position(|c| c == name)
+                    .or_else(|| COLS.iter().position(|c| c.eq_ignore_ascii_case(name)))
+            })
+            .collect();
+        let proj_rows: Vec<Vec<V>> = rows
+            .iter()
+            .map(|r| {
+                idxs.iter()
+                    .map(|i| i.map(|i| r[i]).unwrap_or(V::Ref(0)))
+                    .collect()
+            })
+            .collect();
+        (projection.to_vec(), proj_rows)
+    };
+    let col_v: Vec<V> = cols.iter().map(|c| jstr(vm, c)).collect();
     let col_arr = arr(vm, "Ljava/lang/String;", col_v);
     let row_refs: Vec<V> = rows
         .into_iter()
