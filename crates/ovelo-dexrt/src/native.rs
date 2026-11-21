@@ -77,9 +77,17 @@ pub(crate) static LOADED_RANGES: Mutex<Vec<(usize, usize)>> = Mutex::new(Vec::ne
 /// first TLS read. The block is zeroed apart from a self pointer
 /// (slot 0) and a fixed stack-guard cookie (slot 5, +0x28) — the same
 /// value reads back at function exit, so the check passes.
+///
+/// The buffer is deliberately far larger than the slots we use: guest
+/// code may resolve real Darwin pthread entry points
+/// (`pthread_setspecific`, `pthread_mutex_lock`, …) via
+/// `dlsym(RTLD_DEFAULT)`, and while TPIDR_EL0 is swapped those index
+/// the host `_pthread` struct — whose TSD region reaches several
+/// kilobytes past TPIDR — inside this block instead of clobbering
+/// whatever Rust statics happen to follow a small array in BSS.
 #[cfg(target_arch = "aarch64")]
-static mut GUEST_TCB: [u64; 64] = {
-    let mut t = [0u64; 64];
+static mut GUEST_TCB: [u64; 8192] = {
+    let mut t = [0u64; 8192];
     t[5] = 0x9e3779b97f4a7c15; // arbitrary but nonzero stack guard
     t
 };
@@ -444,6 +452,7 @@ extern "C" fn sh_dl_iterate_phdr(cb: *const c_void, data: *mut c_void) -> i32 {
     if cb.is_null() {
         return -1;
     }
+    eprintln!("[jni] dl_iterate_phdr cb={cb:p}");
     let cb: PhdrCb = unsafe { std::mem::transmute(cb) };
     // Snapshot under the lock, then run guest callbacks unlocked —
     // libunwind-style callbacks may re-enter dl_iterate_phdr.

@@ -819,6 +819,11 @@ fn run_app(store: &InstallStore, package: &str) -> Result<(), OveloError> {
     let (mut guest, ui) = loop {
         let fonts2 = fonts.clone();
         let out = sup.supervise("guest-dispatch", || {
+            // VM mutex for the whole dispatch — serializes every
+            // interpreter step + driver-side heap touch against JNI
+            // calls from guest-spawned pthreads (call_native releases
+            // all levels so .so threads can reach JNI while it runs).
+            let _vmg = ovelo_dexrt::lock_vm();
             let ui = ovelo_framework::GuestUi::new(720, 1280, fonts2);
             // Components returned by initializer `create()` — shared
             // between the startup pass and `initializeComponent` so a
@@ -1079,6 +1084,10 @@ fn run_app(store: &InstallStore, package: &str) -> Result<(), OveloError> {
         // Apps that inflate layout xml (setContentView(res)) live in the
         // VM's dex view tree — materialize it into drawable host views.
         if let Some((vm, this)) = &mut guest {
+            // One lock for the whole tick — drain_runnables, GC and
+            // the layout pass all touch the heap between invokes, and
+            // guest-pthread JNI calls must not alias them.
+            let _vmg = ovelo_dexrt::lock_vm();
             dex_frame = dex_frame.wrapping_add(1);
             // Drain queued background work (`Thread.start`/
             // `Executor.execute`/`Handler.post*`) on the same cadence

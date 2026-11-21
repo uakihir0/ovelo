@@ -362,6 +362,14 @@ pub const NORMAL_PERMISSIONS: &[&str] = &[
     "android.permission.BLUETOOTH_ADMIN",
 ];
 
+/// Hold the VM's recursive mutex for a batch of driver-side work.
+/// `invoke` self-locks, but the driver also touches `&mut Vm` between
+/// invokes (runnable-drain bookkeeping, GC, dex-tree refresh) — wrap
+/// those batches so guest-pthread JNI calls can't alias them.
+pub fn lock_vm() -> impl Drop {
+    jni::vm_lock()
+}
+
 impl Vm {
     /// Static field value stored on class `class_idx` (`None` when the
     /// class is unloaded or the field unset). Used by `Enum.values()`.
@@ -2816,6 +2824,11 @@ impl Vm {
 
     /// Invoke `midx` per `kind`; `args` includes the receiver for non-static.
     fn invoke(&mut self, midx: GIdx, args: Vec<V>, kind: InvokeKind) -> Rt<Option<V>> {
+        // Serialize with JNI entry points: guest `.so`s spawn real
+        // pthreads whose env calls must not alias the interpreter's
+        // heap access (recursive mutex — nested invoke/JNI re-enters
+        // fine, call_native drops all levels while guest code runs).
+        let _vmlock = jni::vm_lock();
         if std::env::var_os("OVELO_VIEWDBG").is_some() {
             if let Some(d) = self.dex_of(midx) {
                 if let Ok(m) = d.method(gl(midx)) {

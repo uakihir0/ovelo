@@ -70,42 +70,118 @@ fn vm_mtx() -> *mut c_void {
     VM_MTX.load(std::sync::atomic::Ordering::Acquire) as *mut c_void
 }
 
-/// Guard holding the VM lock; derefs to `&mut Vm` so every existing
-/// `vm().heap…` call site works unchanged.
-pub(crate) struct VmGuard(&'static mut Vm);
-impl std::ops::Deref for VmGuard {
-    type Target = Vm;
-    fn deref(&self) -> &Vm {
-        self.0
-    }
+/// One held level of the VM recursive mutex. The interpreter itself
+/// takes this (every `invoke`), so the lock is what makes the JNI-side
+/// serialization real: a guest-pthread JNI call can only touch the Vm
+/// while the interpreter is inside `call_native` — where
+/// `without_vm_lock` releases all levels — or between dispatches.
+pub(crate) struct VmLock;
+thread_local! {
+    static VM_DEPTH: std::cell::Cell<u32> = const { std::cell::Cell::new(0) };
 }
-impl std::ops::DerefMut for VmGuard {
-    fn deref_mut(&mut self) -> &mut Vm {
-        self.0
-    }
-}
-impl Drop for VmGuard {
+impl Drop for VmLock {
     fn drop(&mut self) {
+        VM_DEPTH.with(|d| d.set(d.get() - 1));
         unsafe {
             pthread_mutex_unlock(vm_mtx());
         }
     }
 }
-
-pub(crate) fn vm() -> VmGuard {
+pub(crate) fn vm_lock() -> VmLock {
     unsafe {
         if pthread_mutex_lock(vm_mtx()) != 0 {
             // Continuing without the lock is UB; aborting is safer.
             std::process::abort();
         }
     }
+    VM_DEPTH.with(|d| d.set(d.get() + 1));
+    VmLock
+}
+
+/// Release every level of the VM lock this thread holds while `f`
+/// runs, then re-acquire them. `call_native` uses this: the
+/// interpreter cannot touch `Vm` while blocked inside guest machine
+/// code, and threads the `.so` spawns need JNI — and so the lock —
+/// during exactly that window.
+pub(crate) fn without_vm_lock<R>(f: impl FnOnce() -> R) -> R {
+    let n = VM_DEPTH.with(|d| d.replace(0));
+    let m = vm_mtx();
+    for _ in 0..n {
+        unsafe {
+            pthread_mutex_unlock(m);
+        }
+    }
+    let r = f();
+    for _ in 0..n {
+        unsafe {
+            if pthread_mutex_lock(m) != 0 {
+                std::process::abort();
+            }
+        }
+    }
+    VM_DEPTH.with(|d| d.set(n));
+    r
+}
+
+/// Guard holding the VM lock; derefs to `&mut Vm` so every existing
+/// `vm().heap…` call site works unchanged.
+pub(crate) struct VmGuard {
+    vm: &'static mut Vm,
+    _lock: VmLock,
+}
+impl std::ops::Deref for VmGuard {
+    type Target = Vm;
+    fn deref(&self) -> &Vm {
+        self.vm
+    }
+}
+impl std::ops::DerefMut for VmGuard {
+    fn deref_mut(&mut self) -> &mut Vm {
+        self.vm
+    }
+}
+
+// Track the last env-fn entry (set by `env_enter`); used to name the
+// caller whose preceding work corrupted the malloc zone.
+thread_local! {
+    static LAST_ENV: std::cell::Cell<&'static str> = const { std::cell::Cell::new("?") };
+}
+
+/// Env-fn entry hook: `env_enter("FindClass")` at the top of each fn.
+/// Under OVELO_ZONECHECK it verifies the default malloc zone every
+/// entry — the LAST_ENV name then identifies whichever env call ran
+/// just before the corruption was first observed.
+pub(crate) fn env_enter(name: &'static str) {
+    if std::env::var_os("OVELO_ENVCALL").is_some() {
+        eprintln!("[env>] {name}");
+    }
+    if std::env::var_os("OVELO_ZONECHECK").is_some() {
+        unsafe {
+            extern "C" {
+                fn malloc_default_zone() -> *mut std::ffi::c_void;
+                fn malloc_zone_check(zone: *mut std::ffi::c_void) -> bool;
+            }
+            if !malloc_zone_check(malloc_default_zone()) {
+                eprintln!("[zonecheck] BAD ZONE on entry to {name}; previous env call: {}", LAST_ENV.get());
+                std::process::abort();
+            }
+        }
+    }
+    LAST_ENV.set(name);
+}
+
+pub(crate) fn vm() -> VmGuard {
+    let lock = vm_lock();
     let p = CUR_VM.get() as usize;
     let p = if p != 0 {
         p
     } else {
         FALLBACK_VM.load(std::sync::atomic::Ordering::Acquire)
     };
-    VmGuard(unsafe { &mut *(p as *mut Vm) })
+    VmGuard {
+        vm: unsafe { &mut *(p as *mut Vm) },
+        _lock: lock,
+    }
 }
 
 /// Run `f` with the JNIEnv bound to `vm` — every native call holds this
@@ -158,8 +234,16 @@ extern "C" {
 #[cfg(target_arch = "aarch64")]
 pub(crate) fn call_native(fnptr: usize, iargs: &[u64; 8], fargs: &[f64; 8]) -> (u64, u64) {
     let mut out = [0u64; 2];
-    crate::native::with_guest_tls(|| unsafe {
-        ovelo_jni_call(fnptr, iargs.as_ptr(), fargs.as_ptr(), out.as_mut_ptr())
+    if std::env::var_os("OVELO_ENVCALL").is_some() {
+        if let Some(m) = ENV_NAMES.get() {
+            let name = m.get(&fnptr).copied().unwrap_or("?");
+            eprintln!("[envcall] {name}({iargs:p})");
+        }
+    }
+    without_vm_lock(|| {
+        crate::native::with_guest_tls(|| unsafe {
+            ovelo_jni_call(fnptr, iargs.as_ptr(), fargs.as_ptr(), out.as_mut_ptr())
+        });
     });
     (out[0], out[1])
 }
@@ -179,6 +263,9 @@ pub(crate) fn call_native(
 
 static mut JNI_TABLE: [u64; 240] = [0; 240];
 static mut JAVAVM_TABLE: [u64; 8] = [0; 8];
+/// fnptr → env-fn name for OVELO_ENVCALL tracing.
+static ENV_NAMES: std::sync::OnceLock<std::collections::HashMap<usize, &'static str>> =
+    std::sync::OnceLock::new();
 // JNIEnv*/JavaVM* are one more level of indirection: the guest
 // dereferences the handle to get the function table address, so the
 // handle must point at a cell HOLDING the table pointer, not at the
@@ -194,6 +281,7 @@ pub(crate) fn vm_ptr() -> usize {
 }
 
 extern "C" fn unimpl() -> u64 {
+    env_enter("unimpl");
     eprintln!("[jni] unimplemented env fn");
     0
 }
@@ -359,15 +447,51 @@ pub(crate) fn init_tables() {
         JAVAVM_TABLE[5] = ef!(ret0 as *const ()); // DetachCurrentThread
         JAVAVM_TABLE[6] = ef!(vm_get_env as *const ());
         JAVAVM_TABLE[7] = ef!(vm_attach as *const ());
+
+        let mut names = std::collections::HashMap::new();
+        for (i, n) in [
+            (4, "GetVersion"), (6, "FindClass"), (13, "Throw"), (14, "ThrowNew"),
+            (15, "ExceptionOccurred"), (16, "ExceptionDescribe"), (17, "ExceptionClear"),
+            (20, "PopLocalFrame"), (21, "NewLocalRef"), (24, "IsSameObject"),
+            (25, "NewGlobalRef"), (27, "AllocObject"), (31, "GetObjectClass"),
+            (32, "IsInstanceOf"), (33, "GetMethodID"), (36, "CallObjectMethodA"),
+            (39, "CallBooleanMethodA"), (42, "CallByteMethodA"), (45, "CallCharMethodA"),
+            (48, "CallShortMethodA"), (51, "CallIntMethodA"), (54, "CallLongMethodA"),
+            (57, "CallFloatMethodA"), (60, "CallDoubleMethodA"), (63, "CallVoidMethodA"),
+            (94, "GetFieldID"), (95, "GetObjectField"), (100, "GetIntField"),
+            (104, "SetObjectField"), (113, "GetStaticMethodID"),
+            (116, "CallStaticObjectMethodA"), (143, "CallStaticVoidMethodA"),
+            (144, "GetStaticFieldID"), (145, "GetStaticObjectField"),
+            (154, "SetStaticObjectField"), (163, "NewString"), (164, "GetStringLength"),
+            (167, "NewStringUTF"), (168, "GetStringUTFLength"),
+            (169, "GetStringUTFChars"), (170, "ReleaseStringUTFChars"),
+            (171, "GetArrayLength"), (172, "NewObjectArray"),
+            (173, "GetObjectArrayElement"), (174, "SetObjectArrayElement"),
+            (184, "GetByteArrayElements"), (187, "GetIntArrayElements"),
+            (192, "ReleaseByteArrayElements"), (195, "ReleaseIntArrayElements"),
+            (200, "GetByteArrayRegion"), (203, "GetIntArrayRegion"),
+            (208, "SetByteArrayRegion"), (211, "SetIntArrayRegion"),
+            (215, "RegisterNatives"), (219, "GetJavaVM"), (228, "ExceptionCheck"),
+            (229, "NewDirectByteBuffer"), (230, "GetDirectBufferAddress"),
+            (231, "GetDirectBufferCapacity"),
+        ] {
+            let p = JNI_TABLE[i] as usize;
+            if p != ef!(unimpl as *const ()) as usize {
+                names.insert(p, n);
+            }
+        }
+        let _ = ENV_NAMES.set(names);
     });
 }
 
 // ---------- small helpers ----------
 
 extern "C" fn ret0() -> u64 {
+    env_enter("ret0");
     0
 }
 extern "C" fn ret1() -> u64 {
+    env_enter("ret1");
     1
 }
 
@@ -381,6 +505,10 @@ fn cstr_ro(p: u64) -> String {
         while *q != 0 {
             s.push(*q);
             q = q.add(1);
+            if s.len() > 16384 {
+                eprintln!("[jni] cstr_ro runaway at {p:#x} ({}+ bytes)", s.len());
+                break;
+            }
         }
     }
     String::from_utf8_lossy(&s).into_owned()
@@ -522,10 +650,12 @@ fn find_field_id(clazz: u64, name_p: u64, _sig_p: u64, is_static: bool) -> u64 {
 // ---------- env function impls ----------
 
 extern "C" fn get_version(_e: u64) -> u64 {
+    env_enter("get_version");
     0x0001_0008
 }
 
 extern "C" fn find_class(_e: u64, name_p: u64) -> u64 {
+    env_enter("find_class");
     let name = cstr_ro(name_p);
     let dbg = std::env::var("OVELO_JNIDBG").is_ok();
     if dbg { eprintln!("[jni] FindClass {name}"); }
@@ -548,16 +678,19 @@ extern "C" fn find_class(_e: u64, name_p: u64) -> u64 {
 }
 
 extern "C" fn throw(_e: u64, obj: u64) -> u64 {
+    env_enter("throw");
     vm().jni_pending_exc = obj as u32;
     0
 }
 extern "C" fn throw_new(_e: u64, _clazz: u64, msg: u64) -> u64 {
+    env_enter("throw_new");
     let m = cstr_ro(msg);
     eprintln!("[jni] ThrowNew {m}");
     vm().jni_pending_exc = u32::MAX;
     0
 }
 extern "C" fn exception_occurred(_e: u64) -> u64 {
+    env_enter("exception_occurred");
     let p = vm().jni_pending_exc;
     if p == u32::MAX {
         0
@@ -566,28 +699,35 @@ extern "C" fn exception_occurred(_e: u64) -> u64 {
     }
 }
 extern "C" fn exception_describe(_e: u64) -> u64 {
+    env_enter("exception_describe");
     eprintln!("[jni] ExceptionDescribe: pending={:#x}", vm().jni_pending_exc);
     0
 }
 extern "C" fn exception_clear(_e: u64) -> u64 {
+    env_enter("exception_clear");
     vm().jni_pending_exc = 0;
     0
 }
 extern "C" fn exception_check(_e: u64) -> u64 {
+    env_enter("exception_check");
     u64::from(vm().jni_pending_exc != 0)
 }
 
 extern "C" fn pop_local_frame(_e: u64, obj: u64) -> u64 {
+    env_enter("pop_local_frame");
     obj
 }
 extern "C" fn new_ref(_e: u64, obj: u64) -> u64 {
+    env_enter("new_ref");
     obj
 }
 extern "C" fn is_same_object(_e: u64, a: u64, b: u64) -> u64 {
+    env_enter("is_same_object");
     u64::from(a == b)
 }
 
 extern "C" fn alloc_object(_e: u64, clazz: u64) -> u64 {
+    env_enter("alloc_object");
     let mut v = vm();
     let ci = v.heap.class_of(clazz as u32).unwrap_or(crate::GX_NONE);
     let h = v.heap.alloc(Obj::Instance {
@@ -597,6 +737,7 @@ extern "C" fn alloc_object(_e: u64, clazz: u64) -> u64 {
     h as u64
 }
 extern "C" fn get_object_class(_e: u64, obj: u64) -> u64 {
+    env_enter("get_object_class");
     let mut v = vm();
     match v.heap.class_of(obj as u32) {
         Some(ci) => v.class_mirror(ci) as u64,
@@ -604,6 +745,7 @@ extern "C" fn get_object_class(_e: u64, obj: u64) -> u64 {
     }
 }
 extern "C" fn is_instance_of(_e: u64, obj: u64, clazz: u64) -> u64 {
+    env_enter("is_instance_of");
     let v = vm();
     match (v.heap.class_of(obj as u32), v.heap.class_of(clazz as u32)) {
         (Some(a), Some(b)) => u64::from(v.assignable(a, b)),
@@ -612,15 +754,19 @@ extern "C" fn is_instance_of(_e: u64, obj: u64, clazz: u64) -> u64 {
 }
 
 extern "C" fn get_method_id(_e: u64, clazz: u64, name_p: u64, sig_p: u64) -> u64 {
+    env_enter("get_method_id");
     find_method_id(clazz, name_p, sig_p)
 }
 extern "C" fn get_static_method_id(_e: u64, clazz: u64, name_p: u64, sig_p: u64) -> u64 {
+    env_enter("get_static_method_id");
     find_method_id(clazz, name_p, sig_p)
 }
 extern "C" fn get_field_id(_e: u64, clazz: u64, name_p: u64, sig_p: u64) -> u64 {
+    env_enter("get_field_id");
     find_field_id(clazz, name_p, sig_p, false)
 }
 extern "C" fn get_static_field_id(_e: u64, clazz: u64, name_p: u64, sig_p: u64) -> u64 {
+    env_enter("get_static_field_id");
     find_field_id(clazz, name_p, sig_p, true)
 }
 
@@ -652,6 +798,7 @@ call_a!(call_long_method_a, |v: V| v_to_u64(v));
 call_a!(call_float_method_a, |v: V| v_to_u64(v));
 call_a!(call_double_method_a, |v: V| v_to_u64(v));
 extern "C" fn call_void_method_a(_e: u64, obj: u64, mid_: u64, jvalues: u64) -> u64 {
+    env_enter("call_void_method_a");
     let Some(g) = mid_of(mid_) else { return 0 };
     let (_, params, _) = method_params(g);
     let args = jargs(&params, jvalues);
@@ -781,22 +928,27 @@ sets!(set_static_double_field);
 // ---------- strings ----------
 
 extern "C" fn new_string_utf(_e: u64, p: u64) -> u64 {
+    env_enter("new_string_utf");
     let s = cstr_ro(p);
     vm().heap.intern_str(&s) as u64
 }
 extern "C" fn new_string(_e: u64, _p: u64, _len: u64) -> u64 {
+    env_enter("new_string");
     0
 }
 extern "C" fn get_string_length(_e: u64, s: u64) -> u64 {
+    env_enter("get_string_length");
     vm().heap
         .str_val(s as u32)
         .map(|x| x.chars().count() as u64)
         .unwrap_or(0)
 }
 extern "C" fn get_string_utf_length(_e: u64, s: u64) -> u64 {
+    env_enter("get_string_utf_length");
     vm().heap.str_val(s as u32).map(|x| x.len() as u64).unwrap_or(0)
 }
 extern "C" fn get_string_utf_chars(_e: u64, s: u64, _copy: u64) -> u64 {
+    env_enter("get_string_utf_chars");
     let Some(x) = vm().heap.str_val(s as u32).map(|x| x.to_string()) else {
         return 0;
     };
@@ -804,6 +956,7 @@ extern "C" fn get_string_utf_chars(_e: u64, s: u64, _copy: u64) -> u64 {
     c.into_raw() as u64
 }
 extern "C" fn release_string_utf_chars(_e: u64, _s: u64, p: u64) -> u64 {
+    env_enter("release_string_utf_chars");
     if p != 0 {
         unsafe { drop(CString::from_raw(p as *mut i8)) };
     }
@@ -820,9 +973,11 @@ fn arr_data(h: u32) -> Option<Vec<V>> {
 }
 
 extern "C" fn get_array_length(_e: u64, a: u64) -> u64 {
+    env_enter("get_array_length");
     arr_data(a as u32).map(|d| d.len() as u64).unwrap_or(0)
 }
 extern "C" fn new_object_array(_e: u64, len: u64, _clazz: u64, init: u64) -> u64 {
+    env_enter("new_object_array");
     let mut v = vm();
     let h = v.heap.alloc(Obj::Array {
         elem: "Ljava/lang/Object;".into(),
@@ -831,12 +986,14 @@ extern "C" fn new_object_array(_e: u64, len: u64, _clazz: u64, init: u64) -> u64
     h as u64
 }
 extern "C" fn get_object_array_element(_e: u64, a: u64, i: u64) -> u64 {
+    env_enter("get_object_array_element");
     arr_data(a as u32)
         .and_then(|d| d.get(i as usize).copied())
         .map(v_to_u64)
         .unwrap_or(0)
 }
 extern "C" fn set_object_array_element(_e: u64, a: u64, i: u64, v: u64) {
+    env_enter("set_object_array_element");
     if let Some(Obj::Array { data, .. }) = vm().heap.get_mut(a as u32) {
         if let Some(slot) = data.get_mut(i as usize) {
             *slot = V::Ref(v as u32);
@@ -1065,6 +1222,7 @@ sr!(set_double_array_region);
 // ---------- misc ----------
 
 extern "C" fn register_natives(_e: u64, clazz: u64, methods: u64, n: u64) -> u64 {
+    env_enter("register_natives");
     if std::env::var("OVELO_JNIDBG").is_ok() { eprintln!("[jni] RegisterNatives clazz={clazz:#x} n={n}"); }
     let mut v = vm();
     let desc = v
@@ -1092,12 +1250,14 @@ extern "C" fn register_natives(_e: u64, clazz: u64, methods: u64, n: u64) -> u64
 }
 
 extern "C" fn get_java_vm(_e: u64, out: u64) -> u64 {
+    env_enter("get_java_vm");
     if out != 0 {
         unsafe { *(out as *mut usize) = vm_ptr() };
     }
     0
 }
 extern "C" fn vm_get_env(_vm: u64, out: u64, _ver: u64) -> u64 {
+    env_enter("vm_get_env");
     // (*penv) = the JNIEnv handle (cell holding the function table).
     if out != 0 {
         unsafe { *(out as *mut usize) = env_ptr() };
@@ -1105,6 +1265,7 @@ extern "C" fn vm_get_env(_vm: u64, out: u64, _ver: u64) -> u64 {
     0
 }
 extern "C" fn vm_attach(_vm: u64, a: u64, _b: u64) -> u64 {
+    env_enter("vm_attach");
     // AttachCurrentThread(vm, &env, args) — single-threaded VM:
     // every thread is the main thread, so just hand back JNIEnv*.
     if a != 0 {
@@ -1114,6 +1275,7 @@ extern "C" fn vm_attach(_vm: u64, a: u64, _b: u64) -> u64 {
 }
 
 extern "C" fn new_direct_byte_buffer(_e: u64, addr: u64, cap: u64) -> u64 {
+    env_enter("new_direct_byte_buffer");
     let mut v = vm();
     let ci = v.type_index_of("Ljava/nio/ByteBuffer;").unwrap_or(crate::GX_NONE);
     let mut fields = std::collections::HashMap::new();
@@ -1128,11 +1290,13 @@ extern "C" fn new_direct_byte_buffer(_e: u64, addr: u64, cap: u64) -> u64 {
     h as u64
 }
 extern "C" fn get_direct_buffer_address(_e: u64, buf: u64) -> u64 {
+    env_enter("get_direct_buffer_address");
     jdk::pseudo_get(&vm(), buf as u32, jdk::P_DATA)
         .map(v_to_u64)
         .unwrap_or(0)
 }
 extern "C" fn get_direct_buffer_capacity(_e: u64, buf: u64) -> u64 {
+    env_enter("get_direct_buffer_capacity");
     jdk::pseudo_get(&vm(), buf as u32, jdk::P_FLAGS)
         .map(v_to_u64)
         .unwrap_or(0)
