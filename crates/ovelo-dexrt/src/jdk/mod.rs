@@ -1405,6 +1405,150 @@ pub(crate) fn host_supers(d: &str) -> &'static [&'static str] {
             "Ljava/lang/Iterable;",
             OBJ,
         ],
+        // Collections.empty*/singleton*/unmodifiable*/synchronized*
+        // wrappers — without these a `check-cast`/`instanceof List`
+        // on Collections.emptyList() throws (Glide's empty
+        // ModelLoader list failed exactly that way).
+        "Ljava/util/Collections$EmptyList;" => &[
+            "Ljava/util/AbstractList;",
+            "Ljava/util/AbstractCollection;",
+            "Ljava/util/List;",
+            "Ljava/util/RandomAccess;",
+            "Ljava/io/Serializable;",
+            "Ljava/util/Collection;",
+            "Ljava/lang/Iterable;",
+            OBJ,
+        ],
+        "Ljava/util/Collections$EmptySet;" => &[
+            "Ljava/util/AbstractSet;",
+            "Ljava/util/AbstractCollection;",
+            "Ljava/util/Set;",
+            "Ljava/io/Serializable;",
+            "Ljava/util/Collection;",
+            "Ljava/lang/Iterable;",
+            OBJ,
+        ],
+        "Ljava/util/Collections$EmptyMap;" => &[
+            "Ljava/util/AbstractMap;",
+            "Ljava/util/Map;",
+            "Ljava/io/Serializable;",
+            OBJ,
+        ],
+        "Ljava/util/Collections$EmptyIterator;" => &["Ljava/util/Iterator;", OBJ],
+        "Ljava/util/Collections$EmptyListIterator;" => &[
+            "Ljava/util/ListIterator;",
+            "Ljava/util/Iterator;",
+            OBJ,
+        ],
+        "Ljava/util/Collections$EmptyEnumeration;" => {
+            &["Ljava/util/Enumeration;", OBJ]
+        }
+        "Ljava/util/Collections$SingletonList;" => &[
+            "Ljava/util/AbstractList;",
+            "Ljava/util/AbstractCollection;",
+            "Ljava/util/List;",
+            "Ljava/util/RandomAccess;",
+            "Ljava/io/Serializable;",
+            "Ljava/util/Collection;",
+            "Ljava/lang/Iterable;",
+            OBJ,
+        ],
+        "Ljava/util/Collections$SingletonSet;" => &[
+            "Ljava/util/AbstractSet;",
+            "Ljava/util/AbstractCollection;",
+            "Ljava/util/Set;",
+            "Ljava/io/Serializable;",
+            "Ljava/util/Collection;",
+            "Ljava/lang/Iterable;",
+            OBJ,
+        ],
+        "Ljava/util/Collections$SingletonMap;" => &[
+            "Ljava/util/AbstractMap;",
+            "Ljava/util/Map;",
+            "Ljava/io/Serializable;",
+            OBJ,
+        ],
+        "Ljava/util/Arrays$ArrayList;" => &[
+            "Ljava/util/AbstractList;",
+            "Ljava/util/AbstractCollection;",
+            "Ljava/util/List;",
+            "Ljava/util/RandomAccess;",
+            "Ljava/io/Serializable;",
+            "Ljava/util/Collection;",
+            "Ljava/lang/Iterable;",
+            OBJ,
+        ],
+        "Ljava/util/Collections$UnmodifiableCollection;" => &[
+            "Ljava/util/Collection;",
+            "Ljava/lang/Iterable;",
+            "Ljava/io/Serializable;",
+            OBJ,
+        ],
+        "Ljava/util/Collections$UnmodifiableList;" => &[
+            "Ljava/util/Collections$UnmodifiableCollection;",
+            "Ljava/util/List;",
+            "Ljava/util/Collection;",
+            "Ljava/lang/Iterable;",
+            "Ljava/io/Serializable;",
+            OBJ,
+        ],
+        "Ljava/util/Collections$UnmodifiableSet;" => &[
+            "Ljava/util/Collections$UnmodifiableCollection;",
+            "Ljava/util/Set;",
+            "Ljava/util/Collection;",
+            "Ljava/lang/Iterable;",
+            "Ljava/io/Serializable;",
+            OBJ,
+        ],
+        "Ljava/util/Collections$UnmodifiableMap;" => {
+            &["Ljava/util/Map;", "Ljava/io/Serializable;", OBJ]
+        }
+        "Ljava/util/Collections$SynchronizedCollection;" => &[
+            "Ljava/util/Collection;",
+            "Ljava/lang/Iterable;",
+            "Ljava/io/Serializable;",
+            OBJ,
+        ],
+        "Ljava/util/Collections$SynchronizedList;" => &[
+            "Ljava/util/Collections$SynchronizedCollection;",
+            "Ljava/util/List;",
+            "Ljava/util/Collection;",
+            "Ljava/lang/Iterable;",
+            OBJ,
+        ],
+        "Ljava/util/Collections$SynchronizedSet;" => &[
+            "Ljava/util/Collections$SynchronizedCollection;",
+            "Ljava/util/Set;",
+            "Ljava/util/Collection;",
+            "Ljava/lang/Iterable;",
+            OBJ,
+        ],
+        "Ljava/util/Collections$SynchronizedMap;" => &[
+            "Ljava/util/Map;",
+            "Ljava/io/Serializable;",
+            OBJ,
+        ],
+        "Ljava/util/Collections$CheckedCollection;" => &[
+            "Ljava/util/Collection;",
+            "Ljava/lang/Iterable;",
+            "Ljava/io/Serializable;",
+            OBJ,
+        ],
+        "Ljava/util/Collections$CheckedList;" => &[
+            "Ljava/util/Collections$CheckedCollection;",
+            "Ljava/util/List;",
+            "Ljava/util/Collection;",
+            "Ljava/lang/Iterable;",
+            OBJ,
+        ],
+        "Ljava/util/Collections$CheckedSet;" => &[
+            "Ljava/util/Collections$CheckedCollection;",
+            "Ljava/util/Set;",
+            "Ljava/util/Collection;",
+            "Ljava/lang/Iterable;",
+            OBJ,
+        ],
+        "Ljava/util/Collections$CheckedMap;" => &["Ljava/util/Map;", OBJ],
         "Ljava/util/AbstractSequentialList;" => &[
             "Ljava/util/AbstractList;",
             "Ljava/util/AbstractCollection;",
