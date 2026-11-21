@@ -1792,7 +1792,8 @@ pub(crate) fn host_supers(d: &str) -> &'static [&'static str] {
         | "Landroid/app/ActivityOptions;"
         | "Landroid/app/PictureInPictureParams;"
         | "Landroid/app/ActivityManager$RunningAppProcessInfo;"
-        | "Landroid/app/ActivityManager$MemoryInfo;" => &[OBJ],
+        | "Landroid/app/ActivityManager$MemoryInfo;"
+        | "Landroid/app/role/RoleManager;" => &[OBJ],
         // ----- android.view tree
         "Landroid/view/View;" => &[OBJ],
         "Landroid/view/ViewGroup;" => &[
