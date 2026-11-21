@@ -2753,8 +2753,17 @@ impl Vm {
             ("Ljava/lang/Object;", "getClass") => {
                 let this = args.first().copied().unwrap_or(V::Ref(0));
                 let ci = match this {
-                    V::Ref(h) if h != 0 => self.heap.class_of(h).unwrap_or(0),
-                    _ => 0,
+                    V::Ref(h) if h != 0 => match self.heap.class_of(h) {
+                        Some(c) if c != GX_NONE => c,
+                        // Str/Class/Array/Throwable have no stored
+                        // class_idx — derive the descriptor instead so
+                        // e.g. "x".getClass() mirrors String, not the
+                        // class that happens to sit at type index 0.
+                        _ => self
+                            .type_index_of(&jdk::class_of(self, V::Ref(h)))
+                            .unwrap_or(GX_NONE),
+                    },
+                    _ => GX_NONE,
                 };
                 Ok(Some(V::Ref(self.class_mirror(ci))))
             }
@@ -3940,6 +3949,11 @@ impl Vm {
                                 }
                                 if let Some(Obj::Str(t)) = self.heap.get(*h) {
                                     s.push_str(&format!("=\"{}\"", t.chars().take(80).collect::<String>()));
+                                }
+                                if let Some(Obj::Class { type_idx }) = self.heap.get(*h) {
+                                    if let Ok(d) = self.type_desc_of(*type_idx) {
+                                        s.push_str(&format!("<{d}>"));
+                                    }
                                 }
                                 s
                             }
