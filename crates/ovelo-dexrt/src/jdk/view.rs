@@ -2987,18 +2987,34 @@ fn relative_layout_fallback(vm: &mut Vm, this: u32, w: i32, h: i32) {
         let (rw, rh) = (cr - cl, cb - ct);
         if rw != ks[i].w || rh != ks[i].h {
             const EXACTLY: i32 = 1 << 30;
-            // The child's own lp picks the spec per axis — a flat
-            // AT_MOST would shrink match_parent descendants to their
-            // (often 0) content size; EXACTLY|extent + lp yields
-            // EXACTLY for match_parent, AT_MOST for wrap.
-            let dw = attr_find(vm, ch, "layout_width")
-                .map(|v| len_v(vm, v))
-                .unwrap_or(-2);
-            let dh = attr_find(vm, ch, "layout_height")
-                .map(|v| len_v(vm, v))
-                .unwrap_or(-2);
-            let ws = child_measure_spec(EXACTLY | rw.max(0), 0, dw);
-            let hs = child_measure_spec(EXACTLY | rh.max(0), 0, dh);
+            // Read the LIVE LayoutParams dims — `setLayoutParams`
+            // mutations beat the XML attrs. Spec per axis: a changed
+            // axis gets the child's lp vs the resolved extent
+            // (match_parent fills, wrap shrinks); an unchanged axis
+            // keeps its measured size so a width-only rule can't
+            // collapse the height.
+            let lp_obj = match pseudo_get(vm, ch, P_LP) {
+                Some(V::Ref(lp)) => lp,
+                _ => 0,
+            };
+            let dim = |field: &str, xml: &str| {
+                lp_field(vm, lp_obj, field)
+                    .and_then(|v| lp_px(vm, v))
+                    .or_else(|| attr_find(vm, ch, xml).map(|v| len_v(vm, v)))
+                    .unwrap_or(-2)
+            };
+            let dw = dim("width", "layout_width");
+            let dh = dim("height", "layout_height");
+            let ws = if rw != ks[i].w {
+                child_measure_spec(EXACTLY | rw.max(0), 0, dw)
+            } else {
+                EXACTLY | rw.max(0)
+            };
+            let hs = if rh != ks[i].h {
+                child_measure_spec(EXACTLY | rh.max(0), 0, dh)
+            } else {
+                EXACTLY | rh.max(0)
+            };
             let _ = vm.call_virtual(ch, "measure", &[V::I32(ws), V::I32(hs)]);
         }
         if std::env::var_os("OVELO_VIEWDBG").is_some() {

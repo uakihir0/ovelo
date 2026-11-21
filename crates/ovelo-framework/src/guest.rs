@@ -899,7 +899,10 @@ fn viewdbg() -> bool {
 /// to bound interpreter work. `populate()` is idempotent on existing
 /// pages, and adapters filling asynchronously get picked up on later
 /// passes.
-pub fn drive_dex_layout_pass(vm: &mut Vm, activity: u32, frame: u32) {
+/// `win_w`/`win_h` — the real window size the unframed root measures
+/// against: a hardcoded size lays out the content wider than the
+/// buffer and clips the right/bottom columns offscreen.
+pub fn drive_dex_layout_pass(vm: &mut Vm, activity: u32, frame: u32, win_w: i32, win_h: i32) {
     if !frame.is_multiple_of(30) {
         return;
     }
@@ -910,7 +913,7 @@ pub fn drive_dex_layout_pass(vm: &mut Vm, activity: u32, frame: u32) {
     // DrawerLayout throw unless both specs are EXACTLY, so
     // UNSPECIFIED/0 would leave them unmeasured forever.
     const MS_EXACTLY: i32 = 1 << 30;
-    fn walk(vm: &mut Vm, h: u32, depth: u32) {
+    fn walk(vm: &mut Vm, h: u32, depth: u32, win_w: i32, win_h: i32) {
         if depth > 64 {
             return;
         }
@@ -951,7 +954,7 @@ pub fn drive_dex_layout_pass(vm: &mut Vm, activity: u32, frame: u32) {
             let (w, hgt) = info
                 .frame
                 .map(|f| (f.2 - f.0, f.3 - f.1))
-                .unwrap_or((1080, 1920));
+                .unwrap_or((win_w, win_h));
             if let Err(e) = vm.call_virtual(
                 h,
                 "measure",
@@ -1067,10 +1070,10 @@ pub fn drive_dex_layout_pass(vm: &mut Vm, activity: u32, frame: u32) {
         // Re-snapshot: the layout pass may have attached children.
         let kids = vm.dex_view(h).map(|i| i.children).unwrap_or_default();
         for ch in kids {
-            walk(vm, ch, depth + 1);
+            walk(vm, ch, depth + 1, win_w, win_h);
         }
     }
-    walk(vm, root, 0);
+    walk(vm, root, 0, win_w, win_h);
     // Android fires OnGlobalLayoutListener after each layout pass —
     // guests defer init work there (fossify's initFileManager runs its
     // first openPath inside one).

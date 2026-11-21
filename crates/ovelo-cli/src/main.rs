@@ -1138,7 +1138,13 @@ fn run_app(store: &InstallStore, package: &str) -> Result<(), OveloError> {
                 {
                     // Run adapter containers' layout pass OUTSIDE the ui
                     // borrow — guest code re-enters bridged view methods.
-                    ovelo_framework::drive_dex_layout_pass(vm, *this, dex_frame);
+                    let (win_w, win_h) = {
+                        let u = ui2.borrow();
+                        (u.root.w, u.root.h)
+                    };
+                    ovelo_framework::drive_dex_layout_pass(
+                        vm, *this, dex_frame, win_w, win_h,
+                    );
                 }
             }
             ui2.borrow_mut().refresh_dex_tree(vm, *this);
