@@ -1668,9 +1668,69 @@ fn nio_call(vm: &mut Vm, name: &str, args: &[V]) -> Option<Option<V>> {
                         }
                         pseudo_set(vm, this, P_BBUF_POS, V::I32((pos0 + len) as i32));
                     } else {
-                        let x = i32v(args.get(1).copied().unwrap_or(V::I32(0))) as u8;
-                        put(vm, pos0, &[x]);
-                        pseudo_set(vm, this, P_BBUF_POS, V::I32((pos0 + 1) as i32));
+                        // put(byte[]) / put(srcBuffer) / put(byte).
+                        let bytes: Vec<u8> = match args.get(1).copied() {
+                            Some(V::Ref(sh)) => match vm.heap.get(sh) {
+                                Some(Obj::Array { data, .. }) => {
+                                    data.iter().map(|v| i32v(*v) as u8).collect()
+                                }
+                                _ => {
+                                    // Another ByteBuffer: drain its
+                                    // remaining bytes and move its cursor.
+                                    let src_backing = match vm.heap.get(sh) {
+                                        Some(Obj::Host {
+                                            state: HostState::Slot(V::Ref(b)),
+                                            ..
+                                        }) if matches!(
+                                            vm.heap.get(*b),
+                                            Some(Obj::Array { .. })
+                                        ) =>
+                                        {
+                                            Some(*b)
+                                        }
+                                        _ => None,
+                                    };
+                                    let mut v = Vec::new();
+                                    if let Some(sb) = src_backing {
+                                        let sp = i32v(
+                                            pseudo_get(vm, sh, P_BBUF_POS)
+                                                .unwrap_or(V::I32(0)),
+                                        )
+                                        .max(0)
+                                            as usize;
+                                        if let Some(Obj::Array { data, .. }) = vm.heap.get(sb) {
+                                            v = data
+                                                .iter()
+                                                .skip(sp)
+                                                .map(|x| i32v(*x) as u8)
+                                                .collect();
+                                        }
+                                        let n = v.len();
+                                        pseudo_set(
+                                            vm,
+                                            sh,
+                                            P_BBUF_POS,
+                                            V::I32((sp + n) as i32),
+                                        );
+                                    }
+                                    v
+                                }
+                            },
+                            v => vec![i32v(v.unwrap_or(V::I32(0))) as u8],
+                        };
+                        let len = bytes.len();
+                        // Byte-order applies to multi-byte primitives,
+                        // not bulk copies — write through directly.
+                        if let Some(bh) = backing(vm) {
+                            if let Some(Obj::Array { data, .. }) = vm.heap.get_mut(bh) {
+                                for (i, x) in bytes.iter().enumerate() {
+                                    if let Some(slot) = data.get_mut(pos0 + i) {
+                                        *slot = V::I32(*x as i8 as i32);
+                                    }
+                                }
+                            }
+                        }
+                        pseudo_set(vm, this, P_BBUF_POS, V::I32((pos0 + len) as i32));
                     }
                 }
                 _ => {
