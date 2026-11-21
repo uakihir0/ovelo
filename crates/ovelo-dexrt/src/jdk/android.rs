@@ -140,8 +140,20 @@ pub(crate) fn call(
                     .skip(1)
                     .find_map(|a| sv(vm, *a))
                     .unwrap_or_default();
+                // query(uri, projection, selection, selectionArgs,
+                // sortOrder): honor the projection — positional reads
+                // (getString(0)) must return the requested column.
+                let projection: Vec<String> = match args.get(2) {
+                    Some(V::Ref(ph)) => match vm.heap.get(*ph) {
+                        Some(Obj::Array { data, .. }) => {
+                            data.iter().filter_map(|v| sv(vm, *v)).collect()
+                        }
+                        _ => Vec::new(),
+                    },
+                    _ => Vec::new(),
+                };
                 if uri.starts_with("content://media/") {
-                    Some(Some(db::media_cursor(vm, &uri)))
+                    Some(Some(db::media_cursor(vm, &uri, &projection)))
                 } else {
                     Some(Some(host(vm, "Landroid/database/Cursor;", HostState::Empty)))
                 }
@@ -334,8 +346,9 @@ pub(crate) fn call(
                 HostState::Path("/storage/emulated/0".into()),
             ))),
             "getExternalStoragePublicDirectory" => {
-                // e.g. Environment.DIRECTORY_DCIM → /storage/emulated/0/DCIM
-                let dir = sv(vm, *args.get(1).unwrap_or(&V::Ref(0))).unwrap_or_default();
+                // e.g. Environment.DIRECTORY_DCIM → /storage/emulated/0/DCIM.
+                // Static method: the directory name is the first arg.
+                let dir = sv(vm, *args.first().unwrap_or(&V::Ref(0))).unwrap_or_default();
                 Some(Some(host(
                     vm,
                     "Ljava/io/File;",
@@ -431,8 +444,8 @@ pub(crate) fn call(
     } else if class.starts_with("Landroid/provider/") {
         match name {
             // `MediaStore$Files.getContentUri("external")` →
-            // content://media/external/file/media — same segment logic
-            // as the *_CONTENT_URI fields.
+            // content://media/external/file — same segment logic as
+            // the *_CONTENT_URI fields (no extra suffix).
             "getContentUri" => {
                 let media = if class == "Landroid/provider/MediaStore$Files;" {
                     "file".to_string()
@@ -451,7 +464,7 @@ pub(crate) fn call(
                 Some(Some(host(
                     vm,
                     "Landroid/net/Uri;",
-                    HostState::StrBuf(format!("content://media/{vol}/{media}/media")),
+                    HostState::StrBuf(format!("content://media/{vol}/{media}")),
                 )))
             }
             "getString" | "getInt" | "getLong" | "getFloat" => {
