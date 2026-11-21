@@ -1380,6 +1380,23 @@ pub(crate) fn load_native_lib(vm: &mut Vm, arg: &str, absolute: bool) {
         eprintln!("[jni] loadLibrary {arg}: no arm64 .so in apk");
         return;
     };
+    // libglide-webp's JNI_OnLoad corrupts the host heap (native code
+    // shares our address space; crash surfaces in a later host malloc
+    // ~50% of runs). PNG thumbnails never reach the webp decoder, so
+    // skipping loses nothing; OVELO_SKIP_LIBS adds more lib names
+    // (comma-separated substring match), OVELO_NO_SKIP_LIBS=1 disables.
+    let skip: Vec<String> = std::env::var("OVELO_SKIP_LIBS")
+        .map(|s| s.split(',').map(|t| t.trim().to_string()).collect())
+        .unwrap_or_default();
+    let denied = if std::env::var_os("OVELO_NO_SKIP_LIBS").is_some() {
+        skip.iter().any(|n| path.contains(n.as_str()))
+    } else {
+        path.contains("glide-webp") || skip.iter().any(|n| path.contains(n.as_str()))
+    };
+    if denied {
+        eprintln!("[jni] loadLibrary {arg}: {path} skipped (denylist)");
+        return;
+    }
     let lib = match crate::native::load_so(&path, &bytes) {
         Ok(l) => l,
         Err(e) => {
