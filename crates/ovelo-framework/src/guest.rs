@@ -196,6 +196,9 @@ impl Drawable for AbsView {
         s
     }
     fn layout(&mut self, left: i32, top: i32) {
+        if std::env::var_os("OVELO_POSDBG").is_some() {
+            eprintln!("[posdbg] AbsView layout left={left} top={top} rect={:?}", self.rect);
+        }
         self.inner.layout(left, top);
     }
     fn draw(&mut self, c: &mut ovelo_ui::Canvas) {
@@ -241,9 +244,11 @@ pub struct GuestUi {
     /// Dex-view-tree handles → materialized host view. Persistent so
     /// per-view state (pressed, listeners) survives frame rebuilds.
     dex_views: HashMap<u32, Rc<RefCell<GuestView>>>,
-    /// Last materialized child-handle list per parent — a changed set
-    /// (removal, hide) must dirty the group or stale pixels persist.
-    dex_kids: HashMap<u32, Vec<u32>>,
+    /// Last materialized child list per parent — (handle, dex frame)
+    /// pairs. A changed set (removal, hide) or a late-arriving frame
+    /// must dirty the group or stale pixels / misplaced children
+    /// persist.
+    dex_kids: HashMap<u32, Vec<KidEntry>>,
     /// The dex view-tree content root last materialized.
     dex_root: u32,
     /// The host view currently mounted as content — remount only when
@@ -271,6 +276,11 @@ fn ref_arg(args: &[V], i: usize) -> Result<u32> {
 // ---------------------------------------------------------------------
 // Dex view-tree materialization — real apps inflate layout xml into the
 // VM's view-tree model; these turn each node into a drawable host view.
+
+/// One materialized child: its dex handle plus the `setFrame` rect seen
+/// at materialize time (None until dex layout runs — tracking it lets a
+/// late frame flip the child into `AbsView` and re-layout).
+type KidEntry = (u32, Option<(i32, i32, i32, i32)>);
 
 fn dex_len(l: i32) -> Length {
     match l {
@@ -369,6 +379,10 @@ fn update_dex_view(g: &mut GuestView, info: &ovelo_dexrt::DexViewInfo) {
                 tv.invalidate();
             }
         }
+        if tv.gravity != info.gravity {
+            tv.gravity = info.gravity;
+            tv.invalidate();
+        }
     }
     if changed {
         g.invalidate();
@@ -407,7 +421,11 @@ impl GuestUi {
         let mut v: Vec<u32> = self.views.keys().copied().collect();
         v.extend(self.dex_views.keys().copied());
         v.extend(self.dex_kids.keys().copied());
-        v.extend(self.dex_kids.values().flatten().copied());
+        v.extend(
+            self.dex_kids
+                .values()
+                .flat_map(|kids| kids.iter().map(|(h, _)| *h)),
+        );
         v.push(self.dex_root);
         v.extend(self.clicks.borrow().iter().flat_map(|(a, b)| [*a, *b]));
         v.extend(self.click_listeners.keys().copied());
@@ -741,25 +759,37 @@ impl GuestUi {
             Some((l, t, r, b)) => (r - l, b - t),
             None => (0, 0),
         };
-        let ops = vm.guest_draw_ops(h, ow, oh);
+        // Capture the guest's onDraw only at a real size: a 0×0
+        // canvas makes size-derived paint degenerate (every text at
+        // x=0 — an overlapping pile at the parent origin), so keep
+        // the last good ops until a frame lands.
+        let ops = (ow > 0 && oh > 0).then(|| vm.guest_draw_ops(h, ow, oh));
         let mut g = rc.borrow_mut();
         // `g` borrows the view object while `self.materialize_dex`
         // recurses into children — different cells, no aliasing.
         update_dex_view(&mut g, &info);
-        g.view_mut().custom_ops = if ops.is_empty() {
-            None
-        } else {
-            Some(Rc::new(ops))
-        };
+        if let Some(ops) = ops {
+            g.view_mut().custom_ops = if ops.is_empty() {
+                None
+            } else {
+                Some(Rc::new(ops))
+            };
+        }
         if let GuestView::Group(gr) = &mut *g {
             let mut kids: Vec<Box<dyn Drawable>> = Vec::new();
-            let mut kid_handles: Vec<u32> = Vec::new();
+            let mut kid_handles: Vec<KidEntry> = Vec::new();
             for ch in &info.children {
                 if let Some(crc) = self.materialize_dex(vm, *ch) {
-                    kid_handles.push(*ch);
                     // Dex frames are relative to the parent — position
                     // the child exactly where its `setFrame` put it.
-                    let view: Box<dyn Drawable> = match vm.dex_view(*ch).and_then(|i| i.frame) {
+                    let frame = vm.dex_view(*ch).and_then(|i| i.frame);
+                    // The frame is part of the key: dex `onLayout`
+                    // often runs after the first materialize, and a
+                    // late-arriving frame must re-wrap the child into
+                    // AbsView AND re-layout — tracking only the handle
+                    // leaves the stale pile drawn forever.
+                    kid_handles.push((*ch, frame));
+                    let view: Box<dyn Drawable> = match frame {
                         Some(rect) => {
                             if viewdbg() {
                                 eprintln!("[viewdbg] frame h{ch} = {rect:?}");
@@ -782,6 +812,8 @@ impl GuestUi {
                 gr.invalidate();
             }
             gr.children = kids;
+        } else if !info.children.is_empty() && viewdbg() {
+            eprintln!("[viewdbg] KIDS DROPPED h{h} {} kids={} not-a-group", info.desc, info.children.len());
         }
         if info.listener != 0 {
             let listener = info.listener;
@@ -867,7 +899,10 @@ fn viewdbg() -> bool {
 /// to bound interpreter work. `populate()` is idempotent on existing
 /// pages, and adapters filling asynchronously get picked up on later
 /// passes.
-pub fn drive_dex_layout_pass(vm: &mut Vm, activity: u32, frame: u32) {
+/// `win_w`/`win_h` — the real window size the unframed root measures
+/// against: a hardcoded size lays out the content wider than the
+/// buffer and clips the right/bottom columns offscreen.
+pub fn drive_dex_layout_pass(vm: &mut Vm, activity: u32, frame: u32, win_w: i32, win_h: i32) {
     if !frame.is_multiple_of(30) {
         return;
     }
@@ -878,7 +913,7 @@ pub fn drive_dex_layout_pass(vm: &mut Vm, activity: u32, frame: u32) {
     // DrawerLayout throw unless both specs are EXACTLY, so
     // UNSPECIFIED/0 would leave them unmeasured forever.
     const MS_EXACTLY: i32 = 1 << 30;
-    fn walk(vm: &mut Vm, h: u32, depth: u32) {
+    fn walk(vm: &mut Vm, h: u32, depth: u32, win_w: i32, win_h: i32) {
         if depth > 64 {
             return;
         }
@@ -911,11 +946,22 @@ pub fn drive_dex_layout_pass(vm: &mut Vm, activity: u32, frame: u32) {
         // every node and no frame would ever be set.
         let parent_is_dex =
             depth != 0 && info.parent != 0 && vm.is_dex_view(info.parent);
-        if info.is_group && !parent_is_dex {
-            let (w, hgt) = info
-                .frame
-                .map(|f| (f.2 - f.0, f.3 - f.1))
-                .unwrap_or((1080, 1920));
+        // Drive subtree roots regardless of group-ness: a leaf custom
+        // view at the XML root has no dex parent to measure/layout it,
+        // so without this its frame stays unset and `onDraw` ops never
+        // capture (blank screen).
+        if !parent_is_dex {
+            // The root tracks the window: after a resize its stored
+            // frame is stale, so re-measure at the new extent — the
+            // stored frame only wins for deeper subtree roots whose
+            // size genuinely came from a prior pass.
+            let (w, hgt) = if depth == 0 {
+                (win_w, win_h)
+            } else {
+                info.frame
+                    .map(|f| (f.2 - f.0, f.3 - f.1))
+                    .unwrap_or((win_w, win_h))
+            };
             if let Err(e) = vm.call_virtual(
                 h,
                 "measure",
@@ -1031,10 +1077,10 @@ pub fn drive_dex_layout_pass(vm: &mut Vm, activity: u32, frame: u32) {
         // Re-snapshot: the layout pass may have attached children.
         let kids = vm.dex_view(h).map(|i| i.children).unwrap_or_default();
         for ch in kids {
-            walk(vm, ch, depth + 1);
+            walk(vm, ch, depth + 1, win_w, win_h);
         }
     }
-    walk(vm, root, 0);
+    walk(vm, root, 0, win_w, win_h);
     // Android fires OnGlobalLayoutListener after each layout pass —
     // guests defer init work there (fossify's initFileManager runs its
     // first openPath inside one).

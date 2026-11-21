@@ -13,6 +13,7 @@ mod io;
 mod lang;
 mod time;
 mod util;
+pub(crate) mod vector;
 pub(crate) mod view;
 pub(crate) mod xml;
 
@@ -46,6 +47,8 @@ pub(crate) const P_BOUNDS: u32 = u32::MAX - 11;
 /// A `BitmapDrawable`'s wrapped Bitmap — kept as a fields entry so the
 /// renderer's bitmap field-walk (and `getBitmap`) find it.
 pub(crate) const P_BITMAP_SLOT: u64 = 0xFFFD_FEE0;
+/// A `ColorDrawable`'s fill ARGB — `Drawable.draw` emits a rect fill.
+pub(crate) const P_DRAW_COLOR: u64 = 0xFFFD_FEE1;
 
 pub(crate) fn now_ms() -> i64 {
     std::time::SystemTime::now()

@@ -25,6 +25,8 @@ const P_TAG: u32 = u32::MAX - 10;
 /// inflated `android:text` attribute. `pub`: the guest bridge's setter
 /// overrides write it for dex-inflated (non-GuestView) receivers.
 pub const P_TEXT: u32 = u32::MAX - 11;
+/// `setContentDescription` value — accessibility label, never drawn.
+pub const P_CDESC: u32 = u32::MAX - 28;
 /// Pseudo key: `android:hint` / `setHint` text — kept separate from
 /// P_TEXT so `getText` on a search box returns the user's input (empty)
 /// rather than the hint.
@@ -120,6 +122,14 @@ const P_MEAS_H: u32 = 0xFFFD_FFE4;
 pub const P_TCOLOR: u32 = 0xFFFD_FFE3;
 /// Live `setTextSize` px — same fallthrough path as [`P_TCOLOR`].
 pub const P_TSIZE: u32 = 0xFFFD_FFE2;
+/// Resolved layout direction stored on a `*LayoutParams` by
+/// `resolveLayoutDirection` (AOSP `mLayoutDirection`).
+const P_LP_DIR: u32 = u32::MAX - 29;
+/// Relative margins (`startMargin`/`endMargin`) — pseudos because
+/// `MarginLayoutParams.startMargin`/`endMargin` are never referenced
+/// by dex, so they get no canon field key to store under.
+const P_MSTART: u32 = u32::MAX - 42;
+const P_MEND: u32 = u32::MAX - 43;
 
 /// Lazily mint a per-view `ViewTreeObserver` — guests register
 /// `OnGlobalLayoutListener`s on it; `fire_global_layout` (called from
@@ -235,6 +245,10 @@ pub struct DexViewInfo {
     pub parent: u32,
     /// Child view handles, in z-order.
     pub children: Vec<u32>,
+    /// `android:gravity` as the AOSP flag int (LEFT=3, RIGHT=5,
+    /// CENTER_HORIZONTAL=1, TOP=0x30, BOTTOM=0x50, CENTER_VERTICAL=0x10).
+    /// 0 = unset — treat as top|start.
+    pub gravity: i32,
 }
 
 /// The activity's content view handle (what `setContentView` attached).
@@ -406,9 +420,47 @@ pub(crate) fn dex_view_info(vm: &Vm, h: u32) -> Option<DexViewInfo> {
     let lp_h = attr_find(vm, h, "layout_height")
         .map(|v| len_v(vm, v))
         .unwrap_or(-2);
-    let visible = !matches!(pseudo_get(vm, h, P_VIS), Some(V::I32(4) | V::I32(8)));
+    // `android:visibility` is an XML enum: 0=visible, 1=invisible,
+    // 2=gone — map to the View constants (0/4/8) the rest of the
+    // runtime uses.
+    let vis_attr = attr_find(vm, h, "visibility").and_then(|v| match v {
+        V::I32(2) => Some(8),
+        V::I32(1) => Some(4),
+        V::I32(_) => Some(0),
+        V::Ref(r) => match s(vm, r).as_deref() {
+            Some("invisible") => Some(4),
+            Some("gone") => Some(8),
+            _ => Some(0),
+        },
+        _ => None,
+    });
+    let visible = !matches!(
+        pseudo_get(vm, h, P_VIS).or(vis_attr.map(V::I32)),
+        Some(V::I32(4) | V::I32(8))
+    );
     let listener = match pseudo_get(vm, h, P_LISTENER) {
         Some(V::Ref(l)) => l,
+        _ => 0,
+    };
+    let gravity = match attr_find(vm, h, "gravity") {
+        Some(V::I32(g)) => g,
+        Some(V::Ref(r)) => s(vm, r)
+            .map(|n| {
+                n.split('|').fold(0, |acc, f| {
+                    acc | match f.trim() {
+                        "center" => 0x11,
+                        "center_horizontal" => 0x1,
+                        "center_vertical" => 0x10,
+                        "top" => 0x30,
+                        "bottom" => 0x50,
+                        "left" | "start" => 0x3,
+                        "right" | "end" => 0x5,
+                        "fill" => 0x77,
+                        _ => 0,
+                    }
+                })
+            })
+            .unwrap_or(0),
         _ => 0,
     };
     let kids: Vec<u32> = children(vm, h)
@@ -446,6 +498,7 @@ pub(crate) fn dex_view_info(vm: &Vm, h: u32) -> Option<DexViewInfo> {
             _ => 0,
         },
         children: kids,
+        gravity,
     })
 }
 
@@ -520,13 +573,7 @@ fn image_pixels_at(
         return None;
     }
     match v {
-        V::I32(res) if res > 0 => {
-            let bytes = vm
-                .apk_res
-                .as_ref()
-                .and_then(|r| r.file_path(res as u32).and_then(|p| r.read(p)))?;
-            decode_image(&bytes)
-        }
+        V::I32(res) if res > 0 => super::vector::drawable_bitmap(vm, res as u32),
         V::Ref(h) => super::android::bitmap_pixels(vm, v)
             .or_else(|| {
                 let path = image_source_path(vm, v)?;
@@ -616,6 +663,20 @@ pub(crate) fn call(
         "<init>" if class.ends_with("LayoutParams;") => {
             lp_ctor(vm, class, sig, args);
             Some(None)
+        }
+        // AOSP `MarginLayoutParams.resolveLayoutDirection` — the
+        // ConstraintLayout dex override resolves the start/end anchors
+        // into its resolved* fields and invoke-supers here for the
+        // margin fold. Store the direction (a pseudo — `mLayoutDirection`
+        // has no dex field ref) and fold relative margins into left/right.
+        "resolveLayoutDirection" if class.ends_with("LayoutParams;") => {
+            lp_resolve_dir(vm, this, i32v(args.get(1).copied().unwrap_or(V::I32(0))));
+            Some(None)
+        }
+        "getLayoutDirection" if class.ends_with("LayoutParams;") => {
+            Some(Some(
+                pseudo_get(vm, this, P_LP_DIR).unwrap_or(V::I32(0)),
+            ))
         }
         "inflate" if class.contains("MenuInflater") => {
             // MenuInflater.inflate(menuRes, Menu)
@@ -1213,13 +1274,20 @@ pub(crate) fn call(
             }
             Some(None)
         }
-        "setText" | "setTitle" | "setContentDescription" | "setTextScaleX" => {
+        "setText" | "setTitle" | "setTextScaleX" => {
             if name != "setTextScaleX" {
                 pseudo_set(vm, this, P_TEXT, args.get(1).copied().unwrap_or(V::Ref(0)));
                 if std::env::var_os("OVELO_VIEWDBG").is_some() {
                     eprintln!("[viewdbg] setText h{this} arg={:?} stored={:?}", args.get(1), pseudo_get(vm, this, P_TEXT));
                 }
             }
+            Some(None)
+        }
+        // contentDescription is an accessibility label — real Views
+        // never draw it, so it must not land in P_TEXT (it used to
+        // render every day-cell label as overlapped text).
+        "setContentDescription" => {
+            pseudo_set(vm, this, P_CDESC, args.get(1).copied().unwrap_or(V::Ref(0)));
             Some(None)
         }
         "setHint" => {
@@ -1229,8 +1297,11 @@ pub(crate) fn call(
         "getHint" => Some(Some(
             pseudo_get(vm, this, P_HINT).unwrap_or_else(|| jstr(vm, "")),
         )),
-        "getText" | "getTitle" | "getContentDescription" => Some(Some(
+        "getText" | "getTitle" => Some(Some(
             pseudo_get(vm, this, P_TEXT).unwrap_or_else(|| jstr(vm, "")),
+        )),
+        "getContentDescription" => Some(Some(
+            pseudo_get(vm, this, P_CDESC).unwrap_or_else(|| jstr(vm, "")),
         )),
         "setImageBitmap" | "setImageDrawable" | "setImageURI" | "setImageIcon"
         | "setImageResource" => {
@@ -1338,7 +1409,9 @@ pub(crate) fn call(
                     class_of(vm, V::Ref(this))
                 );
             }
-            pseudo_set(vm, this, P_LP, args.get(1).copied().unwrap_or(V::Ref(0)));
+            let lp = args.get(1).copied().unwrap_or(V::Ref(0));
+            pseudo_set(vm, this, P_LP, lp);
+            lp_resolve_dir_dex(vm, lp);
             // AOSP View.setLayoutParams ends in requestLayout() —
             // ConstraintLayout only rebuilds its widget list while a
             // child reports isLayoutRequested.
@@ -2044,6 +2117,12 @@ pub(crate) fn ta_attrs(vm: &Vm, h: u32) -> Vec<i32> {
 /// resolution chain for theme-scoped arrays and unset attrs.
 /// `None` when the value can't be resolved anywhere.
 pub(crate) fn ta_lookup(vm: &mut Vm, h: u32, index: usize) -> Option<V> {
+    if ta_attrs(vm, h).get(index).is_none()
+        && std::env::var_os("OVELO_VIEWDBG").is_some()
+    {
+        let n = ta_attrs(vm, h).len();
+        eprintln!("[viewdbg] ta_lookup[{index}] out-of-range attrs_len={n} h={h}");
+    }
     let attr_id = *ta_attrs(vm, h).get(index)? as u32;
     if std::env::var_os("OVELO_VIEWDBG").is_some() {
         eprintln!(
@@ -2102,7 +2181,11 @@ pub(crate) fn ta_lookup(vm: &mut Vm, h: u32, index: usize) -> Option<V> {
                     return Some(v);
                 }
                 if std::env::var_os("OVELO_VIEWDBG").is_some() {
-                    eprintln!("[viewdbg]   ta_map_miss {name} set={set_h}");
+                    let keys: Vec<String> = m
+                        .iter()
+                        .filter_map(|(k, _)| sv(vm, *k))
+                        .collect();
+                    eprintln!("[viewdbg]   ta_map_miss {name} set={set_h} keys={keys:?}");
                 }
             }
         }
@@ -2439,6 +2522,61 @@ fn child_measure_spec(spec: i32, padding: i32, child_dim: i32) -> i32 {
     (out & !MODE_MASK) | (mode & MODE_MASK)
 }
 
+/// AOSP `MarginLayoutParams.resolveLayoutDirection`: record the
+/// resolved direction and fold relative (start/end) margins into
+/// left/right under every canon key a reader can name.
+fn lp_resolve_dir(vm: &mut Vm, lp: u32, dir: i32) {
+    if lp == 0 {
+        return;
+    }
+    pseudo_set(vm, lp, P_LP_DIR, V::I32(dir));
+    // DEFAULT_MARGIN_RELATIVE — "no relative margin set". Relative
+    // margins arrive as pseudos (see lp_ctor); a code-side
+    // setMarginStart/End may still land on canon fields, so check both.
+    const UNSET: i32 = i32::MIN;
+    let start = pseudo_get(vm, lp, P_MSTART)
+        .or_else(|| lp_field(vm, lp, "startMargin"))
+        .map(i32v)
+        .unwrap_or(UNSET);
+    let end = pseudo_get(vm, lp, P_MEND)
+        .or_else(|| lp_field(vm, lp, "endMargin"))
+        .map(i32v)
+        .unwrap_or(UNSET);
+    if start == UNSET && end == UNSET {
+        return;
+    }
+    let rtl = dir == 1;
+    let left = if rtl { end } else { start };
+    let right = if rtl { start } else { end };
+    for (name, v) in [("leftMargin", left), ("rightMargin", right)] {
+        if v == UNSET {
+            continue;
+        }
+        let keys: Vec<GIdx> = vm
+            .field_keys_named(name, "I")
+            .into_iter()
+            .map(|(_, g)| g)
+            .collect();
+        if let Some(f) = fields_mut(vm, lp) {
+            for g in keys {
+                f.insert(g, V::I32(v));
+            }
+        }
+    }
+}
+
+/// Run the dex `LayoutParams.resolveLayoutDirection` override when the
+/// LP class has one (ConstraintLayout resolves its anchors there).
+/// No-op for LP classes without the override.
+fn lp_resolve_dir_dex(vm: &mut Vm, lp: V) {
+    let V::Ref(h) = lp else { return };
+    if h == 0 {
+        return;
+    }
+    // Host layout direction is LTR (getLayoutDirection → 0).
+    let _ = vm.call_virtual_sig(h, "resolveLayoutDirection", &["I"], &[V::I32(0)]);
+}
+
 /// Read an int field off a LayoutParams object under every canon key
 /// a writer could have used (owner obfuscation, LP subclasses).
 fn lp_field(vm: &Vm, lp: u32, name: &str) -> Option<V> {
@@ -2600,7 +2738,11 @@ fn group_measure_fallback(vm: &mut Vm, this: u32, pw: i32, ph: i32) {
         pseudo_set(vm, this, P_MEAS_H, V::I32(resolve_size(chh + pad_h, ph, true)));
         return;
     }
-    let linear = class_of(vm, V::Ref(this)).contains("LinearLayout");
+    // Stack containers by ancestry, not name — a `MyColumn extends
+    // LinearLayout` stacks vertically even when its name doesn't say
+    // so (matches the layout-side check below).
+    let desc = class_of(vm, V::Ref(this));
+    let linear = desc.contains("LinearLayout") || vm.extends_named(&desc, "LinearLayout");
     let (mut cw, mut chh) = (0i32, 0i32);
     for c in kids {
         let V::Ref(ch) = c else { continue };
@@ -2630,10 +2772,16 @@ fn group_measure_fallback(vm: &mut Vm, this: u32, pw: i32, ph: i32) {
 /// Generic `onLayout` for framework skeleton containers: FrameLayout
 /// semantics (children at the parent's content origin plus their
 /// margins, at measured size); LinearLayout stacks vertically.
-fn group_layout_fallback(vm: &mut Vm, this: u32, _l: i32, _t: i32, _r: i32, _b: i32) {
+fn group_layout_fallback(vm: &mut Vm, this: u32, _l: i32, _t: i32, r: i32, b: i32) {
     let pad_l = lp_px(vm, attr_find(vm, this, "paddingLeft").unwrap_or(V::I32(0))).unwrap_or(0);
     let pad_t = lp_px(vm, attr_find(vm, this, "paddingTop").unwrap_or(V::I32(0))).unwrap_or(0);
-    let linear = class_of(vm, V::Ref(this)).contains("LinearLayout");
+    let desc = class_of(vm, V::Ref(this));
+    let linear =
+        desc.contains("LinearLayout") || vm.extends_named(&desc, "LinearLayout");
+    if !linear && vm.extends_named(&desc, "RelativeLayout") {
+        relative_layout_fallback(vm, this, r - _l, b - _t);
+        return;
+    }
     // Children are laid out in THIS view's content coordinates —
     // (0,0) is its own top-left, not the (l,t) corner of its frame
     // in the parent, or a nested container shifts its children by
@@ -2680,6 +2828,304 @@ fn group_layout_fallback(vm: &mut Vm, this: u32, _l: i32, _t: i32, _r: i32, _b: 
             }
         }
         cur_t = ct + chh + mb;
+    }
+}
+
+/// `RelativeLayout` subset: resolve the usual XML rules
+/// (`layout_alignParent*`, `layout_center*`, `layout_below`/`above`,
+/// `layout_toRightOf`/`toLeftOf`, `layout_align*`) against the
+/// container's content rect at each child's measured size + margins.
+/// Without this every child lands on the same origin — the pile of
+/// overlapped views that used to be the whole month page.
+/// `w`/`h` are the container's content size in its own coordinates.
+fn relative_layout_fallback(vm: &mut Vm, this: u32, w: i32, h: i32) {
+    let pad_l = lp_px(vm, attr_find(vm, this, "paddingLeft").unwrap_or(V::I32(0))).unwrap_or(0);
+    let pad_t = lp_px(vm, attr_find(vm, this, "paddingTop").unwrap_or(V::I32(0))).unwrap_or(0);
+    let pad_r = lp_px(vm, attr_find(vm, this, "paddingRight").unwrap_or(V::I32(0))).unwrap_or(0);
+    let pad_b = lp_px(vm, attr_find(vm, this, "paddingBottom").unwrap_or(V::I32(0))).unwrap_or(0);
+    let kids: Vec<u32> = children(vm, this)
+        .into_iter()
+        .filter_map(|v| match v {
+            V::Ref(h) if h != 0 => Some(h),
+            _ => None,
+        })
+        .collect();
+    let n = kids.len();
+    let margin = |vm: &Vm, ch: u32, name: &str| -> i32 {
+        if let Some(V::Ref(lp)) = pseudo_get(vm, ch, P_LP) {
+            if lp != 0 {
+                return lp_field(vm, lp, name)
+                    .and_then(|f| lp_px(vm, f))
+                    .unwrap_or(0);
+            }
+        }
+        0
+    };
+    struct Kid {
+        id: i32,
+        w: i32,
+        h: i32,
+        ml: i32,
+        mt: i32,
+        mr: i32,
+        mb: i32,
+    }
+    let mut ks: Vec<Kid> = Vec::with_capacity(n);
+    for &ch in &kids {
+        ks.push(Kid {
+            id: pint(vm, ch, P_VIEW_ID),
+            w: pint(vm, ch, P_MEAS_W) & 0x00FF_FFFF,
+            h: pint(vm, ch, P_MEAS_H) & 0x00FF_FFFF,
+            ml: margin(vm, ch, "leftMargin"),
+            mt: margin(vm, ch, "topMargin"),
+            mr: margin(vm, ch, "rightMargin"),
+            mb: margin(vm, ch, "bottomMargin"),
+        });
+    }
+    let idx_of = |id: i32| -> Option<usize> {
+        if id == 0 {
+            return None;
+        }
+        ks.iter().position(|k| k.id == id)
+    };
+    let truthy = |v: Option<V>| matches!(v, Some(V::I32(i)) if i != 0);
+    let ref_id = |v: Option<V>| -> Option<i32> {
+        match v {
+            Some(V::I32(i)) if i > 0 => Some(i),
+            _ => None,
+        }
+    };
+    let rule = |vm: &Vm, ch: u32, names: &[&str]| -> Option<V> {
+        names.iter().find_map(|n| attr_find(vm, ch, n))
+    };
+    // Edges resolve per axis — AOSP's DependencyGraph does the same:
+    // `toEndOf`+`toStartOf` squeeze a child between siblings without a
+    // cycle when the siblings' vertical rules point back (e.g. the
+    // header arrows' alignTop/alignBottom anchor on the label).
+    // Each axis yields (leading, trailing) content-coord edges; a
+    // missing trailing edge falls back to leading+measured.
+    type Axis = Vec<Option<(i32, i32)>>;
+    let resolve_edges = |vm: &Vm,
+                         ch: u32,
+                         k: &Kid,
+                         placed: &Axis,
+                         horiz: bool|
+     -> Option<(i32, i32)> {
+        // Leading edge: sibling rules first (toRightOf/alignLeft,
+        // below/alignTop), else the parent's near edge.
+        let (lead_rules, trail_parent, lead_parent, lead_sib_rules, size, mlead, mtrail) =
+            if horiz {
+                (
+                    &["layout_toRightOf", "layout_toEndOf"][..],
+                    &["layout_alignParentRight", "layout_alignParentEnd"][..],
+                    &["layout_alignParentLeft", "layout_alignParentStart"][..],
+                    &["layout_alignLeft", "layout_alignStart"][..],
+                    k.w,
+                    k.ml,
+                    k.mr,
+                )
+            } else {
+                (
+                    &["layout_below"][..],
+                    &["layout_alignParentBottom"][..],
+                    &["layout_alignParentTop"][..],
+                    &["layout_alignTop"][..],
+                    k.h,
+                    k.mt,
+                    k.mb,
+                )
+            };
+        let (extent, pleading, ptrailing) = if horiz {
+            (w, pad_l, pad_r)
+        } else {
+            (h, pad_t, pad_b)
+        };
+        let sib_edge = |id: i32, trailing: bool| -> Option<Option<i32>> {
+            // Some(edge) = rule present; the inner Option is the
+            // sibling's resolved edge (None while unplaced).
+            Some(idx_of(id).and_then(|j| {
+                placed[j].map(|(a, b)| if trailing { b } else { a })
+            }))
+        };
+
+        let mut lead: Option<i32> = None;
+        let mut trail: Option<i32> = None;
+        let mut pending = false;
+        if truthy(rule(vm, ch, trail_parent)) {
+            trail = Some(extent - ptrailing - mtrail);
+        }
+        if truthy(rule(vm, ch, lead_parent)) {
+            lead = Some(pleading + mlead);
+        }
+        if let Some(dep) = ref_id(rule(vm, ch, lead_rules)) {
+            match sib_edge(dep, true) {
+                Some(Some(e)) => lead = Some(e + mlead),
+                Some(None) => pending = true,
+                None => {}
+            }
+        }
+        if let Some(dep) = ref_id(rule(vm, ch, lead_sib_rules)) {
+            match sib_edge(dep, false) {
+                Some(Some(e)) => lead = Some(e + mlead),
+                Some(None) => pending = true,
+                None => {}
+            }
+        }
+        // Trailing edge, sibling-anchored: `toLeftOf`/`toStartOf`/
+        // `above` anchor the sibling's leading edge, `alignRight`/
+        // `alignEnd`/`alignBottom` its trailing edge — separate rule
+        // sets since they read opposite edges.
+        let (trail_lead_anchor, trail_trail_anchor) = if horiz {
+            (
+                &["layout_toLeftOf", "layout_toStartOf"][..],
+                &["layout_alignRight", "layout_alignEnd"][..],
+            )
+        } else {
+            (&["layout_above"][..], &["layout_alignBottom"][..])
+        };
+        for (names, on_trailing) in [
+            (trail_lead_anchor, false),
+            (trail_trail_anchor, true),
+        ] {
+            if let Some(dep) = ref_id(rule(vm, ch, names)) {
+                match sib_edge(dep, on_trailing) {
+                    Some(Some(e)) => trail = Some(e - mtrail),
+                    Some(None) => pending = true,
+                    None => {}
+                }
+            }
+        }
+
+        if pending {
+            return None;
+        }
+        match (lead, trail) {
+            (Some(l), Some(t)) => Some((l, t)),
+            (Some(l), None) => Some((l, l + size)),
+            (None, Some(t)) => Some((t - size, t)),
+            (None, None) => {
+                if truthy(rule(vm, ch, &["layout_centerInParent"]))
+                    || truthy(rule(
+                        vm,
+                        ch,
+                        if horiz {
+                            &["layout_centerHorizontal"]
+                        } else {
+                            &["layout_centerVertical"]
+                        },
+                    ))
+                {
+                    let c = pleading + (extent - pleading - ptrailing - size) / 2 + mlead - mtrail;
+                    Some((c, c + size))
+                } else {
+                    Some((pleading + mlead, pleading + mlead + size))
+                }
+            }
+        }
+    };
+    // Bounded fixpoint per axis — each pass places every child whose
+    // deps resolved; cycles/missing ids leave the child at origin.
+    let mut xf: Axis = vec![None; n];
+    let mut yf: Axis = vec![None; n];
+    for _ in 0..n {
+        let mut progress = false;
+        for (i, &ch) in kids.iter().enumerate() {
+            if xf[i].is_none() {
+                if let Some(e) = resolve_edges(vm, ch, &ks[i], &xf, true) {
+                    xf[i] = Some(e);
+                    progress = true;
+                }
+            }
+            if yf[i].is_none() {
+                if let Some(e) = resolve_edges(vm, ch, &ks[i], &yf, false) {
+                    yf[i] = Some(e);
+                    progress = true;
+                }
+            }
+        }
+        if !progress {
+            break;
+        }
+    }
+    let pos: Vec<(i32, i32, i32, i32)> = (0..n)
+        .map(|i| {
+            let (l, r) = xf[i].unwrap_or_else(|| {
+                let l = pad_l + ks[i].ml;
+                (l, l + ks[i].w)
+            });
+            let (t, b) = yf[i].unwrap_or_else(|| {
+                let t = pad_t + ks[i].mt;
+                (t, t + ks[i].h)
+            });
+            (l, t, r, b)
+        })
+        .collect();
+    for (i, &ch) in kids.iter().enumerate() {
+        let (cl, ct, cr, cb) = pos[i];
+        // AOSP RelativeLayout measures children twice — once raw, once
+        // under the dependency-resolved extent. Re-measure a child
+        // whose rule-resolved size differs from its first pass so its
+        // own `onLayout`/descendants see the squeezed bounds instead
+        // of the unconstrained measurement.
+        let (rw, rh) = (cr - cl, cb - ct);
+        if rw != ks[i].w || rh != ks[i].h {
+            const EXACTLY: i32 = 1 << 30;
+            // Read the LIVE LayoutParams dims — `setLayoutParams`
+            // mutations beat the XML attrs. Spec per axis: a changed
+            // axis gets the child's lp vs the resolved extent
+            // (match_parent fills, wrap shrinks); an unchanged axis
+            // keeps its measured size so a width-only rule can't
+            // collapse the height.
+            let lp_obj = match pseudo_get(vm, ch, P_LP) {
+                Some(V::Ref(lp)) => lp,
+                _ => 0,
+            };
+            let dim = |field: &str, xml: &str| {
+                lp_field(vm, lp_obj, field)
+                    .and_then(|v| lp_px(vm, v))
+                    .or_else(|| attr_find(vm, ch, xml).map(|v| len_v(vm, v)))
+                    .unwrap_or(-2)
+            };
+            let dw = dim("width", "layout_width");
+            let dh = dim("height", "layout_height");
+            let ws = if rw != ks[i].w {
+                child_measure_spec(EXACTLY | rw.max(0), 0, dw)
+            } else {
+                EXACTLY | rw.max(0)
+            };
+            let hs = if rh != ks[i].h {
+                child_measure_spec(EXACTLY | rh.max(0), 0, dh)
+            } else {
+                EXACTLY | rh.max(0)
+            };
+            let _ = vm.call_virtual(ch, "measure", &[V::I32(ws), V::I32(hs)]);
+        }
+        if std::env::var_os("OVELO_VIEWDBG").is_some() {
+            let rules: Vec<String> = [
+                "layout_centerInParent", "layout_centerHorizontal", "layout_centerVertical",
+                "layout_alignParentRight", "layout_alignParentEnd", "layout_alignParentBottom",
+                "layout_alignParentTop", "layout_alignParentLeft", "layout_toRightOf",
+                "layout_toEndOf", "layout_toLeftOf", "layout_toStartOf", "layout_alignLeft",
+                "layout_alignStart", "layout_alignRight", "layout_alignEnd", "layout_below",
+                "layout_above", "layout_alignTop", "layout_alignBottom",
+            ]
+            .iter()
+            .filter_map(|n| attr_find(vm, ch, n).map(|v| format!("{n}={v:?}")))
+            .collect();
+            eprintln!(
+                "[viewdbg] relLayout h{ch} id={:#x} meas={}x{} at {cl},{ct} rules={:?}",
+                ks[i].id, ks[i].w, ks[i].h, rules
+            );
+        }
+        if let Err(e) = vm.call_virtual(
+            ch,
+            "layout",
+            &[V::I32(cl), V::I32(ct), V::I32(cr), V::I32(cb)],
+        ) {
+            if std::env::var_os("OVELO_VIEWDBG").is_some() {
+                eprintln!("[viewdbg] relLayout h{ch} err {e}");
+            }
+        }
     }
 }
 
@@ -2732,6 +3178,22 @@ fn lp_ctor(vm: &mut Vm, class: &str, sig: &str, args: &[V]) {
                 }
             }
         }
+        // Relative margins can't reach a canon field (dex never refs
+        // `startMargin`/`endMargin`) — hold them on pseudos; the
+        // resolveLayoutDirection fold writes them into left/right.
+        // AOSP keeps `layout_margin` absolute-only — it must NOT feed
+        // start/end, or the fold would later overwrite left/right
+        // margins a caller mutated after construction.
+        for (attr, key) in [
+            ("layout_marginStart", P_MSTART),
+            ("layout_marginEnd", P_MEND),
+        ] {
+            let v = attrset_value(vm, args.get(2).copied().unwrap_or(V::Ref(0)), attr)
+                .and_then(|v| lp_px(vm, v));
+            if let Some(px) = v {
+                pseudo_set(vm, this, key, V::I32(px));
+            }
+        }
         let _ = class;
     } else if sig == "(II)V" {
         for (f, a) in [("width", args.get(1)), ("height", args.get(2))] {
@@ -2765,6 +3227,13 @@ fn lp_ctor(vm: &mut Vm, class: &str, sig: &str, args: &[V]) {
                     {
                         writes.push((f.to_string(), ty.to_string(), v));
                     }
+                }
+            }
+            // Relative margins live on pseudos — carry them too (AOSP
+            // copies startMargin/endMargin in the copy ctor).
+            for key in [P_MSTART, P_MEND] {
+                if let Some(v) = src_fields.get(&(key as u64)).copied() {
+                    pseudo_set(vm, this, key, v);
                 }
             }
         }
@@ -3124,6 +3593,14 @@ pub(crate) fn attach_at(
                     pseudo_set(vm, ch, P_LP, v);
                 }
             }
+        }
+        // AOSP resolves LP direction in resolveLayoutParams during the
+        // layout pass; ConstraintLayout$LayoutParams.resolveLayoutDirection
+        // is what turns `endToEnd=parent` into the resolvedRightToRight
+        // anchor the solver reads — without it start/end constraints
+        // silently drop and the child lands at x=0.
+        if let Some(lp @ V::Ref(_)) = pseudo_get(vm, ch, P_LP) {
+            lp_resolve_dir_dex(vm, lp);
         }
         // AOSP ViewGroup.addViewInner notifies onViewAdded — dex parents
         // (ConstraintLayout) use it to arm mDirtyHierarchy and register

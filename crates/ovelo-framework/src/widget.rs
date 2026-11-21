@@ -206,6 +206,9 @@ pub struct TextView {
     pub text_size: f32,
     /// Uniform padding px.
     pub padding: i32,
+    /// AOSP gravity flags (CENTER_HORIZONTAL=1, CENTER_VERTICAL=0x10,
+    /// RIGHT/END=5, BOTTOM=0x50). 0 = top|start.
+    pub gravity: i32,
 }
 
 impl TextView {
@@ -218,6 +221,7 @@ impl TextView {
             fonts,
             text_size,
             padding: 0,
+            gravity: 0,
         };
         v.view.desired = v.measure_text(None);
         v
@@ -283,13 +287,29 @@ impl Drawable for TextView {
             Some((s.w - self.padding * 2).max(0)),
             false,
         );
+        if std::env::var_os("OVELO_POSDBG").is_some() && !self.text.is_empty() {
+            eprintln!("[posdbg] text {:?} at {},{} size {}", self.text, self.view.left, self.view.top, self.text_size);
+        }
         let lh = t.ascent + t.descent;
-        let mut baseline = self.view.top + self.padding + t.ascent;
+        // Vertical gravity: 0x10 center, 0x50 bottom, else top.
+        let text_h = lh * t.lines.len().max(1) as i32;
+        let vy = match self.gravity & 0x70 {
+            0x10 => self.view.top + (s.h - text_h) / 2,
+            0x50 => self.view.top + s.h - self.padding - text_h,
+            _ => self.view.top + self.padding,
+        };
+        let mut baseline = vy + t.ascent;
         for line in &t.lines {
             let seg = &self.text[line.range.0..line.range.1];
+            // Horizontal gravity: 1 center, 5 right/end, else left.
+            let tx = match self.gravity & 0x7 {
+                0x1 => self.view.left + (s.w - line.width) / 2,
+                0x5 => self.view.left + s.w - self.padding - line.width,
+                _ => self.view.left + self.padding,
+            };
             c.draw_text(
                 seg,
-                self.view.left + self.padding,
+                tx,
                 baseline,
                 Paint {
                     color: self.color,
@@ -380,8 +400,25 @@ impl Drawable for Button {
         c.draw_round_rect(
             Rect::new(self.tv.view.left, self.tv.view.top, s.w, s.h),
             self.radius,
-            Paint::color(self.bg),
+            Paint::color(self.tv.view.background.unwrap_or(self.bg)),
         );
+        // An ImageView-style src (FAB icon, ImageButton) draws centered
+        // inside the bounds, fit-center scaled down when larger.
+        if let Some((iw, ih, px)) = &self.tv.view.image {
+            let fit = ((s.w as f32 / *iw as f32).min(s.h as f32 / *ih as f32)).min(1.0);
+            let (dw, dh) = ((*iw as f32 * fit) as i32, (*ih as f32 * fit) as i32);
+            let x = self.tv.view.left + (s.w - dw) / 2;
+            let y = self.tv.view.top + (s.h - dh) / 2;
+            c.draw_image(
+                x,
+                y,
+                dw.max(0) as usize,
+                dh.max(0) as usize,
+                *iw as usize,
+                *ih as usize,
+                px,
+            );
+        }
         // The label draws inside the bg; skip tv's own background pass.
         let keep = self.tv.view.background.take();
         self.tv.draw(c);
@@ -470,8 +507,13 @@ fn replay_guest_ops(c: &mut Canvas, ops: &[ovelo_dexrt::CanvasOp]) {
             }
             O::Oval { l, t, r, b, paint: p } => {
                 let r = Rect::new(*l as i32, *t as i32, (*r - *l) as i32, (*b - *t) as i32);
-                let rad = (r.x1 - r.x).min(r.y1 - r.y) / 2;
-                stroke_or_fill(c, r, p, rad);
+                if p.style == 1 {
+                    // STROKE — a real ring, not a rect outline.
+                    c.stroke_oval(r, p.stroke_w.max(1.0) as i32, paint(p));
+                } else {
+                    let rad = (r.x1 - r.x).min(r.y1 - r.y) / 2;
+                    stroke_or_fill(c, r, p, rad);
+                }
             }
             O::Circle {
                 cx,
@@ -485,7 +527,11 @@ fn replay_guest_ops(c: &mut Canvas, ops: &[ovelo_dexrt::CanvasOp]) {
                     (*r * 2.0) as i32,
                     (*r * 2.0) as i32,
                 );
-                stroke_or_fill(c, rect, p, *r as i32);
+                if p.style == 1 {
+                    c.stroke_oval(rect, p.stroke_w.max(1.0) as i32, paint(p));
+                } else {
+                    stroke_or_fill(c, rect, p, *r as i32);
+                }
             }
             O::Line {
                 x0,

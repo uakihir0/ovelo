@@ -72,7 +72,7 @@ fn paint_state(vm: &Vm, v: V) -> PaintState {
 }
 
 /// Append an op to a recording canvas handle.
-fn rec(vm: &mut Vm, canvas: V, op: CanvasOp) {
+pub(crate) fn rec(vm: &mut Vm, canvas: V, op: CanvasOp) {
     let V::Ref(h) = canvas else { return };
     if let Some(Obj::Host {
         state: HostState::CanvasOps(ops),
@@ -387,8 +387,19 @@ fn paint_call(vm: &mut Vm, name: &str, _sig: &str, args: &[V]) -> Rt<Option<Opti
     let V::Ref(h) = this else { return Ok(None) };
     Ok(match name {
         "<init>" => {
-            pseudo_set(vm, h, PK_COLOR, V::I32(0xFF00_0000u32 as i32));
-            pseudo_set(vm, h, PK_TSIZE, V::F32(12.0));
+            // Paint(Paint src) copies the source's state; plain init gets
+            // defaults. AOSP copies every field — we carry the pseudo set.
+            if let Some(V::Ref(src)) = args.get(1).copied() {
+                for key in [PK_COLOR, PK_TSIZE, PK_ALIGN, PK_STYLE, PK_SW, PK_BOLD] {
+                    if let Some(v) = pseudo_get(vm, src, key) {
+                        pseudo_set(vm, h, key, v);
+                    }
+                }
+            }
+            if pseudo_get(vm, h, PK_TSIZE).is_none() {
+                pseudo_set(vm, h, PK_COLOR, V::I32(0xFF00_0000u32 as i32));
+                pseudo_set(vm, h, PK_TSIZE, V::F32(12.0));
+            }
             Some(None)
         }
         "setColor" => {
@@ -760,6 +771,17 @@ pub(crate) fn guest_draw_ops(vm: &mut Vm, view: u32, w: i32, h: i32) -> Vec<Canv
     if std::env::var_os("OVELO_DRAWDBG").is_some() {
         let d = crate::jdk::class_of(vm, V::Ref(view));
         eprintln!("[drawdbg] onDraw h{view} {d} {w}x{h} -> {n} ops err={:?}", r.is_err());
+        if std::env::var_os("OVELO_DRAWDBG_DUMP").is_some() {
+            if let Some(Obj::Host {
+                state: HostState::CanvasOps(ops),
+                ..
+            }) = vm.heap.get(canvas)
+            {
+                for (i, op) in ops.iter().enumerate() {
+                    eprintln!("[drawdbg]   op{i} {op:?}");
+                }
+            }
+        }
     }
     match vm.heap.get(canvas) {
         Some(Obj::Host {

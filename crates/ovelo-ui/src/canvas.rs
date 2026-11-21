@@ -116,6 +116,42 @@ impl<'a> Canvas<'a> {
         self.surf.fill_rounded_rect(self.tr(r), rad, p.color);
     }
 
+    /// `drawOval`/`drawCircle` with `Paint.Style.STROKE` — the ring
+    /// between the outer ellipse and the ellipse shrunk by `w` on each
+    /// side. Per-pixel: inside outer AND outside inner is stroke.
+    pub fn stroke_oval(&mut self, r: Rect, w: i32, p: Paint) {
+        let r = self.tr(r);
+        let w = w as f32;
+        let (rw, rh) = ((r.x1 - r.x) as f32, (r.y1 - r.y) as f32);
+        if rw <= 0.0 || rh <= 0.0 {
+            return;
+        }
+        let (cx, cy) = (r.x as f32 + rw / 2.0, r.y as f32 + rh / 2.0);
+        let (rx, ry) = (rw / 2.0, rh / 2.0);
+        // Inner ellipse shrunk by the stroke width on each axis; when a
+        // side collapses the whole interior is ring.
+        let (irx, iry) = ((rx - w).max(0.0), (ry - w).max(0.0));
+        for y in r.y..r.y1 {
+            for x in r.x..r.x1 {
+                let dx = (x as f32 + 0.5 - cx) / rx;
+                let dy = (y as f32 + 0.5 - cy) / ry;
+                if dx * dx + dy * dy > 1.0 {
+                    continue;
+                }
+                let in_inner = irx > 0.0
+                    && iry > 0.0
+                    && {
+                        let ix = (x as f32 + 0.5 - cx) / irx;
+                        let iy = (y as f32 + 0.5 - cy) / iry;
+                        ix * ix + iy * iy <= 1.0
+                    };
+                if !in_inner {
+                    self.surf.blend_pixel(x, y, p.color, 255);
+                }
+            }
+        }
+    }
+
     /// `drawLine` — stroked segment (translated endpoints).
     pub fn draw_line(&mut self, x0: i32, y0: i32, x1: i32, y1: i32, w: i32, p: Paint) {
         self.surf.draw_line(
