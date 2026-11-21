@@ -486,7 +486,7 @@ extern "C" fn sh_vsnprintf_chk(
 }
 static mut SH_ERRNO: i32 = 0;
 extern "C" fn sh_errno() -> *mut i32 {
-    unsafe { std::ptr::addr_of_mut!(SH_ERRNO) }
+    std::ptr::addr_of_mut!(SH_ERRNO)
 }
 extern "C" fn sh_assert2(
     file: *const i8,
@@ -525,6 +525,7 @@ extern "C" fn sh_gettid() -> i32 {
 extern "C" fn sh_open2(path: *const i8, flags: i32) -> i32 {
     unsafe { open(path, flags) }
 }
+#[cfg(target_os = "macos")]
 extern "C" fn sh_terminate() -> ! {
     eprintln!("[native] cxa handler invoked");
     unsafe { abort() }
