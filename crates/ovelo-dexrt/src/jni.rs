@@ -50,11 +50,19 @@ extern "C" {
 static mut MUTEX_STORAGE: [u8; 128] = [0; 128];
 static mut MUTEX_ATTR_STORAGE: [u8; 128] = [0; 128];
 
+// PTHREAD_MUTEX_RECURSIVE is 2 on macOS but 1 on glibc/Bionic
+// (where 2 is PTHREAD_MUTEX_ERRORCHECK — relocking would fail with
+// EDEADLK and Drop would then release a lock this guard never took).
+#[cfg(target_os = "macos")]
+const MUTEX_TYPE_RECURSIVE: i32 = 2;
+#[cfg(not(target_os = "macos"))]
+const MUTEX_TYPE_RECURSIVE: i32 = 1;
+
 fn vm_mtx() -> *mut c_void {
     MTX_ONCE.call_once(|| unsafe {
         let a = std::ptr::addr_of_mut!(MUTEX_ATTR_STORAGE) as *mut c_void;
         pthread_mutexattr_init(a);
-        pthread_mutexattr_settype(a, 2); // PTHREAD_MUTEX_RECURSIVE
+        pthread_mutexattr_settype(a, MUTEX_TYPE_RECURSIVE);
         let m = std::ptr::addr_of_mut!(MUTEX_STORAGE) as *mut c_void;
         pthread_mutex_init(m, a);
         VM_MTX.store(m as usize, std::sync::atomic::Ordering::Release);
@@ -86,7 +94,10 @@ impl Drop for VmGuard {
 
 pub(crate) fn vm() -> VmGuard {
     unsafe {
-        pthread_mutex_lock(vm_mtx());
+        if pthread_mutex_lock(vm_mtx()) != 0 {
+            // Continuing without the lock is UB; aborting is safer.
+            std::process::abort();
+        }
     }
     let p = CUR_VM.get() as usize;
     let p = if p != 0 {
