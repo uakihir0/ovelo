@@ -45,6 +45,7 @@ extern "C" {
     fn vsnprintf(s: *mut i8, n: usize, fmt: *const i8, ap: *mut c_void) -> i32;
     fn open(path: *const i8, flags: i32, ...) -> i32;
     fn abort() -> !;
+    #[cfg(target_os = "macos")]
     fn pthread_threadid_np(t: usize, id: *mut u64) -> i32;
     fn lseek(fd: i32, off: i64, whence: i32) -> i64;
     #[cfg(target_os = "macos")]
@@ -509,12 +510,17 @@ extern "C" fn sh_zero() -> i64 {
 extern "C" fn sh_neg1() -> i64 {
     -1
 }
+#[cfg(target_os = "macos")]
 extern "C" fn sh_gettid() -> i32 {
     unsafe {
         let mut id = 0u64;
         pthread_threadid_np(0, &mut id);
         id as i32
     }
+}
+#[cfg(not(target_os = "macos"))]
+extern "C" fn sh_gettid() -> i32 {
+    0
 }
 extern "C" fn sh_open2(path: *const i8, flags: i32) -> i32 {
     unsafe { open(path, flags) }
