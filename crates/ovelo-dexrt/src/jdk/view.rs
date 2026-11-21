@@ -25,6 +25,8 @@ const P_TAG: u32 = u32::MAX - 10;
 /// inflated `android:text` attribute. `pub`: the guest bridge's setter
 /// overrides write it for dex-inflated (non-GuestView) receivers.
 pub const P_TEXT: u32 = u32::MAX - 11;
+/// `setContentDescription` value — accessibility label, never drawn.
+pub const P_CDESC: u32 = u32::MAX - 28;
 /// Pseudo key: `android:hint` / `setHint` text — kept separate from
 /// P_TEXT so `getText` on a search box returns the user's input (empty)
 /// rather than the hint.
@@ -1230,13 +1232,20 @@ pub(crate) fn call(
             }
             Some(None)
         }
-        "setText" | "setTitle" | "setContentDescription" | "setTextScaleX" => {
+        "setText" | "setTitle" | "setTextScaleX" => {
             if name != "setTextScaleX" {
                 pseudo_set(vm, this, P_TEXT, args.get(1).copied().unwrap_or(V::Ref(0)));
                 if std::env::var_os("OVELO_VIEWDBG").is_some() {
                     eprintln!("[viewdbg] setText h{this} arg={:?} stored={:?}", args.get(1), pseudo_get(vm, this, P_TEXT));
                 }
             }
+            Some(None)
+        }
+        // contentDescription is an accessibility label — real Views
+        // never draw it, so it must not land in P_TEXT (it used to
+        // render every day-cell label as overlapped text).
+        "setContentDescription" => {
+            pseudo_set(vm, this, P_CDESC, args.get(1).copied().unwrap_or(V::Ref(0)));
             Some(None)
         }
         "setHint" => {
@@ -1246,8 +1255,11 @@ pub(crate) fn call(
         "getHint" => Some(Some(
             pseudo_get(vm, this, P_HINT).unwrap_or_else(|| jstr(vm, "")),
         )),
-        "getText" | "getTitle" | "getContentDescription" => Some(Some(
+        "getText" | "getTitle" => Some(Some(
             pseudo_get(vm, this, P_TEXT).unwrap_or_else(|| jstr(vm, "")),
+        )),
+        "getContentDescription" => Some(Some(
+            pseudo_get(vm, this, P_CDESC).unwrap_or_else(|| jstr(vm, "")),
         )),
         "setImageBitmap" | "setImageDrawable" | "setImageURI" | "setImageIcon"
         | "setImageResource" => {
@@ -2647,10 +2659,16 @@ fn group_measure_fallback(vm: &mut Vm, this: u32, pw: i32, ph: i32) {
 /// Generic `onLayout` for framework skeleton containers: FrameLayout
 /// semantics (children at the parent's content origin plus their
 /// margins, at measured size); LinearLayout stacks vertically.
-fn group_layout_fallback(vm: &mut Vm, this: u32, _l: i32, _t: i32, _r: i32, _b: i32) {
+fn group_layout_fallback(vm: &mut Vm, this: u32, _l: i32, _t: i32, r: i32, b: i32) {
     let pad_l = lp_px(vm, attr_find(vm, this, "paddingLeft").unwrap_or(V::I32(0))).unwrap_or(0);
     let pad_t = lp_px(vm, attr_find(vm, this, "paddingTop").unwrap_or(V::I32(0))).unwrap_or(0);
-    let linear = class_of(vm, V::Ref(this)).contains("LinearLayout");
+    let desc = class_of(vm, V::Ref(this));
+    let linear =
+        desc.contains("LinearLayout") || vm.extends_named(&desc, "LinearLayout");
+    if !linear && vm.extends_named(&desc, "RelativeLayout") {
+        relative_layout_fallback(vm, this, r - _l, b - _t);
+        return;
+    }
     // Children are laid out in THIS view's content coordinates —
     // (0,0) is its own top-left, not the (l,t) corner of its frame
     // in the parent, or a nested container shifts its children by
@@ -2697,6 +2715,266 @@ fn group_layout_fallback(vm: &mut Vm, this: u32, _l: i32, _t: i32, _r: i32, _b: 
             }
         }
         cur_t = ct + chh + mb;
+    }
+}
+
+/// `RelativeLayout` subset: resolve the usual XML rules
+/// (`layout_alignParent*`, `layout_center*`, `layout_below`/`above`,
+/// `layout_toRightOf`/`toLeftOf`, `layout_align*`) against the
+/// container's content rect at each child's measured size + margins.
+/// Without this every child lands on the same origin — the pile of
+/// overlapped views that used to be the whole month page.
+/// `w`/`h` are the container's content size in its own coordinates.
+fn relative_layout_fallback(vm: &mut Vm, this: u32, w: i32, h: i32) {
+    let pad_l = lp_px(vm, attr_find(vm, this, "paddingLeft").unwrap_or(V::I32(0))).unwrap_or(0);
+    let pad_t = lp_px(vm, attr_find(vm, this, "paddingTop").unwrap_or(V::I32(0))).unwrap_or(0);
+    let pad_r = lp_px(vm, attr_find(vm, this, "paddingRight").unwrap_or(V::I32(0))).unwrap_or(0);
+    let pad_b = lp_px(vm, attr_find(vm, this, "paddingBottom").unwrap_or(V::I32(0))).unwrap_or(0);
+    let kids: Vec<u32> = children(vm, this)
+        .into_iter()
+        .filter_map(|v| match v {
+            V::Ref(h) if h != 0 => Some(h),
+            _ => None,
+        })
+        .collect();
+    let n = kids.len();
+    let margin = |vm: &Vm, ch: u32, name: &str| -> i32 {
+        if let Some(V::Ref(lp)) = pseudo_get(vm, ch, P_LP) {
+            if lp != 0 {
+                return lp_field(vm, lp, name)
+                    .and_then(|f| lp_px(vm, f))
+                    .unwrap_or(0);
+            }
+        }
+        0
+    };
+    struct Kid {
+        id: i32,
+        w: i32,
+        h: i32,
+        ml: i32,
+        mt: i32,
+        mr: i32,
+        mb: i32,
+    }
+    let mut ks: Vec<Kid> = Vec::with_capacity(n);
+    for &ch in &kids {
+        ks.push(Kid {
+            id: pint(vm, ch, P_VIEW_ID),
+            w: pint(vm, ch, P_MEAS_W) & 0x00FF_FFFF,
+            h: pint(vm, ch, P_MEAS_H) & 0x00FF_FFFF,
+            ml: margin(vm, ch, "leftMargin"),
+            mt: margin(vm, ch, "topMargin"),
+            mr: margin(vm, ch, "rightMargin"),
+            mb: margin(vm, ch, "bottomMargin"),
+        });
+    }
+    let idx_of = |id: i32| -> Option<usize> {
+        if id == 0 {
+            return None;
+        }
+        ks.iter().position(|k| k.id == id)
+    };
+    let truthy = |v: Option<V>| matches!(v, Some(V::I32(i)) if i != 0);
+    let ref_id = |v: Option<V>| -> Option<i32> {
+        match v {
+            Some(V::I32(i)) if i > 0 => Some(i),
+            _ => None,
+        }
+    };
+    let rule = |vm: &Vm, ch: u32, names: &[&str]| -> Option<V> {
+        names.iter().find_map(|n| attr_find(vm, ch, n))
+    };
+    // Edges resolve per axis — AOSP's DependencyGraph does the same:
+    // `toEndOf`+`toStartOf` squeeze a child between siblings without a
+    // cycle when the siblings' vertical rules point back (e.g. the
+    // header arrows' alignTop/alignBottom anchor on the label).
+    // Each axis yields (leading, trailing) content-coord edges; a
+    // missing trailing edge falls back to leading+measured.
+    type Axis = Vec<Option<(i32, i32)>>;
+    let resolve_edges = |vm: &Vm,
+                         ch: u32,
+                         k: &Kid,
+                         placed: &Axis,
+                         horiz: bool|
+     -> Option<(i32, i32)> {
+        // Leading edge: sibling rules first (toRightOf/alignLeft,
+        // below/alignTop), else the parent's near edge.
+        let (lead_rules, trail_parent, lead_parent, lead_sib_rules, size, mlead, mtrail) =
+            if horiz {
+                (
+                    &["layout_toRightOf", "layout_toEndOf"][..],
+                    &["layout_alignParentRight", "layout_alignParentEnd"][..],
+                    &["layout_alignParentLeft", "layout_alignParentStart"][..],
+                    &["layout_alignLeft", "layout_alignStart"][..],
+                    k.w,
+                    k.ml,
+                    k.mr,
+                )
+            } else {
+                (
+                    &["layout_below"][..],
+                    &["layout_alignParentBottom"][..],
+                    &["layout_alignParentTop"][..],
+                    &["layout_alignTop"][..],
+                    k.h,
+                    k.mt,
+                    k.mb,
+                )
+            };
+        let (extent, pleading, ptrailing) = if horiz {
+            (w, pad_l, pad_r)
+        } else {
+            (h, pad_t, pad_b)
+        };
+        let sib_edge = |id: i32, trailing: bool| -> Option<Option<i32>> {
+            // Some(edge) = rule present; the inner Option is the
+            // sibling's resolved edge (None while unplaced).
+            Some(idx_of(id).and_then(|j| {
+                placed[j].map(|(a, b)| if trailing { b } else { a })
+            }))
+        };
+
+        let mut lead: Option<i32> = None;
+        let mut trail: Option<i32> = None;
+        let mut pending = false;
+        if truthy(rule(vm, ch, trail_parent)) {
+            trail = Some(extent - ptrailing - mtrail);
+        }
+        if truthy(rule(vm, ch, lead_parent)) {
+            lead = Some(pleading + mlead);
+        }
+        if let Some(dep) = ref_id(rule(vm, ch, lead_rules)) {
+            match sib_edge(dep, true) {
+                Some(Some(e)) => lead = Some(e + mlead),
+                Some(None) => pending = true,
+                None => {}
+            }
+        }
+        if let Some(dep) = ref_id(rule(vm, ch, lead_sib_rules)) {
+            match sib_edge(dep, false) {
+                Some(Some(e)) => lead = Some(e + mlead),
+                Some(None) => pending = true,
+                None => {}
+            }
+        }
+        // Trailing edge, sibling-anchored: `toLeftOf`/`toStartOf`/
+        // `above` anchor the sibling's leading edge, `alignRight`/
+        // `alignEnd`/`alignBottom` its trailing edge — separate rule
+        // sets since they read opposite edges.
+        let (trail_lead_anchor, trail_trail_anchor) = if horiz {
+            (
+                &["layout_toLeftOf", "layout_toStartOf"][..],
+                &["layout_alignRight", "layout_alignEnd"][..],
+            )
+        } else {
+            (&["layout_above"][..], &["layout_alignBottom"][..])
+        };
+        for (names, on_trailing) in [
+            (trail_lead_anchor, false),
+            (trail_trail_anchor, true),
+        ] {
+            if let Some(dep) = ref_id(rule(vm, ch, names)) {
+                match sib_edge(dep, on_trailing) {
+                    Some(Some(e)) => trail = Some(e - mtrail),
+                    Some(None) => pending = true,
+                    None => {}
+                }
+            }
+        }
+
+        if pending {
+            return None;
+        }
+        match (lead, trail) {
+            (Some(l), Some(t)) => Some((l, t)),
+            (Some(l), None) => Some((l, l + size)),
+            (None, Some(t)) => Some((t - size, t)),
+            (None, None) => {
+                if truthy(rule(vm, ch, &["layout_centerInParent"]))
+                    || truthy(rule(
+                        vm,
+                        ch,
+                        if horiz {
+                            &["layout_centerHorizontal"]
+                        } else {
+                            &["layout_centerVertical"]
+                        },
+                    ))
+                {
+                    let c = pleading + (extent - pleading - ptrailing - size) / 2 + mlead - mtrail;
+                    Some((c, c + size))
+                } else {
+                    Some((pleading + mlead, pleading + mlead + size))
+                }
+            }
+        }
+    };
+    // Bounded fixpoint per axis — each pass places every child whose
+    // deps resolved; cycles/missing ids leave the child at origin.
+    let mut xf: Axis = vec![None; n];
+    let mut yf: Axis = vec![None; n];
+    for _ in 0..n {
+        let mut progress = false;
+        for (i, &ch) in kids.iter().enumerate() {
+            if xf[i].is_none() {
+                if let Some(e) = resolve_edges(vm, ch, &ks[i], &xf, true) {
+                    xf[i] = Some(e);
+                    progress = true;
+                }
+            }
+            if yf[i].is_none() {
+                if let Some(e) = resolve_edges(vm, ch, &ks[i], &yf, false) {
+                    yf[i] = Some(e);
+                    progress = true;
+                }
+            }
+        }
+        if !progress {
+            break;
+        }
+    }
+    let pos: Vec<(i32, i32, i32, i32)> = (0..n)
+        .map(|i| {
+            let (l, r) = xf[i].unwrap_or_else(|| {
+                let l = pad_l + ks[i].ml;
+                (l, l + ks[i].w)
+            });
+            let (t, b) = yf[i].unwrap_or_else(|| {
+                let t = pad_t + ks[i].mt;
+                (t, t + ks[i].h)
+            });
+            (l, t, r, b)
+        })
+        .collect();
+    for (i, &ch) in kids.iter().enumerate() {
+        let (cl, ct, cr, cb) = pos[i];
+        if std::env::var_os("OVELO_VIEWDBG").is_some() {
+            let rules: Vec<String> = [
+                "layout_centerInParent", "layout_centerHorizontal", "layout_centerVertical",
+                "layout_alignParentRight", "layout_alignParentEnd", "layout_alignParentBottom",
+                "layout_alignParentTop", "layout_alignParentLeft", "layout_toRightOf",
+                "layout_toEndOf", "layout_toLeftOf", "layout_toStartOf", "layout_alignLeft",
+                "layout_alignStart", "layout_alignRight", "layout_alignEnd", "layout_below",
+                "layout_above", "layout_alignTop", "layout_alignBottom",
+            ]
+            .iter()
+            .filter_map(|n| attr_find(vm, ch, n).map(|v| format!("{n}={v:?}")))
+            .collect();
+            eprintln!(
+                "[viewdbg] relLayout h{ch} id={:#x} meas={}x{} at {cl},{ct} rules={:?}",
+                ks[i].id, ks[i].w, ks[i].h, rules
+            );
+        }
+        if let Err(e) = vm.call_virtual(
+            ch,
+            "layout",
+            &[V::I32(cl), V::I32(ct), V::I32(cr), V::I32(cb)],
+        ) {
+            if std::env::var_os("OVELO_VIEWDBG").is_some() {
+                eprintln!("[viewdbg] relLayout h{ch} err {e}");
+            }
+        }
     }
 }
 

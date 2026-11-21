@@ -283,6 +283,9 @@ impl Drawable for TextView {
             Some((s.w - self.padding * 2).max(0)),
             false,
         );
+        if std::env::var_os("OVELO_POSDBG").is_some() && !self.text.is_empty() {
+            eprintln!("[posdbg] text {:?} at {},{} size {}", self.text, self.view.left, self.view.top, self.text_size);
+        }
         let lh = t.ascent + t.descent;
         let mut baseline = self.view.top + self.padding + t.ascent;
         for line in &t.lines {

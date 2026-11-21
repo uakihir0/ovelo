@@ -196,6 +196,9 @@ impl Drawable for AbsView {
         s
     }
     fn layout(&mut self, left: i32, top: i32) {
+        if std::env::var_os("OVELO_POSDBG").is_some() {
+            eprintln!("[posdbg] AbsView layout left={left} top={top} rect={:?}", self.rect);
+        }
         self.inner.layout(left, top);
     }
     fn draw(&mut self, c: &mut ovelo_ui::Canvas) {
@@ -241,9 +244,11 @@ pub struct GuestUi {
     /// Dex-view-tree handles → materialized host view. Persistent so
     /// per-view state (pressed, listeners) survives frame rebuilds.
     dex_views: HashMap<u32, Rc<RefCell<GuestView>>>,
-    /// Last materialized child-handle list per parent — a changed set
-    /// (removal, hide) must dirty the group or stale pixels persist.
-    dex_kids: HashMap<u32, Vec<u32>>,
+    /// Last materialized child list per parent — (handle, dex frame)
+    /// pairs. A changed set (removal, hide) or a late-arriving frame
+    /// must dirty the group or stale pixels / misplaced children
+    /// persist.
+    dex_kids: HashMap<u32, Vec<KidEntry>>,
     /// The dex view-tree content root last materialized.
     dex_root: u32,
     /// The host view currently mounted as content — remount only when
@@ -271,6 +276,11 @@ fn ref_arg(args: &[V], i: usize) -> Result<u32> {
 // ---------------------------------------------------------------------
 // Dex view-tree materialization — real apps inflate layout xml into the
 // VM's view-tree model; these turn each node into a drawable host view.
+
+/// One materialized child: its dex handle plus the `setFrame` rect seen
+/// at materialize time (None until dex layout runs — tracking it lets a
+/// late frame flip the child into `AbsView` and re-layout).
+type KidEntry = (u32, Option<(i32, i32, i32, i32)>);
 
 fn dex_len(l: i32) -> Length {
     match l {
@@ -407,7 +417,11 @@ impl GuestUi {
         let mut v: Vec<u32> = self.views.keys().copied().collect();
         v.extend(self.dex_views.keys().copied());
         v.extend(self.dex_kids.keys().copied());
-        v.extend(self.dex_kids.values().flatten().copied());
+        v.extend(
+            self.dex_kids
+                .values()
+                .flat_map(|kids| kids.iter().map(|(h, _)| *h)),
+        );
         v.push(self.dex_root);
         v.extend(self.clicks.borrow().iter().flat_map(|(a, b)| [*a, *b]));
         v.extend(self.click_listeners.keys().copied());
@@ -741,25 +755,37 @@ impl GuestUi {
             Some((l, t, r, b)) => (r - l, b - t),
             None => (0, 0),
         };
-        let ops = vm.guest_draw_ops(h, ow, oh);
+        // Capture the guest's onDraw only at a real size: a 0×0
+        // canvas makes size-derived paint degenerate (every text at
+        // x=0 — an overlapping pile at the parent origin), so keep
+        // the last good ops until a frame lands.
+        let ops = (ow > 0 && oh > 0).then(|| vm.guest_draw_ops(h, ow, oh));
         let mut g = rc.borrow_mut();
         // `g` borrows the view object while `self.materialize_dex`
         // recurses into children — different cells, no aliasing.
         update_dex_view(&mut g, &info);
-        g.view_mut().custom_ops = if ops.is_empty() {
-            None
-        } else {
-            Some(Rc::new(ops))
-        };
+        if let Some(ops) = ops {
+            g.view_mut().custom_ops = if ops.is_empty() {
+                None
+            } else {
+                Some(Rc::new(ops))
+            };
+        }
         if let GuestView::Group(gr) = &mut *g {
             let mut kids: Vec<Box<dyn Drawable>> = Vec::new();
-            let mut kid_handles: Vec<u32> = Vec::new();
+            let mut kid_handles: Vec<KidEntry> = Vec::new();
             for ch in &info.children {
                 if let Some(crc) = self.materialize_dex(vm, *ch) {
-                    kid_handles.push(*ch);
                     // Dex frames are relative to the parent — position
                     // the child exactly where its `setFrame` put it.
-                    let view: Box<dyn Drawable> = match vm.dex_view(*ch).and_then(|i| i.frame) {
+                    let frame = vm.dex_view(*ch).and_then(|i| i.frame);
+                    // The frame is part of the key: dex `onLayout`
+                    // often runs after the first materialize, and a
+                    // late-arriving frame must re-wrap the child into
+                    // AbsView AND re-layout — tracking only the handle
+                    // leaves the stale pile drawn forever.
+                    kid_handles.push((*ch, frame));
+                    let view: Box<dyn Drawable> = match frame {
                         Some(rect) => {
                             if viewdbg() {
                                 eprintln!("[viewdbg] frame h{ch} = {rect:?}");
@@ -782,6 +808,8 @@ impl GuestUi {
                 gr.invalidate();
             }
             gr.children = kids;
+        } else if !info.children.is_empty() && viewdbg() {
+            eprintln!("[viewdbg] KIDS DROPPED h{h} {} kids={} not-a-group", info.desc, info.children.len());
         }
         if info.listener != 0 {
             let listener = info.listener;
