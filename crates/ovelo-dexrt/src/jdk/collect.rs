@@ -3,6 +3,23 @@
 
 use super::*;
 use crate::value::{HostState, Obj, V};
+
+/// Element equality for `contains`/`indexOf`/`remove` — Java compares
+/// via `equals`, not identity. A dex `equals` (e.g. Glide's
+/// `CallResourceReady` keyed on cb+executor) is honored through
+/// `call_virtual_rt`; host objects and unresolved equals fall back to
+/// `value_eq` (identity / string content / class mirror).
+fn elem_eq(vm: &mut Vm, e: V, other: V) -> bool {
+    match e {
+        V::Ref(h) if h != 0 && matches!(vm.heap.get(h), Some(Obj::Instance { .. })) => {
+            match vm.call_virtual_rt(h, "equals", &[other]) {
+                Ok(Some(v)) => i32v(v) != 0,
+                _ => value_eq(vm, e, other),
+            }
+        }
+        _ => value_eq(vm, e, other),
+    }
+}
 use std::rc::Rc;
 
 const LIST_CLASSES: &[&str] = &[
@@ -460,8 +477,8 @@ fn list_call(vm: &mut Vm, name: &str, sig: &str, args: &[V]) -> Rt<Option<Option
                 };
                 Some(Some(if i < l.len() { l.remove(i) } else { V::Ref(0) }))
             } else {
-                let pos =
-                    list_ref(vm, h).and_then(|l| l.iter().position(|e| value_eq(vm, *e, args[1])));
+                let items: Vec<V> = list_ref(vm, h).map(|l| l.to_vec()).unwrap_or_default();
+                let pos = items.iter().position(|e| elem_eq(vm, *e, args[1]));
                 match pos {
                     Some(i) => {
                         if let Some(l) = list_mut(vm, h) {
@@ -588,19 +605,20 @@ fn list_call(vm: &mut Vm, name: &str, sig: &str, args: &[V]) -> Rt<Option<Option
             Some(None)
         }
         "contains" => {
-            let c = list_ref(vm, h).is_some_and(|l| l.iter().any(|e| value_eq(vm, *e, args[1])));
+            let items: Vec<V> = list_ref(vm, h).map(|l| l.to_vec()).unwrap_or_default();
+            let c = items.iter().any(|e| elem_eq(vm, *e, args[1]));
             Some(Some(V::I32(c as i32)))
         }
         "containsAll" | "equals" => Some(Some(V::I32(1))),
         "indexOf" | "lastIndexOf" => {
-            let l = match list_ref(vm, h) {
-                Some(l) => l,
+            let items: Vec<V> = match list_ref(vm, h) {
+                Some(l) => l.to_vec(),
                 None => return Ok(None),
             };
             let i = if name == "indexOf" {
-                l.iter().position(|e| value_eq(vm, *e, args[1]))
+                items.iter().position(|e| elem_eq(vm, *e, args[1]))
             } else {
-                l.iter().rposition(|e| value_eq(vm, *e, args[1]))
+                items.iter().rposition(|e| elem_eq(vm, *e, args[1]))
             };
             Some(Some(V::I32(i.map(|x| x as i32).unwrap_or(-1))))
         }
@@ -949,11 +967,210 @@ fn map_call(vm: &mut Vm, name: &str, sig: &str, args: &[V]) -> Rt<Option<Option<
         }
         "hashCode" => Some(Some(V::I32(map_len(vm, h) as i32))),
         "equals" => Some(Some(V::I32(1))),
+        // NavigableMap/SortedMap key navigation — TreeMap callers
+        // (e.g. Glide's LruArrayPool keyMap.ceilingKey) depend on real
+        // ordering; a placeholder non-null answer here mints lies the
+        // caller then reads fields off of.
+        "ceilingKey" | "floorKey" | "higherKey" | "lowerKey" | "firstKey" | "lastKey" => {
+            let pairs = map_pairs(vm, h);
+            match nav_pick(vm, &pairs, name, args.get(1).copied()) {
+                Some((k, _)) => Some(Some(k)),
+                None if name == "firstKey" || name == "lastKey" => {
+                    return Err(vm.throw_builtin("Ljava/util/NoSuchElementException;", name));
+                }
+                None => Some(Some(V::Ref(0))),
+            }
+        }
+        "ceilingEntry" | "floorEntry" | "higherEntry" | "lowerEntry" | "firstEntry"
+        | "lastEntry" => {
+            let pairs = map_pairs(vm, h);
+            Some(Some(
+                match nav_pick(vm, &pairs, name, args.get(1).copied()) {
+                    Some((k, v)) => entry_of(vm, k, v),
+                    None => V::Ref(0),
+                },
+            ))
+        }
+        "pollFirstEntry" | "pollLastEntry" => {
+            let pairs = map_pairs(vm, h);
+            let op = if name == "pollFirstEntry" { "first" } else { "last" };
+            match nav_pick(vm, &pairs, op, None) {
+                Some((k, v)) => {
+                    let _ = map_remove(vm, h, k);
+                    Some(Some(entry_of(vm, k, v)))
+                }
+                None => Some(Some(V::Ref(0))),
+            }
+        }
+        "headMap" | "tailMap" | "subMap" => {
+            let pairs = map_pairs(vm, h);
+            let (lo, lo_incl, hi, hi_incl) = match name {
+                "headMap" => (
+                    None,
+                    false,
+                    args.get(1).copied(),
+                    args.get(2).map(|v| i32v(*v) != 0).unwrap_or(false),
+                ),
+                "tailMap" => (
+                    args.get(1).copied(),
+                    args.get(2).map(|v| i32v(*v) != 0).unwrap_or(true),
+                    None,
+                    false,
+                ),
+                _ => (
+                    args.get(1).copied(),
+                    args.get(2).map(|v| i32v(*v) != 0).unwrap_or(true),
+                    args.get(3).copied(),
+                    args.get(4).map(|v| i32v(*v) != 0).unwrap_or(false),
+                ),
+            };
+            let mut out = Vec::new();
+            for &(k, v) in &pairs {
+                let lo_ok = lo.is_none_or(|p| {
+                    let c = key_cmp(vm, k, p);
+                    c == std::cmp::Ordering::Greater
+                        || (lo_incl && c == std::cmp::Ordering::Equal)
+                });
+                let hi_ok = hi.is_none_or(|p| {
+                    let c = key_cmp(vm, k, p);
+                    c == std::cmp::Ordering::Less || (hi_incl && c == std::cmp::Ordering::Equal)
+                });
+                if lo_ok && hi_ok {
+                    out.push((k, v));
+                }
+            }
+            Some(Some(host(vm, "Ljava/util/TreeMap;", HostState::Map(out))))
+        }
+        "navigableKeySet" | "descendingKeySet" => {
+            let mut keys: Vec<V> = map_pairs(vm, h).into_iter().map(|(k, _)| k).collect();
+            sort_keys(vm, &mut keys);
+            if name == "descendingKeySet" {
+                keys.reverse();
+            }
+            Some(Some(host(vm, "Ljava/util/NavigableSet;", HostState::List(keys))))
+        }
+        "descendingMap" => {
+            let mut pairs = map_pairs(vm, h);
+            sort_pairs(vm, &mut pairs);
+            pairs.reverse();
+            Some(Some(host(vm, "Ljava/util/TreeMap;", HostState::Map(pairs))))
+        }
+        "comparator" => Some(Some(V::Ref(0))),
         _ => {
             let _ = sig;
             None
         }
     })
+}
+
+/// Snapshot of a host map's pairs (empty for non-map receivers).
+fn map_pairs(vm: &Vm, h: u32) -> Vec<(V, V)> {
+    match vm.heap.get(h) {
+        Some(Obj::Host {
+            state: HostState::Map(m),
+            ..
+        }) => m.clone(),
+        _ => vec![],
+    }
+}
+
+/// Natural ordering for sorted-map keys: boxed numbers compare
+/// numerically, strings lexicographically; anything else goes through
+/// the guest's own `Comparable.compareTo` when it answers.
+fn key_cmp(vm: &mut Vm, a: V, b: V) -> std::cmp::Ordering {
+    use std::cmp::Ordering;
+    let unbox = |v: V| match v {
+        V::Ref(h) => slot_of(vm, h).unwrap_or(v),
+        _ => v,
+    };
+    let (pa, pb) = (unbox(a), unbox(b));
+    let num = |v: V| matches!(v, V::I32(_) | V::I64(_) | V::F32(_) | V::F64(_));
+    if num(pa) && num(pb) {
+        return f64v(pa).partial_cmp(&f64v(pb)).unwrap_or(Ordering::Equal);
+    }
+    if let (Some(ta), Some(tb)) = (sv(vm, pa), sv(vm, pb)) {
+        return ta.cmp(&tb);
+    }
+    if let V::Ref(ha) = a {
+        if ha != 0 {
+            if let Ok(Some(c)) = vm.call_virtual(ha, "compareTo", &[b]) {
+                return i32v(c).cmp(&0);
+            }
+        }
+    }
+    Ordering::Equal
+}
+
+fn sort_keys(vm: &mut Vm, keys: &mut [V]) {
+    // insertion sort — these maps stay small, and `sort_by` can't take
+    // a `&mut Vm` comparator.
+    for i in 1..keys.len() {
+        let mut j = i;
+        while j > 0 && key_cmp(vm, keys[j], keys[j - 1]) == std::cmp::Ordering::Less {
+            keys.swap(j, j - 1);
+            j -= 1;
+        }
+    }
+}
+
+fn sort_pairs(vm: &mut Vm, pairs: &mut [(V, V)]) {
+    let mut keys: Vec<V> = pairs.iter().map(|(k, _)| *k).collect();
+    sort_keys(vm, &mut keys);
+    let mut out = Vec::with_capacity(pairs.len());
+    for k in keys {
+        if let Some(pos) = pairs.iter().position(|(pk, _)| *pk == k) {
+            out.push(pairs[pos]);
+        }
+    }
+    pairs.clone_from_slice(&out);
+}
+
+/// `first/last` scan the extremes; `ceiling/floor/higher/lower` take a
+/// pivot and pick the nearest key on the required side. `name` is the
+/// called method (`ceilingKey`, `firstEntry`, …) or a bare `first`/`last`.
+fn nav_pick(vm: &mut Vm, pairs: &[(V, V)], name: &str, pivot: Option<V>) -> Option<(V, V)> {
+    use std::cmp::Ordering::*;
+    let base = name
+        .trim_end_matches("Key")
+        .trim_end_matches("Entry")
+        .to_lowercase();
+    let mut best: Option<(V, V)> = None;
+    for &(k, v) in pairs {
+        let take = match base.as_str() {
+            "ceiling" => {
+                pivot.is_some_and(|p| key_cmp(vm, k, p) != Less)
+                    && best.is_none_or(|(bk, _)| key_cmp(vm, k, bk) == Less)
+            }
+            "floor" => {
+                pivot.is_some_and(|p| key_cmp(vm, k, p) != Greater)
+                    && best.is_none_or(|(bk, _)| key_cmp(vm, k, bk) == Greater)
+            }
+            "higher" => {
+                pivot.is_some_and(|p| key_cmp(vm, k, p) == Greater)
+                    && best.is_none_or(|(bk, _)| key_cmp(vm, k, bk) == Less)
+            }
+            "lower" => {
+                pivot.is_some_and(|p| key_cmp(vm, k, p) == Less)
+                    && best.is_none_or(|(bk, _)| key_cmp(vm, k, bk) == Greater)
+            }
+            "first" => best.is_none_or(|(bk, _)| key_cmp(vm, k, bk) == Less),
+            "last" => best.is_none_or(|(bk, _)| key_cmp(vm, k, bk) == Greater),
+            _ => false,
+        };
+        if take {
+            best = Some((k, v));
+        }
+    }
+    best
+}
+
+/// A `Map.Entry` host object — key in the Slot and P_COMPONENT, value
+/// under P_DATA, matching the `entrySet` mint.
+fn entry_of(vm: &mut Vm, k: V, v: V) -> V {
+    let eh = vm.alloc_host("Ljava/util/AbstractMap$SimpleEntry;", HostState::Slot(k));
+    pseudo_set(vm, eh, P_COMPONENT, k);
+    pseudo_set(vm, eh, P_DATA, v);
+    V::Ref(eh)
 }
 
 // ---------------------------------------------------------------------

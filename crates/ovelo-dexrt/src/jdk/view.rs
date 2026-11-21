@@ -520,6 +520,7 @@ pub(crate) fn dex_view_info(vm: &Vm, h: u32) -> Option<DexViewInfo> {
     })
 }
 
+
 /// `ImageView.getDrawable()` — the stored image source normalized to a
 /// Drawable-typed object: guest Drawable instances pass through; bare
 /// values (Bitmap host, res-id int, Uri/path object) get wrapped in a
@@ -603,6 +604,14 @@ fn image_pixels_at(
                         .values()
                         .find_map(|f| image_pixels_at(vm, *f, depth + 1))
                 }
+                // LayerDrawable/TransitionDrawable keep their drawables
+                // in an array field — the topmost (last) layer wins: a
+                // TransitionDrawable's "to" drawable is the real image,
+                // layer[0] is a (often blank) placeholder.
+                Some(Obj::Array { data, .. }) => data
+                    .iter()
+                    .rev()
+                    .find_map(|f| image_pixels_at(vm, *f, depth + 1)),
                 _ => None,
             }),
         _ => None,

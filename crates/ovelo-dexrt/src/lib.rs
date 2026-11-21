@@ -277,6 +277,11 @@ pub struct Vm {
     /// deadlocks on self-rescheduling executors). Drained at the
     /// outermost `call_virtual` boundary.
     pub pending_runnables: std::collections::VecDeque<(u32, bool)>,
+    /// Time-gated posts (`Handler.postDelayed`/`sendMessageDelayed`) —
+    /// `(handle, on_main, due_ms)`. Promoted into `pending_runnables` by
+    /// `drain_runnables` once due; without this a self-rescheduling
+    /// handler floods every drain tick regardless of its delay.
+    pub(crate) delayed_runnables: Vec<(u32, bool, u64)>,
     /// ViewTreeObserver handle -> registered onGlobalLayout listeners.
     pub(crate) vto_listeners: HashMap<u32, Vec<u32>>,
     /// ViewTreeObserver handle -> `OnPreDrawListener` handles — Glide's
@@ -432,6 +437,7 @@ impl Vm {
             total_steps: 0,
             pending_activity: None,
             pending_runnables: std::collections::VecDeque::new(),
+            delayed_runnables: Vec::new(),
             vto_listeners: HashMap::new(),
             vto_predraw: HashMap::new(),
             draining: false,
@@ -1367,6 +1373,16 @@ impl Vm {
         self.pending_runnables.push_back((r, on_main));
     }
 
+    /// `enqueue_runnable` with a millisecond delay — the runnable sits
+    /// in `delayed_runnables` until `drain_runnables` sees it due.
+    pub(crate) fn enqueue_runnable_delayed(&mut self, r: u32, on_main: bool, delay_ms: i64) {
+        self.reparked.clear();
+        self.parked_runnables.remove(&r);
+        self.wake_parked();
+        let due = jdk::now_ms().saturating_add(delay_ms.max(0)) as u64;
+        self.delayed_runnables.push((r, on_main, due));
+    }
+
     /// Re-arm runnables that parked out of the live queue — called
     /// from `enqueue_runnable` (fresh work may feed a dropped worker's
     /// internal queue) and `LockSupport.unpark`.
@@ -1400,6 +1416,7 @@ impl Vm {
             }));
         }
         roots.extend(self.pending_runnables.iter().map(|(h, _)| *h));
+        roots.extend(self.delayed_runnables.iter().map(|(h, _, _)| *h));
         roots.extend(self.parked_runnables.keys().copied());
         roots.extend(self.reparked.iter().copied());
         roots.extend(self.repark_counts.keys().copied());
@@ -1465,6 +1482,13 @@ impl Vm {
     pub fn drain_runnables(&mut self, max: usize) -> usize {
         if self.draining {
             return 0;
+        }
+        let now = jdk::now_ms() as u64;
+        let (due, later): (Vec<_>, Vec<_>) =
+            self.delayed_runnables.drain(..).partition(|(_, _, t)| *t <= now);
+        self.delayed_runnables = later;
+        for (r, on_main, _) in due {
+            self.pending_runnables.push_back((r, on_main));
         }
         self.draining = true;
         let mut ran = 0usize;
@@ -2148,6 +2172,44 @@ impl Vm {
                 "Ljava/lang/Object;",
             ],
             "Ljava/lang/RuntimeException;" => &[
+                "Ljava/lang/Exception;",
+                "Ljava/lang/Throwable;",
+                "Ljava/lang/Object;",
+            ],
+            // java.io exception tree — `catch (IOException)` sites (Glide's
+            // header parse, stream wrappers) must see the subtype.
+            "Ljava/io/IOException;" => &[
+                "Ljava/lang/Exception;",
+                "Ljava/lang/Throwable;",
+                "Ljava/lang/Object;",
+            ],
+            "Ljava/io/EOFException;"
+            | "Ljava/io/FileNotFoundException;"
+            | "Ljava/io/InterruptedIOException;"
+            | "Ljava/io/MalformedURLException;"
+            | "Ljava/io/ObjectStreamException;"
+            | "Ljava/io/OptionalDataException;"
+            | "Ljava/io/ProtocolException;"
+            | "Ljava/io/SyncFailedException;"
+            | "Ljava/io/UnknownServiceException;"
+            | "Ljava/io/UnsupportedEncodingException;"
+            | "Ljava/io/UTFDataFormatException;"
+            | "Ljava/io/WriteAbortedException;"
+            | "Ljava/util/zip/ZipException;"
+            | "Ljava/net/UnknownHostException;"
+            | "Ljava/net/HttpRetryException;"
+            | "Ljava/net/SocketException;"
+            | "Ljava/net/ConnectException;"
+            | "Ljava/net/BindException;"
+            | "Ljava/net/NoRouteToHostException;"
+            | "Ljava/net/PortUnreachableException;"
+            | "Ljava/net/SocketTimeoutException;"
+            | "Ljava/net/ProtocolException;"
+            | "Ljava/net/MalformedURLException;"
+            | "Ljavax/net/ssl/SSLException;"
+            | "Ljavax/net/ssl/SSLHandshakeException;"
+            | "Ljavax/net/ssl/SSLPeerUnverifiedException;" => &[
+                "Ljava/io/IOException;",
                 "Ljava/lang/Exception;",
                 "Ljava/lang/Throwable;",
                 "Ljava/lang/Object;",
@@ -3929,6 +3991,9 @@ impl Vm {
                         .map(|v| match v {
                             V::Ref(h) if *h != 0 => {
                                 let mut s = format!("h{h}:{}", self.dbg_class_of(*h));
+                                if let Some(Obj::Array { data, .. }) = self.heap.get(*h) {
+                                    s.push_str(&format!(";{}", data.len()));
+                                }
                                 if let Some(Obj::Host {
                                     state: HostState::List(l),
                                     ..

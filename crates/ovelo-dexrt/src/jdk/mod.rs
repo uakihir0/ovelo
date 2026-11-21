@@ -49,6 +49,23 @@ pub(crate) const P_BOUNDS: u32 = u32::MAX - 11;
 pub(crate) const P_BITMAP_SLOT: u64 = 0xFFFD_FEE0;
 /// A `ColorDrawable`'s fill ARGB — `Drawable.draw` emits a rect fill.
 pub(crate) const P_DRAW_COLOR: u64 = 0xFFFD_FEE1;
+/// `ByteBuffer` write/read cursor and endianness (1 = little) — the
+/// backing bytes live in `HostState::Slot`.
+pub(crate) const P_BBUF_POS: u64 = 0xFFFD_FEE2;
+pub(crate) const P_BBUF_ORD: u64 = 0xFFFD_FEE3;
+/// `Message` routing: target `Handler`, payload `obj`, `callback`
+/// `Runnable` — and a `Handler`'s own `Handler.Callback` — so
+/// `obtainMessage(...).sendToTarget()`/`sendMessage` actually deliver
+/// (Glide's `EngineJob` drives `onResourceReady` through this path).
+pub(crate) const P_MSG_TARGET: u64 = 0xFFFD_FEE4;
+pub(crate) const P_MSG_OBJ: u64 = 0xFFFD_FEE5;
+pub(crate) const P_MSG_CALLBACK: u64 = 0xFFFD_FEE6;
+pub(crate) const P_HANDLER_CB: u64 = 0xFFFD_FEE7;
+pub(crate) const P_MSG_WHAT: u64 = 0xFFFD_FEE8;
+/// A `LayerDrawable`/`TransitionDrawable`'s `Drawable[]` layers — kept as
+/// a fields entry so the renderer's bitmap field-walk reaches the
+/// wrapped drawables (Glide's TransitionDrawable).
+pub(crate) const P_LAYERS: u64 = 0xFFFD_FEE9;
 
 pub(crate) fn now_ms() -> i64 {
     std::time::SystemTime::now()
@@ -174,6 +191,42 @@ pub(crate) fn worker_thread(vm: &mut Vm) -> V {
 /// (Room, WorkManager, kotlinx dispatchers) assert they are NOT on
 /// the main thread, so `Thread.currentThread()` must differ while
 /// they execute. Nested calls restore the previous context.
+/// A queued `Message` isn't a `Runnable` — `drain_runnables` must
+/// deliver it to its target `Handler` (callback → `handleMessage`)
+/// rather than call `run()` on it.
+fn dispatch_message(
+    vm: &mut Vm,
+    msg: u32,
+) -> std::result::Result<Option<V>, ovelo_error::OveloError> {
+    if let Some(V::Ref(h)) = pseudo_get(vm, msg, P_MSG_CALLBACK) {
+        if h != 0 {
+            return vm.call_virtual(h, "run", &[]);
+        }
+    }
+    if let Some(V::Ref(h)) = pseudo_get(vm, msg, P_MSG_TARGET) {
+        if h != 0 {
+            if let Some(V::Ref(cbh)) = pseudo_get(vm, h, P_HANDLER_CB) {
+                if cbh != 0 {
+                    return vm.call_virtual(cbh, "handleMessage", &[V::Ref(msg)]);
+                }
+            }
+            // Host Handler with no callback: `call_virtual` resolves a
+            // dex override if present, else falls back to the builtin
+            // `handler_call` arm which no-ops cleanly.
+            return vm.call_virtual(h, "handleMessage", &[V::Ref(msg)]);
+        }
+    }
+    Ok(None)
+}
+
+/// `true` when `h` is a host `Message` needing `dispatch_message`.
+fn is_message(vm: &Vm, h: u32) -> bool {
+    matches!(
+        vm.heap.get(h),
+        Some(Obj::Host { desc, .. }) if desc == "Landroid/os/Message;"
+    )
+}
+
 pub(crate) fn run_on_worker(
     vm: &mut Vm,
     r: u32,
@@ -181,7 +234,11 @@ pub(crate) fn run_on_worker(
     let prev = vm.cur_thread;
     worker_thread(vm);
     vm.cur_thread = vm.worker_thread_h;
-    let v = vm.call_virtual(r, "run", &[]);
+    let v = if is_message(vm, r) {
+        dispatch_message(vm, r)
+    } else {
+        vm.call_virtual(r, "run", &[])
+    };
     vm.cur_thread = prev;
     v
 }
@@ -196,7 +253,11 @@ pub(crate) fn run_on_main(
     let prev = vm.cur_thread;
     main_thread(vm);
     vm.cur_thread = vm.main_thread_h;
-    let v = vm.call_virtual(r, "run", &[]);
+    let v = if is_message(vm, r) {
+        dispatch_message(vm, r)
+    } else {
+        vm.call_virtual(r, "run", &[])
+    };
     vm.cur_thread = prev;
     v
 }
@@ -842,6 +903,20 @@ pub(crate) fn sfield(vm: &mut Vm, owner: &str, name: &str, ftype: &str) -> Optio
         ("Ljava/lang/System;", "in") => {
             return Some(host(vm, "Ljava/io/InputStream;", HostState::Empty))
         }
+        ("Ljava/nio/ByteOrder;", "BIG_ENDIAN") => {
+            return Some(host(
+                vm,
+                "Ljava/nio/ByteOrder;",
+                HostState::Slot(V::I32(0)),
+            ))
+        }
+        ("Ljava/nio/ByteOrder;", "LITTLE_ENDIAN") => {
+            return Some(host(
+                vm,
+                "Ljava/nio/ByteOrder;",
+                HostState::Slot(V::I32(1)),
+            ))
+        }
         ("Ljava/lang/Void;", "TYPE") => return Some(class_obj(vm, "V".into())),
         ("Ljava/nio/charset/StandardCharsets;", n) => {
             return Some(host(
@@ -1273,7 +1348,12 @@ pub(crate) fn ifield(vm: &Vm, h: u32, owner: &str, name: &str) -> Option<V> {
         ("Landroid/content/pm/ApplicationInfo;", "targetSdkVersion") => Some(V::I32(35)),
         ("Landroid/content/pm/ApplicationInfo;", "minSdkVersion") => Some(V::I32(21)),
         ("Landroid/content/pm/ApplicationInfo;", "flags") => Some(V::I32(0)),
-        ("Landroid/os/Message;", "what" | "arg1" | "arg2") => Some(V::I32(0)),
+        ("Landroid/os/Message;", "what" | "arg1" | "arg2") => {
+            Some(pseudo_get(vm, h, P_MSG_WHAT).unwrap_or(V::I32(0)))
+        }
+        ("Landroid/os/Message;", "obj") => {
+            Some(pseudo_get(vm, h, P_MSG_OBJ).unwrap_or(V::Ref(0)))
+        }
         ("Landroid/graphics/Point;", "x" | "y")
         | ("Landroid/graphics/RectF;", "left" | "top" | "right" | "bottom")
         | ("Landroid/graphics/PointF;", "x" | "y") => Some(V::I32(0)),
