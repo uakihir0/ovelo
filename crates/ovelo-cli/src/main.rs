@@ -693,6 +693,22 @@ fn run_activity_cbs(vm: &mut ovelo_dexrt::Vm, this: u32, callbacks: &[String]) {
             cb,
             if ran { "dex" } else { "framework" }
         );
+        // AOSP ActivityThread calls onPostResume after onResume; androidx
+        // FragmentActivity dispatches FragmentManager resume from there —
+        // without it fragments stay capped at STARTED forever.
+        if cb == "onResume" {
+            let r2 = vm
+                .call_virtual(this, "onPostResume", &[])
+                .inspect_err(|e| println!("callback onPostResume crashed: {e}"));
+            println!(
+                "callback onPostResume ({})",
+                if matches!(r2, Ok(Some(_))) {
+                    "dex"
+                } else {
+                    "framework"
+                }
+            );
+        }
     }
 }
 

@@ -2532,13 +2532,48 @@ fn resources_call(vm: &mut Vm, name: &str, args: &[V]) -> Rt<Option<Option<V>>> 
                 .unwrap_or_default();
             Some(Some(arr(vm, "I", vals)))
         }
-        "getBoolean" | "getInteger" | "getColor" => Some(Some(V::I32(
+        "getBoolean" | "getInteger" => Some(Some(V::I32(
             vm.apk_res
                 .as_ref()
                 .and_then(|r| r.entry_value(res_id()))
                 .map(|v| v.data as i32)
                 .unwrap_or(0),
         ))),
+        "getColor" => {
+            // Chase @color/@mipmap refs and ?attr indirections so a
+            // `?attr/colorPrimary`-style entry yields the real color int
+            // instead of leaking the raw attr res-id as the color value.
+            let mut id = res_id() as u32;
+            // Unresolvable `?attr` colors land here — opaque black keeps
+            // text visible instead of alpha-0 invisible.
+            let mut data = 0xFF00_0000u32;
+            for _ in 0..8 {
+                let Some(res) = vm.apk_res.as_ref() else { break };
+                let Some(ev) = res.entry_value(id) else { break };
+                match ev.data_type {
+                    0x01 => {
+                        id = ev.data;
+                        continue;
+                    }
+                    0x02 => match view::theme_attr_entry(vm, ev.data) {
+                        Some(next) if next.data_type == 0x01 => {
+                            id = next.data;
+                            continue;
+                        }
+                        Some(next) => {
+                            data = next.data;
+                            break;
+                        }
+                        None => break,
+                    },
+                    _ => {
+                        data = ev.data;
+                        break;
+                    }
+                }
+            }
+            Some(Some(V::I32(data as i32)))
+        }
         "getDimension" | "getFraction" => Some(Some(V::F32(
             vm.apk_res
                 .as_ref()
