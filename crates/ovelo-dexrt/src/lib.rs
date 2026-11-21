@@ -286,6 +286,12 @@ pub struct Vm {
     /// (which re-runs them with a fresh budget) instead of spinning
     /// inside one `run()` until the budget kills the task.
     park_spins: u32,
+    /// Consecutive park→requeue cycles per runnable handle — bounds
+    /// the spin where a worker parks on a queue nothing can ever feed
+    /// (e.g. `ReferenceQueue.remove` under our immediate-return stub):
+    /// past the cap the requeue is dropped instead of re-running
+    /// `run()` from the top each drain.
+    repark_counts: HashMap<u32, u32>,
     /// Activity a guest `startActivity` asked to launch — (class
     /// descriptor, the Intent the caller passed). The runner drains
     /// it into a real second-Activity dispatch.
@@ -389,6 +395,7 @@ impl Vm {
             park_depth: 0,
             reparked: std::collections::HashSet::new(),
             park_spins: 0,
+            repark_counts: HashMap::new(),
             field_idx_cache: std::cell::RefCell::new(HashMap::new()),
             type_idx_cache: std::cell::RefCell::new(HashMap::new()),
             fields_named_cache: std::cell::RefCell::new(None),
@@ -1324,12 +1331,24 @@ impl Vm {
                 Err(e) if e.cause() == "ovelo.park" => {
                     // A parked worker yields its slot and reschedules —
                     // the runnable re-enters `run()` on a later drain
-                    // and re-scans its own work queue.
-                    self.reparked.insert(r);
-                    self.pending_runnables.push_back((r, on_main));
+                    // and re-scans its own work queue. A worker that
+                    // can never be woken (nothing feeds its queue)
+                    // spins repark→re-run forever, so after enough
+                    // consecutive parks stop requeueing it: it is
+                    // dropped, not killed — a later `enqueue_runnable`
+                    // of the same handle still runs it afresh.
+                    let n = self.repark_counts.entry(r).or_insert(0);
+                    *n += 1;
+                    if *n <= 64 {
+                        self.reparked.insert(r);
+                        self.pending_runnables.push_back((r, on_main));
+                    } else {
+                        self.reparked.remove(&r);
+                    }
                 }
                 _ => {
                     self.reparked.remove(&r);
+                    self.repark_counts.remove(&r);
                     self.park_spins = 0;
                 }
             }
