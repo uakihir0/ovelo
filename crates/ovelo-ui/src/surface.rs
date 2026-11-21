@@ -214,7 +214,7 @@ impl Surface {
         }
     }
 
-    /// Blit premultiplied pixels (RGBA8, `src_w`×`src_h`) at (dx,dy).
+    /// Blit straight-alpha RGBA8 pixels (`src_w`×`src_h`) at (dx,dy).
     pub fn blit(&mut self, dx: i32, dy: i32, src_w: usize, src_h: usize, src: &[u8]) -> Result<()> {
         if src.len() != src_w * src_h * 4 {
             return Err(err("ui.blit.size"));
@@ -222,16 +222,7 @@ impl Surface {
         for sy in 0..src_h {
             for sx in 0..src_w {
                 let i = (sy * src_w + sx) * 4;
-                self.src_over(
-                    dx + sx as i32,
-                    dy + sy as i32,
-                    Color {
-                        r: src[i],
-                        g: src[i + 1],
-                        b: src[i + 2],
-                        a: src[i + 3],
-                    },
-                );
+                self.src_over(dx + sx as i32, dy + sy as i32, premul(&src[i..i + 4]));
             }
         }
         Ok(())
@@ -265,16 +256,7 @@ impl Surface {
             for x in x0..x1 {
                 let sx = (x - dx) as usize * src_w / dw;
                 let i = (sy * src_w + sx) * 4;
-                self.src_over(
-                    x,
-                    y,
-                    Color {
-                        r: src[i],
-                        g: src[i + 1],
-                        b: src[i + 2],
-                        a: src[i + 3],
-                    },
-                );
+                self.src_over(x, y, premul(&src[i..i + 4]));
             }
         }
     }
@@ -311,6 +293,18 @@ impl Surface {
             b: self.px[i + 2],
             a: self.px[i + 3],
         }
+    }
+}
+
+/// Straight-alpha RGBA8 → premultiplied `Color` (the src-over convention
+/// used by `src_over`).
+fn premul(px: &[u8]) -> Color {
+    let a = px[3] as u32;
+    Color {
+        r: ((px[0] as u32 * a + 127) / 255) as u8,
+        g: ((px[1] as u32 * a + 127) / 255) as u8,
+        b: ((px[2] as u32 * a + 127) / 255) as u8,
+        a: px[3],
     }
 }
 
