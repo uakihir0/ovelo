@@ -47,8 +47,13 @@ extern "C" {
 }
 
 // pthread_mutex_t is 64 bytes on macOS; 128 leaves room for other Unix.
-static mut MUTEX_STORAGE: [u8; 128] = [0; 128];
-static mut MUTEX_ATTR_STORAGE: [u8; 128] = [0; 128];
+// The backing store must be aligned: glibc's lock path issues futex()
+// on a word inside the mutex and aborts with __libc_fatal if the
+// address is unaligned — a bare [u8] only promises 1-byte alignment.
+#[repr(align(16))]
+struct Aligned<const N: usize>([u8; N]);
+static mut MUTEX_STORAGE: Aligned<128> = Aligned([0; 128]);
+static mut MUTEX_ATTR_STORAGE: Aligned<128> = Aligned([0; 128]);
 
 // PTHREAD_MUTEX_RECURSIVE is 2 on macOS but 1 on glibc/Bionic
 // (where 2 is PTHREAD_MUTEX_ERRORCHECK — relocking would fail with
