@@ -17,6 +17,7 @@ mod value;
 
 pub use aot::Aot;
 pub use jdk::view::{fire_global_layout, DexViewInfo, P_TCOLOR, P_TEXT, P_TSIZE};
+pub use value::{CanvasOp, PaintState};
 pub use jdk::{pseudo_get, pseudo_set};
 pub use value::{Heap, HostState, Obj, V};
 
@@ -1535,6 +1536,13 @@ impl Vm {
     /// text, colors, layout params, visibility, listener, children.
     pub fn dex_view(&self, h: u32) -> Option<jdk::view::DexViewInfo> {
         jdk::view::dex_view_info(self, h)
+    }
+
+    /// Run the view's guest `onDraw(Canvas)` over a recording canvas
+    /// sized `(w, h)` and return the ops for host replay. Empty when
+    /// no class in the chain overrides `onDraw` or the call fails.
+    pub fn guest_draw_ops(&mut self, view: u32, w: i32, h: i32) -> Vec<crate::value::CanvasOp> {
+        jdk::gfx::guest_draw_ops(self, view, w, h)
     }
 
     /// Cheap P_IS_VIEW probe — `dex_view` builds full node info

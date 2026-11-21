@@ -100,6 +100,12 @@ impl<'a> Canvas<'a> {
         self.surf.clear(c);
     }
 
+    /// Shaped advance width of `text` at `size_px` — for callers that
+    /// center text (Paint.Align.CENTER) before `draw_text`.
+    pub fn measure(&self, text: &str, size_px: f32) -> f32 {
+        self.fonts.char_advances(text, size_px).iter().sum()
+    }
+
     /// `drawRect` — fill a rect (translated).
     pub fn draw_rect(&mut self, r: Rect, p: Paint) {
         self.surf.fill_rect(self.tr(r), p.color);

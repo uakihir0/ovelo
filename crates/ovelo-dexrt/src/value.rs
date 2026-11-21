@@ -128,6 +128,156 @@ pub enum HostState {
         /// Cursor: index of the current event in `events`.
         pos: usize,
     },
+    /// A recording `android.graphics.Canvas`: draw calls from a guest
+    /// `View.onDraw` append [`CanvasOp`]s the host view materializer
+    /// replays into the real surface.
+    CanvasOps(Vec<CanvasOp>),
+}
+
+/// One recorded `Canvas` call from a guest `View.onDraw`, in local
+/// (view-relative) coordinates, for host-side replay.
+#[derive(Debug, Clone)]
+pub enum CanvasOp {
+    /// `save()` — snapshot transform+clip.
+    Save,
+    /// `restore()` — pop the last save.
+    Restore,
+    /// `translate(dx, dy)`.
+    Translate {
+        /// Horizontal shift px.
+        dx: f32,
+        /// Vertical shift px.
+        dy: f32,
+    },
+    /// `clipRect(l, t, r, b)` (intersect).
+    ClipRect {
+        /// Left edge.
+        l: f32,
+        /// Top edge.
+        t: f32,
+        /// Right edge.
+        r: f32,
+        /// Bottom edge.
+        b: f32,
+    },
+    /// `drawColor`/`drawPaint` — fill the clip with the paint color.
+    Color {
+        /// Packed ARGB.
+        argb: i32,
+    },
+    /// `drawRect` (all rect-typed overloads flatten to edges).
+    Rect {
+        /// Left edge.
+        l: f32,
+        /// Top edge.
+        t: f32,
+        /// Right edge.
+        r: f32,
+        /// Bottom edge.
+        b: f32,
+        /// Paint at call time.
+        paint: PaintState,
+    },
+    /// `drawRoundRect`.
+    RoundRect {
+        /// Left edge.
+        l: f32,
+        /// Top edge.
+        t: f32,
+        /// Right edge.
+        r: f32,
+        /// Bottom edge.
+        b: f32,
+        /// Corner x radius.
+        rx: f32,
+        /// Corner y radius.
+        ry: f32,
+        /// Paint at call time.
+        paint: PaintState,
+    },
+    /// `drawOval`.
+    Oval {
+        /// Left edge.
+        l: f32,
+        /// Top edge.
+        t: f32,
+        /// Right edge.
+        r: f32,
+        /// Bottom edge.
+        b: f32,
+        /// Paint at call time.
+        paint: PaintState,
+    },
+    /// `drawCircle`.
+    Circle {
+        /// Center x.
+        cx: f32,
+        /// Center y.
+        cy: f32,
+        /// Radius.
+        r: f32,
+        /// Paint at call time.
+        paint: PaintState,
+    },
+    /// `drawLine`.
+    Line {
+        /// Start x.
+        x0: f32,
+        /// Start y.
+        y0: f32,
+        /// End x.
+        x1: f32,
+        /// End y.
+        y1: f32,
+        /// Paint at call time.
+        paint: PaintState,
+    },
+    /// `drawText` (pen at `(x, baseline)`).
+    Text {
+        /// The string content.
+        text: String,
+        /// Pen x.
+        x: f32,
+        /// Baseline y.
+        y: f32,
+        /// Paint at call time.
+        paint: PaintState,
+    },
+    /// `drawBitmap` — decoded pixels at `(x, y)`, scaled to `(w, h)`
+    /// when both are nonzero (else natural size).
+    Bitmap {
+        /// Dest x.
+        x: f32,
+        /// Dest y.
+        y: f32,
+        /// Dest width (0 = natural).
+        w: u32,
+        /// Dest height (0 = natural).
+        h: u32,
+        /// Source bitmap width.
+        src_w: u32,
+        /// Source bitmap height.
+        src_h: u32,
+        /// Straight RGBA8 pixels (`src_w` × `src_h`).
+        rgba: std::rc::Rc<Vec<u8>>,
+    },
+}
+
+/// Snapshot of a `Paint` object's state at draw time.
+#[derive(Debug, Clone, Copy)]
+pub struct PaintState {
+    /// `setColor` ARGB.
+    pub argb: i32,
+    /// `setTextSize` px (0 = unset).
+    pub text_size: f32,
+    /// `setTextAlign`: 0 LEFT, 1 CENTER, 2 RIGHT.
+    pub align: u8,
+    /// `setStyle`: 0 FILL, 1 STROKE, 2 FILL_AND_STROKE.
+    pub style: u8,
+    /// `setStrokeWidth` px.
+    pub stroke_w: f32,
+    /// `setFakeBoldText`.
+    pub fake_bold: bool,
 }
 
 /// One `XmlPullParser` event inside an [`HostState::Xml`] stream.

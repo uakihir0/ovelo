@@ -3630,7 +3630,7 @@ fn graphics_call(vm: &mut Vm, class: &str, name: &str, args: &[V]) -> Rt<Option<
 /// `Rect`'s four edges. A guest `rect.left = x` iput lands in the
 /// object's canon field map — read it first, pseudo ints second, so
 /// methods and direct field access never disagree.
-fn rect_edges(vm: &Vm, h: u32) -> (i32, i32, i32, i32) {
+pub(crate) fn rect_edges(vm: &Vm, h: u32) -> (i32, i32, i32, i32) {
     let read = |name: &str, key: u32| -> i32 {
         if let Some(f) = vm
             .field_index_of("Landroid/graphics/Rect;", name)
@@ -3652,7 +3652,7 @@ fn rect_edges(vm: &Vm, h: u32) -> (i32, i32, i32, i32) {
     )
 }
 
-fn rect_write(vm: &mut Vm, h: u32, l: i32, t: i32, r: i32, b: i32) {
+pub(crate) fn rect_write(vm: &mut Vm, h: u32, l: i32, t: i32, r: i32, b: i32) {
     pseudo_set(vm, h, P_RECT_L, V::I32(l));
     pseudo_set(vm, h, P_RECT_T, V::I32(t));
     pseudo_set(vm, h, P_RECT_R, V::I32(r));

@@ -734,10 +734,23 @@ impl GuestUi {
                 .or_insert_with(|| Rc::new(RefCell::new(make_dex_view(vm, &info, &fonts))))
                 .clone(),
         };
+        // Guest `onDraw`: a dex view class that overrides onDraw paints
+        // through Canvas — record its ops for the host draw pass. Done
+        // before `rc.borrow_mut` since it runs guest code.
+        let (ow, oh) = match info.frame {
+            Some((l, t, r, b)) => (r - l, b - t),
+            None => (0, 0),
+        };
+        let ops = vm.guest_draw_ops(h, ow, oh);
         let mut g = rc.borrow_mut();
         // `g` borrows the view object while `self.materialize_dex`
         // recurses into children — different cells, no aliasing.
         update_dex_view(&mut g, &info);
+        g.view_mut().custom_ops = if ops.is_empty() {
+            None
+        } else {
+            Some(Rc::new(ops))
+        };
         if let GuestView::Group(gr) = &mut *g {
             let mut kids: Vec<Box<dyn Drawable>> = Vec::new();
             let mut kid_handles: Vec<u32> = Vec::new();

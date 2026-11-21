@@ -6,6 +6,7 @@
 
 use crate::widget::Drawable;
 use ovelo_ui::Color;
+use std::rc::Rc;
 
 /// A dimension from `LayoutParams`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -75,6 +76,9 @@ pub struct View {
     pub image: Option<(u32, u32, std::rc::Rc<Vec<u8>>)>,
     /// `setOnClickListener` — fired on tap inside the laid-out rect.
     pub on_click: Option<Box<dyn FnMut()>>,
+    /// Guest `onDraw(Canvas)` ops recorded by the dexrt materializer —
+    /// replayed view-locally after background/image in `draw`.
+    pub custom_ops: Option<Rc<Vec<ovelo_dexrt::CanvasOp>>>,
     /// Pressed while the pointer that went down on this view is still
     /// down; a click only fires when the release also lands inside.
     pub pressed: bool,
@@ -94,6 +98,7 @@ impl View {
             background: None,
             image: None,
             on_click: None,
+            custom_ops: None,
             pressed: false,
             dirty: true,
         }

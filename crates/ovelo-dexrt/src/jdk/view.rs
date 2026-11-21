@@ -968,12 +968,18 @@ pub(crate) fn call(
             }
             Some(Some(V::I32(n as i32)))
         }
-        "getChildAt" => Some(Some(
-            children(vm, this)
+        "getChildAt" => {
+            let got = children(vm, this)
                 .get(i32v(args.get(1).copied().unwrap_or(V::I32(0))) as usize)
                 .copied()
-                .unwrap_or(V::Ref(0)),
-        )),
+                .unwrap_or(V::Ref(0));
+            if std::env::var_os("OVELO_VIEWDBG").is_some() {
+                let d = class_of(vm, V::Ref(this));
+                let cd = class_of(vm, got);
+                eprintln!("[viewdbg] getChildAt {d} h{this}[{}] -> {cd}", i32v(args.get(1).copied().unwrap_or(V::I32(0))));
+            }
+            Some(Some(got))
+        }
         "indexOfChild" => {
             let target = args.get(1).copied().unwrap_or(V::Ref(0));
             let i = children(vm, this)
@@ -1397,6 +1403,24 @@ pub(crate) fn call(
             );
             Some(Some(V::I32(frame_set(vm, this, l, t, r, b) as i32)))
         }
+        // Reached when guest code calls `super.onMeasure`/`super.onLayout`
+        // on a framework skeleton class — without an arm the super call
+        // no-ops and children keep 0×0 frames (MonthViewWrapper).
+        "onMeasure" => {
+            group_measure_fallback(vm, this, vint(args.get(1)), vint(args.get(2)));
+            Some(None)
+        }
+        "onLayout" => {
+            let (l, t, r, b) = (
+                vint(args.get(2)),
+                vint(args.get(3)),
+                vint(args.get(4)),
+                vint(args.get(5)),
+            );
+            group_layout_fallback(vm, this, l, t, r, b);
+            Some(None)
+        }
+        "onDraw" => Some(None),
         "offsetLeftAndRight" => {
             let d = vint(args.get(1));
             pseudo_set(vm, this, P_LEFT, V::I32(pint(vm, this, P_LEFT) + d));
