@@ -636,7 +636,7 @@ extern "C" fn sh_log_write(prio: i32, tag: *const i8, text: *const i8) -> i32 {
 /// heap: host code keeps running and a real bug surfaces as a crash
 /// inside zone functions with `[so]` frames pointing at the culprit.
 #[cfg(target_os = "macos")]
-fn guest_zone() -> *mut c_void {
+pub(crate) fn guest_zone() -> *mut c_void {
     static ZONE: OnceLock<usize> = OnceLock::new();
     *ZONE.get_or_init(|| unsafe { malloc_create_zone(0, 0) as usize }) as *mut c_void
 }

@@ -170,9 +170,14 @@ pub(crate) fn env_enter(name: &'static str) {
                 fn malloc_default_zone() -> *mut std::ffi::c_void;
                 fn malloc_zone_check(zone: *mut std::ffi::c_void) -> bool;
             }
-            if !malloc_zone_check(malloc_default_zone()) {
-                eprintln!("[zonecheck] BAD ZONE on entry to {name}; previous env call: {}", LAST_ENV.get());
-                std::process::abort();
+            for (zname, z) in [
+                ("default", malloc_default_zone()),
+                ("guest", crate::native::guest_zone()),
+            ] {
+                if !malloc_zone_check(z) {
+                    eprintln!("[zonecheck] BAD {zname} ZONE on entry to {name}; previous env call: {}", LAST_ENV.get());
+                    std::process::abort();
+                }
             }
         }
     }
