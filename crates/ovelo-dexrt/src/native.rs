@@ -47,6 +47,10 @@ extern "C" {
     fn abort() -> !;
     #[cfg(target_os = "macos")]
     fn pthread_threadid_np(t: usize, id: *mut u64) -> i32;
+    #[cfg(target_os = "macos")]
+    fn __error() -> *mut i32;
+    #[cfg(not(target_os = "macos"))]
+    fn __errno_location() -> *mut i32;
     fn lseek(fd: i32, off: i64, whence: i32) -> i64;
     #[cfg(target_os = "macos")]
     fn sys_icache_invalidate(start: *mut c_void, len: usize);
@@ -432,22 +436,21 @@ extern "C" fn sh_strcpy_chk(d: *mut i8, s: *const i8, dlen: usize) -> *mut i8 {
         strcpy(d, s)
     }
 }
+// Bionic scans at most `slen` bytes: a match or NUL inside the bound
+// succeeds even when the buffer is unterminated past it.
 extern "C" fn sh_strchr_chk(s: *const i8, c: i32, slen: usize) -> *mut i8 {
-    let n = unsafe { strlen(s) };
-    if n > slen {
-        sh_chk_fail();
-    }
-    let mut p = s as *const u8;
+    let p = s as *const u8;
     unsafe {
-        loop {
-            if *p == c as u8 {
-                return p as *mut i8;
+        for i in 0..slen {
+            let b = *p.add(i);
+            if b == c as u8 {
+                return p.add(i) as *mut i8;
             }
-            if *p == 0 {
+            if b == 0 {
                 return std::ptr::null_mut();
             }
-            p = p.add(1);
         }
+        sh_chk_fail();
     }
 }
 extern "C" fn sh_memmove_chk(
@@ -484,9 +487,19 @@ extern "C" fn sh_vsnprintf_chk(
     }
     unsafe { vsnprintf(d, size, fmt, ap) }
 }
-static mut SH_ERRNO: i32 = 0;
+// `__errno()` must return the REAL host errno cell — host libc calls
+// (open, read) write failures there and the guest reads them back.
 extern "C" fn sh_errno() -> *mut i32 {
-    std::ptr::addr_of_mut!(SH_ERRNO)
+    unsafe {
+        #[cfg(target_os = "macos")]
+        {
+            __error()
+        }
+        #[cfg(not(target_os = "macos"))]
+        {
+            __errno_location()
+        }
+    }
 }
 extern "C" fn sh_assert2(
     file: *const i8,
@@ -522,27 +535,84 @@ extern "C" fn sh_gettid() -> i32 {
 extern "C" fn sh_gettid() -> i32 {
     0
 }
-extern "C" fn sh_open2(path: *const i8, flags: i32) -> i32 {
-    unsafe { open(path, flags) }
-}
 #[cfg(target_os = "macos")]
 extern "C" fn sh_terminate() -> ! {
     eprintln!("[native] cxa handler invoked");
     unsafe { abort() }
 }
-// Bionic's `__strncpy_chk2` adds a compile-time `n` bound on top of the
-// runtime dstlen check: `__strncpy_chk2(d, s, n, dlen, max_n)`.
+// Bionic's `__strncpy_chk2` reports the compile-time dst bound; a short
+// source zero-pads legally, so only the destination bound aborts.
 extern "C" fn sh_strncpy_chk2(
     d: *mut i8,
     s: *const i8,
     n: usize,
     dlen: usize,
-    max_n: usize,
+    _max_n: usize,
 ) -> *mut i8 {
-    if n > dlen || n > max_n {
+    if n > dlen {
         sh_chk_fail();
     }
     unsafe { strncpy(d, s, n) }
+}
+extern "C" fn sh_system_property_get(_name: *const i8, value: *mut i8) -> i32 {
+    unsafe { *value = 0 };
+    0
+}
+extern "C" fn sh_getaffinity(_pid: i32, size: usize, mask: *mut u8) -> i32 {
+    unsafe {
+        memset(mask as *mut c_void, 0, size);
+        let cpus = std::thread::available_parallelism()
+            .map(|n| n.get())
+            .unwrap_or(1);
+        let bytes = cpus.div_ceil(8).min(size);
+        for i in 0..bytes {
+            *mask.add(i) = 0xff;
+        }
+        if cpus % 8 != 0 && bytes > 0 {
+            *mask.add(bytes - 1) = (1 << (cpus % 8)) - 1;
+        }
+    }
+    0
+}
+/// Translate Bionic `O_*` bits (asm-generic values) to the host's.
+/// Access-mode bits 0-1 are identical everywhere; named flags differ —
+/// e.g. Bionic O_APPEND=0x400 is Darwin's O_TRUNC.
+#[cfg(target_os = "macos")]
+fn guest_oflags(flags: i32) -> i32 {
+    const MAP: &[(i32, i32)] = &[
+        (0x00040, 0x00200),    // O_CREAT
+        (0x00080, 0x00800),    // O_EXCL
+        (0x00100, 0x20000),    // O_NOCTTY
+        (0x00200, 0x00400),    // O_TRUNC
+        (0x00400, 0x00008),    // O_APPEND
+        (0x00800, 0x00004),    // O_NONBLOCK
+        (0x01000, 0x400000),   // O_DSYNC
+        (0x10000, 0x100000),   // O_DIRECTORY
+        (0x20000, 0x00100),    // O_NOFOLLOW
+        (0x80000, 0x1000000),  // O_CLOEXEC
+        (0x101000, 0x00080),   // O_SYNC (Bionic's value includes DSYNC)
+        (0x200000, 0x00000),   // O_PATH — no Darwin equivalent
+        (0x04000, 0x00000),    // O_DIRECT — drop (Darwin uses fcntl)
+        (0x08000, 0x00000),    // O_LARGEFILE — implicit on 64-bit
+        (0x40000, 0x00000),    // O_NOATIME — no Darwin equivalent
+    ];
+    let mut out = flags & 0x3;
+    for &(b, d) in MAP {
+        if flags & b == b {
+            out |= d;
+        }
+    }
+    out
+}
+#[cfg(not(target_os = "macos"))]
+fn guest_oflags(flags: i32) -> i32 {
+    flags // Linux host: Bionic values are the native ones
+}
+extern "C" fn sh_open(path: *const i8, flags: i32, mode: i32) -> i32 {
+    unsafe { open(path, guest_oflags(flags), mode) }
+}
+extern "C" fn sh_open2(path: *const i8, flags: i32) -> i32 {
+    unsafe { open(path, guest_oflags(flags)) }
 }
 extern "C" fn sh_memcpy_chk(d: *mut c_void, s: *const c_void, n: usize, dlen: usize) -> *mut c_void {
     if n > dlen {
@@ -1073,13 +1143,14 @@ fn builtin_shim(name: &str) -> Option<usize> {
         "__errno" => sh_errno as *const () as usize,
         "__assert2" => sh_assert2 as *const () as usize,
         "getauxval" => sh_zero as *const () as usize,
-        "__system_property_get" => sh_zero as *const () as usize,
         "prctl" => sh_zero as *const () as usize,
         "sched_setaffinity" => sh_zero as *const () as usize,
-        "sched_getaffinity" => sh_zero as *const () as usize,
         "syscall" => sh_neg1 as *const () as usize,
         "gettid" => sh_gettid as *const () as usize,
         "__open_2" => sh_open2 as *const () as usize,
+        "open" => sh_open as *const () as usize,
+        "__system_property_get" => sh_system_property_get as *const () as usize,
+        "sched_getaffinity" => sh_getaffinity as *const () as usize,
         "lseek64" => lseek as *const () as usize,
         "__memcpy_chk" => sh_memcpy_chk as *const () as usize,
         "__memset_chk" => sh_memset_chk as *const () as usize,
