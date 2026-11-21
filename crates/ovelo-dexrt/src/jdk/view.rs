@@ -1045,25 +1045,42 @@ pub(crate) fn call(
         // children carry an empty LP and `iget lp.width` reads 0 forever
         // (Glide's SizeDeterminer waits on it).
         "generateLayoutParams" => {
-            let attrs = args
+            let arg = args
                 .get(1)
                 .copied()
-                .filter(|a| matches!(a, V::Ref(h) if *h != 0))
-                .unwrap_or_else(|| pseudo_get(vm, this, P_ATTRS).unwrap_or(V::Ref(0)));
-            Some(Some(gen_lp(vm, this, attrs)))
+                .filter(|a| matches!(a, V::Ref(h) if *h != 0));
+            let v = match arg {
+                // AOSP: a null/nullable arg defers to
+                // generateDefaultLayoutParams — never inherit the
+                // parent's own attrs (the child would copy e.g. a
+                // 0dp layout_height and vanish).
+                None => default_lp(vm, this),
+                Some(a) => {
+                    let lp = lp_class_for(vm, this);
+                    let h = vm.alloc_host(&lp, HostState::Empty);
+                    if class_of(vm, a).contains("LayoutParams") {
+                        // generateLayoutParams(LayoutParams): copy ctor.
+                        lp_ctor(
+                            vm,
+                            &lp,
+                            "(Landroid/view/ViewGroup$LayoutParams;)V",
+                            &[V::Ref(h), a],
+                        );
+                    } else {
+                        let ctx = pseudo_get(vm, this, P_CONTEXT).unwrap_or(V::Ref(0));
+                        lp_ctor(
+                            vm,
+                            &lp,
+                            "(Landroid/content/Context;Landroid/util/AttributeSet;)V",
+                            &[V::Ref(h), ctx, a],
+                        );
+                    }
+                    V::Ref(h)
+                }
+            };
+            Some(Some(v))
         }
-        "generateDefaultLayoutParams" => {
-            let pcls = class_of(vm, V::Ref(this));
-            let lp = format!("{}$LayoutParams;", pcls.trim_end_matches(';'));
-            let h = vm.alloc_host(&lp, HostState::Empty);
-            lp_ctor(
-                vm,
-                &lp,
-                "(II)V",
-                &[V::Ref(h), V::I32(-2), V::I32(-2)],
-            );
-            Some(Some(V::Ref(h)))
-        }
+        "generateDefaultLayoutParams" => Some(Some(default_lp(vm, this))),
         "getChildCount" => {
             let n = children(vm, this).len();
             if std::env::var_os("OVELO_VIEWDBG").is_some() {
@@ -2864,6 +2881,42 @@ fn group_measure_fallback(vm: &mut Vm, this: u32, pw: i32, ph: i32) {
         let cw_in = self_w - pad_w;
         let ch_in = self_h - pad_h;
         if cw_in > 0 || ch_in > 0 {
+            // AOSP LinearLayout#measureVertical re-measures each
+            // match_parent child with `delta = height - mTotalLength`
+            // (non-match children plus every margin) — not the full
+            // resolved height, which would stack it past the bottom.
+            let (nonmatch_h, match_margins_h) = if linear {
+                kids.iter().copied().fold((0i32, 0i32), |(nm, mm), c| {
+                    let V::Ref(ch) = c else {
+                        return (nm, mm);
+                    };
+                    if ch == 0 {
+                        return (nm, mm);
+                    }
+                    let lp_obj = match pseudo_get(vm, ch, P_LP) {
+                        Some(V::Ref(l)) => l,
+                        _ => 0,
+                    };
+                    let lph = lp_field(vm, lp_obj, "height")
+                        .and_then(|v| lp_px(vm, v))
+                        .or_else(|| attr_find(vm, ch, "layout_height").map(|v| len_v(vm, v)))
+                        .unwrap_or(-2);
+                    let mv = lp_field(vm, lp_obj, "topMargin")
+                        .and_then(|v| lp_px(vm, v))
+                        .unwrap_or(0)
+                        + lp_field(vm, lp_obj, "bottomMargin")
+                            .and_then(|v| lp_px(vm, v))
+                            .unwrap_or(0);
+                    if lph == -1 {
+                        (nm, mm + mv)
+                    } else {
+                        (nm + (pint(vm, ch, P_MEAS_H) & 0x00FF_FFFF) + mv, mm)
+                    }
+                })
+            } else {
+                (0, 0)
+            };
+            let match_h = (ch_in - nonmatch_h - match_margins_h).max(0);
             for c in kids.iter().copied() {
                 let V::Ref(ch) = c else { continue };
                 if ch == 0 {
@@ -2896,7 +2949,12 @@ fn group_measure_fallback(vm: &mut Vm, this: u32, pw: i32, ph: i32) {
                     child_measure_spec(pw, pad_w + mh, lpw)
                 };
                 let hs = if lph == -1 {
-                    EXACTLY | (ch_in - mv).max(0)
+                    EXACTLY
+                        | if linear {
+                            match_h
+                        } else {
+                            (ch_in - mv).max(0)
+                        }
                 } else {
                     child_measure_spec(ph, pad_h + mv, lph)
                 };
@@ -3386,12 +3444,50 @@ fn lp_ctor(vm: &mut Vm, class: &str, sig: &str, args: &[V]) {
     }
 }
 
+/// `Foo$LayoutParams` name for the nearest ancestor that declares one:
+/// a dex subclass with no LP type of its own yields its framework
+/// parent's canonical LP (`FrameLayout$LayoutParams`), not an invented
+/// `MyFrame$LayoutParams` a dex `check-cast` would reject. A
+/// dex-defined `Foo$LayoutParams` wins at each level, then the first
+/// `Landroid/` ancestor's canonical name, else the ViewGroup base.
+fn lp_class_for(vm: &Vm, parent: u32) -> String {
+    let mut d = class_of(vm, V::Ref(parent));
+    for _ in 0..32 {
+        let cand = format!("{}$LayoutParams;", d.trim_end_matches(';'));
+        let dex_def = vm
+            .type_index_of(&cand)
+            .and_then(|g| vm.def_loc_of(g))
+            .is_some();
+        if dex_def || d.starts_with("Landroid/") {
+            return cand;
+        }
+        match vm.super_desc(&d) {
+            Some(s) if s != d => d = s,
+            _ => break,
+        }
+    }
+    "Landroid/view/ViewGroup$LayoutParams;".to_string()
+}
+
+/// Default `Foo$LayoutParams` (wrap_content × wrap_content) for a
+/// host-stub parent.
+fn default_lp(vm: &mut Vm, parent: u32) -> V {
+    let lp = lp_class_for(vm, parent);
+    let h = vm.alloc_host(&lp, HostState::Empty);
+    lp_ctor(
+        vm,
+        &lp,
+        "(II)V",
+        &[V::Ref(h), V::I32(-2), V::I32(-2)],
+    );
+    V::Ref(h)
+}
+
 /// Host-fabricated `ViewGroup$LayoutParams` for framework-stub parents:
 /// a host object whose field map `lp_ctor` fills from the child attrs,
 /// so dex `iget lp.width`/`lp.height` reads real dims (-1/-2/px).
 fn gen_lp(vm: &mut Vm, parent: u32, attrs: V) -> V {
-    let pcls = class_of(vm, V::Ref(parent));
-    let lp = format!("{}$LayoutParams;", pcls.trim_end_matches(';'));
+    let lp = lp_class_for(vm, parent);
     let ctx = pseudo_get(vm, parent, P_CONTEXT).unwrap_or(V::Ref(0));
     let h = vm.alloc_host(&lp, HostState::Empty);
     lp_ctor(
