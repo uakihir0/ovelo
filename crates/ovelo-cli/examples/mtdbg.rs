@@ -55,6 +55,9 @@ fn main() {
                         "  {i:04x}@{:04x} {} regs={:?}",
                         ins.offset, ins.name, ins.regs
                     );
+                    if let Some(l) = ins.lit {
+                        line += &format!(" lit={l}");
+                    }
                     if let Some(t) = ins.target {
                         let ti = insns
                             .iter()

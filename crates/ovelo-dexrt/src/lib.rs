@@ -210,6 +210,11 @@ pub struct Vm {
     /// strings and updater-style guests (`AtomicReferenceFieldUpdater`,
     /// `Unsafe`) issue thousands of lookups.
     field_idx_cache: std::cell::RefCell<HashMap<(String, String), Option<GIdx>>>,
+    /// `(field_name, field_type)` → canonical field GIdxs across all
+    /// dexes, built lazily — lets host code write fields on dex
+    /// instances under every owner a reader's field ref might name
+    /// (R8 renames owners like `ViewGroup$LayoutParams` arbitrarily).
+    fields_named_cache: std::cell::RefCell<Option<HashMap<(String, String), Vec<GIdx>>>>,
     /// Deferred async work — `(runnable, on_main)`. `Thread.start`,
     /// `Executor.execute`/`submit` and `Handler.post*` enqueue here
     /// instead of running inline (AOSP is async; inline execution
@@ -338,6 +343,7 @@ impl Vm {
             reparked: std::collections::HashSet::new(),
             park_spins: 0,
             field_idx_cache: std::cell::RefCell::new(HashMap::new()),
+            fields_named_cache: std::cell::RefCell::new(None),
             class_mirrors: HashMap::new(),
             granted_permissions: std::collections::HashSet::new(),
         };
@@ -362,6 +368,7 @@ impl Vm {
     pub fn add_dex(&mut self, dex: DexFile) -> Result<()> {
         // A new dex can resolve names previous lookups missed.
         self.field_idx_cache.borrow_mut().clear();
+        self.fields_named_cache.borrow_mut().take();
         let di = self.dexes.len();
         for (class_idx, em) in dex.methods()? {
             self.defined
@@ -472,6 +479,39 @@ impl Vm {
             }
         }
         self.field_idx_cache.borrow_mut().insert(key, out);
+        out
+    }
+
+    /// Canonical field keys for `(name, type)` across every loaded dex,
+    /// regardless of declaring owner — used when host code must write a
+    /// field on a dex instance that readers reach through arbitrarily
+    /// (R8-)named owner references.
+    pub(crate) fn field_keys_named(&self, name: &str, ty: &str) -> Vec<GIdx> {
+        if let Some(m) = self.fields_named_cache.borrow().as_ref() {
+            return m
+                .get(&(name.to_string(), ty.to_string()))
+                .cloned()
+                .unwrap_or_default();
+        }
+        let mut m: HashMap<(String, String), Vec<GIdx>> = HashMap::new();
+        for (di, d) in self.dexes.iter().enumerate() {
+            for i in 0..d.field_ids_len() {
+                let Ok(f) = d.field(i as u32) else { continue };
+                let (Ok(n), Ok(t)) = (
+                    d.string(f.name_idx),
+                    d.type_descriptor(f.type_idx as u32),
+                ) else {
+                    continue;
+                };
+                let g = self.canon_field(gx(di, i as u32));
+                m.entry((n, t)).or_default().push(g);
+            }
+        }
+        let out = m
+            .get(&(name.to_string(), ty.to_string()))
+            .cloned()
+            .unwrap_or_default();
+        *self.fields_named_cache.borrow_mut() = Some(m);
         out
     }
 

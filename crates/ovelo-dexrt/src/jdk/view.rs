@@ -433,7 +433,8 @@ pub(crate) fn is_viewish(vm: &Vm, class: &str, args: &[V]) -> bool {
             | "Landroidx/appcompat/view/menu/MenuBuilder;"
             | "Landroidx/appcompat/view/menu/MenuItemImpl;"
             | "Landroid/view/ViewTreeObserver;"
-    ) || desc_is_a(class, VIEW)
+    ) || class.ends_with("LayoutParams;")
+        || desc_is_a(class, VIEW)
         || class.ends_with("$DecorView;")
     {
         return true;
@@ -457,6 +458,10 @@ pub(crate) fn call(
     };
     Ok(match name {
         // ---------- inflation ----------
+        "<init>" if class.ends_with("LayoutParams;") => {
+            lp_ctor(vm, class, sig, args);
+            Some(None)
+        }
         "inflate" if class.contains("MenuInflater") => {
             // MenuInflater.inflate(menuRes, Menu)
             if let Some(V::Ref(mh)) = args.get(2).copied() {
@@ -1093,6 +1098,10 @@ pub(crate) fn call(
                 );
             }
             pseudo_set(vm, this, P_LP, args.get(1).copied().unwrap_or(V::Ref(0)));
+            // AOSP View.setLayoutParams ends in requestLayout() —
+            // ConstraintLayout only rebuilds its widget list while a
+            // child reports isLayoutRequested.
+            pseudo_set(vm, this, P_LAYOUT_REQ, V::I32(1));
             Some(None)
         }
         "measure" => {
@@ -1758,9 +1767,24 @@ pub(crate) fn ta_lookup(vm: &mut Vm, h: u32, index: usize) -> Option<V> {
         .map(|s| s.to_string());
     if let Some(name) = name {
         if let Some(V::Ref(set_h)) = pseudo_get(vm, h, P_TA_SET) {
+            let is_xml = matches!(
+                vm.heap.get(set_h),
+                Some(Obj::Host {
+                    state: HostState::Xml { .. },
+                    ..
+                })
+            );
             if let Some(v) = xml::cur_attr_value(vm, set_h, &name) {
+                if std::env::var_os("OVELO_VIEWDBG").is_some() {
+                    eprintln!("[viewdbg]   ta_hit {name} = {v:?}");
+                }
                 return Some(v);
             }
+            if std::env::var_os("OVELO_VIEWDBG").is_some() {
+                eprintln!("[viewdbg]   ta_miss {name} set={set_h} xml={is_xml}");
+            }
+        } else if std::env::var_os("OVELO_VIEWDBG").is_some() {
+            eprintln!("[viewdbg]   ta_noset {name}");
         }
         if let Some(V::Ref(set_h)) = pseudo_get(vm, h, P_TA_SET) {
             if let Some(Obj::Host {
@@ -1775,7 +1799,13 @@ pub(crate) fn ta_lookup(vm: &mut Vm, h: u32, index: usize) -> Option<V> {
                         None
                     }
                 }) {
+                    if std::env::var_os("OVELO_VIEWDBG").is_some() {
+                        eprintln!("[viewdbg]   ta_map_hit {name} = {v:?}");
+                    }
                     return Some(v);
+                }
+                if std::env::var_os("OVELO_VIEWDBG").is_some() {
+                    eprintln!("[viewdbg]   ta_map_miss {name} set={set_h}");
                 }
             }
         }
@@ -1996,6 +2026,144 @@ fn layout_params(vm: &mut Vm, this: u32) -> V {
         );
     }
     v
+}
+
+/// XML attr name → `LayoutParams`/`MarginLayoutParams` field names it
+/// feeds (framework ctor semantics). `weight` is `F`, the rest `I`.
+const LP_ATTRS: &[(&str, &[&str])] = &[
+    ("layout_width", &["width"]),
+    ("layout_height", &["height"]),
+    ("layout_gravity", &["gravity"]),
+    ("layout_weight", &["weight"]),
+    (
+        "layout_margin",
+        &["leftMargin", "topMargin", "rightMargin", "bottomMargin"],
+    ),
+    ("layout_marginLeft", &["leftMargin"]),
+    ("layout_marginTop", &["topMargin"]),
+    ("layout_marginRight", &["rightMargin"]),
+    ("layout_marginBottom", &["bottomMargin"]),
+    ("layout_marginStart", &["startMargin"]),
+    ("layout_marginEnd", &["endMargin"]),
+    ("layout_marginHorizontal", &["leftMargin", "rightMargin"]),
+    ("layout_marginVertical", &["topMargin", "bottomMargin"]),
+];
+
+/// Value on an `AttributeSet` by local attr name — Map-backed sets and
+/// live `XmlResourceParser`s alike.
+fn attrset_value(vm: &mut Vm, set: V, name: &str) -> Option<V> {
+    let V::Ref(h) = set else { return None };
+    match vm.heap.get(h) {
+        Some(Obj::Host {
+            state: HostState::Map(m),
+            ..
+        }) => {
+            let v = m.iter().find_map(|(k, v)| {
+                if sv(vm, *k).as_deref() == Some(name) {
+                    Some(*v)
+                } else {
+                    None
+                }
+            })?;
+            Some(v)
+        }
+        Some(Obj::Host {
+            state: HostState::Xml { .. },
+            ..
+        }) => xml::cur_attr_value(vm, h, name),
+        _ => None,
+    }
+}
+
+/// A dimension-ish runtime value → px int: resource ids resolve
+/// through the arsc dimen table, floats are already px.
+fn lp_px(vm: &Vm, v: V) -> Option<i32> {
+    let i = match v {
+        V::I32(i) => i,
+        V::I64(l) => l as i32,
+        V::F32(f) => return Some(f as i32),
+        V::F64(f) => return Some(f as i32),
+        _ => return None,
+    };
+    if i > 0 {
+        if let Some(px) = vm.apk_res.as_ref().and_then(|r| r.dimen(i as u32)) {
+            return Some(px as i32);
+        }
+    }
+    Some(i)
+}
+
+/// Framework `*LayoutParams` ctors the dex subclasses invoke-super
+/// into: `(Context, AttributeSet)` parses the XML attrs, `(int, int)`
+/// takes raw dims, `(LayoutParams)` copies. Values go into the
+/// instance's field map under every canon key the app's field refs
+/// use — dex `iget` reads `Ly70.width`, `MarginLayoutParams.width`
+/// and friends by exact canon key, and R8 names the owners freely.
+fn lp_ctor(vm: &mut Vm, class: &str, sig: &str, args: &[V]) {
+    let this = match args.first() {
+        Some(V::Ref(h)) => *h,
+        _ => return,
+    };
+    let mut writes: Vec<(String, String, V)> = Vec::new();
+    if sig.contains("AttributeSet") {
+        for (attr, fields) in LP_ATTRS {
+            let Some(v) = attrset_value(vm, args.get(2).copied().unwrap_or(V::Ref(0)), attr)
+            else {
+                continue;
+            };
+            for f in *fields {
+                if *f == "weight" {
+                    if let V::F32(_) | V::F64(_) | V::I32(_) = v {
+                        writes.push((f.to_string(), "F".to_string(), v));
+                    }
+                } else if let Some(px) = lp_px(vm, v) {
+                    writes.push((f.to_string(), "I".to_string(), V::I32(px)));
+                }
+            }
+        }
+        let _ = class;
+    } else if sig == "(II)V" {
+        for (f, a) in [("width", args.get(1)), ("height", args.get(2))] {
+            if let Some(v) = a.copied().and_then(|v| lp_px(vm, v)) {
+                writes.push((f.to_string(), "I".to_string(), V::I32(v)));
+            }
+        }
+    } else if sig.contains("LayoutParams") {
+        // Copy ctor: carry every recognized LP field the source has.
+        let src = match args.get(1).copied() {
+            Some(V::Ref(h)) => h,
+            _ => 0,
+        };
+        let src_fields = match vm.heap.get(src) {
+            Some(Obj::Instance { fields, .. }) | Some(Obj::Host { fields, .. }) => {
+                Some(fields.clone())
+            }
+            _ => None,
+        };
+        if let Some(src_fields) = src_fields {
+            for (_, fields) in LP_ATTRS {
+                for f in *fields {
+                    let ty = if *f == "weight" { "F" } else { "I" };
+                    if let Some(v) = vm
+                        .field_keys_named(f, ty)
+                        .iter()
+                        .find_map(|g| src_fields.get(g).copied())
+                    {
+                        writes.push((f.to_string(), ty.to_string(), v));
+                    }
+                }
+            }
+        }
+    }
+    for (name, ty, v) in writes {
+        for g in vm.field_keys_named(&name, &ty) {
+            if let Some(Obj::Instance { fields, .. }) | Some(Obj::Host { fields, .. }) =
+                vm.heap.get_mut(this)
+            {
+                fields.insert(g, v);
+            }
+        }
+    }
 }
 
 fn is_group_tag(tag: &str) -> bool {
@@ -2279,6 +2447,42 @@ pub(crate) fn attach_at(vm: &mut Vm, parent: u32, child: V, idx: Option<usize>) 
     }
     if let V::Ref(ch) = child {
         pseudo_set(vm, ch, P_PARENT, V::Ref(parent));
+        // AOSP addViewInner checkLayoutParams → generateLayoutParams
+        // first: ConstraintLayout's onViewAdded reads getLayoutParams()
+        // and mints the child widget from the LP, so the LP must exist
+        // before the notification lands.
+        // AOSP addViewInner → child.setLayoutParams → requestLayout:
+        // the child must report isLayoutRequested or dex parents
+        // (ConstraintLayout.updateHierarchy) skip rebuilding the
+        // widget list, leaving the solver with no children at 0,0,0,0.
+        pseudo_set(vm, ch, P_LAYOUT_REQ, V::I32(1));
+        if pseudo_get(vm, ch, P_LP).is_none() {
+            let attrs = pseudo_get(vm, ch, P_ATTRS).unwrap_or(V::Ref(0));
+            let lp = vm
+                .call_virtual_sig(
+                    parent,
+                    "generateLayoutParams",
+                    &["Landroid/util/AttributeSet;"],
+                    &[attrs],
+                )
+                .ok()
+                .flatten()
+                .or_else(|| {
+                    vm.call_virtual_rt(parent, "generateDefaultLayoutParams", &[])
+                        .ok()
+                        .flatten()
+                });
+            if let Some(v @ V::Ref(lp)) = lp {
+                if lp != 0 {
+                    pseudo_set(vm, ch, P_LP, v);
+                }
+            }
+        }
+        // AOSP ViewGroup.addViewInner notifies onViewAdded — dex parents
+        // (ConstraintLayout) use it to arm mDirtyHierarchy and register
+        // the child in mChildrenById; without it updateHierarchy skips
+        // the child and the solver leaves its widget at 0,0,0,0.
+        let _ = vm.call_virtual_rt(parent, "onViewAdded", &[V::Ref(ch)]);
         // App content lands under the `android.R.id.content` frame —
         // whether via our Window.setContentView or appcompat's dex-side
         // ensureSubDecor — so remember it as the running activity's
