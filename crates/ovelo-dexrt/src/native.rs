@@ -180,17 +180,38 @@ extern "C" fn sh_sincos(x: f64, s: *mut f64, c: *mut f64) {
     }
 }
 // FORTIFY `_chk` variants — guest image memory is real host memory, so the
-// libc bodies apply directly; the object-size argument is ignored.
-extern "C" fn sh_strlen_chk(s: *const i8, _slen: usize) -> usize {
-    unsafe { strlen(s) }
+// libc bodies apply directly, but the object-size bound is still enforced:
+// Bionic's __chk_fail aborts the process (SIGABRT) when a write/copy would
+// exceed the destination's declared size.
+extern "C" fn sh_chk_fail() -> ! {
+    eprintln!("[native] __chk_fail");
+    std::process::abort()
 }
-extern "C" fn sh_strcpy_chk(d: *mut i8, s: *const i8, _dlen: usize) -> *mut i8 {
-    unsafe { strcpy(d, s) }
+extern "C" fn sh_strlen_chk(s: *const i8, slen: usize) -> usize {
+    let n = unsafe { strlen(s) };
+    if n >= slen {
+        sh_chk_fail();
+    }
+    n
 }
-extern "C" fn sh_memcpy_chk(d: *mut c_void, s: *const c_void, n: usize, _dlen: usize) -> *mut c_void {
+extern "C" fn sh_strcpy_chk(d: *mut i8, s: *const i8, dlen: usize) -> *mut i8 {
+    unsafe {
+        if strlen(s) + 1 > dlen {
+            sh_chk_fail();
+        }
+        strcpy(d, s)
+    }
+}
+extern "C" fn sh_memcpy_chk(d: *mut c_void, s: *const c_void, n: usize, dlen: usize) -> *mut c_void {
+    if n > dlen {
+        sh_chk_fail();
+    }
     unsafe { memcpy(d, s, n) }
 }
-extern "C" fn sh_memset_chk(d: *mut c_void, c: i32, n: usize, _dlen: usize) -> *mut c_void {
+extern "C" fn sh_memset_chk(d: *mut c_void, c: i32, n: usize, dlen: usize) -> *mut c_void {
+    if n > dlen {
+        sh_chk_fail();
+    }
     unsafe { memset(d, c, n) }
 }
 
