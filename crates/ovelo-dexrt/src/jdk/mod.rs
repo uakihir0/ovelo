@@ -92,6 +92,12 @@ pub(crate) fn s(vm: &Vm, h: u32) -> Option<String> {
             state: HostState::StrBuf(t) | HostState::Path(t) | HostState::Regex(t),
             ..
         }) => Some(t.clone()),
+        // `new String(x)` — the String.<init> arm stashes the source
+        // text under P_DATA so copies read like the interned form.
+        Some(Obj::Instance { fields, .. }) => match fields.get(&(P_DATA as u64)) {
+            Some(&V::Ref(rh)) if rh != 0 => s(vm, rh),
+            _ => None,
+        },
         Some(Obj::Host { .. }) => None,
         _ => None,
     }
@@ -372,7 +378,8 @@ pub(crate) fn field_set(vm: &mut Vm, h: u32, owner: &str, name: &str, v: V) {
     }
 }
 
-pub(crate) fn pseudo_get(vm: &Vm, h: u32, key: impl Into<u64>) -> Option<V> {
+/// Read a pseudo field (`P_*` key) off a host/instance object.
+pub fn pseudo_get(vm: &Vm, h: u32, key: impl Into<u64>) -> Option<V> {
     match vm.heap.get(h) {
         Some(Obj::Instance { fields, .. }) | Some(Obj::Host { fields, .. }) => {
             fields.get(&key.into()).copied()
@@ -381,7 +388,8 @@ pub(crate) fn pseudo_get(vm: &Vm, h: u32, key: impl Into<u64>) -> Option<V> {
     }
 }
 
-pub(crate) fn pseudo_set(vm: &mut Vm, h: u32, key: impl Into<u64>, v: V) {
+/// Write a pseudo field (`P_*` key) on a host/instance object.
+pub fn pseudo_set(vm: &mut Vm, h: u32, key: impl Into<u64>, v: V) {
     let key = key.into();
     if let Some(f) = fields_mut(vm, h) {
         // Re-writing the same value (deterministic layout passes do this

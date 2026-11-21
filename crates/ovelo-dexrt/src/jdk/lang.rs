@@ -800,12 +800,26 @@ fn boxed_call(
             _ => V::I32(i32v(args[0]).swap_bytes()),
         })),
         "rotateLeft" | "rotateRight" => {
-            let (x, d) = (i32v(args[0]), i32v(args[1]) as u32);
-            Some(Some(V::I32(if name == "rotateLeft" {
-                x.rotate_left(d)
+            let d = match args[1] {
+                V::I64(l) => l as u32,
+                V::I32(i) => i as u32,
+                _ => 0,
+            };
+            Some(Some(if class == "Ljava/lang/Long;" {
+                let x = i64v(args[0]);
+                V::I64(if name == "rotateLeft" {
+                    x.rotate_left(d)
+                } else {
+                    x.rotate_right(d)
+                })
             } else {
-                x.rotate_right(d)
-            })))
+                let x = i32v(args[0]);
+                V::I32(if name == "rotateLeft" {
+                    x.rotate_left(d)
+                } else {
+                    x.rotate_right(d)
+                })
+            }))
         }
         "signum" => Some(Some(V::I32(i32v(args[0]).signum()))),
         "compare" | "compareUnsigned" => {

@@ -508,31 +508,63 @@ fn viewconfig_call(vm: &mut Vm, class: &str, name: &str, args: &[V]) -> Rt<Optio
         // int getAbsoluteGravity(int gravity, int layoutDirection):
         // resolves START/END bits against the direction (AOSP semantics).
         ("Landroid/view/Gravity;", "getAbsoluteGravity") => {
-            let mut result = i64v(args.first().copied().unwrap_or(V::I32(0))) as i32;
+            let result = i64v(args.first().copied().unwrap_or(V::I32(0))) as i32;
             let dir = i64v(args.get(1).copied().unwrap_or(V::I32(0))) as i32;
-            const RELATIVE_LAYOUT_DIRECTION: i32 = 0x0080_0000;
-            const START: i32 = 0x0080_0003;
-            const END: i32 = 0x0080_0005;
-            const LEFT: i32 = 0x0000_0003;
-            const RIGHT: i32 = 0x0000_0005;
-            if result > 0 && (result & RELATIVE_LAYOUT_DIRECTION) == RELATIVE_LAYOUT_DIRECTION {
-                result &= !RELATIVE_LAYOUT_DIRECTION;
-                if dir == 1 {
-                    // RTL: START→RIGHT, END→LEFT
-                    if (result & START) == START {
-                        result = (result & !START) | RIGHT;
-                    } else if (result & END) == END {
-                        result = (result & !END) | LEFT;
-                    }
-                } else {
-                    if (result & START) == START {
-                        result = (result & !START) | LEFT;
-                    } else if (result & END) == END {
-                        result = (result & !END) | RIGHT;
-                    }
-                }
+            Some(Some(V::I32(absolute_gravity(result, dir))))
+        }
+        // apply(int gravity, int w, int h, Rect container, Rect out)
+        // apply(int gravity, int w, int h, Rect container, Rect out, int layoutDirection)
+        // apply(int gravity, int w, int h, Rect container, int xAdj, int yAdj, Rect out)
+        // apply(int gravity, int w, int h, Rect container, int xAdj, int yAdj, Rect out, int layoutDirection)
+        ("Landroid/view/Gravity;", "apply") => {
+            let g = i64v(args.first().copied().unwrap_or(V::I32(0))) as i32;
+            let w = i64v(args.get(1).copied().unwrap_or(V::I32(0))) as i32;
+            let h = i64v(args.get(2).copied().unwrap_or(V::I32(0))) as i32;
+            let container = args.get(3).copied().unwrap_or(V::Ref(0));
+            let (x_adj, y_adj, out, dir) = match args.len() {
+                5 => (0, 0, args.get(4).copied().unwrap_or(V::Ref(0)), 0),
+                // (g, w, h, container, out, layoutDirection) — the
+                // form androidx GravityCompat delegates to.
+                6 => (
+                    0,
+                    0,
+                    args.get(4).copied().unwrap_or(V::Ref(0)),
+                    i64v(args.get(5).copied().unwrap_or(V::I32(0))) as i32,
+                ),
+                7 => (
+                    i64v(args.get(4).copied().unwrap_or(V::I32(0))) as i32,
+                    i64v(args.get(5).copied().unwrap_or(V::I32(0))) as i32,
+                    args.get(6).copied().unwrap_or(V::Ref(0)),
+                    0,
+                ),
+                _ => (
+                    i64v(args.get(4).copied().unwrap_or(V::I32(0))) as i32,
+                    i64v(args.get(5).copied().unwrap_or(V::I32(0))) as i32,
+                    args.get(6).copied().unwrap_or(V::Ref(0)),
+                    i64v(args.get(7).copied().unwrap_or(V::I32(0))) as i32,
+                ),
+            };
+            if std::env::var_os("OVELO_VIEWDBG").is_some() {
+                eprintln!("[viewdbg] gravity apply g={g:#x} {w}x{h}");
             }
-            Some(Some(V::I32(result)))
+            gravity_apply(vm, g, w, h, container, x_adj, y_adj, out, dir);
+            Some(None)
+        }
+        // applyDisplay(int gravity, Rect display, Rect inoutObj)
+        // applyDisplay(int gravity, Rect display, Rect inoutObj, int layoutDirection)
+        ("Landroid/view/Gravity;", "applyDisplay") => {
+            let g = i64v(args.first().copied().unwrap_or(V::I32(0))) as i32;
+            let display = args.get(1).copied().unwrap_or(V::Ref(0));
+            let inout = args.get(2).copied().unwrap_or(V::Ref(0));
+            let dir = i64v(args.get(3).copied().unwrap_or(V::I32(0))) as i32;
+            let (w, h) = if let V::Ref(ih) = inout {
+                let (l, t, r, b) = rect_edges(vm, ih);
+                (r - l, b - t)
+            } else {
+                (0, 0)
+            };
+            gravity_apply(vm, g, w, h, display, 0, 0, inout, dir);
+            Some(None)
         }
         ("Landroid/view/Gravity;", "isVertical" | "isHorizontal") => Some(Some(V::I32(0))),
         ("Landroid/view/Gravity;", _) => Some(None),
@@ -3312,6 +3344,104 @@ fn rect_write(vm: &mut Vm, h: u32, l: i32, t: i32, r: i32, b: i32) {
             }
         }
     }
+}
+
+/// `Gravity.getAbsoluteGravity`: resolve START/END relative bits
+/// against a layout direction (0 = LTR, 1 = RTL).
+fn absolute_gravity(gravity: i32, dir: i32) -> i32 {
+    let mut result = gravity;
+    const RELATIVE_LAYOUT_DIRECTION: i32 = 0x0080_0000;
+    const START: i32 = 0x0080_0003;
+    const END: i32 = 0x0080_0005;
+    const LEFT: i32 = 0x0000_0003;
+    const RIGHT: i32 = 0x0000_0005;
+    if result > 0 && (result & RELATIVE_LAYOUT_DIRECTION) == RELATIVE_LAYOUT_DIRECTION {
+        result &= !RELATIVE_LAYOUT_DIRECTION;
+        if dir == 1 {
+            if (result & START) == START {
+                result = (result & !START) | RIGHT;
+            } else if (result & END) == END {
+                result = (result & !END) | LEFT;
+            }
+        } else {
+            if (result & START) == START {
+                result = (result & !START) | LEFT;
+            } else if (result & END) == END {
+                result = (result & !END) | RIGHT;
+            }
+        }
+    }
+    result
+}
+
+/// `Gravity.apply`: place a `w`×`h` child inside `container` per the
+/// gravity flags and write the resulting frame into `out`. Without
+/// this the AOSP `GravityCompat.apply(container, out)` idiom leaves
+/// `out` at (0,0,0,0) — every child then gets `layout(0,0,0,0)`.
+fn gravity_apply(
+    vm: &mut Vm,
+    gravity: i32,
+    w: i32,
+    h: i32,
+    container: V,
+    x_adj: i32,
+    y_adj: i32,
+    out: V,
+    dir: i32,
+) {
+    let (V::Ref(ch), V::Ref(oh)) = (container, out) else {
+        if std::env::var_os("OVELO_VIEWDBG").is_some() {
+            eprintln!("[viewdbg] gravity apply not-refs c={container:?} o={out:?}");
+        }
+        return;
+    };
+    if oh == 0 {
+        return;
+    }
+    let (cl, ct, cr, cb) = rect_edges(vm, ch);
+    const LEFT: i32 = 0x3;
+    const RIGHT: i32 = 0x5;
+    const CENTER_H: i32 = 0x1;
+    const FILL_H: i32 = 0x7;
+    const TOP: i32 = 0x30;
+    const BOTTOM: i32 = 0x50;
+    const CENTER_V: i32 = 0x10;
+    const FILL_V: i32 = 0x70;
+    let abs = absolute_gravity(gravity, dir);
+    // Unset axes default to TOP|START per AOSP callers (NO_GRAVITY is
+    // resolved upstream, but skeleton callers pass it straight in).
+    let hg = match abs & FILL_H {
+        0 => LEFT,
+        m => m,
+    };
+    let vg = match gravity & FILL_V {
+        0 => TOP,
+        m => m,
+    };
+    let (l, r) = match hg {
+        FILL_H => (cl + x_adj, cr - x_adj),
+        RIGHT => (cr - x_adj - w, cr - x_adj),
+        CENTER_H => {
+            let lft = cl + (cr - cl - w) / 2 + x_adj;
+            (lft, lft + w)
+        }
+        _ => (cl + x_adj, cl + x_adj + w),
+    };
+    let (t, b) = match vg {
+        FILL_V => (ct + y_adj, cb - y_adj),
+        BOTTOM => (cb - y_adj - h, cb - y_adj),
+        CENTER_V => {
+            let tp = ct + (cb - ct - h) / 2 + y_adj;
+            (tp, tp + h)
+        }
+        _ => (ct + y_adj, ct + y_adj + h),
+    };
+    if std::env::var_os("OVELO_VIEWDBG").is_some() {
+        eprintln!(
+            "[viewdbg] gravity apply h{oh} c=({cl},{ct},{cr},{cb}) -> ({l},{t},{r},{b})"
+        );
+    }
+    rect_write(vm, oh, l, t, r, b);
 }
 
 /// `SharedPreferences` host object interned per file name — Android

@@ -552,14 +552,22 @@ impl GuestUi {
                 "(Ljava/lang/CharSequence;)V",
                 |ui, vm, a| {
                     let this = ref_arg(a, 0)?;
+                    let Some(rc) = ui.views.get(&this).cloned() else {
+                        // Dex-inflated (non-GuestView) receiver: record the
+                        // argument on the pseudo text slot so the inflated-
+                        // tree renderer still sees the string.
+                        ovelo_dexrt::pseudo_set(
+                            vm,
+                            this,
+                            ovelo_dexrt::P_TEXT,
+                            a.get(1).copied().unwrap_or(V::Ref(0)),
+                        );
+                        return Ok(None);
+                    };
                     let text = match a.get(1) {
                         Some(V::Ref(h)) => vm.heap().str_val(*h).unwrap_or("").to_string(),
                         Some(V::I32(0)) => String::new(),
                         _ => return Err(crate::err("guest.arg.type")),
-                    };
-                    let Some(rc) = ui.views.get(&this).cloned() else {
-                        // Not a GuestView (dex-inflated) — setters no-op.
-                        return Ok(None);
                     };
                     let mut g = rc.borrow_mut();
                     let tv = g
@@ -569,7 +577,7 @@ impl GuestUi {
                     Ok(None)
                 },
             );
-            Self::on(ui, vm, cls, "setTextSize", "(F)V", |ui, _vm, a| {
+            Self::on(ui, vm, cls, "setTextSize", "(F)V", |ui, vm, a| {
                 let this = ref_arg(a, 0)?;
                 // A float literal arrives as V::I32 (const loads the
                 // bit pattern); a computed float is V::F32.
@@ -579,7 +587,7 @@ impl GuestUi {
                     _ => return Err(crate::err("guest.arg.type")),
                 };
                 let Some(rc) = ui.views.get(&this).cloned() else {
-                    // Not a GuestView (dex-inflated) — setters no-op.
+                    ovelo_dexrt::pseudo_set(vm, this, ovelo_dexrt::P_TSIZE, V::F32(size));
                     return Ok(None);
                 };
                 let mut g = rc.borrow_mut();
@@ -590,16 +598,17 @@ impl GuestUi {
                 tv.set_text(tv.text.clone());
                 Ok(None)
             });
-            Self::on(ui, vm, cls, "setTextColor", "(I)V", |ui, _vm, a| {
+            Self::on(ui, vm, cls, "setTextColor", "(I)V", |ui, vm, a| {
                 let this = ref_arg(a, 0)?;
-                let color = match a.get(1) {
-                    Some(V::I32(c)) => argb(*c),
+                let raw = match a.get(1) {
+                    Some(V::I32(c)) => *c,
                     _ => return Err(crate::err("guest.arg.type")),
                 };
                 let Some(rc) = ui.views.get(&this).cloned() else {
-                    // Not a GuestView (dex-inflated) — setters no-op.
+                    ovelo_dexrt::pseudo_set(vm, this, ovelo_dexrt::P_TCOLOR, V::I32(raw));
                     return Ok(None);
                 };
+                let color = argb(raw);
                 let mut g = rc.borrow_mut();
                 let tv = g
                     .text_mut()
@@ -800,15 +809,15 @@ impl GuestUi {
 /// Runs OUTSIDE the `GuestUi` borrow: the guest code it dispatches
 /// re-enters bridged view methods that borrow the same RefCell.
 ///
-/// `frame` is a render-cycle counter — the pass runs every 30th frame
-/// to bound interpreter work. `populate()` is idempotent on existing
-/// pages, and adapters filling asynchronously get picked up on later
-/// passes.
 fn viewdbg() -> bool {
     static V: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *V.get_or_init(|| std::env::var_os("OVELO_VIEWDBG").is_some())
 }
 
+/// `frame` is a render-cycle counter — the pass runs every 30th frame
+/// to bound interpreter work. `populate()` is idempotent on existing
+/// pages, and adapters filling asynchronously get picked up on later
+/// passes.
 pub fn drive_dex_layout_pass(vm: &mut Vm, activity: u32, frame: u32) {
     if !frame.is_multiple_of(30) {
         return;
@@ -847,7 +856,12 @@ pub fn drive_dex_layout_pass(vm: &mut Vm, activity: u32, frame: u32) {
         // Keep the view's existing rect when it has one: re-driving
         // `layout` with a full-screen rect would overwrite
         // parent-computed bounds.
-        let parent_is_dex = info.parent != 0 && vm.is_dex_view(info.parent);
+        // The walk root always drives: the activity's content view
+        // reports a dex parent (the `android.R.id.content` frame the
+        // decor wraps it in), so `!parent_is_dex` alone would skip
+        // every node and no frame would ever be set.
+        let parent_is_dex =
+            depth != 0 && info.parent != 0 && vm.is_dex_view(info.parent);
         if info.is_group && !parent_is_dex {
             let (w, hgt) = info
                 .frame

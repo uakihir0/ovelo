@@ -14,7 +14,8 @@ mod res_attrs;
 mod value;
 
 pub use aot::Aot;
-pub use jdk::view::{fire_global_layout, DexViewInfo};
+pub use jdk::view::{fire_global_layout, DexViewInfo, P_TCOLOR, P_TEXT, P_TSIZE};
+pub use jdk::{pseudo_get, pseudo_set};
 pub use value::{Heap, HostState, Obj, V};
 
 use aot::{AotFn, TRAP_DIV_ZERO, TRAP_REM_ZERO};
@@ -1191,6 +1192,10 @@ impl Vm {
             })?;
             return Ok(r.flatten());
         };
+        if std::env::var_os("OVELO_VIEWDBG").is_some() && (name == "layout" || name == "measure") {
+            let d = self.describe_method(midx);
+            eprintln!("[viewdbg] dex layout h{this} -> {d}");
+        }
         let mut a = Vec::with_capacity(args.len() + 1);
         a.push(V::Ref(this));
         a.extend_from_slice(args);
@@ -1221,6 +1226,12 @@ impl Vm {
             .find_method_on_chain(ci, name, args.len())
             .map_err(E::Vm)?
         else {
+            if std::env::var_os("OVELO_VIEWDBG").is_some()
+                && matches!(name, "onMeasure" | "onLayout")
+            {
+                let d = self.type_desc_of(ci).unwrap_or_default();
+                eprintln!("[viewdbg] onChain miss {name} ci_desc={d}");
+            }
             return Ok(None);
         };
         let mut a = Vec::with_capacity(args.len() + 1);
@@ -1358,6 +1369,21 @@ impl Vm {
     /// that only need to know whether a handle is a view.
     pub fn is_dex_view(&self, h: u32) -> bool {
         h != 0 && jdk::pseudo_get(self, h, jdk::view::P_IS_VIEW).is_some()
+    }
+
+    /// Does `h` have a dex-defined override of `name(params)` on its
+    /// class chain? Framework containers (RelativeLayout,
+    /// FrameLayout, LinearLayout) arrive as skeleton classes with no
+    /// methods, so a virtual call misses — builtins use this to pick
+    /// between the dex method and a generic framework fallback.
+    pub(crate) fn has_dex_virtual(&self, h: u32, name: &str, params: &[&str]) -> bool {
+        let Some(ci) = self.heap.class_of(h) else {
+            return false;
+        };
+        matches!(
+            self.find_method_on_chain_sig(ci, name, params),
+            Ok(Some(_))
+        )
     }
 
     /// The options `Menu` attached to an Activity — the runner hands it
@@ -2449,6 +2475,11 @@ impl Vm {
     }
 
     fn call_builtin(&mut self, midx: GIdx, args: &[V], has_receiver: bool) -> Rt<Option<V>> {
+        if std::env::var_os("OVELO_VIEWDBG").is_some()
+            && self.describe_method(midx).contains("setText")
+        {
+            eprintln!("[viewdbg] call_builtin {} args={args:?}", self.describe_method(midx));
+        }
         let args = self.compact_args(midx, args, has_receiver);
         let args = args.as_slice();
         let host = self.hosts.get(&midx).cloned().or(self.host_named(midx)?);
@@ -2476,11 +2507,30 @@ impl Vm {
             }
             ("Ljava/lang/String;", "length") => {
                 if let V::Ref(h) = args.first().copied().unwrap_or(V::Ref(0)) {
-                    if let Some(s) = self.heap.str_val(h) {
+                    if let Some(s) = self.heap.str_val(h).map(|x| x.to_string()).or_else(|| {
+                        jdk::pseudo_get(self, h, jdk::P_DATA)
+                            .and_then(|v| jdk::sv(self, v))
+                    }) {
                         return Ok(Some(V::I32(s.chars().count() as i32)));
                     }
                 }
                 Err(self.throw_builtin("Ljava/lang/NullPointerException;", "String.length"))
+            }
+            // `new String(x)` on a non-dex class: capture the source
+            // text into P_DATA so the Instance behaves like the
+            // interned Obj::Str everywhere s()/str_val read strings.
+            ("Ljava/lang/String;", "<init>") => {
+                if let V::Ref(this) = args.first().copied().unwrap_or(V::Ref(0)) {
+                    if this != 0 {
+                        let t = args
+                            .get(1)
+                            .and_then(|v| jdk::sv(self, *v))
+                            .unwrap_or_default();
+                        let r = self.heap.intern_str(&t);
+                        jdk::pseudo_set(self, this, jdk::P_DATA, V::Ref(r));
+                    }
+                }
+                Ok(None)
             }
             _ => {
                 let ret_desc;
@@ -2584,6 +2634,17 @@ impl Vm {
 
     /// Invoke `midx` per `kind`; `args` includes the receiver for non-static.
     fn invoke(&mut self, midx: GIdx, args: Vec<V>, kind: InvokeKind) -> Rt<Option<V>> {
+        if std::env::var_os("OVELO_VIEWDBG").is_some() {
+            if let Some(d) = self.dex_of(midx) {
+                if let Ok(m) = d.method(gl(midx)) {
+                    if let Ok(n) = d.string(m.name_idx) {
+                        if matches!(n.as_str(), "measure" | "measureChild" | "measureChildWithMargins" | "onMeasureChild") {
+                            eprintln!("[viewdbg] invoke {} recv={:?}", self.describe_method(midx), args.first());
+                        }
+                    }
+                }
+            }
+        }
         let loc = match kind {
             InvokeKind::Static | InvokeKind::Direct => match self.resolve_defined(midx) {
                 Ok(l) => l,
@@ -3348,9 +3409,18 @@ impl Vm {
                     // Host objects expose named fields through builtins
                     // (PackageInfo.versionCode, ApplicationInfo.dataDir);
                     // guest objects fall back to the field's type default.
-                    None => self
-                        .builtin_ifield(h, f)
-                        .unwrap_or_else(|| self.field_default(f).unwrap_or(V::I32(0))),
+                    None => match self.builtin_ifield(h, f) {
+                        Some(b) => b,
+                        // A host placeholder's ctor never ran — ref-typed
+                        // fields stay null and the next iget/iput on them
+                        // NPEs (RecyclerView lp.mDecorInsets.top). Give
+                        // them a stub of the declared type, stored so the
+                        // same object comes back on later reads.
+                        None => match self.ref_field_stub(h, f) {
+                            Some(v) => v,
+                            None => self.field_default(f).unwrap_or(V::I32(0)),
+                        },
+                    },
                 };
                 set!(regs[0], v);
             }
@@ -3568,6 +3638,26 @@ impl Vm {
             _ => return vm("dexrt.op.unsupported"),
         }
         Ok(Out::Next(next))
+    }
+
+    /// Host placeholders have no ctor, so ref-typed fields that dex
+    /// never explicitly wrote stay null; mint a stub of the field's
+    /// declared type and remember it on the object.
+    fn ref_field_stub(&mut self, h: u32, field_idx: GIdx) -> Option<V> {
+        if !matches!(self.heap.get(h), Some(Obj::Host { .. })) {
+            return None;
+        }
+        let d = self.dex_of(field_idx)?;
+        let f = d.field(gl(field_idx)).ok()?;
+        let ty = d.type_descriptor(f.type_idx as u32).ok()?;
+        if !ty.starts_with('L') && !ty.starts_with('[') {
+            return None;
+        }
+        let v = jdk::host(self, &ty, HostState::Empty);
+        if let Some(Obj::Host { fields, .. }) = self.heap.get_mut(h) {
+            fields.insert(field_idx, v);
+        }
+        Some(v)
     }
 
     fn field_default(&self, field_idx: GIdx) -> Option<V> {

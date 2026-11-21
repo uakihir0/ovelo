@@ -21,7 +21,10 @@ const P_VIEW_ID: u32 = u32::MAX - 7;
 const P_CHILDREN: u32 = u32::MAX - 8;
 const P_PARENT: u32 = u32::MAX - 9;
 const P_TAG: u32 = u32::MAX - 10;
-const P_TEXT: u32 = u32::MAX - 11;
+/// Live `setText`/`setHint` argument — read by `dex_view` before the
+/// inflated `android:text` attribute. `pub`: the guest bridge's setter
+/// overrides write it for dex-inflated (non-GuestView) receivers.
+pub const P_TEXT: u32 = u32::MAX - 11;
 const P_CONTENT: u32 = u32::MAX - 12;
 const P_WINDOW: u32 = u32::MAX - 13;
 // Marker keys are pub(crate): `is_instance` consults them so inflated
@@ -105,6 +108,11 @@ const P_RIGHT: u32 = 0xFFFD_FFE7;
 const P_BOTTOM: u32 = 0xFFFD_FFE6;
 const P_MEAS_W: u32 = 0xFFFD_FFE5;
 const P_MEAS_H: u32 = 0xFFFD_FFE4;
+/// Live `setTextColor` ARGB — written by the guest bridge's
+/// fallthrough for dex-inflated views.
+pub const P_TCOLOR: u32 = 0xFFFD_FFE3;
+/// Live `setTextSize` px — same fallthrough path as [`P_TCOLOR`].
+pub const P_TSIZE: u32 = 0xFFFD_FFE2;
 
 /// Lazily mint a per-view `ViewTreeObserver` — guests register
 /// `OnGlobalLayoutListener`s on it; `fire_global_layout` (called from
@@ -345,7 +353,7 @@ pub(crate) fn dex_view_info(vm: &Vm, h: u32) -> Option<DexViewInfo> {
     // then the inflated `text`/`hint` attributes. A Reference resolves
     // through the arsc string table.
     let text = match pseudo_get(vm, h, P_TEXT) {
-        Some(V::Ref(th)) if th != 0 => vm.heap.str_val(th).map(|s| s.to_string()),
+        Some(V::Ref(th)) if th != 0 => s(vm, th),
         Some(V::I32(id)) if id > 0 => vm
             .apk_res
             .as_ref()
@@ -357,7 +365,7 @@ pub(crate) fn dex_view_info(vm: &Vm, h: u32) -> Option<DexViewInfo> {
         attr_find(vm, h, "text")
             .or_else(|| attr_find(vm, h, "hint"))
             .and_then(|v| match v {
-                V::Ref(th) => vm.heap.str_val(th).map(|s| s.to_string()),
+                V::Ref(th) => s(vm, th),
                 V::I32(id) if id > 0 => vm
                     .apk_res
                     .as_ref()
@@ -366,12 +374,21 @@ pub(crate) fn dex_view_info(vm: &Vm, h: u32) -> Option<DexViewInfo> {
                 _ => None,
             })
     });
-    let text_size = attr_find(vm, h, "textSize").and_then(|v| match v {
-        V::F32(f) => Some(f),
-        V::I32(id) if id > 0 => vm.apk_res.as_ref().and_then(|r| r.dimen(id as u32)),
-        _ => None,
-    });
-    let text_color = attr_find(vm, h, "textColor").and_then(|v| color_v(vm, v));
+    let text_size = match pseudo_get(vm, h, P_TSIZE) {
+        Some(V::F32(f)) => Some(f),
+        Some(V::I32(b)) => Some(f32::from_bits(b as u32)),
+        _ => attr_find(vm, h, "textSize").and_then(|v| match v {
+            V::F32(f) => Some(f),
+            V::I32(id) if id > 0 => vm.apk_res.as_ref().and_then(|r| r.dimen(id as u32)),
+            _ => None,
+        }),
+    };
+    let text_color = match pseudo_get(vm, h, P_TCOLOR) {
+        // `setTextColor` may hand us either a packed ARGB int or an
+        // unresolved color res id — `color_v` resolves both.
+        Some(v @ (V::I32(_) | V::Ref(_))) => color_v(vm, v),
+        _ => attr_find(vm, h, "textColor").and_then(|v| color_v(vm, v)),
+    };
     let bg_color = attr_find(vm, h, "background").and_then(|v| color_v(vm, v));
     let lp_w = attr_find(vm, h, "layout_width")
         .map(|v| len_v(vm, v))
@@ -502,35 +519,67 @@ pub(crate) fn call(
         ))),
         // Static View/ViewGroup.getChildMeasureSpec(parentSpec,
         // padding, childDimension) — AOSP packing rules.
-        "getChildMeasureSpec" => {
-            const MODE_MASK: i32 = 0x3 << 30;
-            const EXACTLY: i32 = 1 << 30;
+        "getChildMeasureSpec" => Some(Some(V::I32(child_measure_spec(
+            i32v(args.first().copied().unwrap_or(V::I32(0))),
+            i32v(args.get(1).copied().unwrap_or(V::I32(0))),
+            i32v(args.get(2).copied().unwrap_or(V::I32(0))),
+        )))),
+        // Static View size resolution — every dex container's
+        // onMeasure folds its content size against the spec through
+        // these; stubs returning null collapse the whole tree to 0×0.
+        "getDefaultSize" | "resolveSize" => Some(Some(V::I32(resolve_size(
+            i32v(args.first().copied().unwrap_or(V::I32(0))),
+            i32v(args.get(1).copied().unwrap_or(V::I32(0))),
+            name == "resolveSize",
+        )))),
+        "resolveSizeAndState" => {
+            let size = i32v(args.first().copied().unwrap_or(V::I32(0)));
+            let spec = i32v(args.get(1).copied().unwrap_or(V::I32(0)));
+            let state = i32v(args.get(2).copied().unwrap_or(V::I32(0)));
             const AT_MOST: i32 = 2 << 30;
-            let spec = i32v(args.first().copied().unwrap_or(V::I32(0)));
-            let padding = i32v(args.get(1).copied().unwrap_or(V::I32(0)));
-            let child_dim = i32v(args.get(2).copied().unwrap_or(V::I32(0)));
-            let size = (spec & !MODE_MASK) - padding;
-            let size = if size < 0 { 0 } else { size };
-            let (mode, out) = match spec & MODE_MASK {
-                m if m == EXACTLY => match child_dim {
-                    d if d >= 0 => (EXACTLY, d),
-                    -2 => (AT_MOST, size), // WRAP_CONTENT
-                    _ => (EXACTLY, size),  // MATCH_PARENT (-1) / unspecified
-                },
-                m if m == AT_MOST => match child_dim {
-                    d if d >= 0 => (EXACTLY, d),
-                    -2 => (AT_MOST, size),
-                    _ => (AT_MOST, size),
-                },
-                // UNSPECIFIED: a fixed child dimension still measures
-                // EXACTLY (AOSP); MATCH_PARENT/WRAP_CONTENT measure at
-                // UNSPECIFIED size 0 (sUseZeroUnspecifiedMeasureSpec).
-                _ => match child_dim {
-                    d if d >= 0 => (EXACTLY, d),
-                    _ => (0, 0),
-                },
+            const MODE_MASK: i32 = 0x3 << 30;
+            const TOO_SMALL: i32 = 0x0100_0000;
+            const STATE_MASK: i32 = 0xFF00_0000_u32 as i32;
+            let spec_size = spec & !MODE_MASK;
+            let result = match spec & MODE_MASK {
+                m if m == AT_MOST && spec_size < size => spec_size | TOO_SMALL,
+                m if m == AT_MOST => size,
+                m if m == (1 << 30) => spec_size, // EXACTLY
+                _ => size,
             };
-            Some(Some(V::I32((out & !MODE_MASK) | (mode & MODE_MASK))))
+            Some(Some(V::I32(result | (state & STATE_MASK))))
+        }
+        "combineMeasuredStates" => Some(Some(V::I32(
+            i32v(args.first().copied().unwrap_or(V::I32(0)))
+                | i32v(args.get(1).copied().unwrap_or(V::I32(0))),
+        ))),
+        // ViewGroup.measureChild / measureChildWithMargins — the path
+        // dex parents use to measure each child. Without it guest
+        // onMeasure loops run but children never get measured, so the
+        // whole tree stays at 0×0.
+        "measureChild" | "measureChildWithMargins" => {
+            let child = match args.get(1) {
+                Some(V::Ref(h)) if *h != 0 => *h,
+                _ => return Ok(Some(None)),
+            };
+            let margins = name == "measureChildWithMargins";
+            let (pw, ph, w_used, h_used) = if margins {
+                (
+                    i32v(args.get(2).copied().unwrap_or(V::I32(0))),
+                    i32v(args.get(4).copied().unwrap_or(V::I32(0))),
+                    i32v(args.get(3).copied().unwrap_or(V::I32(0))),
+                    i32v(args.get(5).copied().unwrap_or(V::I32(0))),
+                )
+            } else {
+                (
+                    i32v(args.get(2).copied().unwrap_or(V::I32(0))),
+                    i32v(args.get(3).copied().unwrap_or(V::I32(0))),
+                    0,
+                    0,
+                )
+            };
+            measure_child(vm, this, child, pw, w_used, ph, h_used, margins);
+            Some(None)
         }
         "getMenu" => Some(Some(menu_of(vm, this))),
         // Toolbar.inflateMenu(int) / NavigationView.inflateMenu(int).
@@ -861,7 +910,17 @@ pub(crate) fn call(
                     name,
                     "attachViewToParent" | "attachViewToParentInLayout"
                 );
-                attach_at(vm, this, child, idx, notify);
+                // attachViewToParent(v,i,lp) / addView(v,lp) /
+                // addViewInLayout(v,i,lp) hand a fully-built dex
+                // LayoutParams — keep it on the child or later dex
+                // reads (`iget lp.mDecorInsets`) hit a host
+                // placeholder and see null fields.
+                let lp = args[2..]
+                    .iter()
+                    .rev()
+                    .find(|a| matches!(a, V::Ref(h) if *h != 0))
+                    .copied();
+                attach_at(vm, this, child, idx, notify, lp);
             }
             Some(match ret(sig) {
                 "V" => None,
@@ -991,6 +1050,9 @@ pub(crate) fn call(
         "setText" | "setHint" | "setTitle" | "setContentDescription" | "setTextScaleX" => {
             if name != "setTextScaleX" {
                 pseudo_set(vm, this, P_TEXT, args.get(1).copied().unwrap_or(V::Ref(0)));
+                if std::env::var_os("OVELO_VIEWDBG").is_some() {
+                    eprintln!("[viewdbg] setText h{this} arg={:?} stored={:?}", args.get(1), pseudo_get(vm, this, P_TEXT));
+                }
             }
             Some(None)
         }
@@ -1105,14 +1167,29 @@ pub(crate) fn call(
             // Guest exceptions must reach the guest's try/catch —
             // swallowing them leaves the caller believing the measure
             // succeeded with half-updated state.
-            let _ = vm.call_virtual_rt(
-                this,
-                "onMeasure",
-                &[
-                    args.get(1).copied().unwrap_or(V::I32(0)),
-                    args.get(2).copied().unwrap_or(V::I32(0)),
-                ],
-            )?;
+            if vm.has_dex_virtual(this, "onMeasure", &["I", "I"]) {
+                let r = vm.call_virtual_rt(
+                    this,
+                    "onMeasure",
+                    &[
+                        args.get(1).copied().unwrap_or(V::I32(0)),
+                        args.get(2).copied().unwrap_or(V::I32(0)),
+                    ],
+                )?;
+                if std::env::var_os("OVELO_VIEWDBG").is_some() {
+                    eprintln!("[viewdbg] builtin measure h{this} onMeasure={:?}", r.is_some());
+                }
+            } else {
+                // Framework skeleton container — no dex onMeasure
+                // exists, so measure the children generically or they
+                // stay 0×0 forever.
+                group_measure_fallback(
+                    vm,
+                    this,
+                    i32v(args.get(1).copied().unwrap_or(V::I32(0))),
+                    i32v(args.get(2).copied().unwrap_or(V::I32(0))),
+                );
+            }
             Some(None)
         }
         "setMeasuredDimension" => {
@@ -1129,24 +1206,40 @@ pub(crate) fn call(
                 vint(args.get(3)),
                 vint(args.get(4)),
             );
+            if std::env::var_os("OVELO_VIEWDBG").is_some() {
+                eprintln!("[viewdbg] builtin layout h{this} {l},{t},{r},{b}");
+            }
             // AOSP clears PFLAG_LAYOUT_REQUESTED once the view is laid out.
             pseudo_set(vm, this, P_LAYOUT_REQ, V::I32(0));
             let changed = frame_set(vm, this, l, t, r, b);
-            if let Err(e) = vm.call_virtual_rt(
-                this,
-                "onLayout",
-                &[
-                    V::I32(changed as i32),
-                    V::I32(l),
-                    V::I32(t),
-                    V::I32(r),
-                    V::I32(b),
-                ],
-            ) {
-                if std::env::var_os("OVELO_VIEWDBG").is_some() {
-                    eprintln!("[viewdbg] onLayout h{this} failed");
+            if vm.has_dex_virtual(this, "onLayout", &["Z", "I", "I", "I", "I"]) {
+                if let Err(e) = vm.call_virtual_rt(
+                    this,
+                    "onLayout",
+                    &[
+                        V::I32(changed as i32),
+                        V::I32(l),
+                        V::I32(t),
+                        V::I32(r),
+                        V::I32(b),
+                    ],
+                ) {
+                    if std::env::var_os("OVELO_VIEWDBG").is_some() {
+                        match &e {
+                            crate::E::Vm(oe) => {
+                                eprintln!("[viewdbg] onLayout h{this} vmerr {oe}")
+                            }
+                            crate::E::Throw(th) => {
+                                eprintln!("[viewdbg] onLayout h{this} throw h{th}")
+                            }
+                        }
+                    }
+                    return Err(e);
                 }
-                return Err(e);
+            } else {
+                // Framework skeleton container — position children
+                // generically or they keep their 0×0 frames.
+                group_layout_fallback(vm, this, l, t, r, b);
             }
             Some(None)
         }
@@ -1961,8 +2054,12 @@ fn layout_params(vm: &mut Vm, this: u32) -> V {
             &[attrs],
         );
         if std::env::var_os("OVELO_VIEWDBG").is_some() {
-            if let Err(e) = &lp_v {
-                eprintln!("[viewdbg] generateLayoutParams h{this} -> {e}");
+            match &lp_v {
+                Err(e) => eprintln!("[viewdbg] generateLayoutParams h{this} -> {e}"),
+                Ok(v) => eprintln!(
+                    "[viewdbg] generateLayoutParams h{this} -> {v:?} (parent {})",
+                    class_of(vm, V::Ref(p))
+                ),
             }
         }
         if let Ok(Some(v @ V::Ref(h))) = lp_v {
@@ -1974,8 +2071,14 @@ fn layout_params(vm: &mut Vm, this: u32) -> V {
         // Attr parsing may have thrown — `generateDefaultLayoutParams`
         // is the attr-free sibling and still fully initializes the
         // params object (ConstraintLayout$LayoutParams' widget, …).
-        if let Ok(Some(v @ V::Ref(h))) =
-            vm.call_virtual_sig(p, "generateDefaultLayoutParams", &[], &[])
+        let dlp = vm.call_virtual_sig(p, "generateDefaultLayoutParams", &[], &[]);
+        if std::env::var_os("OVELO_VIEWDBG").is_some() {
+            match &dlp {
+                Err(e) => eprintln!("[viewdbg] generateDefaultLayoutParams h{this} -> {e}"),
+                Ok(v) => eprintln!("[viewdbg] generateDefaultLayoutParams h{this} -> {v:?}"),
+            }
+        }
+        if let Ok(Some(v @ V::Ref(h))) = dlp
         {
             if h != 0 {
                 pseudo_set(vm, this, P_LP, v);
@@ -2067,8 +2170,70 @@ fn attrset_value(vm: &mut Vm, set: V, name: &str) -> Option<V> {
     }
 }
 
+/// AOSP `View.resolveSize` / `View.getDefaultSize`: fold a view's
+/// content size against the spec mode. `resolve=true` picks the
+/// resolveSize rule (AT_MOST → min(size, specSize)); getDefaultSize
+/// returns the spec size under both AT_MOST and EXACTLY.
+fn resolve_size(size: i32, spec: i32, resolve: bool) -> i32 {
+    const MODE_MASK: i32 = 0x3 << 30;
+    const EXACTLY: i32 = 1 << 30;
+    const AT_MOST: i32 = 2 << 30;
+    let spec_size = spec & !MODE_MASK;
+    match spec & MODE_MASK {
+        m if m == EXACTLY => spec_size,
+        m if m == AT_MOST => {
+            if resolve {
+                size.min(spec_size)
+            } else {
+                spec_size
+            }
+        }
+        _ => size,
+    }
+}
+
 /// A dimension-ish runtime value → px int: resource ids resolve
 /// through the arsc dimen table, floats are already px.
+/// AOSP `ViewGroup.getChildMeasureSpec` packing rules.
+fn child_measure_spec(spec: i32, padding: i32, child_dim: i32) -> i32 {
+    const MODE_MASK: i32 = 0x3 << 30;
+    const EXACTLY: i32 = 1 << 30;
+    const AT_MOST: i32 = 2 << 30;
+    let size = (spec & !MODE_MASK) - padding;
+    let size = if size < 0 { 0 } else { size };
+    let (mode, out) = match spec & MODE_MASK {
+        m if m == EXACTLY => match child_dim {
+            d if d >= 0 => (EXACTLY, d),
+            -2 => (AT_MOST, size), // WRAP_CONTENT
+            _ => (EXACTLY, size),  // MATCH_PARENT (-1) / unspecified
+        },
+        m if m == AT_MOST => match child_dim {
+            d if d >= 0 => (EXACTLY, d),
+            -2 => (AT_MOST, size),
+            _ => (AT_MOST, size),
+        },
+        // UNSPECIFIED: a fixed child dimension still measures EXACTLY
+        // (AOSP); MATCH_PARENT/WRAP_CONTENT measure at UNSPECIFIED 0.
+        _ => match child_dim {
+            d if d >= 0 => (EXACTLY, d),
+            _ => (0, 0),
+        },
+    };
+    (out & !MODE_MASK) | (mode & MODE_MASK)
+}
+
+/// Read an int field off a LayoutParams object under every canon key
+/// a writer could have used (owner obfuscation, LP subclasses).
+fn lp_field(vm: &Vm, lp: u32, name: &str) -> Option<V> {
+    let fields = match vm.heap.get(lp) {
+        Some(Obj::Instance { fields, .. }) | Some(Obj::Host { fields, .. }) => fields,
+        _ => return None,
+    };
+    vm.field_keys_named(name, "I")
+        .iter()
+        .find_map(|(_, g)| fields.get(g).copied())
+}
+
 fn lp_px(vm: &Vm, v: V) -> Option<i32> {
     let i = match v {
         V::I32(i) => i,
@@ -2083,6 +2248,171 @@ fn lp_px(vm: &Vm, v: V) -> Option<i32> {
         }
     }
     Some(i)
+}
+
+/// Shared `measureChild(WithMargins)` core: reads the child's
+/// LayoutParams, builds the child spec per AOSP
+/// `getChildMeasureSpec`, and drives `child.measure`. Used by the
+/// invoked builtins and the generic framework-group fallback —
+/// framework containers (RelativeLayout, FrameLayout, LinearLayout)
+/// arrive as skeleton classes with no dex `onMeasure`/`onLayout`, so
+/// without a host fallback their children stay 0×0 forever.
+fn measure_child(
+    vm: &mut Vm,
+    parent: u32,
+    child: u32,
+    pw: i32,
+    w_used: i32,
+    ph: i32,
+    h_used: i32,
+    margins: bool,
+) {
+    // Child dims/margins come from its LayoutParams; AOSP's
+    // default LP is (WRAP, WRAP, 0 margins).
+    let (mut lp_w, mut lp_h) = (-2, -2);
+    let (mut ml, mut mt, mut mr, mut mb) = (0, 0, 0, 0);
+    if let Some(V::Ref(lp)) = pseudo_get(vm, child, P_LP) {
+        if lp != 0 {
+            if let Some(f) = lp_field(vm, lp, "width") {
+                lp_w = lp_px(vm, f).unwrap_or(-2);
+            }
+            if let Some(f) = lp_field(vm, lp, "height") {
+                lp_h = lp_px(vm, f).unwrap_or(-2);
+            }
+            if margins {
+                ml = lp_field(vm, lp, "leftMargin")
+                    .and_then(|f| lp_px(vm, f))
+                    .unwrap_or(0);
+                mt = lp_field(vm, lp, "topMargin")
+                    .and_then(|f| lp_px(vm, f))
+                    .unwrap_or(0);
+                mr = lp_field(vm, lp, "rightMargin")
+                    .and_then(|f| lp_px(vm, f))
+                    .unwrap_or(0);
+                mb = lp_field(vm, lp, "bottomMargin")
+                    .and_then(|f| lp_px(vm, f))
+                    .unwrap_or(0);
+            }
+        }
+    }
+    // Host placeholder LPs carry no dex fields — fall back to the
+    // inflated AttributeSet's layout_width/layout_height.
+    if lp_w == -2 {
+        if let Some(f) = attr_find(vm, child, "layout_width") {
+            lp_w = len_v(vm, f);
+        }
+    }
+    if lp_h == -2 {
+        if let Some(f) = attr_find(vm, child, "layout_height") {
+            lp_h = len_v(vm, f);
+        }
+    }
+    // Parent padding halves the space handed to children.
+    let pad_w = lp_px(vm, attr_find(vm, parent, "paddingLeft").unwrap_or(V::I32(0)))
+        .unwrap_or(0)
+        + lp_px(vm, attr_find(vm, parent, "paddingRight").unwrap_or(V::I32(0))).unwrap_or(0);
+    let pad_h = lp_px(vm, attr_find(vm, parent, "paddingTop").unwrap_or(V::I32(0)))
+        .unwrap_or(0)
+        + lp_px(vm, attr_find(vm, parent, "paddingBottom").unwrap_or(V::I32(0))).unwrap_or(0);
+    let ws = child_measure_spec(pw, pad_w + ml + mr + w_used, lp_w);
+    let hs = child_measure_spec(ph, pad_h + mt + mb + h_used, lp_h);
+    if std::env::var_os("OVELO_VIEWDBG").is_some() {
+        eprintln!(
+            "[viewdbg] measureChild h{child} lp={lp_w}x{lp_h} used={w_used},{h_used} in={pw:#x}/{ph:#x} -> {ws:#x}/{hs:#x}"
+        );
+    }
+    if let Err(e) = vm.call_virtual(child, "measure", &[V::I32(ws), V::I32(hs)]) {
+        if std::env::var_os("OVELO_VIEWDBG").is_some() {
+            eprintln!("[viewdbg] measureChild h{child} err {e}");
+        }
+    }
+}
+
+/// Generic `onMeasure` for framework skeleton containers: measure
+/// each child with margins, then fold the measured content size
+/// against the spec via `resolveSize`. The `measure` arm pre-seeds
+/// P_MEAS_* with the spec size, which is right under EXACTLY but
+/// reports 0 under UNSPECIFIED (e.g. RecyclerView's wrap-content
+/// fill) — Framework containers must report their content extent
+/// there or every ancestor's measured height collapses to padding.
+fn group_measure_fallback(vm: &mut Vm, this: u32, pw: i32, ph: i32) {
+    let pad_w = lp_px(vm, attr_find(vm, this, "paddingLeft").unwrap_or(V::I32(0))).unwrap_or(0)
+        + lp_px(vm, attr_find(vm, this, "paddingRight").unwrap_or(V::I32(0))).unwrap_or(0);
+    let pad_h = lp_px(vm, attr_find(vm, this, "paddingTop").unwrap_or(V::I32(0))).unwrap_or(0)
+        + lp_px(vm, attr_find(vm, this, "paddingBottom").unwrap_or(V::I32(0))).unwrap_or(0);
+    let linear = class_of(vm, V::Ref(this)).contains("LinearLayout");
+    let (mut cw, mut chh) = (0i32, 0i32);
+    for c in children(vm, this) {
+        let V::Ref(ch) = c else { continue };
+        if ch == 0 {
+            continue;
+        }
+        measure_child(vm, this, ch, pw, 0, ph, chh, true);
+        let w = pint(vm, ch, P_MEAS_W) & 0x00FF_FFFF;
+        let hh = pint(vm, ch, P_MEAS_H) & 0x00FF_FFFF;
+        cw = cw.max(w);
+        // LinearLayout stacks: consumed height accumulates; the rest
+        // report their tallest child (FrameLayout semantics).
+        if linear {
+            chh += hh;
+        } else {
+            chh = chh.max(hh);
+        }
+    }
+    pseudo_set(vm, this, P_MEAS_W, V::I32(resolve_size(cw + pad_w, pw, true)));
+    pseudo_set(vm, this, P_MEAS_H, V::I32(resolve_size(chh + pad_h, ph, true)));
+}
+
+/// Generic `onLayout` for framework skeleton containers: FrameLayout
+/// semantics (children at the parent's content origin plus their
+/// margins, at measured size); LinearLayout stacks vertically.
+fn group_layout_fallback(vm: &mut Vm, this: u32, l: i32, t: i32, _r: i32, _b: i32) {
+    let pad_l = lp_px(vm, attr_find(vm, this, "paddingLeft").unwrap_or(V::I32(0))).unwrap_or(0);
+    let pad_t = lp_px(vm, attr_find(vm, this, "paddingTop").unwrap_or(V::I32(0))).unwrap_or(0);
+    let linear = class_of(vm, V::Ref(this)).contains("LinearLayout");
+    let mut cur_t = t + pad_t;
+    for c in children(vm, this) {
+        let V::Ref(ch) = c else { continue };
+        if ch == 0 {
+            continue;
+        }
+        let (ml, mt, mb) = if let Some(V::Ref(lp)) = pseudo_get(vm, ch, P_LP) {
+            if lp != 0 {
+                (
+                    lp_field(vm, lp, "leftMargin")
+                        .and_then(|f| lp_px(vm, f))
+                        .unwrap_or(0),
+                    lp_field(vm, lp, "topMargin")
+                        .and_then(|f| lp_px(vm, f))
+                        .unwrap_or(0),
+                    lp_field(vm, lp, "bottomMargin")
+                        .and_then(|f| lp_px(vm, f))
+                        .unwrap_or(0),
+                )
+            } else {
+                (0, 0, 0)
+            }
+        } else {
+            (0, 0, 0)
+        };
+        let cw = pint(vm, ch, P_MEAS_W) & 0x00FF_FFFF;
+        let chh = pint(vm, ch, P_MEAS_H) & 0x00FF_FFFF;
+        let cl = l + pad_l + ml;
+        let ct = if linear { cur_t + mt } else { t + pad_t + mt };
+        if std::env::var_os("OVELO_VIEWDBG").is_some() {
+            eprintln!("[viewdbg] groupLayout h{ch} meas={cw}x{chh} at {cl},{ct}");
+        }
+        if let Err(e) = vm.call_virtual(
+            ch,
+            "layout",
+            &[V::I32(cl), V::I32(ct), V::I32(cl + cw), V::I32(ct + chh)],
+        ) {
+            if std::env::var_os("OVELO_VIEWDBG").is_some() {
+                eprintln!("[viewdbg] groupLayout h{ch} err {e}");
+            }
+        }
+        cur_t = ct + chh + mb;
+    }
 }
 
 /// Framework `*LayoutParams` ctors the dex subclasses invoke-super
@@ -2427,14 +2757,21 @@ fn view_id(vm: &Vm, h: u32) -> i32 {
 }
 
 pub(crate) fn attach(vm: &mut Vm, parent: u32, child: V) {
-    attach_at(vm, parent, child, None, true)
+    attach_at(vm, parent, child, None, true, None)
 }
 
 /// `idx` mirrors ViewGroup's positional add/attach: absent or past-the-
 /// end appends, otherwise the child lands at that child index. `notify`
 /// fires the dex `onViewAdded` callback — real `addView` paths only;
 /// AOSP's transient `attachViewToParent` never notifies.
-pub(crate) fn attach_at(vm: &mut Vm, parent: u32, child: V, idx: Option<usize>, notify: bool) {
+pub(crate) fn attach_at(
+    vm: &mut Vm,
+    parent: u32,
+    child: V,
+    idx: Option<usize>,
+    notify: bool,
+    lp: Option<V>,
+) {
     if parent == 0 {
         return;
     }
@@ -2474,6 +2811,13 @@ pub(crate) fn attach_at(vm: &mut Vm, parent: u32, child: V, idx: Option<usize>, 
         // (ConstraintLayout.updateHierarchy) skip rebuilding the
         // widget list, leaving the solver with no children at 0,0,0,0.
         pseudo_set(vm, ch, P_LAYOUT_REQ, V::I32(1));
+        // A passed-in LP wins — dex callers (RecyclerView's
+        // attachViewToParent) already built the real params.
+        if let Some(v @ V::Ref(lph)) = lp {
+            if lph != 0 {
+                pseudo_set(vm, ch, P_LP, v);
+            }
+        }
         if pseudo_get(vm, ch, P_LP).is_none() {
             let attrs = pseudo_get(vm, ch, P_ATTRS).unwrap_or(V::Ref(0));
             let lp = vm
