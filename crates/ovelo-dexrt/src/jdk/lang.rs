@@ -1433,6 +1433,39 @@ fn class_call(vm: &mut Vm, name: &str, _sig: &str, args: &[V]) -> Rt<Option<Opti
                 None => Some(Some(V::Ref(0))),
             }
         }
+        "getGenericSuperclass" => {
+            // A ParameterizedType over the real superclass: Gson's
+            // TypeToken checks `instanceof ParameterizedType` and reads
+            // actualTypeArguments[0]. The dex keeps no usable Signature
+            // annotation, so the type argument degrades to Object — the
+            // result still walks Gson's Object adapter instead of
+            // throwing "Must only create direct subclasses of TypeToken".
+            let d = match args[0] {
+                V::Ref(h) => class_desc_of(vm, h).unwrap_or_default(),
+                _ => String::new(),
+            };
+            let sup = host_supers(&d)
+                .first()
+                .map(|x| (*x).to_string())
+                .or_else(|| vm.super_desc(&d));
+            match sup {
+                Some(sup) => {
+                    // Interned `Obj::Class` mirrors so `getRawType() ==
+                    // TypeToken.class` (handle equality, Gson's check).
+                    let raw = V::Ref(vm.class_handle(&sup));
+                    let obj = V::Ref(vm.class_handle(OBJ));
+                    let args_arr = arr(vm, OBJ, vec![obj]);
+                    let h = vm.alloc_host(
+                        "Ljava/lang/reflect/ParameterizedType;",
+                        HostState::Empty,
+                    );
+                    pseudo_set(vm, h, P_TARGET, raw);
+                    pseudo_set(vm, h, P_DATA, args_arr);
+                    Some(Some(V::Ref(h)))
+                }
+                None => Some(Some(V::Ref(0))),
+            }
+        }
         "getComponentType" => {
             let d = s(
                 vm,
@@ -1594,7 +1627,6 @@ fn class_call(vm: &mut Vm, name: &str, _sig: &str, args: &[V]) -> Rt<Option<Opti
         | "getDeclaringClass"
         | "getModule"
         | "getNestHost"
-        | "getGenericSuperclass"
         | "getAnnotation"
         | "getDeclaredAnnotation"
         | "describeConstable"
@@ -2130,6 +2162,14 @@ fn reflect_call(
         .and_then(|v| sv(vm, v))
         .unwrap_or_default();
     Ok(match name {
+        _ if class == "Ljava/lang/reflect/ParameterizedType;" => match name {
+            "getActualTypeArguments" => {
+                Some(pseudo_get(vm, h, P_DATA).or(Some(arr(vm, OBJ, vec![]))))
+            }
+            "getRawType" => Some(pseudo_get(vm, h, P_TARGET).or(Some(V::Ref(0)))),
+            "getOwnerType" => Some(Some(V::Ref(0))),
+            _ => None,
+        },
         _ if class == "Ljava/lang/reflect/Modifier;" => {
             // Static `Modifier.isX(int)` predicates over the
             // java.lang.reflect modifier bit set.

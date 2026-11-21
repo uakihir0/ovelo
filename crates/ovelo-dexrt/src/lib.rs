@@ -410,14 +410,13 @@ impl Vm {
         Ok(v)
     }
 
-    /// Seed install-time grants: the manifest's `<uses-permission>`
-    /// entries that are normal-level auto-grant; the rest stay denied
-    /// until the app calls `requestPermissions`.
+    /// Seed install-time grants: every declared `<uses-permission>` is
+    /// granted — the runtime has no permission UI, and apps that check
+    /// `hasPermission` before requesting (fossify, …) would otherwise
+    /// park on a grant screen forever.
     pub fn grant_manifest_permissions(&mut self, declared: &[String]) {
         for p in declared {
-            if NORMAL_PERMISSIONS.contains(&p.as_str()) {
-                self.granted_permissions.insert(p.clone());
-            }
+            self.granted_permissions.insert(p.clone());
         }
     }
 
@@ -2195,8 +2194,12 @@ impl Vm {
                 // builtin_supers is the java.* table — framework
                 // exception hierarchies (android.database.*) live in
                 // host_supers and are reachable via assignable_desc.
+                // Framework exception classes absent from the dex can't
+                // be traced at all; their names still imply the family.
                 Self::builtin_supers(descriptor).contains(&sup.as_str())
                     || self.assignable_desc(descriptor, &sup)
+                    || (sup == "Ljava/lang/Exception;" && descriptor.ends_with("Exception;"))
+                    || (sup == "Ljava/lang/Throwable;" && descriptor.starts_with('L'))
             }
             Some(Obj::Str(_)) => {
                 sup == "Ljava/lang/String;"
@@ -2205,7 +2208,16 @@ impl Vm {
                     || sup == "Ljava/lang/Comparable;"
                     || sup == "Ljava/io/Serializable;"
             }
-            Some(Obj::Class { .. }) => sup == "Ljava/lang/Class;" || sup == "Ljava/lang/Object;",
+            Some(Obj::Class { .. }) => {
+                // java.lang.Class implements Type, GenericDeclaration,
+                // AnnotatedElement, Serializable.
+                sup == "Ljava/lang/Class;"
+                    || sup == "Ljava/lang/Object;"
+                    || sup == "Ljava/lang/reflect/Type;"
+                    || sup == "Ljava/lang/reflect/GenericDeclaration;"
+                    || sup == "Ljava/lang/reflect/AnnotatedElement;"
+                    || sup == "Ljava/io/Serializable;"
+            }
             Some(Obj::Array { elem, .. }) => {
                 sup == "Ljava/lang/Object;"
                     || sup == "Ljava/lang/Cloneable;"

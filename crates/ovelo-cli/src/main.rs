@@ -867,8 +867,24 @@ fn run_app(store: &InstallStore, package: &str) -> Result<(), OveloError> {
                     let _ = std::fs::create_dir_all(ext.join(d));
                 }
                 for (f, body) in [
-                    ("readme.md", "ovelo guest storage\n"),
-                    ("Documents/notes.txt", "hello from ovelo\n"),
+                    ("readme.md", "ovelo guest storage\n".as_bytes().to_vec()),
+                    ("Documents/notes.txt", "hello from ovelo\n".as_bytes().to_vec()),
+                    (
+                        "Pictures/sunset.png",
+                        include_bytes!("../assets/seed-sunset.png").to_vec(),
+                    ),
+                    (
+                        "Pictures/mountain.png",
+                        include_bytes!("../assets/seed-mountain.png").to_vec(),
+                    ),
+                    (
+                        "Pictures/forest.png",
+                        include_bytes!("../assets/seed-forest.png").to_vec(),
+                    ),
+                    (
+                        "Pictures/ocean.png",
+                        include_bytes!("../assets/seed-ocean.png").to_vec(),
+                    ),
                 ] {
                     let p = ext.join(f);
                     if !p.exists() {

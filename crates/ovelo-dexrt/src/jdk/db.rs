@@ -271,6 +271,205 @@ fn first_string(vm: &Vm, args: &[V]) -> Option<String> {
     args.iter().find_map(|a| sv(vm, *a))
 }
 
+/// `ContentResolver.query(content://media/...)` — scan `external_root`
+/// into a Cursor carrying the MediaStore column set. `external/images/
+/// media`, `external/images/thumbnails` (same rows), `external/file`
+/// and friends all share the on-disk scan; a `selection`/`selectionArgs`
+/// narrowing isn't applied.
+pub(crate) fn media_cursor(vm: &mut Vm, uri: &str) -> V {
+    const COLS: &[&str] = &[
+        "_id",
+        "_data",
+        "_display_name",
+        "title",
+        "_size",
+        "date_added",
+        "date_modified",
+        "datetaken",
+        "mime_type",
+        "media_type",
+        "bucket_id",
+        "bucket_display_name",
+        "relative_path",
+        "width",
+        "height",
+        "orientation",
+        "duration",
+        "is_favorite",
+        "volume_name",
+    ];
+    let images = uri.contains("/images/");
+    let video = uri.contains("/video/");
+    let audio = uri.contains("/audio/");
+    let mut rows: Vec<Vec<V>> = Vec::new();
+    let mut dirs = vec![vm.external_root.clone()];
+    let mut id = 1i64;
+    while let Some(d) = dirs.pop() {
+        let Ok(rd) = std::fs::read_dir(&d) else {
+            continue;
+        };
+        for e in rd.flatten() {
+            let p = e.path();
+            if p.is_dir() {
+                dirs.push(p);
+                continue;
+            }
+            let ext = p
+                .extension()
+                .and_then(|x| x.to_str())
+                .unwrap_or("")
+                .to_lowercase();
+            let (mime, mtype) = match ext.as_str() {
+                "jpg" | "jpeg" => ("image/jpeg", 1i64),
+                "png" => ("image/png", 1),
+                "gif" => ("image/gif", 1),
+                "webp" => ("image/webp", 1),
+                "bmp" => ("image/bmp", 1),
+                "mp4" | "m4v" => ("video/mp4", 3),
+                "mkv" => ("video/x-matroska", 3),
+                "webm" => ("video/webm", 3),
+                "3gp" => ("video/3gpp", 3),
+                "mp3" => ("audio/mpeg", 2),
+                "m4a" | "aac" => ("audio/mp4a-latm", 2),
+                "ogg" | "opus" => ("audio/ogg", 2),
+                "flac" => ("audio/flac", 2),
+                "wav" => ("audio/x-wav", 2),
+                _ => continue,
+            };
+            // A scoped volume (images/video/audio) filters by media
+            // type; "file"/"media" volumes accept everything.
+            let wanted = if images {
+                mtype == 1
+            } else if video {
+                mtype == 3
+            } else if audio {
+                mtype == 2
+            } else {
+                true
+            };
+            if !wanted {
+                continue;
+            }
+            let rel = p
+                .strip_prefix(&vm.external_root)
+                .ok()
+                .map(|r| r.to_string_lossy().replace('\\', "/"))
+                .unwrap_or_default();
+            let name = p
+                .file_name()
+                .map(|n| n.to_string_lossy().to_string())
+                .unwrap_or_default();
+            let title = p
+                .file_stem()
+                .map(|n| n.to_string_lossy().to_string())
+                .unwrap_or_default();
+            let bucket = p
+                .parent()
+                .and_then(|x| x.file_name())
+                .map(|n| n.to_string_lossy().to_string())
+                .unwrap_or_default();
+            let meta = std::fs::metadata(&p).ok();
+            let size = meta.as_ref().map(|m| m.len() as i64).unwrap_or(0);
+            let mtime = meta
+                .and_then(|m| m.modified().ok())
+                .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+                .map(|d| d.as_secs() as i64)
+                .unwrap_or(0);
+            let (w, h) = img_dims(&p);
+            rows.push(vec![
+                V::I64(id),
+                jstr(vm, &format!("/storage/emulated/0/{rel}")),
+                jstr(vm, &name),
+                jstr(vm, &title),
+                V::I64(size),
+                V::I64(mtime),
+                V::I64(mtime),
+                V::I64(mtime * 1000),
+                jstr(vm, mime),
+                V::I64(mtype),
+                V::I64(bucket.as_str().len() as i64), // stable-ish bucket id
+                jstr(vm, &bucket),
+                jstr(vm, &format!("{bucket}/")),
+                V::I64(w),
+                V::I64(h),
+                V::I64(0),
+                V::I64(0),
+                V::I64(0),
+                jstr(vm, "external"),
+            ]);
+            id += 1;
+        }
+    }
+    let col_v: Vec<V> = COLS.iter().map(|c| jstr(vm, c)).collect();
+    let col_arr = arr(vm, "Ljava/lang/String;", col_v);
+    let row_refs: Vec<V> = rows
+        .into_iter()
+        .map(|r| arr(vm, "Ljava/lang/Object;", r))
+        .collect();
+    let rows_l = host(vm, "Ljava/util/ArrayList;", HostState::List(row_refs));
+    let V::Ref(c) = host(vm, "Landroid/database/Cursor;", HostState::Empty) else {
+        unreachable!()
+    };
+    pseudo_set(vm, c, P_CUR_COLS, col_arr);
+    pseudo_set(vm, c, P_CUR_ROWS, rows_l);
+    pseudo_set(vm, c, P_CUR_POS, V::I32(-1));
+    V::Ref(c)
+}
+
+/// PNG/JPEG/GIF header dims without an image crate.
+fn img_dims(p: &std::path::Path) -> (i64, i64) {
+    let Ok(f) = std::fs::File::open(p) else {
+        return (0, 0);
+    };
+    use std::io::Read;
+    let mut buf = [0u8; 65536];
+    let Ok(n) = f.take(65536).read(&mut buf) else {
+        return (0, 0);
+    };
+    let b = &buf[..n];
+    if b.starts_with(b"\x89PNG\r\n\x1a\n") && b.len() >= 24 {
+        let w = u32::from_be_bytes(b[16..20].try_into().unwrap());
+        let h = u32::from_be_bytes(b[20..24].try_into().unwrap());
+        return (w as i64, h as i64);
+    }
+    if b.starts_with(b"GIF8") && b.len() >= 10 {
+        let w = u16::from_le_bytes(b[6..8].try_into().unwrap());
+        let h = u16::from_le_bytes(b[8..10].try_into().unwrap());
+        return (w as i64, h as i64);
+    }
+    if b.starts_with(b"BM") && b.len() >= 26 {
+        let w = i32::from_le_bytes(b[18..22].try_into().unwrap());
+        let h = i32::from_le_bytes(b[22..26].try_into().unwrap()).abs();
+        return (w as i64, h as i64);
+    }
+    if b.starts_with(&[0xFF, 0xD8]) {
+        // JPEG: walk SOI→segment markers until a SOF carries dims.
+        let mut i = 2usize;
+        while i + 9 < b.len() {
+            if b[i] != 0xFF {
+                i += 1;
+                continue;
+            }
+            let marker = b[i + 1];
+            if (0xC0..=0xCF).contains(&marker) && marker != 0xC4 && marker != 0xC8 && marker != 0xCC
+            {
+                let h = u16::from_be_bytes(b[i + 5..i + 7].try_into().unwrap());
+                let w = u16::from_be_bytes(b[i + 7..i + 9].try_into().unwrap());
+                return (w as i64, h as i64);
+            }
+            if i + 4 > b.len() {
+                break;
+            }
+            let len = u16::from_be_bytes(b[i + 2..i + 4].try_into().unwrap()) as usize;
+            if len < 2 {
+                break;
+            }
+            i += 2 + len;
+        }
+    }
+    (0, 0)
+}
+
 /// Build `SELECT …` for `query*` overloads: scan args for
 /// (table, columns[], selection, selectionArgs[], groupBy, having,
 /// orderBy, limit) in order.

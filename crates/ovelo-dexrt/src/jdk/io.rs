@@ -419,9 +419,97 @@ pub(crate) fn literal_match(pat: &str, text: &str) -> bool {
         return true;
     }
     // Very small recursive matcher for common metachars.
+    fn class_ok(spec: &[char], c: char) -> bool {
+        let (neg, spec) = match spec.first() {
+            Some('^') => (true, &spec[1..]),
+            _ => (false, spec),
+        };
+        let mut hit = false;
+        let mut i = 0;
+        while i < spec.len() {
+            let lo = if spec[i] == '\\' && i + 1 < spec.len() {
+                i += 1;
+                match spec[i] {
+                    'n' => '\n',
+                    'r' => '\r',
+                    't' => '\t',
+                    'd' | 'w' | 's' => {
+                        // \d \w \s inside a class — set membership, no range
+                        let ok = match spec[i] {
+                            'd' => c.is_ascii_digit(),
+                            'w' => c.is_alphanumeric() || c == '_',
+                            _ => c.is_whitespace(),
+                        };
+                        hit |= ok;
+                        i += 1;
+                        continue;
+                    }
+                    x => x,
+                }
+            } else {
+                spec[i]
+            };
+            if i + 2 < spec.len() && spec[i + 1] == '-' {
+                hit |= (lo..=spec[i + 2]).contains(&c);
+                i += 3;
+            } else {
+                hit |= lo == c;
+                i += 1;
+            }
+        }
+        hit != neg
+    }
+    // Position of the `]` that closes a class starting at p[0]='['.
+    fn class_end(p: &[char]) -> Option<usize> {
+        let mut i = 1;
+        while i < p.len() {
+            match p[i] {
+                '\\' => i += 1,
+                ']' if i > 1 => return Some(i),
+                _ => {}
+            }
+            i += 1;
+        }
+        None
+    }
     fn m(p: &[char], t: &[char]) -> bool {
         if p.is_empty() {
             return t.is_empty();
+        }
+        // [...] with an optional *, + or ? quantifier.
+        if p[0] == '[' {
+            if let Some(end) = class_end(p) {
+                let spec = &p[1..end];
+                let after = &p[end + 1..];
+                let (quant, rest): (char, &[char]) = match after.first() {
+                    Some('*') => ('*', &after[1..]),
+                    Some('+') => ('+', &after[1..]),
+                    Some('?') => ('?', &after[1..]),
+                    _ => ('\0', after),
+                };
+                return match quant {
+                    '*' | '+' => {
+                        let mut max = 0;
+                        while max < t.len() && class_ok(spec, t[max]) {
+                            max += 1;
+                        }
+                        if quant == '+' && max == 0 {
+                            return false;
+                        }
+                        for skip in (0..=max).rev() {
+                            if m(rest, &t[skip..]) {
+                                return true;
+                            }
+                        }
+                        false
+                    }
+                    '?' => {
+                        (!t.is_empty() && class_ok(spec, t[0]) && m(rest, &t[1..]))
+                            || m(rest, t)
+                    }
+                    _ => !t.is_empty() && class_ok(spec, t[0]) && m(rest, &t[1..]),
+                };
+            }
         }
         match p[0] {
             '*' => false, // stray star

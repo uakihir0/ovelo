@@ -134,11 +134,18 @@ pub(crate) fn call(
         pm_call(vm, name, args)?
     } else if class == "Landroid/content/ContentResolver;" || class.ends_with("ContentResolver;") {
         match name {
-            "query" | "rawQuery" => Some(Some(host(
-                vm,
-                "Landroid/database/Cursor;",
-                HostState::Empty,
-            ))),
+            "query" | "rawQuery" => {
+                let uri = args
+                    .iter()
+                    .skip(1)
+                    .find_map(|a| sv(vm, *a))
+                    .unwrap_or_default();
+                if uri.starts_with("content://media/") {
+                    Some(Some(db::media_cursor(vm, &uri)))
+                } else {
+                    Some(Some(host(vm, "Landroid/database/Cursor;", HostState::Empty)))
+                }
+            }
             "insert"
             | "call"
             | "openFileDescriptor"
@@ -326,6 +333,15 @@ pub(crate) fn call(
                 "Ljava/io/File;",
                 HostState::Path("/storage/emulated/0".into()),
             ))),
+            "getExternalStoragePublicDirectory" => {
+                // e.g. Environment.DIRECTORY_DCIM → /storage/emulated/0/DCIM
+                let dir = sv(vm, *args.get(1).unwrap_or(&V::Ref(0))).unwrap_or_default();
+                Some(Some(host(
+                    vm,
+                    "Ljava/io/File;",
+                    HostState::Path(format!("/storage/emulated/0/{dir}")),
+                )))
+            }
             "getExternalStorageState" | "getStorageState" | "getExternalStorageStateLegacy" => {
                 Some(Some(jstr(vm, "mounted")))
             }
@@ -414,6 +430,30 @@ pub(crate) fn call(
         super::db::db_call(vm, name, args)?
     } else if class.starts_with("Landroid/provider/") {
         match name {
+            // `MediaStore$Files.getContentUri("external")` →
+            // content://media/external/file/media — same segment logic
+            // as the *_CONTENT_URI fields.
+            "getContentUri" => {
+                let media = if class == "Landroid/provider/MediaStore$Files;" {
+                    "file".to_string()
+                } else {
+                    class
+                        .trim_start_matches("Landroid/provider/MediaStore$")
+                        .trim_end_matches(';')
+                        .split('$')
+                        .collect::<Vec<_>>()
+                        .join("/")
+                        .to_lowercase()
+                };
+                let vol = sv(vm, *args.first().unwrap_or(&V::Ref(0)))
+                    .filter(|v| !v.is_empty())
+                    .unwrap_or_else(|| "external".into());
+                Some(Some(host(
+                    vm,
+                    "Landroid/net/Uri;",
+                    HostState::StrBuf(format!("content://media/{vol}/{media}/media")),
+                )))
+            }
             "getString" | "getInt" | "getLong" | "getFloat" => {
                 Some(Some(args.get(2).copied().unwrap_or(V::I32(0))))
             }
@@ -2039,6 +2079,19 @@ fn perm_arg(vm: &Vm, args: &[V]) -> Option<String> {
 fn pm_call(vm: &mut Vm, name: &str, args: &[V]) -> Rt<Option<Option<V>>> {
     Ok(match name {
         "getPackageInfo" => {
+            // Unknown package names must throw NameNotFoundException —
+            // callers like fossify's isPackageInstalled probe sibling
+            // apps this way and branch on the catch.
+            let want = args.iter().skip(1).find_map(|a| sv(vm, *a));
+            let mine = vm.guest_package.clone().unwrap_or_default();
+            if let Some(w) = want.as_deref() {
+                if w != mine && !w.starts_with("android") && !w.starts_with("com.android") {
+                    return Err(vm.throw_builtin(
+                        "Landroid/content/pm/PackageManager$NameNotFoundException;",
+                        w,
+                    ));
+                }
+            }
             let h = vm.alloc_host("Landroid/content/pm/PackageInfo;", HostState::Empty);
             let pkg = vm.guest_package.clone().unwrap_or_else(|| "app".into());
             let pv = jstr(vm, &pkg);
