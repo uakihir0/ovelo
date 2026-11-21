@@ -26,7 +26,7 @@ thread_local! {
     static CUR_VM: Cell<*mut Vm> = const { Cell::new(std::ptr::null_mut()) };
 }
 
-fn vm() -> &'static mut Vm {
+pub(crate) fn vm() -> &'static mut Vm {
     unsafe { &mut *CUR_VM.get() }
 }
 
