@@ -16,18 +16,23 @@ use crate::Vm;
 
 use super::{host, pseudo_set, P_BITMAP_SLOT, P_DRAW_COLOR};
 
+/// Cached rasterization result: (w, h, rgba) or None when not drawable.
+type CachedDrawable = Option<(u32, u32, Rc<Vec<u8>>)>;
+
 thread_local! {
-    /// res_id → rendered pixels (None = not an image we can make).
-    /// Keyed by res id only — one process hosts a single app's runtime.
+    /// (res_id, theme_id) → rendered pixels (None = not an image we can
+    /// make). Colors resolve through the current theme, so the key must
+    /// carry it or a theme change would keep returning stale pixels.
     static DRAW_CACHE: std::cell::RefCell<
-        std::collections::HashMap<u32, Option<(u32, u32, Rc<Vec<u8>>)>>,
+        std::collections::HashMap<(u32, u32), CachedDrawable>,
     > = std::cell::RefCell::new(std::collections::HashMap::new());
 }
 
 /// Pixels for a `res/drawable` id: `<vector>` rasterized, or PNG/JPEG
 /// decoded. `None` for non-image resources.
 pub(crate) fn drawable_bitmap(vm: &Vm, res_id: u32) -> Option<(u32, u32, Rc<Vec<u8>>)> {
-    if let Some(hit) = DRAW_CACHE.with(|c| c.borrow().get(&res_id).cloned()) {
+    let key = (res_id, vm.theme_id);
+    if let Some(hit) = DRAW_CACHE.with(|c| c.borrow().get(&key).cloned()) {
         return hit;
     }
     let out = render_vector(vm, res_id).or_else(|| {
@@ -38,7 +43,7 @@ pub(crate) fn drawable_bitmap(vm: &Vm, res_id: u32) -> Option<(u32, u32, Rc<Vec<
         let (w, h) = rgba.dimensions();
         Some((w, h, Rc::new(rgba.into_raw())))
     });
-    DRAW_CACHE.with(|c| c.borrow_mut().insert(res_id, out.clone()));
+    DRAW_CACHE.with(|c| c.borrow_mut().insert(key, out.clone()));
     out
 }
 
@@ -66,8 +71,7 @@ pub(crate) fn drawable_for_res(vm: &mut Vm, res_id: u32) -> V {
                 .apk_res
                 .as_ref()
                 .and_then(|r| r.type_name(res_id))
-                .as_deref()
-                == Some("color");
+                .is_some_and(|t| t == "color");
             if is_color {
                 let d = host(vm, "Landroid/graphics/drawable/ColorDrawable;", HostState::Empty);
                 if let (V::Ref(dh), Some(argb)) = (d, resolve_ref_color(vm, res_id)) {
@@ -104,8 +108,8 @@ pub(crate) fn render_vector(vm: &Vm, res_id: u32) -> Option<(u32, u32, Rc<Vec<u8
     if vw <= 0.0 || vh <= 0.0 || !vw.is_finite() || !vh.is_finite() {
         return None;
     }
-    let out_w = ((vw * OUT_SCALE).round() as u32).max(1).min(1024);
-    let out_h = ((vh * OUT_SCALE).round() as u32).max(1).min(1024);
+    let out_w = ((vw * OUT_SCALE).round() as u32).clamp(1, 1024);
+    let out_h = ((vh * OUT_SCALE).round() as u32).clamp(1, 1024);
     let rw = (out_w * SS) as usize;
     let rh = (out_h * SS) as usize;
     // viewport → raster: viewport unit * OUT_SCALE * SS.
@@ -160,12 +164,11 @@ pub(crate) fn render_vector(vm: &Vm, res_id: u32) -> Option<(u32, u32, Rc<Vec<u8
                     let sw = f32_attr(el, "strokeWidth").unwrap_or(1.0) * k;
                     let polys: Vec<Vec<(f32, f32)>> = subs
                         .iter()
-                        .map(|s| {
+                        .flat_map(|s| {
                             let pts: Vec<(f32, f32)> =
                                 s.pts.iter().map(|&(x, y)| tr.apply(x, y)).collect();
                             stroke_quads(&pts, s.closed, sw)
                         })
-                        .flatten()
                         .collect();
                     let mut cov = vec![0u8; rw * rh];
                     accumulate(&mut cov, &polys, rw, rh);
@@ -340,12 +343,18 @@ fn resolve_ref_color(vm: &Vm, id: u32) -> Option<u32> {
 }
 
 fn entry_color(res: &crate::res::ApkResources, ev: &ovelo_apk::arsc::EntryValue) -> Option<u32> {
-    match ev.data_type {
-        0x1c..=0x1f | 0x10 | 0x11 => Some(ev.data),
-        0x01 => res.entry_value(ev.data).and_then(|e| entry_color(res, e)),
-        0x03 => ev.string.as_deref().and_then(parse_color),
-        _ => None,
+    // TYPE_REFERENCE chains are walked iteratively — a cyclic or
+    // self-referencing color resource must not recurse without bound.
+    let mut ev = ev;
+    for _ in 0..8 {
+        match ev.data_type {
+            0x1c..=0x1f | 0x10 | 0x11 => return Some(ev.data),
+            0x01 => ev = res.entry_value(ev.data)?,
+            0x03 => return ev.string.as_deref().and_then(parse_color),
+            _ => return None,
+        }
     }
+    None
 }
 
 fn parse_color(s: &str) -> Option<u32> {
@@ -353,12 +362,17 @@ fn parse_color(s: &str) -> Option<u32> {
     let v = u32::from_str_radix(s, 16).ok()?;
     Some(match s.len() {
         3 => {
-            let (r, g, b) = (v >> 8 & 0xf, v >> 4 & 0xf, v & 0xf);
-            0xff00_0000 | (r * 0x11) << 16 | (g * 0x11) << 8 | b * 0x11
+            let (r, g, b) = ((v >> 8) & 0xf, (v >> 4) & 0xf, v & 0xf);
+            0xff00_0000 | ((r * 0x11) << 16) | ((g * 0x11) << 8) | (b * 0x11)
         }
         4 => {
-            let (a, r, g, b) = (v >> 12 & 0xf, v >> 8 & 0xf, v >> 4 & 0xf, v & 0xf);
-            (a * 0x11) << 24 | (r * 0x11) << 16 | (g * 0x11) << 8 | b * 0x11
+            let (a, r, g, b) = (
+                (v >> 12) & 0xf,
+                (v >> 8) & 0xf,
+                (v >> 4) & 0xf,
+                v & 0xf,
+            );
+            ((a * 0x11) << 24) | ((r * 0x11) << 16) | ((g * 0x11) << 8) | (b * 0x11)
         }
         6 => 0xff00_0000 | v,
         8 => v,
@@ -493,6 +507,10 @@ fn parse_path(d: &str) -> Vec<Sub> {
                     });
                 }
                 (x, y) = (sx, sy);
+                // A `Z` takes no operands — leaving `cmd` at Z makes the
+                // implicit-repeat path re-execute it forever on stray
+                // input like `Z0`. A number after Z is malformed; end.
+                cmd = b' ';
                 pc = false;
                 pq = false;
             }

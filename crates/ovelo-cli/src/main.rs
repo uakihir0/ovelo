@@ -438,17 +438,19 @@ fn register_compat_shims(
         }))
     };
     for (class, name, sig, arg_idx) in [
+        // Instance method — compact args put the receiver first, so
+        // the res id sits at index 2.
         (
             "Landroidx/appcompat/widget/ResourceManagerInternal;",
             "getDrawable",
             "(Landroid/content/Context;I)Landroid/graphics/drawable/Drawable;",
-            1usize,
+            2usize,
         ),
         (
             "Landroidx/appcompat/widget/ResourceManagerInternal;",
             "getDrawable",
             "(Landroid/content/Context;IZ)Landroid/graphics/drawable/Drawable;",
-            1,
+            2,
         ),
         (
             "Landroidx/appcompat/content/res/AppCompatResources;",
