@@ -460,7 +460,16 @@ fn image_drawable(vm: &mut Vm, this: u32) -> V {
     }
     let bare = match raw {
         V::I32(_) => true,
-        V::Ref(h) => !matches!(vm.heap.get(h), Some(Obj::Instance { .. })),
+        V::Ref(h) => match vm.heap.get(h) {
+            Some(Obj::Instance { .. }) => false,
+            // A previous call's BitmapDrawable is already a proper
+            // drawable — re-wrapping would nest drawable-in-drawable
+            // and break getBitmap().
+            Some(Obj::Host { desc, .. }) => {
+                desc != "Landroid/graphics/drawable/BitmapDrawable;"
+            }
+            _ => true,
+        },
         _ => false,
     };
     if !bare {
