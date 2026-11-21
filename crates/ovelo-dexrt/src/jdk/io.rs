@@ -14,11 +14,24 @@ pub(crate) fn call(
         if desc_is_a(class, "Ljava/io/PrintStream;") || desc_is_a(class, "Ljava/io/PrintWriter;") {
             print_call(vm, name, sig, args)
         } else if class.ends_with("FileInputStream;") && name == "<init>" {
-            // Open the real file: arg is a File (Path host) or a String.
-            let path = stream_arg_path(vm, args.get(1).copied().unwrap_or(V::Ref(0)));
-            let bytes = path
-                .and_then(|p| std::fs::read(fspath(vm, &p)).ok())
-                .unwrap_or_default();
+            // Open the real file: arg is a File (Path host), a String, or a
+            // FileDescriptor already carrying bytes (`getFD`/ParcelFileDescriptor).
+            let arg = args.get(1).copied().unwrap_or(V::Ref(0));
+            let fd_bytes = match arg {
+                V::Ref(h) => match vm.heap.get(h) {
+                    Some(Obj::Host {
+                        state: HostState::Bytes(b, p),
+                        ..
+                    }) => Some(b[*p..].to_vec()),
+                    _ => None,
+                },
+                _ => None,
+            };
+            let bytes = fd_bytes.unwrap_or_else(|| {
+                stream_arg_path(vm, arg)
+                    .and_then(|p| std::fs::read(fspath(vm, &p)).ok())
+                    .unwrap_or_default()
+            });
             if let Some(V::Ref(this)) = args.first() {
                 let (ci, d, fs) = match vm.heap.get(*this) {
                     Some(Obj::Host {
