@@ -493,10 +493,10 @@ pub(crate) fn literal_match(pat: &str, text: &str) -> bool {
                         while max < t.len() && class_ok(spec, t[max]) {
                             max += 1;
                         }
-                        if quant == '+' && max == 0 {
-                            return false;
-                        }
-                        for skip in (0..=max).rev() {
+                        // `+` requires at least one consumed char;
+                        // `*` may consume none.
+                        let lo = usize::from(quant == '+');
+                        for skip in (lo..=max).rev() {
                             if m(rest, &t[skip..]) {
                                 return true;
                             }
