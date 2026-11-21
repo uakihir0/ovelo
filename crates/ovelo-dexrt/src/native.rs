@@ -361,6 +361,37 @@ extern "C" fn sh_ab_unlock_pixels(_env: usize, _bitmap: usize) -> i32 {
     0
 }
 
+// __android_log_print is variadic; stable Rust can't define variadic
+// extern "C" fns, so a fixed 7-arg signature captures the register
+// args — stack-spilled extras are ignored and the format goes out
+// unsubstituted.
+extern "C" fn sh_log_print(
+    prio: i32,
+    tag: *const i8,
+    fmt: *const i8,
+    _a3: usize,
+    _a4: usize,
+    _a5: usize,
+    _a6: usize,
+) -> i32 {
+    unsafe {
+        let t = if tag.is_null() {
+            "?".into()
+        } else {
+            std::ffi::CStr::from_ptr(tag).to_string_lossy()
+        };
+        let f = if fmt.is_null() {
+            "?".into()
+        } else {
+            std::ffi::CStr::from_ptr(fmt).to_string_lossy()
+        };
+        eprintln!("[alog:{prio}] {t}: {f}");
+    }
+    0
+}
+extern "C" fn sh_log_write(prio: i32, tag: *const i8, text: *const i8) -> i32 {
+    sh_log_print(prio, tag, text, 0, 0, 0, 0)
+}
 extern "C" fn sh_atoi(s: *const i8) -> i32 {
     unsafe {
         let mut n = 0i32;
@@ -391,6 +422,8 @@ fn builtin_shim(name: &str) -> Option<usize> {
         "AndroidBitmap_getInfo" => sh_ab_get_info as *const () as usize,
         "AndroidBitmap_lockPixels" => sh_ab_lock_pixels as *const () as usize,
         "AndroidBitmap_unlockPixels" => sh_ab_unlock_pixels as *const () as usize,
+        "__android_log_print" | "__android_log_vprint" => sh_log_print as *const () as usize,
+        "__android_log_write" => sh_log_write as *const () as usize,
         "__emutls_get_address" => 0, // TLS unimplemented — signal caller
         _ => return None,
     })
