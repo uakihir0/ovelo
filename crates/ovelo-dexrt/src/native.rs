@@ -540,16 +540,17 @@ extern "C" fn sh_terminate() -> ! {
     eprintln!("[native] cxa handler invoked");
     unsafe { abort() }
 }
-// Bionic's `__strncpy_chk2` reports the compile-time dst bound; a short
-// source zero-pads legally, so only the destination bound aborts.
+// Bionic's `__strncpy_chk2` enforces both compile-time bounds:
+// n over the dst size truncates, n over the src size reads past the
+// source object — FORTIFY aborts on either.
 extern "C" fn sh_strncpy_chk2(
     d: *mut i8,
     s: *const i8,
     n: usize,
     dlen: usize,
-    _max_n: usize,
+    max_n: usize,
 ) -> *mut i8 {
-    if n > dlen {
+    if n > dlen || n > max_n {
         sh_chk_fail();
     }
     unsafe { strncpy(d, s, n) }
