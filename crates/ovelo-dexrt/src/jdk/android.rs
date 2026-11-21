@@ -556,14 +556,43 @@ fn viewconfig_call(vm: &mut Vm, class: &str, name: &str, args: &[V]) -> Rt<Optio
             let g = i64v(args.first().copied().unwrap_or(V::I32(0))) as i32;
             let display = args.get(1).copied().unwrap_or(V::Ref(0));
             let inout = args.get(2).copied().unwrap_or(V::Ref(0));
-            let dir = i64v(args.get(3).copied().unwrap_or(V::I32(0))) as i32;
-            let (w, h) = if let V::Ref(ih) = inout {
-                let (l, t, r, b) = rect_edges(vm, ih);
-                (r - l, b - t)
-            } else {
-                (0, 0)
+            let (V::Ref(dh), V::Ref(ih)) = (display, inout) else {
+                return Ok(Some(None));
             };
-            gravity_apply(vm, g, w, h, display, 0, 0, inout, dir);
+            // AOSP keeps an in-bounds rect untouched — it only shifts
+            // the edge that overflows `display` (or clips it when the
+            // DISPLAY_CLIP_* bits are set), never re-lays it out.
+            const DISPLAY_CLIP_VERTICAL: i32 = 0x80;
+            const DISPLAY_CLIP_HORIZONTAL: i32 = 0x100;
+            let (dl, dt, dr, db) = rect_edges(vm, dh);
+            let (mut l, mut t, mut r, mut b) = rect_edges(vm, ih);
+            if g & DISPLAY_CLIP_VERTICAL != 0 {
+                t = t.max(dt);
+                b = b.min(db);
+            } else if b - t > db - dt {
+                t = dt;
+                b = db;
+            } else if t < dt {
+                b += dt - t;
+                t = dt;
+            } else if b > db {
+                t -= b - db;
+                b = db;
+            }
+            if g & DISPLAY_CLIP_HORIZONTAL != 0 {
+                l = l.max(dl);
+                r = r.min(dr);
+            } else if r - l > dr - dl {
+                l = dl;
+                r = dr;
+            } else if l < dl {
+                r += dl - l;
+                l = dl;
+            } else if r > dr {
+                l -= r - dr;
+                r = dr;
+            }
+            rect_write(vm, ih, l, t, r, b);
             Some(None)
         }
         ("Landroid/view/Gravity;", "isVertical" | "isHorizontal") => Some(Some(V::I32(0))),

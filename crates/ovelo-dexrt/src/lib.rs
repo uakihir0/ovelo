@@ -3654,7 +3654,19 @@ impl Vm {
         let d = self.dex_of(field_idx)?;
         let f = d.field(gl(field_idx)).ok()?;
         let ty = d.type_descriptor(f.type_idx as u32).ok()?;
-        if !ty.starts_with('L') && !ty.starts_with('[') {
+        // Only eagerly-allocated value holders (AOSP ctors `new` these
+        // up front — LayoutParams.mDecorInsets is the motivating case):
+        // minting a stub for an ordinary ref field fakes `x != null`
+        // and corrupts guest null checks (Message.obj, payloads).
+        const REF_FIELD_STUB_TYPES: &[&str] = &[
+            "Landroid/graphics/Rect;",
+            "Landroid/graphics/RectF;",
+            "Landroid/graphics/Point;",
+            "Landroid/graphics/PointF;",
+            "Landroid/graphics/Insets;",
+            "Landroid/graphics/Region;",
+        ];
+        if !REF_FIELD_STUB_TYPES.contains(&ty.as_str()) {
             return None;
         }
         let v = jdk::host(self, &ty, HostState::Empty);

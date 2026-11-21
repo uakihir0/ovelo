@@ -991,12 +991,15 @@ pub(crate) fn sfield(vm: &mut Vm, owner: &str, name: &str, ftype: &str) -> Optio
         (o, "EXTERNAL_CONTENT_URI" | "INTERNAL_CONTENT_URI" | "CONTENT_URI")
             if o.starts_with("Landroid/provider/MediaStore") =>
         {
+            // `MediaStore$Images$Media` → "images/media",
+            // `MediaStore$Images$Thumbnails` → "images/thumbnails" —
+            // the real content-provider path suffixes.
             let media = o
                 .trim_start_matches("Landroid/provider/MediaStore$")
                 .trim_end_matches(';')
                 .split('$')
-                .next()
-                .unwrap_or("media")
+                .collect::<Vec<_>>()
+                .join("/")
                 .to_lowercase();
             let vol = if name.starts_with("EXTERNAL") {
                 "external"

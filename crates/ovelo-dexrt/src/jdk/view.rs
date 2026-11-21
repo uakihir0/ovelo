@@ -2269,16 +2269,17 @@ fn measure_child(
     margins: bool,
 ) {
     // Child dims/margins come from its LayoutParams; AOSP's
-    // default LP is (WRAP, WRAP, 0 margins).
-    let (mut lp_w, mut lp_h) = (-2, -2);
+    // default LP is (WRAP, WRAP, 0 margins). `None` = field absent;
+    // -2 can be a real WRAP_CONTENT, not a miss.
+    let (mut lp_w, mut lp_h) = (None, None);
     let (mut ml, mut mt, mut mr, mut mb) = (0, 0, 0, 0);
     if let Some(V::Ref(lp)) = pseudo_get(vm, child, P_LP) {
         if lp != 0 {
             if let Some(f) = lp_field(vm, lp, "width") {
-                lp_w = lp_px(vm, f).unwrap_or(-2);
+                lp_w = lp_px(vm, f);
             }
             if let Some(f) = lp_field(vm, lp, "height") {
-                lp_h = lp_px(vm, f).unwrap_or(-2);
+                lp_h = lp_px(vm, f);
             }
             if margins {
                 ml = lp_field(vm, lp, "leftMargin")
@@ -2298,16 +2299,17 @@ fn measure_child(
     }
     // Host placeholder LPs carry no dex fields — fall back to the
     // inflated AttributeSet's layout_width/layout_height.
-    if lp_w == -2 {
+    if lp_w.is_none() {
         if let Some(f) = attr_find(vm, child, "layout_width") {
-            lp_w = len_v(vm, f);
+            lp_w = Some(len_v(vm, f));
         }
     }
-    if lp_h == -2 {
+    if lp_h.is_none() {
         if let Some(f) = attr_find(vm, child, "layout_height") {
-            lp_h = len_v(vm, f);
+            lp_h = Some(len_v(vm, f));
         }
     }
+    let (lp_w, lp_h) = (lp_w.unwrap_or(-2), lp_h.unwrap_or(-2));
     // Parent padding halves the space handed to children.
     let pad_w = lp_px(vm, attr_find(vm, parent, "paddingLeft").unwrap_or(V::I32(0)))
         .unwrap_or(0)
@@ -2341,14 +2343,51 @@ fn group_measure_fallback(vm: &mut Vm, this: u32, pw: i32, ph: i32) {
         + lp_px(vm, attr_find(vm, this, "paddingRight").unwrap_or(V::I32(0))).unwrap_or(0);
     let pad_h = lp_px(vm, attr_find(vm, this, "paddingTop").unwrap_or(V::I32(0))).unwrap_or(0)
         + lp_px(vm, attr_find(vm, this, "paddingBottom").unwrap_or(V::I32(0))).unwrap_or(0);
+    let kids = children(vm, this);
+    if kids.is_empty() {
+        // Leaf view (TextView/Button with no dex onMeasure): report
+        // its intrinsic text extent or wrap_content collapses to 0.
+        let text = match pseudo_get(vm, this, P_TEXT) {
+            Some(V::Ref(th)) if th != 0 => s(vm, th).unwrap_or_default(),
+            Some(V::I32(id)) if id > 0 => vm
+                .apk_res
+                .as_ref()
+                .and_then(|r| r.string_of(id as u32))
+                .map(|s| s.to_string())
+                .unwrap_or_default(),
+            _ => String::new(),
+        };
+        let ts = match pseudo_get(vm, this, P_TSIZE) {
+            Some(V::F32(f)) => f,
+            Some(V::I32(b)) => f32::from_bits(b as u32),
+            _ => 14.0,
+        }
+        .abs()
+        .max(1.0);
+        let (cw, chh) = if text.is_empty() {
+            (0, 0)
+        } else {
+            (
+                (text.chars().count() as f32 * ts * 0.6) as i32,
+                (ts * 1.3) as i32,
+            )
+        };
+        pseudo_set(vm, this, P_MEAS_W, V::I32(resolve_size(cw + pad_w, pw, true)));
+        pseudo_set(vm, this, P_MEAS_H, V::I32(resolve_size(chh + pad_h, ph, true)));
+        return;
+    }
     let linear = class_of(vm, V::Ref(this)).contains("LinearLayout");
     let (mut cw, mut chh) = (0i32, 0i32);
-    for c in children(vm, this) {
+    for c in kids {
         let V::Ref(ch) = c else { continue };
         if ch == 0 {
             continue;
         }
-        measure_child(vm, this, ch, pw, 0, ph, chh, true);
+        // AOSP measureChildWithMargins: `heightUsed` is the running
+        // total only for stacking containers — FrameLayout children
+        // each get the full height (a leading match_parent must not
+        // starve later siblings).
+        measure_child(vm, this, ch, pw, 0, ph, if linear { chh } else { 0 }, true);
         let w = pint(vm, ch, P_MEAS_W) & 0x00FF_FFFF;
         let hh = pint(vm, ch, P_MEAS_H) & 0x00FF_FFFF;
         cw = cw.max(w);
@@ -2367,11 +2406,15 @@ fn group_measure_fallback(vm: &mut Vm, this: u32, pw: i32, ph: i32) {
 /// Generic `onLayout` for framework skeleton containers: FrameLayout
 /// semantics (children at the parent's content origin plus their
 /// margins, at measured size); LinearLayout stacks vertically.
-fn group_layout_fallback(vm: &mut Vm, this: u32, l: i32, t: i32, _r: i32, _b: i32) {
+fn group_layout_fallback(vm: &mut Vm, this: u32, _l: i32, _t: i32, _r: i32, _b: i32) {
     let pad_l = lp_px(vm, attr_find(vm, this, "paddingLeft").unwrap_or(V::I32(0))).unwrap_or(0);
     let pad_t = lp_px(vm, attr_find(vm, this, "paddingTop").unwrap_or(V::I32(0))).unwrap_or(0);
     let linear = class_of(vm, V::Ref(this)).contains("LinearLayout");
-    let mut cur_t = t + pad_t;
+    // Children are laid out in THIS view's content coordinates —
+    // (0,0) is its own top-left, not the (l,t) corner of its frame
+    // in the parent, or a nested container shifts its children by
+    // its own position a second time.
+    let mut cur_t = pad_t;
     for c in children(vm, this) {
         let V::Ref(ch) = c else { continue };
         if ch == 0 {
@@ -2398,8 +2441,8 @@ fn group_layout_fallback(vm: &mut Vm, this: u32, l: i32, t: i32, _r: i32, _b: i3
         };
         let cw = pint(vm, ch, P_MEAS_W) & 0x00FF_FFFF;
         let chh = pint(vm, ch, P_MEAS_H) & 0x00FF_FFFF;
-        let cl = l + pad_l + ml;
-        let ct = if linear { cur_t + mt } else { t + pad_t + mt };
+        let cl = pad_l + ml;
+        let ct = if linear { cur_t + mt } else { pad_t + mt };
         if std::env::var_os("OVELO_VIEWDBG").is_some() {
             eprintln!("[viewdbg] groupLayout h{ch} meas={cw}x{chh} at {cl},{ct}");
         }
