@@ -164,7 +164,10 @@ impl EglDisplay {
     }
 
     /// The buffer a surface renders into this frame (`ANativeWindow_lock`).
-    pub fn surface_buffer(&mut self, surface: u64) -> Result<&mut crate::surface::Surface, OveloError> {
+    pub fn surface_buffer(
+        &mut self,
+        surface: u64,
+    ) -> Result<&mut crate::surface::Surface, OveloError> {
         let s = self
             .surfaces
             .get_mut(&surface)
@@ -178,15 +181,15 @@ impl EglDisplay {
     /// Host side: latch the newest posted frame for display.
     /// Without this the producer's queue is unreachable and fills up.
     pub fn acquire(&mut self, surface: u64) -> Option<FrameId> {
-        self.surfaces.get_mut(&surface)?.window.queue_mut().acquire()
+        self.surfaces
+            .get_mut(&surface)?
+            .window
+            .queue_mut()
+            .acquire()
     }
 
     /// Host side: the latched frame's pixels.
-    pub fn frame_pixels(
-        &self,
-        surface: u64,
-        frame: FrameId,
-    ) -> Option<&crate::surface::Surface> {
+    pub fn frame_pixels(&self, surface: u64, frame: FrameId) -> Option<&crate::surface::Surface> {
         self.surfaces.get(&surface)?.window.queue().read(frame)
     }
 
@@ -271,9 +274,7 @@ mod tests {
             .is_none());
         let ctx = d.create_context(None);
         d.make_current(ctx).unwrap();
-        let s = d.create_window_surface(ANativeWindow::new(
-            BufferQueue::new(2, 4, 4).unwrap(),
-        ));
+        let s = d.create_window_surface(ANativeWindow::new(BufferQueue::new(2, 4, 4).unwrap()));
         {
             let gl = d.gl().unwrap();
             gl.clear_color(0.5, 0.5, 0.5, 1.0);

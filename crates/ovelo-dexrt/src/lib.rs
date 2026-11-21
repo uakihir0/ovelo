@@ -27,8 +27,7 @@ fn err(cause: &str) -> OveloError {
     OveloError::new(ErrorCategory::DexUnsupported, Phase::DexExec, cause)
 }
 fn errd(cause: &str, detail: String) -> OveloError {
-    OveloError::new(ErrorCategory::DexUnsupported, Phase::DexExec, cause)
-        .with_detail(detail)
+    OveloError::new(ErrorCategory::DexUnsupported, Phase::DexExec, cause).with_detail(detail)
 }
 
 /// Internal control flow: a guest `throw` carries a heap handle, VM faults
@@ -97,9 +96,7 @@ struct Loc {
 /// `create` calling `initializeComponent`) — the dispatcher answers a
 /// `dexrt.host.reentrant` error there instead of panicking on the
 /// RefCell's second mutable borrow.
-pub type HostCall = std::rc::Rc<
-    std::cell::RefCell<dyn FnMut(&mut Vm, &[V]) -> Result<Option<V>>>,
->;
+pub type HostCall = std::rc::Rc<std::cell::RefCell<dyn FnMut(&mut Vm, &[V]) -> Result<Option<V>>>>;
 
 /// DEX interpreter over one or more [`DexFile`]s (multi-dex apps).
 pub struct Vm {
@@ -611,8 +608,6 @@ impl Vm {
         Ok((class, name, sig))
     }
 
-
-
     /// Register a host implementation for the method reference
     /// `class_desc.name proto_desc` (e.g.
     /// `Landroid/app/Activity;` `setContentView`
@@ -834,7 +829,13 @@ impl Vm {
         });
         let slots: usize = args
             .iter()
-            .map(|a| if matches!(a, V::I64(_) | V::F64(_)) { 2 } else { 1 })
+            .map(|a| {
+                if matches!(a, V::I64(_) | V::F64(_)) {
+                    2
+                } else {
+                    1
+                }
+            })
             .sum();
         if let Some(midx) = self.find_method_by_name(class_desc, "<init>", slots)? {
             let mut a = Vec::with_capacity(args.len() + 1);
@@ -1078,17 +1079,15 @@ impl Vm {
     /// (builtin callbacks like `SQLiteOpenHelper.onCreate`): a guest
     /// throw propagates as `E::Throw` so the app's own catch/finally
     /// sees it, instead of becoming a fatal VM error.
-    pub(crate) fn call_virtual_rt(
-        &mut self,
-        this: u32,
-        name: &str,
-        args: &[V],
-    ) -> Rt<Option<V>> {
+    pub(crate) fn call_virtual_rt(&mut self, this: u32, name: &str, args: &[V]) -> Rt<Option<V>> {
         let ci = self
             .heap
             .class_of(this)
             .ok_or_else(|| E::Vm(errd("dexrt.bad_this", name.to_string())))?;
-        let Some(midx) = self.find_method_on_chain(ci, name, args.len()).map_err(E::Vm)? else {
+        let Some(midx) = self
+            .find_method_on_chain(ci, name, args.len())
+            .map_err(E::Vm)?
+        else {
             return Ok(None);
         };
         let mut a = Vec::with_capacity(args.len() + 1);
@@ -1175,10 +1174,7 @@ impl Vm {
             if dbg {
                 match &out {
                     Ok(_) => eprintln!("[drain] ran h={r} main={on_main}"),
-                    Err(e) => eprintln!(
-                        "[drain] h={r} main={on_main} err={:?}",
-                        e
-                    ),
+                    Err(e) => eprintln!("[drain] h={r} main={on_main} err={:?}", e),
                 }
             }
             match &out {
@@ -1284,9 +1280,7 @@ impl Vm {
                                 extra.push_str(&format!(": {t}"));
                             }
                             Some(Obj::Throwable { descriptor, detail }) => {
-                                extra.push_str(&format!(
-                                    " caused by {descriptor}: {detail}"
-                                ));
+                                extra.push_str(&format!(" caused by {descriptor}: {detail}"));
                             }
                             _ => {}
                         }
@@ -1333,7 +1327,10 @@ impl Vm {
     /// Live call stack as `Lcls;.name(sig)ret` strings, newest frame
     /// last — jdk shims read it to build guest stack traces.
     pub(crate) fn describe_stack(&self) -> Vec<String> {
-        self.stack.iter().map(|&m| self.describe_method(m)).collect()
+        self.stack
+            .iter()
+            .map(|&m| self.describe_method(m))
+            .collect()
     }
 
     /// `Lcls;.name` for a field ref — error details identify the field.
@@ -1588,7 +1585,9 @@ impl Vm {
     fn class_data_of(&self, class_idx: GIdx) -> Result<Option<ClassData>> {
         match self.def_loc_of(class_idx) {
             Some((cg, d)) => Ok(Some(
-                self.dex_of(cg).ok_or_else(|| err("dexrt.dex.idx"))?.class_data(d)?,
+                self.dex_of(cg)
+                    .ok_or_else(|| err("dexrt.dex.idx"))?
+                    .class_data(d)?,
             )),
             None => Ok(None),
         }
@@ -1646,8 +1645,7 @@ impl Vm {
                         break;
                     };
                     loop {
-                        if d == sup_desc || jdk::host_supers(&d).iter().any(|s| *s == sup_desc)
-                        {
+                        if d == sup_desc || jdk::host_supers(&d).iter().any(|s| *s == sup_desc) {
                             return true;
                         }
                         let Some(next) = Self::framework_super(&d) else {
@@ -1750,10 +1748,9 @@ impl Vm {
                 "Ljava/lang/Throwable;",
                 "Ljava/lang/Object;",
             ],
-            "Ljava/lang/Exception;" | "Ljava/lang/Error;" => &[
-                "Ljava/lang/Throwable;",
-                "Ljava/lang/Object;",
-            ],
+            "Ljava/lang/Exception;" | "Ljava/lang/Error;" => {
+                &["Ljava/lang/Throwable;", "Ljava/lang/Object;"]
+            }
             "Ljava/lang/Throwable;" => &["Ljava/lang/Object;"],
             _ => &[],
         }
@@ -1789,15 +1786,26 @@ impl Vm {
             "Ljava/lang/StringBuilder;" | "Ljava/lang/StringBuffer;" => {
                 HostState::StrBuf(String::new())
             }
-            "Ljava/util/ArrayList;" | "Ljava/util/LinkedList;" | "Ljava/util/Vector;"
-            | "Ljava/util/Stack;" | "Ljava/util/HashSet;" | "Ljava/util/EnumSet;"
+            "Ljava/util/ArrayList;"
+            | "Ljava/util/LinkedList;"
+            | "Ljava/util/Vector;"
+            | "Ljava/util/Stack;"
+            | "Ljava/util/HashSet;"
+            | "Ljava/util/EnumSet;"
             | "Ljava/util/LinkedHashSet;"
-            | "Ljava/util/TreeSet;" | "Ljava/util/ArrayDeque;" | "Ljava/util/BitSet;"
-            | "Ljava/util/PriorityQueue;" | "Ljava/util/AbstractCollection;"
-            | "Ljava/util/AbstractList;" | "Ljava/util/AbstractSet;"
-            | "Ljava/util/AbstractQueue;" | "Ljava/util/AbstractSequentialList;"
-            | "Ljava/util/Arrays$ArrayList;" | "Ljava/util/Collections$EmptyList;"
-            | "Ljava/util/Collections$EmptySet;" | "Ljava/util/Collections$SingletonList;"
+            | "Ljava/util/TreeSet;"
+            | "Ljava/util/ArrayDeque;"
+            | "Ljava/util/BitSet;"
+            | "Ljava/util/PriorityQueue;"
+            | "Ljava/util/AbstractCollection;"
+            | "Ljava/util/AbstractList;"
+            | "Ljava/util/AbstractSet;"
+            | "Ljava/util/AbstractQueue;"
+            | "Ljava/util/AbstractSequentialList;"
+            | "Ljava/util/Arrays$ArrayList;"
+            | "Ljava/util/Collections$EmptyList;"
+            | "Ljava/util/Collections$EmptySet;"
+            | "Ljava/util/Collections$SingletonList;"
             | "Ljava/util/Collections$SingletonSet;"
             | "Ljava/util/concurrent/CopyOnWriteArrayList;"
             | "Ljava/util/concurrent/CopyOnWriteArraySet;"
@@ -1806,36 +1814,65 @@ impl Vm {
             | "Ljava/util/concurrent/LinkedBlockingQueue;"
             | "Ljava/util/concurrent/LinkedBlockingDeque;"
             | "Ljava/util/concurrent/ArrayBlockingQueue;"
-            | "Ljava/util/concurrent/PriorityBlockingQueue;" | "Landroid/util/ArraySet;" => {
-                HostState::List(Vec::new())
-            }
-            "Ljava/util/HashMap;" | "Ljava/util/LinkedHashMap;" | "Ljava/util/Hashtable;"
-            | "Ljava/util/TreeMap;" | "Ljava/util/WeakHashMap;" | "Ljava/util/IdentityHashMap;"
-            | "Ljava/util/EnumMap;" | "Ljava/util/Properties;" | "Ljava/util/AbstractMap;"
-            | "Ljava/util/Collections$EmptyMap;" | "Ljava/util/Collections$SingletonMap;"
+            | "Ljava/util/concurrent/PriorityBlockingQueue;"
+            | "Landroid/util/ArraySet;" => HostState::List(Vec::new()),
+            "Ljava/util/HashMap;"
+            | "Ljava/util/LinkedHashMap;"
+            | "Ljava/util/Hashtable;"
+            | "Ljava/util/TreeMap;"
+            | "Ljava/util/WeakHashMap;"
+            | "Ljava/util/IdentityHashMap;"
+            | "Ljava/util/EnumMap;"
+            | "Ljava/util/Properties;"
+            | "Ljava/util/AbstractMap;"
+            | "Ljava/util/Collections$EmptyMap;"
+            | "Ljava/util/Collections$SingletonMap;"
             | "Ljava/util/concurrent/ConcurrentHashMap;"
-            | "Ljava/util/concurrent/ConcurrentSkipListMap;" | "Landroid/util/ArrayMap;"
-            | "Landroid/util/SparseArray;" | "Landroid/util/SparseIntArray;"
-            | "Landroid/util/SparseBooleanArray;" | "Landroid/util/LongSparseArray;"
-            | "Landroid/util/LruCache;" | "Landroid/os/Bundle;" | "Landroid/os/BaseBundle;"
-            | "Landroid/os/PersistableBundle;" | "Landroid/content/Intent;" => {
-                HostState::Map(Vec::new())
-            }
-            "Ljava/util/Calendar;" | "Ljava/util/GregorianCalendar;" | "Ljava/util/Date;"
-            | "Ljava/time/Instant;" | "Ljava/sql/Date;" | "Ljava/sql/Timestamp;"
+            | "Ljava/util/concurrent/ConcurrentSkipListMap;"
+            | "Landroid/util/ArrayMap;"
+            | "Landroid/util/SparseArray;"
+            | "Landroid/util/SparseIntArray;"
+            | "Landroid/util/SparseBooleanArray;"
+            | "Landroid/util/LongSparseArray;"
+            | "Landroid/util/LruCache;"
+            | "Landroid/os/Bundle;"
+            | "Landroid/os/BaseBundle;"
+            | "Landroid/os/PersistableBundle;"
+            | "Landroid/content/Intent;" => HostState::Map(Vec::new()),
+            "Ljava/util/Calendar;"
+            | "Ljava/util/GregorianCalendar;"
+            | "Ljava/util/Date;"
+            | "Ljava/time/Instant;"
+            | "Ljava/sql/Date;"
+            | "Ljava/sql/Timestamp;"
             | "Ljava/sql/Time;" => HostState::Millis(now_ms),
-            "Ljava/util/Random;" | "Ljava/security/SecureRandom;"
-            | "Ljava/util/concurrent/ThreadLocalRandom;" | "Ljava/util/SplittableRandom;" => {
+            "Ljava/util/Random;"
+            | "Ljava/security/SecureRandom;"
+            | "Ljava/util/concurrent/ThreadLocalRandom;"
+            | "Ljava/util/SplittableRandom;" => {
                 HostState::Slot(V::I64(0x9E3779B97F4A7C15_u64 as i64))
             }
-            "Ljava/lang/Integer;" | "Ljava/lang/Long;" | "Ljava/lang/Short;"
-            | "Ljava/lang/Byte;" | "Ljava/lang/Float;" | "Ljava/lang/Double;"
-            | "Ljava/lang/Boolean;" | "Ljava/lang/Character;" | "Ljava/lang/Void;"
-            | "Ljava/lang/Thread;" | "Ljava/lang/ThreadLocal;"
-            | "Ljava/lang/InheritableThreadLocal;" | "Ljava/lang/ref/WeakReference;"
-            | "Ljava/lang/ref/SoftReference;" | "Ljava/lang/ref/PhantomReference;"
-            | "Ljava/util/Optional;" | "Ljava/util/OptionalInt;" | "Ljava/util/OptionalLong;"
-            | "Ljava/util/OptionalDouble;" | "Landroid/util/Pair;" | "Landroid/util/MutableInt;"
+            "Ljava/lang/Integer;"
+            | "Ljava/lang/Long;"
+            | "Ljava/lang/Short;"
+            | "Ljava/lang/Byte;"
+            | "Ljava/lang/Float;"
+            | "Ljava/lang/Double;"
+            | "Ljava/lang/Boolean;"
+            | "Ljava/lang/Character;"
+            | "Ljava/lang/Void;"
+            | "Ljava/lang/Thread;"
+            | "Ljava/lang/ThreadLocal;"
+            | "Ljava/lang/InheritableThreadLocal;"
+            | "Ljava/lang/ref/WeakReference;"
+            | "Ljava/lang/ref/SoftReference;"
+            | "Ljava/lang/ref/PhantomReference;"
+            | "Ljava/util/Optional;"
+            | "Ljava/util/OptionalInt;"
+            | "Ljava/util/OptionalLong;"
+            | "Ljava/util/OptionalDouble;"
+            | "Landroid/util/Pair;"
+            | "Landroid/util/MutableInt;"
             | "Ljava/util/concurrent/atomic/AtomicReference;"
             | "Ljava/util/concurrent/atomic/AtomicInteger;"
             | "Ljava/util/concurrent/atomic/AtomicLong;"
@@ -1845,17 +1882,20 @@ impl Vm {
             | "Ljava/util/concurrent/atomic/AtomicReferenceFieldUpdater;"
             | "Ljava/util/concurrent/atomic/AtomicIntegerFieldUpdater;"
             | "Ljava/util/concurrent/atomic/AtomicLongFieldUpdater;"
-            | "Ljava/util/concurrent/CountDownLatch;" | "Ljava/util/concurrent/Semaphore;"
+            | "Ljava/util/concurrent/CountDownLatch;"
+            | "Ljava/util/concurrent/Semaphore;"
             | "Landroid/os/Message;" => HostState::Slot(V::I32(0)),
             "Ljava/io/File;" => HostState::Path(String::new()),
             "Lorg/json/JSONObject;" => HostState::Map(Vec::new()),
             "Lorg/json/JSONArray;" => HostState::List(Vec::new()),
-            "Ljava/util/regex/Pattern;" | "Ljava/util/regex/Matcher;"
-            | "Ljava/text/SimpleDateFormat;" | "Ljava/text/DateFormat;"
-            | "Ljava/text/DecimalFormat;" | "Ljava/text/NumberFormat;"
-            | "Ljava/text/MessageFormat;" | "Ljava/time/format/DateTimeFormatter;" => {
-                HostState::Regex(String::new())
-            }
+            "Ljava/util/regex/Pattern;"
+            | "Ljava/util/regex/Matcher;"
+            | "Ljava/text/SimpleDateFormat;"
+            | "Ljava/text/DateFormat;"
+            | "Ljava/text/DecimalFormat;"
+            | "Ljava/text/NumberFormat;"
+            | "Ljava/text/MessageFormat;"
+            | "Ljava/time/format/DateTimeFormatter;" => HostState::Regex(String::new()),
             _ => HostState::Empty,
         }
     }
@@ -1868,9 +1908,7 @@ impl Vm {
         let fd = d.field(gl(f)).ok()?;
         let owner = d.type_descriptor(fd.class_idx as u32).ok()?;
         let name = d.string(fd.name_idx).ok()?;
-        let fty = d
-            .type_descriptor(fd.type_idx as u32)
-            .unwrap_or_default();
+        let fty = d.type_descriptor(fd.type_idx as u32).unwrap_or_default();
         jdk::sfield(self, &owner, &name, &fty)
     }
 
@@ -1937,9 +1975,7 @@ impl Vm {
                     return true;
                 }
                 // Dex-class element → walk its hierarchy for the sup.
-                if let (Some(a), Some(b)) =
-                    (self.type_index_of(sub), self.type_index_of(sup))
-                {
+                if let (Some(a), Some(b)) = (self.type_index_of(sub), self.type_index_of(sup)) {
                     if self.assignable(a, b) {
                         return true;
                     }
@@ -1988,9 +2024,7 @@ impl Vm {
                     || sup == "Ljava/lang/Comparable;"
                     || sup == "Ljava/io/Serializable;"
             }
-            Some(Obj::Class { .. }) => {
-                sup == "Ljava/lang/Class;" || sup == "Ljava/lang/Object;"
-            }
+            Some(Obj::Class { .. }) => sup == "Ljava/lang/Class;" || sup == "Ljava/lang/Object;",
             Some(Obj::Array { elem, .. }) => {
                 sup == "Ljava/lang/Object;"
                     || sup == "Ljava/lang/Cloneable;"
@@ -2127,10 +2161,11 @@ impl Vm {
             let Some(d) = self.dex_of(cg) else { break };
             if let Ok(cd) = d.class_data(def) {
                 for m in &cd.virtual_methods {
-                    let Ok(om) = d.method(m.method_idx) else { continue };
+                    let Ok(om) = d.method(m.method_idx) else {
+                        continue;
+                    };
                     let oname = d.string(om.name_idx).unwrap_or_default();
-                    if oname == name
-                        && proto_sig(d, om.proto_idx as u32).unwrap_or_default() == sig
+                    if oname == name && proto_sig(d, om.proto_idx as u32).unwrap_or_default() == sig
                     {
                         return Ok(Loc {
                             class_idx: cg,
@@ -2235,11 +2270,7 @@ impl Vm {
     fn call_builtin(&mut self, midx: GIdx, args: &[V], has_receiver: bool) -> Rt<Option<V>> {
         let args = self.compact_args(midx, args, has_receiver);
         let args = args.as_slice();
-        let host = self
-            .hosts
-            .get(&midx)
-            .cloned()
-            .or(self.host_named(midx)?);
+        let host = self.hosts.get(&midx).cloned().or(self.host_named(midx)?);
         if let Some(f) = host {
             let Ok(mut g) = f.try_borrow_mut() else {
                 return vm("dexrt.host.reentrant");
@@ -2373,24 +2404,19 @@ impl Vm {
     /// Invoke `midx` per `kind`; `args` includes the receiver for non-static.
     fn invoke(&mut self, midx: GIdx, args: Vec<V>, kind: InvokeKind) -> Rt<Option<V>> {
         let loc = match kind {
-            InvokeKind::Static | InvokeKind::Direct => {
-                match self.resolve_defined(midx) {
-                    Ok(l) => l,
-                    Err(_) => {
-                        return self.call_builtin(midx, &args, matches!(kind, InvokeKind::Direct));
-                    }
+            InvokeKind::Static | InvokeKind::Direct => match self.resolve_defined(midx) {
+                Ok(l) => l,
+                Err(_) => {
+                    return self.call_builtin(midx, &args, matches!(kind, InvokeKind::Direct));
                 }
-            }
+            },
             InvokeKind::Virtual | InvokeKind::Interface => {
                 let recv = match args.first() {
                     Some(&V::Ref(h)) if h != 0 => h,
                     _ => {
                         return Err(self.throw_builtin(
                             "Ljava/lang/NullPointerException;",
-                            &format!(
-                                "null receiver calling {}",
-                                self.describe_method(midx)
-                            ),
+                            &format!("null receiver calling {}", self.describe_method(midx)),
                         ))
                     }
                 };
@@ -2447,8 +2473,7 @@ impl Vm {
                         .map_err(E::Vm)?,
                 )
             };
-            let args =
-                self.compact_args(loc.midx, &args, !matches!(kind, InvokeKind::Static));
+            let args = self.compact_args(loc.midx, &args, !matches!(kind, InvokeKind::Static));
             if let Some(r) = jdk::call(self, &class, &name, &sig, &args)? {
                 return Ok(r);
             }
@@ -2523,10 +2548,7 @@ impl Vm {
     /// Execute one frame to return or throw.
     fn exec(&mut self, loc: Loc, args: Vec<V>) -> Rt<Option<V>> {
         if self.depth >= 512 {
-            return Err(self.throw_builtin(
-                "Ljava/lang/StackOverflowError;",
-                "call depth exceeded",
-            ));
+            return Err(self.throw_builtin("Ljava/lang/StackOverflowError;", "call depth exceeded"));
         }
         self.depth += 1;
         self.stack.push(loc.midx);
@@ -2693,7 +2715,9 @@ enum InvokeKind {
     Virtual,
     Interface,
     /// Dispatch begins at the caller's superclass.
-    Super { caller_class: GIdx },
+    Super {
+        caller_class: GIdx,
+    },
 }
 
 impl Vm {
@@ -2804,12 +2828,7 @@ impl Vm {
                     .result
                     .take()
                     .ok_or_else(|| E::Vm(err("dexrt.result.missing")))?
-                    .ok_or_else(|| {
-                        E::Vm(err(&format!(
-                            "dexrt.result.void {}",
-                            fr.last_call
-                        )))
-                    })?;
+                    .ok_or_else(|| E::Vm(err(&format!("dexrt.result.void {}", fr.last_call))))?;
                 set!(regs[0], v);
             }
             0x0d => {
@@ -2828,9 +2847,7 @@ impl Vm {
             0x16..=0x18 => set!(regs[0], V::I64(ins.lit.unwrap_or(0))),
             0x19 => set!(regs[0], V::I64(ins.lit.unwrap_or(0) << 48)),
             0x1a | 0x1b => {
-                let s = self.dexes[di]
-                    .string(ins.idx.unwrap_or(0))
-                    .map_err(E::Vm)?;
+                let s = self.dexes[di].string(ins.idx.unwrap_or(0)).map_err(E::Vm)?;
                 let h = self.heap.intern_str(&s);
                 set!(regs[0], V::Ref(h));
             }
@@ -2918,13 +2935,11 @@ impl Vm {
             0x23 => {
                 let len = Self::i32v(r(1)?)?;
                 if len < 0 {
-                    return Err(self.throw_builtin(
-                        "Ljava/lang/NegativeArraySizeException;",
-                        "new-array",
-                    ));
+                    return Err(
+                        self.throw_builtin("Ljava/lang/NegativeArraySizeException;", "new-array")
+                    );
                 }
-                let desc = self
-                    .dexes[di]
+                let desc = self.dexes[di]
                     .type_descriptor(ins.idx.unwrap_or(0))
                     .map_err(E::Vm)?;
                 let elem = desc.trim_start_matches('[').to_string();
@@ -2937,8 +2952,7 @@ impl Vm {
             0x24 | 0x25 => {
                 // filled-new-array {args}, type@idx — `/range` carries
                 // (count, first_reg), the 35c form lists registers.
-                let desc = self
-                    .dexes[di]
+                let desc = self.dexes[di]
                     .type_descriptor(ins.idx.unwrap_or(0))
                     .map_err(E::Vm)?;
                 let elem = desc.trim_start_matches('[').to_string();
@@ -2966,10 +2980,9 @@ impl Vm {
             0x27 => {
                 let h = Self::refv(r(0)?)?;
                 if h == 0 {
-                    return Err(self.throw_builtin(
-                        "Ljava/lang/NullPointerException;",
-                        "throw null",
-                    ));
+                    return Err(
+                        self.throw_builtin("Ljava/lang/NullPointerException;", "throw null")
+                    );
                 }
                 let site = self.describe_method(fr.loc.midx);
                 self.throw_sites.insert(h, site);
@@ -2987,8 +3000,7 @@ impl Vm {
                 let tgt = self.switch_target(&fr.table, toff, v, op == 0x2b)?;
                 // Payload targets are relative to the switch insn's offset.
                 return Ok(Out::Next(
-                    tgt.map(|t| (pc as i64 + t as i64) as usize)
-                        .unwrap_or(next),
+                    tgt.map(|t| (pc as i64 + t as i64) as usize).unwrap_or(next),
                 ));
             }
             0x2d..=0x30 => {
@@ -2999,7 +3011,11 @@ impl Vm {
                 };
                 let less_bias = op == 0x2d || op == 0x2f; // cmpl → NaN is -1
                 let c = if a.is_nan() || b.is_nan() {
-                    if less_bias { -1 } else { 1 }
+                    if less_bias {
+                        -1
+                    } else {
+                        1
+                    }
                 } else if a < b {
                     -1
                 } else if a > b {
@@ -3117,9 +3133,11 @@ impl Vm {
                         return vm("dexrt.type");
                     }
                 };
-                if self.trace_field.as_deref().is_some_and(|t| {
-                    self.describe_field(gi(ins.idx.unwrap_or(0))).contains(t)
-                }) {
+                if self
+                    .trace_field
+                    .as_deref()
+                    .is_some_and(|t| self.describe_field(gi(ins.idx.unwrap_or(0))).contains(t))
+                {
                     eprintln!(
                         "[ftrace] iget {} obj={} -> {:?} in {}",
                         self.describe_field(gi(ins.idx.unwrap_or(0))),
@@ -3150,9 +3168,11 @@ impl Vm {
                     return Err(self.throw_builtin("Ljava/lang/NullPointerException;", &d));
                 }
                 let f = self.canon_field(gi(ins.idx.unwrap_or(0)));
-                if self.trace_field.as_deref().is_some_and(|t| {
-                    self.describe_field(gi(ins.idx.unwrap_or(0))).contains(t)
-                }) {
+                if self
+                    .trace_field
+                    .as_deref()
+                    .is_some_and(|t| self.describe_field(gi(ins.idx.unwrap_or(0))).contains(t))
+                {
                     eprintln!(
                         "[ftrace] iput {} obj={} <- {:?} in {}",
                         self.describe_field(gi(ins.idx.unwrap_or(0))),
@@ -3172,12 +3192,8 @@ impl Vm {
             0x60..=0x66 => {
                 let fl = ins.idx.unwrap_or(0);
                 let f = self.canon_field(gi(fl));
-                let owner = self.canon(gi(
-                    self.dexes[di]
-                        .field(fl)
-                        .map_err(E::Vm)?
-                        .class_idx as u32,
-                ));
+                let owner =
+                    self.canon(gi(self.dexes[di].field(fl).map_err(E::Vm)?.class_idx as u32));
                 self.ensure_init(owner)?;
                 let stored = self
                     .classes
@@ -3199,11 +3215,7 @@ impl Vm {
                         // Cache reference constants — enum singletons and
                         // Charset/Locale objects rely on `==` identity.
                         if matches!(v, V::Ref(h) if h != 0) {
-                            self.classes
-                                .entry(owner)
-                                .or_default()
-                                .statics
-                                .insert(f, v);
+                            self.classes.entry(owner).or_default().statics.insert(f, v);
                         }
                         v
                     }
@@ -3213,15 +3225,9 @@ impl Vm {
                         // that's where every `R.*` constant lives.
                         let v = self
                             .encoded_static(owner, f)
-                            .unwrap_or_else(|| {
-                                self.field_default(f).unwrap_or(V::I32(0))
-                            });
+                            .unwrap_or_else(|| self.field_default(f).unwrap_or(V::I32(0)));
                         if matches!(v, V::Ref(h) if h != 0) {
-                            self.classes
-                                .entry(owner)
-                                .or_default()
-                                .statics
-                                .insert(f, v);
+                            self.classes.entry(owner).or_default().statics.insert(f, v);
                         }
                         v
                     }
@@ -3231,12 +3237,8 @@ impl Vm {
             0x67..=0x6d => {
                 let fl = ins.idx.unwrap_or(0);
                 let f = self.canon_field(gi(fl));
-                let owner = self.canon(gi(
-                    self.dexes[di]
-                        .field(fl)
-                        .map_err(E::Vm)?
-                        .class_idx as u32,
-                ));
+                let owner =
+                    self.canon(gi(self.dexes[di].field(fl).map_err(E::Vm)?.class_idx as u32));
                 self.ensure_init(owner)?;
                 self.classes
                     .entry(owner)
@@ -3390,12 +3392,13 @@ impl Vm {
         let local_idx = if gd(field) == gd(cg) {
             gl(field)
         } else {
-            let (name, ty) = self
-                .dex_of(field)
-                .and_then(|d| {
-                    let f = d.field(gl(field)).ok()?;
-                    Some((d.string(f.name_idx).ok()?, d.type_descriptor(f.type_idx as u32).ok()?))
-                })?;
+            let (name, ty) = self.dex_of(field).and_then(|d| {
+                let f = d.field(gl(field)).ok()?;
+                Some((
+                    d.string(f.name_idx).ok()?,
+                    d.type_descriptor(f.type_idx as u32).ok()?,
+                ))
+            })?;
             let cd = self.dex_of(cg)?.class_data(def).ok()?;
             let mut found = None;
             for f in &cd.static_fields {
@@ -3461,10 +3464,9 @@ impl Vm {
             Some(Obj::Array { data, .. }) => {
                 let i = i as usize;
                 if i >= data.len() {
-                    return Err(self.throw_builtin(
-                        "Ljava/lang/ArrayIndexOutOfBoundsException;",
-                        "aget",
-                    ));
+                    return Err(
+                        self.throw_builtin("Ljava/lang/ArrayIndexOutOfBoundsException;", "aget")
+                    );
                 }
                 Ok(data[i])
             }
@@ -3478,10 +3480,9 @@ impl Vm {
             Some(Obj::Array { data, .. }) => {
                 if i < 0 || i as usize >= data.len() {
                     let d = format!("aput idx {i} len {}", data.len());
-                    return Err(self.throw_builtin(
-                        "Ljava/lang/ArrayIndexOutOfBoundsException;",
-                        &d,
-                    ));
+                    return Err(
+                        self.throw_builtin("Ljava/lang/ArrayIndexOutOfBoundsException;", &d)
+                    );
                 }
                 data[i as usize] = v;
                 Ok(())
@@ -3526,9 +3527,10 @@ impl Vm {
                 *data = vals;
                 Ok(())
             }
-            Some(Obj::Array { .. }) => {
-                Err(self.throw_builtin("Ljava/lang/ArrayIndexOutOfBoundsException;", "fill-array-data"))
-            }
+            Some(Obj::Array { .. }) => Err(self.throw_builtin(
+                "Ljava/lang/ArrayIndexOutOfBoundsException;",
+                "fill-array-data",
+            )),
             _ => vm("dexrt.type"),
         }
     }
@@ -3551,9 +3553,7 @@ impl Vm {
                 return Ok(None);
             }
             let i = 4 + k as usize * 2;
-            return Ok(Some(
-                (((raw[i + 1] as i32) << 16) | raw[i] as i32) as u32,
-            ));
+            return Ok(Some((((raw[i + 1] as i32) << 16) | raw[i] as i32) as u32));
         }
         if raw.len() < 2 || raw[0] != 0x0200 {
             return vm("dexrt.payload");
@@ -3564,9 +3564,7 @@ impl Vm {
             let key = ((raw[ki + 1] as i32) << 16) | raw[ki] as i32;
             if key == v {
                 let ti = 2 + size * 2 + k * 2;
-                return Ok(Some(
-                    (((raw[ti + 1] as i32) << 16) | raw[ti] as i32) as u32,
-                ));
+                return Ok(Some((((raw[ti + 1] as i32) << 16) | raw[ti] as i32) as u32));
             }
             if key > v {
                 break;
@@ -3583,19 +3581,17 @@ impl Vm {
             0xd2 | 0xda => b.wrapping_mul(lit),
             0xd3 | 0xdb => {
                 if lit == 0 {
-                    return Err(self.throw_builtin(
-                        "Ljava/lang/ArithmeticException;",
-                        "divide by zero",
-                    ));
+                    return Err(
+                        self.throw_builtin("Ljava/lang/ArithmeticException;", "divide by zero")
+                    );
                 }
                 b.wrapping_div(lit)
             }
             0xd4 | 0xdc => {
                 if lit == 0 {
-                    return Err(self.throw_builtin(
-                        "Ljava/lang/ArithmeticException;",
-                        "rem by zero",
-                    ));
+                    return Err(
+                        self.throw_builtin("Ljava/lang/ArithmeticException;", "rem by zero")
+                    );
                 }
                 b.wrapping_rem(lit)
             }
@@ -3619,20 +3615,18 @@ impl Vm {
             0x93 => {
                 let (x, y) = (Self::i32v(b)?, Self::i32v(c)?);
                 if y == 0 {
-                    return Err(self.throw_builtin(
-                        "Ljava/lang/ArithmeticException;",
-                        "divide by zero",
-                    ));
+                    return Err(
+                        self.throw_builtin("Ljava/lang/ArithmeticException;", "divide by zero")
+                    );
                 }
                 V::I32(x.wrapping_div(y))
             }
             0x94 => {
                 let (x, y) = (Self::i32v(b)?, Self::i32v(c)?);
                 if y == 0 {
-                    return Err(self.throw_builtin(
-                        "Ljava/lang/ArithmeticException;",
-                        "rem by zero",
-                    ));
+                    return Err(
+                        self.throw_builtin("Ljava/lang/ArithmeticException;", "rem by zero")
+                    );
                 }
                 V::I32(x.wrapping_rem(y))
             }
@@ -3641,9 +3635,9 @@ impl Vm {
             0x97 => V::I32(Self::i32v(b)? ^ Self::i32v(c)?),
             0x98 => V::I32(Self::i32v(b)?.wrapping_shl(Self::i32v(c)? as u32 & 0x1f)),
             0x99 => V::I32(Self::i32v(b)?.wrapping_shr(Self::i32v(c)? as u32 & 0x1f)),
-            0x9a => V::I32(
-                (Self::i32v(b)? as u32).wrapping_shr(Self::i32v(c)? as u32 & 0x1f) as i32,
-            ),
+            0x9a => {
+                V::I32((Self::i32v(b)? as u32).wrapping_shr(Self::i32v(c)? as u32 & 0x1f) as i32)
+            }
             // long
             0x9b => V::I64(Self::i64v(b)?.wrapping_add(Self::i64v(c)?)),
             0x9c => V::I64(Self::i64v(b)?.wrapping_sub(Self::i64v(c)?)),
@@ -3651,20 +3645,18 @@ impl Vm {
             0x9e => {
                 let (x, y) = (Self::i64v(b)?, Self::i64v(c)?);
                 if y == 0 {
-                    return Err(self.throw_builtin(
-                        "Ljava/lang/ArithmeticException;",
-                        "divide by zero",
-                    ));
+                    return Err(
+                        self.throw_builtin("Ljava/lang/ArithmeticException;", "divide by zero")
+                    );
                 }
                 V::I64(x.wrapping_div(y))
             }
             0x9f => {
                 let (x, y) = (Self::i64v(b)?, Self::i64v(c)?);
                 if y == 0 {
-                    return Err(self.throw_builtin(
-                        "Ljava/lang/ArithmeticException;",
-                        "rem by zero",
-                    ));
+                    return Err(
+                        self.throw_builtin("Ljava/lang/ArithmeticException;", "rem by zero")
+                    );
                 }
                 V::I64(x.wrapping_rem(y))
             }
@@ -3673,9 +3665,9 @@ impl Vm {
             0xa2 => V::I64(Self::i64v(b)? ^ Self::i64v(c)?),
             0xa3 => V::I64(Self::i64v(b)?.wrapping_shl(Self::i32v(c)? as u32 & 0x3f)),
             0xa4 => V::I64(Self::i64v(b)?.wrapping_shr(Self::i32v(c)? as u32 & 0x3f)),
-            0xa5 => V::I64(
-                (Self::i64v(b)? as u64).wrapping_shr(Self::i32v(c)? as u32 & 0x3f) as i64,
-            ),
+            0xa5 => {
+                V::I64((Self::i64v(b)? as u64).wrapping_shr(Self::i32v(c)? as u32 & 0x3f) as i64)
+            }
             // float / double
             0xa6 => V::F32(Self::f32v(b)? + Self::f32v(c)?),
             0xa7 => V::F32(Self::f32v(b)? - Self::f32v(c)?),
@@ -3692,13 +3684,11 @@ impl Vm {
     }
 }
 
-
 #[cfg(test)]
 mod tests {
     use super::*;
 
     use ovelo_dex::testdex::*;
-
 
     fn vm(bytes: Vec<u8>) -> Vm {
         Vm::new(DexFile::open(bytes).unwrap()).unwrap()
@@ -3792,14 +3782,18 @@ mod tests {
     #[test]
     fn div_by_zero_caught_by_handler() {
         // try units 1..3: div-int v0,v0,v0 -> handler @4 returns -1.
-        let mut m = dir("f", 0, vec![
-            0x0012, // const/4 v0,0
-            0x0093, 0x0000, // div-int v0,v0,v0
-            0x000f, // return v0
-            0x020d, // move-exception v2
-            0xf112, // const/4 v1,-1
-            0x010f, // return v1
-        ]);
+        let mut m = dir(
+            "f",
+            0,
+            vec![
+                0x0012, // const/4 v0,0
+                0x0093, 0x0000, // div-int v0,v0,v0
+                0x000f, // return v0
+                0x020d, // move-exception v2
+                0xf112, // const/4 v1,-1
+                0x010f, // return v1
+            ],
+        );
         m.tries = vec![(1, 2, vec![], Some(4))];
         let (b, _ix) = build(&[cls("LT;", vec![m])]);
         let mut v = vm(b);
@@ -3812,13 +3806,17 @@ mod tests {
             class: "LT;",
             // forces "I" into the type table
             sfields: &[("I", "unused")],
-            methods: vec![dir("f", 0, vec![
-                0x1112,             // const/4 v1,1
-                0x1023, 0x0000,     // new-array v0,v1,type@I (patched)
-                0x2212,             // const/4 v2,2
-                0x0044, 0x0200,     // aget v0,v0,v2
-                0x000f,
-            ])],
+            methods: vec![dir(
+                "f",
+                0,
+                vec![
+                    0x1112, // const/4 v1,1
+                    0x1023, 0x0000, // new-array v0,v1,type@I (patched)
+                    0x2212, // const/4 v2,2
+                    0x0044, 0x0200, // aget v0,v0,v2
+                    0x000f,
+                ],
+            )],
             ..cls("LT;", vec![])
         };
         let (mut b, ix) = build(&[c]);
@@ -3848,12 +3846,16 @@ mod tests {
         };
         let entry = cls(
             "LT;",
-            vec![dir("main", 0, vec![
-                0x0022, 0x0000,           // new-instance v0,LC (patched)
-                0x106e, 0x0000, 0x0000,   // invoke-virtual {v0},LB.who (patched)
-                0x010a,                   // move-result v1
-                0x010f,                   // return v1
-            ])],
+            vec![dir(
+                "main",
+                0,
+                vec![
+                    0x0022, 0x0000, // new-instance v0,LC (patched)
+                    0x106e, 0x0000, 0x0000, // invoke-virtual {v0},LB.who (patched)
+                    0x010a, // move-result v1
+                    0x010f, // return v1
+                ],
+            )],
         );
         let (mut b, ix) = build(&[base, child, entry]);
         let tc = ix.t("LC;");
@@ -3887,19 +3889,23 @@ mod tests {
                     ins: 0,
                     outs: 0,
                     insns: vec![
-                        0x1112,         // const/4 v1,1
+                        0x1112, // const/4 v1,1
                         0x0169, 0x0000, // sput v1,LT.x (patched)
-                        0x000e,         // return-void
+                        0x000e, // return-void
                     ],
                     tries: vec![],
                     lits: &[],
                 },
-                dir("main", 0, vec![
-                    0x0060, 0x0000, // sget v0,LT.x
-                    0x0160, 0x0000, // sget v1,LT.x
-                    0x0090, 0x0100, // add-int v0,v0,v1
-                    0x000f,
-                ]),
+                dir(
+                    "main",
+                    0,
+                    vec![
+                        0x0060, 0x0000, // sget v0,LT.x
+                        0x0160, 0x0000, // sget v1,LT.x
+                        0x0090, 0x0100, // add-int v0,v0,v1
+                        0x000f,
+                    ],
+                ),
             ],
             ..cls("LT;", vec![])
         };
@@ -3914,8 +3920,6 @@ mod tests {
         let mut v = vm(b);
         assert_eq!(v.run("LT;", "main", &[]).unwrap(), Some(V::I32(2)));
     }
-
-
 
     #[test]
     fn const_string_and_builtin_length() {
@@ -4007,18 +4011,22 @@ mod tests {
         //       (case0 abs 4 -> +3, case1 abs 6 -> +5)
         let c = cls(
             "LT;",
-            vec![dir("f", 0, vec![
-                0x1012,                 // const/4 v0,1
-                0x002b, 0x0008, 0x0000, // packed-switch v0,+8 -> @9
-                0xa112,                 // const/4 v1,10
-                0x010f,                 // return v1
-                0x0113, 0x0014,         // const/16 v1,20
-                0x010f,                 // return v1
-                0x0100, 0x0002,         // payload: packed, size 2
-                0x0000, 0x0000,         // first_key = 0
-                0x0003, 0x0000,         // target[0] = +3 -> @4
-                0x0005, 0x0000,         // target[1] = +5 -> @6
-            ])],
+            vec![dir(
+                "f",
+                0,
+                vec![
+                    0x1012, // const/4 v0,1
+                    0x002b, 0x0008, 0x0000, // packed-switch v0,+8 -> @9
+                    0xa112, // const/4 v1,10
+                    0x010f, // return v1
+                    0x0113, 0x0014, // const/16 v1,20
+                    0x010f, // return v1
+                    0x0100, 0x0002, // payload: packed, size 2
+                    0x0000, 0x0000, // first_key = 0
+                    0x0003, 0x0000, // target[0] = +3 -> @4
+                    0x0005, 0x0000, // target[1] = +5 -> @6
+                ],
+            )],
         );
         let (b, _ix) = build(&[c]);
         let mut v = vm(b);
@@ -4174,14 +4182,18 @@ mod tests {
         // try/catch (non-empty tries) is outside the compile whitelist:
         // enable_aot must leave it to the interpreter, which still runs
         // the handler.
-        let mut m = dir("f", 0, vec![
-            0x0012, // const/4 v0,0
-            0x0093, 0x0000, // div-int v0,v0,v0
-            0x000f, // return v0
-            0x020d, // move-exception v2
-            0xf112, // const/4 v1,-1
-            0x010f, // return v1
-        ]);
+        let mut m = dir(
+            "f",
+            0,
+            vec![
+                0x0012, // const/4 v0,0
+                0x0093, 0x0000, // div-int v0,v0,v0
+                0x000f, // return v0
+                0x020d, // move-exception v2
+                0xf112, // const/4 v1,-1
+                0x010f, // return v1
+            ],
+        );
         m.tries = vec![(1, 2, vec![], Some(4))];
         let (b, _ix) = build(&[cls("LT;", vec![m])]);
         let mut v = vm(b);

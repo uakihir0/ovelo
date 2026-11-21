@@ -8,15 +8,30 @@ fn main() {
     let bytes = std::fs::read(&apk).unwrap();
     let (_cd, ents) = parse_central_directory(&bytes, &Default::default()).unwrap();
     for e in &ents {
-        if !e.name.starts_with("classes") || !e.name.ends_with(".dex") { continue; }
+        if !e.name.starts_with("classes") || !e.name.ends_with(".dex") {
+            continue;
+        }
         let buf = read_entry(&bytes, e).unwrap();
-        let dex = match DexFile::parse(buf) { Ok(d) => d, Err(_) => continue };
+        let dex = match DexFile::parse(buf) {
+            Ok(d) => d,
+            Err(_) => continue,
+        };
         for cd in dex.class_defs() {
             let owner = dex.type_descriptor(cd.class_idx).unwrap_or_default();
-            if !owner.contains(&owner_pat) { continue; }
-            let Ok(data) = dex.class_data(cd) else { continue };
-            for m in data.direct_methods.iter().chain(data.virtual_methods.iter()) {
-                let Ok(mm) = dex.method(m.method_idx) else { continue };
+            if !owner.contains(&owner_pat) {
+                continue;
+            }
+            let Ok(data) = dex.class_data(cd) else {
+                continue;
+            };
+            for m in data
+                .direct_methods
+                .iter()
+                .chain(data.virtual_methods.iter())
+            {
+                let Ok(mm) = dex.method(m.method_idx) else {
+                    continue;
+                };
                 let mn = dex.string(mm.name_idx).unwrap_or_default();
                 let hit = if pat == "*" {
                     true
@@ -25,10 +40,16 @@ fn main() {
                 } else {
                     mn.contains(&pat)
                 };
-                if !hit { continue; }
+                if !hit {
+                    continue;
+                }
                 println!("== {owner}.{mn} proto={}", m.method_idx);
-                let Ok(Some(code)) = dex.code_item(m.code_off) else { continue };
-                let Ok(insns) = decode_all(&code.insns) else { continue };
+                let Ok(Some(code)) = dex.code_item(m.code_off) else {
+                    continue;
+                };
+                let Ok(insns) = decode_all(&code.insns) else {
+                    continue;
+                };
                 for (i, ins) in insns.iter().enumerate() {
                     let mut line = format!(
                         "  {i:04x}@{:04x} {} regs={:?}",
@@ -44,11 +65,14 @@ fn main() {
                     }
                     if let Some(ix) = ins.idx {
                         let n = ins.name;
-                        if n.starts_with("iget") || n.starts_with("iput")
-                            || n.starts_with("sget") || n.starts_with("sput")
+                        if n.starts_with("iget")
+                            || n.starts_with("iput")
+                            || n.starts_with("sget")
+                            || n.starts_with("sput")
                         {
                             if let Ok(f) = dex.field(ix) {
-                                let fo = dex.type_descriptor(f.class_idx.into()).unwrap_or_default();
+                                let fo =
+                                    dex.type_descriptor(f.class_idx.into()).unwrap_or_default();
                                 let fn_ = dex.string(f.name_idx).unwrap_or_default();
                                 let ft = dex.type_descriptor(f.type_idx.into()).unwrap_or_default();
                                 line += &format!(" -> field {fo}.{fn_}:{ft}");

@@ -315,10 +315,7 @@ mod tests {
         let mut s = Surface::new(2, 2).unwrap();
         s.clear(Color::srgb(255, 255, 255));
         // 50% black over white => ~128 straight
-        s.fill_rect(
-            Rect::new(0, 0, 2, 2),
-            Color::from_srgb8(0, 0, 0, 128),
-        );
+        s.fill_rect(Rect::new(0, 0, 2, 2), Color::from_srgb8(0, 0, 0, 128));
         let (r, _, _, a) = s.pixel(0, 0).straight();
         assert!((r as i32 - 128).abs() <= 1);
         assert_eq!(a, 255);

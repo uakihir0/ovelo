@@ -180,9 +180,7 @@ impl Heap {
         if h == 0 {
             return None;
         }
-        self.objs
-            .get_mut(h as usize - 1)
-            .and_then(|o| o.as_mut())
+        self.objs.get_mut(h as usize - 1).and_then(|o| o.as_mut())
     }
 
     /// Intern a string value; the same `V::Ref` comes back for equal text.

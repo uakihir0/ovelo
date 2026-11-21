@@ -13,19 +13,19 @@ pub(crate) fn call(
     sig: &str,
     args: &[V],
 ) -> Rt<Option<Option<V>>> {
-    Ok(if desc_is_a(class, DATE_DESC) || class.starts_with("Ljava/sql/") {
-        date_call(vm, name, args)?
-    } else if desc_is_a(class, "Ljava/util/GregorianCalendar;")
-        || desc_is_a(class, CAL_DESC)
-    {
-        cal_call(vm, name, sig, args)?
-    } else if desc_is_a(class, "Ljava/util/TimeZone;") {
-        timezone_call(vm, name, args)
-    } else if class.starts_with("Ljava/time/") {
-        jtime_call(vm, class, name, args)?
-    } else {
-        return Ok(None);
-    })
+    Ok(
+        if desc_is_a(class, DATE_DESC) || class.starts_with("Ljava/sql/") {
+            date_call(vm, name, args)?
+        } else if desc_is_a(class, "Ljava/util/GregorianCalendar;") || desc_is_a(class, CAL_DESC) {
+            cal_call(vm, name, sig, args)?
+        } else if desc_is_a(class, "Ljava/util/TimeZone;") {
+            timezone_call(vm, name, args)
+        } else if class.starts_with("Ljava/time/") {
+            jtime_call(vm, class, name, args)?
+        } else {
+            return Ok(None);
+        },
+    )
 }
 
 // ---------------------------------------------------------------------
@@ -131,8 +131,7 @@ fn date_call(vm: &mut Vm, name: &str, args: &[V]) -> Rt<Option<Option<V>>> {
             // Date() -> now; Date(long) -> millis; Date(y,m,d[,h,mi,s])
             // (deprecated) -> civil with 1900-based year.
             if let Some(V::Ref(h)) = args.first() {
-                let g =
-                    |i: usize| args.get(i).map(|v| i64v(*v)).unwrap_or(0);
+                let g = |i: usize| args.get(i).map(|v| i64v(*v)).unwrap_or(0);
                 let v = match args.len() {
                     0 | 1 => now_ms(),
                     // Date(String) parses; Date(long) and Date(Date)
@@ -144,8 +143,7 @@ fn date_call(vm: &mut Vm, name: &str, args: &[V]) -> Rt<Option<Option<V>>> {
                         _ => g(1),
                     },
                     _ => {
-                        days_from_civil(g(1) + 1900, g(2) + 1, g(3))
-                            * 86_400_000
+                        days_from_civil(g(1) + 1900, g(2) + 1, g(3)) * 86_400_000
                             + g(4) * 3_600_000
                             + g(5) * 60_000
                             + g(6) * 1000
@@ -165,11 +163,7 @@ fn date_call(vm: &mut Vm, name: &str, args: &[V]) -> Rt<Option<Option<V>>> {
         "before" => Some(Some(V::I32((ms < millis_of(vm, args[1])) as i32))),
         "after" => Some(Some(V::I32((ms > millis_of(vm, args[1])) as i32))),
         "compareTo" => Some(Some(V::I32(ms.cmp(&millis_of(vm, args[1])) as i32))),
-        "toInstant" => Some(Some(host(
-            vm,
-            "Ljava/time/Instant;",
-            HostState::Millis(ms),
-        ))),
+        "toInstant" => Some(Some(host(vm, "Ljava/time/Instant;", HostState::Millis(ms)))),
         "from" => Some(Some(host(
             vm,
             DATE_DESC,
@@ -223,9 +217,9 @@ fn cal_call(vm: &mut Vm, name: &str, sig: &str, args: &[V]) -> Rt<Option<Option<
                     "Ljava/util/GregorianCalendar;",
                     HostState::Millis(now_ms()),
                 ))),
-                "getAvailableLocales" | "getAvailableCalendarTypes" => Some(Some(arr(
-                    vm, "Ljava/util/Locale;", vec![],
-                ))),
+                "getAvailableLocales" | "getAvailableCalendarTypes" => {
+                    Some(Some(arr(vm, "Ljava/util/Locale;", vec![])))
+                }
                 _ => None,
             });
         }
@@ -238,8 +232,7 @@ fn cal_call(vm: &mut Vm, name: &str, sig: &str, args: &[V]) -> Rt<Option<Option<
             // The object-arg overloads must not land in the civil
             // branch — i64v(ref) is 0, which would pin the calendar at
             // year 0.
-            let g =
-                |i: usize| args.get(i).map(|v| i64v(*v)).unwrap_or(0);
+            let g = |i: usize| args.get(i).map(|v| i64v(*v)).unwrap_or(0);
             let numeric_args = args
                 .get(1)
                 .is_some_and(|v| matches!(v, V::I32(_) | V::I64(_)));
@@ -273,22 +266,22 @@ fn cal_call(vm: &mut Vm, name: &str, sig: &str, args: &[V]) -> Rt<Option<Option<
             let (y, mo, d, hh, mi, s, msec) = ms_fields(ms);
             let f = i32v(args[1]);
             Some(Some(V::I32(match f {
-                1 => y as i32,          // YEAR
-                2 => (mo - 1) as i32,   // MONTH
-                3 => 0,                 // WEEK_OF_YEAR (approx)
-                4 => 0,                 // WEEK_OF_MONTH
-                5 => d as i32,          // DATE / DAY_OF_MONTH
+                1 => y as i32,                                                          // YEAR
+                2 => (mo - 1) as i32,                                                   // MONTH
+                3 => 0,        // WEEK_OF_YEAR (approx)
+                4 => 0,        // WEEK_OF_MONTH
+                5 => d as i32, // DATE / DAY_OF_MONTH
                 6 => (ms.div_euclid(86_400_000) - days_from_civil(y, 1, 1) + 1) as i32, // DAY_OF_YEAR
                 7 => ((ms.div_euclid(86_400_000) + 4).rem_euclid(7) + 1) as i32, // DAY_OF_WEEK (Sun=1)
                 8 => ((d - 1) / 7 + 1) as i32, // DAY_OF_WEEK_IN_MONTH
-                9 => (hh >= 12) as i32, // AM_PM
-                10 => (hh % 12) as i32, // HOUR
-                11 => hh as i32,        // HOUR_OF_DAY
-                12 => mi as i32,        // MINUTE
-                13 => s as i32,         // SECOND
-                14 => msec as i32,      // MILLISECOND
-                15 => 0,                // ZONE_OFFSET
-                16 => 0,                // DST_OFFSET
+                9 => (hh >= 12) as i32,        // AM_PM
+                10 => (hh % 12) as i32,        // HOUR
+                11 => hh as i32,               // HOUR_OF_DAY
+                12 => mi as i32,               // MINUTE
+                13 => s as i32,                // SECOND
+                14 => msec as i32,             // MILLISECOND
+                15 => 0,                       // ZONE_OFFSET
+                16 => 0,                       // DST_OFFSET
                 _ => 0,
             })))
         }
@@ -327,14 +320,12 @@ fn cal_call(vm: &mut Vm, name: &str, sig: &str, args: &[V]) -> Rt<Option<Option<
                 set_millis(
                     vm,
                     h,
-                    days_from_civil(i64v(args[1]), i64v(args[2]) + 1, i64v(args[3]))
-                        * 86_400_000,
+                    days_from_civil(i64v(args[1]), i64v(args[2]) + 1, i64v(args[3])) * 86_400_000,
                 );
             } else {
                 // set(y,m,d,h,mi[,s]) — read through get() so a short
                 // overload can never index past the arg list.
-                let g =
-                    |i: usize| args.get(i).map(|v| i64v(*v)).unwrap_or(0);
+                let g = |i: usize| args.get(i).map(|v| i64v(*v)).unwrap_or(0);
                 set_millis(
                     vm,
                     h,
@@ -395,8 +386,11 @@ fn cal_call(vm: &mut Vm, name: &str, sig: &str, args: &[V]) -> Rt<Option<Option<
             "Ljava/util/TimeZone;",
             HostState::StrBuf("UTC".into()),
         ))),
-        "setTimeZone" | "setLenient" | "setFirstDayOfWeek"
-        | "setMinimalDaysInFirstWeek" | "setWeekDate" => Some(None),
+        "setTimeZone"
+        | "setLenient"
+        | "setFirstDayOfWeek"
+        | "setMinimalDaysInFirstWeek"
+        | "setWeekDate" => Some(None),
         "isLenient" => Some(Some(V::I32(1))),
         "getFirstDayOfWeek" => Some(Some(V::I32(1))),
         "getMinimalDaysInFirstWeek" => Some(Some(V::I32(1))),
@@ -419,11 +413,7 @@ fn cal_call(vm: &mut Vm, name: &str, sig: &str, args: &[V]) -> Rt<Option<Option<
             })))
         }
         "getDisplayName" | "getDisplayNames" => Some(Some(V::Ref(0))),
-        "toInstant" => Some(Some(host(
-            vm,
-            "Ljava/time/Instant;",
-            HostState::Millis(ms),
-        ))),
+        "toInstant" => Some(Some(host(vm, "Ljava/time/Instant;", HostState::Millis(ms)))),
         _ => None,
     })
 }
@@ -436,8 +426,14 @@ fn timezone_call(vm: &mut Vm, name: &str, args: &[V]) -> Option<Option<V>> {
             HostState::StrBuf("UTC".into()),
         ))),
         "getID" | "getDisplayName" | "toString" => {
-            let t = s(vm, match args[0] { V::Ref(h) => h, _ => 0 })
-                .unwrap_or_else(|| "UTC".into());
+            let t = s(
+                vm,
+                match args[0] {
+                    V::Ref(h) => h,
+                    _ => 0,
+                },
+            )
+            .unwrap_or_else(|| "UTC".into());
             Some(Some(jstr(vm, &t)))
         }
         "getOffset" | "getRawOffset" | "getDSTSavings" | "observeDaylightTime" => {
@@ -459,11 +455,7 @@ fn timezone_call(vm: &mut Vm, name: &str, args: &[V]) -> Option<Option<V>> {
 
 fn jtime_call(vm: &mut Vm, class: &str, name: &str, args: &[V]) -> Rt<Option<Option<V>>> {
     Ok(match (class, name) {
-        ("Ljava/time/Instant;", "now") => Some(Some(host(
-            vm,
-            class,
-            HostState::Millis(now_ms()),
-        ))),
+        ("Ljava/time/Instant;", "now") => Some(Some(host(vm, class, HostState::Millis(now_ms())))),
         ("Ljava/time/Instant;", "ofEpochMilli" | "ofEpochSecond") => {
             let ms = if name == "ofEpochMilli" {
                 i64v(args[0])
@@ -472,15 +464,15 @@ fn jtime_call(vm: &mut Vm, class: &str, name: &str, args: &[V]) -> Rt<Option<Opt
             };
             Some(Some(host(vm, class, HostState::Millis(ms))))
         }
-        ("Ljava/time/Instant;", "toEpochMilli") => {
-            Some(Some(V::I64(millis_of(vm, args[0]))))
-        }
+        ("Ljava/time/Instant;", "toEpochMilli") => Some(Some(V::I64(millis_of(vm, args[0])))),
         ("Ljava/time/Instant;", "getEpochSecond") => {
             Some(Some(V::I64(millis_of(vm, args[0]) / 1000)))
         }
         ("Ljava/time/Instant;", "getNano") => Some(Some(V::I32(0))),
-        ("Ljava/time/Duration;", "ofMillis" | "ofSeconds" | "ofNanos"
-        | "ofMinutes" | "ofHours" | "ofDays") => {
+        (
+            "Ljava/time/Duration;",
+            "ofMillis" | "ofSeconds" | "ofNanos" | "ofMinutes" | "ofHours" | "ofDays",
+        ) => {
             let f = match name {
                 "ofSeconds" => 1_000,
                 "ofMinutes" => 60_000,
@@ -488,15 +480,9 @@ fn jtime_call(vm: &mut Vm, class: &str, name: &str, args: &[V]) -> Rt<Option<Opt
                 "ofDays" => 86_400_000,
                 _ => 1,
             };
-            Some(Some(host(
-                vm,
-                class,
-                HostState::Millis(i64v(args[0]) * f),
-            )))
+            Some(Some(host(vm, class, HostState::Millis(i64v(args[0]) * f))))
         }
-        ("Ljava/time/Duration;", "toMillis") => {
-            Some(Some(V::I64(millis_of(vm, args[0]))))
-        }
+        ("Ljava/time/Duration;", "toMillis") => Some(Some(V::I64(millis_of(vm, args[0])))),
         ("Ljava/time/Duration;", "getSeconds" | "toSeconds") => {
             Some(Some(V::I64(millis_of(vm, args[0]) / 1000)))
         }

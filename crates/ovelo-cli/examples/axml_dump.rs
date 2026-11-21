@@ -1,5 +1,8 @@
 //! dump elements of one res/ xml file by path
-use ovelo_apk::{manifest::{parse_axml, Value}, zip::{parse_central_directory, read_entry, ZipLimits}};
+use ovelo_apk::{
+    manifest::{parse_axml, Value},
+    zip::{parse_central_directory, read_entry, ZipLimits},
+};
 fn main() {
     let apk = std::env::args().nth(1).unwrap();
     let path = std::env::args().nth(2).unwrap();

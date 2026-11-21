@@ -107,8 +107,7 @@ impl ApplicationHandler for HostWindow {
         let w = Rc::new(el.create_window(attrs).expect("window"));
         self.sb_ctx = Some(softbuffer::Context::new(w.clone()).expect("sb context"));
         self.sb_surf = Some(
-            softbuffer::Surface::new(self.sb_ctx.as_ref().unwrap(), w.clone())
-                .expect("sb surface"),
+            softbuffer::Surface::new(self.sb_ctx.as_ref().unwrap(), w.clone()).expect("sb surface"),
         );
         self.window = Some(w);
     }
@@ -155,11 +154,8 @@ impl ApplicationHandler for HostWindow {
         };
         let (w, h) = presented.frame.size;
         let surf = self.sb_surf.as_mut().unwrap();
-        surf.resize(
-            NonZeroU32::new(w).unwrap(),
-            NonZeroU32::new(h).unwrap(),
-        )
-        .expect("resize");
+        surf.resize(NonZeroU32::new(w).unwrap(), NonZeroU32::new(h).unwrap())
+            .expect("resize");
         let mut buf = surf.buffer_mut().expect("buffer");
         to_sb(&presented.frame.buffer, &mut buf);
         buf.present().expect("present");

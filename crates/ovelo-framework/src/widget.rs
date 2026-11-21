@@ -143,7 +143,10 @@ impl Drawable for ViewGroup {
     fn draw(&mut self, c: &mut Canvas) {
         let s = self.view.measured;
         if let Some(bg) = self.view.background {
-            c.draw_rect(Rect::new(self.view.left, self.view.top, s.w, s.h), Paint::color(bg));
+            c.draw_rect(
+                Rect::new(self.view.left, self.view.top, s.w, s.h),
+                Paint::color(bg),
+            );
         }
         // Children draw at their own laid-out origins (absolute coords).
         for ch in &mut self.children {
@@ -247,7 +250,10 @@ impl Drawable for TextView {
     fn draw(&mut self, c: &mut Canvas) {
         let s = self.view.measured;
         if let Some(bg) = self.view.background {
-            c.draw_rect(Rect::new(self.view.left, self.view.top, s.w, s.h), Paint::color(bg));
+            c.draw_rect(
+                Rect::new(self.view.left, self.view.top, s.w, s.h),
+                Paint::color(bg),
+            );
         }
         let t = ovelo_ui::layout(
             &self.text,

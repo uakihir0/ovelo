@@ -8,8 +8,7 @@
 use ovelo_error::{ErrorCategory, OveloError, Phase, Result};
 
 fn err(cause: &str, detail: impl std::fmt::Display) -> OveloError {
-    OveloError::new(ErrorCategory::ServiceMissing, Phase::Ui, cause)
-        .with_detail(detail.to_string())
+    OveloError::new(ErrorCategory::ServiceMissing, Phase::Ui, cause).with_detail(detail.to_string())
 }
 
 /// One font's metric/shaping interface, in output pixels.
@@ -39,12 +38,7 @@ pub trait GlyphSource {
     /// Shaped, positioned glyph run for `text` in direction `rtl`
     /// (ligatures, mark placement resolved by the shaper), or `None`
     /// when the font can't shape/rasterize.
-    fn shaped_glyphs(
-        &self,
-        _text: &str,
-        _rtl: bool,
-        _size_px: f32,
-    ) -> Option<Vec<ShapedGlyph>> {
+    fn shaped_glyphs(&self, _text: &str, _rtl: bool, _size_px: f32) -> Option<Vec<ShapedGlyph>> {
         None
     }
     /// Whether [`GlyphSource::shaped_glyphs`] can produce a run — lets
@@ -103,17 +97,18 @@ impl TtfFont {
 
     /// Parse face `index` of a font file or TrueType collection.
     pub fn from_bytes_at(bytes: &[u8], index: u32) -> Result<Self> {
-        let face = ttf_parser::Face::parse(bytes, index)
-            .map_err(|e| err("ui.font.parse", e))?;
+        let face = ttf_parser::Face::parse(bytes, index).map_err(|e| err("ui.font.parse", e))?;
         if face.is_variable() {
             // Variable fonts need instance pinning for deterministic layout;
             // reject until pinning is implemented.
-            return Err(err("ui.font.variable", face
-                .names()
-                .into_iter()
-                .find(|n| n.name_id == ttf_parser::name_id::FAMILY)
-                .and_then(|n| n.to_string())
-                .unwrap_or_default()));
+            return Err(err(
+                "ui.font.variable",
+                face.names()
+                    .into_iter()
+                    .find(|n| n.name_id == ttf_parser::name_id::FAMILY)
+                    .and_then(|n| n.to_string())
+                    .unwrap_or_default(),
+            ));
         }
         let name = face
             .names()
@@ -303,21 +298,22 @@ impl FontSet {
     pub fn load_dirs(&mut self, dirs: &[&str]) -> usize {
         let mut n = 0;
         for d in dirs {
-            let Ok(rd) = std::fs::read_dir(d) else { continue };
+            let Ok(rd) = std::fs::read_dir(d) else {
+                continue;
+            };
             for e in rd.flatten() {
                 let p = e.path();
-                let ok = p
-                    .extension()
-                    .and_then(|e| e.to_str())
-                    .is_some_and(|e| {
-                        e.eq_ignore_ascii_case("ttf")
-                            || e.eq_ignore_ascii_case("otf")
-                            || e.eq_ignore_ascii_case("ttc")
-                    });
+                let ok = p.extension().and_then(|e| e.to_str()).is_some_and(|e| {
+                    e.eq_ignore_ascii_case("ttf")
+                        || e.eq_ignore_ascii_case("otf")
+                        || e.eq_ignore_ascii_case("ttc")
+                });
                 if !ok {
                     continue;
                 }
-                let Ok(bytes) = std::fs::read(&p) else { continue };
+                let Ok(bytes) = std::fs::read(&p) else {
+                    continue;
+                };
                 let faces = ttf_parser::fonts_in_collection(&bytes).unwrap_or(1).max(1);
                 for i in 0..faces {
                     if let Ok(f) = TtfFont::from_bytes_at(&bytes, i) {
@@ -440,8 +436,7 @@ impl FontSet {
         for (run, rtl) in bidi_runs(text) {
             let base = run.start;
             let sub = &text[run];
-            let mut segs: Vec<(std::ops::Range<usize>, Option<usize>, bool)> =
-                Vec::new();
+            let mut segs: Vec<(std::ops::Range<usize>, Option<usize>, bool)> = Vec::new();
             let mut start = 0usize;
             let mut cluster_start = 0usize;
             let mut cur: Option<usize> = None;
@@ -459,15 +454,13 @@ impl FontSet {
                     // cluster (last base char + marks since) can affect
                     // this mark's composition, so compose just that —
                     // re-composing the whole segment is quadratic.
-                    let covered_here = cur.is_some_and(|i| {
-                        self.fonts[i].advance_for(c, size_px).is_some()
-                    });
+                    let covered_here =
+                        cur.is_some_and(|i| self.fonts[i].advance_for(c, size_px).is_some());
                     if covered_here {
                         continue;
                     }
                     if cur.is_some_and(|i| {
-                        let mut scratch =
-                            String::with_capacity(b - cluster_start + c.len_utf8());
+                        let mut scratch = String::with_capacity(b - cluster_start + c.len_utf8());
                         scratch.push_str(&sub[cluster_start..b]);
                         scratch.push(c);
                         let comp = nfc_str(&scratch);
@@ -543,15 +536,13 @@ impl FontSet {
         for c in text.chars() {
             // Walk the whole fallback chain: the run's font may cover the
             // char but be unable to rasterize (or shape) it.
-            let bmp = self
-                .raster(c, size_px)
-                .unwrap_or(GlyphBmp {
-                    xmin: 0,
-                    ymin: 0,
-                    w: 0,
-                    h: 0,
-                    cov: Vec::new(),
-                });
+            let bmp = self.raster(c, size_px).unwrap_or(GlyphBmp {
+                xmin: 0,
+                ymin: 0,
+                w: 0,
+                h: 0,
+                cov: Vec::new(),
+            });
             out.push(ShapedGlyph {
                 bmp,
                 x_adv: self.advance(c, size_px),
@@ -641,10 +632,7 @@ impl FontSet {
                         let mut sums: std::collections::HashMap<usize, f32> =
                             std::collections::HashMap::new();
                         for (byte, adv) in glyphs {
-                            let cci = byte_to_cci
-                                .get(byte)
-                                .copied()
-                                .unwrap_or(usize::MAX);
+                            let cci = byte_to_cci.get(byte).copied().unwrap_or(usize::MAX);
                             if cci >= cchars.len() {
                                 continue;
                             }
@@ -656,10 +644,7 @@ impl FontSet {
                         leaders.sort_unstable();
                         for (k, &cci) in leaders.iter().enumerate() {
                             comp_adv[cci] = Some(sums[&cci]);
-                            let end = leaders
-                                .get(k + 1)
-                                .copied()
-                                .unwrap_or(cchars.len());
+                            let end = leaders.get(k + 1).copied().unwrap_or(cchars.len());
                             for m in comp_adv.iter_mut().take(end).skip(cci + 1) {
                                 // Non-leader chars drew no advance of
                                 // their own — the shaper folded them
@@ -702,10 +687,7 @@ impl FontSet {
                     spans.push((start_ci, olen, cs, clen));
                 }
             }
-            let base_ci = byte_to_ci
-                .get(range.start)
-                .copied()
-                .unwrap_or(usize::MAX);
+            let base_ci = byte_to_ci.get(range.start).copied().unwrap_or(usize::MAX);
             for &(os, ol, cs, cl) in &spans {
                 if !((base_ci + os) < n) {
                     continue;
@@ -770,8 +752,7 @@ mod tests {
     fn raster_skips_uncovered_chars_for_fallback() {
         let mut fs = FontSet::new();
         fs.push(Box::new(
-            TtfFont::from_bytes(include_bytes!("../tests/geneva.ttf"))
-                .expect("font parses"),
+            TtfFont::from_bytes(include_bytes!("../tests/geneva.ttf")).expect("font parses"),
         ));
         // A PUA char Geneva doesn't cover: raster must return None so a
         // later font in the chain can supply the glyph.
@@ -819,8 +800,7 @@ mod tests {
         let mut fs = FontSet::new();
         fs.push(Box::new(ShapeOnly));
         fs.push(Box::new(
-            TtfFont::from_bytes(include_bytes!("../tests/geneva.ttf"))
-                .expect("font parses"),
+            TtfFont::from_bytes(include_bytes!("../tests/geneva.ttf")).expect("font parses"),
         ));
         let run = fs.shaped_run("fi", 16.0).expect("run");
         assert_eq!(run.len(), 2);
@@ -852,12 +832,7 @@ mod tests {
             fn descent(&self, _s: f32) -> f32 {
                 2.0
             }
-            fn shaped_glyphs(
-                &self,
-                text: &str,
-                _rtl: bool,
-                _s: f32,
-            ) -> Option<Vec<ShapedGlyph>> {
+            fn shaped_glyphs(&self, text: &str, _rtl: bool, _s: f32) -> Option<Vec<ShapedGlyph>> {
                 Some(
                     text.chars()
                         .map(|_| ShapedGlyph {
@@ -879,11 +854,7 @@ mod tests {
                 true
             }
             fn shaped_advances(&self, text: &str, _s: f32) -> Option<Vec<(usize, f32)>> {
-                Some(
-                    text.char_indices()
-                        .map(|(b, _)| (b, 5.0))
-                        .collect(),
-                )
+                Some(text.char_indices().map(|(b, _)| (b, 5.0)).collect())
             }
         }
         // Base font covers 'e' and precomposed 'é' but NOT the mark;
@@ -958,12 +929,7 @@ mod tests {
             fn descent(&self, _s: f32) -> f32 {
                 2.0
             }
-            fn shaped_glyphs(
-                &self,
-                _text: &str,
-                _rtl: bool,
-                _s: f32,
-            ) -> Option<Vec<ShapedGlyph>> {
+            fn shaped_glyphs(&self, _text: &str, _rtl: bool, _s: f32) -> Option<Vec<ShapedGlyph>> {
                 // One glyph for the whole "a + mark" cluster.
                 Some(vec![ShapedGlyph {
                     bmp: GlyphBmp {
@@ -1020,12 +986,7 @@ mod tests {
             fn descent(&self, _s: f32) -> f32 {
                 2.0
             }
-            fn shaped_glyphs(
-                &self,
-                text: &str,
-                _rtl: bool,
-                _s: f32,
-            ) -> Option<Vec<ShapedGlyph>> {
+            fn shaped_glyphs(&self, text: &str, _rtl: bool, _s: f32) -> Option<Vec<ShapedGlyph>> {
                 Some(
                     text.chars()
                         .map(|_| ShapedGlyph {
@@ -1086,12 +1047,7 @@ mod tests {
             fn descent(&self, _s: f32) -> f32 {
                 2.0
             }
-            fn shaped_glyphs(
-                &self,
-                text: &str,
-                _rtl: bool,
-                _s: f32,
-            ) -> Option<Vec<ShapedGlyph>> {
+            fn shaped_glyphs(&self, text: &str, _rtl: bool, _s: f32) -> Option<Vec<ShapedGlyph>> {
                 Some(
                     text.chars()
                         .map(|_| ShapedGlyph {
@@ -1125,8 +1081,8 @@ mod tests {
             ],
         }));
         let text = "\u{1100}\u{1161}\u{1102}\u{1161}e\u{301}"; // 가나é decomposed
-        // Jamo pairs and e+mark each compose to one covered char;
-        // the syllable width lands on each cluster's lead jamo.
+                                                               // Jamo pairs and e+mark each compose to one covered char;
+                                                               // the syllable width lands on each cluster's lead jamo.
         assert_eq!(
             fs.char_advances(text, 16.0),
             vec![5.0, 0.0, 5.0, 0.0, 5.0, 0.0]

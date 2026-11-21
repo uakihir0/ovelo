@@ -10,104 +10,124 @@ pub(crate) fn call(
     sig: &str,
     args: &[V],
 ) -> Rt<Option<Option<V>>> {
-    Ok(if desc_is_a(class, "Ljava/io/PrintStream;") || desc_is_a(class, "Ljava/io/PrintWriter;") {
-        print_call(vm, name, sig, args)
-    } else if desc_is_a(class, "Ljava/io/InputStream;")
-        || class.ends_with("InputStream;")
-        || class.ends_with("Reader;")
-        || class.ends_with("OutputStream;")
-        || class.ends_with("Writer;")
-    {
-        stream_call(vm, name, args)
-    } else if class == "Ljava/io/File;" {
-        file_call(vm, name, args)
-    } else if class == "Ljava/util/regex/Pattern;" {
-        pattern_call(vm, name, args)
-    } else if class == "Ljava/util/regex/Matcher;" {
-        matcher_call(vm, name, args)?
-    } else if desc_is_a(class, "Ljava/text/SimpleDateFormat;")
-        || desc_is_a(class, "Ljava/text/DateFormat;")
-        || class == "Ljava/text/NumberFormat;" || class == "Ljava/text/DecimalFormat;"
-    {
-        format_call(vm, name, args)
-    } else if class == "Lorg/json/JSONObject;" {
-        json_obj(vm, name, args)
-    } else if class == "Lorg/json/JSONArray;" {
-        json_arr(vm, name, args)
-    } else if class == "Ljavax/net/ssl/TrustManagerFactory;" {
-        match name {
-            // OkHttp's Platform requires exactly one default trust
-            // manager — answer a single X509TrustManager placeholder.
-            "getTrustManagers" => {
-                let tm = host(vm, "Ljavax/net/ssl/X509TrustManager;", HostState::Empty);
-                Some(Some(arr(vm, "Ljavax/net/ssl/TrustManager;", vec![tm])))
+    Ok(
+        if desc_is_a(class, "Ljava/io/PrintStream;") || desc_is_a(class, "Ljava/io/PrintWriter;") {
+            print_call(vm, name, sig, args)
+        } else if desc_is_a(class, "Ljava/io/InputStream;")
+            || class.ends_with("InputStream;")
+            || class.ends_with("Reader;")
+            || class.ends_with("OutputStream;")
+            || class.ends_with("Writer;")
+        {
+            stream_call(vm, name, args)
+        } else if class == "Ljava/io/File;" {
+            file_call(vm, name, args)
+        } else if class == "Ljava/util/regex/Pattern;" {
+            pattern_call(vm, name, args)
+        } else if class == "Ljava/util/regex/Matcher;" {
+            matcher_call(vm, name, args)?
+        } else if desc_is_a(class, "Ljava/text/SimpleDateFormat;")
+            || desc_is_a(class, "Ljava/text/DateFormat;")
+            || class == "Ljava/text/NumberFormat;"
+            || class == "Ljava/text/DecimalFormat;"
+        {
+            format_call(vm, name, args)
+        } else if class == "Lorg/json/JSONObject;" {
+            json_obj(vm, name, args)
+        } else if class == "Lorg/json/JSONArray;" {
+            json_arr(vm, name, args)
+        } else if class == "Ljavax/net/ssl/TrustManagerFactory;" {
+            match name {
+                // OkHttp's Platform requires exactly one default trust
+                // manager — answer a single X509TrustManager placeholder.
+                "getTrustManagers" => {
+                    let tm = host(vm, "Ljavax/net/ssl/X509TrustManager;", HostState::Empty);
+                    Some(Some(arr(vm, "Ljavax/net/ssl/TrustManager;", vec![tm])))
+                }
+                "getDefaultAlgorithm" => Some(Some(jstr(vm, "PKIX"))),
+                _ => Some(Some(stub_ret(vm, sig))),
             }
-            "getDefaultAlgorithm" => Some(Some(jstr(vm, "PKIX"))),
-            _ => Some(Some(stub_ret(vm, sig))),
-        }
-    } else if class == "Ljavax/net/ssl/X509TrustManager;"
-        || class == "Ljavax/net/ssl/TrustManager;"
-        || class == "Ljavax/net/ssl/SSLSocketFactory;"
-        || class == "Ljavax/net/ssl/SSLContext;"
-    {
-        match name {
-            "getAcceptedIssuers" => Some(Some(arr(vm, "Ljava/security/cert/X509Certificate;", vec![]))),
-            "init" | "checkClientTrusted" | "checkServerTrusted" => Some(None),
-            "getSocketFactory" | "getDefault" => {
-                Some(Some(host(vm, "Ljavax/net/ssl/SSLSocketFactory;", HostState::Empty)))
+        } else if class == "Ljavax/net/ssl/X509TrustManager;"
+            || class == "Ljavax/net/ssl/TrustManager;"
+            || class == "Ljavax/net/ssl/SSLSocketFactory;"
+            || class == "Ljavax/net/ssl/SSLContext;"
+        {
+            match name {
+                "getAcceptedIssuers" => Some(Some(arr(
+                    vm,
+                    "Ljava/security/cert/X509Certificate;",
+                    vec![],
+                ))),
+                "init" | "checkClientTrusted" | "checkServerTrusted" => Some(None),
+                "getSocketFactory" | "getDefault" => Some(Some(host(
+                    vm,
+                    "Ljavax/net/ssl/SSLSocketFactory;",
+                    HostState::Empty,
+                ))),
+                "getInstance" => Some(Some(host(vm, class, HostState::Empty))),
+                _ => Some(Some(stub_ret(vm, sig))),
             }
-            "getInstance" => Some(Some(host(vm, class, HostState::Empty))),
-            _ => Some(Some(stub_ret(vm, sig))),
-        }
-    } else if class == "Ljava/net/URLEncoder;" || class == "Ljava/net/URLDecoder;" {
-        url_codec(vm, name, args)
-    } else if class == "Ljava/net/URL;" || class == "Ljava/net/URI;" {
-        url_call(vm, name, args)?
-    } else if class == "Ljava/net/URLConnection;" || desc_is_a(class, "Ljava/net/URLConnection;") {
-        match name {
-            "connect" | "disconnect" | "setRequestProperty" | "setDoInput"
-            | "setDoOutput" | "setConnectTimeout" | "setReadTimeout"
-            | "setRequestMethod" | "setChunkedStreamingMode"
-            | "setFixedLengthStreamingMode" | "setInstanceFollowRedirects" => {
-                Some(None)
+        } else if class == "Ljava/net/URLEncoder;" || class == "Ljava/net/URLDecoder;" {
+            url_codec(vm, name, args)
+        } else if class == "Ljava/net/URL;" || class == "Ljava/net/URI;" {
+            url_call(vm, name, args)?
+        } else if class == "Ljava/net/URLConnection;"
+            || desc_is_a(class, "Ljava/net/URLConnection;")
+        {
+            match name {
+                "connect"
+                | "disconnect"
+                | "setRequestProperty"
+                | "setDoInput"
+                | "setDoOutput"
+                | "setConnectTimeout"
+                | "setReadTimeout"
+                | "setRequestMethod"
+                | "setChunkedStreamingMode"
+                | "setFixedLengthStreamingMode"
+                | "setInstanceFollowRedirects" => Some(None),
+                "getResponseCode" => Some(Some(V::I32(200))),
+                "getResponseMessage" | "getContentType" | "getContentEncoding"
+                | "getHeaderField" | "getRequestProperty" | "getURL" => Some(Some(V::Ref(0))),
+                "getContentLength"
+                | "getContentLengthLong"
+                | "getDate"
+                | "getExpiration"
+                | "getLastModified"
+                | "getHeaderFieldInt"
+                | "getHeaderFieldLong" => Some(Some(V::I64(0))),
+                "getInputStream" => Some(Some(host(vm, "Ljava/io/InputStream;", HostState::Empty))),
+                "getOutputStream" => {
+                    Some(Some(host(vm, "Ljava/io/OutputStream;", HostState::Empty)))
+                }
+                "getHeaderFields" => {
+                    Some(Some(host(vm, "Ljava/util/Map;", HostState::Map(vec![]))))
+                }
+                _ => None,
             }
-            "getResponseCode" => Some(Some(V::I32(200))),
-            "getResponseMessage" | "getContentType" | "getContentEncoding"
-            | "getHeaderField" | "getRequestProperty" | "getURL" => {
-                Some(Some(V::Ref(0)))
-            }
-            "getContentLength" | "getContentLengthLong" | "getDate"
-            | "getExpiration" | "getLastModified" | "getHeaderFieldInt"
-            | "getHeaderFieldLong" => Some(Some(V::I64(0))),
-            "getInputStream" => {
-                Some(Some(host(vm, "Ljava/io/InputStream;", HostState::Empty)))
-            }
-            "getOutputStream" => {
-                Some(Some(host(vm, "Ljava/io/OutputStream;", HostState::Empty)))
-            }
-            "getHeaderFields" => {
-                Some(Some(host(vm, "Ljava/util/Map;", HostState::Map(vec![]))))
-            }
-            _ => None,
-        }
-    } else if desc_is_a(class, "Ljava/nio/charset/Charset;")
-        || class == "Ljava/nio/charset/StandardCharsets;"
-    {
-        charset_call(vm, name, args)
-    } else if desc_is_a(class, "Ljava/nio/Buffer;") || class.starts_with("Ljava/nio/") {
-        nio_call(vm, name, args)
-    } else if class == "Ljava/util/Base64;" || class == "Ljava/util/Base64$Encoder;"
-        || class == "Ljava/util/Base64$Decoder;" || class == "Landroid/util/Base64;"
-    {
-        base64_call(vm, name, args)
-    } else if class == "Ljava/util/Formatter;" || class == "Ljava/util/Scanner;"
-        || class == "Ljava/util/Locale;" || class == "Ljava/text/MessageFormat;"
-        || class.starts_with("Ljava/text/")
-    {
-        misc_fmt(vm, class, name, args)
-    } else {
-        return Ok(None);
-    })
+        } else if desc_is_a(class, "Ljava/nio/charset/Charset;")
+            || class == "Ljava/nio/charset/StandardCharsets;"
+        {
+            charset_call(vm, name, args)
+        } else if desc_is_a(class, "Ljava/nio/Buffer;") || class.starts_with("Ljava/nio/") {
+            nio_call(vm, name, args)
+        } else if class == "Ljava/util/Base64;"
+            || class == "Ljava/util/Base64$Encoder;"
+            || class == "Ljava/util/Base64$Decoder;"
+            || class == "Landroid/util/Base64;"
+        {
+            base64_call(vm, name, args)
+        } else if class == "Ljava/util/Formatter;"
+            || class == "Ljava/util/Scanner;"
+            || class == "Ljava/util/Locale;"
+            || class == "Ljava/text/MessageFormat;"
+            || class.starts_with("Ljava/text/")
+        {
+            misc_fmt(vm, class, name, args)
+        } else {
+            return Ok(None);
+        },
+    )
 }
 
 // ---------------------------------------------------------------------
@@ -228,7 +248,14 @@ fn under(root: &std::path::Path, guest: &str) -> std::path::PathBuf {
 }
 
 fn file_call(vm: &mut Vm, name: &str, args: &[V]) -> Option<Option<V>> {
-    let path = s(vm, match args[0] { V::Ref(h) => h, _ => 0 }).unwrap_or_default();
+    let path = s(
+        vm,
+        match args[0] {
+            V::Ref(h) => h,
+            _ => 0,
+        },
+    )
+    .unwrap_or_default();
     let std_path = fspath(vm, &path);
     match name {
         "<init>" => {
@@ -292,9 +319,7 @@ fn file_call(vm: &mut Vm, name: &str, args: &[V]) -> Option<Option<V>> {
                 .map(|d| d.as_millis() as i64)
                 .unwrap_or(0),
         )),
-        "mkdir" | "mkdirs" => Some(V::I32(
-            std::fs::create_dir_all(&std_path).is_ok() as i32,
-        )),
+        "mkdir" | "mkdirs" => Some(V::I32(std::fs::create_dir_all(&std_path).is_ok() as i32)),
         "delete" => {
             // `new File("")` maps onto the storage root — deleting it
             // would wipe the whole sandbox, which a failed delete must
@@ -315,9 +340,16 @@ fn file_call(vm: &mut Vm, name: &str, args: &[V]) -> Option<Option<V>> {
                 .is_ok() as i32,
         )),
         "renameTo" => {
-            let to = s(vm, match args[1] { V::Ref(h) => h, _ => 0 }).unwrap_or_default();
+            let to = s(
+                vm,
+                match args[1] {
+                    V::Ref(h) => h,
+                    _ => 0,
+                },
+            )
+            .unwrap_or_default();
             Some(V::I32(
-                std::fs::rename(&std_path, fspath(vm, &to)).is_ok() as i32,
+                std::fs::rename(&std_path, fspath(vm, &to)).is_ok() as i32
             ))
         }
         "list" | "listFiles" => {
@@ -329,7 +361,11 @@ fn file_call(vm: &mut Vm, name: &str, args: &[V]) -> Option<Option<V>> {
                 })
                 .unwrap_or_default();
             if std::env::var_os("OVELO_VIEWDBG").is_some() {
-                eprintln!("[viewdbg] {name} {path} -> {} ({} entries)", std_path.display(), names.len());
+                eprintln!(
+                    "[viewdbg] {name} {path} -> {} ({} entries)",
+                    std_path.display(),
+                    names.len()
+                );
             }
             if name == "list" {
                 let vs: Vec<V> = names.iter().map(|n| jstr(vm, n)).collect();
@@ -343,9 +379,7 @@ fn file_call(vm: &mut Vm, name: &str, args: &[V]) -> Option<Option<V>> {
                 Some(arr(vm, "Ljava/io/File;", out))
             }
         }
-        "getFreeSpace" | "getTotalSpace" | "getUsableSpace" => {
-            Some(V::I64(1i64 << 32))
-        }
+        "getFreeSpace" | "getTotalSpace" | "getUsableSpace" => Some(V::I64(1i64 << 32)),
         // Hidden on Android == getName() starts with '.' — Java's
         // getName is the raw last segment, so "." and ".." count too
         // (std::path's file_name would normalize them away).
@@ -353,12 +387,11 @@ fn file_call(vm: &mut Vm, name: &str, args: &[V]) -> Option<Option<V>> {
             path.trim_end_matches('/')
                 .rsplit('/')
                 .next()
-                .is_some_and(|n| n.starts_with('.'))
-                as i32,
+                .is_some_and(|n| n.starts_with('.')) as i32,
         )),
-        "setReadable" | "setWritable" | "setExecutable" | "setReadOnly"
-        | "setLastModified" | "deleteOnExit" | "toPath" | "toURI" | "toURL"
-        | "listRoots" | "createTempFile" | "compareTo" => {
+        "setReadable" | "setWritable" | "setExecutable" | "setReadOnly" | "setLastModified"
+        | "deleteOnExit" | "toPath" | "toURI" | "toURL" | "listRoots" | "createTempFile"
+        | "compareTo" => {
             if name == "listRoots" || name == "createTempFile" {
                 Some(host(vm, "Ljava/io/File;", HostState::Path("/tmp/x".into())))
             } else if matches!(name, "toPath" | "toURI" | "toURL") {
@@ -467,10 +500,7 @@ fn pattern_call(vm: &mut Vm, name: &str, args: &[V]) -> Option<Option<V>> {
             Some(Some(V::I32(literal_match(&pat, &t) as i32)))
         }
         "matcher" => {
-            let h = vm.alloc_host(
-                "Ljava/util/regex/Matcher;",
-                HostState::Slot(args[1]),
-            );
+            let h = vm.alloc_host("Ljava/util/regex/Matcher;", HostState::Slot(args[1]));
             if let V::Ref(ph) = args[0] {
                 if let Some(pat) = s(vm, ph) {
                     let pv = jstr(vm, &pat);
@@ -480,11 +510,25 @@ fn pattern_call(vm: &mut Vm, name: &str, args: &[V]) -> Option<Option<V>> {
             Some(Some(V::Ref(h)))
         }
         "pattern" | "toString" => {
-            let t = s(vm, match args[0] { V::Ref(h) => h, _ => 0 }).unwrap_or_default();
+            let t = s(
+                vm,
+                match args[0] {
+                    V::Ref(h) => h,
+                    _ => 0,
+                },
+            )
+            .unwrap_or_default();
             Some(Some(jstr(vm, &t)))
         }
         "split" => {
-            let pat = s(vm, match args[0] { V::Ref(h) => h, _ => 0 }).unwrap_or_default();
+            let pat = s(
+                vm,
+                match args[0] {
+                    V::Ref(h) => h,
+                    _ => 0,
+                },
+            )
+            .unwrap_or_default();
             let t = sv(vm, args[1]).unwrap_or_default();
             let parts: Vec<V> = t.split(&pat).map(|x| jstr(vm, x)).collect();
             Some(Some(arr(vm, STRING, parts)))
@@ -505,8 +549,7 @@ fn matcher_call(vm: &mut Vm, name: &str, args: &[V]) -> Rt<Option<Option<V>>> {
     Ok(match name {
         "matches" => Some(Some(V::I32(literal_match(&pat, &text) as i32))),
         "lookingAt" | "find" => {
-            let found = literal_match(&pat, &text)
-                || (!pat.is_empty() && text.contains(&pat));
+            let found = literal_match(&pat, &text) || (!pat.is_empty() && text.contains(&pat));
             Some(Some(V::I32(found as i32)))
         }
         "group" => {
@@ -529,13 +572,14 @@ fn matcher_call(vm: &mut Vm, name: &str, args: &[V]) -> Rt<Option<Option<V>>> {
         "quoteReplacement" => Some(args.first().copied()),
         "start" | "end" => Some(Some(V::I32(0))),
         "reset" => Some(Some(args[0])),
-        "region" | "useAnchoringBounds" | "useTransparentBounds"
-        | "usePattern" | "appendReplacement" => Some(Some(args[0])),
+        "region"
+        | "useAnchoringBounds"
+        | "useTransparentBounds"
+        | "usePattern"
+        | "appendReplacement" => Some(Some(args[0])),
         "appendTail" => Some(Some(args[1])),
         "pattern" => Some(Some(args[0])),
-        "requireEnd" | "hasAnchoringBounds" | "hasTransparentBounds" => {
-            Some(Some(V::I32(0)))
-        }
+        "requireEnd" | "hasAnchoringBounds" | "hasTransparentBounds" => Some(Some(V::I32(0))),
         "namedGroups" => Some(Some(host(vm, "Ljava/util/Set;", HostState::List(vec![])))),
         _ => None,
     })
@@ -659,8 +703,12 @@ fn format_call(vm: &mut Vm, name: &str, args: &[V]) -> Option<Option<V>> {
                 HostState::Millis(crate::jdk::time::parse_date(&t)),
             )))
         }
-        "applyPattern" | "applyLocalizedPattern" | "setLenient"
-        | "setTimeZone" | "setCalendar" | "setNumberFormat"
+        "applyPattern"
+        | "applyLocalizedPattern"
+        | "setLenient"
+        | "setTimeZone"
+        | "setCalendar"
+        | "setNumberFormat"
         | "setDateFormatSymbols" => Some(None),
         "toPattern" | "toLocalizedPattern" => Some(Some(jstr(vm, ""))),
         "getTimeZone" => Some(Some(host(
@@ -670,11 +718,18 @@ fn format_call(vm: &mut Vm, name: &str, args: &[V]) -> Option<Option<V>> {
         ))),
         "getCalendar" | "clone" => Some(Some(args[0])),
         "isLenient" => Some(Some(V::I32(1))),
-        "getDateInstance" | "getTimeInstance" | "getDateTimeInstance"
-        | "getInstance" | "getNumberInstance" | "getIntegerInstance"
-        | "getCurrencyInstance" | "getPercentInstance" => {
-            Some(Some(host(vm, "Ljava/text/SimpleDateFormat;", HostState::Empty)))
-        }
+        "getDateInstance"
+        | "getTimeInstance"
+        | "getDateTimeInstance"
+        | "getInstance"
+        | "getNumberInstance"
+        | "getIntegerInstance"
+        | "getCurrencyInstance"
+        | "getPercentInstance" => Some(Some(host(
+            vm,
+            "Ljava/text/SimpleDateFormat;",
+            HostState::Empty,
+        ))),
         "getAvailableLocales" => Some(Some(arr(vm, "Ljava/util/Locale;", vec![]))),
         "get2DigitYearStart" | "set2DigitYearStart" => Some(Some(V::Ref(0))),
         "parseObject" => Some(Some(V::Ref(0))),
@@ -886,8 +941,8 @@ fn json_obj(vm: &mut Vm, name: &str, args: &[V]) -> Option<Option<V>> {
                 ),
             })
         }
-        "getInt" | "optInt" | "getLong" | "optLong" | "getDouble"
-        | "optDouble" | "getBoolean" | "optBoolean" => {
+        "getInt" | "optInt" | "getLong" | "optLong" | "getDouble" | "optDouble" | "getBoolean"
+        | "optBoolean" => {
             let dflt = args.get(1 + (name.starts_with('o') as usize));
             match map_get(vm, h, args[1]) {
                 Some(v) if !matches!(v, V::Ref(0)) => Some(v),
@@ -927,10 +982,9 @@ fn json_obj(vm: &mut Vm, name: &str, args: &[V]) -> Option<Option<V>> {
                 }) => m.iter().map(|(k, _)| *k).collect(),
                 _ => vec![],
             };
-            Some(V::Ref(vm.alloc_host(
-                "Lorg/json/JSONArray;",
-                HostState::List(ks),
-            )))
+            Some(V::Ref(
+                vm.alloc_host("Lorg/json/JSONArray;", HostState::List(ks)),
+            ))
         }
         "toString" | "toStringInt" => Some(jstr(vm, &json_dump_v(vm, V::Ref(h)))),
         _ => return None,
@@ -1013,8 +1067,8 @@ fn json_arr(vm: &mut Vm, name: &str, args: &[V]) -> Option<Option<V>> {
                 ),
             })
         }
-        "getInt" | "optInt" | "getLong" | "optLong" | "getDouble"
-        | "optDouble" | "getBoolean" | "optBoolean" => {
+        "getInt" | "optInt" | "getLong" | "optLong" | "getDouble" | "optDouble" | "getBoolean"
+        | "optBoolean" => {
             let i = i32v(args[1]) as usize;
             Some(
                 list_ref(vm, h)
@@ -1022,9 +1076,7 @@ fn json_arr(vm: &mut Vm, name: &str, args: &[V]) -> Option<Option<V>> {
                     .unwrap_or_else(|| args.get(2).copied().unwrap_or(V::I32(0))),
             )
         }
-        "length" => Some(V::I32(
-            list_ref(vm, h).map(|l| l.len() as i32).unwrap_or(0),
-        )),
+        "length" => Some(V::I32(list_ref(vm, h).map(|l| l.len() as i32).unwrap_or(0))),
         "remove" => {
             let i = i32v(args[1]) as usize;
             let v = list_mut(vm, h)
@@ -1082,10 +1134,16 @@ fn url_call(vm: &mut Vm, name: &str, args: &[V]) -> Rt<Option<Option<V>>> {
         "openConnection" | "openStream" | "getContent" | "toURI" | "toURL" => {
             Some(Some(host(vm, "Ljava/net/URLConnection;", HostState::Empty)))
         }
-        "getProtocol" | "getHost" | "getPath" | "getFile" | "getQuery"
-        | "getAuthority" | "getUserInfo" | "getRef" | "toExternalForm"
-        | "toString" => {
-            let t = s(vm, match args[0] { V::Ref(h) => h, _ => 0 }).unwrap_or_default();
+        "getProtocol" | "getHost" | "getPath" | "getFile" | "getQuery" | "getAuthority"
+        | "getUserInfo" | "getRef" | "toExternalForm" | "toString" => {
+            let t = s(
+                vm,
+                match args[0] {
+                    V::Ref(h) => h,
+                    _ => 0,
+                },
+            )
+            .unwrap_or_default();
             Some(Some(jstr(vm, &t)))
         }
         "getPort" | "getDefaultPort" => Some(Some(V::I32(-1))),
@@ -1105,8 +1163,14 @@ fn charset_call(vm: &mut Vm, name: &str, args: &[V]) -> Option<Option<V>> {
             )))
         }
         "name" | "displayName" | "toString" => {
-            let n = s(vm, match args[0] { V::Ref(h) => h, _ => 0 })
-                .unwrap_or_else(|| "UTF-8".into());
+            let n = s(
+                vm,
+                match args[0] {
+                    V::Ref(h) => h,
+                    _ => 0,
+                },
+            )
+            .unwrap_or_else(|| "UTF-8".into());
             Some(Some(jstr(vm, &n)))
         }
         "defaultCharset" => Some(Some(host(
@@ -1114,8 +1178,8 @@ fn charset_call(vm: &mut Vm, name: &str, args: &[V]) -> Option<Option<V>> {
             "Ljava/nio/charset/Charset;",
             HostState::StrBuf("UTF-8".into()),
         ))),
-        "encode" | "decode" | "newEncoder" | "newDecoder" | "aliases"
-        | "availableCharsets" | "isSupported" | "contains" | "canEncode" => {
+        "encode" | "decode" | "newEncoder" | "newDecoder" | "aliases" | "availableCharsets"
+        | "isSupported" | "contains" | "canEncode" => {
             if name == "isSupported" || name == "canEncode" || name == "contains" {
                 Some(Some(V::I32(1)))
             } else if name == "availableCharsets" {
@@ -1148,11 +1212,13 @@ fn nio_call(vm: &mut Vm, name: &str, args: &[V]) -> Option<Option<V>> {
             };
             Some(Some(V::I32(n as i32)))
         }
-        "get" | "put" | "flip" | "clear" | "rewind" | "mark" | "reset"
-        | "compact" | "slice" | "duplicate" | "asReadOnlyBuffer" | "array"
-        | "hasArray" | "arrayOffset" | "isDirect" | "isReadOnly" | "hasRemaining" => {
+        "get" | "put" | "flip" | "clear" | "rewind" | "mark" | "reset" | "compact" | "slice"
+        | "duplicate" | "asReadOnlyBuffer" | "array" | "hasArray" | "arrayOffset" | "isDirect"
+        | "isReadOnly" | "hasRemaining" => {
             if name.starts_with("is") || name == "hasArray" || name == "hasRemaining" {
-                Some(Some(V::I32((name == "hasRemaining" || name == "hasArray") as i32)))
+                Some(Some(V::I32(
+                    (name == "hasRemaining" || name == "hasArray") as i32,
+                )))
             } else if name == "array" {
                 Some(Some(V::Ref(0)))
             } else {
@@ -1212,8 +1278,8 @@ fn b64_decode(s: &str) -> Vec<u8> {
 
 fn base64_call(vm: &mut Vm, name: &str, args: &[V]) -> Option<Option<V>> {
     match name {
-        "getEncoder" | "getUrlEncoder" | "getMimeEncoder" | "getDecoder"
-        | "getUrlDecoder" | "getMimeDecoder" => {
+        "getEncoder" | "getUrlEncoder" | "getMimeEncoder" | "getDecoder" | "getUrlDecoder"
+        | "getMimeDecoder" => {
             let d = if name.contains("Decoder") {
                 "Ljava/util/Base64$Decoder;"
             } else {
@@ -1224,9 +1290,7 @@ fn base64_call(vm: &mut Vm, name: &str, args: &[V]) -> Option<Option<V>> {
         "encode" | "encodeToString" | "encodeToByteArray" => {
             let data = match args[0] {
                 V::Ref(h) => match vm.heap.get(h) {
-                    Some(Obj::Array { data, .. }) => {
-                        data.iter().map(|v| i32v(*v) as u8).collect()
-                    }
+                    Some(Obj::Array { data, .. }) => data.iter().map(|v| i32v(*v) as u8).collect(),
                     Some(Obj::Str(t)) => t.bytes().collect(),
                     Some(Obj::Host {
                         state: HostState::StrBuf(t),
@@ -1261,19 +1325,23 @@ fn base64_call(vm: &mut Vm, name: &str, args: &[V]) -> Option<Option<V>> {
 fn misc_fmt(vm: &mut Vm, class: &str, name: &str, args: &[V]) -> Option<Option<V>> {
     if class == "Ljava/util/Locale;" {
         return match name {
-            "getDefault" | "getDefault0" | "forLanguageTag" | "ROOT" => {
-                Some(host(
-                    vm,
-                    "Ljava/util/Locale;",
-                    HostState::StrBuf("en-US".into()),
-                ))
-            }
+            "getDefault" | "getDefault0" | "forLanguageTag" | "ROOT" => Some(host(
+                vm,
+                "Ljava/util/Locale;",
+                HostState::StrBuf("en-US".into()),
+            )),
             "getLanguage" => Some(jstr(vm, "en")),
             "getCountry" | "getVariant" | "getScript" => Some(jstr(vm, "US")),
-            "toString" | "toLanguageTag" | "getDisplayName"
-            | "getDisplayLanguage" | "getDisplayCountry" => {
-                let t = s(vm, match args[0] { V::Ref(h) => h, _ => 0 })
-                    .unwrap_or_else(|| "en-US".into());
+            "toString" | "toLanguageTag" | "getDisplayName" | "getDisplayLanguage"
+            | "getDisplayCountry" => {
+                let t = s(
+                    vm,
+                    match args[0] {
+                        V::Ref(h) => h,
+                        _ => 0,
+                    },
+                )
+                .unwrap_or_else(|| "en-US".into());
                 Some(jstr(vm, &t))
             }
             "getAvailableLocales" | "getISOCountries" | "getISOLanguages" => {
@@ -1301,8 +1369,14 @@ fn misc_fmt(vm: &mut Vm, class: &str, name: &str, args: &[V]) -> Option<Option<V
                 Some(args[0])
             }
             "toString" | "out" => {
-                let t = s(vm, match args[0] { V::Ref(h) => h, _ => 0 })
-                    .unwrap_or_default();
+                let t = s(
+                    vm,
+                    match args[0] {
+                        V::Ref(h) => h,
+                        _ => 0,
+                    },
+                )
+                .unwrap_or_default();
                 Some(jstr(vm, &t))
             }
             "flush" | "close" | "locale" => Some(args[0]),
@@ -1313,21 +1387,20 @@ fn misc_fmt(vm: &mut Vm, class: &str, name: &str, args: &[V]) -> Option<Option<V
     if class == "Ljava/util/Scanner;" {
         return match name {
             "next" | "nextLine" => Some(V::Ref(0)),
-            "hasNext" | "hasNextLine" | "hasNextInt" | "hasNextLong"
-            | "hasNextDouble" | "hasNextBoolean" => Some(V::I32(0)),
-            "nextInt" | "nextLong" | "nextDouble" | "nextFloat" | "nextShort"
-            | "nextByte" => Some(V::I64(0)),
-            "useDelimiter" | "useLocale" | "useRadix" | "reset" | "close"
-            | "skip" | "findInLine" | "findWithinHorizon" => {
+            "hasNext" | "hasNextLine" | "hasNextInt" | "hasNextLong" | "hasNextDouble"
+            | "hasNextBoolean" => Some(V::I32(0)),
+            "nextInt" | "nextLong" | "nextDouble" | "nextFloat" | "nextShort" | "nextByte" => {
+                Some(V::I64(0))
+            }
+            "useDelimiter" | "useLocale" | "useRadix" | "reset" | "close" | "skip"
+            | "findInLine" | "findWithinHorizon" => {
                 if matches!(name, "skip" | "findInLine" | "findWithinHorizon") {
                     Some(V::Ref(0))
                 } else {
                     Some(args[0])
                 }
             }
-            "delimiter" | "locale" | "radix" | "match" | "ioException" => {
-                Some(V::Ref(0))
-            }
+            "delimiter" | "locale" | "radix" | "match" | "ioException" => Some(V::Ref(0)),
             "tokens" => Some(host(vm, "Ljava/util/stream/Stream;", HostState::Empty)),
             "remove" => None,
             _ => return None,

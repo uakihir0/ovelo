@@ -26,8 +26,8 @@ use cranelift_codegen::settings::{self, Configurable};
 use cranelift_frontend::{FunctionBuilder, FunctionBuilderContext, Variable};
 use cranelift_jit::{JITBuilder, JITModule};
 use cranelift_module::{Linkage, Module};
-use ovelo_dex::{decode_all, Insn};
 use ovelo_dex::CodeItem;
+use ovelo_dex::{decode_all, Insn};
 use std::collections::HashMap;
 
 /// Compiled method: `(regs, trap) -> i64`.
@@ -121,11 +121,9 @@ impl Aot {
         let Some(func) = build_function(midx, code, &mut fbcx, cfg) else {
             return;
         };
-        let Ok(fid) = module.declare_function(
-            &format!("dex_m{midx}"),
-            Linkage::Export,
-            &func.signature,
-        ) else {
+        let Ok(fid) =
+            module.declare_function(&format!("dex_m{midx}"), Linkage::Export, &func.signature)
+        else {
             return;
         };
         ctx.func = func;
@@ -188,9 +186,7 @@ fn build_function(
     let mut func = Function::with_name_signature(UserFuncName::user(0, midx as u32), sig);
     let mut b = FunctionBuilder::new(&mut func, fbcx);
     let nregs = code.registers_size as usize;
-    let vars: Vec<Variable> = (0..nregs)
-        .map(|_| b.declare_var(types::I64))
-        .collect();
+    let vars: Vec<Variable> = (0..nregs).map(|_| b.declare_var(types::I64)).collect();
 
     // One IR block per instruction offset (payloads excluded below).
     let mut blocks = HashMap::new();
@@ -209,7 +205,8 @@ fn build_function(
     let start = nregs.saturating_sub(ins_size);
     for (i, var) in vars.iter().enumerate().take(nregs) {
         let v = if i >= start {
-            b.ins().load(types::I64, MemFlagsData::trusted(), regs_ptr, i as i32 * 8)
+            b.ins()
+                .load(types::I64, MemFlagsData::trusted(), regs_ptr, i as i32 * 8)
         } else {
             b.ins().iconst(types::I64, 0)
         };
@@ -330,9 +327,7 @@ fn emit(
                 let c = r(b, ins.regs[1] as usize);
                 b.ins().icmp(cc, a, c)
             };
-            let (Some(&taken), Some(not)) =
-                (ins.target.and_then(|t| blocks.get(&t)), next)
-            else {
+            let (Some(&taken), Some(not)) = (ins.target.and_then(|t| blocks.get(&t)), next) else {
                 return false;
             };
             b.ins().brif(cond, taken, &[], not, &[]);
@@ -450,9 +445,14 @@ fn zero_guard(b: &mut FunctionBuilder, divisor: Value, flag_ptr: Value, code: u8
 /// the same results a divisor of 1 gives, so we substitute 1.
 fn safe_divisor(b: &mut FunctionBuilder, a: Value, c: Value) -> Value {
     let ty = b.func.dfg.value_type(c);
-    let min = b
-        .ins()
-        .iconst(ty, if ty == types::I64 { i64::MIN } else { i32::MIN as i64 });
+    let min = b.ins().iconst(
+        ty,
+        if ty == types::I64 {
+            i64::MIN
+        } else {
+            i32::MIN as i64
+        },
+    );
     let neg1 = b.ins().iconst(ty, -1);
     let one = b.ins().iconst(ty, 1);
     let is_min = b.ins().icmp(IntCC::Equal, a, min);
@@ -513,7 +513,11 @@ fn emit_binop(
             b.ins().ushr(a, k)
         }
     };
-    let v = if wide { v } else { b.ins().sextend(types::I64, v) };
+    let v = if wide {
+        v
+    } else {
+        b.ins().sextend(types::I64, v)
+    };
     b.def_var(vars[dst], v);
 }
 

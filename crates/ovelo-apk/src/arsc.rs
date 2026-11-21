@@ -231,7 +231,13 @@ pub fn parse_arsc(b: &[u8]) -> Result<Vec<ResourcePackage>> {
                 global_strings = pool;
             }
             RES_TABLE_PACKAGE_TYPE => {
-                packages.push(parse_package(b, pos, chunk_header, chunk_size, &global_strings)?);
+                packages.push(parse_package(
+                    b,
+                    pos,
+                    chunk_header,
+                    chunk_size,
+                    &global_strings,
+                )?);
                 seen_packages += 1;
             }
             _ => {}
@@ -398,7 +404,11 @@ fn parse_package(
                             return Err(err("arsc.entry.bounds"));
                         }
                         let rel = u32at(b, p + hsz + i * 4)? as usize;
-                        Ok(if rel == 0xffff_ffff { None } else { Some((i, rel)) })
+                        Ok(if rel == 0xffff_ffff {
+                            None
+                        } else {
+                            Some((i, rel))
+                        })
                     }
                 };
                 // ResTable_config sits inside the header right after the fixed
@@ -608,7 +618,7 @@ mod tests {
         typ.extend(16u32.to_le_bytes()); // config size
         typ.extend([0u8; 12]); // minimal config body
         typ.extend(0u32.to_le_bytes()); // entry 0 offset = 0
-        // entry: size=8, flags=0, key=0; value: size=8 res0=0 type=3 data=0
+                                        // entry: size=8, flags=0, key=0; value: size=8 res0=0 type=3 data=0
         typ.extend(8u16.to_le_bytes());
         typ.extend(0u16.to_le_bytes());
         typ.extend(0u32.to_le_bytes());

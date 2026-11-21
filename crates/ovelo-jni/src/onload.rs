@@ -25,8 +25,9 @@ pub fn find_on_load(exports: &HashMap<String, u64>) -> Option<u64> {
 pub fn check_version(ret: i64) -> Result<i32, OveloError> {
     let v = ret as i32;
     if v < JNI_VERSION_1_6 {
-        return Err(err("jni.onload.version")
-            .with_detail(format!("returned 0x{v:08x}, need >= 0x{JNI_VERSION_1_6:08x}")));
+        return Err(err("jni.onload.version").with_detail(format!(
+            "returned 0x{v:08x}, need >= 0x{JNI_VERSION_1_6:08x}"
+        )));
     }
     Ok(v)
 }

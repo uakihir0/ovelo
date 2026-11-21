@@ -9,9 +9,14 @@ fn main() {
     let bytes = std::fs::read(&apk).unwrap();
     let (_cd, ents) = parse_central_directory(&bytes, &Default::default()).unwrap();
     for e in &ents {
-        if !e.name.starts_with("classes") || !e.name.ends_with(".dex") { continue; }
+        if !e.name.starts_with("classes") || !e.name.ends_with(".dex") {
+            continue;
+        }
         let buf = read_entry(&bytes, e).unwrap();
-        let dex = match DexFile::parse(buf) { Ok(d) => d, Err(_) => continue };
+        let dex = match DexFile::parse(buf) {
+            Ok(d) => d,
+            Err(_) => continue,
+        };
         let mut tgt = std::collections::HashSet::new();
         for fid in 0..dex.field_ids_len() {
             let f = dex.field(fid as u32).unwrap();
@@ -23,12 +28,24 @@ fn main() {
                 tgt.insert(fid as u32);
             }
         }
-        if tgt.is_empty() { continue; }
+        if tgt.is_empty() {
+            continue;
+        }
         for cd in dex.class_defs() {
-            let Ok(data) = dex.class_data(cd) else { continue };
-            for m in data.direct_methods.iter().chain(data.virtual_methods.iter()) {
-                let Ok(Some(code)) = dex.code_item(m.code_off) else { continue };
-                let Ok(insns) = decode_all(&code.insns) else { continue };
+            let Ok(data) = dex.class_data(cd) else {
+                continue;
+            };
+            for m in data
+                .direct_methods
+                .iter()
+                .chain(data.virtual_methods.iter())
+            {
+                let Ok(Some(code)) = dex.code_item(m.code_off) else {
+                    continue;
+                };
+                let Ok(insns) = decode_all(&code.insns) else {
+                    continue;
+                };
                 for ins in &insns {
                     // ins.idx is a field index only on field insns —
                     // the same number indexes strings/types/methods on
@@ -43,8 +60,7 @@ fn main() {
                     if is_field_insn {
                         if let Some(ix) = ins.idx {
                             if tgt.contains(&ix) {
-                                let o =
-                                    dex.type_descriptor(cd.class_idx).unwrap_or_default();
+                                let o = dex.type_descriptor(cd.class_idx).unwrap_or_default();
                                 let mn = dex
                                     .string(dex.method(m.method_idx).unwrap().name_idx)
                                     .unwrap_or_default();

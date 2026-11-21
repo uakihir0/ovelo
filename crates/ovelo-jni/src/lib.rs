@@ -56,7 +56,10 @@ mod tests {
         let m = r.resolve("LFoo;", "n", "(I)I").unwrap();
         assert_eq!(m.fn_ptr, 0x4000);
         assert!(!m.is_static);
-        assert_eq!(r.resolve("LFoo;", "n", "()V").unwrap_err().cause(), "jni.native.unbound");
+        assert_eq!(
+            r.resolve("LFoo;", "n", "()V").unwrap_err().cause(),
+            "jni.native.unbound"
+        );
         r.unregister_class("LFoo;");
         assert!(r.is_empty());
     }

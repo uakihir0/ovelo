@@ -83,10 +83,7 @@ pub fn split_kind(split: Option<&str>) -> SplitKind {
         return SplitKind::Density(d.1);
     }
     // Numeric densities ('420dpi') need no bucket entry.
-    if let Some(dpi) = cfg
-        .strip_suffix("dpi")
-        .and_then(|n| n.parse::<u32>().ok())
-    {
+    if let Some(dpi) = cfg.strip_suffix("dpi").and_then(|n| n.parse::<u32>().ok()) {
         return SplitKind::Density(dpi);
     }
     // `_` is a separator variant (`config.arm64_v8a`).
@@ -197,15 +194,13 @@ pub fn validate_split_set(inputs: &[SplitInput]) -> Result<Vec<SplitMember>> {
         return Err(err("split.base.count").with_detail(format!("{bases}")));
     }
     // configForSplit must point at a member of this set.
-    let names: std::collections::HashSet<&str> =
-        members.iter().map(|m| m.name.as_str()).collect();
+    let names: std::collections::HashSet<&str> = members.iter().map(|m| m.name.as_str()).collect();
     for m in &members {
         if let Some(t) = &m.config_for {
             if !names.contains(t.as_str()) {
-                return Err(err("split.config_target.missing").with_detail(format!(
-                    "{} -> {t}",
-                    m.name
-                )));
+                return Err(
+                    err("split.config_target.missing").with_detail(format!("{} -> {t}", m.name))
+                );
             }
         }
     }
@@ -221,7 +216,10 @@ fn norm_locale(l: &str) -> String {
 /// Pick the members to install for `profile`: the base always; for each
 /// config dimension the best-matching split (first in `abis`/`locales`
 /// order; nearest density bucket); feature splits pass through.
-pub fn resolve_splits<'m>(members: &'m [SplitMember], profile: &DeviceProfile) -> Vec<&'m SplitMember> {
+pub fn resolve_splits<'m>(
+    members: &'m [SplitMember],
+    profile: &DeviceProfile,
+) -> Vec<&'m SplitMember> {
     let mut picked: Vec<&SplitMember> = Vec::new();
     let mut abi: Option<&SplitMember> = None;
     let mut density: Option<&SplitMember> = None;
@@ -233,12 +231,18 @@ pub fn resolve_splits<'m>(members: &'m [SplitMember], profile: &DeviceProfile) -
                 // `universal` ranks after every listed ABI but still
                 // serves as the fallback when nothing specific matches.
                 let rank = |s: &SplitMember| {
-                    let SplitKind::Abi(n) = &s.kind else { return usize::MAX };
+                    let SplitKind::Abi(n) = &s.kind else {
+                        return usize::MAX;
+                    };
                     profile
                         .abis
                         .iter()
                         .position(|p| p == n)
-                        .unwrap_or(if n == "universal" { profile.abis.len() } else { usize::MAX })
+                        .unwrap_or(if n == "universal" {
+                            profile.abis.len()
+                        } else {
+                            usize::MAX
+                        })
                 };
                 let better = match abi {
                     None => rank(m) != usize::MAX,
@@ -252,7 +256,9 @@ pub fn resolve_splits<'m>(members: &'m [SplitMember], profile: &DeviceProfile) -
                 let better = match density {
                     None => true,
                     Some(cur) => {
-                        let SplitKind::Density(cd) = cur.kind else { unreachable!() };
+                        let SplitKind::Density(cd) = cur.kind else {
+                            unreachable!()
+                        };
                         (d.abs_diff(profile.density), m.name.as_str())
                             < (cd.abs_diff(profile.density), cur.name.as_str())
                     }
@@ -351,16 +357,37 @@ mod tests {
     #[test]
     fn classifies_split_names() {
         assert_eq!(split_kind(None), SplitKind::Base);
-        assert_eq!(split_kind(Some("config.arm64-v8a")), SplitKind::Abi("arm64-v8a".into()));
+        assert_eq!(
+            split_kind(Some("config.arm64-v8a")),
+            SplitKind::Abi("arm64-v8a".into())
+        );
         assert_eq!(split_kind(Some("config.xhdpi")), SplitKind::Density(320));
-        assert_eq!(split_kind(Some("config.ja")), SplitKind::Locale("ja".into()));
+        assert_eq!(
+            split_kind(Some("config.ja")),
+            SplitKind::Locale("ja".into())
+        );
         assert_eq!(split_kind(Some("config.x86")), SplitKind::Abi("x86".into()));
-        assert_eq!(split_kind(Some("config.x86_64")), SplitKind::Abi("x86-64".into()));
-        assert_eq!(split_kind(Some("config.arm64_v8a")), SplitKind::Abi("arm64-v8a".into()));
+        assert_eq!(
+            split_kind(Some("config.x86_64")),
+            SplitKind::Abi("x86-64".into())
+        );
+        assert_eq!(
+            split_kind(Some("config.arm64_v8a")),
+            SplitKind::Abi("arm64-v8a".into())
+        );
         assert_eq!(split_kind(Some("config.420dpi")), SplitKind::Density(420));
-        assert_eq!(split_kind(Some("config.en-rUS")), SplitKind::Locale("en-rUS".into()));
-        assert_eq!(split_kind(Some("config.en_US")), SplitKind::Locale("en_US".into()));
-        assert_eq!(split_kind(Some("feature_x")), SplitKind::Feature("feature_x".into()));
+        assert_eq!(
+            split_kind(Some("config.en-rUS")),
+            SplitKind::Locale("en-rUS".into())
+        );
+        assert_eq!(
+            split_kind(Some("config.en_US")),
+            SplitKind::Locale("en_US".into())
+        );
+        assert_eq!(
+            split_kind(Some("feature_x")),
+            SplitKind::Feature("feature_x".into())
+        );
     }
 
     #[test]
@@ -379,19 +406,23 @@ mod tests {
         assert!(validate_split_set(&[
             inp("b.apk", None, "com.a", 1, "s"),
             inp("a.apk", Some("config.en"), "com.b", 1, "s"),
-        ]).is_err());
+        ])
+        .is_err());
         assert!(validate_split_set(&[
             inp("b.apk", None, "com.a", 1, "s"),
             inp("a.apk", Some("config.en"), "com.a", 2, "s"),
-        ]).is_err());
+        ])
+        .is_err());
         assert!(validate_split_set(&[
             inp("b.apk", None, "com.a", 1, "s"),
             inp("a.apk", Some("config.en"), "com.a", 1, "other"),
-        ]).is_err());
+        ])
+        .is_err());
         assert!(validate_split_set(&[
             inp("b1.apk", None, "com.a", 1, "s"),
             inp("b2.apk", None, "com.a", 1, "s"),
-        ]).is_err());
+        ])
+        .is_err());
     }
 
     #[test]

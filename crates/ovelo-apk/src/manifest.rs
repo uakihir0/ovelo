@@ -383,9 +383,7 @@ pub fn parse_axml(b: &[u8]) -> Result<Vec<Element>> {
                             .or_else(|| {
                                 // Fall back to the resource map id name, which
                                 // AOSP manifests encode for android: attrs.
-                                res_map
-                                    .get(aname as usize)
-                                    .map(|id| format!("@0x{id:08x}"))
+                                res_map.get(aname as usize).map(|id| format!("@0x{id:08x}"))
                             })
                             .ok_or_else(|| err("axml.attr.name_oob"))?
                     };
@@ -401,17 +399,11 @@ pub fn parse_axml(b: &[u8]) -> Result<Vec<Element>> {
                         value,
                     });
                 }
-                elements.push(Element {
-                    name,
-                    attrs,
-                    depth,
-                });
+                elements.push(Element { name, attrs, depth });
                 depth += 1;
             }
             RES_XML_END_ELEMENT_TYPE => depth = depth.saturating_sub(1),
-            RES_XML_START_NAMESPACE_TYPE
-            | RES_XML_END_NAMESPACE_TYPE
-            | RES_XML_CDATA_TYPE => {}
+            RES_XML_START_NAMESPACE_TYPE | RES_XML_END_NAMESPACE_TYPE | RES_XML_CDATA_TYPE => {}
             _ => {} // ignore unknown chunk types
         }
     }
@@ -548,14 +540,14 @@ pub fn parse_manifest(b: &[u8]) -> Result<ManifestInfo> {
                             _ => None,
                         })
                         .unwrap_or(0);
-                    info.version_name = el
-                        .attrs
-                        .iter()
-                        .find(|a| a.name == "versionName")
-                        .and_then(|a| match &a.value {
-                            Value::Str(s) => Some(s.clone()),
-                            _ => None,
-                        });
+                    info.version_name =
+                        el.attrs
+                            .iter()
+                            .find(|a| a.name == "versionName")
+                            .and_then(|a| match &a.value {
+                                Value::Str(s) => Some(s.clone()),
+                                _ => None,
+                            });
                     info.split = el
                         .attrs
                         .iter()
@@ -585,9 +577,7 @@ pub fn parse_manifest(b: &[u8]) -> Result<ManifestInfo> {
                 }
             }
             "application" => {
-                info.application_class = el
-                    .android_str("name")
-                    .map(|n| qualify(&info.package, n));
+                info.application_class = el.android_str("name").map(|n| qualify(&info.package, n));
                 info.theme = match el.android("theme") {
                     Some(Value::Reference(r)) => Some(*r),
                     _ => None,
@@ -612,15 +602,13 @@ pub fn parse_manifest(b: &[u8]) -> Result<ManifestInfo> {
                     let q = qualify(&info.package, n);
                     info.activities.push(q.clone());
                     // An alias launches its targetActivity, not itself.
-                    cur_activity_for_filter = Some(
-                        if el.name == "activity-alias" {
-                            el.android_str("targetActivity")
-                                .map(|t| qualify(&info.package, t))
-                                .unwrap_or_else(|| q.clone())
-                        } else {
-                            q.clone()
-                        },
-                    );
+                    cur_activity_for_filter = Some(if el.name == "activity-alias" {
+                        el.android_str("targetActivity")
+                            .map(|t| qualify(&info.package, t))
+                            .unwrap_or_else(|| q.clone())
+                    } else {
+                        q.clone()
+                    });
                     if let Some(Value::Reference(t)) = el.android("theme") {
                         info.activity_themes.insert(q, *t);
                     }
@@ -644,8 +632,7 @@ pub fn parse_manifest(b: &[u8]) -> Result<ManifestInfo> {
                 }
             }
             "meta-data"
-                if cur_provider.as_deref()
-                    == Some("androidx.startup.InitializationProvider")
+                if cur_provider.as_deref() == Some("androidx.startup.InitializationProvider")
                     && el.android_str("value") == Some("androidx.startup") =>
             {
                 if let Some(n) = el.android_str("name") {
@@ -658,8 +645,7 @@ pub fn parse_manifest(b: &[u8]) -> Result<ManifestInfo> {
                 filter_launcher = false;
             }
             "action"
-                if in_filter
-                    && el.android_str("name") == Some("android.intent.action.MAIN") =>
+                if in_filter && el.android_str("name") == Some("android.intent.action.MAIN") =>
             {
                 filter_main = true;
             }

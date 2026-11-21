@@ -166,7 +166,8 @@ impl<'a> Canvas<'a> {
         for row in 0..g.h {
             for col in 0..g.w {
                 let cov = g.cov[row * g.w + col];
-                self.surf.blend_pixel(gx + col as i32, gy + row as i32, c, cov);
+                self.surf
+                    .blend_pixel(gx + col as i32, gy + row as i32, c, cov);
             }
         }
     }

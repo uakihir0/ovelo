@@ -91,7 +91,11 @@ impl VkSurface {
 
     /// `vkCreateSwapchainKHR` — `images` slot count, `format` must be in
     /// [`SURFACE_FORMATS`].
-    pub fn create_swapchain(&mut self, format: &str, images: usize) -> Result<VkSwapchain, OveloError> {
+    pub fn create_swapchain(
+        &mut self,
+        format: &str,
+        images: usize,
+    ) -> Result<VkSwapchain, OveloError> {
         if self.destroyed {
             return Err(err("ui.surface.destroyed"));
         }
@@ -150,7 +154,10 @@ mod tests {
     #[test]
     fn surface_swapchain_present() {
         let inst = VkInstance::create(INSTANCE_EXTENSIONS).unwrap();
-        let mut surf = VkSurface::create(&inst, ANativeWindow::new(BufferQueue::new(2, 4, 4).unwrap()));
+        let mut surf = VkSurface::create(
+            &inst,
+            ANativeWindow::new(BufferQueue::new(2, 4, 4).unwrap()),
+        );
         let mut sc = surf.create_swapchain("VK_FORMAT_R8G8B8A8_SRGB", 3).unwrap();
         assert!(surf.create_swapchain("VK_FORMAT_D16", 3).is_err());
         assert!(surf.window.unlock_and_post().is_err()); // nothing locked

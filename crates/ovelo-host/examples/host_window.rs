@@ -43,8 +43,7 @@ impl ApplicationHandler for App {
             }
             WindowEvent::KeyboardInput { event, .. } => {
                 if event.state == ElementState::Pressed {
-                    if let Some(k) = ovelo_host::map_host_key(&event.logical_key, self.cmd)
-                    {
+                    if let Some(k) = ovelo_host::map_host_key(&event.logical_key, self.cmd) {
                         println!("host key: {k:?}");
                     }
                 }

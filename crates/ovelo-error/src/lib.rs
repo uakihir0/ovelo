@@ -106,11 +106,7 @@ pub struct OveloError {
 
 impl OveloError {
     /// Create an error in `category`/`phase` with a machine-readable `cause`.
-    pub fn new(
-        category: ErrorCategory,
-        phase: Phase,
-        cause: impl Into<String>,
-    ) -> Self {
+    pub fn new(category: ErrorCategory, phase: Phase, cause: impl Into<String>) -> Self {
         Self {
             category,
             phase,

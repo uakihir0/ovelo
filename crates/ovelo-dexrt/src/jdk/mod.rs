@@ -124,8 +124,7 @@ pub(crate) fn host(vm: &mut Vm, desc: &str, state: HostState) -> V {
 /// identity, so both must return the same handle.
 pub(crate) fn main_thread(vm: &mut Vm) -> V {
     if vm.main_thread_h == 0 {
-        let V::Ref(h) = host(vm, "Ljava/lang/Thread;", HostState::StrBuf("main".into()))
-        else {
+        let V::Ref(h) = host(vm, "Ljava/lang/Thread;", HostState::StrBuf("main".into())) else {
             unreachable!()
         };
         vm.main_thread_h = h;
@@ -138,8 +137,7 @@ pub(crate) fn main_thread(vm: &mut Vm) -> V {
 /// source must hand back the same handle.
 pub(crate) fn main_looper(vm: &mut Vm) -> V {
     if vm.main_looper_h == 0 {
-        let V::Ref(h) = host(vm, "Landroid/os/Looper;", HostState::Empty)
-        else {
+        let V::Ref(h) = host(vm, "Landroid/os/Looper;", HostState::Empty) else {
             unreachable!()
         };
         vm.main_looper_h = h;
@@ -151,8 +149,7 @@ pub(crate) fn main_looper(vm: &mut Vm) -> V {
 /// `assertNotMainThread`-style checks pass inside executor work.
 pub(crate) fn worker_thread(vm: &mut Vm) -> V {
     if vm.worker_thread_h == 0 {
-        let V::Ref(h) = host(vm, "Ljava/lang/Thread;", HostState::StrBuf("worker".into()))
-        else {
+        let V::Ref(h) = host(vm, "Ljava/lang/Thread;", HostState::StrBuf("worker".into())) else {
             unreachable!()
         };
         vm.worker_thread_h = h;
@@ -196,8 +193,7 @@ pub(crate) fn run_on_main(
 /// so it must be Application-typed, not the Activity receiver.
 pub(crate) fn app_object(vm: &mut Vm) -> V {
     if vm.app_h == 0 {
-        let V::Ref(h) = host(vm, "Landroid/app/Application;", HostState::Empty)
-        else {
+        let V::Ref(h) = host(vm, "Landroid/app/Application;", HostState::Empty) else {
             unreachable!()
         };
         vm.app_h = h;
@@ -255,22 +251,17 @@ pub(crate) fn v_to_s(vm: &mut Vm, v: V) -> String {
         V::Ref(h) => match vm.heap.get(h) {
             Some(Obj::Str(t)) => t.clone(),
             Some(Obj::Host { desc, state, .. }) => match state {
-                HostState::StrBuf(t) | HostState::Path(t) | HostState::Regex(t) => {
-                    t.clone()
-                }
+                HostState::StrBuf(t) | HostState::Path(t) | HostState::Regex(t) => t.clone(),
                 HostState::Slot(inner) => v_to_s(vm, *inner),
                 HostState::Millis(ms) => time::date_to_string(*ms),
                 HostState::List(l) => {
-                    let parts: Vec<String> =
-                        l.iter().map(|e| shallow_s(vm, *e)).collect();
+                    let parts: Vec<String> = l.iter().map(|e| shallow_s(vm, *e)).collect();
                     format!("[{}]", parts.join(", "))
                 }
                 HostState::Map(m) => {
                     let parts: Vec<String> = m
                         .iter()
-                        .map(|(k, v)| {
-                            format!("{}={}", shallow_s(vm, *k), shallow_s(vm, *v))
-                        })
+                        .map(|(k, v)| format!("{}={}", shallow_s(vm, *k), shallow_s(vm, *v)))
                         .collect();
                     format!("{{{}}}", parts.join(", "))
                 }
@@ -292,9 +283,7 @@ pub(crate) fn v_to_s(vm: &mut Vm, v: V) -> String {
                 }
             }
             Some(Obj::Class { type_idx }) => {
-                let d = vm
-                    .type_desc_of(*type_idx)
-                    .unwrap_or_else(|_| "?".into());
+                let d = vm.type_desc_of(*type_idx).unwrap_or_else(|_| "?".into());
                 format!("class {}", d.trim_start_matches('L').trim_end_matches(';'))
             }
             Some(Obj::Array { elem, .. }) => format!("[{elem}@{h:x}"),
@@ -358,14 +347,9 @@ pub(crate) fn dotted(desc: &str) -> String {
         .replace('/', ".")
 }
 
-pub(crate) fn fields_mut(
-    vm: &mut Vm,
-    h: u32,
-) -> Option<&mut HashMap<u64, V>> {
+pub(crate) fn fields_mut(vm: &mut Vm, h: u32) -> Option<&mut HashMap<u64, V>> {
     match vm.heap.get_mut(h) {
-        Some(Obj::Instance { fields, .. }) | Some(Obj::Host { fields, .. }) => {
-            Some(fields)
-        }
+        Some(Obj::Instance { fields, .. }) | Some(Obj::Host { fields, .. }) => Some(fields),
         _ => None,
     }
 }
@@ -521,7 +505,10 @@ pub(crate) fn map_get(vm: &Vm, h: u32, k: V) -> Option<V> {
         Some(Obj::Host {
             state: HostState::Map(m),
             ..
-        }) => m.iter().find(|(ek, _)| value_eq(vm, *ek, k)).map(|(_, v)| *v),
+        }) => m
+            .iter()
+            .find(|(ek, _)| value_eq(vm, *ek, k))
+            .map(|(_, v)| *v),
         _ => None,
     }
 }
@@ -608,9 +595,9 @@ pub(crate) fn ret(sig: &str) -> &str {
 pub(crate) fn class_of(vm: &Vm, v: V) -> String {
     match v {
         V::Ref(h) => match vm.heap.get(h) {
-            Some(Obj::Instance { class_idx, .. }) => vm
-                .type_desc_of(*class_idx)
-                .unwrap_or_else(|_| OBJ.into()),
+            Some(Obj::Instance { class_idx, .. }) => {
+                vm.type_desc_of(*class_idx).unwrap_or_else(|_| OBJ.into())
+            }
             Some(Obj::Host { desc, .. }) => desc.clone(),
             Some(Obj::Str(_)) => STRING.into(),
             Some(Obj::Class { .. }) => "Ljava/lang/Class;".into(),
@@ -669,13 +656,7 @@ pub(crate) fn call(
 }
 
 /// Methods that mean the same thing on every object.
-fn universal(
-    vm: &mut Vm,
-    class: &str,
-    name: &str,
-    sig: &str,
-    args: &[V],
-) -> Rt<Option<Option<V>>> {
+fn universal(vm: &mut Vm, class: &str, name: &str, sig: &str, args: &[V]) -> Rt<Option<Option<V>>> {
     Ok(match name {
         "toString" if ret(sig) == STRING => {
             let t = v_to_s(vm, args[0]);
@@ -706,7 +687,6 @@ fn universal(
         }
     })
 }
-
 
 // ---------------------------------------------------------------------
 // static fields
@@ -792,25 +772,53 @@ pub(crate) fn sfield(vm: &mut Vm, owner: &str, name: &str, ftype: &str) -> Optio
             ))
         }
         ("Ljava/util/Locale;", "ENGLISH") => {
-            return Some(host(vm, "Ljava/util/Locale;", HostState::StrBuf("en".into())))
+            return Some(host(
+                vm,
+                "Ljava/util/Locale;",
+                HostState::StrBuf("en".into()),
+            ))
         }
         ("Ljava/util/Locale;", "US") => {
-            return Some(host(vm, "Ljava/util/Locale;", HostState::StrBuf("en-US".into())))
+            return Some(host(
+                vm,
+                "Ljava/util/Locale;",
+                HostState::StrBuf("en-US".into()),
+            ))
         }
         ("Ljava/util/Locale;", "UK") => {
-            return Some(host(vm, "Ljava/util/Locale;", HostState::StrBuf("en-GB".into())))
+            return Some(host(
+                vm,
+                "Ljava/util/Locale;",
+                HostState::StrBuf("en-GB".into()),
+            ))
         }
         ("Ljava/util/Locale;", "JAPAN" | "JAPANESE") => {
-            return Some(host(vm, "Ljava/util/Locale;", HostState::StrBuf("ja-JP".into())))
+            return Some(host(
+                vm,
+                "Ljava/util/Locale;",
+                HostState::StrBuf("ja-JP".into()),
+            ))
         }
         ("Ljava/util/Locale;", "GERMAN" | "GERMANY") => {
-            return Some(host(vm, "Ljava/util/Locale;", HostState::StrBuf("de-DE".into())))
+            return Some(host(
+                vm,
+                "Ljava/util/Locale;",
+                HostState::StrBuf("de-DE".into()),
+            ))
         }
         ("Ljava/util/Locale;", "FRENCH" | "FRANCE") => {
-            return Some(host(vm, "Ljava/util/Locale;", HostState::StrBuf("fr-FR".into())))
+            return Some(host(
+                vm,
+                "Ljava/util/Locale;",
+                HostState::StrBuf("fr-FR".into()),
+            ))
         }
         ("Ljava/util/Locale;", "CHINESE" | "CHINA" | "SIMPLIFIED_CHINESE") => {
-            return Some(host(vm, "Ljava/util/Locale;", HostState::StrBuf("zh-CN".into())))
+            return Some(host(
+                vm,
+                "Ljava/util/Locale;",
+                HostState::StrBuf("zh-CN".into()),
+            ))
         }
         ("Ljava/util/Locale;", "ROOT") => {
             return Some(host(vm, "Ljava/util/Locale;", HostState::StrBuf("".into())))
@@ -870,25 +878,25 @@ pub(crate) fn sfield(vm: &mut Vm, owner: &str, name: &str, ftype: &str) -> Optio
             return Some(jstr(vm, "15"))
         }
         ("Landroid/os/Build$VERSION;", "CODENAME") => return Some(jstr(vm, "REL")),
-        ("Landroid/os/Build$VERSION;", "INCREMENTAL") => {
-            return Some(jstr(vm, "ovelo"))
-        }
-        ("Landroid/os/Build;", "DEVICE" | "MODEL" | "PRODUCT" | "HARDWARE"
-        | "BOARD" | "DISPLAY" | "ID") => return Some(jstr(vm, "ovelo")),
-        ("Landroid/os/Build;", "MANUFACTURER" | "BRAND") => {
-            return Some(jstr(vm, "ovelo"))
-        }
-        ("Landroid/os/Build;", "FINGERPRINT" | "HOST" | "TAGS" | "TYPE"
-        | "BOOTLOADER" | "RADIO" | "SERIAL" | "SOC_MANUFACTURER"
-        | "SOC_MODEL" | "ODM_SKU" | "SKU") => return Some(jstr(vm, "ovelo")),
-        ("Landroid/os/Build;", "SUPPORTED_ABIS" | "SUPPORTED_32_BIT_ABIS"
-        | "SUPPORTED_64_BIT_ABIS") => {
+        ("Landroid/os/Build$VERSION;", "INCREMENTAL") => return Some(jstr(vm, "ovelo")),
+        (
+            "Landroid/os/Build;",
+            "DEVICE" | "MODEL" | "PRODUCT" | "HARDWARE" | "BOARD" | "DISPLAY" | "ID",
+        ) => return Some(jstr(vm, "ovelo")),
+        ("Landroid/os/Build;", "MANUFACTURER" | "BRAND") => return Some(jstr(vm, "ovelo")),
+        (
+            "Landroid/os/Build;",
+            "FINGERPRINT" | "HOST" | "TAGS" | "TYPE" | "BOOTLOADER" | "RADIO" | "SERIAL"
+            | "SOC_MANUFACTURER" | "SOC_MODEL" | "ODM_SKU" | "SKU",
+        ) => return Some(jstr(vm, "ovelo")),
+        (
+            "Landroid/os/Build;",
+            "SUPPORTED_ABIS" | "SUPPORTED_32_BIT_ABIS" | "SUPPORTED_64_BIT_ABIS",
+        ) => {
             let abi = jstr(vm, "arm64-v8a");
-            return Some(arr(vm, STRING, vec![abi]))
+            return Some(arr(vm, STRING, vec![abi]));
         }
-        ("Landroid/os/Build;", "CPU_ABI" | "CPU_ABI2") => {
-            return Some(jstr(vm, "arm64-v8a"))
-        }
+        ("Landroid/os/Build;", "CPU_ABI" | "CPU_ABI2") => return Some(jstr(vm, "arm64-v8a")),
         ("Landroid/os/Build$VERSION_CODES;", n) => V::I32(match n {
             "BASE" => 1,
             "DONUT" => 4,
@@ -913,9 +921,7 @@ pub(crate) fn sfield(vm: &mut Vm, owner: &str, name: &str, ftype: &str) -> Optio
             _ => 35,
         }),
         (o, "SDK_INT") if o.starts_with("Landroid/os/Build") => V::I32(35),
-        ("Landroid/content/Context;", n) => {
-            return Some(jstr(vm, context_service_name(n)))
-        }
+        ("Landroid/content/Context;", n) => return Some(jstr(vm, context_service_name(n))),
         ("Landroid/content/Intent;", n) if n.starts_with("ACTION_") => {
             let a = n
                 .trim_start_matches("ACTION_")
@@ -923,8 +929,11 @@ pub(crate) fn sfield(vm: &mut Vm, owner: &str, name: &str, ftype: &str) -> Optio
                 .replace('_', ".");
             return Some(jstr(
                 vm,
-                &format!("android.intent.action.{}", a.to_uppercase().replace('.', "_")),
-            ))
+                &format!(
+                    "android.intent.action.{}",
+                    a.to_uppercase().replace('.', "_")
+                ),
+            ));
         }
         ("Landroid/content/Intent;", n) if n.starts_with("CATEGORY_") => {
             let a = n
@@ -933,8 +942,11 @@ pub(crate) fn sfield(vm: &mut Vm, owner: &str, name: &str, ftype: &str) -> Optio
                 .replace('_', ".");
             return Some(jstr(
                 vm,
-                &format!("android.intent.category.{}", a.to_uppercase().replace('.', "_")),
-            ))
+                &format!(
+                    "android.intent.category.{}",
+                    a.to_uppercase().replace('.', "_")
+                ),
+            ));
         }
         ("Landroid/content/Intent;", n) if n.starts_with("EXTRA_") => {
             let a = n
@@ -943,24 +955,17 @@ pub(crate) fn sfield(vm: &mut Vm, owner: &str, name: &str, ftype: &str) -> Optio
                 .replace('_', ".");
             return Some(jstr(
                 vm,
-                &format!("android.intent.extra.{}", a.to_uppercase().replace('.', "_")),
-            ))
+                &format!(
+                    "android.intent.extra.{}",
+                    a.to_uppercase().replace('.', "_")
+                ),
+            ));
         }
-        ("Landroid/content/Intent;", "FLAG_ACTIVITY_NEW_TASK") => {
-            V::I32(0x10000000)
-        }
-        ("Landroid/content/Intent;", "FLAG_ACTIVITY_CLEAR_TOP") => {
-            V::I32(0x04000000)
-        }
-        ("Landroid/content/Intent;", "FLAG_ACTIVITY_SINGLE_TOP") => {
-            V::I32(0x20000000)
-        }
-        ("Landroid/content/Intent;", "FLAG_GRANT_READ_URI_PERMISSION") => {
-            V::I32(1)
-        }
-        ("Landroid/content/Intent;", "FLAG_GRANT_WRITE_URI_PERMISSION") => {
-            V::I32(2)
-        }
+        ("Landroid/content/Intent;", "FLAG_ACTIVITY_NEW_TASK") => V::I32(0x10000000),
+        ("Landroid/content/Intent;", "FLAG_ACTIVITY_CLEAR_TOP") => V::I32(0x04000000),
+        ("Landroid/content/Intent;", "FLAG_ACTIVITY_SINGLE_TOP") => V::I32(0x20000000),
+        ("Landroid/content/Intent;", "FLAG_GRANT_READ_URI_PERMISSION") => V::I32(1),
+        ("Landroid/content/Intent;", "FLAG_GRANT_WRITE_URI_PERMISSION") => V::I32(2),
         ("Lorg/json/JSONObject;", "NULL") => {
             return Some(host(vm, "Lorg/json/JSONObject$Null;", HostState::Empty))
         }
@@ -1037,7 +1042,6 @@ fn context_service_name(n: &str) -> &'static str {
     }
 }
 
-
 // ---------------------------------------------------------------------
 // instance fields
 
@@ -1056,9 +1060,7 @@ pub(crate) fn ifield(vm: &Vm, h: u32, owner: &str, name: &str) -> Option<V> {
         ("Landroid/content/pm/PackageInfo;", "versionName") => {
             Some(V::Ref(0)) // caller lacks str context; guests tolerate null
         }
-        ("Landroid/content/pm/ApplicationInfo;", "targetSdkVersion") => {
-            Some(V::I32(35))
-        }
+        ("Landroid/content/pm/ApplicationInfo;", "targetSdkVersion") => Some(V::I32(35)),
         ("Landroid/content/pm/ApplicationInfo;", "minSdkVersion") => Some(V::I32(21)),
         ("Landroid/content/pm/ApplicationInfo;", "flags") => Some(V::I32(0)),
         ("Landroid/os/Message;", "what" | "arg1" | "arg2") => Some(V::I32(0)),
@@ -1084,9 +1086,7 @@ pub(crate) fn ifield(vm: &Vm, h: u32, owner: &str, name: &str) -> Option<V> {
         }
         ("Landroid/content/res/Configuration;", "orientation") => Some(V::I32(1)),
         ("Landroid/content/res/Configuration;", "screenWidthDp")
-        | ("Landroid/content/res/Configuration;", "screenHeightDp") => {
-            Some(V::I32(360))
-        }
+        | ("Landroid/content/res/Configuration;", "screenHeightDp") => Some(V::I32(360)),
         _ => None,
     }
 }
@@ -1111,11 +1111,9 @@ pub(crate) fn host_supers(d: &str) -> &'static [&'static str] {
         "Ljava/lang/CharSequence;" => &[OBJ],
         "Ljava/lang/Comparable;" => &[OBJ],
         "Ljava/io/Serializable;" => &[OBJ],
-        "Ljava/lang/AbstractStringBuilder;" => &[
-            "Ljava/lang/Appendable;",
-            "Ljava/lang/CharSequence;",
-            OBJ,
-        ],
+        "Ljava/lang/AbstractStringBuilder;" => {
+            &["Ljava/lang/Appendable;", "Ljava/lang/CharSequence;", OBJ]
+        }
         "Ljava/lang/StringBuilder;" => &[
             "Ljava/lang/AbstractStringBuilder;",
             "Ljava/lang/Appendable;",
@@ -1138,12 +1136,8 @@ pub(crate) fn host_supers(d: &str) -> &'static [&'static str] {
         "Ljava/lang/Byte;" => &["Ljava/lang/Number;", "Ljava/lang/Comparable;", OBJ],
         "Ljava/lang/Double;" => &["Ljava/lang/Number;", "Ljava/lang/Comparable;", OBJ],
         "Ljava/lang/Float;" => &["Ljava/lang/Number;", "Ljava/lang/Comparable;", OBJ],
-        "Ljava/math/BigInteger;" => {
-            &["Ljava/lang/Number;", "Ljava/lang/Comparable;", OBJ]
-        }
-        "Ljava/math/BigDecimal;" => {
-            &["Ljava/lang/Number;", "Ljava/lang/Comparable;", OBJ]
-        }
+        "Ljava/math/BigInteger;" => &["Ljava/lang/Number;", "Ljava/lang/Comparable;", OBJ],
+        "Ljava/math/BigDecimal;" => &["Ljava/lang/Number;", "Ljava/lang/Comparable;", OBJ],
         "Ljava/lang/Character;" => &["Ljava/lang/Comparable;", "Ljava/io/Serializable;", OBJ],
         "Ljava/lang/Boolean;" => &["Ljava/lang/Comparable;", "Ljava/io/Serializable;", OBJ],
         "Ljava/lang/Thread;" => &["Ljava/lang/Runnable;", OBJ],
@@ -1154,8 +1148,12 @@ pub(crate) fn host_supers(d: &str) -> &'static [&'static str] {
         "Ljava/lang/Enum;" => &["Ljava/lang/Comparable;", "Ljava/io/Serializable;", OBJ],
         "Ljava/lang/Throwable;" => &["Ljava/io/Serializable;", OBJ],
         "Ljava/lang/StackTraceElement;" => &["Ljava/io/Serializable;", OBJ],
-        "Ljava/lang/System;" | "Ljava/lang/Math;" | "Ljava/lang/StrictMath;"
-        | "Ljava/lang/Runtime;" | "Ljava/lang/Process;" | "Ljava/lang/Void;" => &[OBJ],
+        "Ljava/lang/System;"
+        | "Ljava/lang/Math;"
+        | "Ljava/lang/StrictMath;"
+        | "Ljava/lang/Runtime;"
+        | "Ljava/lang/Process;"
+        | "Ljava/lang/Void;" => &[OBJ],
         // ----- java.util collection tree
         "Ljava/lang/Iterable;" => &[OBJ],
         "Ljava/util/Collection;" => &["Ljava/lang/Iterable;", OBJ],
@@ -1320,49 +1318,31 @@ pub(crate) fn host_supers(d: &str) -> &'static [&'static str] {
             "Ljava/io/Serializable;",
             OBJ,
         ],
-        "Ljava/util/Properties;" => &[
-            "Ljava/util/Hashtable;",
-            "Ljava/util/Map;",
-            OBJ,
-        ],
+        "Ljava/util/Properties;" => &["Ljava/util/Hashtable;", "Ljava/util/Map;", OBJ],
         "Ljava/util/Dictionary;" => &[OBJ],
-        "Ljava/util/WeakHashMap;" => &[
-            "Ljava/util/AbstractMap;",
-            "Ljava/util/Map;",
-            OBJ,
-        ],
-        "Ljava/util/IdentityHashMap;" => &[
-            "Ljava/util/AbstractMap;",
-            "Ljava/util/Map;",
-            OBJ,
-        ],
+        "Ljava/util/WeakHashMap;" => &["Ljava/util/AbstractMap;", "Ljava/util/Map;", OBJ],
+        "Ljava/util/IdentityHashMap;" => &["Ljava/util/AbstractMap;", "Ljava/util/Map;", OBJ],
         "Ljava/util/concurrent/ConcurrentHashMap;" => &[
             "Ljava/util/AbstractMap;",
             "Ljava/util/concurrent/ConcurrentMap;",
             "Ljava/util/Map;",
             OBJ,
         ],
-        "Ljava/util/concurrent/ConcurrentLinkedQueue;" => &[
-            "Ljava/util/AbstractQueue;",
-            "Ljava/util/Queue;",
-            OBJ,
-        ],
-        "Ljava/util/concurrent/ConcurrentLinkedDeque;" => &[
-            "Ljava/util/AbstractCollection;",
-            "Ljava/util/Deque;",
-            OBJ,
-        ],
+        "Ljava/util/concurrent/ConcurrentLinkedQueue;" => {
+            &["Ljava/util/AbstractQueue;", "Ljava/util/Queue;", OBJ]
+        }
+        "Ljava/util/concurrent/ConcurrentLinkedDeque;" => {
+            &["Ljava/util/AbstractCollection;", "Ljava/util/Deque;", OBJ]
+        }
         "Ljava/util/concurrent/CopyOnWriteArrayList;" => &[
             "Ljava/util/List;",
             "Ljava/util/Collection;",
             "Ljava/lang/Iterable;",
             OBJ,
         ],
-        "Ljava/util/concurrent/CopyOnWriteArraySet;" => &[
-            "Ljava/util/AbstractSet;",
-            "Ljava/util/Set;",
-            OBJ,
-        ],
+        "Ljava/util/concurrent/CopyOnWriteArraySet;" => {
+            &["Ljava/util/AbstractSet;", "Ljava/util/Set;", OBJ]
+        }
         "Ljava/util/concurrent/atomic/AtomicReference;" => &[OBJ],
         "Ljava/util/concurrent/atomic/AtomicInteger;" => &["Ljava/lang/Number;", OBJ],
         "Ljava/util/concurrent/atomic/AtomicLong;" => &["Ljava/lang/Number;", OBJ],
@@ -1378,38 +1358,40 @@ pub(crate) fn host_supers(d: &str) -> &'static [&'static str] {
         "Ljava/util/concurrent/CountDownLatch;" => &[OBJ],
         "Ljava/util/concurrent/Semaphore;" => &["Ljava/io/Serializable;", OBJ],
         "Ljava/util/concurrent/TimeUnit;" => &["Ljava/lang/Enum;", OBJ],
-        "Ljava/util/concurrent/Executor;" | "Ljava/util/concurrent/ExecutorService;"
+        "Ljava/util/concurrent/Executor;"
+        | "Ljava/util/concurrent/ExecutorService;"
         | "Ljava/util/concurrent/ScheduledExecutorService;"
-        | "Ljava/util/concurrent/Callable;" | "Ljava/util/concurrent/Future;"
+        | "Ljava/util/concurrent/Callable;"
+        | "Ljava/util/concurrent/Future;"
         | "Ljava/util/concurrent/BlockingQueue;" => &[OBJ],
-        "Ljava/util/Iterator;" | "Ljava/util/Enumeration;"
-        | "Ljava/util/Comparator;" | "Ljava/util/Spliterator;"
-        | "Ljava/util/Observer;" | "Ljava/util/EventListener;"
-        | "Ljava/util/RandomAccess;" | "Ljava/lang/Cloneable;" => &[OBJ],
+        "Ljava/util/Iterator;"
+        | "Ljava/util/Enumeration;"
+        | "Ljava/util/Comparator;"
+        | "Ljava/util/Spliterator;"
+        | "Ljava/util/Observer;"
+        | "Ljava/util/EventListener;"
+        | "Ljava/util/RandomAccess;"
+        | "Ljava/lang/Cloneable;" => &[OBJ],
         "Ljava/util/ListIterator;" => &["Ljava/util/Iterator;", OBJ],
         "Ljava/util/Map$Entry;" => &[OBJ],
-        "Ljava/util/AbstractMap$SimpleEntry;" => &[
-            "Ljava/util/Map$Entry;",
-            "Ljava/io/Serializable;",
-            OBJ,
-        ],
-        "Ljava/util/AbstractMap$SimpleImmutableEntry;" => &[
-            "Ljava/util/Map$Entry;",
-            "Ljava/io/Serializable;",
-            OBJ,
-        ],
-        "Ljava/util/Optional;" | "Ljava/util/OptionalInt;" | "Ljava/util/OptionalLong;"
+        "Ljava/util/AbstractMap$SimpleEntry;" => {
+            &["Ljava/util/Map$Entry;", "Ljava/io/Serializable;", OBJ]
+        }
+        "Ljava/util/AbstractMap$SimpleImmutableEntry;" => {
+            &["Ljava/util/Map$Entry;", "Ljava/io/Serializable;", OBJ]
+        }
+        "Ljava/util/Optional;"
+        | "Ljava/util/OptionalInt;"
+        | "Ljava/util/OptionalLong;"
         | "Ljava/util/OptionalDouble;" => &[OBJ],
-        "Ljava/util/Objects;" | "Ljava/util/Arrays;" | "Ljava/util/Collections;"
+        "Ljava/util/Objects;"
+        | "Ljava/util/Arrays;"
+        | "Ljava/util/Collections;"
         | "Ljava/util/Scanner;" => &[OBJ],
         "Ljava/util/StringTokenizer;" => &["Ljava/util/Enumeration;", OBJ],
         "Ljava/util/Random;" => &["Ljava/io/Serializable;", OBJ],
         "Ljava/security/SecureRandom;" => &["Ljava/util/Random;", OBJ],
-        "Ljava/util/UUID;" => &[
-            "Ljava/io/Serializable;",
-            "Ljava/lang/Comparable;",
-            OBJ,
-        ],
+        "Ljava/util/UUID;" => &["Ljava/io/Serializable;", "Ljava/lang/Comparable;", OBJ],
         "Ljava/util/Locale;" => &["Ljava/lang/Cloneable;", "Ljava/io/Serializable;", OBJ],
         "Ljava/util/BitSet;" => &["Ljava/lang/Cloneable;", "Ljava/io/Serializable;", OBJ],
         "Ljava/util/Base64;" | "Ljava/util/Base64$Encoder;" | "Ljava/util/Base64$Decoder;" => {
@@ -1426,10 +1408,14 @@ pub(crate) fn host_supers(d: &str) -> &'static [&'static str] {
             "Ljava/lang/Appendable;",
             OBJ,
         ],
-        "Ljava/util/function/Supplier;" | "Ljava/util/function/Function;"
-        | "Ljava/util/function/BiFunction;" | "Ljava/util/function/Consumer;"
-        | "Ljava/util/function/BiConsumer;" | "Ljava/util/function/Predicate;"
-        | "Ljava/util/function/BiPredicate;" | "Ljava/util/function/UnaryOperator;"
+        "Ljava/util/function/Supplier;"
+        | "Ljava/util/function/Function;"
+        | "Ljava/util/function/BiFunction;"
+        | "Ljava/util/function/Consumer;"
+        | "Ljava/util/function/BiConsumer;"
+        | "Ljava/util/function/Predicate;"
+        | "Ljava/util/function/BiPredicate;"
+        | "Ljava/util/function/UnaryOperator;"
         | "Ljava/util/function/BinaryOperator;" => &[OBJ],
         // ----- java.util.date/calendar
         "Ljava/util/Date;" => &[
@@ -1452,12 +1438,22 @@ pub(crate) fn host_supers(d: &str) -> &'static [&'static str] {
         "Ljava/util/SimpleTimeZone;" => &["Ljava/util/TimeZone;", OBJ],
         // ----- java.time
         "Ljava/time/Instant;" => &["Ljava/lang/Comparable;", "Ljava/io/Serializable;", OBJ],
-        "Ljava/time/LocalDate;" | "Ljava/time/LocalTime;" | "Ljava/time/LocalDateTime;"
-        | "Ljava/time/ZonedDateTime;" | "Ljava/time/OffsetDateTime;"
-        | "Ljava/time/OffsetTime;" | "Ljava/time/Duration;" | "Ljava/time/Period;"
-        | "Ljava/time/Year;" | "Ljava/time/YearMonth;" | "Ljava/time/MonthDay;"
-        | "Ljava/time/ZoneId;" | "Ljava/time/ZoneOffset;" | "Ljava/time/DayOfWeek;"
-        | "Ljava/time/Month;" | "Ljava/time/format/DateTimeFormatter;" => &[OBJ],
+        "Ljava/time/LocalDate;"
+        | "Ljava/time/LocalTime;"
+        | "Ljava/time/LocalDateTime;"
+        | "Ljava/time/ZonedDateTime;"
+        | "Ljava/time/OffsetDateTime;"
+        | "Ljava/time/OffsetTime;"
+        | "Ljava/time/Duration;"
+        | "Ljava/time/Period;"
+        | "Ljava/time/Year;"
+        | "Ljava/time/YearMonth;"
+        | "Ljava/time/MonthDay;"
+        | "Ljava/time/ZoneId;"
+        | "Ljava/time/ZoneOffset;"
+        | "Ljava/time/DayOfWeek;"
+        | "Ljava/time/Month;"
+        | "Ljava/time/format/DateTimeFormatter;" => &[OBJ],
         // ----- regex
         "Ljava/util/regex/Pattern;" => &["Ljava/io/Serializable;", OBJ],
         "Ljava/util/regex/Matcher;" => &["Ljava/util/regex/MatchResult;", OBJ],
@@ -1482,9 +1478,11 @@ pub(crate) fn host_supers(d: &str) -> &'static [&'static str] {
         "Ljava/io/BufferedInputStream;" => {
             &["Ljava/io/FilterInputStream;", "Ljava/io/InputStream;", OBJ]
         }
-        "Ljava/io/BufferedOutputStream;" => {
-            &["Ljava/io/FilterOutputStream;", "Ljava/io/OutputStream;", OBJ]
-        }
+        "Ljava/io/BufferedOutputStream;" => &[
+            "Ljava/io/FilterOutputStream;",
+            "Ljava/io/OutputStream;",
+            OBJ,
+        ],
         "Ljava/io/DataInputStream;" => &[
             "Ljava/io/FilterInputStream;",
             "Ljava/io/DataInput;",
@@ -1500,9 +1498,7 @@ pub(crate) fn host_supers(d: &str) -> &'static [&'static str] {
         "Ljava/io/DataInput;" | "Ljava/io/DataOutput;" => &[OBJ],
         "Ljava/io/ByteArrayInputStream;" => &["Ljava/io/InputStream;", OBJ],
         "Ljava/io/ByteArrayOutputStream;" => &["Ljava/io/OutputStream;", OBJ],
-        "Ljava/io/FileInputStream;" | "Ljava/io/FileDescriptor;" => {
-            &["Ljava/io/InputStream;", OBJ]
-        }
+        "Ljava/io/FileInputStream;" | "Ljava/io/FileDescriptor;" => &["Ljava/io/InputStream;", OBJ],
         "Ljava/io/FileOutputStream;" => &["Ljava/io/OutputStream;", OBJ],
         "Ljava/io/Reader;" => &["Ljava/lang/Readable;", "Ljava/io/Closeable;", OBJ],
         "Ljava/io/Writer;" => &[
@@ -1538,7 +1534,9 @@ pub(crate) fn host_supers(d: &str) -> &'static [&'static str] {
         "Ljava/net/URLConnection;" => &[OBJ],
         "Ljava/net/HttpURLConnection;" => &["Ljava/net/URLConnection;", OBJ],
         "Ljava/net/URLEncoder;" | "Ljava/net/URLDecoder;" => &[OBJ],
-        "Ljava/net/InetAddress;" | "Ljava/net/Socket;" | "Ljava/net/ServerSocket;"
+        "Ljava/net/InetAddress;"
+        | "Ljava/net/Socket;"
+        | "Ljava/net/ServerSocket;"
         | "Ljava/net/SocketAddress;"
         | "Ljava/net/Proxy;" => &[OBJ],
         "Ljava/net/InetSocketAddress;" => &["Ljava/net/SocketAddress;", OBJ],
@@ -1552,13 +1550,18 @@ pub(crate) fn host_supers(d: &str) -> &'static [&'static str] {
             OBJ,
         ],
         "Ljava/nio/charset/Charset;" => &["Ljava/lang/Comparable;", OBJ],
-        "Ljava/nio/charset/StandardCharsets;" | "Ljava/nio/charset/CharsetEncoder;"
-        | "Ljava/nio/charset/CharsetDecoder;" | "Ljava/nio/ByteOrder;" => &[OBJ],
+        "Ljava/nio/charset/StandardCharsets;"
+        | "Ljava/nio/charset/CharsetEncoder;"
+        | "Ljava/nio/charset/CharsetDecoder;"
+        | "Ljava/nio/ByteOrder;" => &[OBJ],
         // ----- throwable tree
         "Ljava/lang/Exception;" => &[THROWABLE, "Ljava/io/Serializable;", OBJ],
-        "Ljava/lang/RuntimeException;" => {
-            &["Ljava/lang/Exception;", THROWABLE, "Ljava/io/Serializable;", OBJ]
-        }
+        "Ljava/lang/RuntimeException;" => &[
+            "Ljava/lang/Exception;",
+            THROWABLE,
+            "Ljava/io/Serializable;",
+            OBJ,
+        ],
         "Ljava/lang/Error;" => &[THROWABLE, "Ljava/io/Serializable;", OBJ],
         // ----- android.os
         "Landroid/os/BaseBundle;" => &[OBJ],
@@ -1568,77 +1571,114 @@ pub(crate) fn host_supers(d: &str) -> &'static [&'static str] {
             "Ljava/lang/Cloneable;",
             OBJ,
         ],
-        "Landroid/os/PersistableBundle;" => &[
-            "Landroid/os/BaseBundle;",
-            "Landroid/os/Parcelable;",
-            OBJ,
-        ],
+        "Landroid/os/PersistableBundle;" => {
+            &["Landroid/os/BaseBundle;", "Landroid/os/Parcelable;", OBJ]
+        }
         "Landroid/os/Parcelable;" | "Landroid/os/Parcel;" | "Landroid/os/IBinder;" => &[OBJ],
         "Landroid/os/Binder;" => &["Landroid/os/IBinder;", OBJ],
-        "Landroid/os/Looper;" | "Landroid/os/Handler;" | "Landroid/os/Message;"
-        | "Landroid/os/Messenger;" | "Landroid/os/MessageQueue;"
-        | "Landroid/os/AsyncTask;" | "Landroid/os/Trace;"
-        | "Landroid/os/SystemClock;" | "Landroid/os/Process;"
-        | "Landroid/os/Build;" | "Landroid/os/Build$VERSION;"
-        | "Landroid/os/Build$VERSION_CODES;" | "Landroid/os/PowerManager;"
-        | "Landroid/os/Vibrator;" | "Landroid/os/VibrationEffect;"
+        "Landroid/os/Looper;"
+        | "Landroid/os/Handler;"
+        | "Landroid/os/Message;"
+        | "Landroid/os/Messenger;"
+        | "Landroid/os/MessageQueue;"
+        | "Landroid/os/AsyncTask;"
+        | "Landroid/os/Trace;"
+        | "Landroid/os/SystemClock;"
+        | "Landroid/os/Process;"
+        | "Landroid/os/Build;"
+        | "Landroid/os/Build$VERSION;"
+        | "Landroid/os/Build$VERSION_CODES;"
+        | "Landroid/os/PowerManager;"
+        | "Landroid/os/Vibrator;"
+        | "Landroid/os/VibrationEffect;"
         | "Landroid/os/ResultReceiver;"
-        | "Landroid/os/StrictMode;" | "Landroid/os/DeadObjectException;"
-        | "Landroid/os/Environment;" | "Landroid/os/Debug;"
-        | "Landroid/os/BatteryManager;" | "Landroid/os/CancellationSignal;"
-        | "Landroid/os/UserHandle;" | "Landroid/os/UserManager;"
-        | "Landroid/os/PatternMatcher;" | "Landroid/os/StatFs;" => &[OBJ],
+        | "Landroid/os/StrictMode;"
+        | "Landroid/os/DeadObjectException;"
+        | "Landroid/os/Environment;"
+        | "Landroid/os/Debug;"
+        | "Landroid/os/BatteryManager;"
+        | "Landroid/os/CancellationSignal;"
+        | "Landroid/os/UserHandle;"
+        | "Landroid/os/UserManager;"
+        | "Landroid/os/PatternMatcher;"
+        | "Landroid/os/StatFs;" => &[OBJ],
         "Landroid/os/HandlerThread;" => &["Ljava/lang/Thread;", OBJ],
         // ----- android.content tree
         "Landroid/content/Context;" => &[OBJ],
         "Landroid/content/ContextWrapper;" => &["Landroid/content/Context;", OBJ],
-        "Landroid/content/ContextThemeWrapper;" => {
-            &["Landroid/content/ContextWrapper;", "Landroid/content/Context;", OBJ]
-        }
+        "Landroid/content/ContextThemeWrapper;" => &[
+            "Landroid/content/ContextWrapper;",
+            "Landroid/content/Context;",
+            OBJ,
+        ],
         "Landroid/app/Activity;" => &[
             "Landroid/content/ContextThemeWrapper;",
             "Landroid/content/ContextWrapper;",
             "Landroid/content/Context;",
             OBJ,
         ],
-        "Landroid/app/Application;" => {
-            &["Landroid/content/ContextWrapper;", "Landroid/content/Context;", OBJ]
-        }
-        "Landroid/app/Service;" => {
-            &["Landroid/content/ContextWrapper;", "Landroid/content/Context;", OBJ]
-        }
+        "Landroid/app/Application;" => &[
+            "Landroid/content/ContextWrapper;",
+            "Landroid/content/Context;",
+            OBJ,
+        ],
+        "Landroid/app/Service;" => &[
+            "Landroid/content/ContextWrapper;",
+            "Landroid/content/Context;",
+            OBJ,
+        ],
         "Landroid/app/IntentService;" => &["Landroid/app/Service;", OBJ],
         "Landroid/content/Intent;" => &["Landroid/os/Parcelable;", "Ljava/lang/Cloneable;", OBJ],
         "Landroid/content/IntentFilter;" => &["Landroid/os/Parcelable;", OBJ],
-        "Landroid/content/ComponentName;" => {
-            &["Landroid/os/Parcelable;", "Ljava/lang/Cloneable;", "Ljava/lang/Comparable;", OBJ]
-        }
+        "Landroid/content/ComponentName;" => &[
+            "Landroid/os/Parcelable;",
+            "Ljava/lang/Cloneable;",
+            "Ljava/lang/Comparable;",
+            OBJ,
+        ],
         "Landroid/content/BroadcastReceiver;" => &[OBJ],
-        "Landroid/content/ContentResolver;" | "Landroid/content/ContentProvider;"
+        "Landroid/content/ContentResolver;"
+        | "Landroid/content/ContentProvider;"
         | "Landroid/content/ClipboardManager;"
-        | "Landroid/content/ClipData;" | "Landroid/content/DialogInterface;"
+        | "Landroid/content/ClipData;"
+        | "Landroid/content/DialogInterface;"
         | "Landroid/content/SharedPreferences;"
         | "Landroid/content/SharedPreferences$Editor;" => &[OBJ],
         "Landroid/content/ContentValues;" => &["Landroid/os/Parcelable;", OBJ],
-        "Landroid/content/pm/PackageManager;" | "Landroid/content/pm/PackageInfo;"
-        | "Landroid/content/pm/ApplicationInfo;" | "Landroid/content/pm/ActivityInfo;"
-        | "Landroid/content/pm/ResolveInfo;" | "Landroid/content/pm/ServiceInfo;"
+        "Landroid/content/pm/PackageManager;"
+        | "Landroid/content/pm/PackageInfo;"
+        | "Landroid/content/pm/ApplicationInfo;"
+        | "Landroid/content/pm/ActivityInfo;"
+        | "Landroid/content/pm/ResolveInfo;"
+        | "Landroid/content/pm/ServiceInfo;"
         | "Landroid/content/pm/ProviderInfo;" => &[OBJ],
         // ----- android.app
         "Landroid/app/Dialog;" => &[OBJ],
         "Landroid/app/AlertDialog;" => &["Landroid/app/Dialog;", OBJ],
-        "Landroid/app/ProgressDialog;" => &["Landroid/app/AlertDialog;", "Landroid/app/Dialog;", OBJ],
+        "Landroid/app/ProgressDialog;" => {
+            &["Landroid/app/AlertDialog;", "Landroid/app/Dialog;", OBJ]
+        }
         "Landroid/app/AlertDialog$Builder;" => &[OBJ],
-        "Landroid/app/Fragment;" | "Landroid/app/FragmentManager;"
-        | "Landroid/app/LoaderManager;" | "Landroid/app/PendingIntent;"
-        | "Landroid/app/ActivityManager;" | "Landroid/app/NotificationManager;"
-        | "Landroid/app/Notification;" | "Landroid/app/Notification$Builder;"
-        | "Landroid/app/NotificationChannel;" | "Landroid/app/NotificationChannelGroup;"
-        | "Landroid/app/AlarmManager;" | "Landroid/app/KeyguardManager;"
-        | "Landroid/app/SearchManager;" | "Landroid/app/DownloadManager;"
-        | "Landroid/app/UiModeManager;" | "Landroid/app/WallpaperManager;"
-        | "Landroid/app/TaskStackBuilder;" | "Landroid/app/Instrumentation;"
-        | "Landroid/app/ActivityOptions;" | "Landroid/app/PictureInPictureParams;"
+        "Landroid/app/Fragment;"
+        | "Landroid/app/FragmentManager;"
+        | "Landroid/app/LoaderManager;"
+        | "Landroid/app/PendingIntent;"
+        | "Landroid/app/ActivityManager;"
+        | "Landroid/app/NotificationManager;"
+        | "Landroid/app/Notification;"
+        | "Landroid/app/Notification$Builder;"
+        | "Landroid/app/NotificationChannel;"
+        | "Landroid/app/NotificationChannelGroup;"
+        | "Landroid/app/AlarmManager;"
+        | "Landroid/app/KeyguardManager;"
+        | "Landroid/app/SearchManager;"
+        | "Landroid/app/DownloadManager;"
+        | "Landroid/app/UiModeManager;"
+        | "Landroid/app/WallpaperManager;"
+        | "Landroid/app/TaskStackBuilder;"
+        | "Landroid/app/Instrumentation;"
+        | "Landroid/app/ActivityOptions;"
+        | "Landroid/app/PictureInPictureParams;"
         | "Landroid/app/ActivityManager$RunningAppProcessInfo;"
         | "Landroid/app/ActivityManager$MemoryInfo;" => &[OBJ],
         // ----- android.view tree
@@ -1650,18 +1690,15 @@ pub(crate) fn host_supers(d: &str) -> &'static [&'static str] {
             OBJ,
         ],
         "Landroid/view/ViewParent;" | "Landroid/view/ViewManager;" => &[OBJ],
-        "Landroid/widget/LinearLayout;" => &[
-            "Landroid/view/ViewGroup;",
-            "Landroid/view/View;",
-            OBJ,
-        ],
-        "Landroid/widget/FrameLayout;" | "Landroid/widget/RelativeLayout;"
-        | "Landroid/widget/AbsoluteLayout;" | "Landroid/widget/GridLayout;"
-        | "Landroid/widget/TableLayout;" | "Landroid/widget/TableRow;" => &[
-            "Landroid/view/ViewGroup;",
-            "Landroid/view/View;",
-            OBJ,
-        ],
+        "Landroid/widget/LinearLayout;" => {
+            &["Landroid/view/ViewGroup;", "Landroid/view/View;", OBJ]
+        }
+        "Landroid/widget/FrameLayout;"
+        | "Landroid/widget/RelativeLayout;"
+        | "Landroid/widget/AbsoluteLayout;"
+        | "Landroid/widget/GridLayout;"
+        | "Landroid/widget/TableLayout;"
+        | "Landroid/widget/TableRow;" => &["Landroid/view/ViewGroup;", "Landroid/view/View;", OBJ],
         "Landroid/widget/ScrollView;" | "Landroid/widget/HorizontalScrollView;" => &[
             "Landroid/widget/FrameLayout;",
             "Landroid/view/ViewGroup;",
@@ -1673,12 +1710,12 @@ pub(crate) fn host_supers(d: &str) -> &'static [&'static str] {
             &["Landroid/widget/TextView;", "Landroid/view/View;", OBJ]
         }
         "Landroid/widget/ImageView;" => &["Landroid/view/View;", OBJ],
-        "Landroid/widget/ImageButton;" => &["Landroid/widget/ImageView;", "Landroid/view/View;", OBJ],
-        "Landroid/widget/CheckBox;" | "Landroid/widget/RadioButton;" => &[
-            "Landroid/widget/Button;",
-            "Landroid/widget/TextView;",
-            OBJ,
-        ],
+        "Landroid/widget/ImageButton;" => {
+            &["Landroid/widget/ImageView;", "Landroid/view/View;", OBJ]
+        }
+        "Landroid/widget/CheckBox;" | "Landroid/widget/RadioButton;" => {
+            &["Landroid/widget/Button;", "Landroid/widget/TextView;", OBJ]
+        }
         "Landroid/widget/CompoundButton;" => {
             &["Landroid/widget/Button;", "Landroid/widget/TextView;", OBJ]
         }
@@ -1709,7 +1746,8 @@ pub(crate) fn host_supers(d: &str) -> &'static [&'static str] {
             "Landroid/view/ViewGroup;",
             OBJ,
         ],
-        "Landroid/widget/Adapter;" | "Landroid/widget/ListAdapter;"
+        "Landroid/widget/Adapter;"
+        | "Landroid/widget/ListAdapter;"
         | "Landroid/widget/SpinnerAdapter;" => &[OBJ],
         "Landroid/widget/BaseAdapter;" => &[
             "Landroid/widget/ListAdapter;",
@@ -1718,63 +1756,105 @@ pub(crate) fn host_supers(d: &str) -> &'static [&'static str] {
             OBJ,
         ],
         "Landroid/widget/ArrayAdapter;" => &["Landroid/widget/BaseAdapter;", OBJ],
-        "Landroid/widget/Toast;" | "Landroid/widget/VideoView;"
-        | "Landroid/widget/Space;" | "Landroid/widget/DigitalClock;" => &[OBJ],
-        "Landroid/view/ViewStub;" | "Landroid/view/SurfaceView;"
-        | "Landroid/view/TextureView;" => &["Landroid/view/View;", OBJ],
+        "Landroid/widget/Toast;"
+        | "Landroid/widget/VideoView;"
+        | "Landroid/widget/Space;"
+        | "Landroid/widget/DigitalClock;" => &[OBJ],
+        "Landroid/view/ViewStub;" | "Landroid/view/SurfaceView;" | "Landroid/view/TextureView;" => {
+            &["Landroid/view/View;", OBJ]
+        }
         "Landroid/webkit/WebView;" => &[
             "Landroid/widget/AbsoluteLayout;",
             "Landroid/view/ViewGroup;",
             "Landroid/view/View;",
             OBJ,
         ],
-        "Landroid/view/Window;" | "Landroid/view/WindowManager;"
-        | "Landroid/view/WindowManager$LayoutParams;" | "Landroid/view/Display;"
+        "Landroid/view/Window;"
+        | "Landroid/view/WindowManager;"
+        | "Landroid/view/WindowManager$LayoutParams;"
+        | "Landroid/view/Display;"
         | "Landroid/view/Gravity;"
-        | "Landroid/view/Menu;" | "Landroid/view/MenuItem;"
-        | "Landroid/view/SubMenu;" | "Landroid/view/ContextMenu;"
-        | "Landroid/view/MenuInflater;" | "Landroid/view/LayoutInflater;"
-        | "Landroid/view/ViewTreeObserver;" | "Landroid/view/GestureDetector;"
-        | "Landroid/view/ScaleGestureDetector;" | "Landroid/view/ViewConfiguration;"
-        | "Landroid/view/VelocityTracker;" | "Landroid/view/InflateException;"
-        | "Landroid/view/Surface;" | "Landroid/view/SurfaceHolder;"
-        | "Landroid/view/Choreographer;" | "Landroid/view/View$OnClickListener;"
-        | "Landroid/view/View$OnTouchListener;" | "Landroid/view/View$OnLongClickListener;"
-        | "Landroid/view/animation/Animation;" | "Landroid/view/animation/AnimationUtils;"
-        | "Landroid/view/animation/Interpolator;" | "Landroid/view/ViewPropertyAnimator;"
-        | "Landroid/animation/ValueAnimator;" | "Landroid/animation/ObjectAnimator;"
-        | "Landroid/animation/Animator;" | "Landroid/animation/AnimatorSet;"
-        | "Landroid/animation/TimeInterpolator;" | "Landroid/animation/ArgbEvaluator;"
+        | "Landroid/view/Menu;"
+        | "Landroid/view/MenuItem;"
+        | "Landroid/view/SubMenu;"
+        | "Landroid/view/ContextMenu;"
+        | "Landroid/view/MenuInflater;"
+        | "Landroid/view/LayoutInflater;"
+        | "Landroid/view/ViewTreeObserver;"
+        | "Landroid/view/GestureDetector;"
+        | "Landroid/view/ScaleGestureDetector;"
+        | "Landroid/view/ViewConfiguration;"
+        | "Landroid/view/VelocityTracker;"
+        | "Landroid/view/InflateException;"
+        | "Landroid/view/Surface;"
+        | "Landroid/view/SurfaceHolder;"
+        | "Landroid/view/Choreographer;"
+        | "Landroid/view/View$OnClickListener;"
+        | "Landroid/view/View$OnTouchListener;"
+        | "Landroid/view/View$OnLongClickListener;"
+        | "Landroid/view/animation/Animation;"
+        | "Landroid/view/animation/AnimationUtils;"
+        | "Landroid/view/animation/Interpolator;"
+        | "Landroid/view/ViewPropertyAnimator;"
+        | "Landroid/animation/ValueAnimator;"
+        | "Landroid/animation/ObjectAnimator;"
+        | "Landroid/animation/Animator;"
+        | "Landroid/animation/AnimatorSet;"
+        | "Landroid/animation/TimeInterpolator;"
+        | "Landroid/animation/ArgbEvaluator;"
         | "Landroid/animation/AnimatorListenerAdapter;" => &[OBJ],
         "Landroid/view/MotionEvent;" | "Landroid/view/KeyEvent;" => {
             &["Landroid/view/InputEvent;", OBJ]
         }
         "Landroid/view/InputEvent;" => &[OBJ],
         // ----- android.widget remaining
-        "Landroid/widget/PopupWindow;" | "Landroid/widget/PopupMenu;"
+        "Landroid/widget/PopupWindow;"
+        | "Landroid/widget/PopupMenu;"
         | "Landroid/widget/AutoCompleteTextView;"
-        | "Landroid/widget/MultiAutoCompleteTextView;" | "Landroid/widget/CheckedTextView;"
-        | "Landroid/widget/Chronometer;" | "Landroid/widget/CalendarView;"
-        | "Landroid/widget/DatePicker;" | "Landroid/widget/TimePicker;"
-        | "Landroid/widget/NumberPicker;" | "Landroid/widget/SearchView;"
-        | "Landroid/widget/TabHost;" | "Landroid/widget/TabWidget;"
-        | "Landroid/widget/TextClock;" | "Landroid/widget/AnalogClock;"
-        | "Landroid/widget/ExpandableListView;" | "Landroid/widget/QuickContactBadge;"
-        | "Landroid/widget/RadioGroup;" | "Landroid/widget/SimpleAdapter;"
-        | "Landroid/widget/CursorAdapter;" | "Landroid/widget/ResourceCursorAdapter;"
-        | "Landroid/widget/SimpleCursorAdapter;" | "Landroid/widget/Scroller;"
-        | "Landroid/widget/OverScroller;" | "Landroid/widget/EdgeEffect;"
-        | "Landroid/widget/ZoomControls;" | "Landroid/widget/Gallery;"
+        | "Landroid/widget/MultiAutoCompleteTextView;"
+        | "Landroid/widget/CheckedTextView;"
+        | "Landroid/widget/Chronometer;"
+        | "Landroid/widget/CalendarView;"
+        | "Landroid/widget/DatePicker;"
+        | "Landroid/widget/TimePicker;"
+        | "Landroid/widget/NumberPicker;"
+        | "Landroid/widget/SearchView;"
+        | "Landroid/widget/TabHost;"
+        | "Landroid/widget/TabWidget;"
+        | "Landroid/widget/TextClock;"
+        | "Landroid/widget/AnalogClock;"
+        | "Landroid/widget/ExpandableListView;"
+        | "Landroid/widget/QuickContactBadge;"
+        | "Landroid/widget/RadioGroup;"
+        | "Landroid/widget/SimpleAdapter;"
+        | "Landroid/widget/CursorAdapter;"
+        | "Landroid/widget/ResourceCursorAdapter;"
+        | "Landroid/widget/SimpleCursorAdapter;"
+        | "Landroid/widget/Scroller;"
+        | "Landroid/widget/OverScroller;"
+        | "Landroid/widget/EdgeEffect;"
+        | "Landroid/widget/ZoomControls;"
+        | "Landroid/widget/Gallery;"
         | "Landroid/widget/Filter;"
-        | "Landroid/widget/Filterable;" | "Landroid/widget/AdapterViewFlipper;" => &[OBJ],
+        | "Landroid/widget/Filterable;"
+        | "Landroid/widget/AdapterViewFlipper;" => &[OBJ],
         // ----- android.util
-        "Landroid/util/Log;" | "Landroid/util/Pair;" | "Landroid/util/AttributeSet;"
-        | "Landroid/util/Xml;" | "Landroid/util/Base64;" | "Landroid/util/TypedValue;"
+        "Landroid/util/Log;"
+        | "Landroid/util/Pair;"
+        | "Landroid/util/AttributeSet;"
+        | "Landroid/util/Xml;"
+        | "Landroid/util/Base64;"
+        | "Landroid/util/TypedValue;"
         | "Landroid/util/LruCache;"
-        | "Landroid/util/Patterns;" | "Landroid/util/JsonReader;"
-        | "Landroid/util/JsonWriter;" | "Landroid/util/MalformedJsonException;"
-        | "Landroid/util/Size;" | "Landroid/util/SizeF;" | "Landroid/util/Rational;"
-        | "Landroid/util/Range;" | "Landroid/util/LogPrinter;" => &[OBJ],
+        | "Landroid/util/Patterns;"
+        | "Landroid/util/JsonReader;"
+        | "Landroid/util/JsonWriter;"
+        | "Landroid/util/MalformedJsonException;"
+        | "Landroid/util/Size;"
+        | "Landroid/util/SizeF;"
+        | "Landroid/util/Rational;"
+        | "Landroid/util/Range;"
+        | "Landroid/util/LogPrinter;" => &[OBJ],
         "Landroid/util/ArraySet;" => &[
             "Ljava/util/Set;",
             "Ljava/util/Collection;",
@@ -1785,10 +1865,15 @@ pub(crate) fn host_supers(d: &str) -> &'static [&'static str] {
         "Landroid/util/DisplayMetrics;" => &["Landroid/os/Parcelable;", OBJ],
         // ----- android.text
         "Landroid/text/TextUtils;"
-        | "Landroid/text/SpannableStringInternal;" | "Landroid/text/TextWatcher;"
-        | "Landroid/text/InputFilter;" | "Landroid/text/Html;" | "Landroid/text/Layout;"
-        | "Landroid/text/StaticLayout;" | "Landroid/text/Selection;"
-        | "Landroid/text/method/TransformationMethod;" | "Landroid/text/GetChars;"
+        | "Landroid/text/SpannableStringInternal;"
+        | "Landroid/text/TextWatcher;"
+        | "Landroid/text/InputFilter;"
+        | "Landroid/text/Html;"
+        | "Landroid/text/Layout;"
+        | "Landroid/text/StaticLayout;"
+        | "Landroid/text/Selection;"
+        | "Landroid/text/method/TransformationMethod;"
+        | "Landroid/text/GetChars;"
         | "Landroid/text/NoCopySpan;" => &[OBJ],
         "Landroid/text/Spanned;" => &["Ljava/lang/CharSequence;", OBJ],
         "Landroid/text/Spannable;" => &["Landroid/text/Spanned;", "Ljava/lang/CharSequence;", OBJ],
@@ -1799,11 +1884,9 @@ pub(crate) fn host_supers(d: &str) -> &'static [&'static str] {
             "Ljava/lang/Appendable;",
             OBJ,
         ],
-        "Landroid/text/SpannableString;" | "Landroid/text/SpannedString;" => &[
-            "Landroid/text/Spanned;",
-            "Ljava/lang/CharSequence;",
-            OBJ,
-        ],
+        "Landroid/text/SpannableString;" | "Landroid/text/SpannedString;" => {
+            &["Landroid/text/Spanned;", "Ljava/lang/CharSequence;", OBJ]
+        }
         "Landroid/text/SpannableStringBuilder;" => &[
             "Landroid/text/SpannableStringInternal;",
             "Landroid/text/Editable;",
@@ -1813,25 +1896,44 @@ pub(crate) fn host_supers(d: &str) -> &'static [&'static str] {
             OBJ,
         ],
         // ----- android.graphics
-        "Landroid/graphics/Paint;" | "Landroid/graphics/Canvas;"
-        | "Landroid/graphics/Bitmap;" | "Landroid/graphics/BitmapFactory;"
-        | "Landroid/graphics/Bitmap$Config;" | "Landroid/graphics/Color;"
-        | "Landroid/graphics/ColorFilter;" | "Landroid/graphics/PorterDuff;"
-        | "Landroid/graphics/PorterDuff$Mode;" | "Landroid/graphics/Xfermode;"
-        | "Landroid/graphics/PorterDuffXfermode;" | "Landroid/graphics/Matrix;"
-        | "Landroid/graphics/Path;" | "Landroid/graphics/Region;"
-        | "Landroid/graphics/Shader;" | "Landroid/graphics/LinearGradient;"
-        | "Landroid/graphics/RadialGradient;" | "Landroid/graphics/SweepGradient;"
-        | "Landroid/graphics/BitmapShader;" | "Landroid/graphics/Typeface;"
-        | "Landroid/graphics/Point;" | "Landroid/graphics/PointF;"
-        | "Landroid/graphics/Rect;" | "Landroid/graphics/RectF;"
-        | "Landroid/graphics/Camera;" | "Landroid/graphics/NinePatch;"
-        | "Landroid/graphics/Picture;" | "Landroid/graphics/ImageDecoder;"
-        | "Landroid/graphics/Movie;" | "Landroid/graphics/PathMeasure;"
-        | "Landroid/graphics/BlurMaskFilter;" | "Landroid/graphics/Paint$Style;"
-        | "Landroid/graphics/Paint$Align;" | "Landroid/graphics/Paint$Cap;"
-        | "Landroid/graphics/Paint$Join;" | "Landroid/graphics/Paint$FontMetrics;"
-        | "Landroid/graphics/drawable/Drawable;" | "Landroid/graphics/drawable/Drawable$Callback;"
+        "Landroid/graphics/Paint;"
+        | "Landroid/graphics/Canvas;"
+        | "Landroid/graphics/Bitmap;"
+        | "Landroid/graphics/BitmapFactory;"
+        | "Landroid/graphics/Bitmap$Config;"
+        | "Landroid/graphics/Color;"
+        | "Landroid/graphics/ColorFilter;"
+        | "Landroid/graphics/PorterDuff;"
+        | "Landroid/graphics/PorterDuff$Mode;"
+        | "Landroid/graphics/Xfermode;"
+        | "Landroid/graphics/PorterDuffXfermode;"
+        | "Landroid/graphics/Matrix;"
+        | "Landroid/graphics/Path;"
+        | "Landroid/graphics/Region;"
+        | "Landroid/graphics/Shader;"
+        | "Landroid/graphics/LinearGradient;"
+        | "Landroid/graphics/RadialGradient;"
+        | "Landroid/graphics/SweepGradient;"
+        | "Landroid/graphics/BitmapShader;"
+        | "Landroid/graphics/Typeface;"
+        | "Landroid/graphics/Point;"
+        | "Landroid/graphics/PointF;"
+        | "Landroid/graphics/Rect;"
+        | "Landroid/graphics/RectF;"
+        | "Landroid/graphics/Camera;"
+        | "Landroid/graphics/NinePatch;"
+        | "Landroid/graphics/Picture;"
+        | "Landroid/graphics/ImageDecoder;"
+        | "Landroid/graphics/Movie;"
+        | "Landroid/graphics/PathMeasure;"
+        | "Landroid/graphics/BlurMaskFilter;"
+        | "Landroid/graphics/Paint$Style;"
+        | "Landroid/graphics/Paint$Align;"
+        | "Landroid/graphics/Paint$Cap;"
+        | "Landroid/graphics/Paint$Join;"
+        | "Landroid/graphics/Paint$FontMetrics;"
+        | "Landroid/graphics/drawable/Drawable;"
+        | "Landroid/graphics/drawable/Drawable$Callback;"
         | "Landroid/graphics/drawable/PaintDrawable;"
         | "Landroid/graphics/drawable/shapes/Shape;"
         | "Landroid/graphics/drawable/shapes/RectShape;"
@@ -1857,9 +1959,11 @@ pub(crate) fn host_supers(d: &str) -> &'static [&'static str] {
         "Landroid/graphics/drawable/StateListDrawable;"
         | "Landroid/graphics/drawable/LevelListDrawable;"
         | "Landroid/graphics/drawable/LayerDrawable;"
-        | "Landroid/graphics/drawable/AnimationDrawable;" => {
-            &["Landroid/graphics/drawable/DrawableContainer;", "Landroid/graphics/drawable/Drawable;", OBJ]
-        }
+        | "Landroid/graphics/drawable/AnimationDrawable;" => &[
+            "Landroid/graphics/drawable/DrawableContainer;",
+            "Landroid/graphics/drawable/Drawable;",
+            OBJ,
+        ],
         "Landroid/graphics/drawable/ClipDrawable;"
         | "Landroid/graphics/drawable/InsetDrawable;"
         | "Landroid/graphics/drawable/RotateDrawable;"
@@ -1869,11 +1973,13 @@ pub(crate) fn host_supers(d: &str) -> &'static [&'static str] {
             &["Landroid/graphics/drawable/Drawable;", OBJ]
         }
         // ----- android.content.res
-        "Landroid/content/res/Resources;" | "Landroid/content/res/AssetManager;"
-        | "Landroid/content/res/Configuration;" | "Landroid/content/res/TypedArray;"
+        "Landroid/content/res/Resources;"
+        | "Landroid/content/res/AssetManager;"
+        | "Landroid/content/res/Configuration;"
+        | "Landroid/content/res/TypedArray;"
         | "Landroid/content/res/Resources$Theme;"
-        | "Landroid/content/res/ColorStateList;" | "Landroid/content/res/AssetFileDescriptor;"
-        => &[OBJ],
+        | "Landroid/content/res/ColorStateList;"
+        | "Landroid/content/res/AssetFileDescriptor;" => &[OBJ],
         "Landroid/content/res/XmlResourceParser;" => &[
             "Lorg/xmlpull/v1/XmlPullParser;",
             "Landroid/util/AttributeSet;",
@@ -1887,28 +1993,47 @@ pub(crate) fn host_supers(d: &str) -> &'static [&'static str] {
         // ----- android.net
         "Landroid/net/Uri;" => &["Landroid/os/Parcelable;", "Ljava/lang/Comparable;", OBJ],
         "Landroid/net/Uri$Builder;" => &[OBJ],
-        "Landroid/net/ConnectivityManager;" | "Landroid/net/NetworkInfo;"
-        | "Landroid/net/Network;" | "Landroid/net/NetworkCapabilities;"
-        | "Landroid/net/LinkProperties;" | "Landroid/net/NetworkRequest;"
-        | "Landroid/net/Proxy;" | "Landroid/net/wifi/WifiManager;"
-        | "Landroid/net/wifi/WifiInfo;" | "Landroid/net/LocalSocket;" => &[OBJ],
+        "Landroid/net/ConnectivityManager;"
+        | "Landroid/net/NetworkInfo;"
+        | "Landroid/net/Network;"
+        | "Landroid/net/NetworkCapabilities;"
+        | "Landroid/net/LinkProperties;"
+        | "Landroid/net/NetworkRequest;"
+        | "Landroid/net/Proxy;"
+        | "Landroid/net/wifi/WifiManager;"
+        | "Landroid/net/wifi/WifiInfo;"
+        | "Landroid/net/LocalSocket;" => &[OBJ],
         // ----- android.media / hardware
-        "Landroid/media/MediaPlayer;" | "Landroid/media/MediaRecorder;"
-        | "Landroid/media/AudioManager;" | "Landroid/media/SoundPool;"
-        | "Landroid/media/ToneGenerator;" | "Landroid/media/MediaMetadataRetriever;"
-        | "Landroid/media/AudioTrack;" | "Landroid/media/AudioRecord;"
-        | "Landroid/media/Image;" | "Landroid/hardware/Camera;"
-        | "Landroid/hardware/camera2/CameraManager;" | "Landroid/hardware/Sensor;"
-        | "Landroid/hardware/SensorManager;" | "Landroid/hardware/SensorEvent;"
+        "Landroid/media/MediaPlayer;"
+        | "Landroid/media/MediaRecorder;"
+        | "Landroid/media/AudioManager;"
+        | "Landroid/media/SoundPool;"
+        | "Landroid/media/ToneGenerator;"
+        | "Landroid/media/MediaMetadataRetriever;"
+        | "Landroid/media/AudioTrack;"
+        | "Landroid/media/AudioRecord;"
+        | "Landroid/media/Image;"
+        | "Landroid/hardware/Camera;"
+        | "Landroid/hardware/camera2/CameraManager;"
+        | "Landroid/hardware/Sensor;"
+        | "Landroid/hardware/SensorManager;"
+        | "Landroid/hardware/SensorEvent;"
         | "Landroid/hardware/display/DisplayManager;"
-        | "Landroid/bluetooth/BluetoothAdapter;" | "Landroid/bluetooth/BluetoothDevice;"
-        | "Landroid/bluetooth/BluetoothSocket;" | "Landroid/location/Location;"
-        | "Landroid/location/LocationManager;" | "Landroid/location/LocationListener;"
-        | "Landroid/telephony/TelephonyManager;" | "Landroid/nfc/NfcAdapter;" => &[OBJ],
+        | "Landroid/bluetooth/BluetoothAdapter;"
+        | "Landroid/bluetooth/BluetoothDevice;"
+        | "Landroid/bluetooth/BluetoothSocket;"
+        | "Landroid/location/Location;"
+        | "Landroid/location/LocationManager;"
+        | "Landroid/location/LocationListener;"
+        | "Landroid/telephony/TelephonyManager;"
+        | "Landroid/nfc/NfcAdapter;" => &[OBJ],
         // ----- android.database / provider
-        "Landroid/database/Cursor;" | "Landroid/database/DatabaseUtils;"
-        | "Landroid/database/MatrixCursor;" | "Landroid/database/CursorWrapper;"
-        | "Landroid/database/ContentObserver;" | "Landroid/database/DataSetObserver;"
+        "Landroid/database/Cursor;"
+        | "Landroid/database/DatabaseUtils;"
+        | "Landroid/database/MatrixCursor;"
+        | "Landroid/database/CursorWrapper;"
+        | "Landroid/database/ContentObserver;"
+        | "Landroid/database/DataSetObserver;"
         | "Landroid/database/sqlite/SQLiteDatabase;"
         | "Landroid/database/sqlite/SQLiteOpenHelper;"
         | "Landroid/database/sqlite/SQLiteStatement;"
@@ -1947,21 +2072,35 @@ pub(crate) fn host_supers(d: &str) -> &'static [&'static str] {
             THROWABLE,
             OBJ,
         ],
-        "Landroid/provider/Settings;" | "Landroid/provider/Settings$System;"
-        | "Landroid/provider/Settings$Secure;" | "Landroid/provider/Settings$Global;"
-        | "Landroid/provider/MediaStore;" | "Landroid/provider/ContactsContract;"
-        | "Landroid/provider/CalendarContract;" | "Landroid/provider/DocumentsContract;"
-        | "Landroid/provider/OpenableColumns;" | "Landroid/provider/Browser;" => &[OBJ],
+        "Landroid/provider/Settings;"
+        | "Landroid/provider/Settings$System;"
+        | "Landroid/provider/Settings$Secure;"
+        | "Landroid/provider/Settings$Global;"
+        | "Landroid/provider/MediaStore;"
+        | "Landroid/provider/ContactsContract;"
+        | "Landroid/provider/CalendarContract;"
+        | "Landroid/provider/DocumentsContract;"
+        | "Landroid/provider/OpenableColumns;"
+        | "Landroid/provider/Browser;" => &[OBJ],
         // ----- android.webkit / opengl / renderscript
-        "Landroid/webkit/WebSettings;" | "Landroid/webkit/WebViewClient;"
-        | "Landroid/webkit/WebChromeClient;" | "Landroid/webkit/CookieManager;"
-        | "Landroid/webkit/JavascriptInterface;" | "Landroid/webkit/WebResourceRequest;"
-        | "Landroid/webkit/WebResourceResponse;" | "Landroid/webkit/MimeTypeMap;"
-        | "Landroid/webkit/URLUtil;" | "Landroid/webkit/ValueCallback;"
+        "Landroid/webkit/WebSettings;"
+        | "Landroid/webkit/WebViewClient;"
+        | "Landroid/webkit/WebChromeClient;"
+        | "Landroid/webkit/CookieManager;"
+        | "Landroid/webkit/JavascriptInterface;"
+        | "Landroid/webkit/WebResourceRequest;"
+        | "Landroid/webkit/WebResourceResponse;"
+        | "Landroid/webkit/MimeTypeMap;"
+        | "Landroid/webkit/URLUtil;"
+        | "Landroid/webkit/ValueCallback;"
         | "Landroid/opengl/Matrix;"
-        | "Landroid/opengl/GLUtils;" | "Landroid/opengl/EGL14;"
-        | "Landroid/opengl/GLES20;" | "Landroid/opengl/GLES30;" => &[OBJ],
-        "Landroid/opengl/GLSurfaceView;" => &["Landroid/view/SurfaceView;", "Landroid/view/View;", OBJ],
+        | "Landroid/opengl/GLUtils;"
+        | "Landroid/opengl/EGL14;"
+        | "Landroid/opengl/GLES20;"
+        | "Landroid/opengl/GLES30;" => &[OBJ],
+        "Landroid/opengl/GLSurfaceView;" => {
+            &["Landroid/view/SurfaceView;", "Landroid/view/View;", OBJ]
+        }
         // ----- androidx (treated as host-model classes too)
         "Landroidx/appcompat/app/AppCompatActivity;" => &[
             "Landroidx/fragment/app/FragmentActivity;",
@@ -1977,56 +2116,81 @@ pub(crate) fn host_supers(d: &str) -> &'static [&'static str] {
             "Landroid/app/Activity;",
             OBJ,
         ],
-        "Landroidx/activity/ComponentActivity;" => &[
-            "Landroid/app/Activity;",
-            OBJ,
-        ],
+        "Landroidx/activity/ComponentActivity;" => &["Landroid/app/Activity;", OBJ],
         "Landroidx/recyclerview/widget/RecyclerView;" => {
             &["Landroid/view/ViewGroup;", "Landroid/view/View;", OBJ]
         }
         "Landroidx/viewpager/widget/ViewPager;" => {
             &["Landroid/view/ViewGroup;", "Landroid/view/View;", OBJ]
         }
-        "Landroidx/fragment/app/Fragment;" | "Landroidx/fragment/app/FragmentManager;"
+        "Landroidx/fragment/app/Fragment;"
+        | "Landroidx/fragment/app/FragmentManager;"
         | "Landroidx/appcompat/app/AlertDialog$Builder;"
-        | "Landroidx/appcompat/widget/Toolbar;" | "Landroidx/core/app/NotificationCompat;"
-        | "Landroidx/core/content/ContextCompat;" | "Landroidx/core/app/ActivityCompat;"
-        | "Landroidx/lifecycle/ViewModel;" | "Landroidx/lifecycle/LiveData;"
-        | "Landroidx/lifecycle/MutableLiveData;" | "Landroidx/lifecycle/ViewModelProvider;"
-        | "Landroidx/preference/PreferenceManager;" | "Landroidx/work/WorkManager;"
-        | "Landroidx/core/util/Pair;" | "Landroidx/collection/ArrayMap;"
-        | "Landroidx/collection/ArraySet;" | "Landroidx/collection/SparseArrayCompat;"
+        | "Landroidx/appcompat/widget/Toolbar;"
+        | "Landroidx/core/app/NotificationCompat;"
+        | "Landroidx/core/content/ContextCompat;"
+        | "Landroidx/core/app/ActivityCompat;"
+        | "Landroidx/lifecycle/ViewModel;"
+        | "Landroidx/lifecycle/LiveData;"
+        | "Landroidx/lifecycle/MutableLiveData;"
+        | "Landroidx/lifecycle/ViewModelProvider;"
+        | "Landroidx/preference/PreferenceManager;"
+        | "Landroidx/work/WorkManager;"
+        | "Landroidx/core/util/Pair;"
+        | "Landroidx/collection/ArrayMap;"
+        | "Landroidx/collection/ArraySet;"
+        | "Landroidx/collection/SparseArrayCompat;"
         | "Landroidx/core/app/NotificationManagerCompat;"
         | "Landroidx/localbroadcastmanager/content/LocalBroadcastManager;" => &[OBJ],
         // ----- kotlin stdlib (host-modeled)
-        "Lkotlin/Unit;" | "Lkotlin/Pair;" | "Lkotlin/Triple;" | "Lkotlin/KotlinNullPointerException;"
-        | "Lkotlin/jvm/internal/Intrinsics;" | "Lkotlin/jvm/internal/DefaultConstructorMarker;"
+        "Lkotlin/Unit;"
+        | "Lkotlin/Pair;"
+        | "Lkotlin/Triple;"
+        | "Lkotlin/KotlinNullPointerException;"
+        | "Lkotlin/jvm/internal/Intrinsics;"
+        | "Lkotlin/jvm/internal/DefaultConstructorMarker;"
         | "Lkotlin/jvm/internal/Ref$ObjectRef;"
-        | "Lkotlin/jvm/internal/Ref$IntRef;" | "Lkotlin/jvm/internal/Ref$LongRef;"
-        | "Lkotlin/jvm/internal/Ref$BooleanRef;" | "Lkotlin/jvm/internal/Ref$ByteRef;"
-        | "Lkotlin/jvm/internal/Ref$ShortRef;" | "Lkotlin/jvm/internal/Ref$FloatRef;"
-        | "Lkotlin/jvm/internal/Ref$DoubleRef;" | "Lkotlin/jvm/internal/Ref$CharRef;"
-        | "Lkotlin/text/StringsKt;" | "Lkotlin/collections/CollectionsKt;"
-        | "Lkotlin/collections/ArraysKt;" | "Lkotlin/ExceptionsKt;" => &[OBJ],
+        | "Lkotlin/jvm/internal/Ref$IntRef;"
+        | "Lkotlin/jvm/internal/Ref$LongRef;"
+        | "Lkotlin/jvm/internal/Ref$BooleanRef;"
+        | "Lkotlin/jvm/internal/Ref$ByteRef;"
+        | "Lkotlin/jvm/internal/Ref$ShortRef;"
+        | "Lkotlin/jvm/internal/Ref$FloatRef;"
+        | "Lkotlin/jvm/internal/Ref$DoubleRef;"
+        | "Lkotlin/jvm/internal/Ref$CharRef;"
+        | "Lkotlin/text/StringsKt;"
+        | "Lkotlin/collections/CollectionsKt;"
+        | "Lkotlin/collections/ArraysKt;"
+        | "Lkotlin/ExceptionsKt;" => &[OBJ],
         "Lkotlin/jvm/internal/Lambda;" => &["Ljava/lang/Object;"],
         // ----- org.json
-        "Lorg/json/JSONObject;" | "Lorg/json/JSONArray;" | "Lorg/json/JSONTokener;"
-        | "Lorg/json/JSONStringer;" | "Lorg/json/JSONObject$Null;" => &[OBJ],
+        "Lorg/json/JSONObject;"
+        | "Lorg/json/JSONArray;"
+        | "Lorg/json/JSONTokener;"
+        | "Lorg/json/JSONStringer;"
+        | "Lorg/json/JSONObject$Null;" => &[OBJ],
         // ----- misc
-        "Ldalvik/system/DexClassLoader;" | "Ldalvik/system/PathClassLoader;"
-        | "Ldalvik/system/BaseDexClassLoader;" => {
-            &["Ljava/lang/ClassLoader;", OBJ]
-        }
+        "Ldalvik/system/DexClassLoader;"
+        | "Ldalvik/system/PathClassLoader;"
+        | "Ldalvik/system/BaseDexClassLoader;" => &["Ljava/lang/ClassLoader;", OBJ],
         "Ljava/lang/ref/Reference;" => &[OBJ],
-        "Ljava/lang/ref/WeakReference;" | "Ljava/lang/ref/SoftReference;"
+        "Ljava/lang/ref/WeakReference;"
+        | "Ljava/lang/ref/SoftReference;"
         | "Ljava/lang/ref/PhantomReference;" => &["Ljava/lang/ref/Reference;", OBJ],
         "Ljava/security/MessageDigest;"
-        | "Ljava/security/KeyStore;" | "Ljava/security/Signature;"
-        | "Ljava/security/cert/Certificate;" | "Ljava/security/NoSuchAlgorithmException;"
-        | "Ljavax/crypto/Cipher;" | "Ljavax/crypto/Mac;" | "Ljavax/crypto/KeyGenerator;"
-        | "Ljavax/crypto/SecretKey;" | "Ljavax/crypto/SecretKeyFactory;"
-        | "Ljavax/crypto/spec/SecretKeySpec;" | "Ljavax/crypto/spec/IvParameterSpec;"
-        | "Ljavax/crypto/spec/PBEKeySpec;" | "Ljavax/crypto/spec/GCMParameterSpec;" => &[OBJ],
+        | "Ljava/security/KeyStore;"
+        | "Ljava/security/Signature;"
+        | "Ljava/security/cert/Certificate;"
+        | "Ljava/security/NoSuchAlgorithmException;"
+        | "Ljavax/crypto/Cipher;"
+        | "Ljavax/crypto/Mac;"
+        | "Ljavax/crypto/KeyGenerator;"
+        | "Ljavax/crypto/SecretKey;"
+        | "Ljavax/crypto/SecretKeyFactory;"
+        | "Ljavax/crypto/spec/SecretKeySpec;"
+        | "Ljavax/crypto/spec/IvParameterSpec;"
+        | "Ljavax/crypto/spec/PBEKeySpec;"
+        | "Ljavax/crypto/spec/GCMParameterSpec;" => &[OBJ],
         _ => &[],
     }
 }

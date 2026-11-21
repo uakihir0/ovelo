@@ -6,7 +6,6 @@
 
 use ovelo_error::{ErrorCategory, OveloError, Phase, Result};
 
-
 const EOCD_SIG: u32 = 0x0605_4b50;
 const EOCD_LEN: usize = 22;
 const EOCD_MAX_SEARCH: usize = 64 * 1024 + EOCD_LEN;
@@ -29,7 +28,7 @@ pub struct ZipLimits {
 }
 
 impl Default for ZipLimits {
-fn default() -> Self {
+    fn default() -> Self {
         Self {
             max_entries: 65_535,
             max_uncompressed_total: 4 * 1024 * 1024 * 1024,
@@ -100,8 +99,7 @@ pub fn find_central_directory(bytes: &[u8]) -> Result<CentralDirectory> {
     let (eocd, cd_offset) = find_eocd(bytes)?;
     let entries16 = u16::from_le_bytes(bytes[eocd + 10..eocd + 12].try_into().unwrap());
     let size = u32::from_le_bytes(bytes[eocd + 12..eocd + 16].try_into().unwrap()) as u64;
-    if entries16 == 0xffff || size as u32 == 0xffff_ffff || cd_offset as u32 == 0xffff_ffff
-    {
+    if entries16 == 0xffff || size as u32 == 0xffff_ffff || cd_offset as u32 == 0xffff_ffff {
         return Err(zip_err("zip.zip64.unsupported"));
     }
     let end = cd_offset

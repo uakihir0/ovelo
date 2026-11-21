@@ -29,9 +29,7 @@ pub(crate) fn call(
             ))),
             _ => None,
         }
-    } else if desc_is_a(class, "Landroid/net/Uri;")
-        || class == "Landroid/net/Uri$Builder;"
-    {
+    } else if desc_is_a(class, "Landroid/net/Uri;") || class == "Landroid/net/Uri$Builder;" {
         uri_call(vm, name, args)?
     } else if desc_is_a(class, "Landroid/content/Intent;") {
         intent_call(vm, name, sig, args)?
@@ -39,8 +37,8 @@ pub(crate) fn call(
         component_call(vm, name, args)?
     } else if class == "Landroid/content/IntentFilter;" {
         match name {
-            "addAction" | "addCategory" | "addDataScheme" | "addDataType"
-            | "addDataAuthority" | "addDataPath" | "setPriority" => Some(None),
+            "addAction" | "addCategory" | "addDataScheme" | "addDataType" | "addDataAuthority"
+            | "addDataPath" | "setPriority" => Some(None),
             "matchAction" | "hasAction" | "hasCategory" => Some(Some(V::I32(1))),
             "match" => Some(Some(V::I32(0))),
             "countActions" | "countCategories" => Some(Some(V::I32(0))),
@@ -64,9 +62,7 @@ pub(crate) fn call(
             "registerObserver" => {
                 if let V::Ref(this) = args[0] {
                     let obs = args.get(1).copied().unwrap_or(V::Ref(0));
-                    if let Some(V::Ref(lh)) =
-                        field_get(vm, this, class, "mObservers")
-                    {
+                    if let Some(V::Ref(lh)) = field_get(vm, this, class, "mObservers") {
                         if let Some(Obj::Host {
                             state: HostState::List(l),
                             ..
@@ -81,9 +77,7 @@ pub(crate) fn call(
             "unregisterObserver" => {
                 if let V::Ref(this) = args[0] {
                     let obs = args.get(1).copied().unwrap_or(V::Ref(0));
-                    if let Some(V::Ref(lh)) =
-                        field_get(vm, this, class, "mObservers")
-                    {
+                    if let Some(V::Ref(lh)) = field_get(vm, this, class, "mObservers") {
                         if let Some(Obj::Host {
                             state: HostState::List(l),
                             ..
@@ -97,9 +91,7 @@ pub(crate) fn call(
             }
             "unregisterAll" => {
                 if let V::Ref(this) = args[0] {
-                    if let Some(V::Ref(lh)) =
-                        field_get(vm, this, class, "mObservers")
-                    {
+                    if let Some(V::Ref(lh)) = field_get(vm, this, class, "mObservers") {
                         if let Some(Obj::Host {
                             state: HostState::List(l),
                             ..
@@ -138,28 +130,36 @@ pub(crate) fn call(
         || class.ends_with("Service;")
     {
         context_call(vm, class, name, sig, args)?
-    } else if class == "Landroid/content/pm/PackageManager;"
-        || class.ends_with("PackageManager;")
-    {
+    } else if class == "Landroid/content/pm/PackageManager;" || class.ends_with("PackageManager;") {
         pm_call(vm, name, args)?
-    } else if class == "Landroid/content/ContentResolver;"
-        || class.ends_with("ContentResolver;")
-    {
+    } else if class == "Landroid/content/ContentResolver;" || class.ends_with("ContentResolver;") {
         match name {
-            "query" | "rawQuery" => {
-                Some(Some(host(vm, "Landroid/database/Cursor;", HostState::Empty)))
+            "query" | "rawQuery" => Some(Some(host(
+                vm,
+                "Landroid/database/Cursor;",
+                HostState::Empty,
+            ))),
+            "insert"
+            | "call"
+            | "openFileDescriptor"
+            | "openAssetFileDescriptor"
+            | "openTypedAssetFileDescriptor"
+            | "openFile"
+            | "getType"
+            | "getStreamTypes"
+            | "getPersistedUriPermissions"
+            | "takePersistableUriPermission"
+            | "loadThumbnail" => Some(Some(V::Ref(0))),
+            "delete"
+            | "update"
+            | "bulkInsert"
+            | "getOutgoingPersistedUriPermissions"
+            | "getSyncStatus"
+            | "startSync"
+            | "requestSync" => Some(Some(V::I32(0))),
+            "getSyncAdapterTypes" => {
+                Some(Some(arr(vm, "Landroid/content/SyncAdapterType;", vec![])))
             }
-            "insert" | "call" | "openFileDescriptor" | "openAssetFileDescriptor"
-            | "openTypedAssetFileDescriptor" | "openFile" | "getType"
-            | "getStreamTypes" | "getPersistedUriPermissions"
-            | "takePersistableUriPermission" | "loadThumbnail" => {
-                Some(Some(V::Ref(0)))
-            }
-            "delete" | "update" | "bulkInsert" | "getOutgoingPersistedUriPermissions"
-            | "getSyncStatus" | "startSync" | "requestSync" => {
-                Some(Some(V::I32(0)))
-            }
-            "getSyncAdapterTypes" => Some(Some(arr(vm, "Landroid/content/SyncAdapterType;", vec![]))),
             "openInputStream" => Some(Some(host(
                 vm,
                 "Ljava/io/FileInputStream;",
@@ -170,10 +170,12 @@ pub(crate) fn call(
                 "Ljava/io/FileOutputStream;",
                 HostState::Empty,
             ))),
-            "isSyncActive" | "getSyncAutomatically" | "getMasterSyncAutomatically"
-            | "getIsSyncable" | "validateSyncExtrasBundle" | "canPerformSync" => {
-                Some(Some(V::I32(0)))
-            }
+            "isSyncActive"
+            | "getSyncAutomatically"
+            | "getMasterSyncAutomatically"
+            | "getIsSyncable"
+            | "validateSyncExtrasBundle"
+            | "canPerformSync" => Some(Some(V::I32(0))),
             _ => {
                 // applyBatch/notifyChange/register*/cancelSync/… — match
                 // the return type rather than assuming void.
@@ -185,17 +187,13 @@ pub(crate) fn call(
                 })
             }
         }
-    } else if class == "Landroid/content/res/Resources;"
-        || class.ends_with("Resources;")
-    {
+    } else if class == "Landroid/content/res/Resources;" || class.ends_with("Resources;") {
         resources_call(vm, name, args)?
     } else if class == "Landroid/util/Xml;" {
         match name {
             // The parser IS its own AttributeSet — hand back the same
             // handle so attribute reads follow the cursor.
-            "asAttributeSet" => {
-                Some(Some(args.first().copied().unwrap_or(V::Ref(0))))
-            }
+            "asAttributeSet" => Some(Some(args.first().copied().unwrap_or(V::Ref(0)))),
             "newPullParser" => Some(Some(host(
                 vm,
                 "Landroid/content/res/XmlResourceParser;",
@@ -225,16 +223,21 @@ pub(crate) fn call(
     } else if class == "Landroid/os/Message;" || class == "Landroid/os/Messenger;" {
         match name {
             "obtain" => Some(Some(host(vm, "Landroid/os/Message;", HostState::Empty))),
-            "sendToTarget" | "recycle" | "send" | "sendMessage"
-            | "sendMessageDelayed" | "sendEmptyMessage" => {
+            "sendToTarget" | "recycle" | "send" | "sendMessage" | "sendMessageDelayed"
+            | "sendEmptyMessage" => {
                 if name == "sendEmptyMessage" || name == "sendToTarget" {
                     // invoke the linked Handler's handleMessage inline
                     let _ = args;
                 }
-                Some(if name.starts_with("send") { Some(V::I32(1)) } else { None })
+                Some(if name.starts_with("send") {
+                    Some(V::I32(1))
+                } else {
+                    None
+                })
             }
-            "getData" | "peekData" | "getCallback" | "getTarget"
-            | "getMessenger" => Some(Some(V::Ref(0))),
+            "getData" | "peekData" | "getCallback" | "getTarget" | "getMessenger" => {
+                Some(Some(V::Ref(0)))
+            }
             "getWhen" | "getSendingUid" => Some(Some(V::I64(0))),
             "setData" | "setTarget" | "copyFrom" => Some(None),
             _ => None,
@@ -244,9 +247,7 @@ pub(crate) fn call(
             "uptimeMillis" | "elapsedRealtime" | "currentThreadTimeMillis" => {
                 Some(Some(V::I64(now_ms())))
             }
-            "elapsedRealtimeNanos" | "nanoTime" => {
-                Some(Some(V::I64(now_ms() * 1_000_000)))
-            }
+            "elapsedRealtimeNanos" | "nanoTime" => Some(Some(V::I64(now_ms() * 1_000_000))),
             "sleep" | "setCurrentTimeMillis" => Some(None),
             _ => None,
         }
@@ -257,14 +258,18 @@ pub(crate) fn call(
             }
             "getThreadPriority" => Some(Some(V::I32(0))),
             "setThreadPriority" | "killProcess" | "sendSignal" => Some(None),
-            "getElapsedCpuTime" | "getStartElapsedRealtime"
-            | "getStartRequestedElapsedRealtime" | "getStartUptimeMillis"
-            | "getFreeMemory" | "getTotalMemory" => Some(Some(V::I64(0))),
+            "getElapsedCpuTime"
+            | "getStartElapsedRealtime"
+            | "getStartRequestedElapsedRealtime"
+            | "getStartUptimeMillis"
+            | "getFreeMemory"
+            | "getTotalMemory" => Some(Some(V::I64(0))),
             "is64Bit" | "isApplicationUid" | "supportsProcesses" | "isSdkSandbox"
             | "isIsolated" => Some(Some(V::I32((name == "is64Bit") as i32))),
             _ => None,
         }
-    } else if class == "Landroid/os/Trace;" || class == "Landroid/os/StrictMode;"
+    } else if class == "Landroid/os/Trace;"
+        || class == "Landroid/os/StrictMode;"
         || class == "Landroid/os/Debug;"
     {
         match name {
@@ -276,25 +281,39 @@ pub(crate) fn call(
                     Some(None)
                 }
             }
-            "allowThreadDiskWrites" | "allowThreadDiskReads"
-            | "detectAll" | "penaltyLog" | "penaltyDeath" | "build"
-            | "setVmPolicy" | "setThreadPolicy" | "getVmPolicy"
-            | "getThreadPolicy" | "noteSlowCall" | "noteUntaggedSocket"
-            | "noteDiskRead" | "noteDiskWrite" | "getInstanceCount"
-            | "getGlobalAllocSize" | "getGlobalAllocCount"
-            | "getNativeHeapAllocatedSize" | "getNativeHeapSize"
-            | "getNativeHeapFreeSize" | "getPss" | "getMemoryInfo" => {
-                if name.ends_with("Size") || name.ends_with("Pss")
-                    || name.ends_with("Count") || name.ends_with("Info")
+            "allowThreadDiskWrites"
+            | "allowThreadDiskReads"
+            | "detectAll"
+            | "penaltyLog"
+            | "penaltyDeath"
+            | "build"
+            | "setVmPolicy"
+            | "setThreadPolicy"
+            | "getVmPolicy"
+            | "getThreadPolicy"
+            | "noteSlowCall"
+            | "noteUntaggedSocket"
+            | "noteDiskRead"
+            | "noteDiskWrite"
+            | "getInstanceCount"
+            | "getGlobalAllocSize"
+            | "getGlobalAllocCount"
+            | "getNativeHeapAllocatedSize"
+            | "getNativeHeapSize"
+            | "getNativeHeapFreeSize"
+            | "getPss"
+            | "getMemoryInfo" => {
+                if name.ends_with("Size")
+                    || name.ends_with("Pss")
+                    || name.ends_with("Count")
+                    || name.ends_with("Info")
                 {
                     Some(Some(V::I64(0)))
                 } else {
                     Some(None)
                 }
             }
-            "dumpHeap" | "waitingForDebugger" | "isDebuggerConnected" => {
-                Some(Some(V::I32(0)))
-            }
+            "dumpHeap" | "waitingForDebugger" | "isDebuggerConnected" => Some(Some(V::I32(0))),
             _ => Some(None),
         }
     } else if class == "Landroid/os/Environment;" {
@@ -302,9 +321,11 @@ pub(crate) fn call(
             // The guest sandbox's shared storage: real File I/O maps
             // absolute guest paths under vm.guest_root, so report the
             // canonical emulated path.
-            "getExternalStorageDirectory" | "getStorageDirectory" => Some(Some(
-                host(vm, "Ljava/io/File;", HostState::Path("/storage/emulated/0".into())),
-            )),
+            "getExternalStorageDirectory" | "getStorageDirectory" => Some(Some(host(
+                vm,
+                "Ljava/io/File;",
+                HostState::Path("/storage/emulated/0".into()),
+            ))),
             "getExternalStorageState" | "getStorageState" | "getExternalStorageStateLegacy" => {
                 Some(Some(jstr(vm, "mounted")))
             }
@@ -323,7 +344,8 @@ pub(crate) fn call(
                 "Ljava/io/File;",
                 HostState::Path("/cache".into()),
             ))),
-            "isExternalStorageRemovable" | "isExternalStorageEmulated"
+            "isExternalStorageRemovable"
+            | "isExternalStorageEmulated"
             | "isExternalStorageManager" => Some(Some(V::I32(1))),
             _ => Some(None),
         }
@@ -340,28 +362,21 @@ pub(crate) fn call(
             "get" => Some(Some(V::Ref(0))),
             _ => None,
         }
-    } else if class == "Landroid/os/Binder;" || class == "Landroid/os/Parcel;"
+    } else if class == "Landroid/os/Binder;"
+        || class == "Landroid/os/Parcel;"
         || class == "Landroid/os/IBinder;"
     {
         match name {
-            "getCallingUid" | "getCallingPid" | "getCallingUserHandle" => {
-                Some(Some(V::I32(1000)))
-            }
-            "clearCallingIdentity" | "restoreCallingIdentity" | "obtain" => {
-                Some(Some(V::I64(0)))
-            }
-            "flushPendingCommands" | "isBinderAlive" | "pingBinder" => {
-                Some(Some(V::I32(1)))
-            }
-            "writeInt" | "writeLong" | "writeString" | "writeByte"
-            | "writeFloat" | "writeDouble" | "writeByteArray" | "writeValue"
-            | "writeStrongBinder" | "writeParcelable" | "writeBundle"
-            | "writeStringArray" | "writeIntArray" | "readInt" | "readLong"
-            | "readString" | "readByte" | "readFloat" | "readDouble"
-            | "readByteArray" | "readValue" | "readStrongBinder"
-            | "readParcelable" | "readBundle" | "recycle" | "dataSize"
-            | "dataPosition" | "setDataPosition" | "marshall" | "unmarshall"
-            | "transact" | "linkToDeath" | "unlinkToDeath" => {
+            "getCallingUid" | "getCallingPid" | "getCallingUserHandle" => Some(Some(V::I32(1000))),
+            "clearCallingIdentity" | "restoreCallingIdentity" | "obtain" => Some(Some(V::I64(0))),
+            "flushPendingCommands" | "isBinderAlive" | "pingBinder" => Some(Some(V::I32(1))),
+            "writeInt" | "writeLong" | "writeString" | "writeByte" | "writeFloat"
+            | "writeDouble" | "writeByteArray" | "writeValue" | "writeStrongBinder"
+            | "writeParcelable" | "writeBundle" | "writeStringArray" | "writeIntArray"
+            | "readInt" | "readLong" | "readString" | "readByte" | "readFloat" | "readDouble"
+            | "readByteArray" | "readValue" | "readStrongBinder" | "readParcelable"
+            | "readBundle" | "recycle" | "dataSize" | "dataPosition" | "setDataPosition"
+            | "marshall" | "unmarshall" | "transact" | "linkToDeath" | "unlinkToDeath" => {
                 if name.starts_with("read") && !name.contains("Array") {
                     Some(Some(V::I64(0)))
                 } else if name.starts_with("data") {
@@ -374,22 +389,19 @@ pub(crate) fn call(
                     Some(None)
                 }
             }
-            "getInterfaceDescriptor" | "getInterfaceDescriptor0" => {
-                Some(Some(jstr(vm, "")))
-            }
+            "getInterfaceDescriptor" | "getInterfaceDescriptor0" => Some(Some(jstr(vm, ""))),
             _ => None,
         }
-    } else if class == "Landroid/content/ClipData;"
-        || class == "Landroid/content/ClipboardManager;"
+    } else if class == "Landroid/content/ClipData;" || class == "Landroid/content/ClipboardManager;"
     {
         match name {
-            "newPlainText" | "newUri" | "newIntent" => {
-                Some(Some(host(vm, "Landroid/content/ClipData;", HostState::Empty)))
-            }
+            "newPlainText" | "newUri" | "newIntent" => Some(Some(host(
+                vm,
+                "Landroid/content/ClipData;",
+                HostState::Empty,
+            ))),
             "setPrimaryClip" | "setText" | "clearPrimaryClip" => Some(None),
-            "getPrimaryClip" | "getText" | "getPrimaryClipDescription" => {
-                Some(Some(V::Ref(0)))
-            }
+            "getPrimaryClip" | "getText" | "getPrimaryClipDescription" => Some(Some(V::Ref(0))),
             "hasPrimaryClip" | "hasText" => Some(Some(V::I32(0))),
             "getItemCount" => Some(Some(V::I32(0))),
             "getItemAt" => Some(Some(V::Ref(0))),
@@ -405,21 +417,22 @@ pub(crate) fn call(
             "getString" | "getInt" | "getLong" | "getFloat" => {
                 Some(Some(args.get(2).copied().unwrap_or(V::I32(0))))
             }
-            "putString" | "putInt" | "putLong" | "putFloat" => {
-                Some(Some(V::I32(1)))
-            }
+            "putString" | "putInt" | "putLong" | "putFloat" => Some(Some(V::I32(1))),
             _ => Some(Some(V::Ref(0))),
         }
     } else if class == "Landroid/util/LruCache;" {
         match name {
-            "get" => Some(Some(map_get(
-                vm,
-                match args[0] {
-                    V::Ref(h) => h,
-                    _ => 0,
-                },
-                args[1],
-            ).unwrap_or(V::Ref(0)))),
+            "get" => Some(Some(
+                map_get(
+                    vm,
+                    match args[0] {
+                        V::Ref(h) => h,
+                        _ => 0,
+                    },
+                    args[1],
+                )
+                .unwrap_or(V::Ref(0)),
+            )),
             "put" => {
                 if let V::Ref(h) = args[0] {
                     map_put(vm, h, args[1], args[2]);
@@ -444,7 +457,8 @@ pub(crate) fn call(
         }
     } else if class.starts_with("Landroid/graphics/")
         || class.starts_with("Landroid/util/Patterns")
-        || class == "Landroid/util/Size;" || class == "Landroid/util/SizeF;"
+        || class == "Landroid/util/Size;"
+        || class == "Landroid/util/SizeF;"
         || class == "Landroid/util/AttributeSet;"
     {
         graphics_call(vm, class, name, args)?
@@ -466,9 +480,7 @@ pub(crate) fn call(
         }
     } else if class == "Landroid/view/View$MeasureSpec;" {
         measurespec_call(vm, name, args)
-    } else if class == "Landroid/view/ViewConfiguration;"
-        || class == "Landroid/view/Gravity;"
-    {
+    } else if class == "Landroid/view/ViewConfiguration;" || class == "Landroid/view/Gravity;" {
         viewconfig_call(vm, class, name, args)?
     } else if view::is_viewish(vm, class, args) {
         view::call(vm, class, name, sig, args)?
@@ -491,12 +503,7 @@ fn ta_index(vm: &Vm, args: &[V]) -> Option<(u32, usize)> {
 // ---------------------------------------------------------------------
 // ViewConfiguration / Gravity
 
-fn viewconfig_call(
-    vm: &mut Vm,
-    class: &str,
-    name: &str,
-    args: &[V],
-) -> Rt<Option<Option<V>>> {
+fn viewconfig_call(vm: &mut Vm, class: &str, name: &str, args: &[V]) -> Rt<Option<Option<V>>> {
     Ok(match (class, name) {
         // int getAbsoluteGravity(int gravity, int layoutDirection):
         // resolves START/END bits against the direction (AOSP semantics).
@@ -508,8 +515,7 @@ fn viewconfig_call(
             const END: i32 = 0x0080_0005;
             const LEFT: i32 = 0x0000_0003;
             const RIGHT: i32 = 0x0000_0005;
-            if result > 0 && (result & RELATIVE_LAYOUT_DIRECTION) == RELATIVE_LAYOUT_DIRECTION
-            {
+            if result > 0 && (result & RELATIVE_LAYOUT_DIRECTION) == RELATIVE_LAYOUT_DIRECTION {
                 result &= !RELATIVE_LAYOUT_DIRECTION;
                 if dir == 1 {
                     // RTL: START→RIGHT, END→LEFT
@@ -528,9 +534,7 @@ fn viewconfig_call(
             }
             Some(Some(V::I32(result)))
         }
-        ("Landroid/view/Gravity;", "isVertical" | "isHorizontal") => {
-            Some(Some(V::I32(0)))
-        }
+        ("Landroid/view/Gravity;", "isVertical" | "isHorizontal") => Some(Some(V::I32(0))),
         ("Landroid/view/Gravity;", _) => Some(None),
         ("Landroid/view/ViewConfiguration;", "get") => Some(Some(host(
             vm,
@@ -631,10 +635,7 @@ fn textutils_call(vm: &mut Vm, name: &str, args: &[V]) -> Rt<Option<Option<V>>> 
         "equals" => {
             let eq = match (args[0], args[1]) {
                 (V::Ref(0), V::Ref(0)) => true,
-                _ => {
-                    sv(vm, args[0]).unwrap_or_default()
-                        == sv(vm, args[1]).unwrap_or_default()
-                }
+                _ => sv(vm, args[0]).unwrap_or_default() == sv(vm, args[1]).unwrap_or_default(),
             };
             Some(Some(V::I32(eq as i32)))
         }
@@ -651,8 +652,7 @@ fn textutils_call(vm: &mut Vm, name: &str, args: &[V]) -> Rt<Option<Option<V>>> 
                 },
                 _ => vec![],
             };
-            let parts: Vec<String> =
-                items.iter().map(|v| v_to_s(vm, *v)).collect();
+            let parts: Vec<String> = items.iter().map(|v| v_to_s(vm, *v)).collect();
             Some(Some(jstr(vm, &parts.join(&d))))
         }
         "split" => {
@@ -674,13 +674,9 @@ fn textutils_call(vm: &mut Vm, name: &str, args: &[V]) -> Rt<Option<Option<V>>> 
         "indexOf" => {
             let t = sv(vm, args[0]).unwrap_or_default();
             let n = sv(vm, args[1]).unwrap_or_default();
-            Some(Some(V::I32(
-                t.find(&n).map(|i| i as i32).unwrap_or(-1),
-            )))
+            Some(Some(V::I32(t.find(&n).map(|i| i as i32).unwrap_or(-1))))
         }
-        "ellipsize" | "commaEllipsize" | "stringOrSpannedString" => {
-            Some(args.first().copied())
-        }
+        "ellipsize" | "commaEllipsize" | "stringOrSpannedString" => Some(args.first().copied()),
         "copy" | "getChars" => {
             if name == "copy" {
                 let (src, dst) = (sv(vm, args[0]).unwrap_or_default(), args[3]);
@@ -700,7 +696,9 @@ fn textutils_call(vm: &mut Vm, name: &str, args: &[V]) -> Rt<Option<Option<V>>> 
             let t = sv(vm, args[0]).unwrap_or_default();
             Some(Some(jstr(
                 vm,
-                &t.replace('&', "&amp;").replace('<', "&lt;").replace('>', "&gt;"),
+                &t.replace('&', "&amp;")
+                    .replace('<', "&lt;")
+                    .replace('>', "&gt;"),
             )))
         }
         "regionMatches" => {
@@ -710,9 +708,7 @@ fn textutils_call(vm: &mut Vm, name: &str, args: &[V]) -> Rt<Option<Option<V>>> 
         "replace" | "expandTemplate" | "formatSimple" => Some(args.first().copied()),
         "writeToParcel" => Some(None),
         "getReverse" | "getTrimmedLength" => Some(Some(V::I32(0))),
-        "isGraphic" | "isPrintableAscii" | "isPrintableAsciiOnly" => {
-            Some(Some(V::I32(1)))
-        }
+        "isGraphic" | "isPrintableAscii" | "isPrintableAsciiOnly" => Some(Some(V::I32(1))),
         _ => None,
     })
 }
@@ -721,11 +717,20 @@ fn textutils_call(vm: &mut Vm, name: &str, args: &[V]) -> Rt<Option<Option<V>>> 
 // Uri — stored as StrBuf text
 
 fn uri_call(vm: &mut Vm, name: &str, args: &[V]) -> Rt<Option<Option<V>>> {
-    let text = s(vm, match args[0] { V::Ref(h) => h, _ => 0 }).unwrap_or_default();
+    let text = s(
+        vm,
+        match args[0] {
+            V::Ref(h) => h,
+            _ => 0,
+        },
+    )
+    .unwrap_or_default();
     Ok(match name {
-        "parse" => Some(Some(host(vm, "Landroid/net/Uri;", HostState::StrBuf(
-            sv(vm, args[0]).unwrap_or_default(),
-        )))),
+        "parse" => Some(Some(host(
+            vm,
+            "Landroid/net/Uri;",
+            HostState::StrBuf(sv(vm, args[0]).unwrap_or_default()),
+        ))),
         "encode" | "decode" => {
             let t = sv(vm, args[0]).unwrap_or_default();
             let out = if name == "encode" {
@@ -758,10 +763,17 @@ fn uri_call(vm: &mut Vm, name: &str, args: &[V]) -> Rt<Option<Option<V>>> {
             Some(Some(jstr(vm, &out)))
         }
         "withAppendedPath" => {
-            let a = sv(vm, args[0]).or_else(|| s(vm, match args[0] {
-                V::Ref(h) => h,
-                _ => 0,
-            })).unwrap_or_default();
+            let a = sv(vm, args[0])
+                .or_else(|| {
+                    s(
+                        vm,
+                        match args[0] {
+                            V::Ref(h) => h,
+                            _ => 0,
+                        },
+                    )
+                })
+                .unwrap_or_default();
             let b = sv(vm, args[1]).unwrap_or_default();
             Some(Some(host(
                 vm,
@@ -771,11 +783,7 @@ fn uri_call(vm: &mut Vm, name: &str, args: &[V]) -> Rt<Option<Option<V>>> {
         }
         "toString" | "getPath" | "getEncodedPath" | "getLastPathSegment" => {
             let t = match name {
-                "getLastPathSegment" => text
-                    .rsplit('/')
-                    .next()
-                    .unwrap_or("")
-                    .to_string(),
+                "getLastPathSegment" => text.rsplit('/').next().unwrap_or("").to_string(),
                 "getPath" | "getEncodedPath" => {
                     let after_scheme = text.split("://").nth(1).unwrap_or(&text);
                     after_scheme
@@ -802,9 +810,15 @@ fn uri_call(vm: &mut Vm, name: &str, args: &[V]) -> Rt<Option<Option<V>>> {
                 .to_string();
             Some(Some(jstr(vm, &h)))
         }
-        "getQuery" | "getEncodedQuery" | "getFragment" | "getEncodedFragment"
-        | "getQueryParameter" | "getQueryParameterNames"
-        | "getQueryParameters" | "getPathSegments" | "getUserInfo" => {
+        "getQuery"
+        | "getEncodedQuery"
+        | "getFragment"
+        | "getEncodedFragment"
+        | "getQueryParameter"
+        | "getQueryParameterNames"
+        | "getQueryParameters"
+        | "getPathSegments"
+        | "getUserInfo" => {
             if name == "getQueryParameter" {
                 // ?k=v&k2=v2 lookup
                 let key = sv(vm, args[1]).unwrap_or_default();
@@ -849,11 +863,22 @@ fn uri_call(vm: &mut Vm, name: &str, args: &[V]) -> Rt<Option<Option<V>>> {
             let h = vm.alloc_host("Landroid/net/Uri$Builder;", HostState::StrBuf(text));
             Some(Some(V::Ref(h)))
         }
-        "scheme" | "authority" | "path" | "encodedPath" | "query"
-        | "encodedQuery" | "fragment" | "encodedFragment"
-        | "appendQueryParameter" | "appendPath" | "appendEncodedPath"
-        | "appendBooleanQueryParameter" | "clearQuery" | "encodedAuthority"
-        | "opaquePart" | "encodedOpaquePart" => {
+        "scheme"
+        | "authority"
+        | "path"
+        | "encodedPath"
+        | "query"
+        | "encodedQuery"
+        | "fragment"
+        | "encodedFragment"
+        | "appendQueryParameter"
+        | "appendPath"
+        | "appendEncodedPath"
+        | "appendBooleanQueryParameter"
+        | "clearQuery"
+        | "encodedAuthority"
+        | "opaquePart"
+        | "encodedOpaquePart" => {
             // Uri.Builder mutators — keep appended text.
             if let V::Ref(bh) = args[0] {
                 if name.starts_with("append") && args.len() > 1 {
@@ -875,12 +900,21 @@ fn uri_call(vm: &mut Vm, name: &str, args: &[V]) -> Rt<Option<Option<V>>> {
             Some(Some(args[0]))
         }
         "build" => {
-            let t = s(vm, match args[0] { V::Ref(h) => h, _ => 0 }).unwrap_or_default();
+            let t = s(
+                vm,
+                match args[0] {
+                    V::Ref(h) => h,
+                    _ => 0,
+                },
+            )
+            .unwrap_or_default();
             Some(Some(host(vm, "Landroid/net/Uri;", HostState::StrBuf(t))))
         }
-        "fromFile" | "fromParts" | "fromBundle" => {
-            Some(Some(host(vm, "Landroid/net/Uri;", HostState::StrBuf("".into()))))
-        }
+        "fromFile" | "fromParts" | "fromBundle" => Some(Some(host(
+            vm,
+            "Landroid/net/Uri;",
+            HostState::StrBuf("".into()),
+        ))),
         "writeToParcel" | "describeContents" => Some(None),
         "equals" | "hashCode" | "compareTo" => Some(Some(V::I32(0))),
         "normalizeScheme" => Some(Some(args[0])),
@@ -920,9 +954,7 @@ fn intent_call(vm: &mut Vm, name: &str, sig: &str, args: &[V]) -> Rt<Option<Opti
             pseudo_set(vm, h, P_DATA, args[1]);
             Some(Some(args[0]))
         }
-        "getData" | "getDataString" => {
-            Some(Some(pseudo_get(vm, h, P_DATA).unwrap_or(V::Ref(0))))
-        }
+        "getData" | "getDataString" => Some(Some(pseudo_get(vm, h, P_DATA).unwrap_or(V::Ref(0)))),
         "setType" => {
             pseudo_set(vm, h, P_FLAGS, args[1]);
             Some(Some(args[0]))
@@ -938,31 +970,36 @@ fn intent_call(vm: &mut Vm, name: &str, sig: &str, args: &[V]) -> Rt<Option<Opti
             pseudo_set(vm, h, P_COMPONENT, args.get(2).copied().unwrap_or(args[1]));
             Some(Some(args[0]))
         }
-        "getComponent" => {
-            Some(Some(pseudo_get(vm, h, P_COMPONENT).unwrap_or(V::Ref(0))))
+        "getComponent" => Some(Some(pseudo_get(vm, h, P_COMPONENT).unwrap_or(V::Ref(0)))),
+        "setPackage" | "addCategory" | "removeCategory" | "addFlags" | "setFlags"
+        | "setSelector" | "setClipData" | "setSourceBounds" | "setIdentifier" => {
+            Some(Some(args[0]))
         }
-        "setPackage" | "addCategory" | "removeCategory" | "addFlags"
-        | "setFlags" | "setSelector" | "setClipData" | "setSourceBounds"
-        | "setIdentifier" => Some(Some(args[0])),
-        "getPackage" | "getCategories" | "getFlags" | "getSelector"
-        | "getClipData" | "getSourceBounds" | "getIdentifier" => {
-            Some(Some(match name {
-                "getFlags" => V::I32(0),
-                "getCategories" => return Ok(Some(Some(host(
-                    vm, "Ljava/util/Set;", HostState::List(vec![]),
-                )))),
-                _ => V::Ref(0),
-            }))
-        }
-        "putExtra" | "putCharSequenceArrayListExtra" | "putStringArrayListExtra"
-        | "putIntegerArrayListExtra" | "putParcelableArrayListExtra" => {
+        "getPackage" | "getCategories" | "getFlags" | "getSelector" | "getClipData"
+        | "getSourceBounds" | "getIdentifier" => Some(Some(match name {
+            "getFlags" => V::I32(0),
+            "getCategories" => {
+                return Ok(Some(Some(host(
+                    vm,
+                    "Ljava/util/Set;",
+                    HostState::List(vec![]),
+                ))))
+            }
+            _ => V::Ref(0),
+        })),
+        "putExtra"
+        | "putCharSequenceArrayListExtra"
+        | "putStringArrayListExtra"
+        | "putIntegerArrayListExtra"
+        | "putParcelableArrayListExtra" => {
             map_put(vm, h, args[1], args[2]);
             Some(Some(args[0]))
         }
-        "getStringExtra" | "getCharSequenceExtra" | "getSerializableExtra"
-        | "getParcelableExtra" | "getBundleExtra" => {
-            Some(Some(map_get(vm, h, args[1]).unwrap_or(V::Ref(0))))
-        }
+        "getStringExtra"
+        | "getCharSequenceExtra"
+        | "getSerializableExtra"
+        | "getParcelableExtra"
+        | "getBundleExtra" => Some(Some(map_get(vm, h, args[1]).unwrap_or(V::Ref(0)))),
         n if n.starts_with("get") && n.ends_with("Extra") => {
             // getIntExtra/getBooleanExtra/…: map get with default arg
             let v = map_get(vm, h, args[1])
@@ -1038,20 +1075,22 @@ fn intent_call(vm: &mut Vm, name: &str, sig: &str, args: &[V]) -> Rt<Option<Opti
                 .or_else(|| args.get(2).copied())
                 .unwrap_or(V::I32(0)),
         )),
-        "getFloatExtra" => Some(Some(V::F32(
-            f64v(map_get(vm, h, args[1])
+        "getFloatExtra" => Some(Some(V::F32(f64v(
+            map_get(vm, h, args[1])
                 .or_else(|| args.get(2).copied())
-                .unwrap_or(V::F32(0.0))) as f32,
-        ))),
+                .unwrap_or(V::F32(0.0)),
+        ) as f32))),
         "getDoubleExtra" => Some(Some(V::F64(f64v(
             map_get(vm, h, args[1])
                 .or_else(|| args.get(2).copied())
                 .unwrap_or(V::F64(0.0)),
         )))),
-        "makeMainActivity" | "makeRestartActivityForTask" | "getIntent"
-        | "getIntentOld" | "parseIntent" | "getIntentInternal" => {
-            Some(Some(args[0]))
-        }
+        "makeMainActivity"
+        | "makeRestartActivityForTask"
+        | "getIntent"
+        | "getIntentOld"
+        | "parseIntent"
+        | "getIntentInternal" => Some(Some(args[0])),
         "createChooser" => Some(Some(args[0])),
         "resolveActivity" | "resolveActivityInfo" => Some(Some(V::Ref(0))),
         "describeContents" | "writeToParcel" | "readFromParcel" => Some(None),
@@ -1113,33 +1152,69 @@ fn dialog_call(vm: &mut Vm, name: &str, args: &[V]) -> Rt<Option<Option<V>>> {
             Some(V::Ref(hit))
         }
         "isShowing" | "isCancelable" => Some(V::I32(1)),
-        "show" | "dismiss" | "cancel" | "hide" | "create" | "onCreate"
-        | "onStart" | "onStop" | "onAttachedToWindow" | "onDetachedFromWindow"
-        | "setTitle" | "setCancelable" | "setCanceledOnTouchOutside"
-        | "setOnCancelListener" | "setOnDismissListener" | "setOnShowListener"
-        | "setOnKeyListener" | "setOwnerActivity" | "setVolumeControlStream"
-        | "setFeatureDrawableResource" | "setFeatureDrawable"
-        | "requestWindowFeature" | "addContentView" | "dismissWithBehaviour"
-        | "takeKeyEvents" | "onWindowAttributesChanged"
-        | "onWindowFocusChanged" | "onRestoreInstanceState"
-        | "setActionBar" | "setOnActionModeStarted" | "setOnActionModeFinished" => {
-            None
-        }
+        "show"
+        | "dismiss"
+        | "cancel"
+        | "hide"
+        | "create"
+        | "onCreate"
+        | "onStart"
+        | "onStop"
+        | "onAttachedToWindow"
+        | "onDetachedFromWindow"
+        | "setTitle"
+        | "setCancelable"
+        | "setCanceledOnTouchOutside"
+        | "setOnCancelListener"
+        | "setOnDismissListener"
+        | "setOnShowListener"
+        | "setOnKeyListener"
+        | "setOwnerActivity"
+        | "setVolumeControlStream"
+        | "setFeatureDrawableResource"
+        | "setFeatureDrawable"
+        | "requestWindowFeature"
+        | "addContentView"
+        | "dismissWithBehaviour"
+        | "takeKeyEvents"
+        | "onWindowAttributesChanged"
+        | "onWindowFocusChanged"
+        | "onRestoreInstanceState"
+        | "setActionBar"
+        | "setOnActionModeStarted"
+        | "setOnActionModeFinished" => None,
         _ => return Ok(None),
     }))
 }
 
 fn component_call(vm: &mut Vm, name: &str, args: &[V]) -> Rt<Option<Option<V>>> {
     Ok(match name {
-        "getPackageName" | "getClassName" | "getShortClassName" | "toString"
-        | "flatten" | "flattenToShortString" | "flattenToString" => {
-            let t = s(vm, match args[0] { V::Ref(h) => h, _ => 0 })
-                .or_else(|| pseudo_get(
+        "getPackageName"
+        | "getClassName"
+        | "getShortClassName"
+        | "toString"
+        | "flatten"
+        | "flattenToShortString"
+        | "flattenToString" => {
+            let t = s(
+                vm,
+                match args[0] {
+                    V::Ref(h) => h,
+                    _ => 0,
+                },
+            )
+            .or_else(|| {
+                pseudo_get(
                     vm,
-                    match args[0] { V::Ref(h) => h, _ => 0 },
+                    match args[0] {
+                        V::Ref(h) => h,
+                        _ => 0,
+                    },
                     P_DATA,
-                ).and_then(|v| sv(vm, v)))
-                .unwrap_or_default();
+                )
+                .and_then(|v| sv(vm, v))
+            })
+            .unwrap_or_default();
             Some(Some(jstr(vm, &t)))
         }
         "unflattenFromString" => Some(Some(host(
@@ -1169,8 +1244,7 @@ fn prefs_call(vm: &mut Vm, name: &str, args: &[V]) -> Rt<Option<Option<V>>> {
     let class = class_of(vm, args[0]);
     Ok(if class.ends_with("$Editor;") {
         match name {
-            "putString" | "putInt" | "putLong" | "putFloat" | "putBoolean"
-            | "putStringSet" => {
+            "putString" | "putInt" | "putLong" | "putFloat" | "putBoolean" | "putStringSet" => {
                 // write through to the parent prefs (P_EDIT_PARENT link)
                 let parent = pseudo_get(vm, h, P_EDIT_PARENT).unwrap_or(V::Ref(h));
                 let ph = match parent {
@@ -1277,9 +1351,7 @@ fn context_call(
         "getPackageCodePath" | "getPackageResourcePath" => {
             Some(Some(jstr(vm, "/data/app/base.apk")))
         }
-        "getApplicationContext" | "getApplication" => {
-            Some(Some(app_object(vm)))
-        }
+        "getApplicationContext" | "getApplication" => Some(Some(app_object(vm))),
         "getBaseContext" => Some(Some(args[0])),
         "getApplicationInfo" | "getActivityInfo" => Some(Some(host(
             vm,
@@ -1292,19 +1364,15 @@ fn context_call(
             HostState::Empty,
         ))),
         "getMainLooper" | "getLooper" => Some(Some(main_looper(vm))),
-        "getMainExecutor" | "getMainHandler" => Some(Some(host(
-            vm,
-            "Landroid/os/Handler;",
-            HostState::Empty,
-        ))),
+        "getMainExecutor" | "getMainHandler" => {
+            Some(Some(host(vm, "Landroid/os/Handler;", HostState::Empty)))
+        }
         "getResources" => Some(Some(host(
             vm,
             "Landroid/content/res/Resources;",
             HostState::Empty,
         ))),
-        "obtainStyledAttributes" | "obtainAttributes" => {
-            Some(Some(view::typed_array(vm, args)))
-        }
+        "obtainStyledAttributes" | "obtainAttributes" => Some(Some(view::typed_array(vm, args))),
         "getTheme" => Some(Some(host(
             vm,
             "Landroid/content/res/Resources$Theme;",
@@ -1324,14 +1392,16 @@ fn context_call(
             // apps read defaults this way (NewPipe's saved_tabs JSON
             // default comes from a string resource).
             let id = i64v(args.get(1).copied().unwrap_or(V::I32(0))) as u32;
-            Some(Some(match vm
-                .apk_res
-                .as_ref()
-                .and_then(|r| r.string_of(id).map(|s| s.to_string()))
-            {
-                Some(s) => jstr(vm, &s),
-                None => jstr(vm, ""),
-            }))
+            Some(Some(
+                match vm
+                    .apk_res
+                    .as_ref()
+                    .and_then(|r| r.string_of(id).map(|s| s.to_string()))
+                {
+                    Some(s) => jstr(vm, &s),
+                    None => jstr(vm, ""),
+                },
+            ))
         }
         "getColor" => Some(Some(V::I32(0xFF000000u32 as i32))),
         "getDrawable" => {
@@ -1342,10 +1412,17 @@ fn context_call(
             .iter()
             .find_map(|c| vm.instantiate(c).ok().map(V::Ref));
             let r = vdc.unwrap_or_else(|| {
-                host(vm, "Landroid/graphics/drawable/VectorDrawable;", HostState::Empty)
+                host(
+                    vm,
+                    "Landroid/graphics/drawable/VectorDrawable;",
+                    HostState::Empty,
+                )
             });
             if std::env::var_os("OVELO_TRACE_DRAW").is_some() {
-                eprintln!("[ctx.getDrawable] class={class} args={:?} -> {r:?}", args.get(1));
+                eprintln!(
+                    "[ctx.getDrawable] class={class} args={:?} -> {r:?}",
+                    args.get(1)
+                );
             }
             Some(Some(r))
         }
@@ -1368,9 +1445,7 @@ fn context_call(
                 Some("device_policy") => "Landroid/app/admin/DevicePolicyManager;",
                 Some("display") => "Landroid/hardware/display/DisplayManager;",
                 Some("download") => "Landroid/app/DownloadManager;",
-                Some("input_method") => {
-                    "Landroid/view/inputmethod/InputMethodManager;"
-                }
+                Some("input_method") => "Landroid/view/inputmethod/InputMethodManager;",
                 Some("jobscheduler") => "Landroid/app/job/JobScheduler;",
                 Some("keyguard") => "Landroid/app/KeyguardManager;",
                 Some("layout_inflater") => "Landroid/view/LayoutInflater;",
@@ -1394,9 +1469,7 @@ fn context_call(
                 Some("bluetooth") => "Landroid/bluetooth/BluetoothManager;",
                 Some("role") => "Landroid/app/role/RoleManager;",
                 Some("shortcut") => "Landroid/content/pm/ShortcutManager;",
-                Some("textservices") => {
-                    "Landroid/view/textservice/TextServicesManager;"
-                }
+                Some("textservices") => "Landroid/view/textservice/TextServicesManager;",
                 Some("wallpaper") => "Landroid/app/WallpaperManager;",
                 _ => "Ljava/lang/Object;",
             };
@@ -1406,9 +1479,7 @@ fn context_call(
                 Some(Some(host(vm, desc, HostState::Empty)))
             }
         }
-        "getSystemServiceName" => {
-            Some(Some(jstr(vm, "java.lang.Object")))
-        }
+        "getSystemServiceName" => Some(Some(jstr(vm, "java.lang.Object"))),
         "getFilesDir" => Some(Some(host(
             vm,
             "Ljava/io/File;",
@@ -1428,8 +1499,12 @@ fn context_call(
                 HostState::Path(format!("/data/local/ovelo/databases/{name}")),
             )))
         }
-        "getExternalFilesDir" | "getExternalCacheDir" | "getObbDir"
-        | "getCodeCacheDir" | "getDataDir" | "getNoBackupFilesDir"
+        "getExternalFilesDir"
+        | "getExternalCacheDir"
+        | "getObbDir"
+        | "getCodeCacheDir"
+        | "getDataDir"
+        | "getNoBackupFilesDir"
         | "getExternalMediaDir" => {
             if name == "getExternalMediaDir" {
                 Some(Some(V::Ref(0)))
@@ -1441,8 +1516,9 @@ fn context_call(
                 )))
             }
         }
-        "getExternalFilesDirs" | "getExternalCacheDirs" | "getExternalMediaDirs"
-        | "getObbDirs" => Some(Some(arr(vm, "Ljava/io/File;", vec![]))),
+        "getExternalFilesDirs" | "getExternalCacheDirs" | "getExternalMediaDirs" | "getObbDirs" => {
+            Some(Some(arr(vm, "Ljava/io/File;", vec![])))
+        }
         "getDir" => Some(Some(host(
             vm,
             "Ljava/io/File;",
@@ -1467,13 +1543,15 @@ fn context_call(
                 .unwrap_or_default();
             Some(Some(super::db::open_or_create(vm, &n)?))
         }
-        "deleteFile" | "deleteDatabase" | "deleteSharedPreferences" => {
-            Some(Some(V::I32(0)))
-        }
+        "deleteFile" | "deleteDatabase" | "deleteSharedPreferences" => Some(Some(V::I32(0))),
         "moveDatabaseFrom" | "moveSharedPreferencesFrom" => Some(Some(V::I32(0))),
-        "startActivity" | "startActivities" | "startActivityForResult"
-        | "startActivityFromChild" | "startActivityFromFragment"
-        | "startActivityIfNeeded" | "startNextMatchingActivity" => {
+        "startActivity"
+        | "startActivities"
+        | "startActivityForResult"
+        | "startActivityFromChild"
+        | "startActivityFromFragment"
+        | "startActivityIfNeeded"
+        | "startNextMatchingActivity" => {
             // Component-targeted intents become a pending launch the
             // runner drains into a real second-Activity dispatch. The
             // Intent travels with the launch so the target's getIntent
@@ -1481,9 +1559,9 @@ fn context_call(
             if let Some(V::Ref(ih)) = args.get(1).copied() {
                 if let Some(c) = pseudo_get(vm, ih, P_COMPONENT) {
                     let desc = match c {
-                        V::Ref(ch) if ch != 0 => vm
-                            .class_descriptor_of(ch)
-                            .or_else(|| sv(vm, V::Ref(ch))),
+                        V::Ref(ch) if ch != 0 => {
+                            vm.class_descriptor_of(ch).or_else(|| sv(vm, V::Ref(ch)))
+                        }
                         _ => None,
                     };
                     if let Some(d) = desc {
@@ -1493,25 +1571,50 @@ fn context_call(
             }
             Some(Some(V::I32(0)))
         }
-        "startService" | "stopService"
-        | "bindService" | "unbindService" | "sendBroadcast"
-        | "sendOrderedBroadcast" | "sendStickyBroadcast" | "registerReceiver"
-        | "unregisterReceiver" | "startInstrumentation" | "startIntentSender"
-        | "startForegroundService" | "startIntentSenderFromChild"
-        | "revokeUriPermission" | "grantUriPermission"
-        | "enforcePermission" | "enforceCallingPermission"
-        | "enforceCallingOrSelfPermission" | "enforceUriPermission"
-        | "checkPermission" | "checkSelfPermission"
-        | "checkCallingPermission" | "checkCallingOrSelfPermission"
-        | "checkUriPermission" | "checkCallingOrSelfUriPermission"
-        | "checkCallingUriPermission" | "registerComponentCallbacks"
-        | "unregisterComponentCallbacks" | "setTheme" | "getDisplay"
-        | "getDisplayId" | "isRestricted" | "getAttributionSource"
-        | "createDeviceProtectedStorageContext" | "createPackageContext"
-        | "createContextForSplit" | "createAttributionContext"
-        | "createDisplayContext" | "createWindowContext"
-        | "moveResources" | "reloadResources" | "bindServiceAsUser"
-        | "bindIsolatedService" | "updateServiceGroup" => {
+        "startService"
+        | "stopService"
+        | "bindService"
+        | "unbindService"
+        | "sendBroadcast"
+        | "sendOrderedBroadcast"
+        | "sendStickyBroadcast"
+        | "registerReceiver"
+        | "unregisterReceiver"
+        | "startInstrumentation"
+        | "startIntentSender"
+        | "startForegroundService"
+        | "startIntentSenderFromChild"
+        | "revokeUriPermission"
+        | "grantUriPermission"
+        | "enforcePermission"
+        | "enforceCallingPermission"
+        | "enforceCallingOrSelfPermission"
+        | "enforceUriPermission"
+        | "checkPermission"
+        | "checkSelfPermission"
+        | "checkCallingPermission"
+        | "checkCallingOrSelfPermission"
+        | "checkUriPermission"
+        | "checkCallingOrSelfUriPermission"
+        | "checkCallingUriPermission"
+        | "registerComponentCallbacks"
+        | "unregisterComponentCallbacks"
+        | "setTheme"
+        | "getDisplay"
+        | "getDisplayId"
+        | "isRestricted"
+        | "getAttributionSource"
+        | "createDeviceProtectedStorageContext"
+        | "createPackageContext"
+        | "createContextForSplit"
+        | "createAttributionContext"
+        | "createDisplayContext"
+        | "createWindowContext"
+        | "moveResources"
+        | "reloadResources"
+        | "bindServiceAsUser"
+        | "bindIsolatedService"
+        | "updateServiceGroup" => {
             if name.starts_with("check") {
                 // checkSelfPermission/checkPermission/…: PERMISSION_
                 // GRANTED only when the name is in the granted set
@@ -1522,17 +1625,21 @@ fn context_call(
                     .map(|p| vm.granted_permissions.contains(&p))
                     .unwrap_or(true);
                 Some(Some(V::I32(if g { 0 } else { -1 })))
-            } else if matches!(name, "bindService" | "bindServiceAsUser"
-                | "bindIsolatedService" | "stopService")
-            {
+            } else if matches!(
+                name,
+                "bindService" | "bindServiceAsUser" | "bindIsolatedService" | "stopService"
+            ) {
                 Some(Some(V::I32(1)))
             } else if matches!(
                 name,
-                "isRestricted" | "createDeviceProtectedStorageContext"
-                    | "moveResources" | "reloadResources"
+                "isRestricted"
+                    | "createDeviceProtectedStorageContext"
+                    | "moveResources"
+                    | "reloadResources"
             ) {
                 Some(Some(V::I32(0)))
-            } else if name.starts_with("create") || name == "getDisplay"
+            } else if name.starts_with("create")
+                || name == "getDisplay"
                 || name == "registerReceiver"
             {
                 Some(Some(V::Ref(0)))
@@ -1540,11 +1647,7 @@ fn context_call(
                 Some(None)
             }
         }
-        "getClassLoader" => Some(Some(host(
-            vm,
-            "Ljava/lang/ClassLoader;",
-            HostState::Empty,
-        ))),
+        "getClassLoader" => Some(Some(host(vm, "Ljava/lang/ClassLoader;", HostState::Empty))),
         "getWallpaper" | "peekWallpaper" => Some(Some(V::Ref(0))),
         "getWallpaperDesiredMinimumWidth" | "getWallpaperDesiredMinimumHeight" => {
             Some(Some(V::I32(0)))
@@ -1565,10 +1668,7 @@ fn context_call(
             let mut names: Vec<String> = Vec::new();
             if let V::Ref(ah) = perms_v {
                 if let Some(Obj::Array { data, .. }) = vm.heap.get(ah) {
-                    names = data
-                        .iter()
-                        .filter_map(|v| sv(vm, *v))
-                        .collect();
+                    names = data.iter().filter_map(|v| sv(vm, *v)).collect();
                 }
             }
             for p in &names {
@@ -1593,30 +1693,61 @@ fn context_call(
             }
             Some(None)
         }
-        "setIntent" | "requestWindowFeature"
-        | "setTitle" | "setTitleColor" | "setVisible" | "setResult"
-        | "setRequestedOrientation" | "setTaskDescription"
+        "setIntent"
+        | "requestWindowFeature"
+        | "setTitle"
+        | "setTitleColor"
+        | "setVisible"
+        | "setResult"
+        | "setRequestedOrientation"
+        | "setTaskDescription"
         | "registerActivityLifecycleCallbacks"
-        | "unregisterActivityLifecycleCallbacks" | "invalidateOptionsMenu"
-        | "supportRequestWindowFeature" | "onWindowFocusChanged"
-        | "openOptionsMenu" | "closeOptionsMenu" | "openContextMenu"
-        | "closeContextMenu" | "registerForContextMenu"
-        | "unregisterForContextMenu" | "showDialog" | "dismissDialog"
-        | "removeDialog" | "managedQuery"
+        | "unregisterActivityLifecycleCallbacks"
+        | "invalidateOptionsMenu"
+        | "supportRequestWindowFeature"
+        | "onWindowFocusChanged"
+        | "openOptionsMenu"
+        | "closeOptionsMenu"
+        | "openContextMenu"
+        | "closeContextMenu"
+        | "registerForContextMenu"
+        | "unregisterForContextMenu"
+        | "showDialog"
+        | "dismissDialog"
+        | "removeDialog"
+        | "managedQuery"
         | "requestDragAndDropPermissions"
-        | "startLocalVoiceInteraction" | "stopLocalVoiceInteraction"
-        | "startSearch" | "triggerSearch" | "takeKeyEvents"
-        | "overridePendingTransition" | "requestShowKeyboardShortcuts"
-        | "requestVisibleBehind" | "setContentTransitionManager"
-        | "setEnterSharedElementCallback" | "setExitSharedElementCallback"
-        | "setFinishOnTouchOutside" | "setImmersive" | "setInheritShowWhenLocked"
-        | "setLocusContext" | "setPictureInPictureParams"
-        | "setRecentsScreenshotEnabled" | "setShouldDockBigOverlays"
-        | "setShowWhenLocked" | "setTranslucent" | "setTurnScreenOn"
-        | "setVrModeEnabled" | "showAssist" | "showLockTaskEscapeMessage"
-        | "startLockTask" | "stopLockTask" | "requestFullscreenMode"
-        | "reportFullyDrawn" | "dismissKeyboardShortcutsHelper"
-        | "dismissKeyguard" | "onProvideKeyboardShortcuts" => Some(None),
+        | "startLocalVoiceInteraction"
+        | "stopLocalVoiceInteraction"
+        | "startSearch"
+        | "triggerSearch"
+        | "takeKeyEvents"
+        | "overridePendingTransition"
+        | "requestShowKeyboardShortcuts"
+        | "requestVisibleBehind"
+        | "setContentTransitionManager"
+        | "setEnterSharedElementCallback"
+        | "setExitSharedElementCallback"
+        | "setFinishOnTouchOutside"
+        | "setImmersive"
+        | "setInheritShowWhenLocked"
+        | "setLocusContext"
+        | "setPictureInPictureParams"
+        | "setRecentsScreenshotEnabled"
+        | "setShouldDockBigOverlays"
+        | "setShowWhenLocked"
+        | "setTranslucent"
+        | "setTurnScreenOn"
+        | "setVrModeEnabled"
+        | "showAssist"
+        | "showLockTaskEscapeMessage"
+        | "startLockTask"
+        | "stopLockTask"
+        | "requestFullscreenMode"
+        | "reportFullyDrawn"
+        | "dismissKeyboardShortcutsHelper"
+        | "dismissKeyguard"
+        | "onProvideKeyboardShortcuts" => Some(None),
         // Activity.findViewById searches the decor tree under the content
         // view set by setContentView; miss → null like real Android.
         "findViewById" => {
@@ -1649,40 +1780,75 @@ fn context_call(
         "getLayoutInflater" | "getMenuInflater" => {
             Some(Some(view::inflater(vm, args.first().copied())))
         }
-        "getWindowManager" | "getActionBar" | "getFragmentManager"
+        "getWindowManager"
+        | "getActionBar"
+        | "getFragmentManager"
         | "getLoaderManager"
-        | "getMediaController" | "getSearchEvent" | "getCallingActivity"
-        | "getCallingPackage" | "getReferrer" | "getTaskId" | "getMaxNumPictureInPictureActions"
-        | "getParentActivityIntent" | "getLocalClassName" | "getComponentName"
-        | "getVoiceInteractor" | "getActivityToken" | "getAssistToken"
-        | "getCurrentFocus" | "getLastNonConfigurationInstance"
-        | "onRetainNonConfigurationInstance" | "isTaskRoot"
-        | "isFinishing" | "isDestroyed" | "isChangingConfigurations"
-        | "isInMultiWindowMode" | "isInPictureInPictureMode" | "isChild"
-        | "isImmersive" | "isLaunchedFromBubble" | "isLocalVoiceInteractionSupported"
-        | "hasWindowFocus" | "moveTaskToBack" | "finish" | "finishAffinity"
-        | "finishActivity" | "finishActivityFromChild" | "finishAfterTransition"
-        | "finishAndRemoveTask" | "finishFromChild" | "onBackPressed"
-        | "onUserInteraction" | "onPostResume" | "navigateUpTo"
-        | "navigateUpToFromChild" | "shouldUpRecreateTask" => {
+        | "getMediaController"
+        | "getSearchEvent"
+        | "getCallingActivity"
+        | "getCallingPackage"
+        | "getReferrer"
+        | "getTaskId"
+        | "getMaxNumPictureInPictureActions"
+        | "getParentActivityIntent"
+        | "getLocalClassName"
+        | "getComponentName"
+        | "getVoiceInteractor"
+        | "getActivityToken"
+        | "getAssistToken"
+        | "getCurrentFocus"
+        | "getLastNonConfigurationInstance"
+        | "onRetainNonConfigurationInstance"
+        | "isTaskRoot"
+        | "isFinishing"
+        | "isDestroyed"
+        | "isChangingConfigurations"
+        | "isInMultiWindowMode"
+        | "isInPictureInPictureMode"
+        | "isChild"
+        | "isImmersive"
+        | "isLaunchedFromBubble"
+        | "isLocalVoiceInteractionSupported"
+        | "hasWindowFocus"
+        | "moveTaskToBack"
+        | "finish"
+        | "finishAffinity"
+        | "finishActivity"
+        | "finishActivityFromChild"
+        | "finishAfterTransition"
+        | "finishAndRemoveTask"
+        | "finishFromChild"
+        | "onBackPressed"
+        | "onUserInteraction"
+        | "onPostResume"
+        | "navigateUpTo"
+        | "navigateUpToFromChild"
+        | "shouldUpRecreateTask" => {
             match name {
                 "getTaskId" => Some(Some(V::I32(1))),
-                "isFinishing" => Some(Some(V::I32(
-                    match args[0] {
-                        V::Ref(h) => view::is_finishing(vm, h) as i32,
-                        _ => 0,
-                    },
-                ))),
-                "isTaskRoot" | "hasWindowFocus" | "isInMultiWindowMode"
-                | "isInPictureInPictureMode" | "isImmersive" | "isChild"
-                | "isLaunchedFromBubble" | "isLocalVoiceInteractionSupported"
-                | "isDestroyed" | "isChangingConfigurations" => {
-                    Some(Some(V::I32(
-                        matches!(name, "isTaskRoot" | "hasWindowFocus") as i32,
-                    )))
-                }
-                "finish" | "finishAffinity" | "finishAfterTransition"
-                | "finishAndRemoveTask" | "finishFromChild" => {
+                "isFinishing" => Some(Some(V::I32(match args[0] {
+                    V::Ref(h) => view::is_finishing(vm, h) as i32,
+                    _ => 0,
+                }))),
+                "isTaskRoot"
+                | "hasWindowFocus"
+                | "isInMultiWindowMode"
+                | "isInPictureInPictureMode"
+                | "isImmersive"
+                | "isChild"
+                | "isLaunchedFromBubble"
+                | "isLocalVoiceInteractionSupported"
+                | "isDestroyed"
+                | "isChangingConfigurations" => Some(Some(V::I32(matches!(
+                    name,
+                    "isTaskRoot" | "hasWindowFocus"
+                ) as i32))),
+                "finish"
+                | "finishAffinity"
+                | "finishAfterTransition"
+                | "finishAndRemoveTask"
+                | "finishFromChild" => {
                     if let V::Ref(h) = args[0] {
                         pseudo_set(vm, h, view::P_FINISHED, V::I32(1));
                     }
@@ -1691,15 +1857,18 @@ fn context_call(
                 // finishActivity*(requestCode) ends a *child* activity
                 // started for a result, not the caller — flagging it
                 // would mark `this` finished and abort its lifecycle.
-                "finishActivity" | "finishActivityFromChild"
-                | "onBackPressed" | "onUserInteraction" | "onPostResume"
-                | "onRetainNonConfigurationInstance" | "moveTaskToBack" => {
-                    Some(None)
-                }
-                "navigateUpTo" | "navigateUpToFromChild" | "shouldUpRecreateTask"
-                | "startActivityIfNeeded" | "startNextMatchingActivity" => {
-                    Some(Some(V::I32(0)))
-                }
+                "finishActivity"
+                | "finishActivityFromChild"
+                | "onBackPressed"
+                | "onUserInteraction"
+                | "onPostResume"
+                | "onRetainNonConfigurationInstance"
+                | "moveTaskToBack" => Some(None),
+                "navigateUpTo"
+                | "navigateUpToFromChild"
+                | "shouldUpRecreateTask"
+                | "startActivityIfNeeded"
+                | "startNextMatchingActivity" => Some(Some(V::I32(0))),
                 "getLocalClassName" => {
                     let c = class_of(vm, args[0]);
                     Some(Some(jstr(vm, &dotted(&c))))
@@ -1743,20 +1912,41 @@ fn context_call(
             );
             Some(None)
         }
-        "onCreate" | "onStart" | "onResume" | "onPause" | "onStop"
-        | "onDestroy" | "onRestart" | "onSaveInstanceState"
-        | "onRestoreInstanceState" | "onActivityResult" | "onNewIntent"
-        | "onRequestPermissionsResult" | "onCreateOptionsMenu"
-        | "onOptionsItemSelected" | "onCreateContextMenu"
-        | "onContextItemSelected" | "onOptionsMenuClosed"
-        | "onPrepareOptionsMenu" | "onConfigurationChanged"
-        | "onLowMemory" | "onTrimMemory" | "onMultiWindowModeChanged"
-        | "onPictureInPictureModeChanged" | "onWindowAttributesChanged"
-        | "onMenuOpened" | "onContextMenuClosed" | "onAttachedToWindow"
-        | "onDetachedFromWindow" | "onEnterAnimationComplete"
-        | "onGetDirectActions" | "onPerformDirectAction"
-        | "onProvideAssistContent" | "onProvideAssistData"
-        | "onStateNotSaved" | "onTopResumedActivityChanged" => {
+        "onCreate"
+        | "onStart"
+        | "onResume"
+        | "onPause"
+        | "onStop"
+        | "onDestroy"
+        | "onRestart"
+        | "onSaveInstanceState"
+        | "onRestoreInstanceState"
+        | "onActivityResult"
+        | "onNewIntent"
+        | "onRequestPermissionsResult"
+        | "onCreateOptionsMenu"
+        | "onOptionsItemSelected"
+        | "onCreateContextMenu"
+        | "onContextItemSelected"
+        | "onOptionsMenuClosed"
+        | "onPrepareOptionsMenu"
+        | "onConfigurationChanged"
+        | "onLowMemory"
+        | "onTrimMemory"
+        | "onMultiWindowModeChanged"
+        | "onPictureInPictureModeChanged"
+        | "onWindowAttributesChanged"
+        | "onMenuOpened"
+        | "onContextMenuClosed"
+        | "onAttachedToWindow"
+        | "onDetachedFromWindow"
+        | "onEnterAnimationComplete"
+        | "onGetDirectActions"
+        | "onPerformDirectAction"
+        | "onProvideAssistContent"
+        | "onProvideAssistData"
+        | "onStateNotSaved"
+        | "onTopResumedActivityChanged" => {
             // Reached only via invoke-super — direct calls resolve to
             // the guest override first, and host-side lifecycle delivery
             // goes through call_virtual. The framework default is empty;
@@ -1811,111 +2001,167 @@ fn pm_call(vm: &mut Vm, name: &str, args: &[V]) -> Rt<Option<Option<V>>> {
             "Landroid/content/pm/ApplicationInfo;",
             HostState::Empty,
         ))),
-        "getActivityInfo" | "getServiceInfo" | "getReceiverInfo"
-        | "getProviderInfo" | "resolveActivity" | "resolveService"
-        | "resolveContentProvider" | "getInstallerPackageName"
-        | "getLaunchIntentForPackage" | "getLeanbackLaunchIntentForPackage"
-        | "getDrawable" | "getActivityIcon" | "getApplicationIcon"
-        | "getDefaultActivityIcon" | "getActivityBanner"
-        | "getApplicationBanner" | "getApplicationLabel"
-        | "getPermissionGroupInfo" | "getPermissionInfo"
-        | "getPackageArchiveInfo" | "getResourcesForActivity"
-        | "getResourcesForApplication" | "getText" | "getXml"
-        | "getSystemSharedLibraryNames" | "getChangedPackages"
-        | "getSharedLibraries" | "getInstantAppCookie"
-        | "getSuspendedPackageAppExtras" | "getUnbadgedIcon"
-        | "getUserBadgedIcon" | "getUserBadgedLabel"
-        | "getUserBadgedDrawableForDensity" | "getPackagesForUid"
-        | "getNameForUid" | "getSyntheticAppDetailsActivityEnabled"
-        | "queryIntentActivities" | "queryIntentActivityOptions"
-        | "queryIntentServices" | "queryIntentContentProviders"
-        | "queryBroadcastReceivers" | "getInstalledPackages"
-        | "getInstalledApplications" | "getPackagesHoldingPermissions"
-        | "checkPermission" | "checkSignatures" | "hasSystemFeature"
-        | "isInstantApp" | "isPackageSuspended" | "canRequestPackageInstalls"
-        | "hasSigningCertificate" | "addPermission" | "addPermissionAsync"
-        | "removePermission" | "clearPackagePreferredActivities"
-        | "addPackageToPreferred" | "removePackageFromPreferred"
-        | "getPreferredPackages" | "getPreferredActivities"
-        | "setComponentEnabledSetting" | "getComponentEnabledSetting"
-        | "setApplicationEnabledSetting" | "getApplicationEnabledSetting"
-        | "isSafeMode" | "getPackageInstaller" | "extendVerificationTimeout"
-        | "verifyPendingInstall" | "setInstallerPackageName"
-        | "updateInstantAppCookie" | "clearInstantAppCookie" | "getModuleInfo"
-        | "getInstallReason" | "getInstallSourceInfo" => {
-            match name {
-                "getActivityInfo" => Some(Some(host(
-                    vm,
-                    "Landroid/content/pm/ActivityInfo;",
-                    HostState::Empty,
-                ))),
-                "getServiceInfo" => Some(Some(host(
-                    vm,
-                    "Landroid/content/pm/ServiceInfo;",
-                    HostState::Empty,
-                ))),
-                "getReceiverInfo" => Some(Some(host(
-                    vm,
-                    "Landroid/content/pm/ActivityInfo;",
-                    HostState::Empty,
-                ))),
-                "getProviderInfo" => Some(Some(host(
-                    vm,
-                    "Landroid/content/pm/ProviderInfo;",
-                    HostState::Empty,
-                ))),
-                "getInstallerPackageName" | "getLaunchIntentForPackage"
-                | "getLeanbackLaunchIntentForPackage" | "getDrawable"
-                | "getActivityIcon" | "getApplicationIcon"
-                | "getDefaultActivityIcon" | "getActivityBanner"
-                | "getApplicationBanner" | "getPermissionGroupInfo"
-                | "getPermissionInfo" | "getPackageArchiveInfo"
-                | "getResourcesForActivity" | "getResourcesForApplication"
-                | "getText" | "getXml" | "getSystemSharedLibraryNames"
-                | "getChangedPackages" | "getSharedLibraries"
-                | "getInstantAppCookie" | "getSuspendedPackageAppExtras"
-                | "getUnbadgedIcon" | "getUserBadgedIcon"
-                | "getUserBadgedLabel" | "getUserBadgedDrawableForDensity"
-                | "getPackagesForUid" | "getNameForUid"
-                | "resolveActivity" | "resolveService"
-                | "resolveContentProvider" | "getModuleInfo"
-                | "getInstallSourceInfo" | "getPackageInstaller" => {
-                    if name == "getApplicationLabel" {
-                        Some(Some(jstr(vm, "app")))
-                    } else {
-                        Some(Some(V::Ref(0)))
-                    }
+        "getActivityInfo"
+        | "getServiceInfo"
+        | "getReceiverInfo"
+        | "getProviderInfo"
+        | "resolveActivity"
+        | "resolveService"
+        | "resolveContentProvider"
+        | "getInstallerPackageName"
+        | "getLaunchIntentForPackage"
+        | "getLeanbackLaunchIntentForPackage"
+        | "getDrawable"
+        | "getActivityIcon"
+        | "getApplicationIcon"
+        | "getDefaultActivityIcon"
+        | "getActivityBanner"
+        | "getApplicationBanner"
+        | "getApplicationLabel"
+        | "getPermissionGroupInfo"
+        | "getPermissionInfo"
+        | "getPackageArchiveInfo"
+        | "getResourcesForActivity"
+        | "getResourcesForApplication"
+        | "getText"
+        | "getXml"
+        | "getSystemSharedLibraryNames"
+        | "getChangedPackages"
+        | "getSharedLibraries"
+        | "getInstantAppCookie"
+        | "getSuspendedPackageAppExtras"
+        | "getUnbadgedIcon"
+        | "getUserBadgedIcon"
+        | "getUserBadgedLabel"
+        | "getUserBadgedDrawableForDensity"
+        | "getPackagesForUid"
+        | "getNameForUid"
+        | "getSyntheticAppDetailsActivityEnabled"
+        | "queryIntentActivities"
+        | "queryIntentActivityOptions"
+        | "queryIntentServices"
+        | "queryIntentContentProviders"
+        | "queryBroadcastReceivers"
+        | "getInstalledPackages"
+        | "getInstalledApplications"
+        | "getPackagesHoldingPermissions"
+        | "checkPermission"
+        | "checkSignatures"
+        | "hasSystemFeature"
+        | "isInstantApp"
+        | "isPackageSuspended"
+        | "canRequestPackageInstalls"
+        | "hasSigningCertificate"
+        | "addPermission"
+        | "addPermissionAsync"
+        | "removePermission"
+        | "clearPackagePreferredActivities"
+        | "addPackageToPreferred"
+        | "removePackageFromPreferred"
+        | "getPreferredPackages"
+        | "getPreferredActivities"
+        | "setComponentEnabledSetting"
+        | "getComponentEnabledSetting"
+        | "setApplicationEnabledSetting"
+        | "getApplicationEnabledSetting"
+        | "isSafeMode"
+        | "getPackageInstaller"
+        | "extendVerificationTimeout"
+        | "verifyPendingInstall"
+        | "setInstallerPackageName"
+        | "updateInstantAppCookie"
+        | "clearInstantAppCookie"
+        | "getModuleInfo"
+        | "getInstallReason"
+        | "getInstallSourceInfo" => match name {
+            "getActivityInfo" => Some(Some(host(
+                vm,
+                "Landroid/content/pm/ActivityInfo;",
+                HostState::Empty,
+            ))),
+            "getServiceInfo" => Some(Some(host(
+                vm,
+                "Landroid/content/pm/ServiceInfo;",
+                HostState::Empty,
+            ))),
+            "getReceiverInfo" => Some(Some(host(
+                vm,
+                "Landroid/content/pm/ActivityInfo;",
+                HostState::Empty,
+            ))),
+            "getProviderInfo" => Some(Some(host(
+                vm,
+                "Landroid/content/pm/ProviderInfo;",
+                HostState::Empty,
+            ))),
+            "getInstallerPackageName"
+            | "getLaunchIntentForPackage"
+            | "getLeanbackLaunchIntentForPackage"
+            | "getDrawable"
+            | "getActivityIcon"
+            | "getApplicationIcon"
+            | "getDefaultActivityIcon"
+            | "getActivityBanner"
+            | "getApplicationBanner"
+            | "getPermissionGroupInfo"
+            | "getPermissionInfo"
+            | "getPackageArchiveInfo"
+            | "getResourcesForActivity"
+            | "getResourcesForApplication"
+            | "getText"
+            | "getXml"
+            | "getSystemSharedLibraryNames"
+            | "getChangedPackages"
+            | "getSharedLibraries"
+            | "getInstantAppCookie"
+            | "getSuspendedPackageAppExtras"
+            | "getUnbadgedIcon"
+            | "getUserBadgedIcon"
+            | "getUserBadgedLabel"
+            | "getUserBadgedDrawableForDensity"
+            | "getPackagesForUid"
+            | "getNameForUid"
+            | "resolveActivity"
+            | "resolveService"
+            | "resolveContentProvider"
+            | "getModuleInfo"
+            | "getInstallSourceInfo"
+            | "getPackageInstaller" => {
+                if name == "getApplicationLabel" {
+                    Some(Some(jstr(vm, "app")))
+                } else {
+                    Some(Some(V::Ref(0)))
                 }
-                "getApplicationLabel" => Some(Some(jstr(vm, "app"))),
-                "queryIntentActivities" | "queryIntentActivityOptions"
-                | "queryIntentServices" | "queryIntentContentProviders"
-                | "queryBroadcastReceivers" | "getInstalledPackages"
-                | "getInstalledApplications" | "getPackagesHoldingPermissions"
-                | "getPreferredPackages" => Some(Some(host(
-                    vm,
-                    "Ljava/util/List;",
-                    HostState::List(vec![]),
-                ))),
-                "checkPermission" | "checkSignatures" => {
-                    let g = perm_arg(vm, args)
-                        .map(|p| vm.granted_permissions.contains(&p))
-                        .unwrap_or(true);
-                    Some(Some(V::I32(if g { 0 } else { -1 })))
-                }
-                "hasSystemFeature" | "isInstantApp" | "isPackageSuspended"
-                | "canRequestPackageInstalls" | "hasSigningCertificate"
-                | "isSafeMode" | "getSyntheticAppDetailsActivityEnabled" => {
-                    Some(Some(V::I32(0)))
-                }
-                "getComponentEnabledSetting" | "getApplicationEnabledSetting" => {
-                    Some(Some(V::I32(1)))
-                }
-                "getPreferredActivities" | "getInstallReason" => {
-                    Some(Some(V::I32(0)))
-                }
-                _ => Some(None),
             }
-        }
+            "getApplicationLabel" => Some(Some(jstr(vm, "app"))),
+            "queryIntentActivities"
+            | "queryIntentActivityOptions"
+            | "queryIntentServices"
+            | "queryIntentContentProviders"
+            | "queryBroadcastReceivers"
+            | "getInstalledPackages"
+            | "getInstalledApplications"
+            | "getPackagesHoldingPermissions"
+            | "getPreferredPackages" => {
+                Some(Some(host(vm, "Ljava/util/List;", HostState::List(vec![]))))
+            }
+            "checkPermission" | "checkSignatures" => {
+                let g = perm_arg(vm, args)
+                    .map(|p| vm.granted_permissions.contains(&p))
+                    .unwrap_or(true);
+                Some(Some(V::I32(if g { 0 } else { -1 })))
+            }
+            "hasSystemFeature"
+            | "isInstantApp"
+            | "isPackageSuspended"
+            | "canRequestPackageInstalls"
+            | "hasSigningCertificate"
+            | "isSafeMode"
+            | "getSyntheticAppDetailsActivityEnabled" => Some(Some(V::I32(0))),
+            "getComponentEnabledSetting" | "getApplicationEnabledSetting" => Some(Some(V::I32(1))),
+            "getPreferredActivities" | "getInstallReason" => Some(Some(V::I32(0))),
+            _ => Some(None),
+        },
         _ => None,
     })
 }
@@ -1923,12 +2169,16 @@ fn pm_call(vm: &mut Vm, name: &str, args: &[V]) -> Rt<Option<Option<V>>> {
 fn resources_call(vm: &mut Vm, name: &str, args: &[V]) -> Rt<Option<Option<V>>> {
     let res_id = || -> u32 { i64v(args.get(1).copied().unwrap_or(V::I32(0))) as u32 };
     Ok(match name {
-        "getString" | "getText" => Some(Some(match vm.apk_res.as_ref().and_then(|r| {
-            r.string_of(res_id()).map(|s| s.to_string())
-        }) {
-            Some(s) => jstr(vm, &s),
-            None => jstr(vm, ""),
-        })),
+        "getString" | "getText" => Some(Some(
+            match vm
+                .apk_res
+                .as_ref()
+                .and_then(|r| r.string_of(res_id()).map(|s| s.to_string()))
+            {
+                Some(s) => jstr(vm, &s),
+                None => jstr(vm, ""),
+            },
+        )),
         "getQuantityString" | "getQuantityText" => {
             let id = res_id();
             let qty = i64v(args.get(2).copied().unwrap_or(V::I32(0)));
@@ -2118,7 +2368,11 @@ fn resources_call(vm: &mut Vm, name: &str, args: &[V]) -> Rt<Option<Option<V>>> 
             .iter()
             .find_map(|c| vm.instantiate(c).ok().map(V::Ref))
             .unwrap_or_else(|| {
-                host(vm, "Landroid/graphics/drawable/VectorDrawable;", HostState::Empty)
+                host(
+                    vm,
+                    "Landroid/graphics/drawable/VectorDrawable;",
+                    HostState::Empty,
+                )
             });
             Some(Some(d))
         }
@@ -2132,97 +2386,106 @@ fn resources_call(vm: &mut Vm, name: &str, args: &[V]) -> Rt<Option<Option<V>>> 
             "Landroid/graphics/Typeface;",
             HostState::Empty,
         ))),
-        "getLayout" | "obtainTypedArray" | "obtainAttributes"
-        | "getXml" | "getRawResource" | "openRawResource"
-        | "openRawResourceFd" | "getValue" | "getValueForDensity"
-        | "getResourceName" | "getResourcePackageName"
-        | "getResourceTypeName" | "getResourceEntryName" | "getDisplayMetrics"
-        | "getConfiguration" | "getAssets" | "getSystem" | "newTheme"
-        | "getMovie" => {
-            match name {
-                "getLayout" => Some(Some(xml::parser_of(
-                    vm,
-                    i64v(args.get(1).copied().unwrap_or(V::I32(0))) as u32,
-                ))),
-                "getDisplayMetrics" => Some(Some(host(
-                    vm,
-                    "Landroid/util/DisplayMetrics;",
-                    HostState::Empty,
-                ))),
-                "getConfiguration" => Some(Some(host(
-                    vm,
-                    "Landroid/content/res/Configuration;",
-                    HostState::Empty,
-                ))),
-                "getAssets" => Some(Some(host(
-                    vm,
-                    "Landroid/content/res/AssetManager;",
-                    HostState::Empty,
-                ))),
-                "getSystem" | "newTheme" => Some(Some(host(
-                    vm,
-                    "Landroid/content/res/Resources;",
-                    HostState::Empty,
-                ))),
-                "obtainTypedArray" | "obtainAttributes" => Some(Some(host(
-                    vm,
-                    "Landroid/content/res/TypedArray;",
-                    HostState::Empty,
-                ))),
-                "getResourceName" => Some(Some(match vm
+        "getLayout"
+        | "obtainTypedArray"
+        | "obtainAttributes"
+        | "getXml"
+        | "getRawResource"
+        | "openRawResource"
+        | "openRawResourceFd"
+        | "getValue"
+        | "getValueForDensity"
+        | "getResourceName"
+        | "getResourcePackageName"
+        | "getResourceTypeName"
+        | "getResourceEntryName"
+        | "getDisplayMetrics"
+        | "getConfiguration"
+        | "getAssets"
+        | "getSystem"
+        | "newTheme"
+        | "getMovie" => match name {
+            "getLayout" => Some(Some(xml::parser_of(
+                vm,
+                i64v(args.get(1).copied().unwrap_or(V::I32(0))) as u32,
+            ))),
+            "getDisplayMetrics" => Some(Some(host(
+                vm,
+                "Landroid/util/DisplayMetrics;",
+                HostState::Empty,
+            ))),
+            "getConfiguration" => Some(Some(host(
+                vm,
+                "Landroid/content/res/Configuration;",
+                HostState::Empty,
+            ))),
+            "getAssets" => Some(Some(host(
+                vm,
+                "Landroid/content/res/AssetManager;",
+                HostState::Empty,
+            ))),
+            "getSystem" | "newTheme" => Some(Some(host(
+                vm,
+                "Landroid/content/res/Resources;",
+                HostState::Empty,
+            ))),
+            "obtainTypedArray" | "obtainAttributes" => Some(Some(host(
+                vm,
+                "Landroid/content/res/TypedArray;",
+                HostState::Empty,
+            ))),
+            "getResourceName" => Some(Some(
+                match vm.apk_res.as_ref().and_then(|r| {
+                    r.resource_name(i64v(args.get(1).copied().unwrap_or(V::I32(0))) as u32)
+                }) {
+                    Some(n) => jstr(vm, &n),
+                    None => jstr(vm, ""),
+                },
+            )),
+            "getResourceEntryName" => {
+                let n = vm
                     .apk_res
                     .as_ref()
                     .and_then(|r| {
-                        r.resource_name(i64v(args.get(1).copied().unwrap_or(V::I32(0))) as u32)
-                    }) {
-                    Some(n) => jstr(vm, &n),
-                    None => jstr(vm, ""),
-                })),
-                "getResourceEntryName" => {
-                    let n = vm
-                        .apk_res
-                        .as_ref()
-                        .and_then(|r| {
-                            r.entry_name(
-                                i64v(args.get(1).copied().unwrap_or(V::I32(0))) as u32,
-                            )
-                        })
-                        .map(str::to_string);
-                    if std::env::var_os("OVELO_VIEWDBG").is_some() {
-                        eprintln!("[viewdbg] getResourceEntryName({:?}) -> {n:?}", args.get(1));
-                    }
-                    Some(Some(jstr(vm, n.as_deref().unwrap_or(""))))
+                        r.entry_name(i64v(args.get(1).copied().unwrap_or(V::I32(0))) as u32)
+                    })
+                    .map(str::to_string);
+                if std::env::var_os("OVELO_VIEWDBG").is_some() {
+                    eprintln!("[viewdbg] getResourceEntryName({:?}) -> {n:?}", args.get(1));
                 }
-                "getResourceTypeName" => {
-                    let n = vm
-                        .apk_res
-                        .as_ref()
-                        .and_then(|r| {
-                            r.type_name(
-                                i64v(args.get(1).copied().unwrap_or(V::I32(0))) as u32,
-                            )
-                        })
-                        .map(str::to_string);
-                    Some(Some(jstr(vm, n.as_deref().unwrap_or(""))))
-                }
-                "getResourcePackageName" => {
-                    let n = vm
-                        .apk_res
-                        .as_ref()
-                        .and_then(|r| r.package_name())
-                        .map(str::to_string);
-                    Some(Some(jstr(vm, n.as_deref().unwrap_or(""))))
-                }
-                "getXml" => Some(Some(xml::parser_of(
-                    vm,
-                    i64v(args.get(1).copied().unwrap_or(V::I32(0))) as u32,
-                ))),
-                _ => Some(Some(V::Ref(0))),
+                Some(Some(jstr(vm, n.as_deref().unwrap_or(""))))
             }
-        }
-        "updateConfiguration" | "flushLayoutCache" | "finishPreloading"
-        | "clearCachesForUntrustedConfigs" | "registerResourcePaths"
-        | "getCompatibilityInfo" | "getCompatibilityInfo0" => Some(None),
+            "getResourceTypeName" => {
+                let n = vm
+                    .apk_res
+                    .as_ref()
+                    .and_then(|r| {
+                        r.type_name(i64v(args.get(1).copied().unwrap_or(V::I32(0))) as u32)
+                    })
+                    .map(str::to_string);
+                Some(Some(jstr(vm, n.as_deref().unwrap_or(""))))
+            }
+            "getResourcePackageName" => {
+                let n = vm
+                    .apk_res
+                    .as_ref()
+                    .and_then(|r| r.package_name())
+                    .map(str::to_string);
+                Some(Some(jstr(vm, n.as_deref().unwrap_or(""))))
+            }
+            "getXml" => Some(Some(xml::parser_of(
+                vm,
+                i64v(args.get(1).copied().unwrap_or(V::I32(0))) as u32,
+            ))),
+            _ => Some(Some(V::Ref(0))),
+        },
+        "updateConfiguration"
+        | "flushLayoutCache"
+        | "finishPreloading"
+        | "clearCachesForUntrustedConfigs"
+        | "registerResourcePaths"
+        | "getCompatibilityInfo"
+        | "getCompatibilityInfo0" => Some(None),
         "getQuantityText0" => Some(Some(V::Ref(0))),
         _ => None,
     })
@@ -2275,12 +2538,7 @@ fn fill_typed_value(vm: &mut Vm, tv: V, v: V) {
 /// `data_type` numbering IS `android.util.TypedValue.TYPE_*`, so
 /// boolean/dimension/color attrs keep their exact type and a
 /// `TYPE_REFERENCE` keeps its resource id.
-fn fill_typed_value_ev(
-    vm: &mut Vm,
-    tv: V,
-    ev: &ovelo_apk::arsc::EntryValue,
-    res_id: u32,
-) {
+fn fill_typed_value_ev(vm: &mut Vm, tv: V, ev: &ovelo_apk::arsc::EntryValue, res_id: u32) {
     let V::Ref(h) = tv else {
         return;
     };
@@ -2335,9 +2593,17 @@ fn res_misc(vm: &mut Vm, class: &str, name: &str, args: &[V]) -> Rt<Option<Optio
                     .unwrap_or_else(|| args.get(2).copied().unwrap_or(V::Ref(0))),
             ))
         }
-        ("Landroid/content/res/TypedArray;", "getInt" | "getColor"
-        | "getBoolean" | "getInteger" | "getResourceId" | "getDimensionPixelSize"
-        | "getDimensionPixelOffset" | "getLayoutDimension") => {
+        (
+            "Landroid/content/res/TypedArray;",
+            "getInt"
+            | "getColor"
+            | "getBoolean"
+            | "getInteger"
+            | "getResourceId"
+            | "getDimensionPixelSize"
+            | "getDimensionPixelOffset"
+            | "getLayoutDimension",
+        ) => {
             let def = args.get(2).copied().unwrap_or(V::I32(0));
             let found = ta_index(vm, args)
                 .and_then(|(h, i)| view::ta_lookup(vm, h, i))
@@ -2358,8 +2624,9 @@ fn res_misc(vm: &mut Vm, class: &str, name: &str, args: &[V]) -> Rt<Option<Optio
                             .as_ref()
                             .and_then(|r| r.entry_value(id as u32).cloned());
                         match entry {
-                            Some(v) if name.starts_with("getDimension")
-                                || name == "getLayoutDimension" =>
+                            Some(v)
+                                if name.starts_with("getDimension")
+                                    || name == "getLayoutDimension" =>
                             {
                                 V::I32(crate::res::typed_px(&v) as i32)
                             }
@@ -2381,9 +2648,7 @@ fn res_misc(vm: &mut Vm, class: &str, name: &str, args: &[V]) -> Rt<Option<Optio
                 .map(|v| match v {
                     // A @dimen/ reference resolves to its decoded px
                     // value (type byte nonzero — see getInt's guard).
-                    V::I32(id)
-                        if (id as u32) >> 24 == 0x7f && (id as u32) >> 16 & 0xff != 0 =>
-                    {
+                    V::I32(id) if (id as u32) >> 24 == 0x7f && (id as u32) >> 16 & 0xff != 0 => {
                         V::F32(
                             vm.apk_res
                                 .as_ref()
@@ -2403,11 +2668,7 @@ fn res_misc(vm: &mut Vm, class: &str, name: &str, args: &[V]) -> Rt<Option<Optio
                     V::I32(id) if (id as u32) >> 24 == 0x7f => Some(id as u32),
                     _ => None,
                 })
-                .and_then(|id| {
-                    vm.apk_res
-                        .as_ref()
-                        .map(|r| r.array_items(id))
-                })
+                .and_then(|id| vm.apk_res.as_ref().map(|r| r.array_items(id)))
                 .unwrap_or_default();
             if items.is_empty() {
                 return Ok(Some(Some(V::Ref(0))));
@@ -2425,8 +2686,9 @@ fn res_misc(vm: &mut Vm, class: &str, name: &str, args: &[V]) -> Rt<Option<Optio
             };
             Some(Some(arr(vm, OBJ, vals)))
         }
-        ("Landroid/content/res/TypedArray;", "getDrawable" | "getFont"
-        | "getColorStateList") => Some(Some(V::Ref(0))),
+        ("Landroid/content/res/TypedArray;", "getDrawable" | "getFont" | "getColorStateList") => {
+            Some(Some(V::Ref(0)))
+        }
         ("Landroid/content/res/TypedArray;", "hasValue" | "hasValueOrEmpty") => {
             let yes = ta_index(vm, args).is_some_and(|(h, i)| {
                 if view::ta_lookup(vm, h, i).is_some() {
@@ -2487,9 +2749,7 @@ fn res_misc(vm: &mut Vm, class: &str, name: &str, args: &[V]) -> Rt<Option<Optio
                 .unwrap_or(0);
             Some(Some(V::I32(v)))
         }
-        ("Landroid/content/res/TypedArray;", "getType") => {
-            Some(Some(V::I32(0)))
-        }
+        ("Landroid/content/res/TypedArray;", "getType") => Some(Some(V::I32(0))),
         ("Landroid/content/res/TypedArray;", "getValue" | "peekValue") => {
             // getValue(index, TypedValue) fills the caller's TypedValue
             // in place and answers bool; peekValue answers a fresh one.
@@ -2507,54 +2767,54 @@ fn res_misc(vm: &mut Vm, class: &str, name: &str, args: &[V]) -> Rt<Option<Optio
             }
             Some(Some(V::I32(1)))
         }
-        ("Landroid/content/res/TypedArray;", "recycle" | "extractThemeAttrs"
-        | "getChangingConfigurations") => Some(None),
-        ("Landroid/util/TypedValue;", "applyDimension" | "complexToDimension"
-        | "complexToDimensionPixelSize" | "complexToDimensionPixelOffset"
-        | "complexToFloat" | "complexToFraction") => {
-            Some(Some(V::F32(f64v(args.get(1).copied().unwrap_or(V::F32(0.0))) as f32)))
-        }
+        (
+            "Landroid/content/res/TypedArray;",
+            "recycle" | "extractThemeAttrs" | "getChangingConfigurations",
+        ) => Some(None),
+        (
+            "Landroid/util/TypedValue;",
+            "applyDimension"
+            | "complexToDimension"
+            | "complexToDimensionPixelSize"
+            | "complexToDimensionPixelOffset"
+            | "complexToFloat"
+            | "complexToFraction",
+        ) => Some(Some(V::F32(
+            f64v(args.get(1).copied().unwrap_or(V::F32(0.0))) as f32,
+        ))),
         ("Landroid/content/res/ColorStateList;", "valueOf") => {
             Some(Some(host(vm, class, HostState::Slot(args[0]))))
         }
-        ("Landroid/content/res/ColorStateList;", "getDefaultColor") => {
-            Some(Some(match args[0] {
-                V::Ref(h) => slot_of(vm, h).unwrap_or(V::I32(0)),
-                v => v,
-            }))
-        }
-        ("Landroid/content/res/ColorStateList;", "getColorForState") => {
-            Some(Some(match args[0] {
-                V::Ref(h) => slot_of(vm, h).unwrap_or(V::I32(0)),
-                _ => V::I32(0),
-            }))
-        }
-        ("Landroid/content/res/AssetManager;", "open" | "openFd"
-        | "openNonAssetFd" | "openXmlResourceParser" | "list") => {
+        ("Landroid/content/res/ColorStateList;", "getDefaultColor") => Some(Some(match args[0] {
+            V::Ref(h) => slot_of(vm, h).unwrap_or(V::I32(0)),
+            v => v,
+        })),
+        ("Landroid/content/res/ColorStateList;", "getColorForState") => Some(Some(match args[0] {
+            V::Ref(h) => slot_of(vm, h).unwrap_or(V::I32(0)),
+            _ => V::I32(0),
+        })),
+        (
+            "Landroid/content/res/AssetManager;",
+            "open" | "openFd" | "openNonAssetFd" | "openXmlResourceParser" | "list",
+        ) => {
             if name == "list" {
                 Some(Some(arr(vm, STRING, vec![])))
             } else {
                 Some(Some(V::Ref(0)))
             }
         }
-        ("Landroid/content/res/AssetManager;", "close" | "addAssetPath"
-        | "isUpToDate" | "getLocales" | "getConfigurations") => {
-            match name {
-                "addAssetPath" => Some(Some(V::I32(0))),
-                "isUpToDate" => Some(Some(V::I32(1))),
-                "getLocales" => Some(Some(host(
-                    vm,
-                    "Landroid/os/LocaleList;",
-                    HostState::Empty,
-                ))),
-                "getConfigurations" => Some(Some(arr(
-                    vm,
-                    "Landroid/content/res/Configuration;",
-                    vec![],
-                ))),
-                _ => Some(None),
+        (
+            "Landroid/content/res/AssetManager;",
+            "close" | "addAssetPath" | "isUpToDate" | "getLocales" | "getConfigurations",
+        ) => match name {
+            "addAssetPath" => Some(Some(V::I32(0))),
+            "isUpToDate" => Some(Some(V::I32(1))),
+            "getLocales" => Some(Some(host(vm, "Landroid/os/LocaleList;", HostState::Empty))),
+            "getConfigurations" => {
+                Some(Some(arr(vm, "Landroid/content/res/Configuration;", vec![])))
             }
-        }
+            _ => Some(None),
+        },
         ("Landroid/content/res/Resources$Theme;", "obtainStyledAttributes") => {
             Some(Some(view::typed_array(vm, args)))
         }
@@ -2575,11 +2835,7 @@ fn res_misc(vm: &mut Vm, class: &str, name: &str, args: &[V]) -> Rt<Option<Optio
                             break;
                         }
                         res_id = ev.data;
-                        match vm
-                            .apk_res
-                            .as_ref()
-                            .and_then(|r| r.entry_value(ev.data))
-                        {
+                        match vm.apk_res.as_ref().and_then(|r| r.entry_value(ev.data)) {
                             Some(next) => ev = next.clone(),
                             None => break,
                         }
@@ -2592,30 +2848,40 @@ fn res_misc(vm: &mut Vm, class: &str, name: &str, args: &[V]) -> Rt<Option<Optio
                 None => Some(Some(V::I32(0))),
             }
         }
-        ("Landroid/content/res/Resources$Theme;", "applyStyle" | "setTo"
-        | "rebase" | "dump" | "getKey" | "newTheme") => Some(None),
-        ("Landroid/content/res/Configuration;", "setTo" | "updateFrom"
-        | "diff" | "isLayoutSizeAtLeast" | "setLayoutDirection"
-        | "setLocale" | "setLocales" | "readFromProto" | "writeToProto"
-        | "describeContents" | "writeToParcel" | "getLayoutDirection"
-        | "isScreenWideColorGamut" | "isScreenHdr" | "isScreenRound"
-        | "getLocales" | "getGrammaticalGender") => {
-            match name {
-                "getLocales" => Some(Some(host(
-                    vm,
-                    "Landroid/os/LocaleList;",
-                    HostState::Empty,
-                ))),
-                _ if name.starts_with("is")
-                    || name == "getLayoutDirection"
-                    || name == "diff"
-                    || name == "getGrammaticalGender" =>
-                {
-                    Some(Some(V::I32(0)))
-                }
-                _ => Some(None),
+        (
+            "Landroid/content/res/Resources$Theme;",
+            "applyStyle" | "setTo" | "rebase" | "dump" | "getKey" | "newTheme",
+        ) => Some(None),
+        (
+            "Landroid/content/res/Configuration;",
+            "setTo"
+            | "updateFrom"
+            | "diff"
+            | "isLayoutSizeAtLeast"
+            | "setLayoutDirection"
+            | "setLocale"
+            | "setLocales"
+            | "readFromProto"
+            | "writeToProto"
+            | "describeContents"
+            | "writeToParcel"
+            | "getLayoutDirection"
+            | "isScreenWideColorGamut"
+            | "isScreenHdr"
+            | "isScreenRound"
+            | "getLocales"
+            | "getGrammaticalGender",
+        ) => match name {
+            "getLocales" => Some(Some(host(vm, "Landroid/os/LocaleList;", HostState::Empty))),
+            _ if name.starts_with("is")
+                || name == "getLayoutDirection"
+                || name == "diff"
+                || name == "getGrammaticalGender" =>
+            {
+                Some(Some(V::I32(0)))
             }
-        }
+            _ => Some(None),
+        },
         ("Landroid/os/LocaleList;", _) => match name {
             "get" | "getFirstMatch" => Some(Some(host(
                 vm,
@@ -2625,11 +2891,9 @@ fn res_misc(vm: &mut Vm, class: &str, name: &str, args: &[V]) -> Rt<Option<Optio
             "size" => Some(Some(V::I32(1))),
             "isEmpty" => Some(Some(V::I32(0))),
             "indexOf" => Some(Some(V::I32(0))),
-            "getDefault" | "getAdjustedDefault" | "setDefault" => Some(Some(host(
-                vm,
-                "Landroid/os/LocaleList;",
-                HostState::Empty,
-            ))),
+            "getDefault" | "getAdjustedDefault" | "setDefault" => {
+                Some(Some(host(vm, "Landroid/os/LocaleList;", HostState::Empty)))
+            }
             "toString" | "toLanguageTags" => Some(Some(jstr(vm, "en-US"))),
             _ => Some(None),
         },
@@ -2642,12 +2906,22 @@ fn res_misc(vm: &mut Vm, class: &str, name: &str, args: &[V]) -> Rt<Option<Optio
 
 fn handler_call(vm: &mut Vm, name: &str, args: &[V]) -> Rt<Option<Option<V>>> {
     Ok(match name {
-        "post" | "postDelayed" | "postAtTime" | "postAtFrontOfQueue"
-        | "postAtTimeWithDelivery" | "sendMessage" | "sendMessageDelayed"
-        | "sendMessageAtTime" | "sendMessageAtFrontOfQueue"
-        | "sendEmptyMessage" | "sendEmptyMessageDelayed"
-        | "sendEmptyMessageAtTime" | "postWithDeliveryResult"
-        | "postAsIdle" | "executeOrSendMessage" | "sendToTarget" => {
+        "post"
+        | "postDelayed"
+        | "postAtTime"
+        | "postAtFrontOfQueue"
+        | "postAtTimeWithDelivery"
+        | "sendMessage"
+        | "sendMessageDelayed"
+        | "sendMessageAtTime"
+        | "sendMessageAtFrontOfQueue"
+        | "sendEmptyMessage"
+        | "sendEmptyMessageDelayed"
+        | "sendEmptyMessageAtTime"
+        | "postWithDeliveryResult"
+        | "postAsIdle"
+        | "executeOrSendMessage"
+        | "sendToTarget" => {
             if let Some(V::Ref(r)) = args.get(1).copied() {
                 // Handler posts land on the main looper — deferred so a
                 // re-posting callback can't spin inside its own frame.
@@ -2665,16 +2939,12 @@ fn handler_call(vm: &mut Vm, name: &str, args: &[V]) -> Rt<Option<Option<V>>> {
             }
             Some(None)
         }
-        "removeCallbacks" | "removeMessages" | "removeCallbacksAndMessages"
+        "removeCallbacks"
+        | "removeMessages"
+        | "removeCallbacksAndMessages"
         | "removeEqualMessages" => Some(None),
-        "hasMessages" | "hasCallbacks" | "hasEqualMessages" => {
-            Some(Some(V::I32(0)))
-        }
-        "obtainMessage" => Some(Some(host(
-            vm,
-            "Landroid/os/Message;",
-            HostState::Empty,
-        ))),
+        "hasMessages" | "hasCallbacks" | "hasEqualMessages" => Some(Some(V::I32(0))),
+        "obtainMessage" => Some(Some(host(vm, "Landroid/os/Message;", HostState::Empty))),
         "getLooper" => Some(Some(main_looper(vm))),
         "getMessageName" | "getTraceName" => Some(Some(jstr(vm, ""))),
         "createAsync" => Some(Some(args[0])),
@@ -2713,21 +2983,11 @@ fn looper_call(vm: &mut Vm, name: &str, _args: &[V]) -> Rt<Option<Option<V>>> {
 // ---------------------------------------------------------------------
 // android.graphics — Rect/Point/Color/Bitmap stubs
 
-fn graphics_call(
-    vm: &mut Vm,
-    class: &str,
-    name: &str,
-    args: &[V],
-) -> Rt<Option<Option<V>>> {
+fn graphics_call(vm: &mut Vm, class: &str, name: &str, args: &[V]) -> Rt<Option<Option<V>>> {
     Ok(match (class, name) {
         ("Landroid/graphics/Color;", "argb") | ("Landroid/graphics/Color;", "rgb") => {
             let (a, r, g, b) = if name == "argb" && args.len() >= 4 {
-                (
-                    i32v(args[0]),
-                    i32v(args[1]),
-                    i32v(args[2]),
-                    i32v(args[3]),
-                )
+                (i32v(args[0]), i32v(args[1]), i32v(args[2]), i32v(args[3]))
             } else {
                 (255, i32v(args[0]), i32v(args[1]), i32v(args[2]))
             };
@@ -2755,10 +3015,11 @@ fn graphics_call(
         ("Landroid/graphics/Color;", "colorToHSV" | "valueOf" | "luminance") => {
             Some(Some(V::I32(0)))
         }
-        ("Landroid/graphics/Rect;", "set" | "offset" | "offsetTo"
-        | "contains" | "width" | "height" | "isEmpty" | "centerX"
-        | "centerY" | "exactCenterX" | "exactCenterY" | "equals"
-        | "setEmpty" | "<init>") => {
+        (
+            "Landroid/graphics/Rect;",
+            "set" | "offset" | "offsetTo" | "contains" | "width" | "height" | "isEmpty" | "centerX"
+            | "centerY" | "exactCenterX" | "exactCenterY" | "equals" | "setEmpty" | "<init>",
+        ) => {
             let h = match args.first() {
                 Some(V::Ref(h)) => *h,
                 _ => 0,
@@ -2836,27 +3097,26 @@ fn graphics_call(
         }
         // `ShapeDrawable.getPaint()`: a real Paint object — callers
         // (SwipeRefreshLayout) immediately call setColor on it.
-        (c, "getPaint") if c.ends_with("Drawable;") => {
-            match args.first() {
-                Some(V::Ref(h)) => {
-                    if let Some(v @ V::Ref(_)) = pseudo_get(vm, *h, P_PAINT) {
-                        Some(Some(v))
-                    } else {
-                        let p = host(vm, "Landroid/graphics/Paint;", HostState::Empty);
-                        pseudo_set(vm, *h, P_PAINT, p);
-                        Some(Some(p))
-                    }
+        (c, "getPaint") if c.ends_with("Drawable;") => match args.first() {
+            Some(V::Ref(h)) => {
+                if let Some(v @ V::Ref(_)) = pseudo_get(vm, *h, P_PAINT) {
+                    Some(Some(v))
+                } else {
+                    let p = host(vm, "Landroid/graphics/Paint;", HostState::Empty);
+                    pseudo_set(vm, *h, P_PAINT, p);
+                    Some(Some(p))
                 }
-                _ => Some(Some(V::Ref(0))),
             }
-        }
+            _ => Some(Some(V::Ref(0))),
+        },
         // Drawable bounds: a cached Rect mirroring setBounds writes —
         // TabLayout's indicator path reads `drawable.getBounds().left`.
-        (c, "getBounds" | "copyBounds" | "setBounds" | "mutate"
-        | "getIntrinsicWidth" | "getIntrinsicHeight" | "invalidateSelf"
-        | "setAlpha" | "setColorFilter" | "getOpacity" | "setVisible")
-            if c.ends_with("Drawable;") =>
-        {
+        (
+            c,
+            "getBounds" | "copyBounds" | "setBounds" | "mutate" | "getIntrinsicWidth"
+            | "getIntrinsicHeight" | "invalidateSelf" | "setAlpha" | "setColorFilter"
+            | "getOpacity" | "setVisible",
+        ) if c.ends_with("Drawable;") => {
             let V::Ref(h) = args.first().copied().unwrap_or(V::Ref(0)) else {
                 return Ok(Some(None));
             };
@@ -2865,8 +3125,7 @@ fn graphics_call(
                 "copyBounds" => {
                     if let Some(&V::Ref(dst)) = args.get(1) {
                         // copyBounds(Rect) — write the caller's rect, void.
-                        let (l, t, r, b) =
-                            rect_edges(vm, bounds_h(vm, h).unwrap_or(0));
+                        let (l, t, r, b) = rect_edges(vm, bounds_h(vm, h).unwrap_or(0));
                         rect_write(vm, dst, l, t, r, b);
                         Some(None)
                     } else {
@@ -2905,13 +3164,11 @@ fn graphics_call(
                 }
                 "mutate" => Some(Some(V::Ref(h))),
                 "getIntrinsicWidth" => {
-                    let (l, _, r, _) =
-                        rect_edges(vm, bounds_h(vm, h).unwrap_or(0));
+                    let (l, _, r, _) = rect_edges(vm, bounds_h(vm, h).unwrap_or(0));
                     Some(Some(V::I32(r - l)))
                 }
                 "getIntrinsicHeight" => {
-                    let (_, t, _, b) =
-                        rect_edges(vm, bounds_h(vm, h).unwrap_or(0));
+                    let (_, t, _, b) = rect_edges(vm, bounds_h(vm, h).unwrap_or(0));
                     Some(Some(V::I32(b - t)))
                 }
                 "getOpacity" => Some(Some(V::I32(-3))), // TRANSLUCENT
@@ -2930,13 +3187,23 @@ fn graphics_call(
                 Some(None)
             }
         }
-        ("Landroid/util/AttributeSet;", "getAttributeValue"
-        | "getAttributeName" | "getAttributeResourceValue"
-        | "getAttributeIntValue" | "getAttributeBooleanValue"
-        | "getAttributeFloatValue" | "getAttributeCount" | "getAttributeNameResource"
-        | "getPositionDescription" | "getIdAttribute"
-        | "getIdAttributeResourceValue" | "getClassAttribute"
-        | "getStyleAttribute" | "getAttributeUnsignedIntValue") => {
+        (
+            "Landroid/util/AttributeSet;",
+            "getAttributeValue"
+            | "getAttributeName"
+            | "getAttributeResourceValue"
+            | "getAttributeIntValue"
+            | "getAttributeBooleanValue"
+            | "getAttributeFloatValue"
+            | "getAttributeCount"
+            | "getAttributeNameResource"
+            | "getPositionDescription"
+            | "getIdAttribute"
+            | "getIdAttributeResourceValue"
+            | "getClassAttribute"
+            | "getStyleAttribute"
+            | "getAttributeUnsignedIntValue",
+        ) => {
             // An XmlResourceParser receiver IS an AttributeSet too —
             // reads follow its cursor, not this generic stub.
             if let Some(V::Ref(h)) = args.first() {
@@ -2948,8 +3215,10 @@ fn graphics_call(
                     return xml::pull_call(vm, class, name, "()V", args);
                 }
             }
-            if name.contains("Count") || name.contains("Resource")
-                || name.contains("Int") || name == "getStyleAttribute"
+            if name.contains("Count")
+                || name.contains("Resource")
+                || name.contains("Int")
+                || name == "getStyleAttribute"
                 || name == "getIdAttributeResourceValue"
             {
                 Some(Some(args.last().copied().unwrap_or(V::I32(0))))
@@ -2960,15 +3229,22 @@ fn graphics_call(
             }
         }
         ("Landroid/util/Patterns;", _) => Some(Some(V::Ref(0))),
-        ("Landroid/util/Size;", "getWidth" | "getHeight") => {
-            Some(Some(V::I32(0)))
-        }
-        ("Landroid/util/SizeF;", "getWidth" | "getHeight") => {
-            Some(Some(V::F32(0.0)))
-        }
-        (_, "createBitmap" | "createScaledBitmap" | "decodeResource"
-        | "decodeFile" | "decodeStream" | "decodeByteArray" | "decodeFileDescriptor"
-        | "inflate" | "getDrawable" | "obtain" | "obtainStyledAttributes") => {
+        ("Landroid/util/Size;", "getWidth" | "getHeight") => Some(Some(V::I32(0))),
+        ("Landroid/util/SizeF;", "getWidth" | "getHeight") => Some(Some(V::F32(0.0))),
+        (
+            _,
+            "createBitmap"
+            | "createScaledBitmap"
+            | "decodeResource"
+            | "decodeFile"
+            | "decodeStream"
+            | "decodeByteArray"
+            | "decodeFileDescriptor"
+            | "inflate"
+            | "getDrawable"
+            | "obtain"
+            | "obtainStyledAttributes",
+        ) => {
             if name == "inflate" {
                 Some(Some(host(
                     vm,
@@ -3001,9 +3277,7 @@ fn rect_edges(vm: &Vm, h: u32) -> (i32, i32, i32, i32) {
             .field_index_of("Landroid/graphics/Rect;", name)
             .map(|g| vm.canon_field(g))
         {
-            if let Some(Obj::Instance { fields, .. } | Obj::Host { fields, .. }) =
-                vm.heap.get(h)
-            {
+            if let Some(Obj::Instance { fields, .. } | Obj::Host { fields, .. }) = vm.heap.get(h) {
                 if let Some(v) = fields.get(&f) {
                     return i32v(*v);
                 }
@@ -3051,8 +3325,7 @@ fn prefs_file(vm: &mut Vm, file: &str) -> V {
         vm,
         "Landroid/content/SharedPreferences;",
         HostState::Map(vec![]),
-    )
-    else {
+    ) else {
         unreachable!()
     };
     vm.prefs_files.insert(file.to_string(), h);

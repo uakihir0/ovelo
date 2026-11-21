@@ -252,12 +252,7 @@ pub struct GuestUi {
 }
 
 fn argb(c: i32) -> Color {
-    Color::from_srgb8(
-        (c >> 16) as u8,
-        (c >> 8) as u8,
-        c as u8,
-        (c >> 24) as u8,
-    )
+    Color::from_srgb8((c >> 16) as u8, (c >> 8) as u8, c as u8, (c >> 24) as u8)
 }
 
 fn ref_arg(args: &[V], i: usize) -> Result<u32> {
@@ -426,38 +421,45 @@ impl GuestUi {
 
         // ---- ViewGroup.addView -------------------------------------------
         for cls in ["Landroid/view/ViewGroup;", "Landroid/widget/LinearLayout;"] {
-            Self::on(ui, vm, cls, "addView", "(Landroid/view/View;)V", |ui, vm, a| {
-                let this = ref_arg(a, 0)?;
-                let child = ref_arg(a, 1)?;
-                // Dex-inflated views (real Instances or view-tree stubs)
-                // aren't GuestViews — attach them in the VM's view tree
-                // instead of failing.
-                let Some(cv) = ui.views.get(&child).cloned() else {
-                    vm.view_tree_add(this, child);
-                    return Ok(None);
-                };
-                match ui.views.get(&this).cloned() {
-                    Some(rc) => {
-                        let mut g = rc.borrow_mut();
-                        match &mut *g {
-                            GuestView::Group(gr) => {
-                                gr.children.push(Box::new(SharedView(cv)));
-                                gr.view.invalidate();
-                                Ok(None)
-                            }
-                            _ => {
-                                drop(g);
-                                vm.view_tree_add(this, child);
-                                Ok(None)
+            Self::on(
+                ui,
+                vm,
+                cls,
+                "addView",
+                "(Landroid/view/View;)V",
+                |ui, vm, a| {
+                    let this = ref_arg(a, 0)?;
+                    let child = ref_arg(a, 1)?;
+                    // Dex-inflated views (real Instances or view-tree stubs)
+                    // aren't GuestViews — attach them in the VM's view tree
+                    // instead of failing.
+                    let Some(cv) = ui.views.get(&child).cloned() else {
+                        vm.view_tree_add(this, child);
+                        return Ok(None);
+                    };
+                    match ui.views.get(&this).cloned() {
+                        Some(rc) => {
+                            let mut g = rc.borrow_mut();
+                            match &mut *g {
+                                GuestView::Group(gr) => {
+                                    gr.children.push(Box::new(SharedView(cv)));
+                                    gr.view.invalidate();
+                                    Ok(None)
+                                }
+                                _ => {
+                                    drop(g);
+                                    vm.view_tree_add(this, child);
+                                    Ok(None)
+                                }
                             }
                         }
+                        None => {
+                            vm.view_tree_add(this, child);
+                            Ok(None)
+                        }
                     }
-                    None => {
-                        vm.view_tree_add(this, child);
-                        Ok(None)
-                    }
-                }
-            });
+                },
+            );
         }
 
         // ---- Activity.setContentView -------------------------------------
@@ -521,9 +523,9 @@ impl GuestUi {
                     };
                     let q = ui.clicks.clone();
                     let Some(rc) = ui.views.get(&this).cloned() else {
-                    // Not a GuestView (dex-inflated) — setters no-op.
-                    return Ok(None);
-                };
+                        // Not a GuestView (dex-inflated) — setters no-op.
+                        return Ok(None);
+                    };
                     rc.borrow_mut().view_mut().on_click = if listener == 0 {
                         None
                     } else {
@@ -552,9 +554,9 @@ impl GuestUi {
                         _ => return Err(crate::err("guest.arg.type")),
                     };
                     let Some(rc) = ui.views.get(&this).cloned() else {
-                    // Not a GuestView (dex-inflated) — setters no-op.
-                    return Ok(None);
-                };
+                        // Not a GuestView (dex-inflated) — setters no-op.
+                        return Ok(None);
+                    };
                     let mut g = rc.borrow_mut();
                     let tv = g
                         .text_mut()
@@ -653,7 +655,10 @@ impl GuestUi {
         if std::env::var_os("OVELO_VIEWDBG").is_some() {
             eprintln!(
                 "[viewdbg] node {} h{h} vis={} kids={} text={:?}",
-                info.desc, info.visible as u8, info.children.len(), info.text
+                info.desc,
+                info.visible as u8,
+                info.children.len(),
+                info.text
             );
         }
         if !info.visible {
@@ -683,8 +688,7 @@ impl GuestUi {
                     kid_handles.push(*ch);
                     // Dex frames are relative to the parent — position
                     // the child exactly where its `setFrame` put it.
-                    let view: Box<dyn Drawable> = match vm.dex_view(*ch).and_then(|i| i.frame)
-                    {
+                    let view: Box<dyn Drawable> = match vm.dex_view(*ch).and_then(|i| i.frame) {
                         Some(rect) => {
                             if std::env::var_os("OVELO_VIEWDBG").is_some() {
                                 eprintln!("[viewdbg] frame h{ch} = {rect:?}");
@@ -733,15 +737,17 @@ impl GuestUi {
             class,
             "<init>",
             "(Landroid/content/Context;)V",
-            Rc::new(RefCell::new(move |_vm: &mut Vm, a: &[V]| -> Result<Option<V>> {
-                let this = ref_arg(a, 0)?;
-                let mut g = ui2.borrow_mut();
-                if !g.views.contains_key(&this) {
-                    let gv = make(&g);
-                    g.views.insert(this, Rc::new(RefCell::new(gv)));
-                }
-                Ok(None)
-            })) as HostCall,
+            Rc::new(RefCell::new(
+                move |_vm: &mut Vm, a: &[V]| -> Result<Option<V>> {
+                    let this = ref_arg(a, 0)?;
+                    let mut g = ui2.borrow_mut();
+                    if !g.views.contains_key(&this) {
+                        let gv = make(&g);
+                        g.views.insert(this, Rc::new(RefCell::new(gv)));
+                    }
+                    Ok(None)
+                },
+            )) as HostCall,
         );
     }
 
@@ -843,9 +849,7 @@ pub fn drive_dex_layout_pass(vm: &mut Vm, activity: u32, frame: u32) {
                     eprintln!("[viewdbg] layout {} err {e}", info.desc);
                 }
             }
-            if std::env::var_os("OVELO_VIEWDBG").is_some()
-                && info.desc.contains("ViewPager")
-            {
+            if std::env::var_os("OVELO_VIEWDBG").is_some() && info.desc.contains("ViewPager") {
                 let fields: Vec<String> = match vm.heap().get(h) {
                     Some(ovelo_dexrt::Obj::Instance { fields, .. })
                     | Some(ovelo_dexrt::Obj::Host { fields, .. }) => fields
@@ -855,18 +859,14 @@ pub fn drive_dex_layout_pass(vm: &mut Vm, activity: u32, frame: u32) {
                                 let mut s = format!("h{x}:{}", vm.dbg_class_of(*x));
                                 // One level deeper: the adapter's own
                                 // ref fields + host list lengths.
-                                if let Some(ovelo_dexrt::Obj::Instance {
-                                    fields: f2, ..
-                                }) = vm.heap().get(*x)
+                                if let Some(ovelo_dexrt::Obj::Instance { fields: f2, .. }) =
+                                    vm.heap().get(*x)
                                 {
                                     let inner: Vec<String> = f2
                                         .values()
                                         .filter_map(|v2| match v2 {
                                             V::Ref(y) if *y != 0 => {
-                                                let mut t = format!(
-                                                    "h{y}:{}",
-                                                    vm.dbg_class_of(*y)
-                                                );
+                                                let mut t = format!("h{y}:{}", vm.dbg_class_of(*y));
                                                 if let Some(ovelo_dexrt::Obj::Host {
                                                     state: ovelo_dexrt::HostState::List(l),
                                                     ..
@@ -890,9 +890,7 @@ pub fn drive_dex_layout_pass(vm: &mut Vm, activity: u32, frame: u32) {
                 };
                 eprintln!("[viewdbg] pager {h} ref-fields: {fields:?}");
             }
-            if std::env::var_os("OVELO_VIEWDBG").is_some()
-                && info.desc.contains("RecyclerView")
-            {
+            if std::env::var_os("OVELO_VIEWDBG").is_some() && info.desc.contains("RecyclerView") {
                 match vm.call_virtual(h, "getAdapter", &[]) {
                     Ok(Some(V::Ref(ad))) if ad != 0 => {
                         let n = vm
@@ -907,8 +905,7 @@ pub fn drive_dex_layout_pass(vm: &mut Vm, activity: u32, frame: u32) {
                                 .values()
                                 .filter_map(|v| match v {
                                     V::Ref(y) if *y != 0 => {
-                                        let mut t =
-                                            format!("h{y}:{}", vm.dbg_class_of(*y));
+                                        let mut t = format!("h{y}:{}", vm.dbg_class_of(*y));
                                         if let Some(ovelo_dexrt::Obj::Host {
                                             state: ovelo_dexrt::HostState::List(l),
                                             ..
@@ -1048,10 +1045,7 @@ mod tests {
             ext("Landroid/view/View;", vec![]),
             ext("Landroid/view/View$OnClickListener;", vec![]),
             ext("Ljava/lang/CharSequence;", vec![]),
-            ext(
-                "Ljava/lang/Object;",
-                vec![dir("<init>", &[], vec![0x000e])],
-            ),
+            ext("Ljava/lang/Object;", vec![dir("<init>", &[], vec![0x000e])]),
             ext(
                 "Landroid/app/Activity;",
                 vec![virt(
@@ -1076,11 +1070,7 @@ mod tests {
                 "Landroid/app/Dialog;",
                 vec![
                     dir("<init>", &["Landroid/content/Context;"], vec![0x000e]),
-                    virt(
-                        "setContentView",
-                        &["Landroid/view/View;"],
-                        vec![0x000e],
-                    ),
+                    virt("setContentView", &["Landroid/view/View;"], vec![0x000e]),
                 ],
             ),
             ext(
@@ -1119,8 +1109,9 @@ mod tests {
                         "onClick",
                         &["Landroid/view/View;"],
                         vec![
-                            0x001a, S_CLICKED,       // const-string v0,"Clicked"
-                            0x206e, M_TTEXT, 0x0003, // invoke-virtual {v3,v0} TextView.setText
+                            0x001a, S_CLICKED, // const-string v0,"Clicked"
+                            0x206e, M_TTEXT,
+                            0x0003, // invoke-virtual {v3,v0} TextView.setText
                             0x000e,
                         ],
                     )
@@ -1147,24 +1138,27 @@ mod tests {
                         "onCreate",
                         &["Landroid/os/Bundle;"],
                         vec![
-                            0x0022, T_BTN,              // new-instance v0,Button
-                            0x2070, M_BINIT, 0x0040,    // invoke-direct {v0,v4} Button.<init>
-                            0x001f, T_VIEW,             // check-cast v0,View (Button IS-A View)
-                            0x0314, 0x0000, 0x41A0,     // const v3,#0x41A00000 (20f as I32)
-                            0x206e, M_BSIZE, 0x0030,    // invoke-virtual {v0,v3} Button.setTextSize
-                            0x0122, T_LN,               // new-instance v1,LL
-                            0x1070, M_OINIT, 0x0001,    // invoke-direct {v1} Object.<init>
-                            0x021a, S_HELLO,            // const-string v2,"Hello"
-                            0x206e, M_BTEXT, 0x0020,    // invoke-virtual {v0,v2} Button.setText
-                            0x206e, M_BCLICK, 0x0010,   // invoke-virtual {v0,v1} Button.setOnClickListener
-                            0x206e, M_BCLICK, 0x0050,   // invoke-virtual {v0,v5} — null clears it
-                            0x206e, M_BCLICK, 0x0010,   // re-set the listener
-                            0x0322, T_DLG,              // new-instance v3,Dialog
-                            0x2070, M_DINIT, 0x0043,    // invoke-direct {v3,v4} Dialog.<init>
+                            0x0022, T_BTN, // new-instance v0,Button
+                            0x2070, M_BINIT, 0x0040, // invoke-direct {v0,v4} Button.<init>
+                            0x001f, T_VIEW, // check-cast v0,View (Button IS-A View)
+                            0x0314, 0x0000, 0x41A0, // const v3,#0x41A00000 (20f as I32)
+                            0x206e, M_BSIZE,
+                            0x0030, // invoke-virtual {v0,v3} Button.setTextSize
+                            0x0122, T_LN, // new-instance v1,LL
+                            0x1070, M_OINIT, 0x0001, // invoke-direct {v1} Object.<init>
+                            0x021a, S_HELLO, // const-string v2,"Hello"
+                            0x206e, M_BTEXT, 0x0020, // invoke-virtual {v0,v2} Button.setText
+                            0x206e, M_BCLICK,
+                            0x0010, // invoke-virtual {v0,v1} Button.setOnClickListener
+                            0x206e, M_BCLICK,
+                            0x0050, // invoke-virtual {v0,v5} — null clears it
+                            0x206e, M_BCLICK, 0x0010, // re-set the listener
+                            0x0322, T_DLG, // new-instance v3,Dialog
+                            0x2070, M_DINIT, 0x0043, // invoke-direct {v3,v4} Dialog.<init>
                             // Dialog.setContentView must NOT reach Activity's stub
                             // (v1 is a listener, not a view — a wrong dispatch errors).
-                            0x206e, M_DCV, 0x0013,
-                            0x206e, M_SCV2, 0x0004,     // invoke-virtual {v4,v0} LSubAct.setContentView
+                            0x206e, M_DCV, 0x0013, 0x206e, M_SCV2,
+                            0x0004, // invoke-virtual {v4,v0} LSubAct.setContentView
                             0x000e,
                         ],
                     )
@@ -1178,16 +1172,48 @@ mod tests {
         let (mut b, ix) = build(&classes);
         patch(&mut b, T_BTN, ix.t("Landroid/widget/Button;") as u16);
         patch(&mut b, T_LN, ix.t("LL;") as u16);
-        patch(&mut b, M_BINIT, ix.m("Landroid/widget/Button;", "<init>") as u16);
+        patch(
+            &mut b,
+            M_BINIT,
+            ix.m("Landroid/widget/Button;", "<init>") as u16,
+        );
         patch(&mut b, M_OINIT, ix.m("Ljava/lang/Object;", "<init>") as u16);
-        patch(&mut b, M_BTEXT, ix.m("Landroid/widget/Button;", "setText") as u16);
-        patch(&mut b, M_BCLICK, ix.m("Landroid/widget/Button;", "setOnClickListener") as u16);
-        patch(&mut b, M_ACV, ix.m("Landroid/app/Activity;", "setContentView") as u16);
-        patch(&mut b, M_TTEXT, ix.m("Landroid/widget/TextView;", "setText") as u16);
-        patch(&mut b, M_BSIZE, ix.m("Landroid/widget/Button;", "setTextSize") as u16);
+        patch(
+            &mut b,
+            M_BTEXT,
+            ix.m("Landroid/widget/Button;", "setText") as u16,
+        );
+        patch(
+            &mut b,
+            M_BCLICK,
+            ix.m("Landroid/widget/Button;", "setOnClickListener") as u16,
+        );
+        patch(
+            &mut b,
+            M_ACV,
+            ix.m("Landroid/app/Activity;", "setContentView") as u16,
+        );
+        patch(
+            &mut b,
+            M_TTEXT,
+            ix.m("Landroid/widget/TextView;", "setText") as u16,
+        );
+        patch(
+            &mut b,
+            M_BSIZE,
+            ix.m("Landroid/widget/Button;", "setTextSize") as u16,
+        );
         patch(&mut b, M_SCV2, ix.m("LSubAct;", "setContentView") as u16);
-        patch(&mut b, M_DINIT, ix.m("Landroid/app/Dialog;", "<init>") as u16);
-        patch(&mut b, M_DCV, ix.m("Landroid/app/Dialog;", "setContentView") as u16);
+        patch(
+            &mut b,
+            M_DINIT,
+            ix.m("Landroid/app/Dialog;", "<init>") as u16,
+        );
+        patch(
+            &mut b,
+            M_DCV,
+            ix.m("Landroid/app/Dialog;", "setContentView") as u16,
+        );
         patch(&mut b, T_VIEW, ix.t("Landroid/view/View;") as u16);
         patch(&mut b, T_DLG, ix.t("Landroid/app/Dialog;") as u16);
         patch(&mut b, S_HELLO, ix.s_idx("Hello") as u16);
@@ -1249,8 +1275,7 @@ mod tests {
         ))));
         {
             let mut u = ui.borrow_mut();
-            u.root
-                .set_content_view(Box::new(SharedView(rc.clone())));
+            u.root.set_content_view(Box::new(SharedView(rc.clone())));
             let mut s = ovelo_ui::Surface::new(64, 64).unwrap();
             u.root.draw_to(&mut s);
             assert!(!u.root.is_dirty());

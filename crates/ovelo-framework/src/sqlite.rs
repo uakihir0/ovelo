@@ -112,8 +112,7 @@ impl Database {
             .conn
             .prepare(sql)
             .map_err(|e| err("framework.db.query").with_detail(e.to_string()))?;
-        let columns: Vec<String> =
-            st.column_names().iter().map(|s| s.to_string()).collect();
+        let columns: Vec<String> = st.column_names().iter().map(|s| s.to_string()).collect();
         let n = columns.len();
         let mut rows = Vec::new();
         let mut it = st
@@ -154,13 +153,16 @@ impl Database {
         let sql = format!(
             "INSERT INTO {} ({}) VALUES ({})",
             ident(table)?,
-            cols.iter().map(|c| ident(c)).collect::<Result<Vec<_>, _>>()?.join(", "),
+            cols.iter()
+                .map(|c| ident(c))
+                .collect::<Result<Vec<_>, _>>()?
+                .join(", "),
             cols.iter().map(|_| "?").collect::<Vec<_>>().join(", ")
         );
-        match self.conn.execute(
-            &sql,
-            params_from_iter(values.iter().map(|(_, v)| to_rv(v))),
-        ) {
+        match self
+            .conn
+            .execute(&sql, params_from_iter(values.iter().map(|(_, v)| to_rv(v))))
+        {
             Ok(_) => Ok(self.conn.last_insert_rowid()),
             Err(_) => Ok(-1),
         }
@@ -191,10 +193,7 @@ impl Database {
 /// Validated identifier, double-quoted for SQL — `order`, `select` and
 /// other keywords are legal table/column names once quoted.
 fn ident(s: &str) -> Result<String, OveloError> {
-    if s.chars()
-        .all(|c| c.is_ascii_alphanumeric() || c == '_')
-        && !s.is_empty()
-    {
+    if s.chars().all(|c| c.is_ascii_alphanumeric() || c == '_') && !s.is_empty() {
         Ok(format!("\"{s}\""))
     } else {
         Err(err("framework.db.ident"))
@@ -218,7 +217,8 @@ mod tests {
     #[test]
     fn crud_and_tx() {
         let db = Database::memory().unwrap();
-        db.exec("CREATE TABLE notes(id INTEGER PRIMARY KEY, body TEXT)").unwrap();
+        db.exec("CREATE TABLE notes(id INTEGER PRIMARY KEY, body TEXT)")
+            .unwrap();
         let id = db
             .insert("notes", &[("body", SqlValue::Text("hi".into()))])
             .unwrap();
@@ -230,14 +230,12 @@ mod tests {
         assert_eq!(c.get(1), Some(&SqlValue::Text("hi".into())));
 
         db.begin().unwrap();
-        db.insert("notes", &[("body", SqlValue::Text("drop".into()))]).unwrap();
+        db.insert("notes", &[("body", SqlValue::Text("drop".into()))])
+            .unwrap();
         db.rollback().unwrap();
         assert_eq!(db.query("SELECT * FROM notes", &[]).unwrap().count(), 1);
 
-        assert_eq!(
-            db.delete("notes", "id = ?", &[&id.to_string()]).unwrap(),
-            1
-        );
+        assert_eq!(db.delete("notes", "id = ?", &[&id.to_string()]).unwrap(), 1);
     }
 
     #[test]

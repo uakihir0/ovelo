@@ -77,8 +77,7 @@ pub fn layout(
     let adv = |c: char| fonts.advance(c, size);
 
     // Break opportunities at char boundaries (UAX#14 handles kinsoku NS/CJ).
-    let mut breakset: std::collections::HashSet<usize> =
-        std::collections::HashSet::new();
+    let mut breakset: std::collections::HashSet<usize> = std::collections::HashSet::new();
     for (byte, op) in linebreaks(text) {
         if op == BreakOpportunity::Allowed || op == BreakOpportunity::Mandatory {
             breakset.insert(byte);
@@ -109,7 +108,15 @@ pub fn layout(
         }
         // Hard break?
         if text[ch_adv[i].0..].starts_with('\n') {
-            push_line(&mut lines, text, &ch_adv, seg_start, i, para_rtl(ch_adv[seg_start.min(ch_adv.len()-1)].0), false);
+            push_line(
+                &mut lines,
+                text,
+                &ch_adv,
+                seg_start,
+                i,
+                para_rtl(ch_adv[seg_start.min(ch_adv.len() - 1)].0),
+                false,
+            );
             seg_start = i + 1;
             i += 1;
             run_w = 0.0;
@@ -127,7 +134,15 @@ pub fn layout(
                     usize::MAX
                 };
                 if b != usize::MAX {
-                    push_line(&mut lines, text, &ch_adv, seg_start, b, para_rtl(seg_byte), false);
+                    push_line(
+                        &mut lines,
+                        text,
+                        &ch_adv,
+                        seg_start,
+                        b,
+                        para_rtl(seg_byte),
+                        false,
+                    );
                     seg_start = b;
                     i = b;
                     run_w = 0.0; // char b is re-examined below
@@ -145,7 +160,15 @@ pub fn layout(
                         acc += ch_adv[j].1;
                         j += 1;
                     }
-                    push_ell(&mut lines, text, &ch_adv, seg_start, j, para_rtl(seg_byte), ell_w);
+                    push_ell(
+                        &mut lines,
+                        text,
+                        &ch_adv,
+                        seg_start,
+                        j,
+                        para_rtl(seg_byte),
+                        ell_w,
+                    );
                     while i < ch_adv.len() && !text[ch_adv[i].0..].starts_with('\n') {
                         i += 1;
                     }
@@ -158,7 +181,15 @@ pub fn layout(
         i += 1;
     }
     if seg_start < ch_adv.len() {
-        push_line(&mut lines, text, &ch_adv, seg_start, ch_adv.len(), para_rtl(ch_adv[seg_start].0), false);
+        push_line(
+            &mut lines,
+            text,
+            &ch_adv,
+            seg_start,
+            ch_adv.len(),
+            para_rtl(ch_adv[seg_start].0),
+            false,
+        );
     }
     if text.is_empty() || text.ends_with('\n') {
         lines.push(Line {
@@ -297,7 +328,7 @@ mod tests {
         let l4 = layout("ab c", st(), &fs(), Some(30), false);
         assert_eq!(l4.lines.len(), 2);
         assert_eq!(l4.lines[1].range.1 - l4.lines[1].range.0, 1); // "c"
-        // No double-count after wrapping: "cdef" (40px) fits in 45px.
+                                                                  // No double-count after wrapping: "cdef" (40px) fits in 45px.
         let l5 = layout("ab cdef", st(), &fs(), Some(45), false);
         assert_eq!(l5.lines.len(), 2);
         assert!(!l5.lines[1].ellipsized);

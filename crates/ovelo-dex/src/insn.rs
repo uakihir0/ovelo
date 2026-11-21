@@ -83,10 +83,25 @@ impl Format {
     pub fn size(self) -> usize {
         match self {
             Self::F10x | Self::F12x | Self::F11n | Self::F11x | Self::F10t => 1,
-            Self::F20t | Self::F22x | Self::F21t | Self::F21s | Self::F21h | Self::F21c
-            | Self::F23x | Self::F22t | Self::F22c | Self::F22s | Self::F22b => 2,
-            Self::F30t | Self::F31t | Self::F31i | Self::F31l | Self::F31c
-            | Self::F32x | Self::F35c | Self::F3rc => 3,
+            Self::F20t
+            | Self::F22x
+            | Self::F21t
+            | Self::F21s
+            | Self::F21h
+            | Self::F21c
+            | Self::F23x
+            | Self::F22t
+            | Self::F22c
+            | Self::F22s
+            | Self::F22b => 2,
+            Self::F30t
+            | Self::F31t
+            | Self::F31i
+            | Self::F31l
+            | Self::F31c
+            | Self::F32x
+            | Self::F35c
+            | Self::F3rc => 3,
             Self::F45cc | Self::F4rcc => 4,
             Self::F51l => 5,
         }
@@ -136,9 +151,8 @@ pub fn decode(insns: &[u16], off: usize) -> Result<(Insn, usize)> {
         _ => {}
     }
     let op = (w0 & 0xff) as u8;
-    let (name, format) = opcode_info(op).ok_or_else(|| {
-        err(format!("dex.opcode.unsupported:{op:#04x}"))
-    })?;
+    let (name, format) =
+        opcode_info(op).ok_or_else(|| err(format!("dex.opcode.unsupported:{op:#04x}")))?;
     let size = format.size();
     let raw: Vec<u16> = insns
         .get(off..off + size)
@@ -164,7 +178,11 @@ pub fn decode(insns: &[u16], off: usize) -> Result<(Insn, usize)> {
         Format::F12x => insn.regs = vec![a, b4],
         Format::F11n => {
             insn.regs = vec![a];
-            insn.lit = Some(if b4 & 8 != 0 { b4 as i64 - 16 } else { b4 as i64 });
+            insn.lit = Some(if b4 & 8 != 0 {
+                b4 as i64 - 16
+            } else {
+                b4 as i64
+            });
         }
         Format::F11x => insn.regs = vec![high8],
         Format::F10t => {
@@ -268,10 +286,8 @@ pub fn decode(insns: &[u16], off: usize) -> Result<(Insn, usize)> {
         }
         Format::F51l => {
             insn.regs = vec![high8];
-            let bits = ((w(4) as u64) << 48)
-                | ((w(3) as u64) << 32)
-                | ((w(2) as u64) << 16)
-                | w(1) as u64;
+            let bits =
+                ((w(4) as u64) << 48) | ((w(3) as u64) << 32) | ((w(2) as u64) << 16) | w(1) as u64;
             insn.lit = Some(bits as i64);
         }
     }
@@ -281,7 +297,9 @@ pub fn decode(insns: &[u16], off: usize) -> Result<(Insn, usize)> {
 /// `0x0100` packed-switch-payload: ident, size, first_key, then `size` i32
 /// targets.
 fn decode_packed_switch(insns: &[u16], off: usize) -> Result<(Insn, usize)> {
-    let size = *insns.get(off + 1).ok_or_else(|| err("dex.payload.bounds"))? as usize;
+    let size = *insns
+        .get(off + 1)
+        .ok_or_else(|| err("dex.payload.bounds"))? as usize;
     let units = 4 + size * 2;
     if off + units > insns.len() {
         return Err(err("dex.payload.bounds"));
@@ -304,7 +322,9 @@ fn decode_packed_switch(insns: &[u16], off: usize) -> Result<(Insn, usize)> {
 
 /// `0x0200` sparse-switch-payload: ident, size, keys[size], targets[size].
 fn decode_sparse_switch(insns: &[u16], off: usize) -> Result<(Insn, usize)> {
-    let size = *insns.get(off + 1).ok_or_else(|| err("dex.payload.bounds"))? as usize;
+    let size = *insns
+        .get(off + 1)
+        .ok_or_else(|| err("dex.payload.bounds"))? as usize;
     let units = 2 + size * 4;
     if off + units > insns.len() {
         return Err(err("dex.payload.bounds"));
@@ -329,7 +349,9 @@ fn decode_sparse_switch(insns: &[u16], off: usize) -> Result<(Insn, usize)> {
 /// to u16).
 fn decode_fill_array(insns: &[u16], off: usize) -> Result<(Insn, usize)> {
     let w = |i: usize| -> Result<u16> {
-        Ok(*insns.get(off + i).ok_or_else(|| err("dex.payload.bounds"))?)
+        Ok(*insns
+            .get(off + i)
+            .ok_or_else(|| err("dex.payload.bounds"))?)
     };
     let width = w(1)? as usize;
     let count = ((w(3)? as u32) << 16 | w(2)? as u32) as usize;
@@ -603,8 +625,6 @@ fn opcode_info(op: u8) -> Option<(&'static str, Format)> {
         _ => return None,
     })
 }
-
-
 
 #[cfg(test)]
 mod tests {

@@ -101,8 +101,7 @@ fn is_map(class: &str) -> bool {
 fn is_iter(class: &str) -> bool {
     ITER_CLASSES.iter().any(|c| desc_is_a(class, c))
         || class.contains("$")
-            && (class.starts_with("Ljava/util/")
-                || class.starts_with("Landroid/util/"))
+            && (class.starts_with("Ljava/util/") || class.starts_with("Landroid/util/"))
 }
 
 pub(crate) fn call(
@@ -179,10 +178,8 @@ pub(crate) fn call(
         sparse_call(vm, class, name, args)?
     } else if class == "Ljava/util/concurrent/TimeUnit;" {
         match name {
-            "convert" | "toMillis" | "toNanos" | "toMicros" | "toSeconds"
-            | "toMinutes" | "toHours" | "toDays" => {
-                Some(Some(V::I64(i64v(*args.last().unwrap_or(&V::I64(0))))))
-            }
+            "convert" | "toMillis" | "toNanos" | "toMicros" | "toSeconds" | "toMinutes"
+            | "toHours" | "toDays" => Some(Some(V::I64(i64v(*args.last().unwrap_or(&V::I64(0)))))),
             "sleep" | "timedWait" | "timedJoin" => Some(None),
             _ => None,
         }
@@ -205,7 +202,11 @@ pub(crate) fn call(
                 if let V::Ref(r) = args[1] {
                     vm.enqueue_runnable(r, false);
                 }
-                Some(Some(host(vm, "Ljava/util/concurrent/Future;", HostState::Empty)))
+                Some(Some(host(
+                    vm,
+                    "Ljava/util/concurrent/Future;",
+                    HostState::Empty,
+                )))
             }
             "isShutdown" | "isTerminated" => Some(Some(V::I32(0))),
             "shutdown" | "shutdownNow" | "awaitTermination" => {
@@ -217,11 +218,16 @@ pub(crate) fn call(
                     Some(None)
                 }
             }
-            "newSingleThreadExecutor" | "newCachedThreadPool"
-            | "newFixedThreadPool" | "newScheduledThreadPool"
-            | "unconfigurableExecutorService" | "defaultThreadFactory" => Some(Some(
-                host(vm, "Ljava/util/concurrent/ExecutorService;", HostState::Empty),
-            )),
+            "newSingleThreadExecutor"
+            | "newCachedThreadPool"
+            | "newFixedThreadPool"
+            | "newScheduledThreadPool"
+            | "unconfigurableExecutorService"
+            | "defaultThreadFactory" => Some(Some(host(
+                vm,
+                "Ljava/util/concurrent/ExecutorService;",
+                HostState::Empty,
+            ))),
             "get" | "call" => Some(Some(V::Ref(0))),
             "isDone" | "isCancelled" => Some(Some(V::I32(1))),
             "cancel" => Some(Some(V::I32(1))),
@@ -275,7 +281,11 @@ fn enum_set_call(vm: &mut Vm, name: &str, sig: &str, args: &[V]) -> Rt<Option<Op
         "of" | "noneOf" => Some(Some(host(
             vm,
             "Ljava/util/EnumSet;",
-            HostState::List(if name == "of" { args.to_vec() } else { Vec::new() }),
+            HostState::List(if name == "of" {
+                args.to_vec()
+            } else {
+                Vec::new()
+            }),
         ))),
         "allOf" => {
             let vals = class_desc_of_class(vm, args.first().copied().unwrap_or(V::Ref(0)))
@@ -356,7 +366,11 @@ fn list_call(vm: &mut Vm, name: &str, sig: &str, args: &[V]) -> Rt<Option<Option
             } else {
                 l.push(args[1]);
             }
-            Some(if args.len() > 2 { None } else { Some(V::I32(1)) })
+            Some(if args.len() > 2 {
+                None
+            } else {
+                Some(V::I32(1))
+            })
         }
         "addAll" => {
             let src: Vec<V> = match args.last().copied().unwrap_or(V::Ref(0)) {
@@ -367,7 +381,11 @@ fn list_call(vm: &mut Vm, name: &str, sig: &str, args: &[V]) -> Rt<Option<Option
                 Some(l) => l,
                 None => return Ok(None),
             };
-            let at = if args.len() > 2 { i32v(args[1]).max(0) as usize } else { l.len() };
+            let at = if args.len() > 2 {
+                i32v(args[1]).max(0) as usize
+            } else {
+                l.len()
+            };
             for (i, v) in src.iter().enumerate() {
                 l.insert((at + i).min(l.len()), *v);
             }
@@ -383,7 +401,11 @@ fn list_call(vm: &mut Vm, name: &str, sig: &str, args: &[V]) -> Rt<Option<Option
             } else {
                 l.push(args[1]);
             }
-            Some(if name.starts_with("offer") { Some(V::I32(1)) } else { None })
+            Some(if name.starts_with("offer") {
+                Some(V::I32(1))
+            } else {
+                None
+            })
         }
         "removeFirst" | "removeLast" | "pop" | "poll" | "pollFirst" | "pollLast" => {
             let l = match list_mut(vm, h) {
@@ -391,7 +413,11 @@ fn list_call(vm: &mut Vm, name: &str, sig: &str, args: &[V]) -> Rt<Option<Option
                 None => return Ok(None),
             };
             let v = if matches!(name, "removeFirst" | "pop" | "poll" | "pollFirst") {
-                if l.is_empty() { V::Ref(0) } else { l.remove(0) }
+                if l.is_empty() {
+                    V::Ref(0)
+                } else {
+                    l.remove(0)
+                }
             } else {
                 l.pop().unwrap_or(V::Ref(0))
             };
@@ -405,15 +431,10 @@ fn list_call(vm: &mut Vm, name: &str, sig: &str, args: &[V]) -> Rt<Option<Option
                     Some(l) => l,
                     None => return Ok(None),
                 };
-                Some(Some(if i < l.len() {
-                    l.remove(i)
-                } else {
-                    V::Ref(0)
-                }))
+                Some(Some(if i < l.len() { l.remove(i) } else { V::Ref(0) }))
             } else {
-                let pos = list_ref(vm, h).and_then(|l| {
-                    l.iter().position(|e| value_eq(vm, *e, args[1]))
-                });
+                let pos =
+                    list_ref(vm, h).and_then(|l| l.iter().position(|e| value_eq(vm, *e, args[1])));
                 match pos {
                     Some(i) => {
                         if let Some(l) = list_mut(vm, h) {
@@ -445,7 +466,11 @@ fn list_call(vm: &mut Vm, name: &str, sig: &str, args: &[V]) -> Rt<Option<Option
                     .iter()
                     .map(|e| {
                         let in_src = src.iter().any(|s| value_eq(vm, *e, *s));
-                        if name == "removeAll" { !in_src } else { in_src }
+                        if name == "removeAll" {
+                            !in_src
+                        } else {
+                            in_src
+                        }
                     })
                     .collect();
                 let before = cur.len();
@@ -453,7 +478,9 @@ fn list_call(vm: &mut Vm, name: &str, sig: &str, args: &[V]) -> Rt<Option<Option
                 if let Some(l) = list_mut(vm, h) {
                     l.retain(|_| *it.next().unwrap_or(&false));
                 }
-                Some(Some(V::I32((before != keep.iter().filter(|k| **k).count()) as i32)))
+                Some(Some(V::I32(
+                    (before != keep.iter().filter(|k| **k).count()) as i32,
+                )))
             }
         }
         "get" => {
@@ -481,14 +508,15 @@ fn list_call(vm: &mut Vm, name: &str, sig: &str, args: &[V]) -> Rt<Option<Option
                 Some(l) => l,
                 None => return Ok(None),
             };
-            let v = if name == "getLast" { l.last() } else { l.first() };
+            let v = if name == "getLast" {
+                l.last()
+            } else {
+                l.first()
+            };
             match v {
                 Some(v) => Some(Some(*v)),
                 None => {
-                    return Err(vm.throw_builtin(
-                        "Ljava/util/NoSuchElementException;",
-                        name,
-                    ));
+                    return Err(vm.throw_builtin("Ljava/util/NoSuchElementException;", name));
                 }
             }
         }
@@ -533,8 +561,7 @@ fn list_call(vm: &mut Vm, name: &str, sig: &str, args: &[V]) -> Rt<Option<Option
             Some(None)
         }
         "contains" => {
-            let c = list_ref(vm, h)
-                .is_some_and(|l| l.iter().any(|e| value_eq(vm, *e, args[1])));
+            let c = list_ref(vm, h).is_some_and(|l| l.iter().any(|e| value_eq(vm, *e, args[1])));
             Some(Some(V::I32(c as i32)))
         }
         "containsAll" | "equals" => Some(Some(V::I32(1))),
@@ -601,7 +628,12 @@ fn list_call(vm: &mut Vm, name: &str, sig: &str, args: &[V]) -> Rt<Option<Option
         "subList" => {
             let (a, b) = (i32v(args[1]) as usize, i32v(args[2]) as usize);
             let items: Vec<V> = match list_ref(vm, h) {
-                Some(l) => l.iter().skip(a).take(b.saturating_sub(a)).copied().collect(),
+                Some(l) => l
+                    .iter()
+                    .skip(a)
+                    .take(b.saturating_sub(a))
+                    .copied()
+                    .collect(),
                 None => vec![],
             };
             Some(Some(host(vm, "Ljava/util/List;", HostState::List(items))))
@@ -610,15 +642,17 @@ fn list_call(vm: &mut Vm, name: &str, sig: &str, args: &[V]) -> Rt<Option<Option
             if name == "sort" {
                 Some(None)
             } else if name.ends_with("stream") || name.ends_with("Stream") {
-                Some(Some(host(vm, "Ljava/util/stream/Stream;", HostState::Empty)))
+                Some(Some(host(
+                    vm,
+                    "Ljava/util/stream/Stream;",
+                    HostState::Empty,
+                )))
             } else {
                 Some(None)
             }
         }
         "hashCode" => {
-            let hc = list_ref(vm, h)
-                .map(|l| l.len() as i32 * 31)
-                .unwrap_or(1);
+            let hc = list_ref(vm, h).map(|l| l.len() as i32 * 31).unwrap_or(1);
             Some(Some(V::I32(hc)))
         }
         _ => None,
@@ -660,13 +694,33 @@ fn map_call(vm: &mut Vm, name: &str, sig: &str, args: &[V]) -> Rt<Option<Option<
             }
             Some(None)
         }
-        "putInt" | "putLong" | "putFloat" | "putDouble" | "putBoolean"
-        | "putString" | "putChar" | "putShort" | "putByte" | "putParcelable"
-        | "putSerializable" | "putBundle" | "putCharSequence" | "putIntegerArrayList"
-        | "putStringArrayList" | "putParcelableArrayList" | "putIntArray"
-        | "putLongArray" | "putBooleanArray" | "putByteArray" | "putFloatArray"
-        | "putDoubleArray" | "putCharArray" | "putShortArray" | "putStringArray"
-        | "putParcelableArray" | "putCharSequenceArray" => {
+        "putInt"
+        | "putLong"
+        | "putFloat"
+        | "putDouble"
+        | "putBoolean"
+        | "putString"
+        | "putChar"
+        | "putShort"
+        | "putByte"
+        | "putParcelable"
+        | "putSerializable"
+        | "putBundle"
+        | "putCharSequence"
+        | "putIntegerArrayList"
+        | "putStringArrayList"
+        | "putParcelableArrayList"
+        | "putIntArray"
+        | "putLongArray"
+        | "putBooleanArray"
+        | "putByteArray"
+        | "putFloatArray"
+        | "putDoubleArray"
+        | "putCharArray"
+        | "putShortArray"
+        | "putStringArray"
+        | "putParcelableArray"
+        | "putCharSequenceArray" => {
             map_put(vm, h, args[1], args[2]);
             Some(None)
         }
@@ -695,8 +749,8 @@ fn map_call(vm: &mut Vm, name: &str, sig: &str, args: &[V]) -> Rt<Option<Option<
                 }))
             }
         }
-        "getInt" | "getLong" | "getFloat" | "getDouble" | "getBoolean"
-        | "getChar" | "getShort" | "getByte" => {
+        "getInt" | "getLong" | "getFloat" | "getDouble" | "getBoolean" | "getChar" | "getShort"
+        | "getByte" => {
             let v = map_get(vm, h, args[1]);
             let def = args.get(2).copied().unwrap_or(V::I32(0));
             let v = v.unwrap_or(def);
@@ -708,24 +762,33 @@ fn map_call(vm: &mut Vm, name: &str, sig: &str, args: &[V]) -> Rt<Option<Option<
                 _ => V::I32(i32v(v)),
             }))
         }
-        "getString" | "getParcelable" | "getSerializable" | "getBundle"
-        | "getCharSequence" | "getIntegerArrayList" | "getStringArrayList"
-        | "getParcelableArrayList" | "getIntArray" | "getLongArray"
-        | "getBooleanArray" | "getByteArray" | "getFloatArray" | "getDoubleArray"
-        | "getCharArray" | "getShortArray" | "getStringArray"
-        | "getParcelableArray" | "getCharSequenceArray" | "getClassLoader" => {
+        "getString"
+        | "getParcelable"
+        | "getSerializable"
+        | "getBundle"
+        | "getCharSequence"
+        | "getIntegerArrayList"
+        | "getStringArrayList"
+        | "getParcelableArrayList"
+        | "getIntArray"
+        | "getLongArray"
+        | "getBooleanArray"
+        | "getByteArray"
+        | "getFloatArray"
+        | "getDoubleArray"
+        | "getCharArray"
+        | "getShortArray"
+        | "getStringArray"
+        | "getParcelableArray"
+        | "getCharSequenceArray"
+        | "getClassLoader" => {
             Some(Some(
                 map_get(vm, h, args[1])
                     .or_else(|| match args.get(2) {
                         // `getParcelable(key, Class)` and friends take a type
                         // token as the last arg, not a default value — a miss
                         // must yield null, not the Class object itself.
-                        Some(V::Ref(dh))
-                            if matches!(
-                                vm.heap.get(*dh),
-                                Some(Obj::Class { .. })
-                            ) =>
-                        {
+                        Some(V::Ref(dh)) if matches!(vm.heap.get(*dh), Some(Obj::Class { .. })) => {
                             None
                         }
                         other => other.copied(),
@@ -767,10 +830,8 @@ fn map_call(vm: &mut Vm, name: &str, sig: &str, args: &[V]) -> Rt<Option<Option<
                 "entrySet" => pairs
                     .into_iter()
                     .map(|(k, v)| {
-                        let eh = vm.alloc_host(
-                            "Ljava/util/AbstractMap$SimpleEntry;",
-                            HostState::Slot(k),
-                        );
+                        let eh = vm
+                            .alloc_host("Ljava/util/AbstractMap$SimpleEntry;", HostState::Slot(k));
                         pseudo_set(vm, eh, P_DATA, v);
                         V::Ref(eh)
                     })
@@ -805,10 +866,10 @@ fn map_call(vm: &mut Vm, name: &str, sig: &str, args: &[V]) -> Rt<Option<Option<
                             if let V::Ref(fh) = f {
                                 let key = args[1];
                                 let old = cur.unwrap_or(V::Ref(0));
-                                match vm.call_virtual(fh, "apply", &[key, old])
-                                    .or_else(|_| {
-                                        vm.call_virtual(fh, "apply", &[key])
-                                    }) {
+                                match vm
+                                    .call_virtual(fh, "apply", &[key, old])
+                                    .or_else(|_| vm.call_virtual(fh, "apply", &[key]))
+                                {
                                     Ok(v) => v,
                                     Err(_) => cur,
                                 }
@@ -888,7 +949,12 @@ fn iter_call(vm: &mut Vm, name: &str, args: &[V]) -> Rt<Option<Option<V>>> {
             {
                 *v = args.get(1).copied().unwrap_or(V::Ref(0));
             }
-            pseudo_set(vm, h, P_COMPONENT, args.get(1).copied().unwrap_or(V::Ref(0)));
+            pseudo_set(
+                vm,
+                h,
+                P_COMPONENT,
+                args.get(1).copied().unwrap_or(V::Ref(0)),
+            );
             pseudo_set(vm, h, P_DATA, args.get(2).copied().unwrap_or(V::Ref(0)));
             Some(None)
         }
@@ -963,9 +1029,9 @@ fn iter_call(vm: &mut Vm, name: &str, args: &[V]) -> Rt<Option<Option<V>>> {
 
 fn collections_static(vm: &mut Vm, name: &str, args: &[V]) -> Option<Option<V>> {
     match name {
-        "emptyList" | "emptySet" | "emptyMap" | "emptyIterator"
-        | "emptyEnumeration" | "emptyListIterator" | "emptyNavigableSet"
-        | "emptySortedSet" | "emptyNavigableMap" | "emptySortedMap" => {
+        "emptyList" | "emptySet" | "emptyMap" | "emptyIterator" | "emptyEnumeration"
+        | "emptyListIterator" | "emptyNavigableSet" | "emptySortedSet" | "emptyNavigableMap"
+        | "emptySortedMap" => {
             let (d, st) = if name.contains("Map") {
                 ("Ljava/util/Map;", HostState::Map(vec![]))
             } else if name.contains("Iterator") || name.contains("Enumeration") {
@@ -975,22 +1041,34 @@ fn collections_static(vm: &mut Vm, name: &str, args: &[V]) -> Option<Option<V>> 
             };
             Some(Some(host(vm, d, st)))
         }
-        "singletonList" | "singleton" => {
-            Some(Some(host(vm, "Ljava/util/List;", HostState::List(vec![args[0]]))))
-        }
+        "singletonList" | "singleton" => Some(Some(host(
+            vm,
+            "Ljava/util/List;",
+            HostState::List(vec![args[0]]),
+        ))),
         "singletonMap" => Some(Some(host(
             vm,
             "Ljava/util/Map;",
             HostState::Map(vec![(args[0], args[1])]),
         ))),
-        "unmodifiableList" | "unmodifiableSet" | "unmodifiableCollection"
-        | "unmodifiableSortedSet" | "unmodifiableNavigableSet" | "synchronizedList"
-        | "synchronizedSet" | "synchronizedCollection" | "checkedList"
-        | "checkedSet" | "checkedCollection" | "unmodifiableSortedMap"
-        | "unmodifiableNavigableMap" | "unmodifiableMap" | "synchronizedMap"
-        | "checkedMap" | "checkedNavigableMap" | "checkedSortedMap" => {
-            Some(Some(args[0]))
-        }
+        "unmodifiableList"
+        | "unmodifiableSet"
+        | "unmodifiableCollection"
+        | "unmodifiableSortedSet"
+        | "unmodifiableNavigableSet"
+        | "synchronizedList"
+        | "synchronizedSet"
+        | "synchronizedCollection"
+        | "checkedList"
+        | "checkedSet"
+        | "checkedCollection"
+        | "unmodifiableSortedMap"
+        | "unmodifiableNavigableMap"
+        | "unmodifiableMap"
+        | "synchronizedMap"
+        | "checkedMap"
+        | "checkedNavigableMap"
+        | "checkedSortedMap" => Some(Some(args[0])),
         "shuffle" => {
             if let V::Ref(h) = args[0] {
                 if let Some(l) = list_mut(vm, h) {
@@ -1010,9 +1088,7 @@ fn collections_static(vm: &mut Vm, name: &str, args: &[V]) -> Option<Option<V>> 
         "sort" => {
             if let V::Ref(h) = args[0] {
                 let mut items = list_ref(vm, h).cloned().unwrap_or_default();
-                items.sort_by(|a, b| {
-                    natural_cmp(vm, *a, *b).cmp(&0)
-                });
+                items.sort_by(|a, b| natural_cmp(vm, *a, *b).cmp(&0));
                 if let Some(l) = list_mut(vm, h) {
                     *l = items;
                 }
@@ -1033,9 +1109,7 @@ fn collections_static(vm: &mut Vm, name: &str, args: &[V]) -> Option<Option<V>> 
         "binarySearch" => {
             let idx = match args[0] {
                 V::Ref(h) => list_ref(vm, h)
-                    .and_then(|l| {
-                        l.iter().position(|e| value_eq(vm, *e, args[1]))
-                    })
+                    .and_then(|l| l.iter().position(|e| value_eq(vm, *e, args[1])))
                     .map(|i| i as i32)
                     .unwrap_or(-1),
                 _ => -1,
@@ -1100,7 +1174,11 @@ fn collections_static(vm: &mut Vm, name: &str, args: &[V]) -> Option<Option<V>> 
         }
         "list" => {
             // enumeration → list
-            Some(Some(host(vm, "Ljava/util/ArrayList;", HostState::List(vec![]))))
+            Some(Some(host(
+                vm,
+                "Ljava/util/ArrayList;",
+                HostState::List(vec![]),
+            )))
         }
         "enumeration" => {
             let items = match args[0] {
@@ -1113,17 +1191,9 @@ fn collections_static(vm: &mut Vm, name: &str, args: &[V]) -> Option<Option<V>> 
                 HostState::Iter(Rc::new(items), 0),
             )))
         }
-        "reverseOrder" | "comparing" | "comparingInt" | "comparingLong"
-        | "comparingDouble" | "naturalOrder" => Some(Some(host(
-            vm,
-            "Ljava/util/Comparator;",
-            HostState::Empty,
-        ))),
-        "newSetFromMap" => Some(Some(host(
-            vm,
-            "Ljava/util/Set;",
-            HostState::List(vec![]),
-        ))),
+        "reverseOrder" | "comparing" | "comparingInt" | "comparingLong" | "comparingDouble"
+        | "naturalOrder" => Some(Some(host(vm, "Ljava/util/Comparator;", HostState::Empty))),
+        "newSetFromMap" => Some(Some(host(vm, "Ljava/util/Set;", HostState::List(vec![])))),
         "synchronizedCollection0" | "unmodifiableCollection0" => Some(Some(V::Ref(0))),
         _ => None,
     }
@@ -1145,8 +1215,7 @@ fn arrays_static(vm: &mut Vm, name: &str, _sig: &str, args: &[V]) -> Rt<Option<O
             let t = match args[0] {
                 V::Ref(h) => match vm.heap.get(h) {
                     Some(Obj::Array { data, .. }) => {
-                        let parts: Vec<String> =
-                            data.iter().map(|v| fmt_v(*v)).collect();
+                        let parts: Vec<String> = data.iter().map(|v| fmt_v(*v)).collect();
                         format!("[{}]", parts.join(", "))
                     }
                     _ => "[]".into(),
@@ -1159,9 +1228,7 @@ fn arrays_static(vm: &mut Vm, name: &str, _sig: &str, args: &[V]) -> Rt<Option<O
         "equals" | "deepEquals" => {
             let eq = match (args[0], args[1]) {
                 (V::Ref(a), V::Ref(b)) => match (vm.heap.get(a), vm.heap.get(b)) {
-                    (Some(Obj::Array { data: x, .. }), Some(Obj::Array { data: y, .. })) => {
-                        x == y
-                    }
+                    (Some(Obj::Array { data: x, .. }), Some(Obj::Array { data: y, .. })) => x == y,
                     _ => a == b,
                 },
                 (a, b) => a == b,
@@ -1189,10 +1256,7 @@ fn arrays_static(vm: &mut Vm, name: &str, _sig: &str, args: &[V]) -> Rt<Option<O
                 d.resize(n, V::I32(0));
                 d
             } else {
-                let (a, b) = (
-                    i32v(args[1]).max(0) as usize,
-                    i32v(args[2]).max(0) as usize,
-                );
+                let (a, b) = (i32v(args[1]).max(0) as usize, i32v(args[2]).max(0) as usize);
                 let mut d: Vec<V> = data
                     .iter()
                     .skip(a)
@@ -1255,7 +1319,11 @@ fn arrays_static(vm: &mut Vm, name: &str, _sig: &str, args: &[V]) -> Rt<Option<O
         }
         "compare" | "mismatch" => Some(Some(V::I32(0))),
         "equals0" => Some(Some(V::I32(1))),
-        "stream" => Some(Some(host(vm, "Ljava/util/stream/Stream;", HostState::Empty))),
+        "stream" => Some(Some(host(
+            vm,
+            "Ljava/util/stream/Stream;",
+            HostState::Empty,
+        ))),
         "copyOf0" => Some(Some(args[0])),
         _ => None,
     })
@@ -1291,9 +1359,7 @@ fn objects_static(vm: &mut Vm, name: &str, args: &[V]) -> Rt<Option<Option<V>>> 
         }
         "isNull" => Some(Some(V::I32(is_null(args[0]) as i32))),
         "nonNull" => Some(Some(V::I32((!is_null(args[0])) as i32))),
-        "checkIndex" | "checkFromIndexSize" | "checkFromToIndex" => {
-            Some(Some(V::I32(0)))
-        }
+        "checkIndex" | "checkFromIndexSize" | "checkFromToIndex" => Some(Some(V::I32(0))),
         "compare" => Some(Some(V::I32(natural_cmp(vm, args[0], args[1])))),
         _ => None,
     })
@@ -1304,7 +1370,8 @@ fn hash_of(vm: &Vm, v: V) -> V {
         V::Ref(0) => V::I32(0),
         V::Ref(h) => match vm.heap.get(h) {
             Some(Obj::Str(t)) => V::I32(
-                t.chars().fold(0i32, |a, c| a.wrapping_mul(31).wrapping_add(c as i32)),
+                t.chars()
+                    .fold(0i32, |a, c| a.wrapping_mul(31).wrapping_add(c as i32)),
             ),
             Some(Obj::Host {
                 state: HostState::Slot(v),
@@ -1353,17 +1420,14 @@ fn optional_call(vm: &mut Vm, class: &str, name: &str, args: &[V]) -> Option<Opt
     match name {
         "of" | "ofNullable" => Some(host(vm, class, HostState::Slot(args[0]))),
         "empty" => Some(host(vm, class, HostState::Slot(V::Ref(0)))),
-        "ofInt" | "ofLong" | "ofDouble" => {
-            Some(host(vm, class, HostState::Slot(args[0])))
-        }
+        "ofInt" | "ofLong" | "ofDouble" => Some(host(vm, class, HostState::Slot(args[0]))),
         "get" | "orElseThrow" | "orElseGet" => {
             let v = match args[0] {
                 V::Ref(h) => slot_of(vm, h).unwrap_or(V::Ref(0)),
                 x => x,
             };
             if name != "get" && is_null(v) {
-                let e =
-                    vm.throw_builtin("Ljava/util/NoSuchElementException;", "Optional empty");
+                let e = vm.throw_builtin("Ljava/util/NoSuchElementException;", "Optional empty");
                 // orElseThrow may return the supplier's exception; be simple
                 let _ = e;
                 Some(V::Ref(0))
@@ -1384,19 +1448,17 @@ fn optional_call(vm: &mut Vm, class: &str, name: &str, args: &[V]) -> Option<Opt
                 x => x,
             };
             let empty = is_null(v);
-            Some(V::I32(if name == "isPresent" { !empty } else { empty } as i32))
+            Some(V::I32(
+                if name == "isPresent" { !empty } else { empty } as i32
+            ))
         }
-        "ifPresent" | "ifPresentOrElse" | "or" | "flatMap" | "map" | "filter" => {
-            Some(args[0])
-        }
+        "ifPresent" | "ifPresentOrElse" | "or" | "flatMap" | "map" | "filter" => Some(args[0]),
         "stream" => Some(host(vm, "Ljava/util/stream/Stream;", HostState::Empty)),
         "equals" => Some(V::I32(1)),
-        "getAsInt" | "getAsLong" | "getAsDouble" => {
-            Some(match args[0] {
-                V::Ref(h) => slot_of(vm, h).unwrap_or(V::I32(0)),
-                x => x,
-            })
-        }
+        "getAsInt" | "getAsLong" | "getAsDouble" => Some(match args[0] {
+            V::Ref(h) => slot_of(vm, h).unwrap_or(V::I32(0)),
+            x => x,
+        }),
         _ => return None,
     }
     .map(Some)
@@ -1468,7 +1530,11 @@ fn random_call(vm: &mut Vm, name: &str, args: &[V], secure: bool) -> Option<Opti
             return None;
         }
         "ints" | "longs" | "doubles" => {
-            return Some(Some(host(vm, "Ljava/util/stream/Stream;", HostState::Empty)))
+            return Some(Some(host(
+                vm,
+                "Ljava/util/stream/Stream;",
+                HostState::Empty,
+            )))
         }
         "setSeed" => {
             if let V::Ref(h) = args[0] {
@@ -1498,20 +1564,14 @@ fn uuid_call(vm: &mut Vm, name: &str, args: &[V]) -> Option<Option<V>> {
             vm,
             &format!("{:08x}-0000-4000-8000-000000000000", now_ms() & 0xffffffff),
         ))),
-        "nameUUIDFromBytes" => Some(Some(host(
-            vm,
-            "Ljava/util/UUID;",
-            HostState::Slot(args[0]),
-        ))),
+        "nameUUIDFromBytes" => Some(Some(host(vm, "Ljava/util/UUID;", HostState::Slot(args[0])))),
         "fromString" => Some(Some(host(
             vm,
             "Ljava/util/UUID;",
             HostState::Slot(V::I64(0)),
         ))),
         "getMostSignificantBits" | "getLeastSignificantBits" => Some(Some(V::I64(0))),
-        "version" | "variant" | "timestamp" | "clockSequence" | "node" => {
-            Some(Some(V::I64(0)))
-        }
+        "version" | "variant" | "timestamp" | "clockSequence" | "node" => Some(Some(V::I64(0))),
         _ => None,
     }
 }
@@ -1583,8 +1643,8 @@ fn bitset_call(vm: &mut Vm, name: &str, args: &[V]) -> Option<Option<V>> {
             let v = slot_of(vm, h).map(i64v).unwrap_or(0);
             Some(V::I32(((v >> (b % 64)) & 1) as i32))
         }
-        "cardinality" | "size" | "length" | "nextSetBit" | "nextClearBit"
-        | "previousSetBit" | "previousClearBit" => Some(V::I32(0)),
+        "cardinality" | "size" | "length" | "nextSetBit" | "nextClearBit" | "previousSetBit"
+        | "previousClearBit" => Some(V::I32(0)),
         "isEmpty" => Some(V::I32(1)),
         "toByteArray" | "toLongArray" => Some(arr(vm, "B", vec![])),
         _ => return None,
@@ -1636,8 +1696,11 @@ fn atomic_call(vm: &mut Vm, class: &str, name: &str, args: &[V]) -> Option<Optio
             }
             Some(old)
         }
-        "compareAndSet" | "weakCompareAndSet" | "compareAndExchange"
-        | "compareAndExchangeAcquire" | "compareAndExchangeRelease" => {
+        "compareAndSet"
+        | "weakCompareAndSet"
+        | "compareAndExchange"
+        | "compareAndExchangeAcquire"
+        | "compareAndExchangeRelease" => {
             let cur = slot_of(vm, h).unwrap_or(V::I32(0));
             let ok = value_eq(vm, cur, args[1]);
             if ok {
@@ -1655,8 +1718,8 @@ fn atomic_call(vm: &mut Vm, class: &str, name: &str, args: &[V]) -> Option<Optio
                 V::I32(ok as i32)
             })
         }
-        "incrementAndGet" | "getAndIncrement" | "decrementAndGet"
-        | "getAndDecrement" | "addAndGet" | "getAndAdd" => {
+        "incrementAndGet" | "getAndIncrement" | "decrementAndGet" | "getAndDecrement"
+        | "addAndGet" | "getAndAdd" => {
             let cur = slot_of(vm, h).unwrap_or(V::I32(0));
             let delta = if matches!(name, "addAndGet" | "getAndAdd") {
                 i64v(args[1])
@@ -1673,17 +1736,19 @@ fn atomic_call(vm: &mut Vm, class: &str, name: &str, args: &[V]) -> Option<Optio
             {
                 *v = next;
             }
-            Some(if name.starts_with("getAnd") { cur } else { next })
-        }
-        "length" => {
-            Some(match vm.heap.get(h) {
-                Some(Obj::Host {
-                    state: HostState::List(l),
-                    ..
-                }) => V::I32(l.len() as i32),
-                _ => V::I32(0),
+            Some(if name.starts_with("getAnd") {
+                cur
+            } else {
+                next
             })
         }
+        "length" => Some(match vm.heap.get(h) {
+            Some(Obj::Host {
+                state: HostState::List(l),
+                ..
+            }) => V::I32(l.len() as i32),
+            _ => V::I32(0),
+        }),
         _ => return None,
     }
     .map(Some)
@@ -1718,7 +1783,10 @@ fn latch_call(vm: &mut Vm, name: &str, args: &[V]) -> Option<Option<V>> {
 fn fieldupdater_call(vm: &mut Vm, name: &str, args: &[V]) -> Rt<Option<Option<V>>> {
     Ok(match name {
         "newUpdater" | "newUpdaterWithImpl" => {
-            let h = vm.alloc_host("Ljava/util/concurrent/atomic/AtomicReferenceFieldUpdater;", HostState::Empty);
+            let h = vm.alloc_host(
+                "Ljava/util/concurrent/atomic/AtomicReferenceFieldUpdater;",
+                HostState::Empty,
+            );
             // The field-name argument is last in every newUpdater
             // signature: (Class,String), (Class,Class,String) and
             // (Unsafe,Class,String) — indexing args[2] misses the
@@ -1729,11 +1797,10 @@ fn fieldupdater_call(vm: &mut Vm, name: &str, args: &[V]) -> Rt<Option<Option<V>
             }
             Some(Some(V::Ref(h)))
         }
-        "get" | "set" | "lazySet" | "getAndSet" | "compareAndSet"
-        | "weakCompareAndSet" | "getAndUpdate" | "updateAndGet"
-        | "getAndAccumulate" | "accumulateAndGet" | "addAndGet"
-        | "getAndAdd" | "incrementAndGet" | "getAndIncrement"
-        | "decrementAndGet" | "getAndDecrement" => {
+        "get" | "set" | "lazySet" | "getAndSet" | "compareAndSet" | "weakCompareAndSet"
+        | "getAndUpdate" | "updateAndGet" | "getAndAccumulate" | "accumulateAndGet"
+        | "addAndGet" | "getAndAdd" | "incrementAndGet" | "getAndIncrement" | "decrementAndGet"
+        | "getAndDecrement" => {
             let V::Ref(up) = args[0] else {
                 return Ok(Some(Some(V::Ref(0))));
             };
@@ -1767,8 +1834,7 @@ fn fieldupdater_call(vm: &mut Vm, name: &str, args: &[V]) -> Rt<Option<Option<V>
             match name {
                 "get" => {
                     let v = match vm.heap.get(obj) {
-                        Some(Obj::Instance { fields, .. })
-                        | Some(Obj::Host { fields, .. }) => {
+                        Some(Obj::Instance { fields, .. }) | Some(Obj::Host { fields, .. }) => {
                             fields.get(&fid).copied().unwrap_or(V::Ref(0))
                         }
                         _ => V::Ref(0),
@@ -1777,8 +1843,7 @@ fn fieldupdater_call(vm: &mut Vm, name: &str, args: &[V]) -> Rt<Option<Option<V>
                 }
                 "compareAndSet" | "weakCompareAndSet" => {
                     let cur = match vm.heap.get(obj) {
-                        Some(Obj::Instance { fields, .. })
-                        | Some(Obj::Host { fields, .. }) => {
+                        Some(Obj::Instance { fields, .. }) | Some(Obj::Host { fields, .. }) => {
                             fields.get(&fid).copied().unwrap_or(V::Ref(0))
                         }
                         _ => V::Ref(0),
@@ -1788,8 +1853,7 @@ fn fieldupdater_call(vm: &mut Vm, name: &str, args: &[V]) -> Rt<Option<Option<V>
                     // CAS on a null-expected slot spins forever (kotlinx
                     // LockFreeTaskQueue.addLast relies on this).
                     let nullish = |v: V| matches!(v, V::I32(0) | V::Ref(0));
-                    let ok = (nullish(cur) && nullish(args[2]))
-                        || value_eq(vm, cur, args[2]);
+                    let ok = (nullish(cur) && nullish(args[2])) || value_eq(vm, cur, args[2]);
                     if ok {
                         // Widen numeric writes to the stored width — a
                         // `const/4` new value on a `J` field must stay I64.
@@ -1805,13 +1869,11 @@ fn fieldupdater_call(vm: &mut Vm, name: &str, args: &[V]) -> Rt<Option<Option<V>
                     }
                     Some(Some(V::I32(ok as i32)))
                 }
-                "getAndSet" | "getAndUpdate" | "updateAndGet"
-                | "getAndAccumulate" | "accumulateAndGet" | "addAndGet"
-                | "getAndAdd" | "incrementAndGet" | "getAndIncrement"
-                | "decrementAndGet" | "getAndDecrement" => {
+                "getAndSet" | "getAndUpdate" | "updateAndGet" | "getAndAccumulate"
+                | "accumulateAndGet" | "addAndGet" | "getAndAdd" | "incrementAndGet"
+                | "getAndIncrement" | "decrementAndGet" | "getAndDecrement" => {
                     let cur = match vm.heap.get(obj) {
-                        Some(Obj::Instance { fields, .. })
-                        | Some(Obj::Host { fields, .. }) => {
+                        Some(Obj::Instance { fields, .. }) | Some(Obj::Host { fields, .. }) => {
                             fields.get(&fid).copied().unwrap_or(V::Ref(0))
                         }
                         _ => V::Ref(0),
@@ -1846,8 +1908,7 @@ fn fieldupdater_call(vm: &mut Vm, name: &str, args: &[V]) -> Rt<Option<Option<V>
                 _ => {
                     // `set`/`lazySet` — coerce to the stored width as in CAS.
                     let cur = match vm.heap.get(obj) {
-                        Some(Obj::Instance { fields, .. })
-                        | Some(Obj::Host { fields, .. }) => {
+                        Some(Obj::Instance { fields, .. }) | Some(Obj::Host { fields, .. }) => {
                             fields.get(&fid).copied().unwrap_or(V::Ref(0))
                         }
                         _ => V::Ref(0),
@@ -1979,7 +2040,11 @@ fn sparse_call(vm: &mut Vm, class: &str, name: &str, args: &[V]) -> Rt<Option<Op
                 }) => m.clone(),
                 _ => vec![],
             };
-            Some(Some(host(vm, "Landroid/util/SparseArray;", HostState::Map(m))))
+            Some(Some(host(
+                vm,
+                "Landroid/util/SparseArray;",
+                HostState::Map(m),
+            )))
         }
         _ => None,
     })

@@ -150,12 +150,7 @@ impl Presenter {
         }
         Ok(Some(self.registry.present(Frame {
             surface_id: output_id,
-            generation: self
-                .windows
-                .get(&output_id)
-                .unwrap()
-                .queue()
-                .generation(),
+            generation: self.windows.get(&output_id).unwrap().queue().generation(),
             size: (w as u32, h as u32),
             color_space: ColorSpace::SrgbPremul,
             premultiplied: true,
@@ -190,7 +185,7 @@ mod tests {
         let pr = p.display(s).unwrap().unwrap();
         assert_eq!(pr.frame.size, (4, 4));
         assert_eq!(pr.frame.buffer[0], 9); // opaque premultiplied sRGB
-        // Buffer recycled: producer can draw again.
+                                           // Buffer recycled: producer can draw again.
         p.producer(s).unwrap().lock().unwrap();
     }
 
@@ -211,9 +206,10 @@ mod tests {
         let top = p.attach(2, 2, 2).unwrap();
         {
             let w = p.producer(top).unwrap();
-            w.lock()
-                .unwrap()
-                .fill_rect(ovelo_ui::Rect::new(0, 0, 2, 2), ovelo_ui::Color::srgb(200, 0, 0));
+            w.lock().unwrap().fill_rect(
+                ovelo_ui::Rect::new(0, 0, 2, 2),
+                ovelo_ui::Color::srgb(200, 0, 0),
+            );
             w.unlock_and_post().unwrap();
         }
         let pr = p

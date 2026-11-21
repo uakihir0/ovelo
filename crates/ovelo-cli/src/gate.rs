@@ -127,8 +127,12 @@ fn is_macho_executable(path: &Path) -> bool {
 }
 
 fn io_err(op: &str, e: std::io::Error) -> OveloError {
-    OveloError::new(ErrorCategory::HostCrash, Phase::Service, format!("gate.{op}"))
-        .with_detail(e.to_string())
+    OveloError::new(
+        ErrorCategory::HostCrash,
+        Phase::Service,
+        format!("gate.{op}"),
+    )
+    .with_detail(e.to_string())
 }
 
 /// Merge per-binary verdicts: any Fail wins, else Warn, else Skip,
@@ -167,7 +171,10 @@ pub fn evaluate(path: &Path) -> Result<Vec<GateItem>> {
     }
     let bins = binaries(path)?;
     Ok(vec![
-        combine("signature", bins.iter().map(|b| check_signature(b)).collect()),
+        combine(
+            "signature",
+            bins.iter().map(|b| check_signature(b)).collect(),
+        ),
         combine(
             "entitlements",
             bins.iter().map(|b| check_entitlements(b)).collect(),
@@ -185,8 +192,12 @@ pub fn passed(items: &[GateItem]) -> bool {
 
 fn run(cmd: &str, args: &[&str]) -> Result<(String, String)> {
     let out = Command::new(cmd).args(args).output().map_err(|e| {
-        OveloError::new(ErrorCategory::HostCrash, Phase::Service, "gate.tool.missing")
-            .with_detail(format!("{cmd}: {e}"))
+        OveloError::new(
+            ErrorCategory::HostCrash,
+            Phase::Service,
+            "gate.tool.missing",
+        )
+        .with_detail(format!("{cmd}: {e}"))
     })?;
     Ok((
         String::from_utf8_lossy(&out.stdout).into_owned(),
@@ -225,7 +236,10 @@ fn check_signature(path: &Path) -> GateItem {
             } else {
                 GateItem {
                     name: "signature",
-                    verdict: Verdict::Fail(format!("signed but no hardened runtime: {}", err.trim())),
+                    verdict: Verdict::Fail(format!(
+                        "signed but no hardened runtime: {}",
+                        err.trim()
+                    )),
                 }
             }
         }
@@ -254,9 +268,7 @@ fn check_entitlements(path: &Path) -> GateItem {
                 },
                 Ok(o) if !o.status.success() => GateItem {
                     name: "entitlements",
-                    verdict: Verdict::Fail(
-                        String::from_utf8_lossy(&o.stderr).trim().to_string(),
-                    ),
+                    verdict: Verdict::Fail(String::from_utf8_lossy(&o.stderr).trim().to_string()),
                 },
                 Ok(o) => {
                     let body = String::from_utf8_lossy(&o.stdout);
@@ -270,7 +282,10 @@ fn check_entitlements(path: &Path) -> GateItem {
                             name: "entitlements",
                             verdict: Verdict::Fail(format!(
                                 "unlisted entitlements: {}",
-                                bad.iter().map(|s| s.as_str()).collect::<Vec<_>>().join(", ")
+                                bad.iter()
+                                    .map(|s| s.as_str())
+                                    .collect::<Vec<_>>()
+                                    .join(", ")
                             )),
                         }
                     } else if keys
@@ -279,9 +294,7 @@ fn check_entitlements(path: &Path) -> GateItem {
                     {
                         GateItem {
                             name: "entitlements",
-                            verdict: Verdict::Warn(
-                                "unsigned executable memory allowed".into(),
-                            ),
+                            verdict: Verdict::Warn("unsigned executable memory allowed".into()),
                         }
                     } else {
                         GateItem {

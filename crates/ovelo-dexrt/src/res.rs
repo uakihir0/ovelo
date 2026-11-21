@@ -78,12 +78,16 @@ impl ApkResources {
                     res.type_names
                         .entry(e.res_id)
                         .or_insert_with(|| t.name.clone());
-                    res.entry_names.entry(e.res_id).or_insert_with(|| e.key.clone());
+                    res.entry_names
+                        .entry(e.res_id)
+                        .or_insert_with(|| e.key.clone());
                     if let Some(v) = &e.value {
                         if e.config == "default" {
                             res.entry_values.insert(e.res_id, v.clone());
                         } else {
-                            res.entry_values.entry(e.res_id).or_insert_with(|| v.clone());
+                            res.entry_values
+                                .entry(e.res_id)
+                                .or_insert_with(|| v.clone());
                         }
                     }
                     // A complex (style) entry: either a parent or items
@@ -217,7 +221,8 @@ impl ApkResources {
     /// res_id → entry key name, falling back to the framework attr table
     /// for `android:` ids (0x0101xxxx) that the app's arsc doesn't carry.
     pub fn attr_name(&self, res_id: u32) -> Option<&str> {
-        self.entry_name(res_id).or_else(|| framework_attr_name(res_id))
+        self.entry_name(res_id)
+            .or_else(|| framework_attr_name(res_id))
     }
 
     /// res_id → the entry's typed value (default config).

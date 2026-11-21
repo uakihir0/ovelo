@@ -78,11 +78,24 @@ mod ledger;
 mod worker;
 
 enum Cmd {
-    Inspect { apk: PathBuf, json: bool },
-    Install { apks: Vec<PathBuf>, json: bool },
-    Run { app: String },
-    Diagnose { apk: PathBuf, json: bool },
-    Gate { path: PathBuf },
+    Inspect {
+        apk: PathBuf,
+        json: bool,
+    },
+    Install {
+        apks: Vec<PathBuf>,
+        json: bool,
+    },
+    Run {
+        app: String,
+    },
+    Diagnose {
+        apk: PathBuf,
+        json: bool,
+    },
+    Gate {
+        path: PathBuf,
+    },
     /// Disassemble a dex method for debugging (`apk class.method?`).
     Disas {
         apk: PathBuf,
@@ -163,9 +176,7 @@ USAGE:
 ";
 
 fn read_apk(p: &Path) -> Result<Vec<u8>, OveloError> {
-    std::fs::read(p).map_err(|e| {
-        err("cli.apk.read").with_detail(format!("{}: {e}", p.display()))
-    })
+    std::fs::read(p).map_err(|e| err("cli.apk.read").with_detail(format!("{}: {e}", p.display())))
 }
 
 /// Escape control characters before printing untrusted APK fields to a
@@ -211,16 +222,39 @@ fn print_inspect(info: &ApkInfo, json: bool) {
         println!("}}");
     } else {
         println!("package       {}", disp(&m.package));
-        println!("version       {} ({})", m.version_code, m.version_name.as_deref().map(disp).unwrap_or_else(|| "-".into()));
-        println!("minSdk        {}", m.min_sdk.map(|v| v.to_string()).unwrap_or_else(|| "-".into()));
-        println!("targetSdk     {}", m.target_sdk.map(|v| v.to_string()).unwrap_or_else(|| "-".into()));
+        println!(
+            "version       {} ({})",
+            m.version_code,
+            m.version_name
+                .as_deref()
+                .map(disp)
+                .unwrap_or_else(|| "-".into())
+        );
+        println!(
+            "minSdk        {}",
+            m.min_sdk
+                .map(|v| v.to_string())
+                .unwrap_or_else(|| "-".into())
+        );
+        println!(
+            "targetSdk     {}",
+            m.target_sdk
+                .map(|v| v.to_string())
+                .unwrap_or_else(|| "-".into())
+        );
         println!("activities    {}", disp(&m.activities.join(", ")));
         println!("features      {}", disp(&m.features.join(", ")));
         println!("permissions   {}", disp(&m.permissions.join(", ")));
         println!("abis          {}", info.abis.join(", "));
         println!("dex           {}", info.dex_entries.join(", "));
-        println!("resources     {}", if info.has_resources { "yes" } else { "no" });
-        println!("signed v2/v3  {}", if info.signed_v2_or_v3 { "yes" } else { "no" });
+        println!(
+            "resources     {}",
+            if info.has_resources { "yes" } else { "no" }
+        );
+        println!(
+            "signed v2/v3  {}",
+            if info.signed_v2_or_v3 { "yes" } else { "no" }
+        );
         println!("sha256        {}", info.sha256);
     }
 }
@@ -298,11 +332,7 @@ fn disas(apk: &[u8], class: &str, method: Option<&str>) -> Result<(), OveloError
                 if i.is_payload() {
                     continue;
                 }
-                let mut line = format!(
-                    "  {:04x} {:<22}",
-                    i.offset,
-                    i.name
-                );
+                let mut line = format!("  {:04x} {:<22}", i.offset, i.name);
                 if !i.regs.is_empty() {
                     line.push_str(&format!(" v{:?}", i.regs));
                 }
@@ -383,9 +413,7 @@ fn find_record(store: &InstallStore, package: &str) -> Result<InstallRecord, Ove
 fn register_compat_shims(
     v: &mut ovelo_dexrt::Vm,
     initializers: &[String],
-    components: std::rc::Rc<
-        std::cell::RefCell<std::collections::HashMap<String, ovelo_dexrt::V>>,
-    >,
+    components: std::rc::Rc<std::cell::RefCell<std::collections::HashMap<String, ovelo_dexrt::V>>>,
 ) {
     use ovelo_dexrt::{HostState, Obj, V};
     use std::cell::RefCell;
@@ -517,7 +545,11 @@ fn register_compat_shims(
                     if let Ok(ih) = vm.instantiate(&d) {
                         let ctx = match a.first().copied() {
                             Some(V::Ref(ai)) => vm
-                                .get_object_field(ai, "Landroidx/startup/AppInitializer;", "mContext")
+                                .get_object_field(
+                                    ai,
+                                    "Landroidx/startup/AppInitializer;",
+                                    "mContext",
+                                )
                                 .unwrap_or(V::Ref(0)),
                             _ => V::Ref(0),
                         };
@@ -562,12 +594,7 @@ fn register_compat_shims(
                 state: HostState::Empty,
             }));
             if let V::Ref(h) = ai {
-                vm.set_object_field(
-                    h,
-                    "Landroidx/startup/AppInitializer;",
-                    "mDiscovered",
-                    hs,
-                );
+                vm.set_object_field(h, "Landroidx/startup/AppInitializer;", "mDiscovered", hs);
                 // `doInitialize(class, set)` reads mContext for the
                 // initializer's create() argument.
                 vm.set_object_field(
@@ -582,12 +609,7 @@ fn register_compat_shims(
                     fields: HashMap::new(),
                     state: HostState::Map(vec![]),
                 }));
-                vm.set_object_field(
-                    h,
-                    "Landroidx/startup/AppInitializer;",
-                    "mInitialized",
-                    init,
-                );
+                vm.set_object_field(h, "Landroidx/startup/AppInitializer;", "mInitialized", init);
             }
             Ok(Some(ai))
         })) as ovelo_dexrt::HostCall,
@@ -642,11 +664,7 @@ fn drain_pending_activity(
 /// Deliver the queued lifecycle callbacks to a guest Activity:
 /// `finish()` stops the sequence, and the options menu is prepared
 /// before `onResume` the way AOSP lazily creates it on first use.
-fn run_activity_cbs(
-    vm: &mut ovelo_dexrt::Vm,
-    this: u32,
-    callbacks: &[String],
-) {
+fn run_activity_cbs(vm: &mut ovelo_dexrt::Vm, this: u32, callbacks: &[String]) {
     // Content/decor roots attach under the running activity — keep
     // each activity's trees scoped to itself for lookups and render.
     vm.set_activity(this);
@@ -670,7 +688,11 @@ fn run_activity_cbs(
             })
             .inspect_err(|e| println!("callback {cb} crashed: {e}"));
         let ran = matches!(r, Ok(Some(_)));
-        println!("callback {} ({})", cb, if ran { "dex" } else { "framework" });
+        println!(
+            "callback {} ({})",
+            cb,
+            if ran { "dex" } else { "framework" }
+        );
     }
 }
 
@@ -682,9 +704,7 @@ fn run_initializer(
     desc: &str,
     ctx: ovelo_dexrt::V,
     seen: &mut std::collections::HashSet<String>,
-    components: &std::rc::Rc<
-        std::cell::RefCell<std::collections::HashMap<String, ovelo_dexrt::V>>,
-    >,
+    components: &std::rc::Rc<std::cell::RefCell<std::collections::HashMap<String, ovelo_dexrt::V>>>,
 ) {
     if !seen.insert(desc.to_string()) {
         return;
@@ -727,7 +747,11 @@ fn run_app(store: &InstallStore, package: &str) -> Result<(), OveloError> {
     let info = inspect_apk(&bytes)?;
     // Launch pipeline pieces that exist today: dex parse + verify.
     let dexes = verify_dexes(&bytes, &info)?;
-    let bad: Vec<&str> = dexes.iter().filter(|d| !d.ok).map(|d| d.name.as_str()).collect();
+    let bad: Vec<&str> = dexes
+        .iter()
+        .filter(|d| !d.ok)
+        .map(|d| d.name.as_str())
+        .collect();
     if !bad.is_empty() {
         return Err(OveloError::new(
             ErrorCategory::DexUnsupported,
@@ -751,9 +775,14 @@ fn run_app(store: &InstallStore, package: &str) -> Result<(), OveloError> {
     let data_dir = store.app_dir(&rec.app).join("data");
     let _ctx = ovelo_framework::Context::new(rec.app.package.clone(), &data_dir);
     let mut activity = ovelo_framework::Activity::new();
-    activity
-        .launch()
-        .map_err(|e| OveloError::new(ErrorCategory::ServiceMissing, Phase::Service, "cli.run.lifecycle").with_detail(e.to_string()))?;
+    activity.launch().map_err(|e| {
+        OveloError::new(
+            ErrorCategory::ServiceMissing,
+            Phase::Service,
+            "cli.run.lifecycle",
+        )
+        .with_detail(e.to_string())
+    })?;
     let callbacks: Vec<String> = {
         let mut v = Vec::new();
         while let Some(cb) = activity.delivered() {
@@ -774,7 +803,10 @@ fn run_app(store: &InstallStore, package: &str) -> Result<(), OveloError> {
     // into the VM. Registered BEFORE instantiate so a constructor that
     // builds views in <init>/onCreate hits live stubs.
     let mut fonts = ovelo_ui::FontSet::new();
-    fonts.load_dirs(&["/System/Library/Fonts", "/System/Library/Fonts/Supplemental"]);
+    fonts.load_dirs(&[
+        "/System/Library/Fonts",
+        "/System/Library/Fonts/Supplemental",
+    ]);
     let fonts = std::rc::Rc::new(fonts);
     // P3 worker supervision: the whole guest dispatch (VM build → register
     // → instantiate → lifecycle callbacks) runs under catch_unwind. A panic
@@ -791,12 +823,13 @@ fn run_app(store: &InstallStore, package: &str) -> Result<(), OveloError> {
             // Components returned by initializer `create()` — shared
             // between the startup pass and `initializeComponent` so a
             // component initializes once per run.
-            let components = std::rc::Rc::new(std::cell::RefCell::new(
-                std::collections::HashMap::<String, ovelo_dexrt::V>::new(),
-            ));
+            let components =
+                std::rc::Rc::new(std::cell::RefCell::new(std::collections::HashMap::<
+                    String,
+                    ovelo_dexrt::V,
+                >::new()));
             let vm = (|| -> Result<_, OveloError> {
-                let (_cd, entries) =
-                    parse_central_directory(&bytes, &ZipLimits::default())?;
+                let (_cd, entries) = parse_central_directory(&bytes, &ZipLimits::default())?;
                 // Multi-dex: the Vm merges every classes*.dex into one
                 // index space — a method defined in classes2.dex resolves
                 // from an invoke in classes.dex. Put the launcher-defining
@@ -818,8 +851,7 @@ fn run_app(store: &InstallStore, package: &str) -> Result<(), OveloError> {
                     .iter()
                     .position(|d| {
                         d.class_defs().iter().any(|cd| {
-                            d.type_descriptor(cd.class_idx).ok().as_deref()
-                                == Some(desc.as_str())
+                            d.type_descriptor(cd.class_idx).ok().as_deref() == Some(desc.as_str())
                         })
                     })
                     .unwrap_or(0);
@@ -873,9 +905,7 @@ fn run_app(store: &InstallStore, package: &str) -> Result<(), OveloError> {
                         .manifest
                         .application_class
                         .as_ref()
-                        .and_then(|app| {
-                            v.instantiate(&format!("L{};", app.replace('.', "/"))).ok()
-                        })
+                        .and_then(|app| v.instantiate(&format!("L{};", app.replace('.', "/"))).ok())
                         .unwrap_or_else(|| {
                             v.heap.alloc(ovelo_dexrt::Obj::Host {
                                 class_idx: u64::MAX,
@@ -909,12 +939,7 @@ fn run_app(store: &InstallStore, package: &str) -> Result<(), OveloError> {
                 .ok();
             if let Some((vm, this)) = &mut g {
                 run_activity_cbs(vm, *this, &callbacks);
-                drain_pending_activity(
-                    vm,
-                    this,
-                    &callbacks,
-                    &info.manifest,
-                );
+                drain_pending_activity(vm, this, &callbacks, &info.manifest);
             }
             (g, ui)
         });
@@ -928,7 +953,10 @@ fn run_app(store: &InstallStore, package: &str) -> Result<(), OveloError> {
                     continue;
                 }
                 // Still need a ui for the fallback demo tree.
-                break (None, ovelo_framework::GuestUi::new(720, 1280, fonts.clone()));
+                break (
+                    None,
+                    ovelo_framework::GuestUi::new(720, 1280, fonts.clone()),
+                );
             }
         }
     };
@@ -1052,7 +1080,11 @@ fn run_app(store: &InstallStore, package: &str) -> Result<(), OveloError> {
             let posted = u.root.perform_traversals(prod);
             if std::env::var_os("OVELO_VIEWDBG").is_some() && posted.ok().flatten().is_some() {
                 if let Some(c) = &u.root.content {
-                    eprintln!("[viewdbg] drew root measured={:?} lp={:?}", c.measured(), c.lp());
+                    eprintln!(
+                        "[viewdbg] drew root measured={:?} lp={:?}",
+                        c.measured(),
+                        c.lp()
+                    );
                 }
             }
         }
@@ -1108,11 +1140,7 @@ fn cmd() -> Result<(), OveloError> {
             Ok(())
         }
         Cmd::Run { app } => run_app(&default_store()?, &app),
-        Cmd::Disas {
-            apk,
-            class,
-            method,
-        } => disas(&read_apk(&apk)?, &class, method.as_deref()),
+        Cmd::Disas { apk, class, method } => disas(&read_apk(&apk)?, &class, method.as_deref()),
         Cmd::Gate { path } => {
             let items = gate::evaluate(&path)?;
             for i in &items {
@@ -1127,18 +1155,31 @@ fn cmd() -> Result<(), OveloError> {
             if gate::passed(&items) {
                 Ok(())
             } else {
-                Err(OveloError::new(ErrorCategory::PkgInvalid, Phase::Install, "gate.failed"))
+                Err(OveloError::new(
+                    ErrorCategory::PkgInvalid,
+                    Phase::Install,
+                    "gate.failed",
+                ))
             }
         }
         Cmd::Diagnose { apk, json } => {
             let bytes = read_apk(&apk)?;
             let info = inspect_apk(&bytes)?;
             let dexes = verify_dexes(&bytes, &info)?;
-            let sig = if info.signed_v2_or_v3 { "v2/v3" } else { "v1-or-none" };
+            let sig = if info.signed_v2_or_v3 {
+                "v2/v3"
+            } else {
+                "v1-or-none"
+            };
             if json {
                 let dx: Vec<String> = dexes
                     .iter()
-                    .map(|d| format!("{{\"name\":{:?},\"ok\":{},\"cause\":{:?}}}", d.name, d.ok, d.cause))
+                    .map(|d| {
+                        format!(
+                            "{{\"name\":{:?},\"ok\":{},\"cause\":{:?}}}",
+                            d.name, d.ok, d.cause
+                        )
+                    })
                     .collect();
                 println!(
                     "{{\n  \"package\": {:?},\n  \"signature\": {:?},\n  \"abis\": {:?},\n  \"dexes\": [{}],\n  \"sha256\": {:?}\n}}",

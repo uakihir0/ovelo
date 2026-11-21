@@ -19,11 +19,7 @@ const PARSER: &str = "Landroid/content/res/XmlResourceParser;";
 /// `Resources.getXml(resId)` → a pull parser over the resource's binary
 /// XML; `null` when the id isn't a file-backed XML resource.
 pub(crate) fn parser_of(vm: &mut Vm, res_id: u32) -> V {
-    let Some(elements) = vm
-        .apk_res
-        .as_ref()
-        .and_then(|r| r.document(res_id))
-    else {
+    let Some(elements) = vm.apk_res.as_ref().and_then(|r| r.document(res_id)) else {
         return V::Ref(0);
     };
     let elements = Rc::new(elements);
@@ -138,13 +134,11 @@ pub(crate) fn pull_call(
             Some(Some(V::I32(e.map(code_of).unwrap_or(END_DOCUMENT))))
         }
         "getName" => {
-            let t = cur(vm, h)
-                .and_then(|(els, e)| cur_el(&els, e).map(|el| el.name.clone()));
+            let t = cur(vm, h).and_then(|(els, e)| cur_el(&els, e).map(|el| el.name.clone()));
             Some(Some(t.map(|t| jstr(vm, &t)).unwrap_or(V::Ref(0))))
         }
-        "getNamespace" | "getText" | "getInputEncoding" | "getPrefix"
-        | "getAttributePrefix" | "getFeature" | "getIdAttribute"
-        | "getClassAttribute" => {
+        "getNamespace" | "getText" | "getInputEncoding" | "getPrefix" | "getAttributePrefix"
+        | "getFeature" | "getIdAttribute" | "getClassAttribute" => {
             let _ = args;
             Some(Some(V::Ref(0)))
         }
@@ -184,26 +178,20 @@ pub(crate) fn pull_call(
         "getAttributeValue" => {
             // Two shapes: (int) and (ns, name).
             let t = cur(vm, h).and_then(|(els, e)| {
-                cur_el(&els, e).and_then(|el| {
-                    match args.get(1).copied() {
-                        Some(V::I32(i)) => el
-                            .attrs
-                            .get(i as usize)
-                            .and_then(|a| attr_s(&a.value)),
-                        _ => {
-                            let want = args.get(2).and_then(|a| sv(vm, *a));
-                            el.attrs
-                                .iter()
-                                .find(|a| Some(a.name.as_str()) == want.as_deref())
-                                .and_then(|a| attr_s(&a.value))
-                        }
+                cur_el(&els, e).and_then(|el| match args.get(1).copied() {
+                    Some(V::I32(i)) => el.attrs.get(i as usize).and_then(|a| attr_s(&a.value)),
+                    _ => {
+                        let want = args.get(2).and_then(|a| sv(vm, *a));
+                        el.attrs
+                            .iter()
+                            .find(|a| Some(a.name.as_str()) == want.as_deref())
+                            .and_then(|a| attr_s(&a.value))
                     }
                 })
             });
             Some(Some(t.map(|t| jstr(vm, &t)).unwrap_or(V::Ref(0))))
         }
-        "getAttributeResourceValue" | "getAttributeUnsignedIntValue"
-        | "getAttributeIntValue" => {
+        "getAttributeResourceValue" | "getAttributeUnsignedIntValue" | "getAttributeIntValue" => {
             let i = args.get(1).map(|v| i64v(*v)).unwrap_or(0);
             let found = cur(vm, h).and_then(|(els, e)| {
                 cur_el(&els, e)
@@ -216,11 +204,9 @@ pub(crate) fn pull_call(
                     })
             });
             // Signature: index args + a default last.
-            Some(Some(
-                found
-                    .map(|v| V::I32(v as i32))
-                    .unwrap_or_else(|| args.last().copied().unwrap_or(V::I32(0))),
-            ))
+            Some(Some(found.map(|v| V::I32(v as i32)).unwrap_or_else(|| {
+                args.last().copied().unwrap_or(V::I32(0))
+            })))
         }
         "getAttributeBooleanValue" => {
             let i = args.get(1).map(|v| i64v(*v)).unwrap_or(0);
@@ -252,10 +238,10 @@ pub(crate) fn pull_call(
                 args.last().copied().unwrap_or(V::F32(0.0))
             })))
         }
-        "getAttributeNameResource" | "getAttributeListValue"
-        | "getIdAttributeResourceValue" | "getStyleAttribute" => {
-            Some(Some(args.last().copied().unwrap_or(V::I32(0))))
-        }
+        "getAttributeNameResource"
+        | "getAttributeListValue"
+        | "getIdAttributeResourceValue"
+        | "getStyleAttribute" => Some(Some(args.last().copied().unwrap_or(V::I32(0)))),
         "isEmptyElementTag" => {
             let empty = cur(vm, h)
                 .and_then(|(els, e)| {
@@ -274,8 +260,12 @@ pub(crate) fn pull_call(
         "getAttributeType" => Some(Some(jstr(vm, "CDATA"))),
         "getProperty" => Some(Some(args.get(1).copied().unwrap_or(V::Ref(0)))),
         "isWhitespace" => Some(Some(V::I32(0))),
-        "setInput" | "setFeature" | "setProperty"
-        | "defineEntityReplacementText" | "close" | "require" => Some(None),
+        "setInput"
+        | "setFeature"
+        | "setProperty"
+        | "defineEntityReplacementText"
+        | "close"
+        | "require" => Some(None),
         _ => Some(match ret(sig) {
             "V" => None,
             _ => Some(stub_ret(vm, sig)),

@@ -130,10 +130,13 @@ pub fn build(classes: &[C]) -> (Vec<u8>, Ix) {
     let mut fields: Vec<(String, String, String)> = Vec::new();
     let mut methods: Vec<(String, usize, String)> = Vec::new();
     fn intern(v: &mut Vec<String>, s: &str) -> u32 {
-        v.iter().position(|x| x == s).map(|i| i as u32).unwrap_or_else(|| {
-            v.push(s.to_string());
-            (v.len() - 1) as u32
-        })
+        v.iter()
+            .position(|x| x == s)
+            .map(|i| i as u32)
+            .unwrap_or_else(|| {
+                v.push(s.to_string());
+                (v.len() - 1) as u32
+            })
     }
     let shorty = |ret: &str, params: &[&str]| -> String {
         let mut s = String::from(&ret[..1]);
@@ -227,11 +230,21 @@ pub fn build(classes: &[C]) -> (Vec<u8>, Ix) {
     };
 
     let mut b = vec![0u8; 0x70];
-    macro_rules! u32w { ($v:expr) => { b.extend(($v as u32).to_le_bytes()) } }
-    macro_rules! u16w { ($v:expr) => { b.extend(($v as u16).to_le_bytes()) } }
-    macro_rules! patch { ($off:expr, $v:expr) => {
-        b[$off..$off + 4].copy_from_slice(&($v as u32).to_le_bytes())
-    } }
+    macro_rules! u32w {
+        ($v:expr) => {
+            b.extend(($v as u32).to_le_bytes())
+        };
+    }
+    macro_rules! u16w {
+        ($v:expr) => {
+            b.extend(($v as u16).to_le_bytes())
+        };
+    }
+    macro_rules! patch {
+        ($off:expr, $v:expr) => {
+            b[$off..$off + 4].copy_from_slice(&($v as u32).to_le_bytes())
+        };
+    }
 
     let string_ids_off = b.len();
     for _ in &strings {
@@ -404,8 +417,7 @@ pub fn build(classes: &[C]) -> (Vec<u8>, Ix) {
                     let tp = try_pos + k * 8;
                     b[tp..tp + 4].copy_from_slice(&t.0.to_le_bytes());
                     b[tp + 4..tp + 6].copy_from_slice(&t.1.to_le_bytes());
-                    b[tp + 6..tp + 8]
-                        .copy_from_slice(&(hoffs[k] as u16).to_le_bytes());
+                    b[tp + 6..tp + 8].copy_from_slice(&(hoffs[k] as u16).to_le_bytes());
                 }
             }
             while !b.len().is_multiple_of(4) {

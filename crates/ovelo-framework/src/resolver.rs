@@ -27,7 +27,9 @@ impl ContentUri {
         let rest = uri
             .strip_prefix("content://")
             .ok_or_else(|| err("framework.uri.scheme").with_detail(uri))?;
-        let (rest, _frag) = rest.split_once('#').map_or((rest, None), |(r, f)| (r, Some(f)));
+        let (rest, _frag) = rest
+            .split_once('#')
+            .map_or((rest, None), |(r, f)| (r, Some(f)));
         let (rest, query) = rest
             .split_once('?')
             .map_or((rest, None), |(r, q)| (r, Some(q.to_string())));
@@ -38,7 +40,10 @@ impl ContentUri {
         }
         Ok(Self {
             authority: authority.to_string(),
-            path: it.filter(|s| !s.is_empty()).map(|s| s.to_string()).collect(),
+            path: it
+                .filter(|s| !s.is_empty())
+                .map(|s| s.to_string())
+                .collect(),
             query,
         })
     }
@@ -57,7 +62,11 @@ pub trait ContentProvider: Send {
     ) -> Result<Cursor, OveloError>;
 
     /// `insert(uri, values)` — returns the new row id.
-    fn insert(&mut self, _uri: &ContentUri, _values: &[(&str, SqlValue)]) -> Result<i64, OveloError> {
+    fn insert(
+        &mut self,
+        _uri: &ContentUri,
+        _values: &[(&str, SqlValue)],
+    ) -> Result<i64, OveloError> {
         Err(err("framework.provider.unsupported"))
     }
 
@@ -89,15 +98,16 @@ impl ContentResolver {
         self.providers.insert(authority.to_string(), provider);
     }
 
-    fn provider(&self, uri: &str) -> Result<(ContentUri, Arc<Mutex<dyn ContentProvider>>), OveloError> {
+    fn provider(
+        &self,
+        uri: &str,
+    ) -> Result<(ContentUri, Arc<Mutex<dyn ContentProvider>>), OveloError> {
         let u = ContentUri::parse(uri)?;
         let p = self
             .providers
             .get(&u.authority)
             .cloned()
-            .ok_or_else(|| {
-                err("framework.provider.missing").with_detail(&u.authority)
-            })?;
+            .ok_or_else(|| err("framework.provider.missing").with_detail(&u.authority))?;
         Ok((u, p))
     }
 
@@ -111,18 +121,14 @@ impl ContentResolver {
         sort: Option<&str>,
     ) -> Result<Cursor, OveloError> {
         let (u, p) = self.provider(uri)?;
-        let mut g = p
-            .lock()
-            .map_err(|_| err("framework.provider.poison"))?;
+        let mut g = p.lock().map_err(|_| err("framework.provider.poison"))?;
         g.query(&u, projection, selection, args, sort)
     }
 
     /// `resolver.insert(...)`.
     pub fn insert(&self, uri: &str, values: &[(&str, SqlValue)]) -> Result<i64, OveloError> {
         let (u, p) = self.provider(uri)?;
-        let mut g = p
-            .lock()
-            .map_err(|_| err("framework.provider.poison"))?;
+        let mut g = p.lock().map_err(|_| err("framework.provider.poison"))?;
         g.insert(&u, values)
     }
 
@@ -134,9 +140,7 @@ impl ContentResolver {
         args: Option<&[&str]>,
     ) -> Result<usize, OveloError> {
         let (u, p) = self.provider(uri)?;
-        let mut g = p
-            .lock()
-            .map_err(|_| err("framework.provider.poison"))?;
+        let mut g = p.lock().map_err(|_| err("framework.provider.poison"))?;
         g.delete(&u, clause, args)
     }
 }
@@ -180,9 +184,12 @@ mod tests {
     #[test]
     fn dispatches_by_authority() {
         let db = Database::memory().unwrap();
-        db.exec("CREATE TABLE notes(id INTEGER PRIMARY KEY, body TEXT)").unwrap();
-        db.insert("notes", &[("body", SqlValue::Text("one".into()))]).unwrap();
-        db.insert("notes", &[("body", SqlValue::Text("two".into()))]).unwrap();
+        db.exec("CREATE TABLE notes(id INTEGER PRIMARY KEY, body TEXT)")
+            .unwrap();
+        db.insert("notes", &[("body", SqlValue::Text("one".into()))])
+            .unwrap();
+        db.insert("notes", &[("body", SqlValue::Text("two".into()))])
+            .unwrap();
 
         let mut r = ContentResolver::new();
         r.register("com.x.notes", Arc::new(Mutex::new(DbProvider { db })));
@@ -196,6 +203,8 @@ mod tests {
             )
             .unwrap();
         assert_eq!(c.count(), 1);
-        assert!(r.query("content://other/x", None, None, None, None).is_err());
+        assert!(r
+            .query("content://other/x", None, None, None, None)
+            .is_err());
     }
 }

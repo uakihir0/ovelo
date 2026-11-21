@@ -14,18 +14,18 @@ pub mod bufq;
 pub mod canvas;
 pub mod color;
 pub mod egl;
-pub mod vulkan;
 pub mod font;
 pub mod surface;
 pub mod text;
+pub mod vulkan;
 
 pub use bufq::{ANativeWindow, BufferQueue, FrameId};
-pub use egl::{EglDisplay, EglConfig, CONFIG_RGBA8_ES2};
-pub use vulkan::{VkInstance, VkSurface, VkSwapchain};
-pub use color::Color;
-pub use font::{FontSet, GlyphSource, TtfFont};
 pub use canvas::{Canvas, Paint};
+pub use color::Color;
+pub use egl::{EglConfig, EglDisplay, CONFIG_RGBA8_ES2};
+pub use font::{FontSet, GlyphSource, TtfFont};
 pub use surface::{Rect, Surface};
 pub use text::{layout, Line, TextLayout, TextStyle};
+pub use vulkan::{VkInstance, VkSurface, VkSwapchain};
 
 pub use ovelo_error;

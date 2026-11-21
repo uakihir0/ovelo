@@ -15,7 +15,7 @@ use rusqlite::{params_from_iter, types::Value as SV, types::ValueRef, Connection
 use super::io::fspath;
 use super::*;
 use crate::value::{HostState, Obj, V};
-use crate::{E, Rt, Vm};
+use crate::{Rt, Vm, E};
 
 // Pseudo field-idx keys for cursor/statement/db plumbing.
 pub(crate) const P_CUR_COLS: u32 = u32::MAX - 30;
@@ -156,20 +156,14 @@ fn conn_of(vm: &mut Vm, h: u32) -> Result<Rc<RefCell<Db>>, E> {
 }
 
 fn sql_err(vm: &mut Vm, e: impl std::fmt::Display) -> E {
-    vm.throw_builtin(
-        "Landroid/database/sqlite/SQLiteException;",
-        &e.to_string(),
-    )
+    vm.throw_builtin("Landroid/database/sqlite/SQLiteException;", &e.to_string())
 }
 
 /// End the outermost transaction level. A failed COMMIT (deferred
 /// FK violation, …) leaves the SQLite transaction open, so roll it
 /// back — otherwise every later beginTransaction fails too — and
 /// still report the error so callers don't treat it as committed.
-fn commit_or_rollback(
-    conn: &mut rusqlite::Connection,
-    ok: bool,
-) -> rusqlite::Result<()> {
+fn commit_or_rollback(conn: &mut rusqlite::Connection, ok: bool) -> rusqlite::Result<()> {
     match conn.execute_batch(if ok { "COMMIT" } else { "ROLLBACK" }) {
         Err(e) => {
             let _ = conn.execute_batch("ROLLBACK");
@@ -235,8 +229,7 @@ fn run_query(vm: &mut Vm, h: u32, sql: &str, binds: V) -> Result<V, E> {
     let (cols, cells): (Vec<String>, Vec<Vec<SV>>) = {
         let d = db.borrow();
         let mut stmt = d.conn.prepare(sql).map_err(|e| sql_err(vm, e))?;
-        let cols: Vec<String> =
-            stmt.column_names().iter().map(|c| c.to_string()).collect();
+        let cols: Vec<String> = stmt.column_names().iter().map(|c| c.to_string()).collect();
         let mut rows = stmt
             .query(params_from_iter(params))
             .map_err(|e| sql_err(vm, e))?;
@@ -249,9 +242,7 @@ fn run_query(vm: &mut Vm, h: u32, sql: &str, binds: V) -> Result<V, E> {
                     ValueRef::Null => SV::Null,
                     ValueRef::Integer(i) => SV::Integer(i),
                     ValueRef::Real(f) => SV::Real(f),
-                    ValueRef::Text(t) => {
-                        SV::Text(String::from_utf8_lossy(t).to_string())
-                    }
+                    ValueRef::Text(t) => SV::Text(String::from_utf8_lossy(t).to_string()),
                     ValueRef::Blob(b) => SV::Blob(b.to_vec()),
                 });
             }
@@ -267,8 +258,7 @@ fn run_query(vm: &mut Vm, h: u32, sql: &str, binds: V) -> Result<V, E> {
         row_refs.push(arr(vm, OBJ, vals));
     }
     let rows_l = host(vm, "Ljava/util/ArrayList;", HostState::List(row_refs));
-    let V::Ref(c) = host(vm, "Landroid/database/Cursor;", HostState::Empty)
-    else {
+    let V::Ref(c) = host(vm, "Landroid/database/Cursor;", HostState::Empty) else {
         unreachable!()
     };
     pseudo_set(vm, c, P_CUR_COLS, col_arr);
@@ -290,14 +280,8 @@ fn build_query(vm: &Vm, args: &[V]) -> Option<(String, V)> {
     for a in &args[1..] {
         match a {
             V::Ref(0) => {}
-            V::Ref(h)
-                if matches!(vm.heap.get(*h), Some(Obj::Array { .. })) =>
-            {
-                arrays.push(*a)
-            }
-            V::Ref(h) if s(vm, *h).is_some() => {
-                strings.push(s(vm, *h).unwrap_or_default())
-            }
+            V::Ref(h) if matches!(vm.heap.get(*h), Some(Obj::Array { .. })) => arrays.push(*a),
+            V::Ref(h) if s(vm, *h).is_some() => strings.push(s(vm, *h).unwrap_or_default()),
             _ => {}
         }
     }
@@ -381,9 +365,7 @@ fn find_map_arg(vm: &Vm, args: &[V]) -> V {
 fn find_array_arg(vm: &Vm, args: &[V]) -> V {
     args.iter()
         .rev()
-        .find(|a| {
-            matches!(a, V::Ref(h) if matches!(vm.heap.get(*h), Some(Obj::Array{..})))
-        })
+        .find(|a| matches!(a, V::Ref(h) if matches!(vm.heap.get(*h), Some(Obj::Array{..}))))
         .copied()
         .unwrap_or(V::Ref(0))
 }
@@ -391,11 +373,7 @@ fn find_array_arg(vm: &Vm, args: &[V]) -> V {
 /// Single entry: `android.database.*` + `androidx.sqlite` receivers.
 /// Routes by receiver shape — db-bound objects get sqlite ops,
 /// P_SQL-carrying ones get statement ops, everything else cursor ops.
-pub(crate) fn db_call(
-    vm: &mut Vm,
-    name: &str,
-    args: &[V],
-) -> Rt<Option<Option<V>>> {
+pub(crate) fn db_call(vm: &mut Vm, name: &str, args: &[V]) -> Rt<Option<Option<V>>> {
     let h = match args.first() {
         Some(&V::Ref(h)) => h,
         _ => 0,
@@ -421,11 +399,7 @@ pub(crate) fn db_call(
 }
 
 /// `SQLiteOpenHelper` / `SQLiteDatabase` methods.
-fn sqlite_call(
-    vm: &mut Vm,
-    name: &str,
-    args: &[V],
-) -> Rt<Option<Option<V>>> {
+fn sqlite_call(vm: &mut Vm, name: &str, args: &[V]) -> Rt<Option<Option<V>>> {
     let this = match args.first() {
         Some(&V::Ref(h)) => h,
         _ => 0,
@@ -456,11 +430,7 @@ fn sqlite_call(
                     .map(|d| {
                         d.borrow()
                             .conn
-                            .query_row::<i64, _, _>(
-                                "PRAGMA user_version",
-                                [],
-                                |r| r.get(0),
-                            )
+                            .query_row::<i64, _, _>("PRAGMA user_version", [], |r| r.get(0))
                             .unwrap_or(0) as i32
                     })
                     .unwrap_or(0);
@@ -511,9 +481,10 @@ fn sqlite_call(
                     match res {
                         Ok(_) if has_hook => {
                             if let Ok(db) = conn_of(vm, this) {
-                                let _ = db.borrow().conn.execute_batch(
-                                    &format!("PRAGMA user_version={want}"),
-                                );
+                                let _ = db
+                                    .borrow()
+                                    .conn
+                                    .execute_batch(&format!("PRAGMA user_version={want}"));
                             }
                         }
                         // A helper without the callback can't perform
@@ -533,7 +504,8 @@ fn sqlite_call(
             }
             Some(Some(out))
         }
-        "beginTransaction" | "beginTransactionNonExclusive"
+        "beginTransaction"
+        | "beginTransactionNonExclusive"
         | "beginTransactionWithListener"
         | "beginTransactionWithListenerNonExclusive" => {
             let db = conn_of(vm, this)?;
@@ -541,9 +513,7 @@ fn sqlite_call(
             // Nested begins stack on one level each — only the
             // outermost pair issues BEGIN/COMMIT/ROLLBACK.
             if d.tx_stack.is_empty() {
-                d.conn
-                    .execute_batch("BEGIN")
-                    .map_err(|e| sql_err(vm, e))?;
+                d.conn.execute_batch("BEGIN").map_err(|e| sql_err(vm, e))?;
             }
             d.tx_stack.push(false);
             Some(None)
@@ -575,8 +545,7 @@ fn sqlite_call(
                 }
             } else {
                 let commit = ok && !d.tx_failed;
-                commit_or_rollback(&mut d.conn, commit)
-                    .map_err(|e| sql_err(vm, e))?;
+                commit_or_rollback(&mut d.conn, commit).map_err(|e| sql_err(vm, e))?;
                 d.tx_failed = false;
             }
             Some(None)
@@ -678,8 +647,7 @@ fn sqlite_call(
             }
             Some(Some(V::Ref(st)))
         }
-        "insert" | "insertOrThrow" | "insertWithOnConflict" | "replace"
-        | "replaceOrThrow" => {
+        "insert" | "insertOrThrow" | "insertWithOnConflict" | "replace" | "replaceOrThrow" => {
             let t = first_string(vm, &args[1..]).unwrap_or_default();
             let pairs = content_values(vm, find_map_arg(vm, args));
             let verb = if name.starts_with("replace") {
@@ -695,11 +663,7 @@ fn sqlite_call(
                     .map(|(k, _)| format!("\"{k}\""))
                     .collect::<Vec<_>>()
                     .join(", ");
-                let qs = pairs
-                    .iter()
-                    .map(|_| "?")
-                    .collect::<Vec<_>>()
-                    .join(", ");
+                let qs = pairs.iter().map(|_| "?").collect::<Vec<_>>().join(", ");
                 (
                     format!("{verb} INTO \"{t}\" ({cols}) VALUES ({qs})"),
                     pairs.iter().map(|(_, v)| v_to_sql(vm, *v)).collect(),
@@ -730,8 +694,7 @@ fn sqlite_call(
             if !where_.is_empty() {
                 sql.push_str(&format!(" WHERE {where_}"));
             }
-            let mut params: Vec<SV> =
-                pairs.iter().map(|(_, v)| v_to_sql(vm, *v)).collect();
+            let mut params: Vec<SV> = pairs.iter().map(|(_, v)| v_to_sql(vm, *v)).collect();
             params.extend(binds_of(vm, find_array_arg(vm, args)));
             let db = conn_of(vm, this)?;
             let n = db
@@ -756,7 +719,10 @@ fn sqlite_call(
             let n = db
                 .borrow()
                 .conn
-                .execute(&sql, params_from_iter(binds_of(vm, find_array_arg(vm, args))))
+                .execute(
+                    &sql,
+                    params_from_iter(binds_of(vm, find_array_arg(vm, args))),
+                )
                 .map_err(|e| sql_err(vm, e))?;
             Some(Some(V::I32(n as i32)))
         }
@@ -786,24 +752,27 @@ fn sqlite_call(
         }
         "getPath" => {
             let n = db_name_of(vm, this).unwrap_or_default();
-            Some(Some(jstr(
-                vm,
-                &format!("/data/local/ovelo/databases/{n}"),
-            )))
+            Some(Some(jstr(vm, &format!("/data/local/ovelo/databases/{n}"))))
         }
         "getMaximumSize" | "getPageSize" => Some(Some(V::I64(0))),
-        "isReadOnly" | "isDbLockedByCurrentThread"
-        | "isDbLockedByOtherThreads" | "isWriteAheadLoggingEnabled" => {
-            Some(Some(V::I32(0)))
-        }
-        "isDatabaseIntegrityOk" | "yieldIfContendedSafely" => {
-            Some(Some(V::I32(1)))
-        }
-        "setForeignKeyConstraintsEnabled" | "enableWriteAheadLogging"
-        | "disableWriteAheadLogging" | "setMaximumSize" | "setPageSize"
-        | "setIdleConnectionTimeout" | "setLocale" | "setLockingEnabled"
-        | "acquireReference" | "releaseReference" | "releaseMemory"
-        | "setWriteAheadLoggingEnabled" | "markTableSyncable" => Some(None),
+        "isReadOnly"
+        | "isDbLockedByCurrentThread"
+        | "isDbLockedByOtherThreads"
+        | "isWriteAheadLoggingEnabled" => Some(Some(V::I32(0))),
+        "isDatabaseIntegrityOk" | "yieldIfContendedSafely" => Some(Some(V::I32(1))),
+        "setForeignKeyConstraintsEnabled"
+        | "enableWriteAheadLogging"
+        | "disableWriteAheadLogging"
+        | "setMaximumSize"
+        | "setPageSize"
+        | "setIdleConnectionTimeout"
+        | "setLocale"
+        | "setLockingEnabled"
+        | "acquireReference"
+        | "releaseReference"
+        | "releaseMemory"
+        | "setWriteAheadLoggingEnabled"
+        | "markTableSyncable" => Some(None),
         "getAttachedDbs" | "getSyncedTables" => Some(Some(V::Ref(0))),
         "needUpgrade" => Some(Some(V::I32(0))),
         "findEditTable" => Some(Some(
@@ -832,8 +801,7 @@ fn stmt_call(vm: &mut Vm, name: &str, args: &[V]) -> Rt<Option<Option<V>>> {
             if name == "clearBindings" {
                 l.clear();
             } else {
-                let idx =
-                    i32v(*args.get(1).unwrap_or(&V::I32(0))) as usize;
+                let idx = i32v(*args.get(1).unwrap_or(&V::I32(0))) as usize;
                 let val = args.get(2).copied().unwrap_or(V::Ref(0));
                 if idx >= 1 {
                     while l.len() < idx {
@@ -894,9 +862,7 @@ fn stmt_call(vm: &mut Vm, name: &str, args: &[V]) -> Rt<Option<Option<V>>> {
             let d = db.borrow();
             let s: String = d
                 .conn
-                .query_row(&sql, params_from_iter(params), |r| {
-                    r.get::<_, String>(0)
-                })
+                .query_row(&sql, params_from_iter(params), |r| r.get::<_, String>(0))
                 .map_err(|e| sql_err(vm, e))?;
             Some(Some(jstr(vm, &s)))
         }
@@ -923,9 +889,7 @@ fn cur_rows(vm: &Vm, h: u32) -> Vec<V> {
 fn cur_cols(vm: &Vm, h: u32) -> Vec<String> {
     match pseudo_get(vm, h, P_CUR_COLS) {
         Some(V::Ref(ch)) => match vm.heap.get(ch) {
-            Some(Obj::Array { data, .. }) => {
-                data.iter().filter_map(|v| sv(vm, *v)).collect()
-            }
+            Some(Obj::Array { data, .. }) => data.iter().filter_map(|v| sv(vm, *v)).collect(),
             _ => Vec::new(),
         },
         _ => Vec::new(),
@@ -956,11 +920,7 @@ fn cur_cell(vm: &Vm, h: u32, col: i32) -> V {
 
 /// `android.database.Cursor` — every accessor reads the pseudo fields
 /// populated by `run_query`.
-fn cursor_call(
-    vm: &mut Vm,
-    name: &str,
-    args: &[V],
-) -> Rt<Option<Option<V>>> {
+fn cursor_call(vm: &mut Vm, name: &str, args: &[V]) -> Rt<Option<Option<V>>> {
     let V::Ref(h) = args.first().copied().unwrap_or(V::Ref(0)) else {
         return Ok(None);
     };
@@ -1014,28 +974,21 @@ fn cursor_call(
             set_pos(vm, h, if ok { p } else { cur_pos(vm, h) });
             Some(Some(V::I32(ok as i32)))
         }
-        "isFirst" => {
-            Some(Some(V::I32((cur_pos(vm, h) == 0 && n_rows > 0) as i32)))
-        }
+        "isFirst" => Some(Some(V::I32((cur_pos(vm, h) == 0 && n_rows > 0) as i32))),
         "isLast" => Some(Some(V::I32(
             (cur_pos(vm, h) == n_rows - 1 && n_rows > 0) as i32,
         ))),
-        "isBeforeFirst" => {
-            Some(Some(V::I32((cur_pos(vm, h) < 0 && n_rows > 0) as i32)))
-        }
-        "isAfterLast" => {
-            Some(Some(V::I32((cur_pos(vm, h) >= n_rows && n_rows > 0) as i32)))
-        }
+        "isBeforeFirst" => Some(Some(V::I32((cur_pos(vm, h) < 0 && n_rows > 0) as i32))),
+        "isAfterLast" => Some(Some(V::I32(
+            (cur_pos(vm, h) >= n_rows && n_rows > 0) as i32,
+        ))),
         "getColumnIndex" | "getColumnIndexOrThrow" => {
-            let want =
-                sv(vm, *args.get(1).unwrap_or(&V::Ref(0))).unwrap_or_default();
+            let want = sv(vm, *args.get(1).unwrap_or(&V::Ref(0))).unwrap_or_default();
             let cols = cur_cols(vm, h);
             let idx = cols
                 .iter()
                 .position(|c| c == &want)
-                .or_else(|| {
-                    cols.iter().position(|c| c.eq_ignore_ascii_case(&want))
-                })
+                .or_else(|| cols.iter().position(|c| c.eq_ignore_ascii_case(&want)))
                 .map(|i| i as i32)
                 .unwrap_or(-1);
             if idx < 0 && name == "getColumnIndexOrThrow" {
@@ -1054,8 +1007,7 @@ fn cursor_call(
             Some(Some(jstr(vm, &nm)))
         }
         "getColumnNames" => {
-            let vs: Vec<V> =
-                cur_cols(vm, h).iter().map(|c| jstr(vm, c)).collect();
+            let vs: Vec<V> = cur_cols(vm, h).iter().map(|c| jstr(vm, c)).collect();
             Some(Some(arr(vm, STRING, vs)))
         }
         "getColumnCount" => Some(Some(V::I32(cur_cols(vm, h).len() as i32))),
@@ -1069,17 +1021,13 @@ fn cursor_call(
                 V::F64(f) => jstr(vm, &f.to_string()),
             }))
         }
-        "getInt" | "getShort" => {
-            Some(Some(V::I32(i64v(cur_cell(vm, h, col_arg)) as i32)))
-        }
+        "getInt" | "getShort" => Some(Some(V::I32(i64v(cur_cell(vm, h, col_arg)) as i32))),
         "getLong" => Some(Some(V::I64(i64v(cur_cell(vm, h, col_arg))))),
-        "getFloat" => {
-            Some(Some(V::F32(f64v(cur_cell(vm, h, col_arg)) as f32)))
-        }
+        "getFloat" => Some(Some(V::F32(f64v(cur_cell(vm, h, col_arg)) as f32))),
         "getDouble" => Some(Some(V::F64(f64v(cur_cell(vm, h, col_arg))))),
         "getBlob" => Some(Some(cur_cell(vm, h, col_arg))),
         "isNull" => Some(Some(V::I32(
-            matches!(cur_cell(vm, h, col_arg), V::Ref(0)) as i32,
+            matches!(cur_cell(vm, h, col_arg), V::Ref(0)) as i32
         ))),
         "getType" => Some(Some(V::I32(match cur_cell(vm, h, col_arg) {
             V::Ref(0) => 0,
@@ -1088,15 +1036,18 @@ fn cursor_call(
             V::Ref(rh) if s(vm, rh).is_some() => 3,
             _ => 4,
         }))),
-        "getExtras" | "getNotificationUri" | "respond" => {
-            Some(Some(V::Ref(0)))
-        }
+        "getExtras" | "getNotificationUri" | "respond" => Some(Some(V::Ref(0))),
         "requery" => Some(Some(V::I32(0))),
         "getWantsAllOnMoveCalls" => Some(Some(V::I32(0))),
-        "copyStringToBuffer" | "close" | "deactivate"
-        | "registerContentObserver" | "unregisterContentObserver"
-        | "registerDataSetObserver" | "unregisterDataSetObserver"
-        | "setNotificationUri" | "setExtras" => Some(None),
+        "copyStringToBuffer"
+        | "close"
+        | "deactivate"
+        | "registerContentObserver"
+        | "unregisterContentObserver"
+        | "registerDataSetObserver"
+        | "unregisterDataSetObserver"
+        | "setNotificationUri"
+        | "setExtras" => Some(None),
         _ => None,
     })
 }

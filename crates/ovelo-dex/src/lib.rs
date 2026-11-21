@@ -12,8 +12,8 @@ pub mod testdex;
 
 pub use insn::{decode_all, Format, Insn};
 
-use read::{err, mutf8, R};
 use ovelo_error::Result;
+use read::{err, mutf8, R};
 use std::collections::HashSet;
 
 const HEADER_SIZE: usize = 0x70;
@@ -321,7 +321,9 @@ impl DexFile {
 
     /// Field id item.
     pub fn field(&self, idx: u32) -> Result<&FieldId> {
-        self.fields.get(idx as usize).ok_or_else(|| err("dex.field.idx"))
+        self.fields
+            .get(idx as usize)
+            .ok_or_else(|| err("dex.field.idx"))
     }
 
     /// Number of entries in the `field_ids` table — the valid range for
@@ -344,7 +346,9 @@ impl DexFile {
 
     /// Method id item.
     pub fn method(&self, idx: u32) -> Result<&MethodId> {
-        self.methods.get(idx as usize).ok_or_else(|| err("dex.method.idx"))
+        self.methods
+            .get(idx as usize)
+            .ok_or_else(|| err("dex.method.idx"))
     }
 
     /// Number of entries in the `method_ids` table (defined + external
@@ -361,7 +365,9 @@ impl DexFile {
 
     /// Proto id item.
     pub fn proto(&self, idx: u32) -> Result<&ProtoId> {
-        self.protos.get(idx as usize).ok_or_else(|| err("dex.proto.idx"))
+        self.protos
+            .get(idx as usize)
+            .ok_or_else(|| err("dex.proto.idx"))
     }
 
     /// Class definitions in file order.
@@ -423,7 +429,11 @@ impl DexFile {
             return Ok(None);
         }
         let data = self.class_data(def)?;
-        let Some(pos) = data.static_fields.iter().position(|f| f.field_idx == field_idx) else {
+        let Some(pos) = data
+            .static_fields
+            .iter()
+            .position(|f| f.field_idx == field_idx)
+        else {
             return Ok(None);
         };
         let mut r = R::at(&self.bytes, def.static_values_off as usize);
@@ -473,7 +483,11 @@ impl DexFile {
         }
         // encoded_catch_handler_list follows the try array.
         let list_start = r.p - code_off as usize;
-        let n_handlers = if tries_size > 0 { r.uleb128()? as usize } else { 0 };
+        let n_handlers = if tries_size > 0 {
+            r.uleb128()? as usize
+        } else {
+            0
+        };
         // Cap speculative allocation: each handler needs at least a few bytes.
         if n_handlers > r.end - r.p {
             return Err(err("dex.handler.bounds"));
@@ -491,11 +505,7 @@ impl DexFile {
             for _ in 0..pairs {
                 pairs_vec.push((r.uleb128()?, r.uleb128()?));
             }
-            let catch_all_addr = if count <= 0 {
-                Some(r.uleb128()?)
-            } else {
-                None
-            };
+            let catch_all_addr = if count <= 0 { Some(r.uleb128()?) } else { None };
             handlers.push(CatchHandler {
                 handlers: pairs_vec,
                 catch_all_addr,
@@ -622,10 +632,22 @@ impl DexFile {
 
             let cd = self.class_data(def)?;
             // No duplicate field/method definitions within the class.
-            dedup(cd.static_fields.iter().map(|f| f.field_idx), "dex.class.dup.field")?;
-            dedup(cd.instance_fields.iter().map(|f| f.field_idx), "dex.class.dup.field")?;
-            dedup(cd.direct_methods.iter().map(|m| m.method_idx), "dex.class.dup.method")?;
-            dedup(cd.virtual_methods.iter().map(|m| m.method_idx), "dex.class.dup.method")?;
+            dedup(
+                cd.static_fields.iter().map(|f| f.field_idx),
+                "dex.class.dup.field",
+            )?;
+            dedup(
+                cd.instance_fields.iter().map(|f| f.field_idx),
+                "dex.class.dup.field",
+            )?;
+            dedup(
+                cd.direct_methods.iter().map(|m| m.method_idx),
+                "dex.class.dup.method",
+            )?;
+            dedup(
+                cd.virtual_methods.iter().map(|m| m.method_idx),
+                "dex.class.dup.method",
+            )?;
 
             for f in cd.static_fields.iter().chain(cd.instance_fields.iter()) {
                 if f.field_idx >= n_fields {
@@ -708,10 +730,7 @@ impl DexFile {
             let end = t.start_addr + t.insn_count as u32;
             // The try range is [start, end): only start must be an instruction
             // boundary; end is exclusive and may fall mid-instruction.
-            if t.insn_count == 0
-                || !exec_starts.contains(&t.start_addr)
-                || end > insns_len
-            {
+            if t.insn_count == 0 || !exec_starts.contains(&t.start_addr) || end > insns_len {
                 return Err(err("dex.try.bounds"));
             }
         }
@@ -755,20 +774,27 @@ impl DexFile {
                 }
             }
             "const-method-handle" => {} // method_handle_items not modelled yet
-            "sget" | "sget-wide" | "sget-object" | "sget-boolean" | "sget-byte"
-            | "sget-char" | "sget-short" | "sput" | "sput-wide" | "sput-object"
-            | "sput-boolean" | "sput-byte" | "sput-char" | "sput-short" | "iget"
-            | "iget-wide" | "iget-object" | "iget-boolean" | "iget-byte" | "iget-char"
-            | "iget-short" | "iput" | "iput-wide" | "iput-object" | "iput-boolean"
-            | "iput-byte" | "iput-char" | "iput-short" => {
+            "sget" | "sget-wide" | "sget-object" | "sget-boolean" | "sget-byte" | "sget-char"
+            | "sget-short" | "sput" | "sput-wide" | "sput-object" | "sput-boolean"
+            | "sput-byte" | "sput-char" | "sput-short" | "iget" | "iget-wide" | "iget-object"
+            | "iget-boolean" | "iget-byte" | "iget-char" | "iget-short" | "iput" | "iput-wide"
+            | "iput-object" | "iput-boolean" | "iput-byte" | "iput-char" | "iput-short" => {
                 if idx >= n_fields {
                     return Err(bad("field"));
                 }
             }
-            "invoke-virtual" | "invoke-super" | "invoke-direct" | "invoke-static"
-            | "invoke-interface" | "invoke-virtual/range" | "invoke-super/range"
-            | "invoke-direct/range" | "invoke-static/range" | "invoke-interface/range"
-            | "invoke-polymorphic" | "invoke-polymorphic/range" => {
+            "invoke-virtual"
+            | "invoke-super"
+            | "invoke-direct"
+            | "invoke-static"
+            | "invoke-interface"
+            | "invoke-virtual/range"
+            | "invoke-super/range"
+            | "invoke-direct/range"
+            | "invoke-static/range"
+            | "invoke-interface/range"
+            | "invoke-polymorphic"
+            | "invoke-polymorphic/range" => {
                 if idx >= n_methods {
                     return Err(bad("method"));
                 }
@@ -803,7 +829,10 @@ fn verify_switch_cases(
         .iter()
         .find(|p| p.offset == payload_off)
         .ok_or_else(|| err("dex.code.switch_payload"))?;
-    let size = *payload.raw.get(1).ok_or_else(|| err("dex.payload.bounds"))? as usize;
+    let size = *payload
+        .raw
+        .get(1)
+        .ok_or_else(|| err("dex.payload.bounds"))? as usize;
     // targets live after ident+size(+first_key for packed) [+keys for sparse].
     let first_target_unit = if sparse { 2 + size * 2 } else { 4 };
     for i in 0..size {
@@ -921,9 +950,7 @@ fn read_encoded_value_at(r: &mut R, depth: usize) -> Result<EncodedValue> {
         0x10 => EncodedValue::Float(f32::from_bits(
             (read_sized_uint(r, n)? << ((4 - n) * 8)) as u32,
         )),
-        0x11 => EncodedValue::Double(f64::from_bits(
-            read_sized_uint(r, n)? << ((8 - n) * 8),
-        )),
+        0x11 => EncodedValue::Double(f64::from_bits(read_sized_uint(r, n)? << ((8 - n) * 8))),
         0x15 => EncodedValue::MethodType(read_sized_uint(r, n)? as u32),
         0x16 => EncodedValue::MethodHandle(read_sized_uint(r, n)? as u32),
         0x17 => EncodedValue::String(read_sized_uint(r, n)? as u32),
@@ -1020,7 +1047,13 @@ fn read_u32_table(b: &[u8], off: u32, count: usize) -> Result<Vec<u32>> {
     read_table(b, off, count, 4, |r| r.u32())
 }
 
-fn read_table<T>(b: &[u8], off: u32, count: usize, item: usize, f: impl Fn(&mut R) -> Result<T>) -> Result<Vec<T>> {
+fn read_table<T>(
+    b: &[u8],
+    off: u32,
+    count: usize,
+    item: usize,
+    f: impl Fn(&mut R) -> Result<T>,
+) -> Result<Vec<T>> {
     let off = off as usize;
     let need = off
         .checked_add(
@@ -1165,7 +1198,7 @@ mod tests {
         b.uleb(0); // access
         let code_off_slot = b.pos();
         b.uleb(0); // patched below (code_off < 128 fits one uleb? must patch manually)
-        // Rewrite as 2-byte uleb to allow patch of larger offsets:
+                   // Rewrite as 2-byte uleb to allow patch of larger offsets:
         b.b[code_off_slot] = 0x80;
         b.u8(0); // continuation byte -> value patched later
 
@@ -1179,14 +1212,16 @@ mod tests {
         b.u16(1); // outs
         b.u16(1); // tries
         b.u32(0); // debug off
-        // insns:
-        // 0: const/4 v0,0            -> 0x0012
-        // 1: new-instance v1, type0  -> 0x0122, 0x0000  (try starts)
-        // 3: goto +4                 -> 0x0428 -> target 7
-        // 4: if-eqz v0, -4           -> 0x0038, -4 -> target 0
-        // 5: move-exception v2       -> 0x020d  (handler)
-        // 6: return-void             -> 0x000e
-        let insns: [u16; 8] = [0x0012, 0x0122, 0x0000, 0x0428, 0x0038, 0xfffc, 0x020d, 0x000e];
+                  // insns:
+                  // 0: const/4 v0,0            -> 0x0012
+                  // 1: new-instance v1, type0  -> 0x0122, 0x0000  (try starts)
+                  // 3: goto +4                 -> 0x0428 -> target 7
+                  // 4: if-eqz v0, -4           -> 0x0038, -4 -> target 0
+                  // 5: move-exception v2       -> 0x020d  (handler)
+                  // 6: return-void             -> 0x000e
+        let insns: [u16; 8] = [
+            0x0012, 0x0122, 0x0000, 0x0428, 0x0038, 0xfffc, 0x020d, 0x000e,
+        ];
         b.u32(8); // insns_size
         for w in insns {
             b.u16(w);
@@ -1202,12 +1237,12 @@ mod tests {
         b.uleb(1); // sleb128 count = 1 (positive, no catch-all)
         b.uleb(0); // type_idx 0 (LTest;)
         b.uleb(6); // addr = 6 (move-exception unit offset... wait addr must be code-unit offset of handler)
-        // fix: handler addr = 6 where move-exception sits at unit 6
+                   // fix: handler addr = 6 where move-exception sits at unit 6
         b.align4();
         let map_off = b.pos();
         b.u32(9); // map size
         let map_entries = [
-            (0x0000u16, 1u32, 0u32),                  // header
+            (0x0000u16, 1u32, 0u32), // header
             (0x0001, strings.len() as u32, string_ids_off as u32),
             (0x0002, 2, type_ids_off as u32),
             (0x0003, 1, proto_ids_off as u32),
@@ -1276,12 +1311,23 @@ mod tests {
         assert_eq!(defs.len(), 1);
         let cd = dex.class_data(&defs[0]).unwrap();
         assert_eq!(cd.virtual_methods.len(), 1);
-        let code = dex.code_item(cd.virtual_methods[0].code_off).unwrap().unwrap();
+        let code = dex
+            .code_item(cd.virtual_methods[0].code_off)
+            .unwrap()
+            .unwrap();
         assert_eq!(code.insns.len(), 8);
         let insns = decode_all(&code.insns).unwrap();
-        assert_eq!(insns.iter().map(|i| i.name).collect::<Vec<_>>(), vec![
-            "const/4", "new-instance", "goto", "if-eqz", "move-exception", "return-void"
-        ]);
+        assert_eq!(
+            insns.iter().map(|i| i.name).collect::<Vec<_>>(),
+            vec![
+                "const/4",
+                "new-instance",
+                "goto",
+                "if-eqz",
+                "move-exception",
+                "return-void"
+            ]
+        );
         assert_eq!(code.tries.len(), 1);
         assert_eq!(code.handlers[code.tries[0].handler_idx].handlers[0].1, 6);
     }

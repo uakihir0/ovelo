@@ -98,6 +98,7 @@ const P_LP: u32 = 0xFFFD_FFF9;
 // Without them, dex layout code (e.g. RecyclerView's
 // `OrientationHelper` totals) sees every view as 0×0 and lays out
 // nothing.
+const P_LAYOUT_REQ: u32 = 0xFFFD_FFEA;
 const P_LEFT: u32 = 0xFFFD_FFE9;
 const P_TOP: u32 = 0xFFFD_FFE8;
 const P_RIGHT: u32 = 0xFFFD_FFE7;
@@ -112,8 +113,7 @@ fn vto_of(vm: &mut Vm, view: u32) -> V {
     if let Some(v) = pseudo_get(vm, view, P_VTO) {
         return v;
     }
-    let V::Ref(o) = host(vm, "Landroid/view/ViewTreeObserver;", HostState::Empty)
-    else {
+    let V::Ref(o) = host(vm, "Landroid/view/ViewTreeObserver;", HostState::Empty) else {
         return V::Ref(0);
     };
     pseudo_set(vm, o, P_TARGET, V::Ref(view));
@@ -285,7 +285,11 @@ fn spec_size(v: Option<V>) -> i32 {
     match v {
         Some(V::I32(s)) => {
             let mode = s >> 30;
-            if mode == 0 { 0 } else { s & 0x3FFF_FFFF }
+            if mode == 0 {
+                0
+            } else {
+                s & 0x3FFF_FFFF
+            }
         }
         _ => 0,
     }
@@ -367,8 +371,12 @@ pub(crate) fn dex_view_info(vm: &Vm, h: u32) -> Option<DexViewInfo> {
     });
     let text_color = attr_find(vm, h, "textColor").and_then(|v| color_v(vm, v));
     let bg_color = attr_find(vm, h, "background").and_then(|v| color_v(vm, v));
-    let lp_w = attr_find(vm, h, "layout_width").map(|v| len_v(vm, v)).unwrap_or(-1);
-    let lp_h = attr_find(vm, h, "layout_height").map(|v| len_v(vm, v)).unwrap_or(-2);
+    let lp_w = attr_find(vm, h, "layout_width")
+        .map(|v| len_v(vm, v))
+        .unwrap_or(-1);
+    let lp_h = attr_find(vm, h, "layout_height")
+        .map(|v| len_v(vm, v))
+        .unwrap_or(-2);
     let visible = !matches!(pseudo_get(vm, h, P_VIS), Some(V::I32(4) | V::I32(8)));
     let listener = match pseudo_get(vm, h, P_LISTENER) {
         Some(V::Ref(l)) => l,
@@ -388,9 +396,7 @@ pub(crate) fn dex_view_info(vm: &Vm, h: u32) -> Option<DexViewInfo> {
         pseudo_get(vm, h, P_RIGHT),
         pseudo_get(vm, h, P_BOTTOM),
     ) {
-        (Some(V::I32(l)), Some(V::I32(t)), Some(V::I32(r)), Some(V::I32(b))) => {
-            Some((l, t, r, b))
-        }
+        (Some(V::I32(l)), Some(V::I32(t)), Some(V::I32(r)), Some(V::I32(b))) => Some((l, t, r, b)),
         _ => None,
     };
     Some(DexViewInfo {
@@ -478,9 +484,11 @@ pub(crate) fn call(
         }
         "cloneInContext" => Some(Some(inflater(vm, args.get(1).copied()))),
         // ---------- menu ----------
-        "getMenuInflater" | "getSupportMenuInflater" => {
-            Some(Some(host(vm, "Landroid/view/MenuInflater;", HostState::Empty)))
-        }
+        "getMenuInflater" | "getSupportMenuInflater" => Some(Some(host(
+            vm,
+            "Landroid/view/MenuInflater;",
+            HostState::Empty,
+        ))),
         // Static View/ViewGroup.getChildMeasureSpec(parentSpec,
         // padding, childDimension) — AOSP packing rules.
         "getChildMeasureSpec" => {
@@ -554,9 +562,7 @@ pub(crate) fn call(
             }
             Some(Some(it))
         }
-        "size" if is_menuish(vm, this) => {
-            Some(Some(V::I32(menu_items(vm, this).len() as i32)))
-        }
+        "size" if is_menuish(vm, this) => Some(Some(V::I32(menu_items(vm, this).len() as i32))),
         "getItem" if is_menuish(vm, this) => {
             if args.len() > 1 {
                 let i = i64v(args[1]) as usize;
@@ -580,10 +586,7 @@ pub(crate) fn call(
                     if let Some(pos) = items.iter().position(|(k, _)| *k == id) {
                         items.remove(pos);
                     }
-                    items
-                        .into_iter()
-                        .map(|(k, v)| (V::I32(k), v))
-                        .collect()
+                    items.into_iter().map(|(k, v)| (V::I32(k), v)).collect()
                 }
                 _ => {
                     // removeGroup: drop items whose stored group id matches.
@@ -606,11 +609,23 @@ pub(crate) fn call(
             }
             Some(None)
         }
-        "setVisible" | "setEnabled" | "setChecked" | "setCheckable"
-        | "setTitle" | "setTitleCondensed" | "setIcon" | "setShowAsAction"
-        | "setShowAsActionFlags" | "setActionView" | "setIntent"
-        | "setAlphabeticShortcut" | "setNumericShortcut" | "setTooltipText"
-        | "setContentDescription" | "setGroupVisible" if is_menuitem(vm, this) =>
+        "setVisible"
+        | "setEnabled"
+        | "setChecked"
+        | "setCheckable"
+        | "setTitle"
+        | "setTitleCondensed"
+        | "setIcon"
+        | "setShowAsAction"
+        | "setShowAsActionFlags"
+        | "setActionView"
+        | "setIntent"
+        | "setAlphabeticShortcut"
+        | "setNumericShortcut"
+        | "setTooltipText"
+        | "setContentDescription"
+        | "setGroupVisible"
+            if is_menuitem(vm, this) =>
         {
             let key = match name {
                 "setVisible" => P_MENU_VIS,
@@ -626,21 +641,22 @@ pub(crate) fn call(
             // AOSP item mutators return the item for chaining.
             Some(Some(V::Ref(this)))
         }
-        "setOnMenuItemClickListener" | "setOnActionExpandListener"
-            if is_menuitem(vm, this) =>
-        {
-            pseudo_set(vm, this, P_LISTENER, args.get(1).copied().unwrap_or(V::Ref(0)));
+        "setOnMenuItemClickListener" | "setOnActionExpandListener" if is_menuitem(vm, this) => {
+            pseudo_set(
+                vm,
+                this,
+                P_LISTENER,
+                args.get(1).copied().unwrap_or(V::Ref(0)),
+            );
             Some(Some(V::Ref(this)))
         }
         "getItemId" if is_menuitem(vm, this) => {
             Some(Some(pseudo_get(vm, this, P_MENU_ID).unwrap_or(V::I32(0))))
         }
-        "getGroupId" if is_menuitem(vm, this) => {
-            Some(Some(pseudo_get(vm, this, P_MENU_GROUP).unwrap_or(V::I32(0))))
-        }
-        "isVisible" | "isEnabled" | "isChecked" | "isCheckable"
-            if is_menuitem(vm, this) =>
-        {
+        "getGroupId" if is_menuitem(vm, this) => Some(Some(
+            pseudo_get(vm, this, P_MENU_GROUP).unwrap_or(V::I32(0)),
+        )),
+        "isVisible" | "isEnabled" | "isChecked" | "isCheckable" if is_menuitem(vm, this) => {
             let (key, default) = match name {
                 "isEnabled" => (P_MENU_EN, 1),
                 "isCheckable" => (P_MENU_CKABLE, 1),
@@ -744,7 +760,12 @@ pub(crate) fn call(
         }
         "getId" => Some(Some(V::I32(view_id(vm, this)))),
         "setId" => {
-            pseudo_set(vm, this, P_VIEW_ID, args.get(1).copied().unwrap_or(V::I32(0)));
+            pseudo_set(
+                vm,
+                this,
+                P_VIEW_ID,
+                args.get(1).copied().unwrap_or(V::I32(0)),
+            );
             Some(None)
         }
         "getChildCount" => {
@@ -788,8 +809,12 @@ pub(crate) fn call(
             }
             Some(None)
         }
-        "addView" | "addViewInLayout" | "attachViewToParent" | "attachViewToParentInLayout"
-        | "addFocusables" | "addChildrenForAccessibility" => {
+        "addView"
+        | "addViewInLayout"
+        | "attachViewToParent"
+        | "attachViewToParentInLayout"
+        | "addFocusables"
+        | "addChildrenForAccessibility" => {
             if let Some(&child @ V::Ref(_)) = args.get(1) {
                 // Positional overloads (addView(v,i), attachViewToParent
                 // (v,i,lp), addViewInLayout(v,i,lp)) carry a child index;
@@ -879,11 +904,9 @@ pub(crate) fn call(
                         _ => 0,
                     };
                     for i in 0..n {
-                        if let Err(e) = vm.call_virtual(
-                            ad,
-                            "instantiateItem",
-                            &[V::Ref(this), V::I32(i)],
-                        ) {
+                        if let Err(e) =
+                            vm.call_virtual(ad, "instantiateItem", &[V::Ref(this), V::I32(i)])
+                        {
                             if std::env::var_os("OVELO_VIEWDBG").is_some() {
                                 eprintln!("[viewdbg] instantiateItem {i} err {e:?}");
                             }
@@ -918,20 +941,27 @@ pub(crate) fn call(
         }
         // Other observer listener kinds are accepted but never fired
         // (preDraw returning false would suppress drawing).
-        "addOnPreDrawListener" | "addOnDrawListener"
-        | "addOnScrollChangedListener" | "addOnTouchModeChangeListener"
-        | "addOnWindowAttachListener" | "addOnWindowFocusChangeListener"
-        | "removeOnPreDrawListener" | "removeOnDrawListener"
-        | "removeOnScrollChangedListener" | "removeOnTouchModeChangeListener"
-        | "removeOnWindowAttachListener" | "removeOnWindowFocusChangeListener"
-        | "addOnWindowShownListener" | "removeOnWindowShownListener"
-        | "dispatchOnGlobalLayout" | "dispatchOnPreDraw" | "isAlive" => {
-            Some(if name == "isAlive" || name == "dispatchOnPreDraw" {
-                Some(V::I32(1))
-            } else {
-                None
-            })
-        }
+        "addOnPreDrawListener"
+        | "addOnDrawListener"
+        | "addOnScrollChangedListener"
+        | "addOnTouchModeChangeListener"
+        | "addOnWindowAttachListener"
+        | "addOnWindowFocusChangeListener"
+        | "removeOnPreDrawListener"
+        | "removeOnDrawListener"
+        | "removeOnScrollChangedListener"
+        | "removeOnTouchModeChangeListener"
+        | "removeOnWindowAttachListener"
+        | "removeOnWindowFocusChangeListener"
+        | "addOnWindowShownListener"
+        | "removeOnWindowShownListener"
+        | "dispatchOnGlobalLayout"
+        | "dispatchOnPreDraw"
+        | "isAlive" => Some(if name == "isAlive" || name == "dispatchOnPreDraw" {
+            Some(V::I32(1))
+        } else {
+            None
+        }),
         "getParent" => Some(Some(pseudo_get(vm, this, P_PARENT).unwrap_or(V::Ref(0)))),
         "getRootView" => {
             let mut cur = this;
@@ -970,10 +1000,19 @@ pub(crate) fn call(
         "getText" | "getHint" | "getTitle" | "getContentDescription" => Some(Some(
             pseudo_get(vm, this, P_TEXT).unwrap_or_else(|| jstr(vm, "")),
         )),
-        "setOnClickListener" | "setOnLongClickListener" | "setOnTouchListener"
-        | "setOnFocusChangeListener" | "setOnKeyListener" | "setOnAttachStateChangeListener"
+        "setOnClickListener"
+        | "setOnLongClickListener"
+        | "setOnTouchListener"
+        | "setOnFocusChangeListener"
+        | "setOnKeyListener"
+        | "setOnAttachStateChangeListener"
         | "addOnAttachStateChangeListener" => {
-            pseudo_set(vm, this, P_LISTENER, args.get(1).copied().unwrap_or(V::Ref(0)));
+            pseudo_set(
+                vm,
+                this,
+                P_LISTENER,
+                args.get(1).copied().unwrap_or(V::Ref(0)),
+            );
             Some(match ret(sig) {
                 "V" => None,
                 _ => Some(V::I32(1)),
@@ -994,18 +1033,32 @@ pub(crate) fn call(
             pseudo_set(vm, this, P_VIS, args.get(1).copied().unwrap_or(V::I32(0)));
             Some(None)
         }
-        "getVisibility" => Some(Some(
-            pseudo_get(vm, this, P_VIS).unwrap_or(V::I32(0)),
-        )),
-        "isShown" | "isAttachedToWindow" | "hasWindowFocus" | "isEnabled"
-        | "isClickable" | "isFocusable" | "isFocusableInTouchMode" | "isFocusableOnScreen"
-        | "hasFocusable" | "isImportantForAccessibility" => Some(Some(V::I32(1))),
-        "isSelected" | "isActivated" | "isPressed" | "isFocused" | "hasFocus"
-        | "isDirty" | "isOpaque" | "isInEditMode" | "isHardwareAccelerated" => {
-            Some(Some(V::I32(0)))
-        }
+        "getVisibility" => Some(Some(pseudo_get(vm, this, P_VIS).unwrap_or(V::I32(0)))),
+        "isShown"
+        | "isAttachedToWindow"
+        | "hasWindowFocus"
+        | "isEnabled"
+        | "isClickable"
+        | "isFocusable"
+        | "isFocusableInTouchMode"
+        | "isFocusableOnScreen"
+        | "hasFocusable"
+        | "isImportantForAccessibility" => Some(Some(V::I32(1))),
+        "isSelected"
+        | "isActivated"
+        | "isPressed"
+        | "isFocused"
+        | "hasFocus"
+        | "isDirty"
+        | "isOpaque"
+        | "isInEditMode"
+        | "isHardwareAccelerated" => Some(Some(V::I32(0))),
         "getVisibility0" => Some(Some(V::I32(0))),
-        "getResources" => Some(Some(host(vm, "Landroid/content/res/Resources;", HostState::Empty))),
+        "getResources" => Some(Some(host(
+            vm,
+            "Landroid/content/res/Resources;",
+            HostState::Empty,
+        ))),
         "getHandler" => Some(Some(host(vm, "Landroid/os/Handler;", HostState::Empty))),
         "post" | "postDelayed" | "postOnAnimation" | "postOnAnimationDelayed" => {
             Some(Some(V::I32(1)))
@@ -1069,9 +1122,26 @@ pub(crate) fn call(
             Some(None)
         }
         "layout" => {
-            let (l, t, r, b) = (vint(args.get(1)), vint(args.get(2)), vint(args.get(3)), vint(args.get(4)));
+            let (l, t, r, b) = (
+                vint(args.get(1)),
+                vint(args.get(2)),
+                vint(args.get(3)),
+                vint(args.get(4)),
+            );
+            // AOSP clears PFLAG_LAYOUT_REQUESTED once the view is laid out.
+            pseudo_set(vm, this, P_LAYOUT_REQ, V::I32(0));
             let changed = frame_set(vm, this, l, t, r, b);
-            if let Err(e) = vm.call_virtual_rt(this, "onLayout", &[V::I32(changed as i32), V::I32(l), V::I32(t), V::I32(r), V::I32(b)]) {
+            if let Err(e) = vm.call_virtual_rt(
+                this,
+                "onLayout",
+                &[
+                    V::I32(changed as i32),
+                    V::I32(l),
+                    V::I32(t),
+                    V::I32(r),
+                    V::I32(b),
+                ],
+            ) {
                 if std::env::var_os("OVELO_VIEWDBG").is_some() {
                     eprintln!("[viewdbg] onLayout h{this} failed");
                 }
@@ -1080,7 +1150,12 @@ pub(crate) fn call(
             Some(None)
         }
         "setFrame" => {
-            let (l, t, r, b) = (vint(args.get(1)), vint(args.get(2)), vint(args.get(3)), vint(args.get(4)));
+            let (l, t, r, b) = (
+                vint(args.get(1)),
+                vint(args.get(2)),
+                vint(args.get(3)),
+                vint(args.get(4)),
+            );
             Some(Some(V::I32(frame_set(vm, this, l, t, r, b) as i32)))
         }
         "offsetLeftAndRight" => {
@@ -1115,51 +1190,137 @@ pub(crate) fn call(
         | "getPaddingStart" | "getPaddingEnd" | "getMinimumWidth" | "getMinimumHeight"
         | "getScrollX" | "getScrollY" => Some(Some(V::I32(0))),
         "getBaseline" => Some(Some(V::I32(-1))),
-        "isLayoutRequested" | "willNotDraw" => Some(Some(V::I32(0))),
-        "requestLayout" | "invalidate" | "postInvalidate"
-        | "requestFocus" | "clearFocus" | "forceLayout"
-        | "setAlpha" | "setBackgroundColor" | "setBackgroundResource" | "setPadding"
-        | "setMinimumHeight" | "setMinimumWidth" | "setElevation" | "setTranslationX"
-        | "setTranslationY" | "setTranslationZ" | "setScaleX" | "setScaleY" | "setX"
-        | "setY" | "setRotation" | "setScrollX" | "setScrollY" | "scrollTo" | "scrollBy"
-        | "setSelected" | "setActivated" | "setPressed" | "setEnabled" | "setClickable"
-        | "setLongClickable" | "setFocusable" | "setFocusableInTouchMode"
-        | "setWillNotDraw" | "setDescendantFocusability" | "setClipChildren"
-        | "setClipToPadding" | "setNestedScrollingEnabled" | "startNestedScroll"
-        | "stopNestedScroll" | "setSaveEnabled" | "setDuplicateParentStateEnabled"
-        | "setLayerType" | "setKeepScreenOn" | "setFitsSystemWindows"
-        | "setSystemUiVisibility" | "setForegroundGravity" | "setHorizontalGravity"
-        | "setVerticalGravity" | "setGravity" | "setOrientation" | "setWeightSum"
-        | "setClipBounds" | "setOutlineAmbientShadowColor" | "setOverScrollMode"
-        | "setPivotX" | "setPivotY" | "setTooltipText" | "setTransitionName"
-        | "setImportantForAccessibility" | "setAccessibilityLiveRegion"
-        | "setBackground" | "setImageResource" | "setImageDrawable" | "setImageBitmap"
-        | "setImageURI" | "setImageIcon" | "setTextColor" | "setTextSize" | "setTypeface"
-        | "setSingleLine" | "setMaxLines" | "setMinLines" | "setLines" | "setEllipsize"
-        | "setInputType" | "setImeOptions" | "setCompoundDrawables" | "setError"
-        | "setMovementMethod" | "setMarqueeRepeatLimit" | "setFilters" | "setEnabled_true"
-        | "setCheckMarkDrawable" | "setChecked" | "setOnCheckedChangeListener"
-        | "setProgress" | "setMax" | "setIndeterminate" | "setOnItemClickListener"
-        | "setMinWidth" | "setMinHeight" | "setMaxWidth" | "setMaxHeight"
-        | "setIndeterminateDrawableTiled" | "setSecondaryProgress" | "setMin"
-        | "setInterpolator" | "setIndeterminateTintList" | "setProgressTintList"
-        | "setProgressTintMode" | "setProgressBackgroundTintList"
-        | "setProgressBackgroundTintMode" | "setSecondaryProgressTintList"
-        | "setOnItemSelectedListener" | "setOnScrollListener" | "setOnRefreshListener"
-        | "setRefreshing" | "setLayoutManager" | "setClipToOutline" | "setOutlineProvider"
-        | "setAccessibilityDelegate" | "setAutofillHints" | "setScreenReaderFocusable"
-        | "dispatchKeyEvent" | "dispatchTouchEvent" | "dispatchGenericMotionEvent" => {
-            Some(match ret(sig) {
-                "V" => None,
-                "Z" => Some(V::I32(if name == "setRefreshing" { 0 } else { 1 })),
-                _ => Some(stub_ret(vm, sig)),
-            })
+        // requestLayout must be observable: ConstraintLayout re-arms
+        // mDirtyHierarchy only when a child reports isLayoutRequested,
+        // so a permanent 0 leaves adapter-driven re-layouts impossible.
+        "isLayoutRequested" => Some(Some(V::I32(pint(vm, this, P_LAYOUT_REQ)))),
+        "requestLayout" | "forceLayout" => {
+            pseudo_set(vm, this, P_LAYOUT_REQ, V::I32(1));
+            Some(None)
         }
+        "willNotDraw" => Some(Some(V::I32(0))),
+        "invalidate"
+        | "postInvalidate"
+        | "requestFocus"
+        | "clearFocus"
+        | "setAlpha"
+        | "setBackgroundColor"
+        | "setBackgroundResource"
+        | "setPadding"
+        | "setMinimumHeight"
+        | "setMinimumWidth"
+        | "setElevation"
+        | "setTranslationX"
+        | "setTranslationY"
+        | "setTranslationZ"
+        | "setScaleX"
+        | "setScaleY"
+        | "setX"
+        | "setY"
+        | "setRotation"
+        | "setScrollX"
+        | "setScrollY"
+        | "scrollTo"
+        | "scrollBy"
+        | "setSelected"
+        | "setActivated"
+        | "setPressed"
+        | "setEnabled"
+        | "setClickable"
+        | "setLongClickable"
+        | "setFocusable"
+        | "setFocusableInTouchMode"
+        | "setWillNotDraw"
+        | "setDescendantFocusability"
+        | "setClipChildren"
+        | "setClipToPadding"
+        | "setNestedScrollingEnabled"
+        | "startNestedScroll"
+        | "stopNestedScroll"
+        | "setSaveEnabled"
+        | "setDuplicateParentStateEnabled"
+        | "setLayerType"
+        | "setKeepScreenOn"
+        | "setFitsSystemWindows"
+        | "setSystemUiVisibility"
+        | "setForegroundGravity"
+        | "setHorizontalGravity"
+        | "setVerticalGravity"
+        | "setGravity"
+        | "setOrientation"
+        | "setWeightSum"
+        | "setClipBounds"
+        | "setOutlineAmbientShadowColor"
+        | "setOverScrollMode"
+        | "setPivotX"
+        | "setPivotY"
+        | "setTooltipText"
+        | "setTransitionName"
+        | "setImportantForAccessibility"
+        | "setAccessibilityLiveRegion"
+        | "setBackground"
+        | "setImageResource"
+        | "setImageDrawable"
+        | "setImageBitmap"
+        | "setImageURI"
+        | "setImageIcon"
+        | "setTextColor"
+        | "setTextSize"
+        | "setTypeface"
+        | "setSingleLine"
+        | "setMaxLines"
+        | "setMinLines"
+        | "setLines"
+        | "setEllipsize"
+        | "setInputType"
+        | "setImeOptions"
+        | "setCompoundDrawables"
+        | "setError"
+        | "setMovementMethod"
+        | "setMarqueeRepeatLimit"
+        | "setFilters"
+        | "setEnabled_true"
+        | "setCheckMarkDrawable"
+        | "setChecked"
+        | "setOnCheckedChangeListener"
+        | "setProgress"
+        | "setMax"
+        | "setIndeterminate"
+        | "setOnItemClickListener"
+        | "setMinWidth"
+        | "setMinHeight"
+        | "setMaxWidth"
+        | "setMaxHeight"
+        | "setIndeterminateDrawableTiled"
+        | "setSecondaryProgress"
+        | "setMin"
+        | "setInterpolator"
+        | "setIndeterminateTintList"
+        | "setProgressTintList"
+        | "setProgressTintMode"
+        | "setProgressBackgroundTintList"
+        | "setProgressBackgroundTintMode"
+        | "setSecondaryProgressTintList"
+        | "setOnItemSelectedListener"
+        | "setOnScrollListener"
+        | "setOnRefreshListener"
+        | "setRefreshing"
+        | "setLayoutManager"
+        | "setClipToOutline"
+        | "setOutlineProvider"
+        | "setAccessibilityDelegate"
+        | "setAutofillHints"
+        | "setScreenReaderFocusable"
+        | "dispatchKeyEvent"
+        | "dispatchTouchEvent"
+        | "dispatchGenericMotionEvent" => Some(match ret(sig) {
+            "V" => None,
+            "Z" => Some(V::I32(if name == "setRefreshing" { 0 } else { 1 })),
+            _ => Some(stub_ret(vm, sig)),
+        }),
 
         // ---------- Window ----------
-        "getDecorView" | "peekDecorView" => Some(Some(V::Ref(
-            decor_of(vm, this).unwrap_or(0),
-        ))),
+        "getDecorView" | "peekDecorView" => Some(Some(V::Ref(decor_of(vm, this).unwrap_or(0)))),
         "setContentView" if class == WINDOW => {
             // Window.setContentView(int|View): inflate if an id, then parent
             // the result under the decor view.
@@ -1174,9 +1335,7 @@ pub(crate) fn call(
                 // P_CONTENT — mirror it there (the window's owner was
                 // stored on P_TARGET by window_of).
                 if cv != 0 {
-                    if let V::Ref(owner) =
-                        pseudo_get(vm, this, P_TARGET).unwrap_or(V::Ref(0))
-                    {
+                    if let V::Ref(owner) = pseudo_get(vm, this, P_TARGET).unwrap_or(V::Ref(0)) {
                         if owner != 0 {
                             pseudo_set(vm, owner, P_CONTENT, V::Ref(cv));
                         }
@@ -1215,7 +1374,12 @@ pub(crate) fn call(
                 .unwrap_or(V::Ref(0)),
         )),
         "setCallback" => {
-            pseudo_set(vm, this, P_LISTENER, args.get(1).copied().unwrap_or(V::Ref(0)));
+            pseudo_set(
+                vm,
+                this,
+                P_LISTENER,
+                args.get(1).copied().unwrap_or(V::Ref(0)),
+            );
             Some(None)
         }
         "getAttributes" => Some(Some(host(
@@ -1223,19 +1387,36 @@ pub(crate) fn call(
             "Landroid/view/WindowManager$LayoutParams;",
             HostState::Empty,
         ))),
-        "setAttributes" | "setLayout" | "addFlags" | "clearFlags"
-        | "setFlags" | "setSoftInputMode" | "setFeatureInt" | "takeSurface"
-        | "setBackgroundDrawable" | "setBackgroundDrawableResource" | "setDimAmount"
-        | "setWindowAnimations" | "setType" | "setStatusBarColor" | "setNavigationBarColor"
-        | "setFormat" | "setWindowManager" | "setColorMode" | "addSystemFlags"
-        | "setBlurBehindRadius" | "setHideOverlayWindows" | "setDecorFitsSystemWindows" => {
-            Some(None)
-        }
+        "setAttributes"
+        | "setLayout"
+        | "addFlags"
+        | "clearFlags"
+        | "setFlags"
+        | "setSoftInputMode"
+        | "setFeatureInt"
+        | "takeSurface"
+        | "setBackgroundDrawable"
+        | "setBackgroundDrawableResource"
+        | "setDimAmount"
+        | "setWindowAnimations"
+        | "setType"
+        | "setStatusBarColor"
+        | "setNavigationBarColor"
+        | "setFormat"
+        | "setWindowManager"
+        | "setColorMode"
+        | "addSystemFlags"
+        | "setBlurBehindRadius"
+        | "setHideOverlayWindows"
+        | "setDecorFitsSystemWindows" => Some(None),
         "isFloating" | "isActive" | "hasFeature" => Some(Some(V::I32(0))),
-        "getWindowManager" | "getContainer" | "getCurrentFocus" | "getNavigationBarColor"
-        | "getStatusBarColor" | "getMediaController" | "getLayoutInflater" => {
-            Some(Some(stub_ret(vm, sig)))
-        }
+        "getWindowManager"
+        | "getContainer"
+        | "getCurrentFocus"
+        | "getNavigationBarColor"
+        | "getStatusBarColor"
+        | "getMediaController"
+        | "getLayoutInflater" => Some(Some(stub_ret(vm, sig))),
 
         _ => {
             // Any other method on an inflated view/inflater/window: answer
@@ -1289,9 +1470,7 @@ fn inflate_call(vm: &mut Vm, args: &[V]) -> V {
             // children directly under the supplied root so the binding
             // finds them on `findChildViewById(root, …)`.
             let kids = match inflated {
-                V::Ref(h)
-                    if matches!(pseudo_get(vm, h, P_MERGE), Some(V::I32(1))) =>
-                {
+                V::Ref(h) if matches!(pseudo_get(vm, h, P_MERGE), Some(V::I32(1))) => {
                     children(vm, h)
                 }
                 V::Ref(h) => vec![V::Ref(h)],
@@ -1344,10 +1523,7 @@ fn inflate_call(vm: &mut Vm, args: &[V]) -> V {
 /// res_id → inflated view tree (or a bare placeholder when the APK's
 /// resources aren't loaded or the id doesn't name a layout).
 pub(crate) fn inflate_res(vm: &mut Vm, res_id: u32, ctx: V) -> V {
-    let elems = vm
-        .apk_res
-        .as_ref()
-        .and_then(|r| r.layout_elements(res_id));
+    let elems = vm.apk_res.as_ref().and_then(|r| r.layout_elements(res_id));
     if std::env::var_os("OVELO_VIEWDBG").is_some() {
         eprintln!(
             "[viewdbg] inflate {res_id:#x}: {}",
@@ -1404,9 +1580,8 @@ fn make_view_named(vm: &mut Vm, tag: &str, attrs: V, ctx: V) -> V {
     // dex-defined ViewGroup subclass (MyRecyclerView → androidx
     // RecyclerView → ViewGroup) must resolve through the VM or it is
     // never marked as a group — and its onLayout never runs.
-    let group = is_group_tag(name)
-        || desc_is_a(&desc, VIEWGROUP)
-        || vm.assignable_desc(&desc, VIEWGROUP);
+    let group =
+        is_group_tag(name) || desc_is_a(&desc, VIEWGROUP) || vm.assignable_desc(&desc, VIEWGROUP);
     // Dex-defined view classes (custom views, bundled libs like
     // material's NavigationView) get a real instance whose constructor
     // runs — the standard overloads are (Context), (Context, AttributeSet)
@@ -1418,10 +1593,7 @@ fn make_view_named(vm: &mut Vm, tag: &str, attrs: V, ctx: V) -> V {
                 Some(Obj::Host {
                     state: HostState::Map(m),
                     ..
-                }) => m
-                    .iter()
-                    .filter_map(|(k, _)| sv(vm, *k))
-                    .collect(),
+                }) => m.iter().filter_map(|(k, _)| sv(vm, *k)).collect(),
                 _ => Vec::new(),
             },
             _ => Vec::new(),
@@ -1555,9 +1727,7 @@ pub(crate) fn ta_attrs(vm: &Vm, h: u32) -> Vec<i32> {
         return Vec::new();
     };
     match vm.heap.get(ah) {
-        Some(Obj::Array { data, .. }) => {
-            data.iter().map(|v| i64v(*v) as i32).collect()
-        }
+        Some(Obj::Array { data, .. }) => data.iter().map(|v| i64v(*v) as i32).collect(),
         _ => Vec::new(),
     }
 }
@@ -1662,10 +1832,7 @@ pub(crate) fn ta_lookup(vm: &mut Vm, h: u32, index: usize) -> Option<V> {
 /// theme (parents walked by `style_item`), chasing `?attr/`
 /// indirections, and return the raw entry so the caller keeps the
 /// exact TypedValue type (`TYPE_INT_BOOLEAN` etc.).
-pub(crate) fn theme_attr_entry(
-    vm: &mut Vm,
-    attr_id: u32,
-) -> Option<ovelo_apk::arsc::EntryValue> {
+pub(crate) fn theme_attr_entry(vm: &mut Vm, attr_id: u32) -> Option<ovelo_apk::arsc::EntryValue> {
     let res = vm.apk_res.as_ref()?;
     let mut ev = res.style_item(vm.theme_id, attr_id)?.clone();
     for _ in 0..8 {
@@ -1702,10 +1869,7 @@ fn try_construct_view(vm: &mut Vm, desc: &str, ctx: V, attrs: V) -> Option<u32> 
     // longer signatures (more real state wired up) preferred.
     ctors.sort_by_key(|(_, ps)| (fill_count(ps), usize::MAX - ps.len()));
     for (midx, params) in ctors {
-        let args: Vec<V> = params
-            .iter()
-            .map(|t| ctor_arg(vm, t, ctx, attrs))
-            .collect();
+        let args: Vec<V> = params.iter().map(|t| ctor_arg(vm, t, ctx, attrs)).collect();
         match vm.instantiate_ctor(desc, midx, &args) {
             Ok(h) => return Some(h),
             Err(e) => {
@@ -1743,9 +1907,7 @@ fn ctor_arg(vm: &mut Vm, t: &str, ctx: V, attrs: V) -> V {
         "J" => V::I64(0),
         "D" => V::F64(0.0),
         "I" | "F" | "Z" | "B" | "S" | "C" => V::I32(0),
-        _ if t.starts_with('L') || t.starts_with('[') => {
-            host(vm, t, HostState::Empty)
-        }
+        _ if t.starts_with('L') || t.starts_with('[') => host(vm, t, HostState::Empty),
         _ => V::I32(0),
     }
 }
@@ -1822,7 +1984,11 @@ fn layout_params(vm: &mut Vm, this: u32) -> V {
             }
         }
     }
-    let v = host(vm, "Landroid/view/ViewGroup$LayoutParams;", HostState::Empty);
+    let v = host(
+        vm,
+        "Landroid/view/ViewGroup$LayoutParams;",
+        HostState::Empty,
+    );
     if std::env::var_os("OVELO_VIEWDBG").is_some() {
         eprintln!(
             "[viewdbg] layout_params h{this} {} -> host placeholder",
@@ -1887,10 +2053,7 @@ fn expand_includes(vm: &Vm, elems: &[Element]) -> Vec<Element> {
                     continue;
                 }
             };
-            let sub = vm
-                .apk_res
-                .as_ref()
-                .and_then(|r| r.layout_elements(layout));
+            let sub = vm.apk_res.as_ref().and_then(|r| r.layout_elements(layout));
             match sub {
                 Some(sub) if !sub.is_empty() && sub[0].name == "merge" => {
                     // merge root contributes no view; its children splice
@@ -2025,9 +2188,7 @@ fn build_tree(vm: &mut Vm, elems: &[Element], ctx: V) -> V {
 /// `android:id` of an element — `@+id/name`, `@id/name`, or a raw int.
 fn el_id(vm: &Vm, el: &Element) -> Option<i32> {
     match el.android("id") {
-        Some(Value::Reference(r)) | Some(Value::Other { data: r, .. }) => {
-            Some(*r as i32)
-        }
+        Some(Value::Reference(r)) | Some(Value::Other { data: r, .. }) => Some(*r as i32),
         Some(Value::Int(i)) => Some(*i as i32),
         Some(Value::Str(s)) => {
             let name = s
@@ -2154,9 +2315,7 @@ fn detach(vm: &mut Vm, parent: u32, child: V) {
         return;
     };
     let pos = match vm.heap.get(a) {
-        Some(Obj::Array { data, .. }) => {
-            data.iter().position(|&c| value_eq(vm, c, child))
-        }
+        Some(Obj::Array { data, .. }) => data.iter().position(|&c| value_eq(vm, c, child)),
         _ => None,
     };
     if let Some(i) = pos {
@@ -2433,10 +2592,7 @@ fn menu_items_paired(vm: &Vm, menu_h: u32) -> Vec<(i32, V)> {
         Some(Obj::Host {
             state: HostState::Map(items),
             ..
-        }) => items
-            .iter()
-            .map(|(k, v)| (i64v(*k) as i32, *v))
-            .collect(),
+        }) => items.iter().map(|(k, v)| (i64v(*k) as i32, *v)).collect(),
         _ => vec![],
     }
 }
@@ -2500,11 +2656,7 @@ pub(crate) fn menu_find(vm: &mut Vm, menu_h: u32, id_v: Option<V>) -> V {
 /// string so `getTitle()` hands the guest a CharSequence.
 fn menu_title(vm: &mut Vm, v: V) -> V {
     if let V::I32(id) = v {
-        if let Some(s) = vm
-            .apk_res
-            .as_ref()
-            .and_then(|r| r.string_of(id as u32))
-        {
+        if let Some(s) = vm.apk_res.as_ref().and_then(|r| r.string_of(id as u32)) {
             let s = s.to_string();
             return jstr(vm, &s);
         }
@@ -2558,10 +2710,7 @@ fn menu_inflate_level(vm: &mut Vm, doc: &[Element], i: &mut usize, depth: usize,
             *i += 1;
             continue;
         }
-        let item_id = el
-            .android("id")
-            .map(|v| attr_v(vm, v))
-            .unwrap_or(V::I32(0));
+        let item_id = el.android("id").map(|v| attr_v(vm, v)).unwrap_or(V::I32(0));
         let order = el
             .android("orderInCategory")
             .map(|v| attr_v(vm, v))
@@ -2580,7 +2729,10 @@ fn menu_inflate_level(vm: &mut Vm, doc: &[Element], i: &mut usize, depth: usize,
             .map(|n| n.name == "menu" && n.depth > depth)
             .unwrap_or(false);
         if trace {
-            eprintln!("[menu_inflate] item id={:?} sub={sub}", i64v(item_id) as i32);
+            eprintln!(
+                "[menu_inflate] item id={:?} sub={sub}",
+                i64v(item_id) as i32
+            );
         }
         let it = menu_add_entry(
             vm,
@@ -2703,7 +2855,12 @@ pub(crate) fn register_menu_overrides(vm: &mut Vm) {
         "Landroid/view/MenuInflater;",
         "Landroidx/appcompat/view/SupportMenuInflater;",
     ] {
-        let ok = vm.register_host(class, "inflate", "(ILandroid/view/Menu;)V", mk(ov_menu_inflate));
+        let ok = vm.register_host(
+            class,
+            "inflate",
+            "(ILandroid/view/Menu;)V",
+            mk(ov_menu_inflate),
+        );
         if std::env::var_os("OVELO_TRACE_MENU").is_some() {
             eprintln!("[menu_inflate] register_host {class} -> {ok:?}");
         }
