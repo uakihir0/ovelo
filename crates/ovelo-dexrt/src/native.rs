@@ -46,6 +46,7 @@ extern "C" {
     fn open(path: *const i8, flags: i32, ...) -> i32;
     fn abort() -> !;
     fn pthread_threadid_np(t: usize, id: *mut u64) -> i32;
+    fn lseek(fd: i32, off: i64, whence: i32) -> i64;
     #[cfg(target_os = "macos")]
     fn sys_icache_invalidate(start: *mut c_void, len: usize);
     #[cfg(target_os = "macos")]
@@ -1072,6 +1073,7 @@ fn builtin_shim(name: &str) -> Option<usize> {
         "syscall" => sh_neg1 as *const () as usize,
         "gettid" => sh_gettid as *const () as usize,
         "__open_2" => sh_open2 as *const () as usize,
+        "lseek64" => lseek as *const () as usize,
         "__memcpy_chk" => sh_memcpy_chk as *const () as usize,
         "__memset_chk" => sh_memset_chk as *const () as usize,
         "dl_iterate_phdr" => sh_dl_iterate_phdr as *const () as usize,
