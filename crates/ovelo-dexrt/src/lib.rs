@@ -574,9 +574,10 @@ impl Vm {
             // that actually declares the field: `LPolygonShape;.addr`
             // and `LShape;.addr` then share one storage slot.
             if let Some(owner) = self.type_index_of(&owner_desc) {
+                let fty = d.type_descriptor(f.type_idx as u32).ok();
                 if let Some(decl) = self
-                    .find_field_by_name(owner, &name, false)
-                    .or_else(|| self.find_field_by_name(owner, &name, true))
+                    .find_field_by_name(owner, &name, false, fty.as_deref())
+                    .or_else(|| self.find_field_by_name(owner, &name, true, fty.as_deref()))
                 {
                     return Some(decl);
                 }
@@ -3178,6 +3179,25 @@ impl Vm {
         };
         let m = d.method(gl(midx)).map_err(E::Vm)?;
         let name = d.string(m.name_idx).map_err(E::Vm)?;
+        // A zero scalar in a reference slot is `null`, not the number
+        // zero — `null.toString()` must NPE, not yield "0". But when the
+        // resolved method belongs to a numeric box (unboxed JSON numbers
+        // reach `Number.intValue()`), zero is a legitimate value.
+        if Self::scalar_is_zero(v) {
+            let owner = d.type_descriptor(m.class_idx as u32).unwrap_or_default();
+            if !matches!(
+                owner.as_str(),
+                "Ljava/lang/Number;"
+                    | "Ljava/lang/Integer;"
+                    | "Ljava/lang/Long;"
+                    | "Ljava/lang/Short;"
+                    | "Ljava/lang/Byte;"
+                    | "Ljava/lang/Double;"
+                    | "Ljava/lang/Float;"
+            ) {
+                return Ok(None);
+            }
+        }
         let as_f64 = match v {
             V::I32(i) => i as f64,
             V::I64(i) => i as f64,
@@ -3226,11 +3246,23 @@ impl Vm {
         }))
     }
 
+    /// Zero-valued scalar in a reference slot — `const/4 v, 0x0` is
+    /// how dex writes `null`, so 0 is the null literal there.
+    fn scalar_is_zero(v: V) -> bool {
+        match v {
+            V::I32(0) | V::I64(0) => true,
+            V::F32(f) => f == 0.0,
+            V::F64(f) => f == 0.0,
+            _ => false,
+        }
+    }
+
     /// `instanceof`/check-cast target test for an unboxed scalar —
     /// numbers satisfy Number/Object and the matching box class.
     fn scalar_is_instance(&mut self, v: V, ty: GIdx) -> bool {
         let want = self.type_desc_of(ty).unwrap_or_default();
-        let num = matches!(v, V::I32(_) | V::I64(_) | V::F32(_) | V::F64(_));
+        let num = matches!(v, V::I32(_) | V::I64(_) | V::F32(_) | V::F64(_))
+            && !Self::scalar_is_zero(v);
         let int_kind = matches!(v, V::I32(_) | V::I64(_));
         let hit = num
             && matches!(
@@ -3800,13 +3832,18 @@ impl Vm {
     }
 
     /// Walk `class_idx`'s chain for a field by name (static when
-    /// `is_static`, instance otherwise) → global field idx.
+    /// `is_static`, instance otherwise) → global field idx. When
+    /// `want_ty` is given and several fields share the name (legal in
+    /// dex, common under obfuscation), the one declaring that type wins
+    /// over an earlier same-name hit on a shallower class.
     pub(crate) fn find_field_by_name(
         &self,
         mut class_idx: GIdx,
         name: &str,
         is_static: bool,
+        want_ty: Option<&str>,
     ) -> Option<GIdx> {
+        let mut name_hit = None;
         for _ in 0..64 {
             let (cg, def) = self.def_loc_of(class_idx)?;
             let d = self.dex_of(cg)?;
@@ -3818,17 +3855,27 @@ impl Vm {
             };
             for f in it {
                 if let Ok(fi) = d.field(f.field_idx) {
-                    if d.string(fi.name_idx).ok()? == name {
-                        return Some(gx(gd(cg), f.field_idx));
+                    if d.string(fi.name_idx).ok()? != name {
+                        continue;
+                    }
+                    if let Some(want) = want_ty {
+                        if d.type_descriptor(fi.type_idx as u32).ok().as_deref()
+                            == Some(want)
+                        {
+                            return Some(gx(gd(cg), f.field_idx));
+                        }
+                    }
+                    if name_hit.is_none() {
+                        name_hit = Some(gx(gd(cg), f.field_idx));
                     }
                 }
             }
             if def.superclass_idx == u32::MAX {
-                return None;
+                return name_hit;
             }
             class_idx = gx(gd(cg), def.superclass_idx);
         }
-        None
+        name_hit
     }
 
     /// Run a compiled method under the shared register/ABI contract
@@ -4229,6 +4276,9 @@ impl Vm {
                 // is a box class it can satisfy (JSON numbers as Number).
                 let h = match r(0)? {
                     V::Ref(h) => h,
+                    // `const 0` is the null literal in a reference slot —
+                    // null casts to anything.
+                    v if Self::scalar_is_zero(v) => 0,
                     v if self.scalar_is_instance(v, gi(ins.idx.unwrap_or(0))) => 0,
                     _ => {
                         return Err(self.throw_builtin(

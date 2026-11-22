@@ -342,8 +342,21 @@ pub(crate) fn vm_ptr() -> usize {
 }
 
 extern "C" fn unimpl() -> u64 {
+    // Read the guest return address before env_enter's own call
+    // clobbers `lr`, so we can name the call site in the `.so`.
+    #[cfg(target_arch = "aarch64")]
+    let caller = {
+        let lr: usize;
+        unsafe { std::arch::asm!("mov {}, lr", out(reg) lr) };
+        lr
+    };
+    #[cfg(not(target_arch = "aarch64"))]
+    let caller = 0usize;
     env_enter("unimpl");
-    eprintln!("[jni] unimplemented env fn");
+    eprintln!(
+        "[jni] unimplemented env fn caller={caller:#x} so_off={:?}",
+        crate::native::so_off(caller)
+    );
     0
 }
 
@@ -444,6 +457,8 @@ pub(crate) fn init_tables() {
         t[162] = ef!(set_static_double_field as *const ());
         t[163] = ef!(new_string as *const ());
         t[164] = ef!(get_string_length as *const ());
+        t[165] = ef!(get_string_units as *const ());
+        t[166] = ef!(release_string_units as *const ());
         t[167] = ef!(new_string_utf as *const ());
         t[168] = ef!(get_string_utf_length as *const ());
         t[169] = ef!(get_string_utf_chars as *const ());
@@ -497,6 +512,14 @@ pub(crate) fn init_tables() {
         t[217] = ef!(ret0 as *const ());
         t[218] = ef!(ret0 as *const ());
         t[219] = ef!(get_java_vm as *const ());
+        t[220] = ef!(get_string_region as *const ());
+        t[221] = ef!(get_string_utf_region as *const ());
+        t[222] = ef!(get_primitive_array_critical as *const ());
+        t[223] = ef!(release_primitive_array_critical as *const ());
+        t[224] = ef!(get_string_units as *const ());
+        t[225] = ef!(release_string_units as *const ());
+        t[226] = ef!(new_ref as *const ());
+        t[227] = ef!(ret0 as *const ());
         t[228] = ef!(exception_check as *const ());
         t[229] = ef!(new_direct_byte_buffer as *const ());
         t[230] = ef!(get_direct_buffer_address as *const ());
@@ -693,8 +716,9 @@ fn find_method_id(clazz: u64, name_p: u64, sig_p: u64) -> u64 {
     }
 }
 
-fn find_field_id(clazz: u64, name_p: u64, _sig_p: u64, is_static: bool) -> u64 {
+fn find_field_id(clazz: u64, name_p: u64, sig_p: u64, is_static: bool) -> u64 {
     let name = cstr_ro(name_p);
+    let sig = cstr_ro(sig_p);
     if std::env::var("OVELO_JNIDBG").is_ok() { eprintln!("[jni] GetFieldID {name} clazz={clazz:#x}"); }
     let mut v = vm();
     let Some(ci) = (match clazz {
@@ -703,7 +727,7 @@ fn find_field_id(clazz: u64, name_p: u64, _sig_p: u64, is_static: bool) -> u64 {
     }) else {
         return 0;
     };
-    if let Some(g) = v.find_field_by_name(ci, &name, is_static) {
+    if let Some(g) = v.find_field_by_name(ci, &name, is_static, Some(&sig)) {
         v.jni_fids.push(g);
         return v.jni_fids.len() as u64;
     }
@@ -1027,6 +1051,54 @@ extern "C" fn release_string_utf_chars(_e: u64, _s: u64, p: u64) -> u64 {
     0
 }
 
+/// `GetStringChars`/`GetStringCritical`: UTF-16 buffer, NUL-terminated.
+extern "C" fn get_string_units(_e: u64, s: u64, _copy: u64) -> u64 {
+    env_enter("get_string_units");
+    let Some(x) = vm().heap.str_val(s as u32).map(|x| x.to_string()) else {
+        return 0;
+    };
+    let u16s: Vec<u16> = x.encode_utf16().collect();
+    let buf = libc_malloc((u16s.len() + 1) * 2) as *mut u16;
+    if buf.is_null() {
+        return 0;
+    }
+    unsafe {
+        std::ptr::copy_nonoverlapping(u16s.as_ptr(), buf, u16s.len());
+        *buf.add(u16s.len()) = 0;
+    }
+    buf as u64
+}
+extern "C" fn release_string_units(_e: u64, _s: u64, p: u64) {
+    env_enter("release_string_units");
+    if p != 0 {
+        libc_free(p as usize);
+    }
+}
+extern "C" fn get_string_region(_e: u64, s: u64, start: u64, len: u64, buf: u64) {
+    env_enter("get_string_region");
+    let Some(x) = vm().heap.str_val(s as u32).map(|x| x.to_string()) else {
+        return;
+    };
+    let u16s: Vec<u16> = x.encode_utf16().collect();
+    for i in 0..len as usize {
+        let v = u16s.get(start as usize + i).copied().unwrap_or(0);
+        unsafe { *((buf + i as u64 * 2) as *mut u16) = v };
+    }
+}
+extern "C" fn get_string_utf_region(_e: u64, s: u64, start: u64, len: u64, buf: u64) {
+    env_enter("get_string_utf_region");
+    let Some(x) = vm().heap.str_val(s as u32).map(|x| x.to_string()) else {
+        return;
+    };
+    let u16s: Vec<u16> = x.encode_utf16().collect();
+    let lo = (start as usize).min(u16s.len());
+    let hi = (start as usize + len as usize).min(u16s.len());
+    let sub = String::from_utf16_lossy(&u16s[lo..hi]);
+    unsafe {
+        std::ptr::copy_nonoverlapping(sub.as_ptr(), buf as *mut u8, sub.len());
+    }
+}
+
 // ---------- arrays ----------
 
 fn arr_data(h: u32) -> Option<Vec<V>> {
@@ -1210,6 +1282,17 @@ ra!(release_int_array_elements);
 ra!(release_long_array_elements);
 ra!(release_float_array_elements);
 ra!(release_double_array_elements);
+
+/// `GetPrimitiveArrayCritical` — same buffer contract as
+/// `Get*ArrayElements`; libgdx uses it for its scratch float arrays.
+extern "C" fn get_primitive_array_critical(_e: u64, a: u64, copy: u64) -> u64 {
+    env_enter("get_primitive_array_critical");
+    get_elems(a, copy)
+}
+extern "C" fn release_primitive_array_critical(_e: u64, a: u64, buf: u64, mode: u64) {
+    env_enter("release_primitive_array_critical");
+    release_elems(a, buf, mode)
+}
 
 fn get_region(a: u64, start: u64, len: u64, out: u64) {
     let h = a as u32;

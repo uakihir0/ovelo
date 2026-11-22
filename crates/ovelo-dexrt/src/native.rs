@@ -102,6 +102,14 @@ struct DlInfo {
 /// whether the faulting PC is inside a loaded `.so`.
 pub(crate) static LOADED_RANGES: Mutex<Vec<(usize, usize)>> = Mutex::new(Vec::new());
 
+/// Image-relative offset of `addr` when it lies inside a loaded `.so`.
+pub(crate) fn so_off(addr: usize) -> Option<usize> {
+    LOADED_RANGES
+        .lock()
+        .ok()
+        .and_then(|v| v.iter().find(|(b, s)| addr >= *b && addr < b + s).map(|(b, _)| addr - *b))
+}
+
 /// Fake Bionic TCB. Guest `.so`s read Bionic TLS slots off TPIDR_EL0 —
 /// most visibly the `__stack_chk_guard` slot at +0x28 that
 /// `-fstack-protector` emits into every function prologue/epilogue.

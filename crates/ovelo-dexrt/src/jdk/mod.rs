@@ -125,6 +125,15 @@ pub(crate) fn f64v(v: V) -> f64 {
 
 /// Text of a CharSequence-ish handle (Str / StrBuf / Path / Regex).
 pub(crate) fn s(vm: &Vm, h: u32) -> Option<String> {
+    s_d(vm, h, 0)
+}
+
+/// Depth-capped: a self-referential holder (e.g. a Map.Entry whose
+/// value is itself) must not walk P_DATA forever.
+fn s_d(vm: &Vm, h: u32, depth: u8) -> Option<String> {
+    if depth > 16 {
+        return None;
+    }
     match vm.heap.get(h) {
         Some(Obj::Str(t)) => Some(t.clone()),
         Some(Obj::Host {
@@ -137,7 +146,7 @@ pub(crate) fn s(vm: &Vm, h: u32) -> Option<String> {
         // object shapes must answer it.
         Some(Obj::Instance { fields, .. }) | Some(Obj::Host { fields, .. }) => {
             match fields.get(&(P_DATA as u64)) {
-                Some(&V::Ref(rh)) if rh != 0 => s(vm, rh),
+                Some(&V::Ref(rh)) if rh != 0 => s_d(vm, rh, depth + 1),
                 _ => None,
             }
         }
