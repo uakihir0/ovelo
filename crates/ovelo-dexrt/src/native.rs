@@ -263,6 +263,11 @@ pub(crate) fn with_guest_tls<R>(f: impl FnOnce() -> R) -> R {
     f()
 }
 
+#[cfg(not(target_arch = "aarch64"))]
+pub(crate) fn with_guest_tls_at<R>(_site: &'static str, f: impl FnOnce() -> R) -> R {
+    f()
+}
+
 /// Host-TPIDR call thunks: every function pointer handed to guest
 /// code (JNIEnv/JavaVM vtable entries, builtin shims, dlsym'd
 /// libSystem imports) is wrapped in a 64-byte stub that swaps
