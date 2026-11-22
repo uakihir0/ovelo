@@ -1572,41 +1572,92 @@ fn dialog_call(vm: &mut Vm, name: &str, args: &[V]) -> Rt<Option<Option<V>>> {
 }
 
 fn component_call(vm: &mut Vm, name: &str, args: &[V]) -> Rt<Option<Option<V>>> {
+    let this = match args.first() {
+        Some(V::Ref(h)) => *h,
+        _ => 0,
+    };
+    // Stored separately by <init>/unflattenFromString so the
+    // accessors answer real pieces: P_COMPONENT = package,
+    // P_DATA = class.
+    let part = |key: u32| -> Option<String> {
+        pseudo_get(vm, this, key).and_then(|v| sv(vm, v))
+    };
     Ok(match name {
-        "getPackageName"
-        | "getClassName"
-        | "getShortClassName"
-        | "toString"
-        | "flatten"
-        | "flattenToShortString"
-        | "flattenToString" => {
-            let t = s(
-                vm,
-                match args[0] {
-                    V::Ref(h) => h,
-                    _ => 0,
-                },
-            )
-            .or_else(|| {
-                pseudo_get(
-                    vm,
-                    match args[0] {
-                        V::Ref(h) => h,
-                        _ => 0,
-                    },
-                    P_DATA,
-                )
-                .and_then(|v| sv(vm, v))
-            })
-            .unwrap_or_default();
+        "<init>" => {
+            let rest = &args[1.min(args.len())..];
+            // (Context, Class) | (Context, String) | (String, String)
+            let (pkg, cls): (Option<String>, Option<String>) = match rest {
+                [_, V::Ref(ch)] if matches!(vm.heap.get(*ch), Some(Obj::Class { .. })) => (
+                    Some(vm.guest_package.clone().unwrap_or_default()),
+                    class_desc_of(vm, *ch).map(|d| dotted(&d)),
+                ),
+                [V::Ref(p), V::Ref(c)] => (s(vm, *p).or_else(|| {
+                    vm.guest_package.clone()
+                }), s(vm, *c)),
+                [V::Ref(p), V::Ref(c), ..] => (s(vm, *p), s(vm, *c)),
+                _ => (None, None),
+            };
+            if let Some(p) = pkg.filter(|p| !p.is_empty()) {
+                let v = jstr(vm, &p);
+                pseudo_set(vm, this, P_COMPONENT, v);
+            }
+            if let Some(c) = cls.filter(|c| !c.is_empty()) {
+                let v = jstr(vm, &c);
+                pseudo_set(vm, this, P_DATA, v);
+            }
+            Some(None)
+        }
+        "getPackageName" => {
+            Some(Some(jstr(vm, &part(P_COMPONENT).unwrap_or_default())))
+        }
+        "getClassName" => Some(Some(jstr(vm, &part(P_DATA).unwrap_or_default()))),
+        "getShortClassName" => {
+            let c = part(P_DATA).unwrap_or_default();
+            let short = c.rsplit('.').next().unwrap_or(&c).to_string();
+            Some(Some(jstr(vm, &short)))
+        }
+        "toString" | "flatten" | "flattenToShortString" | "flattenToString" => {
+            let t = match (part(P_COMPONENT), part(P_DATA)) {
+                (Some(p), Some(c)) => format!("{p}/{c}"),
+                _ => s(vm, this).unwrap_or_default(),
+            };
             Some(Some(jstr(vm, &t)))
         }
-        "unflattenFromString" => Some(Some(host(
-            vm,
-            "Landroid/content/ComponentName;",
-            HostState::Empty,
-        ))),
-        "equals" | "hashCode" | "compareTo" => Some(Some(V::I32(0))),
+        "unflattenFromString" => {
+            let cn = host(vm, "Landroid/content/ComponentName;", HostState::Empty);
+            if let (V::Ref(ch), V::Ref(fh)) = (cn, args.first().copied().unwrap_or(V::Ref(0))) {
+                if let Some(f) = s(vm, fh) {
+                    if let Some((p, c)) = f.split_once('/') {
+                        let pv = jstr(vm, p);
+                        let cv = jstr(vm, c);
+                        pseudo_set(vm, ch, P_COMPONENT, pv);
+                        pseudo_set(vm, ch, P_DATA, cv);
+                    }
+                }
+            }
+            Some(Some(cn))
+        }
+        "equals" => {
+            let other = match args.get(1) {
+                Some(V::Ref(h)) => *h,
+                _ => 0,
+            };
+            let eq = this != 0
+                && other != 0
+                && pseudo_get(vm, this, P_COMPONENT) == pseudo_get(vm, other, P_COMPONENT)
+                && pseudo_get(vm, this, P_DATA) == pseudo_get(vm, other, P_DATA);
+            Some(Some(V::I32(i32::from(eq))))
+        }
+        "hashCode" | "compareTo" => {
+            let flat = match (part(P_COMPONENT), part(P_DATA)) {
+                (Some(p), Some(c)) => format!("{p}/{c}"),
+                _ => s(vm, this).unwrap_or_default(),
+            };
+            let h = flat.bytes().fold(0i32, |a, b| {
+                a.wrapping_mul(31).wrapping_add(b as i32)
+            });
+            Some(Some(V::I32(h)))
+        }
         "describeContents" | "writeToParcel" | "clone" => {
             if name == "clone" {
                 Some(Some(args[0]))
