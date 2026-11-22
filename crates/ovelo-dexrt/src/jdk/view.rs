@@ -117,6 +117,12 @@ const P_RIGHT: u32 = 0xFFFD_FFE7;
 const P_BOTTOM: u32 = 0xFFFD_FFE6;
 const P_MEAS_W: u32 = 0xFFFD_FFE5;
 const P_MEAS_H: u32 = 0xFFFD_FFE4;
+/// `setMinimumWidth`/`setMinimumHeight` — feed `getMinimum*`/
+/// `getSuggestedMinimum*`.
+const P_MINW: u32 = 0xFFFD_FFDF;
+const P_MINH: u32 = 0xFFFD_FFDE;
+/// `LinearLayout.setOrientation` — 0=HORIZONTAL, 1=VERTICAL.
+const P_ORIENTATION: u32 = 0xFFFD_FFDD;
 /// Live `setTextColor` ARGB — written by the guest bridge's
 /// fallthrough for dex-inflated views.
 pub const P_TCOLOR: u32 = 0xFFFD_FFE3;
@@ -1532,9 +1538,7 @@ pub(crate) fn call(
             // setMeasuredDimension (which many custom views do).
             if std::env::var_os("OVELO_MEASDBG").is_some() {
                 let (ws, hs) = (vint(args.get(1)), vint(args.get(2)));
-                if hs > 8192 || ws > 8192 {
-                    eprintln!("[measdbg] measure h{this} spec={ws:#x},{hs:#x}");
-                }
+                eprintln!("[measdbg] measure h{this} spec={ws:#x},{hs:#x}");
             }
             pseudo_set(vm, this, P_MEAS_W, V::I32(spec_size(args.get(1).copied())));
             pseudo_set(vm, this, P_MEAS_H, V::I32(spec_size(args.get(2).copied())));
@@ -1571,9 +1575,7 @@ pub(crate) fn call(
             // (0x00FF_FFFF); the state bits ride the AndState variant.
             if std::env::var_os("OVELO_MEASDBG").is_some() {
                 let (w, h) = (vint(args.get(1)), vint(args.get(2)));
-                if h > 8192 || w > 8192 {
-                    eprintln!("[measdbg] setMeasured h{this} {w}x{h}");
-                }
+                eprintln!("[measdbg] setMeasured h{this} {w:#x}x{h:#x}");
             }
             pseudo_set(vm, this, P_MEAS_W, V::I32(vint(args.get(1)) & 0x00FF_FFFF));
             pseudo_set(vm, this, P_MEAS_H, V::I32(vint(args.get(2)) & 0x00FF_FFFF));
@@ -1687,8 +1689,17 @@ pub(crate) fn call(
         "getMeasuredWidthAndState" => Some(Some(V::I32(pint(vm, this, P_MEAS_W)))),
         "getMeasuredHeightAndState" => Some(Some(V::I32(pint(vm, this, P_MEAS_H)))),
         "getPaddingLeft" | "getPaddingTop" | "getPaddingRight" | "getPaddingBottom"
-        | "getPaddingStart" | "getPaddingEnd" | "getMinimumWidth" | "getMinimumHeight"
-        | "getScrollX" | "getScrollY" => Some(Some(V::I32(0))),
+        | "getPaddingStart" | "getPaddingEnd" | "getScrollX" | "getScrollY" => {
+            Some(Some(V::I32(0)))
+        }
+        "getMinimumWidth" => Some(Some(V::I32(min_dim(vm, this, P_MINW, "minWidth")))),
+        "getMinimumHeight" => Some(Some(V::I32(min_dim(vm, this, P_MINH, "minHeight")))),
+        // AOSP: max(minDim, background minimum). Drawable minimums are
+        // ~0 for colors/bitmaps, so the explicit minimum wins.
+        "getSuggestedMinimumWidth" => Some(Some(V::I32(min_dim(vm, this, P_MINW, "minWidth")))),
+        "getSuggestedMinimumHeight" => {
+            Some(Some(V::I32(min_dim(vm, this, P_MINH, "minHeight"))))
+        }
         "getBaseline" => Some(Some(V::I32(-1))),
         // requestLayout must be observable: ConstraintLayout re-arms
         // mDirtyHierarchy only when a child reports isLayoutRequested,
@@ -1696,6 +1707,18 @@ pub(crate) fn call(
         "isLayoutRequested" => Some(Some(V::I32(pint(vm, this, P_LAYOUT_REQ)))),
         "requestLayout" | "forceLayout" => {
             pseudo_set(vm, this, P_LAYOUT_REQ, V::I32(1));
+            Some(None)
+        }
+        "setMinimumWidth" => {
+            pseudo_set(vm, this, P_MINW, V::I32(vint(args.get(1))));
+            Some(None)
+        }
+        "setMinimumHeight" => {
+            pseudo_set(vm, this, P_MINH, V::I32(vint(args.get(1))));
+            Some(None)
+        }
+        "setOrientation" => {
+            pseudo_set(vm, this, P_ORIENTATION, V::I32(vint(args.get(1))));
             Some(None)
         }
         "willNotDraw" => Some(Some(V::I32(0))),
@@ -1707,9 +1730,8 @@ pub(crate) fn call(
         | "setBackgroundColor"
         | "setBackgroundResource"
         | "setPadding"
-        | "setMinimumHeight"
-        | "setMinimumWidth"
         | "setElevation"
+        | "setShowDividers"
         | "setTranslationX"
         | "setTranslationY"
         | "setTranslationZ"
@@ -1747,7 +1769,6 @@ pub(crate) fn call(
         | "setHorizontalGravity"
         | "setVerticalGravity"
         | "setGravity"
-        | "setOrientation"
         | "setWeightSum"
         | "setClipBounds"
         | "setOutlineAmbientShadowColor"
@@ -2617,6 +2638,30 @@ fn attrset_value(vm: &mut Vm, set: V, name: &str) -> Option<V> {
     }
 }
 
+/// `LinearLayout` orientation: `setOrientation` wins, else the
+/// `android:orientation` attr (0=horizontal, 1=vertical); the AOSP
+/// documented default is horizontal.
+fn linear_vertical(vm: &mut Vm, this: u32) -> bool {
+    if let Some(V::I32(o)) = pseudo_get(vm, this, P_ORIENTATION) {
+        return o != 0;
+    }
+    attr_find(vm, this, "orientation")
+        .map(|v| i32v(v) != 0)
+        .unwrap_or(false)
+}
+
+/// `getMinimum*`/`getSuggestedMinimum*`: explicit `setMinimum*` wins,
+/// else the inflated `android:minWidth`/`minHeight` attr.
+fn min_dim(vm: &mut Vm, this: u32, key: u32, attr: &str) -> i32 {
+    let explicit = pint(vm, this, key);
+    if explicit > 0 {
+        return explicit;
+    }
+    attr_find(vm, this, attr)
+        .and_then(|v| lp_px(vm, v))
+        .unwrap_or(0)
+}
+
 /// AOSP `View.resolveSize` / `View.getDefaultSize`: fold a view's
 /// content size against the spec mode. `resolve=true` picks the
 /// resolveSize rule (AT_MOST → min(size, specSize)); getDefaultSize
@@ -2890,6 +2935,8 @@ fn group_measure_fallback(vm: &mut Vm, this: u32, pw: i32, ph: i32) {
     // so (matches the layout-side check below).
     let desc = class_of(vm, V::Ref(this));
     let linear = desc.contains("LinearLayout") || vm.extends_named(&desc, "LinearLayout");
+    let linear_v = linear && linear_vertical(vm, this);
+    let linear_h = linear && !linear_v;
     let (mut cw, mut chh) = (0i32, 0i32);
     for c in kids.iter().copied() {
         let V::Ref(ch) = c else { continue };
@@ -2897,16 +2944,23 @@ fn group_measure_fallback(vm: &mut Vm, this: u32, pw: i32, ph: i32) {
             continue;
         }
         // AOSP measureChildWithMargins: `heightUsed` is the running
-        // total only for stacking containers — FrameLayout children
-        // each get the full height (a leading match_parent must not
-        // starve later siblings).
-        measure_child(vm, this, ch, pw, 0, ph, if linear { chh } else { 0 }, true);
+        // total only for vertical stacking — a horizontal LinearLayout
+        // accumulates `widthUsed` instead, and FrameLayout children
+        // each get the full height.
+        let (w_used, h_used) = if linear_v {
+            (0, chh)
+        } else if linear_h {
+            (cw, 0)
+        } else {
+            (0, 0)
+        };
+        measure_child(vm, this, ch, pw, w_used, ph, h_used, true);
         let w = pint(vm, ch, P_MEAS_W) & 0x00FF_FFFF;
         let hh = pint(vm, ch, P_MEAS_H) & 0x00FF_FFFF;
         // AOSP's mTotalLength / FrameLayout maxHeight fold in the
-        // child's vertical margins — omitting them under-reports the
-        // group's own height and starves the match_parent re-measure
-        // below of space that was never accounted for.
+        // child's margins — omitting them under-reports the group's own
+        // extent and starves the match_parent re-measure below of space
+        // that was never accounted for.
         let lp_obj = match pseudo_get(vm, ch, P_LP) {
             Some(V::Ref(l)) => l,
             _ => 0,
@@ -2919,12 +2973,25 @@ fn group_measure_fallback(vm: &mut Vm, this: u32, pw: i32, ph: i32) {
                 .and_then(|v| lp_px(vm, v))
                 .or_else(|| attr_find(vm, ch, "layout_marginBottom").map(|v| len_v(vm, v)))
                 .unwrap_or(0);
-        cw = cw.max(w);
-        // LinearLayout stacks: consumed height accumulates; the rest
-        // report their tallest child (FrameLayout semantics).
-        if linear {
+        let mh = lp_field(vm, lp_obj, "leftMargin")
+            .and_then(|v| lp_px(vm, v))
+            .or_else(|| attr_find(vm, ch, "layout_marginLeft").map(|v| len_v(vm, v)))
+            .unwrap_or(0)
+            + lp_field(vm, lp_obj, "rightMargin")
+                .and_then(|v| lp_px(vm, v))
+                .or_else(|| attr_find(vm, ch, "layout_marginRight").map(|v| len_v(vm, v)))
+                .unwrap_or(0);
+        // Vertical LinearLayout accumulates heights; horizontal
+        // accumulates widths; everything else reports the largest
+        // child (FrameLayout semantics).
+        if linear_v {
             chh += hh + mv;
+            cw = cw.max(w);
+        } else if linear_h {
+            cw += w + mh;
+            chh = chh.max(hh + mv);
         } else {
+            cw = cw.max(w);
             chh = chh.max(hh + mv);
         }
     }
@@ -2951,7 +3018,7 @@ fn group_measure_fallback(vm: &mut Vm, this: u32, pw: i32, ph: i32) {
             // match_parent child with `delta = height - mTotalLength`
             // (non-match children plus every margin) — not the full
             // resolved height, which would stack it past the bottom.
-            let (nonmatch_h, match_margins_h) = if linear {
+            let (nonmatch_h, match_margins_h) = if linear_v {
                 kids.iter().copied().fold((0i32, 0i32), |(nm, mm), c| {
                     let V::Ref(ch) = c else {
                         return (nm, mm);
@@ -3016,7 +3083,7 @@ fn group_measure_fallback(vm: &mut Vm, this: u32, pw: i32, ph: i32) {
                 };
                 let hs = if lph == -1 {
                     EXACTLY
-                        | if linear {
+                        | if linear_v {
                             match_h
                         } else {
                             (ch_in - mv).max(0)
@@ -3039,6 +3106,7 @@ fn group_layout_fallback(vm: &mut Vm, this: u32, _l: i32, _t: i32, r: i32, b: i3
     let desc = class_of(vm, V::Ref(this));
     let linear =
         desc.contains("LinearLayout") || vm.extends_named(&desc, "LinearLayout");
+    let linear_h = linear && !linear_vertical(vm, this);
     if !linear && vm.extends_named(&desc, "RelativeLayout") {
         relative_layout_fallback(vm, this, r - _l, b - _t);
         return;
@@ -3048,12 +3116,13 @@ fn group_layout_fallback(vm: &mut Vm, this: u32, _l: i32, _t: i32, r: i32, b: i3
     // in the parent, or a nested container shifts its children by
     // its own position a second time.
     let mut cur_t = pad_t;
+    let mut cur_l = pad_l;
     for c in children(vm, this) {
         let V::Ref(ch) = c else { continue };
         if ch == 0 {
             continue;
         }
-        let (ml, mt, mb) = if let Some(V::Ref(lp)) = pseudo_get(vm, ch, P_LP) {
+        let (ml, mt, mr, mb) = if let Some(V::Ref(lp)) = pseudo_get(vm, ch, P_LP) {
             if lp != 0 {
                 (
                     lp_field(vm, lp, "leftMargin")
@@ -3062,20 +3131,28 @@ fn group_layout_fallback(vm: &mut Vm, this: u32, _l: i32, _t: i32, r: i32, b: i3
                     lp_field(vm, lp, "topMargin")
                         .and_then(|f| lp_px(vm, f))
                         .unwrap_or(0),
+                    lp_field(vm, lp, "rightMargin")
+                        .and_then(|f| lp_px(vm, f))
+                        .unwrap_or(0),
                     lp_field(vm, lp, "bottomMargin")
                         .and_then(|f| lp_px(vm, f))
                         .unwrap_or(0),
                 )
             } else {
-                (0, 0, 0)
+                (0, 0, 0, 0)
             }
         } else {
-            (0, 0, 0)
+            (0, 0, 0, 0)
         };
         let cw = pint(vm, ch, P_MEAS_W) & 0x00FF_FFFF;
         let chh = pint(vm, ch, P_MEAS_H) & 0x00FF_FFFF;
-        let cl = pad_l + ml;
-        let ct = if linear { cur_t + mt } else { pad_t + mt };
+        let (cl, ct) = if linear_h {
+            (cur_l + ml, pad_t + mt)
+        } else if linear {
+            (pad_l + ml, cur_t + mt)
+        } else {
+            (pad_l + ml, pad_t + mt)
+        };
         if std::env::var_os("OVELO_VIEWDBG").is_some() {
             eprintln!("[viewdbg] groupLayout h{ch} meas={cw}x{chh} at {cl},{ct}");
         }
@@ -3089,6 +3166,7 @@ fn group_layout_fallback(vm: &mut Vm, this: u32, _l: i32, _t: i32, r: i32, b: i3
             }
         }
         cur_t = ct + chh + mb;
+        cur_l = cl + cw + mr;
     }
 }
 
@@ -3648,6 +3726,13 @@ fn expand_includes(vm: &Vm, elems: &[Element]) -> Vec<Element> {
                     if let Some(id) = el_id(vm, el) {
                         set_id_attr(&mut next[root_at], id);
                     }
+                    // AOSP LayoutInflater: the <include> tag's other
+                    // attrs (layout_*, constraint anchors, visibility…)
+                    // override the same-named ones on the included
+                    // root — without them a `bottomToTopOf` anchor
+                    // written only on <include> never reaches the
+                    // solver and the widget stays at 0.
+                    merge_include_attrs(&mut next[root_at], el);
                 }
                 // Unresolvable include stays as a plain view so its own
                 // id remains findable.
@@ -3657,6 +3742,21 @@ fn expand_includes(vm: &Vm, elems: &[Element]) -> Vec<Element> {
         expanded = next;
     }
     expanded
+}
+
+/// Merge an `<include>`'s attributes onto the included root element:
+/// every attr except `layout` (the res reference itself) overrides or
+/// augments the root's attributes.
+fn merge_include_attrs(root: &mut Element, inc: &Element) {
+    for a in &inc.attrs {
+        if a.name == "layout" {
+            continue;
+        }
+        match root.attrs.iter_mut().find(|ra| ra.name == a.name) {
+            Some(ra) => ra.value = a.value.clone(),
+            None => root.attrs.push(a.clone()),
+        }
+    }
 }
 
 /// Replace or add the `android:id` attribute on an element.

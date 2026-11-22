@@ -100,7 +100,9 @@ impl ViewRootImpl {
         if std::env::var_os("OVELO_PIXDBG").is_some() {
             let px = surf.pixels();
             let non_white = px
-                .chunks_exact(4)
+                .as_chunks::<4>()
+                .0
+                .iter()
                 .filter(|p| !(p[0] == 0xff && p[1] == 0xff && p[2] == 0xff))
                 .count();
             eprintln!(
