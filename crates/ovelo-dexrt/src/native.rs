@@ -832,6 +832,7 @@ extern "C" fn sh_open2(path: *const i8, flags: i32) -> i32 {
 /// them lets `guest_dst_ok` reject (and log) destinations that aren't
 /// guest-zone, `.so` image, or stack — the write is skipped so the
 /// app keeps running and we see who asked for it.
+#[cfg(target_os = "macos")]
 extern "C" fn sh_memcpy(d: *mut c_void, s: *const c_void, n: usize) -> *mut c_void {
     if !guest_dst_ok(d as usize, n) {
         eprintln!("[guestptr] memcpy dst {d:p}+{n:#x} not guest/stack/image — skipped");
@@ -839,6 +840,7 @@ extern "C" fn sh_memcpy(d: *mut c_void, s: *const c_void, n: usize) -> *mut c_vo
     }
     unsafe { memcpy(d, s, n) }
 }
+#[cfg(target_os = "macos")]
 extern "C" fn sh_memmove(d: *mut c_void, s: *const c_void, n: usize) -> *mut c_void {
     if !guest_dst_ok(d as usize, n) {
         eprintln!("[guestptr] memmove dst {d:p}+{n:#x} not guest/stack/image — skipped");
@@ -846,6 +848,7 @@ extern "C" fn sh_memmove(d: *mut c_void, s: *const c_void, n: usize) -> *mut c_v
     }
     unsafe { memmove(d, s, n) }
 }
+#[cfg(target_os = "macos")]
 extern "C" fn sh_memset(d: *mut c_void, c: i32, n: usize) -> *mut c_void {
     if !guest_dst_ok(d as usize, n) {
         eprintln!("[guestptr] memset dst {d:p}+{n:#x} not guest/stack/image — skipped");
@@ -853,6 +856,7 @@ extern "C" fn sh_memset(d: *mut c_void, c: i32, n: usize) -> *mut c_void {
     }
     unsafe { memset(d, c, n) }
 }
+#[cfg(target_os = "macos")]
 extern "C" fn sh_strcpy(d: *mut c_void, s: *const c_void) -> *mut c_void {
     unsafe {
         let n = strlen(s as *const i8) + 1;
@@ -863,6 +867,7 @@ extern "C" fn sh_strcpy(d: *mut c_void, s: *const c_void) -> *mut c_void {
         memcpy(d, s, n)
     }
 }
+#[cfg(target_os = "macos")]
 extern "C" fn sh_strncpy(d: *mut c_void, s: *const c_void, n: usize) -> *mut c_void {
     if !guest_dst_ok(d as usize, n) {
         eprintln!("[guestptr] strncpy dst {d:p}+{n:#x} not guest/stack/image — skipped");
