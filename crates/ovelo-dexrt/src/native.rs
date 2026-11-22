@@ -901,18 +901,20 @@ static LIVE_ALLOCS: std::sync::LazyLock<
 > = std::sync::LazyLock::new(|| std::sync::Mutex::new(std::collections::HashMap::new()));
 #[cfg(target_os = "macos")]
 const GDB_CANARY: u64 = 0x0e10_dead_c0de_f00d;
-/// Under OVELO_FREEDBG every guest allocation carries a tail canary,
-/// checked at free time and at every JNI env entry — the first env
-/// call after the corrupting write reports it, naming the window.
+/// Bytes the guest may legally write — the real usable size of the
+/// block (`malloc_size`), which exceeds the request on all but the
+/// tightest buckets. The canary sits at the END of the usable region:
+/// a write between request size and usable size is legal and must not
+/// trip the alarm.
 #[cfg(target_os = "macos")]
 fn dbg_alloc(p: usize, size: usize) {
     if p == 0 || std::env::var_os("OVELO_FREEDBG").is_none() {
         return;
     }
-    // size need not be 8-aligned — p+size can be an unaligned u64.
-    unsafe { ((p + size) as *mut u64).write_unaligned(GDB_CANARY) };
+    let off = unsafe { malloc_size(p as *const c_void) }.saturating_sub(8);
+    unsafe { ((p + off) as *mut u64).write_unaligned(GDB_CANARY) };
     if let Ok(mut m) = LIVE_ALLOCS.lock() {
-        m.insert(p, size);
+        m.insert(p, off);
     }
 }
 /// Check every live guest buffer's tail canary; report the first
@@ -923,15 +925,15 @@ pub(crate) fn dbg_check_all(who: &'static str) {
         return;
     }
     if let Ok(m) = LIVE_ALLOCS.lock() {
-        for (p, size) in m.iter() {
-            let got = unsafe { ((*p + *size) as *const u64).read_unaligned() };
+        for (p, off) in m.iter() {
+            let got = unsafe { ((*p + *off) as *const u64).read_unaligned() };
             if got != GDB_CANARY {
-                let so = so_off(*p + *size);
+                let so = so_off(*p + *off);
                 eprintln!(
                     "[freedbg] {who}: CANARY SMASHED at {:#x} (buf {:#x}+{}) (so_off={so:?})",
-                    *p + *size,
+                    *p + *off,
                     *p,
-                    *size
+                    *off
                 );
                 break;
             }
@@ -956,11 +958,11 @@ fn dbg_free(p: usize, who: &'static str) {
     }
     let mut m = LIVE_ALLOCS.lock().unwrap_or_else(|e| e.into_inner());
     match m.remove(&p) {
-        Some(size) => {
-            let got = unsafe { ((p + size) as *const u64).read_unaligned() };
+        Some(off) => {
+            let got = unsafe { ((p + off) as *const u64).read_unaligned() };
             if got != GDB_CANARY {
-                let so = so_off(p + size);
-                eprintln!("[freedbg] {who}: canary smashed freeing {p:#x}+{size} (so_off={so:?})");
+                let so = so_off(p + off);
+                eprintln!("[freedbg] {who}: canary smashed freeing {p:#x}+{off} (so_off={so:?})");
             }
         }
         None => {
@@ -1003,9 +1005,12 @@ extern "C" fn sh_free(ptr: *mut c_void) {
 
 #[cfg(target_os = "macos")]
 extern "C" fn sh_calloc(n: usize, size: usize) -> *mut c_void {
-    let total = n.max(1) * size.max(1);
     let extra = if std::env::var_os("OVELO_FREEDBG").is_some() { 16 } else { 0 };
-    let p = unsafe { malloc_zone_calloc(guest_zone(), 1, total + extra) };
+    let Some(total) = n.max(1).checked_mul(size.max(1)).and_then(|t| t.checked_add(extra))
+    else {
+        return std::ptr::null_mut(); // overflow — calloc must fail, not wrap
+    };
+    let p = unsafe { malloc_zone_calloc(guest_zone(), 1, total) };
     dbg_alloc(p as usize, total);
     p
 }
@@ -1024,7 +1029,10 @@ extern "C" fn sh_realloc(ptr: *mut c_void, size: usize) -> *mut c_void {
             .and_then(|m| m.get(&(ptr as usize)).copied())
             .unwrap_or(0);
         let np = sh_malloc(size);
-        if !np.is_null() && old_size > 0 {
+        if np.is_null() {
+            return np; // realloc keeps the old block live on failure
+        }
+        if old_size > 0 {
             unsafe { std::ptr::copy_nonoverlapping(ptr, np, old_size.min(size)) };
         }
         sh_free(ptr);
