@@ -399,7 +399,16 @@ fn stream_call(vm: &mut Vm, name: &str, args: &[V]) -> Rt<Option<Option<V>>> {
         )
     {
         if name == "write" {
-            let bytes: Vec<u8> = if args.len() == 2 {
+            // write(byte[]) has the same arity as write(int) — the
+            // argument's TYPE decides: a Ref points at a byte array.
+            let is_arr = matches!(
+                vm.heap.get(match args.get(1) {
+                    Some(&V::Ref(h)) => h,
+                    _ => 0,
+                }),
+                Some(Obj::Array { .. })
+            );
+            let bytes: Vec<u8> = if args.len() == 2 && !is_arr {
                 vec![i64v(args[1]) as u8]
             } else {
                 let arr_h = match args.get(1) {

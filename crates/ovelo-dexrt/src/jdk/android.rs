@@ -304,11 +304,13 @@ pub(crate) fn call(
                     if let Some(parent) = path.parent() {
                         let _ = std::fs::create_dir_all(parent);
                     }
+                    // Modes: "w" truncate, "wa" append, "rw" r/w no
+                    // truncate, "rwt" r/w + truncate.
                     let f = std::fs::OpenOptions::new()
                         .write(true)
                         .read(mode.starts_with("rw"))
                         .create(true)
-                        .truncate(mode != "wa" && !mode.starts_with("rw"))
+                        .truncate(mode != "wa" && mode != "rw")
                         .append(mode == "wa")
                         .open(&path)
                         .ok();
@@ -4665,13 +4667,10 @@ pub(crate) fn media_uri_path(vm: &Vm, uri: &str) -> Option<String> {
         }
     }
     if uri.contains("externalstorage.documents") {
+        // Return the GUEST path — callers pass it through `io::fspath`
+        // which maps the external-storage alias back to external_root.
         let (_id, rel) = db::saf_doc_rel(uri);
-        return Some(
-            vm.external_root
-                .join(&rel)
-                .to_string_lossy()
-                .to_string(),
-        );
+        return Some(format!("/storage/emulated/0/{rel}"));
     }
     None
 }
