@@ -1675,7 +1675,15 @@ pub(crate) fn call(
             pint(vm, this, P_BOTTOM).saturating_sub(pint(vm, this, P_TOP)),
         ))),
         "getMeasuredWidth" => Some(Some(V::I32(pint(vm, this, P_MEAS_W) & 0x00FF_FFFF))),
-        "getMeasuredHeight" => Some(Some(V::I32(pint(vm, this, P_MEAS_H) & 0x00FF_FFFF))),
+        "getMeasuredHeight" => {
+            if std::env::var_os("OVELO_MEASDBG").is_some() {
+                eprintln!(
+                    "[measdbg] getMeasuredHeight h{this} -> {}",
+                    pint(vm, this, P_MEAS_H) & 0x00FF_FFFF
+                );
+            }
+            Some(Some(V::I32(pint(vm, this, P_MEAS_H) & 0x00FF_FFFF)))
+        }
         "getMeasuredWidthAndState" => Some(Some(V::I32(pint(vm, this, P_MEAS_W)))),
         "getMeasuredHeightAndState" => Some(Some(V::I32(pint(vm, this, P_MEAS_H)))),
         "getPaddingLeft" | "getPaddingTop" | "getPaddingRight" | "getPaddingBottom"
