@@ -307,6 +307,12 @@ pub(crate) fn media_cursor(vm: &mut Vm, uri: &str, projection: &[String]) -> V {
         "duration",
         "is_favorite",
         "volume_name",
+        "artist",
+        "album",
+        "album_id",
+        "artist_id",
+        "track",
+        "year",
     ];
     let images = uri.contains("/images/");
     let video = uri.contains("/video/");
@@ -398,6 +404,11 @@ pub(crate) fn media_cursor(vm: &mut Vm, uri: &str, projection: &[String]) -> V {
                 .map(|d| d.as_secs() as i64)
                 .unwrap_or(0);
             let (w, h) = img_dims(&p);
+            let dur = if mtype == 2 {
+                audio_duration_ms(&p, size)
+            } else {
+                0
+            };
             let data = format!("/storage/emulated/0/{rel}");
             // `_id` persists per path for the runtime's life — like a
             // real MediaStore rowid, adding/removing other files never
@@ -428,9 +439,18 @@ pub(crate) fn media_cursor(vm: &mut Vm, uri: &str, projection: &[String]) -> V {
                 V::I64(w),
                 V::I64(h),
                 V::I64(0),
-                V::I64(0),
+                V::I64(dur),
                 V::I64(0),
                 jstr(vm, "external"),
+                // The parent folder doubles as the album name (like a
+                // Music/<Album>/<Track>.mp3 library layout); artist is
+                // left at the conventional unknown-artist label.
+                jstr(vm, "<unknown>"),
+                jstr(vm, &bucket),
+                V::I64(java_hash(&rel_dir.to_lowercase()) as i64),
+                V::I64(1),
+                V::I64(0),
+                V::I64(0),
             ]);
     }
     if std::env::var_os("OVELO_DRAINDBG").is_some() {
@@ -474,6 +494,31 @@ pub(crate) fn media_cursor(vm: &mut Vm, uri: &str, projection: &[String]) -> V {
     pseudo_set(vm, c, P_CUR_ROWS, rows_l);
     pseudo_set(vm, c, P_CUR_POS, V::I32(-1));
     V::Ref(c)
+}
+
+/// MediaStore `duration` (ms) — zero makes music apps filter the row
+/// out ("0 tracks"). WAV parses the real fmt/data chunks; compressed
+/// formats estimate from size at ~128kbps so the value stays plausible.
+fn audio_duration_ms(p: &std::path::Path, size: i64) -> i64 {
+    use std::io::Read;
+    let mut b = [0u8; 64];
+    if let Ok(mut f) = std::fs::File::open(p) {
+        if let Ok(n) = f.read(&mut b) {
+            let b = &b[..n];
+            if b.starts_with(b"RIFF") && b.len() >= 44 {
+                let rate = u32::from_le_bytes(b[28..32].try_into().unwrap()) as u64;
+                let data = u32::from_le_bytes(b[40..44].try_into().unwrap()) as u64;
+                if rate > 0 && data > 0 {
+                    return (data * 1000 / rate) as i64;
+                }
+            }
+        }
+    }
+    if size > 0 {
+        (size * 8 / 128).max(1)
+    } else {
+        0
+    }
 }
 
 /// PNG/JPEG/GIF header dims without an image crate.
@@ -1261,9 +1306,15 @@ fn cursor_call(vm: &mut Vm, name: &str, args: &[V]) -> Rt<Option<Option<V>>> {
         "isLast" => Some(Some(V::I32(
             (cur_pos(vm, h) == n_rows - 1 && n_rows > 0) as i32,
         ))),
-        "isBeforeFirst" => Some(Some(V::I32((cur_pos(vm, h) < 0 && n_rows > 0) as i32))),
+        // AOSP AbstractCursor: an empty cursor is both before-first and
+        // after-last. Returning false there makes guest loops like
+        // `while (!isAfterLast()) { moveToNext() }` spin forever and
+        // blow the interpreter's instruction budget.
+        "isBeforeFirst" => Some(Some(V::I32(
+            (n_rows == 0 || cur_pos(vm, h) < 0) as i32,
+        ))),
         "isAfterLast" => Some(Some(V::I32(
-            (cur_pos(vm, h) >= n_rows && n_rows > 0) as i32,
+            (n_rows == 0 || cur_pos(vm, h) >= n_rows) as i32,
         ))),
         "getColumnIndex" | "getColumnIndexOrThrow" => {
             let want = sv(vm, *args.get(1).unwrap_or(&V::Ref(0))).unwrap_or_default();

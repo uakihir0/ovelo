@@ -685,6 +685,41 @@ pub(crate) fn call(
             "getItemAt" => Some(Some(V::Ref(0))),
             _ => None,
         }
+    } else if class == "Landroid/content/ContentUris;" {
+        match name {
+            // withAppendedId(Uri, long) — players build per-track URIs
+            // like content://media/external/audio/media/<id> with it.
+            "withAppendedId" => {
+                let base = sv(vm, *args.first().unwrap_or(&V::Ref(0))).unwrap_or_default();
+                let id = i64v(*args.get(1).unwrap_or(&V::I64(0)));
+                let sep = if base.ends_with('/') { "" } else { "/" };
+                Some(Some(host(
+                    vm,
+                    "Landroid/net/Uri;",
+                    HostState::StrBuf(format!("{base}{sep}{id}")),
+                )))
+            }
+            // parseId(Uri) → trailing numeric segment, -1 when absent.
+            "parseId" => {
+                let uri = sv(vm, *args.first().unwrap_or(&V::Ref(0))).unwrap_or_default();
+                let id = uri
+                    .rsplit('/')
+                    .next()
+                    .and_then(|tail| tail.parse::<i64>().ok())
+                    .unwrap_or(-1);
+                Some(Some(V::I64(id)))
+            }
+            _ => Some(Some(V::Ref(0))),
+        }
+    } else if class == "Landroid/app/NotificationManager;"
+        || class == "Landroid/app/NotificationManagerCompat;"
+    {
+        match name {
+            // notify/cancel are presentation-only — succeed silently.
+            "cancel" | "cancelAll" | "notify" => Some(None),
+            "areNotificationsEnabled" => Some(Some(V::I32(1))),
+            _ => Some(Some(V::Ref(0))),
+        }
     } else if class == "Landroid/database/Cursor;"
         || class.ends_with("Cursor;")
         || class.starts_with("Landroid/database/")

@@ -1511,7 +1511,14 @@ fn class_call(vm: &mut Vm, name: &str, _sig: &str, args: &[V]) -> Rt<Option<Opti
             Some(Some(V::I32(desc_is_a(&b, &a) as i32)))
         }
         "getSuperclass" => {
-            let d = s(
+            // `s()` returns None for `Obj::Class` mirrors — resolve the
+            // descriptor via `class_desc_of` so `SomeType.class` works,
+            // then walk the real dex superclass (`super_desc`) before
+            // host_supers/Object. Previously an `Obj::Class` argument
+            // yielded `d=""`, never matched `None=>Ref(0)` and returned
+            // `Object.class` for every class — guest loops like
+            // `while (c != null) c = c.getSuperclass()` never exited.
+            let d = class_desc_of(
                 vm,
                 match args[0] {
                     V::Ref(h) => h,
@@ -1519,9 +1526,15 @@ fn class_call(vm: &mut Vm, name: &str, _sig: &str, args: &[V]) -> Rt<Option<Opti
                 },
             )
             .unwrap_or_default();
-            match host_supers(&d).first() {
-                Some(sup) => Some(Some(class_obj(vm, sup.to_string()))),
-                None if d != OBJ => Some(Some(class_obj(vm, OBJ.into()))),
+            let sup = host_supers(&d)
+                .first()
+                .map(|x| (*x).to_string())
+                .or_else(|| vm.super_desc(&d));
+            match sup {
+                Some(sup) => Some(Some(class_obj(vm, sup))),
+                None if !d.is_empty() && d != OBJ => {
+                    Some(Some(class_obj(vm, OBJ.into())))
+                }
                 None => Some(Some(V::Ref(0))),
             }
         }
