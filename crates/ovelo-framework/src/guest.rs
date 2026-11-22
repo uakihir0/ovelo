@@ -716,6 +716,11 @@ impl GuestUi {
             && self.dex_mounted.is_some()
             && self.dex_gen_seen == vm.view_gen
         {
+            // A bound GLSurfaceView.Renderer draws every frame in
+            // continuous mode — its output isn't triggered by
+            // view-tree changes, so pump it even when we skip the
+            // materialize.
+            self.pump_gl_frames(vm);
             return true;
         }
         let Some(rc) = self.materialize_dex(vm, root) else {
@@ -749,6 +754,31 @@ impl GuestUi {
         }
         self.dex_gen_seen = vm.view_gen;
         true
+    }
+
+    /// Run `onDrawFrame` for every materialized view that has a bound
+    /// GL renderer — continuous renderers produce a new frame
+    /// independent of view-tree generation changes.
+    fn pump_gl_frames(&mut self, vm: &mut Vm) {
+        for (&h, rc) in &self.dex_views {
+            if !vm.has_gl_renderer(h) {
+                continue;
+            }
+            let Some((l, t, r, b)) = vm.dex_view(h).and_then(|i| i.frame) else {
+                continue;
+            };
+            let (w, hh) = (r - l, b - t);
+            if w <= 0 || hh <= 0 {
+                continue;
+            }
+            let ops = vm.guest_draw_ops(h, w, hh);
+            let mut g = rc.borrow_mut();
+            g.view_mut().custom_ops = if ops.is_empty() {
+                None
+            } else {
+                Some(Rc::new(ops))
+            };
+        }
     }
 
     fn materialize_dex(&mut self, vm: &mut Vm, h: u32) -> Option<Rc<RefCell<GuestView>>> {

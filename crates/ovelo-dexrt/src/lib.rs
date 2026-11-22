@@ -1704,6 +1704,13 @@ impl Vm {
         jdk::gfx::guest_draw_ops(self, view, w, h)
     }
 
+    /// Whether `view` has a bound `GLSurfaceView.Renderer` — such views
+    /// draw every frame (continuous render mode) independent of
+    /// view-tree generation changes.
+    pub fn has_gl_renderer(&self, view: u32) -> bool {
+        jdk::pseudo_get(self, view, jdk::gl::P_GLES_RENDERER).is_some()
+    }
+
     /// Cheap P_IS_VIEW probe — `dex_view` builds full node info
     /// (attrs, children, strings) and costs far more than callers
     /// that only need to know whether a handle is a view.
