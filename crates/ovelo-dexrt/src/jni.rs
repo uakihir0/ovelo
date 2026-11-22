@@ -753,6 +753,20 @@ fn call_obj(obj: u64, mid: u64, args: &[V], is_static: bool) -> Option<V> {
     v.invoke_pub(g, a, kind).ok().flatten()
 }
 
+/// `CallNonvirtual*Method`: invoke the exact method `mid` resolves to
+/// (found on the caller-supplied `clazz`) — the object's override must
+/// NOT win, or a `super.foo()` through JNI recurses forever.
+fn call_obj_direct(obj: u64, mid: u64, args: &[V]) -> Option<V> {
+    let g = mid_of(mid)?;
+    let mut v = vm();
+    let mut a = Vec::with_capacity(args.len() + 1);
+    a.push(V::Ref(obj as u32));
+    a.extend_from_slice(args);
+    v.invoke_pub(g, a, crate::InvokeKind::Direct)
+        .ok()
+        .flatten()
+}
+
 /// Method-id registration: name+sig on `clazz` (a jclass handle) → id.
 fn find_method_id(clazz: u64, name_p: u64, sig_p: u64) -> u64 {
     let name = cstr_ro(name_p);
@@ -1031,18 +1045,21 @@ fn va_jargs(params: &[String], va: &mut VaRegs) -> Vec<V> {
 /// Shared body for the varargs/`va_list`/`jvalue[]` call entries.
 /// kind: 0 = Call*Method(env,obj,mid,..), 1 = CallNonvirtual*Method
 /// (env,obj,clazz,mid,..), 2 = NewObject(env,clazz,mid,..).
-fn callv_run(obj: u64, mid: u64, args: &[V], new_obj: u64) -> u64 {
-    let Some(g) = mid_of(mid) else {
+fn callv_run(obj: u64, mid: u64, args: &[V], new_obj: u64, nv: bool) -> u64 {
+    if mid_of(mid).is_none() {
         eprintln!("[jni] callv: bad mid {mid:#x}");
         return new_obj;
-    };
-    let _ = g;
+    }
     if new_obj != 0 {
         // NewObject: <init> is a void instance method on the fresh object.
         call_obj(new_obj, mid, args, false);
         return new_obj;
     }
-    call_obj(obj, mid, args, false).map(v_to_u64).unwrap_or(0)
+    if nv {
+        call_obj_direct(obj, mid, args).map(v_to_u64).unwrap_or(0)
+    } else {
+        call_obj(obj, mid, args, false).map(v_to_u64).unwrap_or(0)
+    }
 }
 
 /// Register-dump varargs dispatcher — called by the `emit_va` stub with
@@ -1088,9 +1105,9 @@ extern "C" fn callv_dispatch(regs: u64, stack: u64, kind: u64) -> u64 {
                 fields: std::collections::HashMap::new(),
             }) as u64;
             drop(v);
-            callv_run(0, mid, &args, h)
+            callv_run(0, mid, &args, h, false)
         } else {
-            callv_run(obj_or_clazz, mid, &args, 0)
+            callv_run(obj_or_clazz, mid, &args, 0, kind == 1)
         }
     }
 }
@@ -1164,7 +1181,13 @@ extern "C" fn callv_v(_e: u64, obj: u64, mid: u64, va_p: u64) -> u64 {
 }
 extern "C" fn callnv_v(_e: u64, obj: u64, _clazz: u64, mid: u64, va_p: u64) -> u64 {
     env_enter("callnv_v");
-    callv_v(_e, obj, mid, va_p)
+    let Some(g) = mid_of(mid) else {
+        return 0;
+    };
+    let (_, params, _) = method_params(g);
+    let mut va = unsafe { VaList::load(va_p) };
+    let args = valist_jargs(&params, &mut va);
+    call_obj_direct(obj, mid, &args).map(v_to_u64).unwrap_or(0)
 }
 extern "C" fn callnv_a(_e: u64, obj: u64, _clazz: u64, mid: u64, jvalues: u64) -> u64 {
     env_enter("callnv_a");
@@ -1173,7 +1196,7 @@ extern "C" fn callnv_a(_e: u64, obj: u64, _clazz: u64, mid: u64, jvalues: u64) -
     };
     let (_, params, _) = method_params(g);
     let args = jargs(&params, jvalues);
-    call_obj(obj, mid, &args, false).map(v_to_u64).unwrap_or(0)
+    call_obj_direct(obj, mid, &args).map(v_to_u64).unwrap_or(0)
 }
 
 fn new_object_body(clazz: u64, mid: u64, args: &[V]) -> u64 {
