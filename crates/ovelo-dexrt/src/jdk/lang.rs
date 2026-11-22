@@ -1574,9 +1574,19 @@ fn class_call(vm: &mut Vm, name: &str, _sig: &str, args: &[V]) -> Rt<Option<Opti
             }))
         }
         "getClassLoader" => Some(Some(host(vm, "Ljava/lang/ClassLoader;", HostState::Empty))),
-        "getMethods"
-        | "getDeclaredMethods"
-        | "getFields"
+        "getMethods" | "getDeclaredMethods" => {
+            let owner = class_desc_of(
+                vm,
+                match args[0] {
+                    V::Ref(h) => h,
+                    _ => 0,
+                },
+            )
+            .unwrap_or_default();
+            let items = vm.declared_method_mirrors(&owner);
+            Some(Some(arr(vm, "Ljava/lang/reflect/Method;", items)))
+        }
+        "getFields"
         | "getDeclaredFields"
         | "getConstructors"
         | "getDeclaredConstructors"
@@ -2238,6 +2248,15 @@ fn stacktrace_call(vm: &mut Vm, name: &str, args: &[V]) -> Option<Option<V>> {
 // java.lang.reflect — Field/Method/Constructor mirrors backed by the
 // declaring class descriptor (P_COMPONENT) and member name (StrBuf).
 
+/// The `GIdx` a `Method` mirror stands for (`P_METH` set when the
+/// mirror was minted by `getDeclaredMethods`).
+fn meth_idx(vm: &Vm, h: u32) -> Option<crate::GIdx> {
+    match pseudo_get(vm, h, P_METH) {
+        Some(V::I64(x)) => Some(x as crate::GIdx),
+        _ => None,
+    }
+}
+
 fn reflect_call(
     vm: &mut Vm,
     class: &str,
@@ -2285,7 +2304,16 @@ fn reflect_call(
         }
         "getName" => Some(Some(jstr(vm, &member))),
         "getDeclaringClass" => Some(Some(class_obj(vm, owner))),
-        "getModifiers" => Some(Some(V::I32(1))),
+        "getModifiers" => {
+            // Real dex access_flags for P_METH mirrors, masked to the
+            // java.lang.reflect.Modifier bit set; bare mirrors default
+            // to public (the stub behavior they had before).
+            let f = match pseudo_get(vm, h, P_FLAGS) {
+                Some(V::I32(x)) if pseudo_get(vm, h, P_METH).is_some() => x & 0xffff,
+                _ => 1,
+            };
+            Some(Some(V::I32(f)))
+        }
         "setAccessible"
         | "checkCanSetAccessible"
         | "checkCanSetAccessible0"
@@ -2295,25 +2323,76 @@ fn reflect_call(
         } else {
             None
         }),
-        "isAccessible" | "canAccess" | "isVarArgs" | "isSynthetic" | "isBridge" | "isDefault"
-        | "isEnumConstant" => Some(Some(V::I32(1))),
-        "getType" | "getReturnType" | "getGenericType" | "getGenericReturnType" => {
-            Some(Some(class_obj(vm, OBJ.into())))
+        "isAccessible" | "canAccess" | "isDefault" | "isEnumConstant" => {
+            Some(Some(V::I32(1)))
         }
-        "getParameterTypes"
-        | "getExceptionTypes"
-        | "getGenericParameterTypes"
+        "isSynthetic" | "isBridge" | "isVarArgs" => {
+            let f = pseudo_get(vm, h, P_FLAGS)
+                .map(|v| match v {
+                    V::I32(x) => x,
+                    _ => 0,
+                })
+                .unwrap_or(0);
+            let bit = match name {
+                "isBridge" => 0x40,
+                "isVarArgs" => 0x80,
+                _ => 0x1000,
+            };
+            Some(Some(V::I32(if f & bit != 0 { 1 } else { 0 })))
+        }
+        "getType" | "getReturnType" | "getGenericType" | "getGenericReturnType" => {
+            let d = meth_idx(vm, h).and_then(|m| vm.method_return_desc(m));
+            Some(Some(class_obj(vm, d.unwrap_or_else(|| OBJ.into()))))
+        }
+        "getParameterTypes" | "getGenericParameterTypes" => {
+            let items = meth_idx(vm, h)
+                .map(|m| vm.method_param_descs(m))
+                .unwrap_or_default()
+                .into_iter()
+                .map(|d| class_obj(vm, d))
+                .collect();
+            Some(Some(arr(vm, "Ljava/lang/Class;", items)))
+        }
+        "getExceptionTypes"
         | "getGenericExceptionTypes"
         | "getParameterAnnotations"
-        | "getAnnotations"
-        | "getDeclaredAnnotations"
         | "getTypeParameters" => Some(Some(arr(vm, OBJ, vec![]))),
-        "getAnnotation"
-        | "getDeclaredAnnotation"
-        | "getDefaultValue"
-        | "getGenericSignature"
-        | "getSignature" => Some(Some(V::Ref(0))),
-        "getParameterCount" => Some(Some(V::I32(0))),
+        "getAnnotations" | "getDeclaredAnnotations" => {
+            let items = meth_idx(vm, h)
+                .map(|m| vm.method_annotations(m))
+                .unwrap_or_default();
+            Some(Some(arr(vm, "Ljava/lang/annotation/Annotation;", items)))
+        }
+        "getAnnotation" | "getDeclaredAnnotation" => {
+            let v = match (meth_idx(vm, h), args.get(1)) {
+                (Some(m), Some(V::Ref(c))) => class_desc_of(vm, *c)
+                    .map(|d| vm.method_annotation(m, &d))
+                    .unwrap_or(V::Ref(0)),
+                _ => V::Ref(0),
+            };
+            Some(Some(v))
+        }
+        "isAnnotationPresent" => {
+            let v = match (meth_idx(vm, h), args.get(1)) {
+                (Some(m), Some(V::Ref(c))) => class_desc_of(vm, *c)
+                    .map(|d| vm.method_annotation(m, &d))
+                    .unwrap_or(V::Ref(0)),
+                _ => V::Ref(0),
+            };
+            Some(Some(V::I32(if matches!(v, V::Ref(0)) { 0 } else { 1 })))
+        }
+        "getDefaultValue" => {
+            let v = meth_idx(vm, h)
+                .and_then(|m| vm.method_default_value(m))
+                .unwrap_or(V::Ref(0));
+            Some(Some(v))
+        }
+        "getGenericSignature" | "getSignature" => Some(Some(V::Ref(0))),
+        "getParameterCount" => Some(Some(V::I32(
+            meth_idx(vm, h)
+                .map(|m| vm.method_param_descs(m).len() as i32)
+                .unwrap_or(0),
+        ))),
         "toString" | "toGenericString" => {
             Some(Some(jstr(vm, &format!("{}.{}", dotted(&owner), member))))
         }
@@ -2330,7 +2409,20 @@ fn reflect_call(
                 },
                 _ => vec![],
             };
-            match vm.call_virtual(target, &member, &argv) {
+            let res = match meth_idx(vm, h) {
+                // The mirror knows its exact method — dispatch it
+                // instead of re-resolving by name+arity (wrong overload).
+                Some(m) => vm.invoke_method_mirror(m, target, argv),
+                None => {
+                    if target != 0 {
+                        vm.call_virtual(target, &member, &argv)
+                    } else {
+                        // Static method — resolve by declaring class.
+                        vm.call_static_named(&owner, &member, argv.clone())
+                    }
+                }
+            };
+            match res {
                 Ok(Some(v)) => Some(Some(v)),
                 Ok(None) => Some(Some(V::Ref(0))),
                 Err(e) => {

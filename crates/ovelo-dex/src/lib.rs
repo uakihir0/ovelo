@@ -125,6 +125,32 @@ pub struct EncodedMethod {
     pub code_off: u32,
 }
 
+/// One `annotation_item`: visibility plus the annotation's type and
+/// its (name_idx, encoded_value) element list.
+#[derive(Debug, Clone)]
+pub struct AnnotationItem {
+    /// `visibility` field.
+    pub visibility: u8,
+    /// `type_idx` field.
+    pub type_idx: u32,
+    /// Annotation elements as (name_idx, value) pairs.
+    pub elements: Vec<(u32, EncodedValue)>,
+}
+
+/// Decoded `annotations_directory_item` — annotation-set offsets
+/// grouped by member kind (all local to the class's dex).
+#[derive(Debug, Clone, Default)]
+pub struct AnnotationsDirectory {
+    /// `class_annotations_off` field.
+    pub class_annotations_off: u32,
+    /// (field_idx, annotation_set_off) pairs.
+    pub field_annotations: Vec<(u32, u32)>,
+    /// (method_idx, annotation_set_off) pairs.
+    pub method_annotations: Vec<(u32, u32)>,
+    /// (method_idx, annotation_set_ref_list_off) pairs.
+    pub param_annotations: Vec<(u32, u32)>,
+}
+
 /// Decoded `class_data_item`.
 #[derive(Debug, Clone)]
 pub struct ClassData {
@@ -485,6 +511,59 @@ impl DexFile {
             }
         }
         Ok(None)
+    }
+
+    /// `annotations_directory_item` for a class def — the per-member
+    /// annotation-set offsets. Empty when `annotations_off == 0`.
+    pub fn annotations_directory(&self, def: &ClassDef) -> Result<AnnotationsDirectory> {
+        let mut dir = AnnotationsDirectory::default();
+        if def.annotations_off == 0 {
+            return Ok(dir);
+        }
+        let mut r = R::at(&self.bytes, def.annotations_off as usize);
+        dir.class_annotations_off = r.u32()?;
+        let nf = r.u32()? as usize;
+        let nm = r.u32()? as usize;
+        let np = r.u32()? as usize;
+        for _ in 0..nf {
+            dir.field_annotations.push((r.u32()?, r.u32()?));
+        }
+        for _ in 0..nm {
+            dir.method_annotations.push((r.u32()?, r.u32()?));
+        }
+        for _ in 0..np {
+            dir.param_annotations.push((r.u32()?, r.u32()?));
+        }
+        Ok(dir)
+    }
+
+    /// `annotation_set_item` at `off`: each entry's visibility, type
+    /// index and element list, in set order.
+    pub fn annotation_set(&self, off: u32) -> Result<Vec<AnnotationItem>> {
+        let mut r = R::at(&self.bytes, off as usize);
+        let n = r.u32()? as usize;
+        if n > (r.end - r.p) / 4 {
+            return Err(err("dex.annotations.bounds"));
+        }
+        let mut offs = Vec::with_capacity(n);
+        for _ in 0..n {
+            offs.push(r.u32()?);
+        }
+        let mut out = Vec::with_capacity(n);
+        for o in offs {
+            if o as usize >= self.bytes.len() {
+                return Err(err("dex.annotations.bounds"));
+            }
+            let mut ir = R::at(&self.bytes, o as usize);
+            let visibility = ir.u8()?;
+            let (type_idx, elements) = read_encoded_annotation(&mut ir, 0)?;
+            out.push(AnnotationItem {
+                visibility,
+                type_idx,
+                elements,
+            });
+        }
+        Ok(out)
     }
 
     /// Decode a `code_item` at `code_off` (0 → no code).
@@ -943,8 +1022,14 @@ pub enum EncodedValue {
     MethodHandle(u32),
     /// `VALUE_ARRAY`.
     Array(Vec<EncodedValue>),
-    /// `VALUE_ANNOTATION` (contents skipped).
-    Annotation,
+    /// `VALUE_ANNOTATION` — the annotation's type index and its
+    /// (name_idx, value) element list.
+    Annotation {
+        /// `type_idx` field.
+        type_idx: u32,
+        /// Annotation elements as (name_idx, value) pairs.
+        elements: Vec<(u32, EncodedValue)>,
+    },
     /// `VALUE_NULL`.
     Null,
     /// `VALUE_BOOLEAN`.
@@ -1010,20 +1095,34 @@ fn read_encoded_value_at(r: &mut R, depth: usize) -> Result<EncodedValue> {
             EncodedValue::Array(items)
         }
         0x1d => {
-            // encoded_annotation: type_idx, size, then size ×
-            // (name_idx uleb + encoded_value).
-            let _ty = r.uleb128()?;
-            let size = r.uleb128()? as usize;
-            for _ in 0..size.min(1 << 16) {
-                let _name = r.uleb128()?;
-                let _ = read_encoded_value_at(r, depth + 1)?;
+            let (type_idx, elements) = read_encoded_annotation(r, depth)?;
+            EncodedValue::Annotation {
+                type_idx,
+                elements,
             }
-            EncodedValue::Annotation
         }
         0x1e => EncodedValue::Null,
         0x1f => EncodedValue::Bool(arg != 0),
         _ => return Err(err("dex.encoded_value.type")),
     })
+}
+
+/// `encoded_annotation`: type_idx + size × (name_idx, encoded_value).
+fn read_encoded_annotation(
+    r: &mut R,
+    depth: usize,
+) -> Result<(u32, Vec<(u32, EncodedValue)>)> {
+    let type_idx = r.uleb128()?;
+    let n = r.uleb128()? as usize;
+    if n > 1 << 16 {
+        return Err(err("dex.encoded_value.bounds"));
+    }
+    let mut elements = Vec::with_capacity(n);
+    for _ in 0..n {
+        let name_idx = r.uleb128()?;
+        elements.push((name_idx, read_encoded_value_at(r, depth + 1)?));
+    }
+    Ok((type_idx, elements))
 }
 
 fn read_encoded_fields(r: &mut R, count: usize) -> Result<Vec<EncodedField>> {

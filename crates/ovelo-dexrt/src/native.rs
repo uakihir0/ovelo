@@ -8,9 +8,9 @@
 // code. Safety invariants are documented at each site.
 #![allow(unsafe_code)]
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::ffi::{c_void, CString};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, LazyLock, Mutex};
 #[cfg(target_os = "macos")]
 use std::sync::OnceLock;
 
@@ -343,8 +343,11 @@ unsafe impl Sync for NativeLib {}
 impl Drop for NativeLib {
     fn drop(&mut self) {
         // Unregister first — later dl_iterate_phdr walks must not
-        // report this lib's phdrs after the image is unmapped.
+        // report this lib's phdrs, and the global scope must not hand
+        // out addresses inside this image, after it is unmapped.
         PHDR_LIBS.lock().unwrap().retain(|l| l.bias != self.bias);
+        let (lo, hi) = (self.map as usize, self.map as usize + self.span);
+        globals_scrub(&mut GLOBAL_SYMS.lock().unwrap(), lo, hi);
         LOADED_RANGES
             .lock()
             .unwrap()
@@ -1190,8 +1193,228 @@ struct Dyn {
     needed: Vec<usize>,
 }
 
-/// Parse + map + relocate an ELF64 ET_DYN aarch64 image.
-pub fn load_so(name: &str, elf: &[u8]) -> Result<NativeLib> {
+/// Exports of every lib loaded in this process: symbol → candidate
+/// addresses in load order — the dynamic linker's "global scope"
+/// later relocations resolve against (a lib's DT_NEEDED deps are
+/// always loaded before it). The FIRST candidate is the effective
+/// binding (first registration wins, matching breadth-first order);
+/// shadowed duplicates wait underneath so scrubbing a dead lib's
+/// range uncovers the next provider instead of losing the symbol.
+static GLOBAL_SYMS: LazyLock<Mutex<HashMap<String, Vec<usize>>>> =
+    LazyLock::new(|| Mutex::new(HashMap::new()));
+/// Scrub every candidate inside `[map, map+span)` from `g`; empty
+/// buckets go away.
+fn globals_scrub(g: &mut HashMap<String, Vec<usize>>, lo: usize, hi: usize) {
+    g.retain(|_, cands| {
+        cands.retain(|a| !(*a >= lo && *a < hi));
+        !cands.is_empty()
+    });
+}
+/// Sonames already mapped — a second DT_NEEDED edge or `loadLibrary`
+/// call reuses the image instead of double-mapping it.
+static LOADED_SONAMES: LazyLock<Mutex<HashSet<String>>> =
+    LazyLock::new(|| Mutex::new(HashSet::new()));
+
+/// DT_NEEDED sonames of `elf` (dependencies), in declared order.
+/// Names live in the file's dynstr; DT_STRTAB is a vaddr converted
+/// back to a file offset via the PT_LOAD table.
+fn elf_needed(elf: &[u8]) -> Vec<String> {
+    let mut out = Vec::new();
+    if elf.len() < 64 || &elf[0..4] != b"\x7fELF" {
+        return out;
+    }
+    let phoff = rd64(elf, 32) as usize;
+    let phentsize = rd16(elf, 54) as usize;
+    let phnum = rd16(elf, 56) as usize;
+    let mut loads: Vec<(usize, usize, usize)> = Vec::new(); // (vaddr, off, filesz)
+    let mut dyn_off = 0usize;
+    for i in 0..phnum {
+        let p = phoff + i * phentsize;
+        if p + 56 > elf.len() {
+            break;
+        }
+        match rd32(elf, p) {
+            PT_LOAD => loads.push((
+                rd64(elf, p + 16) as usize,
+                rd64(elf, p + 8) as usize,
+                rd64(elf, p + 32) as usize,
+            )),
+            PT_DYNAMIC => dyn_off = rd64(elf, p + 8) as usize,
+            _ => {}
+        }
+    }
+    if dyn_off == 0 {
+        return out;
+    }
+    let v2o = |va: usize| -> Option<usize> {
+        loads
+            .iter()
+            .find_map(|&(v, o, s)| (va >= v && va < v + s).then_some(o + (va - v)))
+    };
+    let mut strtab = 0usize;
+    let mut strsz = 0usize;
+    let mut need_offs = Vec::new();
+    let mut e = dyn_off;
+    while e + 16 <= elf.len() {
+        let tag = rd64(elf, e) as i64;
+        let val = rd64(elf, e + 8) as usize;
+        if tag == DT_NULL {
+            break;
+        }
+        match tag {
+            DT_NEEDED => need_offs.push(val),
+            DT_STRTAB => strtab = v2o(val).unwrap_or(0),
+            DT_STRSZ => strsz = val,
+            _ => {}
+        }
+        e += 16;
+    }
+    for off in need_offs {
+        if off >= strsz {
+            continue;
+        }
+        let start = strtab + off;
+        if start >= elf.len() {
+            continue;
+        }
+        let end = elf[start..]
+            .iter()
+            .position(|&b| b == 0)
+            .map(|n| start + n)
+            .unwrap_or(elf.len());
+        out.push(String::from_utf8_lossy(&elf[start..end]).into_owned());
+    }
+    out
+}
+
+/// Load `elf` plus, recursively, every DT_NEEDED library `lookup`
+/// can supply (APK-bundled dependencies). Returns libs in
+/// dependency-first order; the tail is the requested lib. Each
+/// dep's exports join `GLOBAL_SYMS` before the dependent relocates,
+/// so `libjxlcoder.so` finds `Jxl*` in `libjxl.so` etc.
+pub fn load_tree(
+    name: &str,
+    elf: &[u8],
+    lookup: &mut dyn FnMut(&str) -> Option<Vec<u8>>,
+) -> Result<Vec<NativeLib>> {
+    let mut out = Vec::new();
+    match load_tree_into(name, elf, lookup, &mut out, 0) {
+        Ok(()) => {
+            // Bionic order: the whole tree relocates first, then ctors
+            // run dependency-first. A dep's DT_INIT may legitimately
+            // call back into its dependent (callback registration) —
+            // running inits during the recursive load would hit a
+            // still-unrelocated, non-executable parent image.
+            for (_, inits) in &out {
+                run_ctors(inits);
+            }
+            Ok(out.into_iter().map(|(l, _)| l).collect())
+        }
+        Err(e) => {
+            // Unwind the failed tree like bionic's failed dlopen:
+            // no ctors ran yet, so nothing outside `out` can have
+            // bound to these exports. Unmark the sonames so a later
+            // load re-maps fresh copies, then drop — NativeLib::drop
+            // scrubs each lib's exports from GLOBAL_SYMS before
+            // unmapping, so no dangling addresses survive.
+            {
+                let mut names = LOADED_SONAMES.lock().unwrap();
+                for (l, _) in &out {
+                    names.remove(l.name.rsplit('/').next().unwrap_or(&l.name));
+                }
+            }
+            drop(out);
+            Err(e)
+        }
+    }
+}
+
+fn load_tree_into(
+    name: &str,
+    elf: &[u8],
+    lookup: &mut dyn FnMut(&str) -> Option<Vec<u8>>,
+    out: &mut Vec<(NativeLib, Vec<usize>)>,
+    depth: usize,
+) -> Result<()> {
+    if depth > 16 {
+        return Err(err("elf.depdepth"));
+    }
+    let base = name.rsplit('/').next().unwrap_or(name).to_string();
+    if !LOADED_SONAMES.lock().unwrap().insert(base.clone()) {
+        // Already loaded, or a dep edge circling back to a lib still
+        // loading — its exports are already in GLOBAL_SYMS either way.
+        return Ok(());
+    }
+    let r = (|| {
+        // Map + publish this lib's exports BEFORE its deps relocate:
+        // a dep that references its dependent's symbols (plugin-style
+        // callbacks into the requester) binds them — bionic adds the
+        // image to the link map's global scope before relocating deps.
+        let mapped = map_so(elf)?;
+        {
+            let mut g = GLOBAL_SYMS.lock().unwrap();
+            for (n, a) in &mapped.exports {
+                g.entry(n.clone()).or_default().push(*a);
+            }
+        }
+        for soname in elf_needed(elf) {
+            let dep = soname.rsplit('/').next().unwrap_or(&soname).to_string();
+            // A bundled bionic would collide with the host/shim libc —
+            // its symbols resolve via builtin_shim/host_dlsym anyway.
+            if matches!(dep.as_str(), "libc.so" | "libm.so" | "libdl.so" | "libstdc++.so") {
+                continue;
+            }
+            if LOADED_SONAMES.lock().unwrap().contains(&dep) {
+                continue;
+            }
+            if let Some(bytes) = lookup(&dep) {
+                if let Err(e) = load_tree_into(&dep, &bytes, lookup, out, depth + 1) {
+                    eprintln!("[jni] dep {dep}: {e}");
+                }
+            }
+        }
+        // Exports were published at map time; a failed finish must
+        // take them back — the image stays mapped but unfinished, so
+        // binding to its symbols would jump into an unrelocated body.
+        let img = (mapped.map as usize, mapped.map as usize + mapped.span);
+        match finish_so(mapped, name) {
+            Ok(x) => out.push(x),
+            Err(e) => {
+                globals_scrub(&mut GLOBAL_SYMS.lock().unwrap(), img.0, img.1);
+                return Err(e);
+            }
+        }
+        Ok(())
+    })();
+    if r.is_err() {
+        LOADED_SONAMES.lock().unwrap().remove(&base);
+    }
+    r
+}
+
+/// An image copied into memory with its dynamic info parsed and
+/// exports computed — relocations and initializers not yet applied.
+/// Deliberately has no Drop: once a lib's exports join `GLOBAL_SYMS`
+/// its mapping must never go away, so a failed finish leaks the
+/// mapping rather than leaving dangling symbol addresses behind.
+struct MappedLib {
+    map: *mut u8,
+    span: usize,
+    bias: usize,
+    lo: u64,
+    d: Dyn,
+    segs: Vec<(usize, usize, u32)>,
+    exports: HashMap<String, usize>,
+    /// Raw program-header bytes (for `dl_iterate_phdr`) + count.
+    phdrs: Vec<u8>,
+    phnum: usize,
+}
+
+/// Parse + map an ELF64 ET_DYN aarch64 image: mmap, copy PT_LOADs,
+/// parse the dynamic table, compute the export map. Relocations and
+/// initializers happen in `finish_so` — split so a dependent's
+/// exports can publish before its deps relocate (dep→dependent edges).
+fn map_so(elf: &[u8]) -> Result<MappedLib> {
     install_crash_dump();
     if elf.len() < 64 || &elf[0..4] != b"\x7fELF" || elf[4] != 2 || elf[5] != 1 {
         return Err(err("elf.bad"));
@@ -1275,10 +1498,6 @@ pub fn load_so(name: &str, elf: &[u8]) -> Result<NativeLib> {
             }
         }
     }
-    // A raw guest-vaddr-derived pointer is legal only inside the
-    // mapping — relocations and init pointers must all pass this.
-    let in_img = |a: usize, n: usize| a >= map as usize && a + n <= map_end;
-
     // Dynamic table.
     let mut d = Dyn {
         strtab: 0,
@@ -1373,8 +1592,6 @@ pub fn load_so(name: &str, elf: &[u8]) -> Result<NativeLib> {
     };
     let sym_shndx = |i: usize| -> u16 { unsafe { ((d.symtab + i * 24 + 6) as *const u16).read() } };
     let sym_value = |i: usize| -> usize { unsafe { ((d.symtab + i * 24 + 8) as *const u64).read() as usize } };
-    let sym_bind = |i: usize| -> u8 { (unsafe { ((d.symtab + i * 24 + 4) as *const u8).read() }) >> 4 };
-
     // Export map (defined GLOBAL/WEAK/DEFAULT symbols).
     let mut exports: HashMap<String, usize> = HashMap::new();
     for i in 0..sym_count {
@@ -1384,12 +1601,66 @@ pub fn load_so(name: &str, elf: &[u8]) -> Result<NativeLib> {
         exports.insert(sym_name(i), bias + sym_value(i));
     }
 
+    let phdrs = elf
+        .get(phoff..phoff + phentsize * phnum)
+        .map(|r| r.to_vec())
+        .unwrap_or_default();
+
+    Ok(MappedLib {
+        map: map as *mut u8,
+        span,
+        bias,
+        lo,
+        d,
+        segs,
+        exports,
+        phdrs,
+        phnum,
+    })
+}
+
+/// Relocate + protect a mapped image, wrap it as a `NativeLib`, and
+/// collect its DT_INIT/DT_INIT_ARRAY entry points for `run_ctors`.
+/// Ctors are NOT run here: `load_tree` runs every tree member's ctors
+/// only after every member has relocated. A lib that fails partway
+/// stays mapped: tree loads publish exports at map time (so
+/// dep→dependent edges resolve), so unmapping it would leave dangling
+/// addresses in `GLOBAL_SYMS`.
+fn finish_so(m: MappedLib, name: &str) -> Result<(NativeLib, Vec<usize>)> {
+    let map = m.map;
+    let span = m.span;
+    let bias = m.bias;
+    let lo = m.lo;
+    let d = &m.d;
+    let segs = &m.segs;
+    let exports = &m.exports;
+    let map_end = map as usize + span;
+    // A raw guest-vaddr-derived pointer is legal only inside the
+    // mapping — relocations and init pointers must all pass this.
+    let in_img = |a: usize, n: usize| a >= map as usize && a + n <= map_end;
+    let sym_name = |i: usize| -> String {
+        let so = unsafe { (d.symtab as *const u8).add(i * 24) };
+        let name_off = unsafe { (so as *const u32).read() };
+        cstr_at(bias, d.strtab, name_off)
+    };
+    let sym_bind = |i: usize| -> u8 { (unsafe { ((d.symtab + i * 24 + 4) as *const u8).read() }) >> 4 };
+
     // Import resolution: own exports → shim table → host dlsym.
     let resolve = |i: usize, exports: &HashMap<String, usize>| -> Result<usize> {
         let name = sym_name(i);
         // strip ELF version suffix (`name@LIBC` handled by dynstr already
         // carrying plain name; version refs live in .gnu.version).
         if let Some(&a) = exports.get(&name) {
+            return Ok(a);
+        }
+        // Already-loaded libs (DT_NEEDED deps, earlier loadLibrary
+        // calls) — the global scope of the process link map.
+        if let Some(a) = GLOBAL_SYMS
+            .lock()
+            .unwrap()
+            .get(&name)
+            .and_then(|v| v.first().copied())
+        {
             return Ok(a);
         }
         if let Some(a) = builtin_shim(&name) {
@@ -1444,9 +1715,9 @@ pub fn load_so(name: &str, elf: &[u8]) -> Result<NativeLib> {
         Ok(())
     };
 
-    apply(&d, d.rela, d.relasz, 24, &exports)?;
-    apply(&d, d.jmprel, d.pltrelsz, 24, &exports)?;
-    apply(&d, d.android_rela, d.android_relasz, 24, &exports)?;
+    apply(d, d.rela, d.relasz, 24, exports)?;
+    apply(d, d.jmprel, d.pltrelsz, 24, exports)?;
+    apply(d, d.android_rela, d.android_relasz, 24, exports)?;
     // Android packed REL (REL, no addend: *loc = base + *loc).
     let n_rel = d.android_relsz / 8;
     for k in 0..n_rel {
@@ -1463,7 +1734,7 @@ pub fn load_so(name: &str, elf: &[u8]) -> Result<NativeLib> {
                 loc.write(bias as u64 + cur);
             },
             R_AARCH64_ABS64 | R_AARCH64_GLOB_DAT | R_AARCH64_JUMP_SLOT => {
-                let s = resolve((r_info >> 32) as usize, &exports)?;
+                let s = resolve((r_info >> 32) as usize, exports)?;
                 unsafe { loc.write(s as u64) };
             }
             0 => {}
@@ -1480,7 +1751,7 @@ pub fn load_so(name: &str, elf: &[u8]) -> Result<NativeLib> {
     // by both an RX and an RW segment keeps both bits.
     let n_pages = span / PAGE;
     let mut page_prot = vec![0i32; n_pages];
-    for &(va, memsz, flags) in &segs {
+    for &(va, memsz, flags) in segs {
         if memsz == 0 {
             continue;
         }
@@ -1509,7 +1780,6 @@ pub fn load_so(name: &str, elf: &[u8]) -> Result<NativeLib> {
             } != 0
         {
             let e = std::io::Error::last_os_error();
-            unsafe { munmap(map, span) };
             return Err(errd("elf.mprotect", format!("{e}")));
         }
         start = end;
@@ -1521,7 +1791,6 @@ pub fn load_so(name: &str, elf: &[u8]) -> Result<NativeLib> {
     // derived, both checked against the mapping before they can branch
     // anywhere outside it.
     if d.init != 0 && !in_img(d.init, 4) {
-        unsafe { munmap(map, span) };
         return Err(err("elf.init"));
     }
     // Register with dl_iterate_phdr BEFORE the initializers run —
@@ -1529,19 +1798,22 @@ pub fn load_so(name: &str, elf: &[u8]) -> Result<NativeLib> {
     // list during DT_INIT and must find this lib. The phdr copy is
     // leaked so the reported pointer stays valid for the process.
     if let Ok(name_c) = CString::new(name) {
-        if let Some(raw) = elf.get(phoff..phoff + phentsize * phnum) {
+        if !m.phdrs.is_empty() {
             PHDR_LIBS.lock().unwrap().push(Arc::new(PhdrLib {
                 bias,
                 name: name_c,
-                phdrs: raw.into(),
-                phnum: phnum.try_into().unwrap_or(u16::MAX),
+                phdrs: m.phdrs.into(),
+                phnum: m.phnum.try_into().unwrap_or(u16::MAX),
             }));
         }
     }
 
+    // Collect initializers — run later by `run_ctors` once every lib
+    // in the tree is relocated. The INIT_ARRAY slots themselves were
+    // just relocated (R_AARCH64_RELATIVE), so read the real addresses.
+    let mut inits = Vec::new();
     if d.init != 0 {
-        let f: extern "C" fn() = unsafe { std::mem::transmute(d.init) };
-        with_guest_tls(|| f());
+        inits.push(d.init);
     }
     let n_init = if in_img(d.init_array, d.init_array_sz) {
         d.init_array_sz / 8
@@ -1549,18 +1821,47 @@ pub fn load_so(name: &str, elf: &[u8]) -> Result<NativeLib> {
         0
     };
     for k in 0..n_init {
-        let f: extern "C" fn() = unsafe { std::mem::transmute(((d.init_array + k * 8) as *const u64).read()) };
-        with_guest_tls(|| f());
+        inits.push(unsafe { ((d.init_array + k * 8) as *const u64).read() } as usize);
     }
 
-    Ok(NativeLib {
-        map: map as *mut u8,
-        span,
-        bias,
-        exports,
-        registered: HashMap::new(),
-        name: name.to_string(),
-    })
+    // Join the process global scope: later libs (and dep edges of
+    // siblings) resolve against these exports. First registration
+    // wins — keeps breadth-first precedence when names collide.
+    {
+        let mut g = GLOBAL_SYMS.lock().unwrap();
+        for (n, a) in exports {
+            g.entry(n.clone()).or_default().push(*a);
+        }
+    }
+
+    Ok((
+        NativeLib {
+            map,
+            span,
+            bias,
+            exports: m.exports,
+            registered: HashMap::new(),
+            name: name.to_string(),
+        },
+        inits,
+    ))
+}
+
+/// DT_INIT then DT_INIT_ARRAY, each under the guest TLS window.
+fn run_ctors(inits: &[usize]) {
+    for &a in inits {
+        let f: extern "C" fn() = unsafe { std::mem::transmute(a) };
+        with_guest_tls(|| f());
+    }
+}
+
+/// Single-image load: map, relocate, initialize. `load_tree` is the
+/// entry point for libs with DT_NEEDED edges.
+#[allow(dead_code)]
+pub fn load_so(name: &str, elf: &[u8]) -> Result<NativeLib> {
+    let (lib, inits) = finish_so(map_so(elf)?, name)?;
+    run_ctors(&inits);
+    Ok(lib)
 }
 
 fn gnu_sym_count(gh: usize) -> usize {

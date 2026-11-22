@@ -414,6 +414,8 @@ fn register_compat_shims(
     v: &mut ovelo_dexrt::Vm,
     initializers: &[String],
     components: std::rc::Rc<std::cell::RefCell<std::collections::HashMap<String, ovelo_dexrt::V>>>,
+    provider_ran: std::rc::Rc<std::cell::Cell<bool>>,
+    manifest: &ovelo_apk::manifest::ManifestInfo,
 ) {
     use ovelo_dexrt::{HostState, Obj, V};
     use std::cell::RefCell;
@@ -568,11 +570,24 @@ fn register_compat_shims(
         "(Ljava/lang/Class;Ljava/util/Set;)Ljava/lang/Object;",
     ] {
         let components2 = components.clone();
+        let provider_ran2 = provider_ran.clone();
         let _ = v.register_host(
             "Landroidx/startup/AppInitializer;",
             "initializeComponent",
             sig,
             Rc::new(RefCell::new(move |vm: &mut ovelo_dexrt::Vm, a: &[V]| {
+                // The real provider already ran discoverAndInitialize:
+                // delegate to the dex body so the guest's own mInitialized
+                // cache answers — never a second create().
+                if provider_ran2.get() {
+                    if let Some(V::Ref(ai)) = a.first().copied() {
+                        if let Ok(r) =
+                            vm.call_virtual_direct(ai, "initializeComponent", &a[1..])
+                        {
+                            return Ok(r);
+                        }
+                    }
+                }
                 // Answer the component instance the caller expects:
                 // instantiate the Initializer named by the Class argument
                 // and return its `create(context)` result, the way AOSP's
@@ -622,6 +637,18 @@ fn register_compat_shims(
         "getInstance",
         "(Landroid/content/Context;)Landroidx/startup/AppInitializer;",
         Rc::new(RefCell::new(move |vm: &mut ovelo_dexrt::Vm, a: &[V]| {
+            // Provider ran: return the guest's own singleton — its
+            // mDiscovered/mInitialized carry the discovered state.
+            if provider_ran.get() {
+                if let Some(V::Ref(h)) = vm.get_static_named(
+                    "Landroidx/startup/AppInitializer;",
+                    "sInstance",
+                ) {
+                    if h != 0 {
+                        return Ok(Some(V::Ref(h)));
+                    }
+                }
+            }
             let set = discovered
                 .iter()
                 .map(|d| V::Ref(vm.class_handle(d)))
@@ -659,9 +686,288 @@ fn register_compat_shims(
             Ok(Some(ai))
         })) as ovelo_dexrt::HostCall,
     );
-}
+    // androidx.startup's `InitializationProvider.onCreate` reads
+    // `getProviderInfo(component, GET_META_DATA).metaData` — the
+    // manifest <meta-data> bundle mapping each initializer's class
+    // name to "androidx.startup". The builtin arm hands back an
+    // empty ProviderInfo, so attach the real manifest data here;
+    // then the provider's own `discoverAndInitialize` populates
+    // the (obfuscated) AppInitializer fields genuinely.
+    let meta_names: Vec<String> = initializers.to_vec();
+    let _ = v.register_host(
+        "Landroid/content/pm/PackageManager;",
+        "getProviderInfo",
+        "(Landroid/content/ComponentName;I)Landroid/content/pm/ProviderInfo;",
+        Rc::new(RefCell::new(move |vm: &mut ovelo_dexrt::Vm, a: &[V]| {
+            // Only the startup provider gets the meta-data bundle —
+            // read the requested ComponentName's mClass so other
+            // providers don't see android.startup data.
+            let wants_startup = match a.get(1).copied() {
+                Some(V::Ref(cn)) => {
+                    let cls = vm
+                        .get_object_field(cn, "Landroid/content/ComponentName;", "mClass")
+                        .and_then(|v| match v {
+                            V::Ref(h) => vm.heap.str_val(h).map(|t| t.to_string()),
+                            _ => None,
+                        })
+                        .unwrap_or_default();
+                    cls.is_empty() || cls.ends_with("InitializationProvider")
+                }
+                _ => false,
+            };
+            if !wants_startup {
+                return Ok(Some(V::Ref(vm.heap.alloc(Obj::Host {
+                    class_idx: u64::MAX,
+                    desc: "Landroid/content/pm/ProviderInfo;".to_string(),
+                    fields: HashMap::new(),
+                    state: HostState::Empty,
+                }))));
+            }
+            let pairs: Vec<(ovelo_dexrt::V, ovelo_dexrt::V)> = meta_names
+                .iter()
+                .map(|n| {
+                    (
+                        V::Ref(vm.heap.intern_str(n)),
+                        V::Ref(vm.heap.intern_str("androidx.startup")),
+                    )
+                })
+                .collect();
+            let bundle = V::Ref(vm.heap.alloc(Obj::Host {
+                class_idx: u64::MAX,
+                desc: "Landroid/os/Bundle;".to_string(),
+                fields: HashMap::new(),
+                state: HostState::Map(pairs),
+            }));
+            let pi = V::Ref(vm.heap.alloc(Obj::Host {
+                class_idx: u64::MAX,
+                desc: "Landroid/content/pm/ProviderInfo;".to_string(),
+                fields: HashMap::new(),
+                state: HostState::Empty,
+            }));
+            if let (V::Ref(h), V::Ref(b)) = (pi, bundle) {
+                ovelo_dexrt::pseudo_set(vm, h, ovelo_dexrt::P_META, V::Ref(b));
+            }
+            Ok(Some(pi))
+        })) as ovelo_dexrt::HostCall,
+    );
 
-/// Launch any Activity a guest queued via `startActivity` (component
+    // Manifest-declared components: libraries that resolve components
+    // through PackageManager — media3's SessionToken finds the app's
+    // MediaBrowserService via queryIntentServices/resolveService and
+    // reads ResolveInfo.serviceInfo — get real ResolveInfo objects
+    // instead of the builtin's empty list. An Intent naming a specific
+    // component filters to that class; no component means "all".
+    // The Intent's target class: the component lives in P_COMPONENT
+    // (setComponent/setClass/ctor) as a ComponentName, a Class mirror
+    // or a bare class-name string; ComponentName keeps it in P_DATA.
+    fn intent_class(vm: &ovelo_dexrt::Vm, v: Option<ovelo_dexrt::V>) -> Option<String> {
+        let V::Ref(ih) = v? else {
+            return None;
+        };
+        let V::Ref(ch) = ovelo_dexrt::pseudo_get(vm, ih, ovelo_dexrt::P_COMPONENT)?
+        else {
+            return None;
+        };
+        if let Some(t) = vm.heap.str_val(ch).map(|t| t.to_string()) {
+            return Some(t);
+        }
+        if let Some(V::Ref(sh)) = ovelo_dexrt::pseudo_get(vm, ch, ovelo_dexrt::P_DATA) {
+            if let Some(t) = vm.heap.str_val(sh).map(|t| t.to_string()) {
+                return Some(t);
+            }
+        }
+        vm.class_descriptor_of(ch).map(|d| {
+            d.trim_start_matches('L')
+                .trim_end_matches(';')
+                .replace('/', ".")
+        })
+    }
+    fn mint_info(
+        vm: &mut ovelo_dexrt::Vm,
+        info_desc: &str,
+        name: &str,
+        pkg: &str,
+    ) -> ovelo_dexrt::V {
+        let info = V::Ref(vm.heap.alloc(Obj::Host {
+            class_idx: u64::MAX,
+            desc: info_desc.to_string(),
+            fields: HashMap::new(),
+            state: HostState::Empty,
+        }));
+        if let V::Ref(h) = info {
+            let n = V::Ref(vm.heap.intern_str(name));
+            let p = V::Ref(vm.heap.intern_str(pkg));
+            ovelo_dexrt::pseudo_set(vm, h, ovelo_dexrt::P_DATA, n);
+            ovelo_dexrt::pseudo_set(vm, h, ovelo_dexrt::P_COMPONENT, p);
+        }
+        info
+    }
+    fn mint_ri(
+        vm: &mut ovelo_dexrt::Vm,
+        info_desc: &str,
+        name: &str,
+        pkg: &str,
+    ) -> ovelo_dexrt::V {
+        let info = mint_info(vm, info_desc, name, pkg);
+        let ri = V::Ref(vm.heap.alloc(Obj::Host {
+            class_idx: u64::MAX,
+            desc: "Landroid/content/pm/ResolveInfo;".to_string(),
+            fields: HashMap::new(),
+            state: HostState::Empty,
+        }));
+        if let (V::Ref(rh), V::Ref(ih)) = (ri, info) {
+            ovelo_dexrt::pseudo_set(vm, rh, ovelo_dexrt::P_TARGET, V::Ref(ih));
+        }
+        ri
+    }
+    // queryIntent* → List<ResolveInfo> over the declared names.
+    for (info_desc, meth, names) in [
+        (
+            "Landroid/content/pm/ServiceInfo;",
+            "queryIntentServices",
+            manifest.services.clone(),
+        ),
+        (
+            "Landroid/content/pm/ActivityInfo;",
+            "queryIntentActivities",
+            manifest.activities.clone(),
+        ),
+        (
+            "Landroid/content/pm/ActivityInfo;",
+            "queryBroadcastReceivers",
+            manifest.receivers.clone(),
+        ),
+        (
+            "Landroid/content/pm/ProviderInfo;",
+            "queryIntentContentProviders",
+            manifest.providers.clone(),
+        ),
+    ] {
+        let pkg = manifest.package.clone();
+        let _ = v.register_host(
+            "Landroid/content/pm/PackageManager;",
+            meth,
+            "(Landroid/content/Intent;I)Ljava/util/List;",
+            Rc::new(RefCell::new(move |vm: &mut ovelo_dexrt::Vm, a: &[V]| {
+                let want = intent_class(vm, a.get(1).copied());
+                let infos: Vec<V> = names
+                    .iter()
+                    .filter(|n| {
+                        want.as_deref()
+                            .is_none_or(|c| n.ends_with(c) || *n == c)
+                    })
+                    .map(|n| mint_ri(vm, info_desc, n, &pkg))
+                    .collect();
+                if std::env::var_os("PMDEBUG").is_some() {
+                    eprintln!("[pmdbg] {meth} want={want:?} names={names:?} -> {} infos", infos.len());
+                }
+                Ok(Some(V::Ref(vm.heap.alloc(Obj::Host {
+                    class_idx: u64::MAX,
+                    desc: "Ljava/util/List;".to_string(),
+                    fields: HashMap::new(),
+                    state: HostState::List(infos),
+                }))))
+            })) as ovelo_dexrt::HostCall,
+        );
+    }
+    // resolveService / resolveActivity → the first match or null.
+    for (info_desc, meth, names) in [
+        (
+            "Landroid/content/pm/ServiceInfo;",
+            "resolveService",
+            manifest.services.clone(),
+        ),
+        (
+            "Landroid/content/pm/ActivityInfo;",
+            "resolveActivity",
+            manifest.activities.clone(),
+        ),
+    ] {
+        let pkg = manifest.package.clone();
+        let _ = v.register_host(
+            "Landroid/content/pm/PackageManager;",
+            meth,
+            "(Landroid/content/Intent;I)Landroid/content/pm/ResolveInfo;",
+            Rc::new(RefCell::new(move |vm: &mut ovelo_dexrt::Vm, a: &[V]| {
+                let want = intent_class(vm, a.get(1).copied());
+                let hit = names
+                    .iter()
+                    .find(|n| {
+                        want.as_deref()
+                            .is_none_or(|c| n.ends_with(c) || *n == c)
+                    })
+                    .map(|n| mint_ri(vm, info_desc, n, &pkg))
+                    .unwrap_or(V::Ref(0));
+                if std::env::var_os("PMDEBUG").is_some() {
+                    eprintln!("[pmdbg] {meth} want={want:?} names={names:?} -> {hit:?}");
+                }
+                Ok(Some(hit))
+            })) as ovelo_dexrt::HostCall,
+        );
+    }
+    // getServiceInfo/getReceiverInfo/getActivityInfo → the declared
+    // info object, or NameNotFoundException like a real PackageManager.
+    for (info_desc, meth, ret_desc, names) in [
+        (
+            "Landroid/content/pm/ServiceInfo;",
+            "getServiceInfo",
+            "(Landroid/content/ComponentName;I)Landroid/content/pm/ServiceInfo;",
+            manifest.services.clone(),
+        ),
+        (
+            "Landroid/content/pm/ActivityInfo;",
+            "getReceiverInfo",
+            "(Landroid/content/ComponentName;I)Landroid/content/pm/ActivityInfo;",
+            manifest.receivers.clone(),
+        ),
+        (
+            "Landroid/content/pm/ActivityInfo;",
+            "getActivityInfo",
+            "(Landroid/content/ComponentName;I)Landroid/content/pm/ActivityInfo;",
+            manifest.activities.clone(),
+        ),
+    ] {
+        let pkg = manifest.package.clone();
+        let _ = v.register_host(
+            "Landroid/content/pm/PackageManager;",
+            meth,
+            ret_desc,
+            Rc::new(RefCell::new(move |vm: &mut ovelo_dexrt::Vm, a: &[V]| {
+                let want = match a.get(1).copied() {
+                    Some(V::Ref(ch)) => vm
+                        .get_object_field(ch, "Landroid/content/ComponentName;", "mClass")
+                        .and_then(|v| match v {
+                            V::Ref(sh) => vm.heap.str_val(sh).map(|t| t.to_string()),
+                            _ => None,
+                        }),
+                    _ => None,
+                };
+                let hit = names
+                    .iter()
+                    .find(|n| {
+                        want.as_deref()
+                            .is_none_or(|c| n.ends_with(c) || *n == c)
+                    })
+                    .map(|n| mint_info(vm, info_desc, n, &pkg))
+                    .unwrap_or_else(|| {
+                        // Undeclared component — keep the builtin's
+                        // empty-info answer (a guest catchable throw
+                        // isn't expressible through HostCall).
+                        V::Ref(vm.heap.alloc(Obj::Host {
+                            class_idx: u64::MAX,
+                            desc: info_desc.to_string(),
+                            fields: HashMap::new(),
+                            state: HostState::Empty,
+                        }))
+                    });
+                if std::env::var_os("PMDEBUG").is_some() {
+                    eprintln!("[pmdbg] {meth} want={want:?} -> {hit:?}");
+                }
+                Ok(Some(hit))
+            })) as ovelo_dexrt::HostCall,
+        );
+    }
+}
 /// Intent) — the target replaces the finished one on the same VM and
 /// window (single-task model). Its own `android:theme` and the caller's
 /// Intent come along. Bounded: a chain of redirects still terminates.
@@ -894,6 +1200,10 @@ fn run_app(store: &InstallStore, package: &str) -> Result<(), OveloError> {
                     String,
                     ovelo_dexrt::V,
                 >::new()));
+            // Set when the real androidx.startup InitializationProvider
+            // ran — the AppInitializer shims then delegate to dex code
+            // (the guest singletons carry the discovered state).
+            let provider_ran = std::rc::Rc::new(std::cell::Cell::new(false));
             let vm = (|| -> Result<_, OveloError> {
                 let (_cd, entries) = parse_central_directory(&bytes, &ZipLimits::default())?;
                 // Multi-dex: the Vm merges every classes*.dex into one
@@ -981,6 +1291,8 @@ fn run_app(store: &InstallStore, package: &str) -> Result<(), OveloError> {
                     &mut v,
                     &info.manifest.startup_initializers,
                     components.clone(),
+                    provider_ran.clone(),
+                    &info.manifest,
                 );
                 Ok(v)
             })();
@@ -1003,7 +1315,39 @@ fn run_app(store: &InstallStore, package: &str) -> Result<(), OveloError> {
                                 state: ovelo_dexrt::HostState::Empty,
                             })
                         });
+                    // Prefer the real ContentProvider path: run the
+                    // manifest's androidx.startup InitializationProvider
+                    // onCreate so `discoverAndInitialize` populates
+                    // AppInitializer's own discovered/initialized sets —
+                    // lazy `initializeComponent` callers (e.g.
+                    // ProcessLifecycleInitializer) depend on them, and
+                    // the fields are R8-obfuscated so host writes can't
+                    // reach them. Fall back to driving the initializers
+                    // directly when the provider path fails.
+                    if info
+                        .manifest
+                        .providers
+                        .iter()
+                        .any(|p| p.ends_with("InitializationProvider"))
                     {
+                        match v.instantiate("Landroidx/startup/InitializationProvider;") {
+                            Ok(ph) => {
+                                let _ = v.call_virtual(
+                                    ph,
+                                    "attachInfo",
+                                    &[ovelo_dexrt::V::Ref(app_h), ovelo_dexrt::V::Ref(0)],
+                                );
+                                match v.call_virtual(ph, "onCreate", &[]) {
+                                    Ok(_) => provider_ran.set(true),
+                                    Err(e) => {
+                                        println!("startup provider onCreate failed: {e}")
+                                    }
+                                }
+                            }
+                            Err(e) => println!("startup provider not instantiated: {e}"),
+                        }
+                    }
+                    if !provider_ran.get() {
                         let mut seen = std::collections::HashSet::new();
                         for init in &info.manifest.startup_initializers {
                             run_initializer(

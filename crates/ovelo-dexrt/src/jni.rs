@@ -1402,13 +1402,33 @@ pub(crate) fn load_native_lib(vm: &mut Vm, arg: &str, absolute: bool) {
         eprintln!("[jni] loadLibrary {arg}: {path} skipped (denylist)");
         return;
     }
-    let lib = match crate::native::load_so(&path, &bytes) {
-        Ok(l) => l,
-        Err(e) => {
-            eprintln!("[jni] load_so {path}: {e}");
-            return;
+    // DT_NEEDED deps live beside the requested lib in the APK; each
+    // dep is mapped before the dependent so its exports are in the
+    // global scope when the dependent relocates.
+    let libs = {
+        let res = vm.apk_res.as_ref();
+        let mut lookup = |soname: &str| -> Option<Vec<u8>> {
+            res.and_then(|r| r.read(&format!("lib/arm64-v8a/{soname}")))
+        };
+        match crate::native::load_tree(&path, &bytes, &mut lookup) {
+            Ok(l) => l,
+            Err(e) => {
+                eprintln!("[jni] load_so {path}: {e}");
+                return;
+            }
         }
     };
+    let mut libs = libs;
+    let Some(lib) = libs.pop() else {
+        // Soname already mapped (e.g. as a dep of an earlier lib) —
+        // JNI_OnLoad runs once per image, so nothing to do.
+        eprintln!("[jni] loadLibrary {arg}: already loaded");
+        return;
+    };
+    if !libs.is_empty() {
+        eprintln!("[jni] deps loaded: {}", libs.len());
+        vm.natives.extend(libs);
+    }
     let onload = lib.exports.get("JNI_OnLoad").copied();
     eprintln!(
         "[jni] loaded {path} exports={} onload={onload:?}",

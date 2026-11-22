@@ -18,7 +18,7 @@ mod value;
 pub use aot::Aot;
 pub use jdk::view::{fire_global_layout, DexViewInfo, P_TCOLOR, P_TEXT, P_TSIZE};
 pub use value::{CanvasOp, PaintState};
-pub use jdk::{pseudo_get, pseudo_set};
+pub use jdk::{pseudo_get, pseudo_set, P_COMPONENT, P_DATA, P_META, P_TARGET};
 pub use value::{Heap, HostState, Obj, V};
 
 use aot::{AotFn, TRAP_DIV_ZERO, TRAP_REM_ZERO};
@@ -2917,6 +2917,11 @@ impl Vm {
                 // with a default would let the app compute on a lie.
                 if self.def_of(gx(gd(midx), mid.class_idx as u32)).is_none() {
                     self.stub_placeholder(midx, &ret_desc, &name, &class, args)
+                } else if let Some(v) = self.annotation_method_value(midx, args) {
+                    // Bodiless annotation-interface call
+                    // (`subscribe.threadMode()`) answered from the
+                    // mirror's stored elements / declared default.
+                    Ok(Some(v))
                 } else {
                     vm("dexrt.invoke.unresolved").map_err(|e| match e {
                         E::Vm(v) => E::Vm(v.with_detail(self.describe_method(midx).to_string())),
@@ -3001,7 +3006,62 @@ impl Vm {
     }
 
     /// Invoke `midx` per `kind`; `args` includes the receiver for non-static.
+    /// `call_virtual` that bypasses registered host overrides on the
+    /// ROOT method only — compat shims delegate to the real dex body
+    /// through this once the genuine path is known to work (nested
+    /// invokes inside the dex body still honor host overrides).
+    pub fn call_virtual_direct(
+        &mut self,
+        this: u32,
+        name: &str,
+        args: &[V],
+    ) -> Result<Option<V>> {
+        let ci = self
+            .heap
+            .class_of(this)
+            .ok_or_else(|| errd("dexrt.bad_this", name.to_string()))?;
+        let Some(midx) = self.find_method_on_chain(ci, name, args.len())? else {
+            let desc = self.type_desc_of(ci).unwrap_or_default();
+            let mut a = Vec::with_capacity(args.len() + 1);
+            a.push(V::Ref(this));
+            a.extend_from_slice(args);
+            let r = jdk::call(self, &desc, name, "", &a).map_err(|e| match e {
+                E::Vm(v) => v,
+                E::Throw(t) => {
+                    let d = self.describe_throw(t);
+                    errd("dexrt.exception.uncaught", d)
+                }
+            })?;
+            return Ok(r.flatten());
+        };
+        let mut a = Vec::with_capacity(args.len() + 1);
+        a.push(V::Ref(this));
+        a.extend_from_slice(args);
+        let out = match self.invoke_inner(midx, a, InvokeKind::Virtual, true) {
+            Ok(v) => Ok(v),
+            Err(E::Vm(e)) => Err(e),
+            Err(E::Throw(r)) => {
+                let d = self.describe_throw(r);
+                Err(errd("dexrt.exception.uncaught", d))
+            }
+        };
+        if self.depth == 0 {
+            self.drain_runnables(500);
+        }
+        out
+    }
+
     fn invoke(&mut self, midx: GIdx, args: Vec<V>, kind: InvokeKind) -> Rt<Option<V>> {
+        self.invoke_inner(midx, args, kind, false)
+    }
+
+    fn invoke_inner(
+        &mut self,
+        midx: GIdx,
+        args: Vec<V>,
+        kind: InvokeKind,
+        skip_host: bool,
+    ) -> Rt<Option<V>> {
         // Serialize with JNI entry points: guest `.so`s spawn real
         // pthreads whose env calls must not alias the interpreter's
         // heap access (recursive mutex — nested invoke/JNI re-enters
@@ -3058,7 +3118,11 @@ impl Vm {
         // A registered host override short-circuits even a dex-defined
         // method — used for compat shims on library code that can't run
         // here (e.g. appcompat's vector-drawable path).
-        if let Some(f) = self.hosts.get(&loc.midx).cloned() {
+        if let Some(f) = if skip_host {
+            None
+        } else {
+            self.hosts.get(&loc.midx).cloned()
+        } {
             let has_recv = !matches!(kind, InvokeKind::Static);
             let args = self.compact_args(loc.midx, &args, has_recv);
             let Ok(mut g) = f.try_borrow_mut() else {
@@ -3121,6 +3185,352 @@ impl Vm {
     /// needs the same interpreter surface the opcodes use.
     pub(crate) fn invoke_pub(&mut self, midx: GIdx, args: Vec<V>, kind: InvokeKind) -> Rt<Option<V>> {
         self.invoke(midx, args, kind)
+    }
+
+    /// Invoke a STATIC method resolved by declaring-class desc + name
+    /// — `Method.invoke` with a null receiver lands here (e.g.
+    /// `Handler.createAsync` via HandlerCompat).
+    /// `Method.invoke` — dispatch the exact method the mirror stored in
+    /// `P_METH`, with virtual resolution on the target when present.
+    /// Mirrors from `getDeclaredMethods` carry the declaring method id;
+    /// re-resolving by name+arity picks the wrong overload.
+    pub(crate) fn invoke_method_mirror(
+        &mut self,
+        midx: GIdx,
+        target: u32,
+        args: Vec<V>,
+    ) -> Result<Option<V>> {
+        let res = if target != 0 {
+            let mut a = Vec::with_capacity(args.len() + 1);
+            a.push(V::Ref(target));
+            a.extend_from_slice(&args);
+            self.invoke(midx, a, InvokeKind::Virtual)
+        } else {
+            self.invoke(midx, args, InvokeKind::Static)
+        };
+        match res {
+            Ok(v) => Ok(v),
+            Err(E::Vm(e)) => Err(e),
+            Err(E::Throw(r)) => {
+                let d = self.describe_throw(r);
+                Err(errd("dexrt.exception.uncaught", d))
+            }
+        }
+    }
+
+    pub(crate) fn call_static_named(
+        &mut self,
+        owner: &str,
+        name: &str,
+        args: Vec<V>,
+    ) -> Result<Option<V>> {
+        let ci = self.type_index_of(owner).unwrap_or(GX_NONE);
+        match self.find_method_on_chain(ci, name, args.len()) {
+            Ok(Some(midx)) => match self.invoke(midx, args, InvokeKind::Static) {
+                Ok(v) => Ok(v),
+                Err(E::Vm(e)) => Err(e),
+                Err(E::Throw(r)) => {
+                    let d = self.describe_throw(r);
+                    Err(errd("dexrt.exception.uncaught", d))
+                }
+            },
+            _ => Err(errd(
+                "dexrt.invoke.unresolved",
+                format!("{owner}.{name}"),
+            )),
+        }
+    }
+
+    /// `EncodedValue` → guest value, resolving the dex-local indices
+    /// (string/type/field) against the dex that owns class `cg`.
+    fn encoded_to_v(&mut self, cg: GIdx, ev: &ovelo_dex::EncodedValue) -> Option<V> {
+        use ovelo_dex::EncodedValue as EV;
+        match ev {
+            EV::Byte(x) => Some(V::I32(*x as i32)),
+            EV::Short(x) => Some(V::I32(*x as i32)),
+            EV::Char(x) => Some(V::I32(*x as i32)),
+            EV::Int(x) => Some(V::I32(*x)),
+            EV::Bool(b) => Some(V::I32(*b as i32)),
+            EV::Long(x) => Some(V::I64(*x)),
+            EV::Float(x) => Some(V::F32(*x)),
+            EV::Double(x) => Some(V::F64(*x)),
+            EV::String(i) => {
+                let s = self.dex_of(cg)?.string(*i).ok()?;
+                Some(jdk::jstr(self, &s))
+            }
+            EV::Type(i) => Some(V::Ref(self.class_mirror(gx(gd(cg), *i)))),
+            EV::Enum(f) | EV::Field(f) => {
+                // The enum constant / field the element names — resolve
+                // to the same object an `sget` would return so guest
+                // `==` comparisons hold (EventBus's threadMode check).
+                let d = self.dex_of(cg)?;
+                let fi = d.field(*f).ok()?;
+                let odesc = d.type_descriptor(fi.class_idx as u32).ok()?;
+                let fname = d.string(fi.name_idx).ok()?;
+                self.get_static_named(&odesc, &fname)
+            }
+            EV::Array(items) => {
+                let vals: Vec<V> = items
+                    .iter()
+                    .map(|it| self.encoded_to_v(cg, it).unwrap_or(V::Ref(0)))
+                    .collect();
+                let h = self.heap.alloc(Obj::Array {
+                    elem: "Ljava/lang/Object;".to_string(),
+                    data: vals,
+                });
+                Some(V::Ref(h))
+            }
+            EV::Annotation {
+                type_idx,
+                elements,
+            } => self.annotation_mirror(cg, *type_idx, elements),
+            _ => None,
+        }
+    }
+
+    /// Mint an annotation mirror: a host obj typed by the annotation
+    /// interface whose Map state carries the element name→value pairs
+    /// (`Subscribe{threadMode:POSTING,sticky:false,priority:0}`).
+    fn annotation_mirror(
+        &mut self,
+        cg: GIdx,
+        type_idx: u32,
+        elements: &[(u32, ovelo_dex::EncodedValue)],
+    ) -> Option<V> {
+        let tdesc = self.dex_of(cg)?.type_descriptor(type_idx).ok()?;
+        let mut pairs = Vec::with_capacity(elements.len());
+        for (ni, ev) in elements {
+            let n = self.dex_of(cg)?.string(*ni).ok()?;
+            let v = self.encoded_to_v(cg, ev).unwrap_or(V::Ref(0));
+            pairs.push((jdk::jstr(self, &n), v));
+        }
+        Some(jdk::host(self, &tdesc, HostState::Map(pairs)))
+    }
+
+    /// The annotation set declared on a method — items are local to
+    /// the defining dex (`cg` pairs them back to their dex context).
+    pub(crate) fn method_annotation_items(
+        &self,
+        midx: GIdx,
+    ) -> (GIdx, Vec<ovelo_dex::AnnotationItem>) {
+        let fallback = (0, Vec::new());
+        let Some(d) = self.dex_of(midx) else {
+            return fallback;
+        };
+        let Ok(mid) = d.method(gl(midx)) else {
+            return fallback;
+        };
+        let cg = gx(gd(midx), mid.class_idx as u32);
+        let Some((_, def)) = self.def_loc_of(cg) else {
+            return fallback;
+        };
+        let Ok(dir) = d.annotations_directory(def) else {
+            return (cg, Vec::new());
+        };
+        let items = dir
+            .method_annotations
+            .iter()
+            .find(|(mi, _)| *mi == gl(midx))
+            .and_then(|(_, off)| d.annotation_set(*off).ok())
+            .unwrap_or_default();
+        (cg, items)
+    }
+
+    /// `Method.getAnnotation(Class)`: the declared annotation whose
+    /// type descriptor matches, minted on demand.
+    pub(crate) fn method_annotation(&mut self, midx: GIdx, annot_desc: &str) -> V {
+        let (cg, items) = self.method_annotation_items(midx);
+        for it in &items {
+            if self
+                .dex_of(cg)
+                .and_then(|d| d.type_descriptor(it.type_idx).ok())
+                .as_deref()
+                == Some(annot_desc)
+            {
+                return self
+                    .annotation_mirror(cg, it.type_idx, &it.elements)
+                    .unwrap_or(V::Ref(0));
+            }
+        }
+        V::Ref(0)
+    }
+
+    /// All declared annotations on a method as minted mirrors.
+    pub(crate) fn method_annotations(&mut self, midx: GIdx) -> Vec<V> {
+        let (cg, items) = self.method_annotation_items(midx);
+        items
+            .iter()
+            .filter_map(|it| self.annotation_mirror(cg, it.type_idx, &it.elements))
+            .collect()
+    }
+
+    /// `Method.getDefaultValue` — the `AnnotationDefault` element for an
+    /// annotation-interface method. DX stores it on the interface's
+    /// *class* annotation set with elements keyed by method name.
+    pub(crate) fn method_default_value(&mut self, midx: GIdx) -> Option<V> {
+        let (cg, name) = {
+            let d = self.dex_of(midx)?;
+            let mid = d.method(gl(midx)).ok()?;
+            let cg = gx(gd(midx), mid.class_idx as u32);
+            (cg, d.string(mid.name_idx).ok()?)
+        };
+        self.annotation_default_element(cg, &name)
+    }
+
+    /// Element `name` of the `AnnotationDefault` item in the class
+    /// annotation set of `cg`, converted to a value.
+    fn annotation_default_element(&mut self, cg: GIdx, name: &str) -> Option<V> {
+        let (_, def) = self.def_loc_of(cg)?;
+        let dir = self.dex_of(cg)?.annotations_directory(def).ok()?;
+        if dir.class_annotations_off == 0 {
+            return None;
+        }
+        let items = self
+            .dex_of(cg)?
+            .annotation_set(dir.class_annotations_off)
+            .ok()?;
+        for it in &items {
+            if self
+                .dex_of(cg)
+                .and_then(|d| d.type_descriptor(it.type_idx).ok())
+                .as_deref()
+                != Some("Ldalvik/annotation/AnnotationDefault;")
+            {
+                continue;
+            }
+            for (ni, ev) in &it.elements {
+                if self
+                    .dex_of(cg)
+                    .and_then(|d| d.string(*ni).ok())
+                    .as_deref()
+                    == Some(name)
+                {
+                    return self.encoded_to_v(cg, ev);
+                }
+            }
+        }
+        None
+    }
+
+    /// Answer a bodiless annotation-interface call (`subscribe.threadMode()`)
+    /// from the receiver mirror's elements, then its declared
+    /// `AnnotationDefault`. `None` when this isn't an annotation call.
+    fn annotation_method_value(&mut self, midx: GIdx, args: &[V]) -> Option<V> {
+        let (cg, name) = {
+            let d = self.dex_of(midx)?;
+            let mid = d.method(gl(midx)).ok()?;
+            let cg = gx(gd(midx), mid.class_idx as u32);
+            let (_, def) = self.def_loc_of(cg)?;
+            // ACC_ANNOTATION — only interface-style dex classes qualify.
+            if def.access_flags & 0x2000 == 0 {
+                return None;
+            }
+            (cg, d.string(mid.name_idx).ok()?)
+        };
+        let V::Ref(h) = args.first().copied().unwrap_or(V::Ref(0)) else {
+            return None;
+        };
+        let owner_desc = self.type_desc_of(cg).ok()?;
+        if let Some(Obj::Host {
+            desc,
+            state: HostState::Map(m),
+            ..
+        }) = self.heap.get(h)
+        {
+            if *desc == owner_desc {
+                for (k, v) in m {
+                    let kn = match k {
+                        V::Ref(kh) => jdk::s(self, *kh),
+                        _ => None,
+                    };
+                    if kn.as_deref() == Some(name.as_str()) {
+                        return Some(*v);
+                    }
+                }
+            } else {
+                return None;
+            }
+        } else {
+            return None;
+        }
+        // Declared default: the interface's class annotation set holds
+        // an AnnotationDefault item keyed by method name.
+        self.annotation_default_element(cg, &name)
+    }
+
+    /// Mint `java.lang.reflect.Method` mirrors for every method a dex
+    /// class declares — `getDeclaredMethods` backs reflection scanners
+    /// like EventBus's `@Subscribe` discovery.
+    pub(crate) fn declared_method_mirrors(&mut self, owner: &str) -> Vec<V> {
+        let mut specs: Vec<(GIdx, String, u32)> = Vec::new();
+        {
+            let Some(ci) = self.type_index_of(owner) else {
+                return Vec::new();
+            };
+            let Some((cg, def)) = self.def_loc_of(ci) else {
+                return Vec::new();
+            };
+            let Some(d) = self.dex_of(cg) else {
+                return Vec::new();
+            };
+            let Ok(cd) = d.class_data_rc(def) else {
+                return Vec::new();
+            };
+            for em in cd.direct_methods.iter().chain(cd.virtual_methods.iter()) {
+                let name = d
+                    .method(em.method_idx)
+                    .ok()
+                    .and_then(|m| d.string(m.name_idx).ok())
+                    .unwrap_or_default();
+                specs.push((gx(gd(cg), em.method_idx), name, em.access_flags));
+            }
+        }
+        let cv = jdk::jstr(self, owner);
+        specs
+            .into_iter()
+            .map(|(midx, name, flags)| {
+                let hv = jdk::host(self, "Ljava/lang/reflect/Method;", HostState::StrBuf(name));
+                if let V::Ref(h) = hv {
+                    jdk::pseudo_set(self, h, jdk::P_COMPONENT, cv);
+                    jdk::pseudo_set(self, h, jdk::P_METH, V::I64(midx as i64));
+                    jdk::pseudo_set(self, h, jdk::P_FLAGS, V::I32(flags as i32));
+                }
+                hv
+            })
+            .collect()
+    }
+
+    /// A method's declared parameter type descriptors (proto order).
+    pub(crate) fn method_param_descs(&self, midx: GIdx) -> Vec<String> {
+        let Some(d) = self.dex_of(midx) else {
+            return Vec::new();
+        };
+        let (Ok(mid),) = (d.method(gl(midx)),) else {
+            return Vec::new();
+        };
+        let Ok(p) = d.proto(mid.proto_idx as u32) else {
+            return Vec::new();
+        };
+        d.proto_params(p)
+            .unwrap_or_default()
+            .iter()
+            .filter_map(|t| d.type_descriptor(*t as u32).ok())
+            .collect()
+    }
+
+    /// A method's declared return type descriptor.
+    pub(crate) fn method_return_desc(&self, midx: GIdx) -> Option<String> {
+        let d = self.dex_of(midx)?;
+        let mid = d.method(gl(midx)).ok()?;
+        let p = d.proto(mid.proto_idx as u32).ok()?;
+        d.type_descriptor(p.return_type_idx).ok()
+    }
+
+    /// Read a guest static field by owner + name — host-side access to
+    /// singletons like `AppInitializer.sInstance` that dex code owns.
+    pub fn get_static_named(&mut self, owner: &str, name: &str) -> Option<V> {
+        let g = self.field_index_of(owner, name)?;
+        self.sget_pub(g)
     }
 
     /// Read a static like the `sget` opcode: guest-encoded value,
@@ -4264,39 +4674,7 @@ impl Vm {
             .static_value(def, local_idx)
             .ok()
             .flatten()?;
-        use ovelo_dex::EncodedValue as EV;
-        match v {
-            EV::Byte(x) => Some(V::I32(x as i32)),
-            EV::Short(x) => Some(V::I32(x as i32)),
-            EV::Char(x) => Some(V::I32(x as i32)),
-            EV::Int(x) => Some(V::I32(x)),
-            EV::Bool(b) => Some(V::I32(b as i32)),
-            EV::Long(x) => Some(V::I64(x)),
-            EV::Float(x) => Some(V::F32(x)),
-            EV::Double(x) => Some(V::F64(x)),
-            EV::String(i) => {
-                let s = self.dex_of(cg)?.string(i).ok()?;
-                Some(jdk::jstr(self, &s))
-            }
-            EV::Type(i) => Some(V::Ref(self.class_mirror(gx(gd(cg), i)))),
-            EV::Array(items) => {
-                let vals: Vec<V> = items
-                    .iter()
-                    .map(|it| match it {
-                        EV::Int(x) => V::I32(*x),
-                        EV::Long(x) => V::I64(*x),
-                        EV::Bool(b) => V::I32(*b as i32),
-                        _ => V::Ref(0),
-                    })
-                    .collect();
-                let h = self.heap.alloc(Obj::Array {
-                    elem: "Ljava/lang/Object;".to_string(),
-                    data: vals,
-                });
-                Some(V::Ref(h))
-            }
-            _ => None,
-        }
+        self.encoded_to_v(cg, &v)
     }
 
     fn aget(&mut self, h: u32, i: i32) -> Rt<V> {
