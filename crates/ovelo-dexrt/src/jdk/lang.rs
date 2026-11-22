@@ -2095,8 +2095,23 @@ fn throwable_call(vm: &mut Vm, name: &str, _sig: &str, args: &[V]) -> Rt<Option<
         "getSuppressed" => Some(Some(arr(vm, THROWABLE, vec![]))),
         "printStackTrace" => {
             let d = class_of(vm, args[0]);
-            let msg = slot_of(vm, h).and_then(|v| sv(vm, v)).unwrap_or_default();
-            eprintln!("[guest] {}: {}", dotted(&d), msg);
+            let mut msg = slot_of(vm, h).and_then(|v| sv(vm, v)).unwrap_or_default();
+            // Runtime-generated throwables keep their message and throw
+            // site on the Obj::Throwable itself rather than in a detail
+            // field — surface both so printStackTrace shows something
+            // useful for VM-thrown exceptions.
+            if let Some(Obj::Throwable { detail, .. }) = vm.heap.get(h) {
+                if msg.is_empty() {
+                    msg = detail.clone();
+                }
+                if let Some(site) = vm.throw_sites.get(&h) {
+                    eprintln!("[guest] {}: {msg} at {site}", dotted(&d));
+                } else {
+                    eprintln!("[guest] {}: {}", dotted(&d), msg);
+                }
+            } else {
+                eprintln!("[guest] {}: {}", dotted(&d), msg);
+            }
             Some(None)
         }
         _ => None,

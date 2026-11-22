@@ -708,7 +708,9 @@ pub(crate) fn call(
         // ---------- MotionEvent ----------
         "<init>" if class == "Landroid/view/MotionEvent;" => Some(None),
         "obtain" if class == "Landroid/view/MotionEvent;" => {
-            let h = vm.instantiate("Landroid/view/MotionEvent;").unwrap_or(0);
+            let V::Ref(h) = host(vm, "Landroid/view/MotionEvent;", HostState::Empty) else {
+                return Ok(Some(Some(V::Ref(0))));
+            };
             if h != 0 {
                 // Copy-overload (obtain(MotionEvent)) inherits the
                 // source's fields; the canonical (JJIFF…) overload
@@ -4422,21 +4424,25 @@ pub(crate) fn dispatch_touch(
     y: i32,
     action: i32,
 ) -> ovelo_error::Result<()> {
-    fn deepest(vm: &Vm, h: u32, x: i32, y: i32, check: bool) -> Option<u32> {
-        if check {
-            let l = pint(vm, h, P_LEFT);
-            let t = pint(vm, h, P_TOP);
-            let r = pint(vm, h, P_RIGHT);
-            let b = pint(vm, h, P_BOTTOM);
-            if !(x >= l && x < r && y >= t && y < b) {
-                return None;
-            }
+    // Child frames are stored in the PARENT's content coordinates
+    // (group_layout_fallback), so the hit test must carry each
+    // ancestor's absolute origin down the recursion.
+    fn deepest(vm: &Vm, h: u32, x: i32, y: i32, ox: i32, oy: i32) -> Option<u32> {
+        let l = ox + pint(vm, h, P_LEFT);
+        let t = oy + pint(vm, h, P_TOP);
+        let r = ox + pint(vm, h, P_RIGHT);
+        let b = oy + pint(vm, h, P_BOTTOM);
+        if std::env::var_os("OVELO_TOUCHDBG").is_some() {
+            eprintln!("[touchdbg]   try h{h} {} {l},{t},{r},{b}", vm.dbg_class_of(h));
+        }
+        if !(x >= l && x < r && y >= t && y < b) {
+            return None;
         }
         // Later children draw on top — hit-test them first.
         for c in children(vm, h).iter().rev() {
             if let V::Ref(ch) = c {
                 if *ch != 0 {
-                    if let Some(v) = deepest(vm, *ch, x, y, true) {
+                    if let Some(v) = deepest(vm, *ch, x, y, l, t) {
                         return Some(v);
                     }
                 }
@@ -4444,38 +4450,102 @@ pub(crate) fn dispatch_touch(
         }
         Some(h)
     }
+    fn abs_origin(vm: &Vm, mut v: u32) -> (i32, i32) {
+        let (mut ox, mut oy) = (0, 0);
+        for _ in 0..64 {
+            ox += pint(vm, v, P_LEFT);
+            oy += pint(vm, v, P_TOP);
+            v = match pseudo_get(vm, v, P_PARENT) {
+                Some(V::Ref(p)) => p,
+                _ => break,
+            };
+        }
+        (ox, oy)
+    }
+    let dbg = std::env::var_os("OVELO_TOUCHDBG").is_some();
     let mut target = 0u32;
     for r in vm.view_roots.clone().iter().rev() {
-        // Root bounds may be unset before its first layout — accept
-        // the root unconditionally so taps during early frames land.
-        if let Some(v) = deepest(vm, *r, x, y, false) {
+        if dbg {
+            eprintln!(
+                "[touchdbg] root h{r} {} {},{},{},{}",
+                vm.dbg_class_of(*r),
+                pint(vm, *r, P_LEFT),
+                pint(vm, *r, P_TOP),
+                pint(vm, *r, P_RIGHT),
+                pint(vm, *r, P_BOTTOM)
+            );
+        }
+        // A laid-out root only wins when the point is inside it —
+        // view_roots also collects detached adapter rows/dialog
+        // trees, and the last one would otherwise swallow every tap.
+        let l = pint(vm, *r, P_LEFT);
+        let t = pint(vm, *r, P_TOP);
+        let rr = pint(vm, *r, P_RIGHT);
+        let b = pint(vm, *r, P_BOTTOM);
+        let inside = if rr > l || b > t {
+            x >= l && x < rr && y >= t && y < b
+        } else {
+            // Never laid out yet — accept so early taps still land.
+            true
+        };
+        if !inside {
+            continue;
+        }
+        // A root's frame is already absolute (screen origin).
+        if let Some(v) = deepest(vm, *r, x, y, 0, 0) {
             target = v;
             break;
         }
     }
     if target == 0 {
+        if dbg {
+            eprintln!("[touchdbg] {x},{y} a{action} no hit (roots {})", vm.view_roots.len());
+        }
         return Ok(());
     }
-    let evt = vm.instantiate("Landroid/view/MotionEvent;")?;
+    if dbg {
+        eprintln!(
+            "[touchdbg] {x},{y} a{action} hit h{target} {}",
+            vm.dbg_class_of(target)
+        );
+    }
+    let V::Ref(evt) = host(vm, "Landroid/view/MotionEvent;", HostState::Empty) else {
+        return Ok(());
+    };
     pseudo_set(vm, evt, P_ME_ACTION, V::I32(action));
-    pseudo_set(vm, evt, P_ME_X, V::F32(x as f32));
-    pseudo_set(vm, evt, P_ME_Y, V::F32(y as f32));
     let mut v = target;
     for _ in 0..32 {
         if v == 0 {
             break;
         }
+        // getX/getY report coordinates relative to the receiving
+        // view (AOSP transforms on dispatch) — rewrite before each hop.
+        let (ox, oy) = abs_origin(vm, v);
+        pseudo_set(vm, evt, P_ME_X, V::F32((x - ox) as f32));
+        pseudo_set(vm, evt, P_ME_Y, V::F32((y - oy) as f32));
         if vm.has_dex_virtual(v, "dispatchTouchEvent", &["Landroid/view/MotionEvent;"]) {
-            if vm.call_virtual(v, "dispatchTouchEvent", &[V::Ref(evt)]).is_ok() {
+            if dbg {
+                eprintln!("[touchdbg] h{v} dex dispatchTouchEvent {}", vm.dbg_class_of(v));
+            }
+            if vm
+                .call_virtual(v, "dispatchTouchEvent", &[V::Ref(evt)])
+                .is_ok()
+            {
                 return Ok(());
             }
         }
         if vm.has_dex_virtual(v, "onTouchEvent", &["Landroid/view/MotionEvent;"]) {
+            if dbg {
+                eprintln!("[touchdbg] h{v} dex onTouchEvent {}", vm.dbg_class_of(v));
+            }
             let _ = vm.call_virtual(v, "onTouchEvent", &[V::Ref(evt)]);
             return Ok(());
         }
         if let Some(V::Ref(l)) = pseudo_get(vm, v, P_TOUCH_L) {
             if l != 0 {
+                if dbg {
+                    eprintln!("[touchdbg] h{v} OnTouchListener.onTouch l{l}");
+                }
                 let _ = vm.call_virtual(l, "onTouch", &[V::Ref(v), V::Ref(evt)]);
                 return Ok(());
             }
@@ -4484,6 +4554,26 @@ pub(crate) fn dispatch_touch(
             Some(V::Ref(p)) => p,
             _ => break,
         };
+    }
+    // AOSP: touches no view consumed reach Activity.onTouchEvent —
+    // fullscreen games hook input there rather than on a view.
+    let act = vm.cur_activity;
+    if dbg {
+        eprintln!(
+            "[touchdbg] act={act} ote={}",
+            vm.has_dex_virtual(act, "onTouchEvent", &["Landroid/view/MotionEvent;"])
+        );
+    }
+    if act != 0 && vm.has_dex_virtual(act, "onTouchEvent", &["Landroid/view/MotionEvent;"]) {
+        pseudo_set(vm, evt, P_ME_X, V::F32(x as f32));
+        pseudo_set(vm, evt, P_ME_Y, V::F32(y as f32));
+        if dbg {
+            eprintln!("[touchdbg] activity onTouchEvent h{act}");
+        }
+        let _ = vm.call_virtual(act, "onTouchEvent", &[V::Ref(evt)]);
+    }
+    if dbg {
+        eprintln!("[touchdbg] {x},{y} a{action} unhandled");
     }
     Ok(())
 }
