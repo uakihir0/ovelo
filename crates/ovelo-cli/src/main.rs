@@ -1587,6 +1587,7 @@ fn run_app(store: &InstallStore, package: &str) -> Result<(), OveloError> {
     }
     let ui2 = ui.clone();
     let mut dex_frame = 0u32;
+    let mut host_grab = false;
     ovelo_host::run(win, move |w| {
         let mut dex_touch: Vec<(i32, i32, i32)> = Vec::new();
         {
@@ -1597,22 +1598,41 @@ fn run_app(store: &InstallStore, package: &str) -> Result<(), OveloError> {
                 };
                 // Android MotionEvent action codes — also forwarded to
                 // the dex view tree below (host widgets only cover
-                // host-materialized views).
+                // host-materialized views). A gesture the host tree
+                // consumed is NOT forwarded — its queued click and the
+                // dex ACTION_UP arm would both fire the same listener.
                 let a = match ev.action {
                     ovelo_host::MotionAction::Down => {
-                        u.root.dispatch_touch(true, pt.x as i32, pt.y as i32);
+                        host_grab =
+                            u.root.dispatch_touch(true, pt.x as i32, pt.y as i32);
                         0
                     }
                     ovelo_host::MotionAction::Up => {
-                        u.root.dispatch_touch(false, pt.x as i32, pt.y as i32);
+                        let _ = u.root.dispatch_touch(false, pt.x as i32, pt.y as i32);
+                        let grabbed = host_grab;
+                        host_grab = false;
+                        if grabbed {
+                            continue;
+                        }
                         1
                     }
-                    ovelo_host::MotionAction::Move => 2,
+                    ovelo_host::MotionAction::Move => {
+                        if host_grab {
+                            continue;
+                        }
+                        2
+                    }
                     ovelo_host::MotionAction::PointerDown => 5,
                     ovelo_host::MotionAction::PointerUp => 6,
-                    ovelo_host::MotionAction::Cancel => 3,
+                    ovelo_host::MotionAction::Cancel => {
+                        host_grab = false;
+                        3
+                    }
                     _ => continue,
                 };
+                if host_grab && a == 0 {
+                    continue;
+                }
                 dex_touch.push((pt.x as i32, pt.y as i32, a));
             }
         }
