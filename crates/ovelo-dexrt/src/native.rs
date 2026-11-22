@@ -165,7 +165,31 @@ fn guest_tcb() -> *mut u64 {
     tcb[0] = tcb.as_ptr() as u64; // TLS_SLOT_SELF
     tcb[5] = 0x9e3779b97f4a7c15; // bionic stack guard slot
     m.insert(tid, tcb.as_ptr() as usize);
+    // Lock-free parallel list the signal handler can scan: tcb stored
+    // before tid so a torn read never pairs a tid with a stale tcb.
+    for i in (0..TCB_LIST.len()).step_by(2) {
+        if TCB_LIST[i + 1].load(std::sync::atomic::Ordering::Acquire) == 0 {
+            TCB_LIST[i].store(tcb.as_ptr() as usize as u64, std::sync::atomic::Ordering::Release);
+            TCB_LIST[i + 1].store(tid, std::sync::atomic::Ordering::Release);
+            break;
+        }
+    }
     tcb.as_ptr() as *mut u64
+}
+
+/// (tcb, tid) pairs appended at TCB creation; never removed.
+#[cfg(target_arch = "aarch64")]
+static TCB_LIST: [std::sync::atomic::AtomicU64; 256] = [const { std::sync::atomic::AtomicU64::new(0) }; 256];
+
+/// TCB for `tid`, scannable from the async-signal handler.
+#[cfg(target_arch = "aarch64")]
+fn tcb_for(tid: u64) -> usize {
+    for i in (0..TCB_LIST.len()).step_by(2) {
+        if TCB_LIST[i + 1].load(std::sync::atomic::Ordering::Acquire) == tid {
+            return TCB_LIST[i].load(std::sync::atomic::Ordering::Acquire) as usize;
+        }
+    }
+    0
 }
 
 #[cfg(target_arch = "aarch64")]
@@ -178,11 +202,20 @@ unsafe fn mach_thread_id() -> u64 {
     id
 }
 
-/// Last TLS window transitions, for the segv dump: [entry site, entry
-/// tid, entry old, exit site, exit tid, exit old]. Read from the
-/// crashing thread's handler — single-writer per thread, no lock.
+/// Last TLS window transitions + last `msr tpidr` writes, for the
+/// segv dump: [0..2]=entry site/tid/old, [3..5]=exit site/tid/old,
+/// [6]=thunk swap value, [7]=thunk restore value, [8]=window-entry tcb
+/// written, [9]=window-exit old written, [10]=tramp tcb written.
+/// Read from the crashing thread's handler — single-writer per
+/// thread, no lock.
 #[cfg(target_arch = "aarch64")]
-static TLS_TRACE: [std::sync::atomic::AtomicU64; 6] = [
+static TLS_TRACE: [std::sync::atomic::AtomicU64; 12] = [
+    std::sync::atomic::AtomicU64::new(0),
+    std::sync::atomic::AtomicU64::new(0),
+    std::sync::atomic::AtomicU64::new(0),
+    std::sync::atomic::AtomicU64::new(0),
+    std::sync::atomic::AtomicU64::new(0),
+    std::sync::atomic::AtomicU64::new(0),
     std::sync::atomic::AtomicU64::new(0),
     std::sync::atomic::AtomicU64::new(0),
     std::sync::atomic::AtomicU64::new(0),
@@ -222,6 +255,7 @@ pub(crate) fn with_guest_tls_at<R>(site: &'static str, f: impl FnOnce() -> R) ->
 
         *tcb.add(SLOT_HOST_TPIDR) = old as u64;
         core::arch::asm!("msr tpidr_el0, {}", in(reg) tcb as usize);
+        TLS_TRACE[8].store(tcb as usize as u64, std::sync::atomic::Ordering::Relaxed);
         // OVELO_TLSPROBE: allocation inside the swapped window — if the
         // crash is malloc's TPIDR-keyed per-thread magazine state, a
         // plain Vec alloc+drop dies here with the same signature.
@@ -232,17 +266,26 @@ pub(crate) fn with_guest_tls_at<R>(site: &'static str, f: impl FnOnce() -> R) ->
             drop(v);
             eprintln!("[tlsprobe] alloc+drop under guest TLS survived");
         }
-        let r = f();
+        // A panic in a thunked env call unwinds through the JIT thunk
+        // and these guest frames, skipping the thunk's `msr tpidr_el0`
+        // restore — leaving TPIDR at the swapped host value (or whatever
+        // the slot held). Catch here so the host TPIDR is restored before
+        // the panic resumes to the supervising caller.
+        let r = std::panic::catch_unwind(std::panic::AssertUnwindSafe(f));
         let mut now: usize;
         core::arch::asm!("mrs {}, tpidr_el0", out(reg) now);
         if now != tcb as usize {
-            eprintln!("[tls] {site} window ended tid={} TPIDR={now:#x} (expected {:#x})\n{}", mach_thread_id(), tcb as usize, std::backtrace::Backtrace::capture());
+            eprintln!("[tls] {site} window ended tid={} TPIDR={now:#x} (expected {:#x})", mach_thread_id(), tcb as usize);
         }
         core::arch::asm!("msr tpidr_el0, {}", in(reg) old);
+        TLS_TRACE[9].store(old as u64, std::sync::atomic::Ordering::Relaxed);
         TLS_TRACE[3].store(tls_site_id(site), std::sync::atomic::Ordering::Relaxed);
         TLS_TRACE[4].store(mach_thread_id(), std::sync::atomic::Ordering::Relaxed);
         TLS_TRACE[5].store(old as u64, std::sync::atomic::Ordering::Relaxed);
-        r
+        match r {
+            Ok(r) => r,
+            Err(p) => std::panic::resume_unwind(p),
+        }
     }
 }
 
@@ -276,8 +319,15 @@ extern "C" fn sh_pthread_create(
             core::arch::asm!("mrs {}, tpidr_el0", out(reg) old);
             *tcb.add(SLOT_HOST_TPIDR) = old as u64;
             core::arch::asm!("msr tpidr_el0, {}", in(reg) tcb as usize);
+            TLS_TRACE[10].store(tcb as usize as u64, std::sync::atomic::Ordering::Relaxed);
             let f: extern "C" fn(usize) -> usize = std::mem::transmute(entry);
-            f(arg) as *mut c_void
+            let r = f(arg) as *mut c_void;
+            // Restore before pthread exit cleanup — Darwin's TSD
+            // destructors and stack teardown dereference TPIDR-relative
+            // pthread fields and must not see the guest TCB.
+            core::arch::asm!("msr tpidr_el0, {}", in(reg) old);
+            TLS_TRACE[9].store(old as u64, std::sync::atomic::Ordering::Relaxed);
+            r
         }
     }
     let b = Box::into_raw(Box::new((entry, arg)));
@@ -457,35 +507,59 @@ mod thunk {
         assert!(a.used + SLOT <= PAGE, "thunk arena exhausted");
         let at = a.base + a.used;
         a.used += SLOT;
+        // Record each thunk's `msr` writes into TLS_TRACE[6]/[7] so the
+        // segv dump can name the last TPIDR writer. adrp needs the trace
+        // cell within ±4GB of the emitted insn — mmap and static data
+        // normally land in the same AS cluster; if not, emit nops.
+        let trace_stores = |base: usize, insn_off: usize, cell: usize, rt: u32| -> [u32; 2] {
+            let addr = &super::TLS_TRACE[cell] as *const _ as usize;
+            let pc = base + insn_off;
+            let diff = ((addr & !0xFFF) as i64 - (pc & !0xFFF) as i64) / 4096;
+            if !(-(1 << 20)..(1 << 20)).contains(&diff) {
+                return [0xD503_201F; 2];
+            }
+            let adrp = 0x9000_0000
+                | (((diff as u64 & 3) << 29) as u32)
+                | ((((diff as u64) >> 2 & 0x7FFFF) << 5) as u32)
+                | 10; // x10
+            let poff = (addr & 0xFFF) / 8;
+            let str_ = 0xF900_0000 | ((poff as u32) << 10) | (10 << 5) | rt;
+            [adrp, str_]
+        };
         unsafe {
             pthread_jit_write_protect_np(0);
             let w = at as *mut u32;
-            let mut ins = Vec::with_capacity(36);
+            let mut ins = Vec::with_capacity(38);
             ins.extend_from_slice(&[0xD103_03FF, 0xA90A_7BFD, 0x9103_03F1, 0x9100_03E9]);
             for _ in 0..10 {
                 ins.extend_from_slice(&[0xA8C1_2E2A, 0xA881_2D2A]);
             }
             ins.extend_from_slice(&[
-                0xD53B_D05D, // mrs x29, tpidr_el0 — this thread's TCB
-                0xF97F_F3B0, // ldr x16, [x29, #0x7ff8] — saved host TPIDR
-                0xD51B_D050, // msr tpidr_el0, x16
-                0xD503_201F, // nop
-                0x5800_0110, // ldr x16, +32 -> target literal at byte 140
-                0xD63F_0200, // blr x16
-                0xD51B_D05D, // msr tpidr_el0, x29 — back to guest TCB
-                0xA94A_7BFD,
-                0x9103_03FF,
-                0xD65F_03C0,
+                0xD53B_D05D, // 24: mrs x29, tpidr_el0 — this thread's TCB
+                0xF97F_FFB0, // 25: ldr x16, [x29, #0x7ff8] — saved host TPIDR
+                0xD51B_D050, // 26: msr tpidr_el0, x16
             ]);
-            debug_assert_eq!(ins.len(), 34);
+            ins.extend_from_slice(&trace_stores(at, 108, 6, 16)); // 27-28: TRACE[6]=swap val
+            ins.extend_from_slice(&[
+                0x5800_0130, // 29: ldr x16, +36 -> target literal at byte 152
+                0xD63F_0200, // 30: blr x16
+                0xD51B_D05D, // 31: msr tpidr_el0, x29 — back to guest TCB
+            ]);
+            ins.extend_from_slice(&trace_stores(at, 128, 7, 29)); // 32-33: TRACE[7]=restore val
+            ins.extend_from_slice(&[
+                0xA94A_7BFD, // 34: ldp x29,x30,[sp,#168]
+                0x9103_03FF, // 35: add sp, sp, #192
+                0xD65F_03C0, // 36: ret
+                0xD503_201F, // 37: pad before literal
+            ]);
+            debug_assert_eq!(ins.len(), 38);
             for (i, ins) in ins.iter().enumerate() {
                 w.add(i).write_volatile(*ins);
             }
-            // Byte 136 is now unused padding; the target literal sits at
-            // byte 140, reached by `ldr x16, +32` from insn 28 (byte 112).
-            let lit = (at + 136) as *mut usize;
-            lit.write_volatile(0);
-            lit.add(1).write_volatile(target);
+            // Target literal at byte 152, reached by `ldr x16, +36` from
+            // insn 29 (byte 116).
+            let lit = (at + 152) as *mut usize;
+            lit.write_volatile(target);
             pthread_jit_write_protect_np(1);
             sys_icache_invalidate(at as *mut c_void, SLOT);
         }
@@ -514,6 +588,44 @@ pub(crate) fn va_thunk(f: usize, _kind: u16) -> usize {
 #[cfg(not(all(target_os = "macos", target_arch = "aarch64")))]
 pub(crate) fn host_thunk(f: usize) -> usize {
     f
+}
+
+/// TLS self-heal: Darwin rewrites TPIDR_EL0 at kernel boundaries
+/// (the handler reads a different TPIDR than the faulting `mrs`
+/// produced), so guest `.so` code — and thunks entered from it — can
+/// run with a smashed thread pointer. When the fault is a small-base
+/// `ldr/str [xN,#imm]` (the bionic `ldr [tpidr,#slot]` shape and the
+/// thunk's slot read alike), restore the thread's guest TCB into the
+/// saved register and retry. Each smashed access heals itself once;
+/// thunk exits re-arm TPIDR via `msr x29` going forward.
+/// `mc` points at mcontext64: ss.x[] at +16 (xN = +16+8N).
+#[cfg(target_arch = "aarch64")]
+unsafe fn heal_tls_fault(si: usize, insn: u32, mc: *mut u8) -> bool {
+    let is_ldr_str = (insn & 0xFFC0_0000) == 0xF940_0000 || (insn & 0xFFC0_0000) == 0xF900_0000;
+    if !is_ldr_str {
+        return false;
+    }
+    let rn = ((insn >> 5) & 31) as usize;
+    let imm = (((insn >> 10) & 0xFFF) * 8) as usize;
+    let base = unsafe { *(mc.add(16 + rn * 8) as *const usize) };
+    if base >= 0x1000 || si != base.wrapping_add(imm) {
+        return false;
+    }
+    let tcb = tcb_for(unsafe { mach_thread_id() });
+    if tcb == 0 {
+        return false;
+    }
+    unsafe {
+        *(mc.add(16 + rn * 8) as *mut usize) = tcb;
+        let s = b"[segv-heal]\n";
+        write(2, s.as_ptr() as *const c_void, s.len());
+    }
+    true
+}
+
+#[cfg(not(target_arch = "aarch64"))]
+unsafe fn heal_tls_fault(_si: usize, _insn: u32, _mc: *mut u8) -> bool {
+    false
 }
 
 /// Debug crash dump: guest `.so`s run REAL arm64 code — a guest
@@ -546,6 +658,9 @@ pub fn install_crash_dump() {
                     .map(|v| v.iter().any(|(b, s)| pc >= *b && pc < b + s))
                     .unwrap_or(false);
                 let insn = *(pc as *const u32);
+                if heal_tls_fault(si, insn, mc as *mut u8) {
+                    return;
+                }
                 // Classify the fault victim: which malloc zone (if any)
                 // claims si_addr — g = guest zone, d = default, ? = none.
                 // Tells a targeted heap hit apart from a wild address.
