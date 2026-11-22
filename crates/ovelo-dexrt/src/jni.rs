@@ -1033,21 +1033,36 @@ extern "C" fn get_string_length(_e: u64, s: u64) -> u64 {
 }
 extern "C" fn get_string_utf_length(_e: u64, s: u64) -> u64 {
     env_enter("get_string_utf_length");
-    vm().heap.str_val(s as u32).map(|x| x.len() as u64).unwrap_or(0)
+    let Some(x) = vm().heap.str_val(s as u32).map(|x| x.to_string()) else {
+        return 0;
+    };
+    // Modified UTF-8 byte count: NUL is 2 bytes and supplementary
+    // characters are two 3-byte units, so this is not `x.len()`.
+    x.encode_utf16()
+        .map(|u| match u {
+            0 => 2,
+            1..=0x7F => 1,
+            0x80..=0x7FF => 2,
+            _ => 3,
+        })
+        .sum()
 }
 extern "C" fn get_string_utf_chars(_e: u64, s: u64, _copy: u64) -> u64 {
     env_enter("get_string_utf_chars");
     let Some(x) = vm().heap.str_val(s as u32).map(|x| x.to_string()) else {
         return 0;
     };
-    let b = x.as_bytes();
-    let buf = libc_malloc(b.len() + 1) as *mut u8;
+    let mut out = Vec::with_capacity(x.len() + 1);
+    for u in x.encode_utf16() {
+        mutf8_unit(&mut out, u);
+    }
+    let buf = libc_malloc(out.len() + 1) as *mut u8;
     if buf.is_null() {
         return 0;
     }
     unsafe {
-        std::ptr::copy_nonoverlapping(b.as_ptr(), buf, b.len());
-        *buf.add(b.len()) = 0;
+        std::ptr::copy_nonoverlapping(out.as_ptr(), buf, out.len());
+        *buf.add(out.len()) = 0;
     }
     buf as u64
 }
