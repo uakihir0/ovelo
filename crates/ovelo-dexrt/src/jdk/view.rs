@@ -2935,14 +2935,21 @@ fn attrset_value(vm: &mut Vm, set: V, name: &str) -> Option<V> {
 
 /// `LinearLayout` orientation: `setOrientation` wins, else the
 /// `android:orientation` attr (0=horizontal, 1=vertical); the AOSP
-/// documented default is horizontal.
+/// documented default is horizontal — except `TableLayout`, whose
+/// constructor forces VERTICAL, and `TableRow`, forced HORIZONTAL.
 fn linear_vertical(vm: &mut Vm, this: u32) -> bool {
     if let Some(V::I32(o)) = pseudo_get(vm, this, P_ORIENTATION) {
         return o != 0;
     }
+    let dflt = vm
+        .heap
+        .class_of(this)
+        .and_then(|ci| vm.type_desc_of(ci).ok())
+        .map(|d| d.contains("TableLayout"))
+        .unwrap_or(false);
     attr_find(vm, this, "orientation")
         .map(|v| i32v(v) != 0)
-        .unwrap_or(false)
+        .unwrap_or(dflt)
 }
 
 /// `getMinimum*`/`getSuggestedMinimum*`: explicit `setMinimum*` wins,
