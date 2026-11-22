@@ -1379,7 +1379,17 @@ fn rx_replace(rx: &Rx, t: &[char], rep: &str, first_only: bool) -> String {
             pos = me;
             break;
         }
-        pos = if me > ms { me } else { me + 1 };
+        pos = if me > ms {
+            me
+        } else {
+            // Zero-width match: the char it sits on is unmatched text —
+            // emit it before advancing past it (Java emits it through
+            // the following `t[pos..ms]` region).
+            if me < hi {
+                out.push(t[me]);
+            }
+            me + 1
+        };
         if pos > hi {
             pos = hi;
             break;
