@@ -28,14 +28,19 @@ pub(crate) const STRING: &str = "Ljava/lang/String;";
 // Pseudo field-idx keys for state a guest can't address via a real field
 // reference (Intent action/data, Runnable target, SharedPreferences link).
 pub(crate) const P_ACTION: u32 = u32::MAX - 1;
-pub(crate) const P_DATA: u32 = u32::MAX - 2;
+/// The `P_DATA` pseudo key (Intent data, `*Info` name, ...).
+pub const P_DATA: u32 = u32::MAX - 2;
 pub(crate) const P_FLAGS: u32 = u32::MAX - 3;
-pub(crate) const P_COMPONENT: u32 = u32::MAX - 4;
+/// The `P_COMPONENT` pseudo key (Intent component, `*Info` package).
+pub const P_COMPONENT: u32 = u32::MAX - 4;
 /// Resolved `GIdx` of the `<init>` a `Constructor` mirror stands for.
 pub(crate) const P_CTOR: u32 = u32::MAX - 36;
+/// Resolved `GIdx` of the method a `Method` mirror stands for.
+pub(crate) const P_METH: u32 = u32::MAX - 44;
 /// A `Drawable`'s cached `Paint` host (ShapeDrawable.getPaint).
 pub(crate) const P_PAINT: u32 = u32::MAX - 37;
-pub(crate) const P_TARGET: u32 = u32::MAX - 5;
+/// The `P_TARGET` pseudo key (ResolveInfo's `*Info` member, ...).
+pub const P_TARGET: u32 = u32::MAX - 5;
 pub(crate) const P_EDIT_PARENT: u32 = u32::MAX - 6;
 // Rect pseudo-fields (left/top/right/bottom ints) + a Drawable's
 // cached bounds Rect handle.
@@ -1370,6 +1375,28 @@ pub(crate) fn ifield(vm: &Vm, h: u32, owner: &str, name: &str) -> Option<V> {
         ("Landroid/content/pm/ApplicationInfo;", "targetSdkVersion") => Some(V::I32(35)),
         ("Landroid/content/pm/ApplicationInfo;", "minSdkVersion") => Some(V::I32(21)),
         ("Landroid/content/pm/ApplicationInfo;", "flags") => Some(V::I32(0)),
+        // Manifest-backed component infos the CLI mints for
+        // resolveService/queryIntentServices & friends — ResolveInfo
+        // links its *Info in P_TARGET; *Info carries name/packageName
+        // (P_DATA/P_COMPONENT) and ProviderInfo's authority (P_FLAGS).
+        ("Landroid/content/pm/ResolveInfo;", "serviceInfo")
+        | ("Landroid/content/pm/ResolveInfo;", "activityInfo")
+        | ("Landroid/content/pm/ResolveInfo;", "providerInfo") => {
+            Some(pseudo_get(vm, h, P_TARGET).unwrap_or(V::Ref(0)))
+        }
+        ("Landroid/content/pm/ServiceInfo;", "name")
+        | ("Landroid/content/pm/ActivityInfo;", "name")
+        | ("Landroid/content/pm/ProviderInfo;", "name") => {
+            Some(pseudo_get(vm, h, P_DATA).unwrap_or(V::Ref(0)))
+        }
+        ("Landroid/content/pm/ServiceInfo;", "packageName")
+        | ("Landroid/content/pm/ActivityInfo;", "packageName")
+        | ("Landroid/content/pm/ProviderInfo;", "packageName") => {
+            Some(pseudo_get(vm, h, P_COMPONENT).unwrap_or(V::Ref(0)))
+        }
+        ("Landroid/content/pm/ProviderInfo;", "authority") => {
+            Some(pseudo_get(vm, h, P_FLAGS).unwrap_or(V::Ref(0)))
+        }
         ("Landroid/os/Message;", "what") => {
             Some(pseudo_get(vm, h, P_MSG_WHAT).unwrap_or(V::I32(0)))
         }
@@ -2225,10 +2252,18 @@ pub(crate) fn host_supers(d: &str) -> &'static [&'static str] {
             OBJ,
         ],
         "Landroid/widget/ArrayAdapter;" => &["Landroid/widget/BaseAdapter;", OBJ],
-        "Landroid/widget/Toast;"
-        | "Landroid/widget/VideoView;"
-        | "Landroid/widget/Space;"
-        | "Landroid/widget/DigitalClock;" => &[OBJ],
+        // TextClock/Chronometer/DigitalClock are TextViews — guest
+        // widgets (MyTextClock) extend them and must check-cast to View.
+        "Landroid/widget/TextClock;"
+        | "Landroid/widget/Chronometer;"
+        | "Landroid/widget/DigitalClock;" => &["Landroid/widget/TextView;", "Landroid/view/View;", OBJ],
+        "Landroid/widget/Space;" => &["Landroid/view/View;", OBJ],
+        "Landroid/widget/VideoView;" => &[
+            "Landroid/view/SurfaceView;",
+            "Landroid/view/View;",
+            OBJ,
+        ],
+        "Landroid/widget/Toast;" => &[OBJ],
         "Landroid/view/ViewStub;" | "Landroid/view/SurfaceView;" | "Landroid/view/TextureView;" => {
             &["Landroid/view/View;", OBJ]
         }
@@ -2282,7 +2317,6 @@ pub(crate) fn host_supers(d: &str) -> &'static [&'static str] {
         | "Landroid/widget/AutoCompleteTextView;"
         | "Landroid/widget/MultiAutoCompleteTextView;"
         | "Landroid/widget/CheckedTextView;"
-        | "Landroid/widget/Chronometer;"
         | "Landroid/widget/CalendarView;"
         | "Landroid/widget/DatePicker;"
         | "Landroid/widget/TimePicker;"
@@ -2290,7 +2324,6 @@ pub(crate) fn host_supers(d: &str) -> &'static [&'static str] {
         | "Landroid/widget/SearchView;"
         | "Landroid/widget/TabHost;"
         | "Landroid/widget/TabWidget;"
-        | "Landroid/widget/TextClock;"
         | "Landroid/widget/AnalogClock;"
         | "Landroid/widget/ExpandableListView;"
         | "Landroid/widget/QuickContactBadge;"
