@@ -110,6 +110,31 @@ struct DlInfo {
 /// whether the faulting PC is inside a loaded `.so`.
 pub(crate) static LOADED_RANGES: Mutex<Vec<(usize, usize)>> = Mutex::new(Vec::new());
 
+/// Bounds of the JIT thunk arena, published so the crash handler's
+/// instruction scan-back knows which addresses it may read. Written
+/// once when the arena is first mapped.
+pub(crate) static JIT_CODE_BASE: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(0);
+pub(crate) static JIT_CODE_END: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(0);
+
+/// Async-signal-safe-ish mapped check for the segv handler: inside a
+/// loaded `.so` or the thunk arena. `try_lock` keeps it deadlock-free
+/// — when the range list is busy we conservatively report unmapped,
+/// which only shrinks the provenance scan.
+#[cfg(target_arch = "aarch64")]
+fn code_mapped(addr: usize) -> bool {
+    let base = JIT_CODE_BASE.load(std::sync::atomic::Ordering::Acquire);
+    let end = JIT_CODE_END.load(std::sync::atomic::Ordering::Acquire);
+    if base != 0 && addr >= base && addr < end {
+        return true;
+    }
+    LOADED_RANGES
+        .try_lock()
+        .map(|v| v.iter().any(|(b, s)| addr >= *b && addr < b + s))
+        .unwrap_or(false)
+}
+
 /// Image-relative offset of `addr` when it lies inside a loaded `.so`.
 pub(crate) fn so_off(addr: usize) -> Option<usize> {
     LOADED_RANGES
@@ -434,6 +459,8 @@ mod thunk {
                 0,
             );
             assert_ne!(p as usize, usize::MAX, "thunk arena mmap failed");
+            super::JIT_CODE_BASE.store(p as usize, std::sync::atomic::Ordering::Release);
+            super::JIT_CODE_END.store(p as usize + PAGE, std::sync::atomic::Ordering::Release);
             Arena {
                 base: p as usize,
                 used: 0,
@@ -499,6 +526,8 @@ mod thunk {
                 0,
             );
             assert_ne!(p as usize, usize::MAX, "thunk arena mmap failed");
+            super::JIT_CODE_BASE.store(p as usize, std::sync::atomic::Ordering::Release);
+            super::JIT_CODE_END.store(p as usize + PAGE, std::sync::atomic::Ordering::Release);
             Arena {
                 base: p as usize,
                 used: 0,
@@ -647,10 +676,15 @@ unsafe fn heal_tls_fault(si: usize, insn: u32, mc: *mut u8) -> bool {
     // scribble into the guest TCB and keep running corrupted.
     let pc = unsafe { *(mc.add(272) as *const usize) };
     let want_mrs = 0xD53B_D040 | rn as u32;
-    let max_back = ((pc & 0xFFF) / 4).min(24);
     let mut proven = false;
-    for i in 1..=max_back {
-        let b = unsafe { *((pc - i * 4) as *const u32) };
+    for i in 1..=24usize {
+        let addr = pc - i * 4;
+        // Never read into an unmapped page: outside the faulting page
+        // only scan addresses we know are mapped code.
+        if addr & !0xFFF != pc & !0xFFF && !code_mapped(addr) {
+            break;
+        }
+        let b = unsafe { *(addr as *const u32) };
         if b == want_mrs {
             proven = true;
             break;
