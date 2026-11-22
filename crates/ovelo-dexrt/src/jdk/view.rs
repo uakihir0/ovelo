@@ -1293,6 +1293,32 @@ pub(crate) fn call(
         }
         "bringChildToFront" => Some(None),
         // ---------- ViewPager ----------
+        // ---------- GLSurfaceView ----------
+        // The invoke site may name the dex subclass (GLFieldView), so
+        // GL-distinctive names match unguarded; generic ones check the
+        // class chain resolves through GLSurfaceView/SurfaceView.
+        "setRenderer" => {
+            if let Some(V::Ref(r)) = args.get(1).copied() {
+                if r != 0 {
+                    pseudo_set(vm, this, crate::jdk::gl::P_GLES_RENDERER, V::Ref(r));
+                }
+            }
+            Some(None)
+        }
+        "setRenderMode" | "requestRender" => Some(None),
+        "queueEvent" | "onPause" | "onResume"
+            if class.contains("GLSurfaceView")
+                || desc_is_a(class, "Landroid/opengl/GLSurfaceView;") =>
+        {
+            Some(None)
+        }
+        "getRenderMode" if class.contains("GLSurfaceView") => Some(Some(V::I32(1))),
+        "getHolder" | "getSurface"
+            if class.contains("SurfaceView")
+                || desc_is_a(class, "Landroid/view/SurfaceView;") =>
+        {
+            Some(Some(V::Ref(0)))
+        }
         "setAdapter" if class.contains("ViewPager") => {
             // Drive the PagerAdapter the way populate() would: count,
             // then instantiateItem per page — androidx attaches each

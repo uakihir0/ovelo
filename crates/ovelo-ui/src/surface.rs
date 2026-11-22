@@ -190,6 +190,43 @@ impl Surface {
         }
     }
 
+    /// Fill a flat-color convex polygon (scanline), clipped. `pts` is
+    /// x,y pairs; anything with < 3 points is ignored.
+    pub fn fill_poly(&mut self, pts: &[i32], c: Color) {
+        let n = pts.len() / 2;
+        if n < 3 {
+            return;
+        }
+        let (mut min_y, mut max_y) = (pts[1], pts[1]);
+        for i in 0..n {
+            min_y = min_y.min(pts[2 * i + 1]);
+            max_y = max_y.max(pts[2 * i + 1]);
+        }
+        let clip = *self.clips.last().unwrap();
+        let (min_y, max_y) = (min_y.max(clip.y), max_y.min(clip.y1 - 1));
+        for y in min_y..=max_y {
+            let yf = y as f64 + 0.5;
+            let mut xs: Vec<f64> = Vec::new();
+            for i in 0..n {
+                let (x1, y1) = (pts[2 * i] as f64, pts[2 * i + 1] as f64);
+                let j = (i + 1) % n;
+                let (x2, y2) = (pts[2 * j] as f64, pts[2 * j + 1] as f64);
+                if (y1 <= yf && y2 > yf) || (y2 <= yf && y1 > yf) {
+                    xs.push(x1 + (yf - y1) * (x2 - x1) / (y2 - y1));
+                }
+            }
+            xs.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+            for pair in xs.chunks(2) {
+                if pair.len() == 2 {
+                    let (l, r) = (pair[0].ceil() as i32, pair[1].floor() as i32);
+                    for x in l.max(clip.x)..=r.min(clip.x1 - 1) {
+                        self.src_over(x, y, c);
+                    }
+                }
+            }
+        }
+    }
+
     /// Thick line via distance-to-segment, `w` px wide, source-over.
     pub fn draw_line(&mut self, x0: i32, y0: i32, x1: i32, y1: i32, w: i32, c: Color) {
         let w = w.max(1) as f32;

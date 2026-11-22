@@ -164,6 +164,16 @@ impl<'a> Canvas<'a> {
         );
     }
 
+    /// Fill a flat-color polygon; `pts` is x,y pairs in canvas space
+    /// (translated + clipped here).
+    pub fn fill_poly(&mut self, pts: &[i32], p: Paint) {
+        let pts: Vec<i32> = pts
+            .chunks(2)
+            .flat_map(|xy| [xy[0] + self.dx, xy[1] + self.dy])
+            .collect();
+        self.surf.fill_poly(&pts, p.color);
+    }
+
     /// `drawBitmap`-style blit: `src` (RGBA8, `src_w`×`src_h`) scaled
     /// nearest into the `w`×`h` rect at `(x, y)` — translated + clipped.
     #[allow(clippy::too_many_arguments)]

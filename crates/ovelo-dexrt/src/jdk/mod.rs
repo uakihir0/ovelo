@@ -9,6 +9,7 @@ mod android;
 mod collect;
 pub(crate) mod db;
 pub(crate) mod gfx;
+pub(crate) mod gl;
 mod io;
 mod lang;
 pub(crate) mod time;
@@ -811,6 +812,9 @@ pub(crate) fn call(
         return Ok(Some(r));
     }
     if let Some(r) = gfx::call(vm, class, name, sig, args)? {
+        return Ok(Some(r));
+    }
+    if let Some(r) = gl::call(vm, class, name, sig, args)? {
         return Ok(Some(r));
     }
     Ok(None)

@@ -533,6 +533,21 @@ fn replay_guest_ops(c: &mut Canvas, ops: &[ovelo_dexrt::CanvasOp]) {
                     stroke_or_fill(c, rect, p, *r as i32);
                 }
             }
+            O::FillPoly { pts, argb } => {
+                let ip: Vec<i32> = pts.iter().map(|f| *f as i32).collect();
+                c.fill_poly(
+                    &ip,
+                    Paint {
+                        color: Color::from_srgb8(
+                            (argb >> 16) as u8,
+                            (argb >> 8) as u8,
+                            *argb as u8,
+                            (argb >> 24) as u8,
+                        ),
+                        text_size: 12.0,
+                    },
+                );
+            }
             O::Line {
                 x0,
                 y0,

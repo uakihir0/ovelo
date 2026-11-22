@@ -246,6 +246,14 @@ pub enum CanvasOp {
         /// Paint at call time.
         paint: PaintState,
     },
+    /// Flat-color convex polygon (GL triangle fan/strip flattened to
+    /// a fill) — `pts` is x,y pairs in canvas space.
+    FillPoly {
+        /// x,y vertex pairs.
+        pts: Vec<f32>,
+        /// Packed ARGB.
+        argb: i32,
+    },
     /// `drawBitmap` — decoded pixels at `(x, y)`, scaled to `(w, h)`
     /// when both are nonzero (else natural size).
     Bitmap {

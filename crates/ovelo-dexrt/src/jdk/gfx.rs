@@ -826,6 +826,11 @@ pub(crate) fn call(
 /// class doesn't override `onDraw` or the call fails — a framework
 /// `View.onDraw` is a no-op anyway).
 pub(crate) fn guest_draw_ops(vm: &mut Vm, view: u32, w: i32, h: i32) -> Vec<CanvasOp> {
+    // GLSurfaceView subclasses draw through a Renderer, not onDraw —
+    // drive the GL10 path and flatten its recorded primitives.
+    if pseudo_get(vm, view, super::gl::P_GLES_RENDERER).is_some() {
+        return super::gl::gl_frame(vm, view, w, h);
+    }
     let Some(ci) = vm.heap.class_of(view) else {
         return Vec::new();
     };
