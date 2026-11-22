@@ -4522,7 +4522,10 @@ pub(crate) fn dispatch_touch(
     x: i32,
     y: i32,
     action: i32,
-) -> ovelo_error::Result<()> {
+) -> ovelo_error::Result<bool> {
+    // Ok(true) when the dex tree claimed the point — the caller then
+    // skips its own (host-widget) dispatch for the gesture so a view
+    // mirrored in both trees never fires its listener twice.
     // Child frames are stored in the PARENT's content coordinates
     // (group_layout_fallback), so the hit test must carry each
     // ancestor's absolute origin down the recursion.
@@ -4604,7 +4607,7 @@ pub(crate) fn dispatch_touch(
         if dbg {
             eprintln!("[touchdbg] {x},{y} a{action} no hit (roots {})", vm.view_roots.len());
         }
-        return Ok(());
+        return Ok(false);
     }
     if dbg {
         eprintln!(
@@ -4613,7 +4616,7 @@ pub(crate) fn dispatch_touch(
         );
     }
     let V::Ref(evt) = host(vm, "Landroid/view/MotionEvent;", HostState::Empty) else {
-        return Ok(());
+        return Ok(true);
     };
     pseudo_set(vm, evt, P_ME_ACTION, V::I32(action));
     let mut v = target;
@@ -4634,7 +4637,7 @@ pub(crate) fn dispatch_touch(
                 .call_virtual(v, "dispatchTouchEvent", &[V::Ref(evt)])
                 .is_ok()
             {
-                return Ok(());
+                return Ok(true);
             }
         }
         if vm.has_dex_virtual(v, "onTouchEvent", &["Landroid/view/MotionEvent;"]) {
@@ -4642,7 +4645,7 @@ pub(crate) fn dispatch_touch(
                 eprintln!("[touchdbg] h{v} dex onTouchEvent {}", vm.dbg_class_of(v));
             }
             let _ = vm.call_virtual(v, "onTouchEvent", &[V::Ref(evt)]);
-            return Ok(());
+            return Ok(true);
         }
         if let Some(V::Ref(l)) = pseudo_get(vm, v, P_TOUCH_L) {
             if l != 0 {
@@ -4650,7 +4653,7 @@ pub(crate) fn dispatch_touch(
                     eprintln!("[touchdbg] h{v} OnTouchListener.onTouch l{l}");
                 }
                 let _ = vm.call_virtual(l, "onTouch", &[V::Ref(v), V::Ref(evt)]);
-                return Ok(());
+                return Ok(true);
             }
         }
         // AOSP `View.onTouchEvent`: a clickable view consumes the touch
@@ -4663,7 +4666,7 @@ pub(crate) fn dispatch_touch(
                         eprintln!("[touchdbg] h{v} OnClickListener.onClick l{l}");
                     }
                     let _ = vm.call_virtual(l, "onClick", &[V::Ref(v)]);
-                    return Ok(());
+                    return Ok(true);
                 }
             }
             if let Some(mname) = attr_find(vm, v, "onClick").and_then(|a| match a {
@@ -4676,7 +4679,7 @@ pub(crate) fn dispatch_touch(
                         eprintln!("[touchdbg] h{v} xml onClick {mname}");
                     }
                     let _ = vm.call_virtual(act, &mname, &[V::Ref(v)]);
-                    return Ok(());
+                    return Ok(true);
                 }
             }
         }
@@ -4705,7 +4708,7 @@ pub(crate) fn dispatch_touch(
     if dbg {
         eprintln!("[touchdbg] {x},{y} a{action} unhandled");
     }
-    Ok(())
+    Ok(true)
 }
 
 pub(crate) fn attach(vm: &mut Vm, parent: u32, child: V) {

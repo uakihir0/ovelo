@@ -1587,69 +1587,37 @@ fn run_app(store: &InstallStore, package: &str) -> Result<(), OveloError> {
     }
     let ui2 = ui.clone();
     let mut dex_frame = 0u32;
-    let mut host_grab = false;
+    let mut dex_grab = false;
     ovelo_host::run(win, move |w| {
-        let mut dex_touch: Vec<(i32, i32, i32)> = Vec::new();
-        {
-            let mut u = ui2.borrow_mut();
-            for ev in w.take_input() {
-                let Some(pt) = ev.pointers.get(ev.action_index) else {
-                    continue;
-                };
-                // Android MotionEvent action codes — also forwarded to
-                // the dex view tree below (host widgets only cover
-                // host-materialized views). A gesture the host tree
-                // consumed is NOT forwarded — its queued click and the
-                // dex ACTION_UP arm would both fire the same listener.
-                let a = match ev.action {
-                    ovelo_host::MotionAction::Down => {
-                        host_grab =
-                            u.root.dispatch_touch(true, pt.x as i32, pt.y as i32);
-                        0
-                    }
-                    ovelo_host::MotionAction::Up => {
-                        let _ = u.root.dispatch_touch(false, pt.x as i32, pt.y as i32);
-                        let grabbed = host_grab;
-                        host_grab = false;
-                        if grabbed {
-                            continue;
-                        }
-                        1
-                    }
-                    ovelo_host::MotionAction::Move => {
-                        if host_grab {
-                            continue;
-                        }
-                        2
-                    }
-                    ovelo_host::MotionAction::PointerDown => 5,
-                    ovelo_host::MotionAction::PointerUp => 6,
-                    ovelo_host::MotionAction::Cancel => {
-                        host_grab = false;
-                        3
-                    }
-                    _ => continue,
-                };
-                if host_grab && a == 0 {
-                    continue;
-                }
-                dex_touch.push((pt.x as i32, pt.y as i32, a));
-            }
-        }
-        // Deferred onClick dispatches — queued during touch handling,
-        // pumped here so the VM is free to run guest code that mutates
-        // the same views (RefCell re-entrancy avoided).
-        let pending = ui2.borrow().drain_clicks();
         let mut dead = false;
-        if let Some((vm, this)) = &mut guest {
-            // Forward pointer events into the dex view tree
-            // (MotionEvent → dex dispatchTouchEvent/onTouchEvent).
-            for (tx, ty, ta) in dex_touch.drain(..) {
-                match sup.supervise("touch", || vm.dispatch_touch(tx, ty, ta)) {
+        for ev in w.take_input() {
+            let Some(pt) = ev.pointers.get(ev.action_index) else {
+                continue;
+            };
+            let (tx, ty) = (pt.x as i32, pt.y as i32);
+            // Android MotionEvent action codes.
+            let a = match ev.action {
+                ovelo_host::MotionAction::Down => 0,
+                ovelo_host::MotionAction::Up => 1,
+                ovelo_host::MotionAction::Move => 2,
+                ovelo_host::MotionAction::PointerDown => 5,
+                ovelo_host::MotionAction::PointerUp => 6,
+                ovelo_host::MotionAction::Cancel => 3,
+                _ => continue,
+            };
+            // The dex view tree is authoritative: when it claims the
+            // point the guest framework (OnTouchListener / performClick
+            // / onTouchEvent) owns the gesture. The host widget tree —
+            // only covering host-materialized views — sees a touch
+            // solely when dex did not claim it, so a view mirrored in
+            // both trees never fires the same listener twice.
+            let mut claimed = false;
+            if let Some((vm, _)) = &mut guest {
+                match sup.supervise("touch", || vm.dispatch_touch(tx, ty, a)) {
+                    worker::Outcome::Ok(Ok(b)) => claimed = b,
                     worker::Outcome::Ok(Err(e)) => {
                         println!("touch crashed: {}", e.cause());
                     }
-                    worker::Outcome::Ok(_) => {}
                     worker::Outcome::Crashed(p) => {
                         println!("touch panic -> {}", p.display());
                         dead = true;
@@ -1657,6 +1625,31 @@ fn run_app(store: &InstallStore, package: &str) -> Result<(), OveloError> {
                     }
                 }
             }
+            if a == 0 {
+                dex_grab = claimed;
+            }
+            if a == 3 {
+                dex_grab = false;
+            }
+            if dex_grab || claimed {
+                continue;
+            }
+            let mut u = ui2.borrow_mut();
+            match a {
+                0 => {
+                    let _ = u.root.dispatch_touch(true, tx, ty);
+                }
+                1 => {
+                    let _ = u.root.dispatch_touch(false, tx, ty);
+                }
+                _ => {}
+            }
+        }
+        // Deferred onClick dispatches — queued during touch handling,
+        // pumped here so the VM is free to run guest code that mutates
+        // the same views (RefCell re-entrancy avoided).
+        let pending = ui2.borrow().drain_clicks();
+        if let Some((vm, this)) = &mut guest {
             for (l, vh) in pending {
                 match sup.supervise("onClick", || {
                     vm.call_virtual(l, "onClick", &[ovelo_dexrt::V::Ref(vh)])

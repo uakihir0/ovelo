@@ -1329,7 +1329,10 @@ impl Vm {
     /// (action: 0=down, 1=up, 2=move). Dex-materialized views —
     /// including games' input views — only see input through this
     /// bridge; the host view tree's own dispatch does not reach them.
-    pub fn dispatch_touch(&mut self, x: i32, y: i32, action: i32) -> Result<()> {
+    /// Ok(true) when the dex view tree claimed the point — callers
+    /// then skip their own (host-widget) dispatch so a view mirrored
+    /// in both trees never fires its listener twice.
+    pub fn dispatch_touch(&mut self, x: i32, y: i32, action: i32) -> Result<bool> {
         jdk::view::dispatch_touch(self, x, y, action)
     }
 
