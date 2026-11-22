@@ -1420,6 +1420,9 @@ pub(crate) fn load_native_lib(vm: &mut Vm, arg: &str, absolute: bool) {
     };
     let mut libs = libs;
     let Some(lib) = libs.pop() else {
+        // Soname already mapped (e.g. as a dep of an earlier lib) —
+        // JNI_OnLoad runs once per image, so nothing to do.
+        eprintln!("[jni] loadLibrary {arg}: already loaded");
         return;
     };
     if !libs.is_empty() {
