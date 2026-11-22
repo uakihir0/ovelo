@@ -379,16 +379,22 @@ pub(crate) fn media_cursor(vm: &mut Vm, uri: &str, projection: &[String]) -> V {
     // artist row spans all audio files and each album row spans its
     // bucket.
     let audio_total = files.iter().filter(|f| f.2 == 2).count() as i64;
+    // Keyed by the full relative parent dir (the bucket_id identity),
+    // not the basename: "a/Music/" and "b/Music/" are different buckets.
     let mut bucket_audio: std::collections::BTreeMap<String, i64> =
         std::collections::BTreeMap::new();
     for f in files.iter().filter(|f| f.2 == 2) {
-        let b = f
+        let rel = f
             .0
-            .parent()
-            .and_then(|x| x.file_name())
-            .map(|n| n.to_string_lossy().to_string())
+            .strip_prefix(&vm.external_root)
+            .ok()
+            .map(|r| r.to_string_lossy().replace('\\', "/"))
             .unwrap_or_default();
-        *bucket_audio.entry(b).or_default() += 1;
+        let dir = rel
+            .rsplit_once('/')
+            .map(|(d, _)| format!("{d}/"))
+            .unwrap_or_default();
+        *bucket_audio.entry(dir).or_default() += 1;
     }
     let audio_albums = bucket_audio.len() as i64;
     for (p, mime, mtype) in files {
@@ -498,7 +504,7 @@ pub(crate) fn media_cursor(vm: &mut Vm, uri: &str, projection: &[String]) -> V {
                 V::I64(if mtype == 2 { audio_total } else { 0 }),
                 V::I64(if mtype == 2 { audio_albums } else { 0 }),
                 V::I64(if mtype == 2 {
-                    *bucket_audio.get(&bucket).unwrap_or(&0)
+                    *bucket_audio.get(&rel_dir).unwrap_or(&0)
                 } else {
                     0
                 }),
