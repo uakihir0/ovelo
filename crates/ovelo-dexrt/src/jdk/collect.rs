@@ -2187,25 +2187,48 @@ fn atomic_array_call(
     args: &[V],
 ) -> Option<Option<V>> {
     let idx = i32v(args.get(1).copied().unwrap_or(V::I32(0))).max(0) as usize;
+    // The element store lives on `h` for our Host objects; a dex
+    // `Obj::Instance` subclass gets a lazily-minted backing list under
+    // P_LIST_BACKING (same scheme as guest collections) — previously
+    // init did nothing and CAS reported success without storing.
+    let sh = match vm.heap.get(h) {
+        Some(Obj::Host {
+            state: HostState::List(_),
+            ..
+        }) => h,
+        Some(Obj::Host { .. }) | Some(Obj::Instance { .. }) => {
+            match pseudo_get(vm, h, P_LIST_BACKING) {
+                Some(V::Ref(bh)) => bh,
+                _ => {
+                    let bh = vm.alloc_host(class, HostState::List(Vec::new()));
+                    pseudo_set(vm, h, P_LIST_BACKING, V::Ref(bh));
+                    bh
+                }
+            }
+        }
+        _ => return None,
+    };
     let elem = |vm: &Vm| -> V {
-        match vm.heap.get(h) {
+        match vm.heap.get(sh) {
             Some(Obj::Host {
                 state: HostState::List(l),
                 ..
             }) => l.get(idx).copied().unwrap_or(V::Ref(0)),
+            Some(Obj::Array { data, .. }) => data.get(idx).copied().unwrap_or(V::Ref(0)),
             _ => V::Ref(0),
         }
     };
-    let set_elem = |vm: &mut Vm, v: V| {
-        if let Some(Obj::Host {
+    let set_elem = |vm: &mut Vm, v: V| match vm.heap.get_mut(sh) {
+        Some(Obj::Host {
             state: HostState::List(l),
             ..
-        }) = vm.heap.get_mut(h)
-        {
+        }) => {
             if idx < l.len() {
                 l[idx] = v;
             }
         }
+        Some(Obj::Array { data, .. }) if idx < data.len() => data[idx] = v,
+        _ => {}
     };
     let long = class.contains("Long") || matches!(elem(vm), V::I64(_));
     let num = |name: &str, cur: V, delta: i64| {
@@ -2237,7 +2260,7 @@ fn atomic_array_call(
                 },
                 _ => Vec::new(),
             };
-            if let Some(Obj::Host { state, .. }) = vm.heap.get_mut(h) {
+            if let Some(Obj::Host { state, .. }) = vm.heap.get_mut(sh) {
                 *state = HostState::List(l);
             }
             return Some(None);
@@ -2273,11 +2296,12 @@ fn atomic_array_call(
                 V::I32(ok as i32)
             }
         }
-        "length" => match vm.heap.get(h) {
+        "length" => match vm.heap.get(sh) {
             Some(Obj::Host {
                 state: HostState::List(l),
                 ..
             }) => V::I32(l.len() as i32),
+            Some(Obj::Array { data, .. }) => V::I32(data.len() as i32),
             _ => V::I32(0),
         },
         "incrementAndGet" | "getAndIncrement" | "decrementAndGet" | "getAndDecrement"
