@@ -313,6 +313,23 @@ pub(crate) fn media_cursor(vm: &mut Vm, uri: &str, projection: &[String]) -> V {
         "artist_id",
         "track",
         "year",
+        "genre_id",
+        "genre",
+        "composer",
+        "is_music",
+        "is_ringtone",
+        "is_notification",
+        "is_alarm",
+        "is_audiobook",
+        "bookmark",
+        // MediaStore.Audio aggregate columns — artists/albums/genres
+        // content URIs feed these; per-file URIs leave them 0/"".
+        "number_of_tracks",
+        "number_of_albums",
+        "numsongs",
+        "minyear",
+        "name",
+        "disc_number",
     ];
     let images = uri.contains("/images/");
     let video = uri.contains("/video/");
@@ -356,6 +373,24 @@ pub(crate) fn media_cursor(vm: &mut Vm, uri: &str, projection: &[String]) -> V {
         }
     }
     files.sort_by(|a, b| a.0.cmp(&b.0));
+    // Aggregate counts for the MediaStore.Audio artists/albums/genres
+    // content URIs: every audio file's artist is the conventional
+    // unknown-artist label and its album is the parent folder, so the
+    // artist row spans all audio files and each album row spans its
+    // bucket.
+    let audio_total = files.iter().filter(|f| f.2 == 2).count() as i64;
+    let mut bucket_audio: std::collections::BTreeMap<String, i64> =
+        std::collections::BTreeMap::new();
+    for f in files.iter().filter(|f| f.2 == 2) {
+        let b = f
+            .0
+            .parent()
+            .and_then(|x| x.file_name())
+            .map(|n| n.to_string_lossy().to_string())
+            .unwrap_or_default();
+        *bucket_audio.entry(b).or_default() += 1;
+    }
+    let audio_albums = bucket_audio.len() as i64;
     for (p, mime, mtype) in files {
             // A scoped volume (images/video/audio) filters by media
             // type; "file"/"media" volumes accept everything.
@@ -451,10 +486,29 @@ pub(crate) fn media_cursor(vm: &mut Vm, uri: &str, projection: &[String]) -> V {
                 V::I64(1),
                 V::I64(0),
                 V::I64(0),
+                V::I64(0),
+                jstr(vm, "<unknown>"),
+                V::Ref(0),
+                V::I64((mtype == 2) as i64),
+                V::I64(0),
+                V::I64(0),
+                V::I64(0),
+                V::I64(0),
+                V::I64(0),
+                V::I64(if mtype == 2 { audio_total } else { 0 }),
+                V::I64(if mtype == 2 { audio_albums } else { 0 }),
+                V::I64(if mtype == 2 {
+                    *bucket_audio.get(&bucket).unwrap_or(&0)
+                } else {
+                    0
+                }),
+                V::I64(0),
+                jstr(vm, "<unknown>"),
+                V::I64(0),
             ]);
     }
     if std::env::var_os("OVELO_DRAINDBG").is_some() {
-        eprintln!("[media_cursor] {uri} rows={}", rows.len());
+        eprintln!("[media_cursor] {uri} rows={} projection={projection:?}", rows.len());
     }
     // Honor the projection: the cursor's column set is exactly the
     // requested names, in the requested order — positional reads must
