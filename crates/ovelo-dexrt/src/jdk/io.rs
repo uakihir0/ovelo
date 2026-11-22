@@ -84,6 +84,14 @@ pub(crate) fn call(
                 }
             }
             Some(None)
+        } else if class == "Ljava/io/ByteArrayOutputStream;" && name == "<init>" {
+            // The output side of the Bytes payload: writes append.
+            if let Some(V::Ref(this)) = args.first() {
+                if let Some(Obj::Host { state, .. }) = vm.heap.get_mut(*this) {
+                    *state = HostState::Bytes(std::rc::Rc::new(Vec::new()), 0);
+                }
+            }
+            Some(None)
         } else if desc_is_a(class, "Ljava/io/FilterInputStream;") && name == "<init>" {
             // Guest subclasses read the wrapped stream straight out of the
             // `in` field — the java ctor would have stored it.
@@ -277,6 +285,100 @@ fn stream_call(vm: &mut Vm, name: &str, args: &[V]) -> Rt<Option<Option<V>>> {
         Some(&V::Ref(h)) => h,
         _ => 0,
     };
+    // ByteArrayOutputStream accumulates into the same Bytes payload —
+    // handled before the mutable borrow below because the write source
+    // and the returned array/string need second heap accesses.
+    let is_baos = matches!(
+        vm.heap.get(this),
+        Some(Obj::Host {
+            desc,
+            state: HostState::Bytes(..),
+            ..
+        }) if desc == "Ljava/io/ByteArrayOutputStream;"
+    );
+    if is_baos {
+        match name {
+            "write" => {
+                let mut chunk: Vec<u8> = Vec::new();
+                match args.get(1) {
+                    Some(&V::Ref(bh)) => {
+                        if let Some(Obj::Array { data: src, .. }) = vm.heap.get(bh) {
+                            let off = args
+                                .get(2)
+                                .map(|v| i64v(*v).max(0) as usize)
+                                .unwrap_or(0);
+                            let want = args
+                                .get(3)
+                                .map(|v| i64v(*v).max(0) as usize)
+                                .unwrap_or(src.len());
+                            chunk = src
+                                .iter()
+                                .skip(off)
+                                .take(want)
+                                .map(|v| i64v(*v) as u8)
+                                .collect();
+                        }
+                    }
+                    Some(v) => chunk.push(i64v(*v) as u8),
+                    _ => {}
+                }
+                if let Some(Obj::Host {
+                    state: HostState::Bytes(data, _),
+                    ..
+                }) = vm.heap.get_mut(this)
+                {
+                    std::rc::Rc::make_mut(data).extend_from_slice(&chunk);
+                }
+                return Ok(Some(None));
+            }
+            "toByteArray" => {
+                let bytes = match vm.heap.get(this) {
+                    Some(Obj::Host {
+                        state: HostState::Bytes(d, _),
+                        ..
+                    }) => d.clone(),
+                    _ => std::rc::Rc::new(Vec::new()),
+                };
+                let out: Vec<V> =
+                    bytes.iter().map(|b| V::I32(*b as i8 as i32)).collect();
+                return Ok(Some(Some(arr(vm, "B", out))));
+            }
+            "size" => {
+                let n = match vm.heap.get(this) {
+                    Some(Obj::Host {
+                        state: HostState::Bytes(d, _),
+                        ..
+                    }) => d.len() as i32,
+                    _ => 0,
+                };
+                return Ok(Some(Some(V::I32(n))));
+            }
+            "reset" => {
+                if let Some(Obj::Host {
+                    state: HostState::Bytes(d, p),
+                    ..
+                }) = vm.heap.get_mut(this)
+                {
+                    std::rc::Rc::make_mut(d).clear();
+                    *p = 0;
+                }
+                return Ok(Some(None));
+            }
+            "toString" => {
+                let bytes = match vm.heap.get(this) {
+                    Some(Obj::Host {
+                        state: HostState::Bytes(d, _),
+                        ..
+                    }) => d.clone(),
+                    _ => std::rc::Rc::new(Vec::new()),
+                };
+                let t = String::from_utf8_lossy(&bytes).into_owned();
+                return Ok(Some(Some(jstr(vm, &t))));
+            }
+            "writeTo" | "flush" | "close" => return Ok(Some(None)),
+            _ => {}
+        }
+    }
     // Byte-backed streams (raw resources, assets): real reads.
     if let Some(Obj::Host {
         state: HostState::Bytes(data, pos),
@@ -1439,6 +1541,13 @@ fn json_arr(vm: &mut Vm, name: &str, args: &[V]) -> Option<Option<V>> {
             )
         }
         "length" => Some(V::I32(list_ref(vm, h).map(|l| l.len() as i32).unwrap_or(0))),
+        // Dex code treats JSON arrays as java.util.List when a parsed
+        // map is consumed generically (`asFloatList(list.get(k))`) —
+        // answer the List shape too so interface dispatch resolves.
+        "size" => Some(V::I32(list_ref(vm, h).map(|l| l.len() as i32).unwrap_or(0))),
+        "isEmpty" => Some(V::I32(
+            list_ref(vm, h).map(|l| l.is_empty()).unwrap_or(true) as i32,
+        )),
         "remove" => {
             let i = i32v(args[1]) as usize;
             let v = list_mut(vm, h)

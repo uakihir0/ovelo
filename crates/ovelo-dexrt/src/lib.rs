@@ -568,9 +568,22 @@ impl Vm {
         let out = (|| {
             let d = self.dex_of(g)?;
             let f = d.field(gl(g)).ok()?;
+            let owner_desc = d.type_descriptor(f.class_idx as u32).ok()?;
+            let name = d.string(f.name_idx).ok()?;
+            // Resolve the ref through the class hierarchy to the class
+            // that actually declares the field: `LPolygonShape;.addr`
+            // and `LShape;.addr` then share one storage slot.
+            if let Some(owner) = self.type_index_of(&owner_desc) {
+                if let Some(decl) = self
+                    .find_field_by_name(owner, &name, false)
+                    .or_else(|| self.find_field_by_name(owner, &name, true))
+                {
+                    return Some(decl);
+                }
+            }
             let sig = (
-                d.type_descriptor(f.class_idx as u32).unwrap_or_default(),
-                d.string(f.name_idx).unwrap_or_default(),
+                owner_desc,
+                name,
                 d.type_descriptor(f.type_idx as u32).unwrap_or_default(),
             );
             Some(self.fields_by_sig.get(&sig).copied().unwrap_or(g))
@@ -2947,10 +2960,30 @@ impl Vm {
             ("Ljava/lang/String;", "<init>") => {
                 if let V::Ref(this) = args.first().copied().unwrap_or(V::Ref(0)) {
                     if this != 0 {
-                        let t = args
-                            .get(1)
-                            .and_then(|v| jdk::sv(self, *v))
-                            .unwrap_or_default();
+                        // `new String(byte[], charset)` — decode the
+                        // byte array; `new String(x)` mirrors the text.
+                        let t = match args.get(1).copied() {
+                            Some(V::Ref(ah)) => match self.heap.get(ah) {
+                                Some(Obj::Array { elem, data }) => {
+                                    if elem == "C" {
+                                        let units: Vec<u16> = data
+                                            .iter()
+                                            .map(|v| jdk::i64v(*v) as u16)
+                                            .collect();
+                                        Some(String::from_utf16_lossy(&units))
+                                    } else {
+                                        let bytes: Vec<u8> = data
+                                            .iter()
+                                            .map(|v| jdk::i64v(*v) as u8)
+                                            .collect();
+                                        Some(String::from_utf8_lossy(&bytes).into_owned())
+                                    }
+                                }
+                                _ => jdk::sv(self, V::Ref(ah)),
+                            },
+                            _ => None,
+                        }
+                        .unwrap_or_default();
                         let r = self.heap.intern_str(&t);
                         jdk::pseudo_set(self, this, jdk::P_DATA, V::Ref(r));
                     }
@@ -3134,6 +3167,92 @@ impl Vm {
         out
     }
 
+    /// Unboxed scalar (I64/F64/I32/F32) used as an Object — JSON values
+    /// reach `((Number)x).doubleValue()` unboxed. Answer the boxing
+    /// surface by coercion; anything else stays unhandled so the
+    // caller falls back to the null-receiver NPE.
+    fn scalar_virtual(&mut self, midx: GIdx, v: V, args: &[V]) -> Rt<Option<V>> {
+        let d = match self.dex_of(midx) {
+            Some(d) => d,
+            None => return Ok(None),
+        };
+        let m = d.method(gl(midx)).map_err(E::Vm)?;
+        let name = d.string(m.name_idx).map_err(E::Vm)?;
+        let as_f64 = match v {
+            V::I32(i) => i as f64,
+            V::I64(i) => i as f64,
+            V::F32(f) => f as f64,
+            V::F64(f) => f,
+            _ => return Ok(None),
+        };
+        let as_i64 = as_f64 as i64;
+        Ok(Some(match name.as_str() {
+            "intValue" | "shortValue" | "byteValue" | "charValue" => {
+                V::I32(as_i64 as i32)
+            }
+            "longValue" => V::I64(as_i64),
+            "floatValue" => V::F32(as_f64 as f32),
+            "doubleValue" => V::F64(as_f64),
+            "booleanValue" => V::I32((as_i64 != 0) as i32),
+            "toString" => {
+                let t = match v {
+                    V::I64(i) => i.to_string(),
+                    V::I32(i) => i.to_string(),
+                    _ => {
+                        if as_f64.fract() == 0.0 {
+                            format!("{}", as_f64 as i64)
+                        } else {
+                            as_f64.to_string()
+                        }
+                    }
+                };
+                jdk::jstr(self, &t)
+            }
+            "hashCode" => V::I32(as_i64 as i32 ^ (as_i64 >> 32) as i32),
+            "equals" => {
+                let eq = match args.get(1).copied() {
+                    Some(o) => match (v, o) {
+                        (V::I32(a), V::I32(b)) => a == b,
+                        (V::I64(a), V::I64(b)) => a == b,
+                        (V::F32(a), V::F32(b)) => a == b,
+                        (V::F64(a), V::F64(b)) => a == b,
+                        _ => false,
+                    },
+                    _ => false,
+                };
+                V::I32(eq as i32)
+            }
+            _ => return Ok(None),
+        }))
+    }
+
+    /// `instanceof`/check-cast target test for an unboxed scalar —
+    /// numbers satisfy Number/Object and the matching box class.
+    fn scalar_is_instance(&mut self, v: V, ty: GIdx) -> bool {
+        let want = self.type_desc_of(ty).unwrap_or_default();
+        let num = matches!(v, V::I32(_) | V::I64(_) | V::F32(_) | V::F64(_));
+        let int_kind = matches!(v, V::I32(_) | V::I64(_));
+        let hit = num
+            && matches!(
+                want.as_str(),
+                "Ljava/lang/Object;"
+                    | "Ljava/lang/Number;"
+                    | "Ljava/lang/Integer;"
+                    | "Ljava/lang/Long;"
+                    | "Ljava/lang/Short;"
+                    | "Ljava/lang/Byte;"
+                    | "Ljava/lang/Double;"
+                    | "Ljava/lang/Float;"
+                    | "Ljava/io/Serializable;"
+                    | "Ljava/lang/Comparable;"
+            )
+            && (want != "Ljava/lang/Double;" && want != "Ljava/lang/Float;" || !int_kind);
+        if std::env::var_os("OVELO_TRACE_INSTOF").is_some() {
+            eprintln!("[instof] scalar {:?} vs {} -> {}", v, want, hit);
+        }
+        hit
+    }
+
     fn invoke(&mut self, midx: GIdx, args: Vec<V>, kind: InvokeKind) -> Rt<Option<V>> {
         self.invoke_inner(midx, args, kind, false)
     }
@@ -3171,7 +3290,19 @@ impl Vm {
             InvokeKind::Virtual | InvokeKind::Interface => {
                 let recv = match args.first() {
                     Some(&V::Ref(h)) if h != 0 => h,
-                    _ => {
+                    Some(v) => {
+                        // JSON/scalar values arrive unboxed (I64/F64):
+                        // `Number.*Value`/`Object` methods on them
+                        // coerce the scalar instead of faulting.
+                        if let Some(r) = self.scalar_virtual(midx, *v, &args)? {
+                            return Ok(Some(r));
+                        }
+                        return Err(self.throw_builtin(
+                            "Ljava/lang/NullPointerException;",
+                            &format!("null receiver calling {}", self.describe_method(midx)),
+                        ));
+                    }
+                    None => {
                         return Err(self.throw_builtin(
                             "Ljava/lang/NullPointerException;",
                             &format!("null receiver calling {}", self.describe_method(midx)),
@@ -3954,13 +4085,14 @@ enum InvokeKind {
 impl Vm {
     /// Set a possibly-wide value: mirrors into `regs[i+1]` for `I64`/`F64`.
     fn set(fr: &mut Frame, i: usize, v: V) {
+        // One V slot carries a whole wide value (I64/F64), so a
+        // single-register op writes exactly one slot. Mirroring into
+        // i+1 would clobber the *next live register* — e.g.
+        // `move-result-object v2` returning an unboxed number must not
+        // overwrite v3. Dex only ever addresses wide pairs by their
+        // low slot, so the mirror slot is never read.
         if let Some(r) = fr.regs.get_mut(i) {
             *r = v;
-        }
-        if matches!(v, V::I64(_) | V::F64(_)) {
-            if let Some(r2) = fr.regs.get_mut(i + 1) {
-                *r2 = v;
-            }
         }
     }
 
@@ -4093,7 +4225,18 @@ impl Vm {
             }
             // ---- casts ----
             0x1f => {
-                let h = Self::refv(r(0)?)?;
+                // A scalar reaching check-cast is valid when the target
+                // is a box class it can satisfy (JSON numbers as Number).
+                let h = match r(0)? {
+                    V::Ref(h) => h,
+                    v if self.scalar_is_instance(v, gi(ins.idx.unwrap_or(0))) => 0,
+                    _ => {
+                        return Err(self.throw_builtin(
+                            "Ljava/lang/ClassCastException;",
+                            "check-cast on primitive",
+                        ))
+                    }
+                };
                 // Opaque placeholders (empty stubs we minted to satisfy a
                 // return type) carry no verifiable class — let the cast
                 // pass. `instanceof`/catch matching stay strict.
@@ -4126,8 +4269,13 @@ impl Vm {
                 }
             }
             0x20 => {
-                let h = Self::refv(r(1)?)?;
-                let res = h != 0 && self.is_instance(h, gi(ins.idx.unwrap_or(0)));
+                // Untyped dex registers can hand a number to
+                // `instanceof` (JSON values map to I64/F64) — a
+                // non-reference is never an instance: false, not fault.
+                let res = match r(1)? {
+                    V::Ref(h) => h != 0 && self.is_instance(h, gi(ins.idx.unwrap_or(0))),
+                    v => self.scalar_is_instance(v, gi(ins.idx.unwrap_or(0))),
+                };
                 set!(regs[0], V::I32(res as i32));
             }
             0x21 => {
@@ -4289,7 +4437,14 @@ impl Vm {
                         };
                         let eq = match (refv(va), refv(vb)) {
                             (Some(a), Some(b)) => a == b,
-                            _ => Self::i32v(va)? == Self::i32v(vb)?,
+                            _ => match (va, vb) {
+                                (V::I32(a), V::I32(b)) => a == b,
+                                // A reference (or null) never equals a
+                                // wide/float value in dex's untyped
+                                // registers — report unequal rather
+                                // than faulting on i32v.
+                                _ => false,
+                            },
                         };
                         if op == 0x32 {
                             eq
@@ -4315,9 +4470,14 @@ impl Vm {
             }
             0x38..=0x3d => {
                 let va = r(0)?;
-                // if-eqz/if-nez also test references against null.
+                // if-eqz/if-nez also test references against null — and
+                // unboxed scalars standing in for boxed values (a JSON
+                // Number reaching the slot) count as non-null/nonzero.
                 let a = match va {
                     V::Ref(h) => h as i32,
+                    V::I64(i) => (i != 0) as i32,
+                    V::F64(f) => (f != 0.0) as i32,
+                    V::F32(f) => (f != 0.0) as i32,
                     _ => Self::i32v(va)?,
                 };
                 let t = match op {

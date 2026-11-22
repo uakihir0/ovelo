@@ -200,17 +200,21 @@ pub fn install_crash_dump() {
                     }
                     let nf = *(f as *const usize);
                     let lr = *((f + 8) as *const usize);
-                    if LOADED_RANGES
+                    let so_off = LOADED_RANGES
                         .lock()
-                        .map(|v| v.iter().any(|(b, s)| lr >= *b && lr < b + s))
-                        .unwrap_or(false)
-                    {
+                        .map(|v| {
+                            v.iter()
+                                .find(|(b, s)| lr >= *b && lr < b + s)
+                                .map(|(b, _)| lr - *b)
+                        })
+                        .unwrap_or(None);
+                    if let Some(off) = so_off {
                         for c in b"[so]" {
                             msg[n] = *c;
                             n += 1;
                         }
                         for i in (0..16).rev() {
-                            msg[n] = b"0123456789abcdef"[(lr >> (i * 4)) & 0xf];
+                            msg[n] = b"0123456789abcdef"[(off >> (i * 4)) & 0xf];
                             n += 1;
                         }
                         msg[n] = b' ';

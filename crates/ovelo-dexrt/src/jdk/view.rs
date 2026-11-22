@@ -4304,6 +4304,24 @@ fn build_tree(vm: &mut Vm, elems: &[Element], ctx: V) -> V {
             let v = jstr(vm, t);
             pseudo_set(vm, h, P_TAG, v);
         }
+        // `android:visibility` — the XML enum (0=visible, 1=invisible,
+        // 2=gone) maps onto the View constants (0/4/8); AOSP honors it
+        // in the ctor's AttributeSet read so getVisibility reflects it
+        // before any setVisibility call.
+        if let Some(v) = el.android("visibility") {
+            let vis = match v {
+                Value::Int(1) => 4,
+                Value::Int(2) => 8,
+                Value::Int(_) => 0,
+                Value::Str(s) => match s.as_str() {
+                    "invisible" => 4,
+                    "gone" => 8,
+                    _ => 0,
+                },
+                _ => 0,
+            };
+            pseudo_set(vm, h, P_VIS, V::I32(vis));
+        }
         if let Some(Value::Str(t)) = el.android("text") {
             let v = jstr(vm, t);
             pseudo_set(vm, h, P_TEXT, v);

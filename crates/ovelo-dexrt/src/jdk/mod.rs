@@ -133,11 +133,14 @@ pub(crate) fn s(vm: &Vm, h: u32) -> Option<String> {
         }) => Some(t.clone()),
         // `new String(x)` — the String.<init> arm stashes the source
         // text under P_DATA so copies read like the interned form.
-        Some(Obj::Instance { fields, .. }) => match fields.get(&(P_DATA as u64)) {
-            Some(&V::Ref(rh)) if rh != 0 => s(vm, rh),
-            _ => None,
-        },
-        Some(Obj::Host { .. }) => None,
+        // new-instance allocates a Host for Ljava/lang/String;, so both
+        // object shapes must answer it.
+        Some(Obj::Instance { fields, .. }) | Some(Obj::Host { fields, .. }) => {
+            match fields.get(&(P_DATA as u64)) {
+                Some(&V::Ref(rh)) if rh != 0 => s(vm, rh),
+                _ => None,
+            }
+        }
         _ => None,
     }
 }

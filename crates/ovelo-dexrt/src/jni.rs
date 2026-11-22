@@ -20,7 +20,7 @@ use std::ffi::{c_void, CString};
 use crate::jdk;
 use crate::proto_sig;
 use crate::value::{HostState, Obj, V};
-use crate::{gl, E, GIdx, Rt, Vm};
+use crate::{gl, GIdx, Rt, Vm};
 
 thread_local! {
     static CUR_VM: Cell<*mut Vm> = const { Cell::new(std::ptr::null_mut()) };
@@ -216,11 +216,30 @@ core::arch::global_asm!(
     ".global _ovelo_jni_call",
     ".p2align 2",
     "_ovelo_jni_call:",
-    // x0=fnptr, x1=iargs[8], x2=fargs[8], x3=out[2]
-    // x19 keeps `out` across the call (callee-saved); lr is clobbered
-    // by blr so it rides the stack beside it (sp stays 16-aligned).
-    "stp x19, lr, [sp, #-16]!",
+    // x0=fnptr, x1=iargs[8], x2=fargs[8], x3=out[2],
+    // x4=sargs[n] (AAPCS64 stack args, 8B slots), x5=n.
+    // x19-x21 keep `out`/sargs/n across the call (callee-saved); lr
+    // is clobbered by blr so it rides the stack beside them.
+    "stp x19, x20, [sp, #-32]!",
+    "stp x21, lr, [sp, #16]",
     "mov x19, x3",
+    "mov x20, x4",
+    "mov x21, x5",
+    // Stack-arg area: round_up(n*8, 16) to keep sp 16-aligned.
+    "lsl x9, x5, #3",
+    "add x9, x9, #15",
+    "and x9, x9, #-16",
+    "sub sp, sp, x9",
+    // Copy surplus args onto the stack in order.
+    "mov x10, #0",
+    "1:",
+    "cmp x10, x21",
+    "b.hs 2f",
+    "ldr x11, [x20, x10, lsl #3]",
+    "str x11, [sp, x10, lsl #3]",
+    "add x10, x10, #1",
+    "b 1b",
+    "2:",
     "mov x9, x0",
     "ldp d0, d1, [x2]",
     "ldp d2, d3, [x2, #16]",
@@ -233,20 +252,40 @@ core::arch::global_asm!(
     "blr x9",
     "str x0, [x19]",
     "str d0, [x19, #8]",
-    "ldp x19, lr, [sp], #16",
+    // Pop the stack-arg area and restore.
+    "lsl x9, x21, #3",
+    "add x9, x9, #15",
+    "and x9, x9, #-16",
+    "add sp, sp, x9",
+    "ldp x21, lr, [sp, #16]",
+    "ldp x19, x20, [sp], #32",
     "ret",
 );
 
 #[cfg(target_arch = "aarch64")]
 extern "C" {
-    /// fnptr(iargs as x0-x7, fargs as d0-d7) → out[0]=x0, out[1]=d0 bits.
-    fn ovelo_jni_call(fnptr: usize, iargs: *const u64, fargs: *const f64, out: *mut u64);
+    /// fnptr(iargs as x0-x7, fargs as d0-d7, sargs onto the stack)
+    /// → out[0]=x0, out[1]=d0 bits.
+    fn ovelo_jni_call(
+        fnptr: usize,
+        iargs: *const u64,
+        fargs: *const f64,
+        out: *mut u64,
+        sargs: *const u64,
+        snargs: u64,
+    );
 }
 
 /// Call a native function: int-class args in `iargs` (≤8), float-class
-/// args in `fargs` (≤8). Returns (x0, d0's bit pattern).
+/// args in `fargs` (≤8), surplus args (either class, in AAPCS64 order)
+/// as 8-byte slots in `sargs`. Returns (x0, d0's bit pattern).
 #[cfg(target_arch = "aarch64")]
-pub(crate) fn call_native(fnptr: usize, iargs: &[u64; 8], fargs: &[f64; 8]) -> (u64, u64) {
+pub(crate) fn call_native(
+    fnptr: usize,
+    iargs: &[u64; 8],
+    fargs: &[f64; 8],
+    sargs: &[u64],
+) -> (u64, u64) {
     let mut out = [0u64; 2];
     if std::env::var_os("OVELO_ENVCALL").is_some() {
         if let Some(m) = ENV_NAMES.get() {
@@ -256,7 +295,14 @@ pub(crate) fn call_native(fnptr: usize, iargs: &[u64; 8], fargs: &[f64; 8]) -> (
     }
     without_vm_lock(|| {
         crate::native::with_guest_tls(|| unsafe {
-            ovelo_jni_call(fnptr, iargs.as_ptr(), fargs.as_ptr(), out.as_mut_ptr())
+            ovelo_jni_call(
+                fnptr,
+                iargs.as_ptr(),
+                fargs.as_ptr(),
+                out.as_mut_ptr(),
+                sargs.as_ptr(),
+                sargs.len() as u64,
+            )
         });
     });
     (out[0], out[1])
@@ -269,6 +315,7 @@ pub(crate) fn call_native(
     _fnptr: usize,
     _iargs: &[u64; 8],
     _fargs: &[f64; 8],
+    _sargs: &[u64],
 ) -> (u64, u64) {
     (0, 0)
 }
@@ -1438,14 +1485,16 @@ pub(crate) fn load_native_lib(vm: &mut Vm, arg: &str, absolute: bool) {
     if let Some(addr) = onload {
         let iargs = [vm_ptr() as u64, 0, 0, 0, 0, 0, 0, 0];
         let fargs = [0f64; 8];
-        let (rc, _) = with_vm(vm, |_| call_native(addr, &iargs, &fargs));
+        let (rc, _) = with_vm(vm, |_| call_native(addr, &iargs, &fargs, &[]));
         eprintln!("[jni] JNI_OnLoad -> {rc:#x}");
     }
 }
 
 /// Marshal dex args and call the native function. `iargs[0..2]` are the
-/// env + receiver/class — params occupy int regs x2-x7 (≤6) and float
-/// regs d0-d7 (≤8). Long/double are single 64-bit slots each.
+/// env + receiver/class — params occupy int regs x2-x7 and float regs
+/// d0-d7; anything beyond rides the AAPCS64 stack area (`sargs`, in
+/// argument order). Long/double are single 64-bit slots each; a float
+/// stack arg keeps its value in the low half of its 8-byte slot.
 pub(crate) fn dispatch_native(
     vm: &mut Vm,
     addr: usize,
@@ -1456,6 +1505,7 @@ pub(crate) fn dispatch_native(
 ) -> Rt<Option<V>> {
     let mut iargs = [0u64; 8];
     let mut fargs = [0f64; 8];
+    let mut sargs: Vec<u64> = Vec::new();
     iargs[0] = env_ptr() as u64;
     iargs[1] = if is_static {
         vm.type_index_of(class)
@@ -1473,38 +1523,32 @@ pub(crate) fn dispatch_native(
     for v in params {
         match v {
             V::F32(f) => {
-                if fi >= 8 {
-                    return Err(E::Vm(crate::errd(
-                        "dexrt.jni.args",
-                        "float args > 8".to_string(),
-                    )));
+                if fi < 8 {
+                    fargs[fi] = *f as f64;
+                    fi += 1;
+                } else {
+                    sargs.push(f.to_bits() as u64);
                 }
-                fargs[fi] = *f as f64;
-                fi += 1;
             }
             V::F64(f) => {
-                if fi >= 8 {
-                    return Err(E::Vm(crate::errd(
-                        "dexrt.jni.args",
-                        "float args > 8".to_string(),
-                    )));
+                if fi < 8 {
+                    fargs[fi] = *f;
+                    fi += 1;
+                } else {
+                    sargs.push(f.to_bits());
                 }
-                fargs[fi] = *f;
-                fi += 1;
             }
             other => {
-                if ii >= 8 {
-                    return Err(E::Vm(crate::errd(
-                        "dexrt.jni.args",
-                        "int args > 6".to_string(),
-                    )));
+                if ii < 8 {
+                    iargs[ii] = v_to_u64(*other);
+                    ii += 1;
+                } else {
+                    sargs.push(v_to_u64(*other));
                 }
-                iargs[ii] = v_to_u64(*other);
-                ii += 1;
             }
         }
     }
-    let (x0, d0) = with_vm(vm, |_| call_native(addr, &iargs, &fargs));
+    let (x0, d0) = with_vm(vm, |_| call_native(addr, &iargs, &fargs, &sargs));
     Ok(Some(match ret {
         "V" => return Ok(None),
         "Z" | "B" | "C" | "S" | "I" => V::I32(x0 as u32 as i32),
