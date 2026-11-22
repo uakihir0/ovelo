@@ -4616,7 +4616,7 @@ pub(crate) fn dispatch_touch(
         );
     }
     let V::Ref(evt) = host(vm, "Landroid/view/MotionEvent;", HostState::Empty) else {
-        return Ok(true);
+        return Ok(false);
     };
     pseudo_set(vm, evt, P_ME_ACTION, V::I32(action));
     let mut v = target;
@@ -4704,11 +4704,15 @@ pub(crate) fn dispatch_touch(
             eprintln!("[touchdbg] activity onTouchEvent h{act}");
         }
         let _ = vm.call_virtual(act, "onTouchEvent", &[V::Ref(evt)]);
+        return Ok(true);
     }
     if dbg {
         eprintln!("[touchdbg] {x},{y} a{action} unhandled");
     }
-    Ok(true)
+    // The hit view had no dex dispatchTouchEvent/onTouchEvent, no
+    // listener, and no activity hook — the host tree may hold the
+    // handler (host-materialized views keep listeners host-side).
+    Ok(false)
 }
 
 pub(crate) fn attach(vm: &mut Vm, parent: u32, child: V) {
