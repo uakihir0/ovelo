@@ -11,7 +11,7 @@ pub(crate) mod db;
 pub(crate) mod gfx;
 mod io;
 mod lang;
-mod time;
+pub(crate) mod time;
 mod util;
 pub(crate) mod vector;
 pub(crate) mod view;

@@ -1950,6 +1950,16 @@ pub(crate) fn call(
         | "getStatusBarColor"
         | "getMediaController"
         | "getLayoutInflater" => Some(Some(stub_ret(vm, sig))),
+        // AOSP `TextClock.onAttachedToWindow` registers the ticker and
+        // calls updateTime(); subclasses that don't override attach
+        // (fossify's MyTextClock) still expect the text to appear.
+        "onAttachedToWindow" => {
+            let d = class_of(vm, V::Ref(this));
+            if vm.assignable_desc(&d, "Landroid/widget/TextClock;") {
+                textclock_update(vm, this);
+            }
+            Some(None)
+        }
 
         _ => {
             // Any other method on an inflated view/inflater/window: answer
@@ -1960,6 +1970,119 @@ pub(crate) fn call(
             })
         }
     })
+}
+
+/// `TextClock.updateTime`: format `now` through the view's
+/// `format24Hour`/`format12Hour` pattern attr (a SimpleDateFormat
+/// pattern; apps like fossify clock set "EEE, d MMM" for the date
+/// line) and write it into the text pseudo-field.
+fn textclock_update(vm: &mut Vm, this: u32) {
+    let pat = attr_find(vm, this, "format24Hour")
+        .and_then(|v| sv(vm, v))
+        .or_else(|| attr_find(vm, this, "format12Hour").and_then(|v| sv(vm, v)))
+        .filter(|p| !p.is_empty())
+        .unwrap_or_else(|| "H:mm:ss".into());
+    let text = jstr(vm, &clock_pattern(&pat, now_ms()));
+    pseudo_set(vm, this, P_TEXT, text);
+}
+
+/// Minimal `SimpleDateFormat` pattern renderer (UTC — the VM's
+/// TimeZone stub is UTC everywhere): y/M/d/E/H/h/K/k/m/s/a/D fields,
+/// quoted literals, other chars verbatim.
+fn clock_pattern(pat: &str, ms: i64) -> String {
+    const MONTHS: [&str; 12] = [
+        "January", "February", "March", "April", "May", "June", "July", "August", "September",
+        "October", "November", "December",
+    ];
+    const DAYS: [&str; 7] = [
+        "Sunday", "Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday",
+    ];
+    let (y, mo, d, h24, mi, s, _) = time::ms_fields(ms);
+    let dow = ((ms.div_euclid(86_400_000) + 4).rem_euclid(7)) as usize; // 0=Sun
+    let chars: Vec<char> = pat.chars().collect();
+    let mut out = String::new();
+    let mut i = 0;
+    while i < chars.len() {
+        let c = chars[i];
+        if c == '\'' {
+            // Quoted literal: '' is one quote, 'text' is verbatim.
+            i += 1;
+            if i < chars.len() && chars[i] == '\'' {
+                out.push('\'');
+                i += 1;
+                continue;
+            }
+            while i < chars.len() && chars[i] != '\'' {
+                out.push(chars[i]);
+                i += 1;
+            }
+            i += 1;
+            continue;
+        }
+        if !c.is_ascii_alphabetic() {
+            out.push(c);
+            i += 1;
+            continue;
+        }
+        let mut n = 1;
+        while i + n < chars.len() && chars[i + n] == c {
+            n += 1;
+        }
+        let num = |v: i64| {
+            if n >= 2 {
+                format!("{v:02}")
+            } else {
+                v.to_string()
+            }
+        };
+        out.push_str(&match c {
+            'y' => {
+                if n == 2 {
+                    format!("{:02}", y % 100)
+                } else {
+                    y.to_string()
+                }
+            }
+            'M' => match n {
+                1 | 2 => num(mo),
+                3 => MONTHS[(mo - 1) as usize][..3].to_string(),
+                _ => MONTHS[(mo - 1) as usize].to_string(),
+            },
+            'd' => num(d),
+            'D' => {
+                let doy = ms.div_euclid(86_400_000) - time::days_from_civil(y, 1, 1) + 1;
+                if n >= 3 {
+                    format!("{doy:03}")
+                } else {
+                    doy.to_string()
+                }
+            }
+            'E' => {
+                let full = DAYS[dow];
+                if n >= 4 {
+                    full.to_string()
+                } else {
+                    full[..3].to_string()
+                }
+            }
+            'a' => {
+                if h24 < 12 {
+                    "AM".into()
+                } else {
+                    "PM".into()
+                }
+            }
+            'H' => num(h24),
+            'h' => num(if h24 % 12 == 0 { 12 } else { h24 % 12 }),
+            'K' => num(h24 % 12),
+            'k' => num(if h24 == 0 { 24 } else { h24 }),
+            'm' => num(mi),
+            's' => num(s),
+            _ => c.to_string().repeat(n),
+        });
+        i += n;
+    }
+    out
 }
 
 // ---------------------------------------------------------------------
@@ -3266,9 +3389,17 @@ fn relative_layout_fallback(vm: &mut Vm, this: u32, w: i32, h: i32) {
         mt: i32,
         mr: i32,
         mb: i32,
+        match_w: bool,
+        match_h: bool,
     }
     let mut ks: Vec<Kid> = Vec::with_capacity(n);
     for &ch in &kids {
+        let lp_dim = |name: &str| -> i32 {
+            match attr_find(vm, ch, name) {
+                Some(V::I32(v)) => v,
+                _ => 0,
+            }
+        };
         ks.push(Kid {
             id: pint(vm, ch, P_VIEW_ID),
             w: pint(vm, ch, P_MEAS_W) & 0x00FF_FFFF,
@@ -3277,6 +3408,8 @@ fn relative_layout_fallback(vm: &mut Vm, this: u32, w: i32, h: i32) {
             mt: margin(vm, ch, "topMargin"),
             mr: margin(vm, ch, "rightMargin"),
             mb: margin(vm, ch, "bottomMargin"),
+            match_w: lp_dim("layout_width") == -1,
+            match_h: lp_dim("layout_height") == -1,
         });
     }
     let idx_of = |id: i32| -> Option<usize> {
@@ -3310,7 +3443,7 @@ fn relative_layout_fallback(vm: &mut Vm, this: u32, w: i32, h: i32) {
      -> Option<(i32, i32)> {
         // Leading edge: sibling rules first (toRightOf/alignLeft,
         // below/alignTop), else the parent's near edge.
-        let (lead_rules, trail_parent, lead_parent, lead_sib_rules, size, mlead, mtrail) =
+        let (lead_rules, trail_parent, lead_parent, lead_sib_rules, size, mlead, mtrail, mp) =
             if horiz {
                 (
                     &["layout_toRightOf", "layout_toEndOf"][..],
@@ -3320,6 +3453,7 @@ fn relative_layout_fallback(vm: &mut Vm, this: u32, w: i32, h: i32) {
                     k.w,
                     k.ml,
                     k.mr,
+                    k.match_w,
                 )
             } else {
                 (
@@ -3330,6 +3464,7 @@ fn relative_layout_fallback(vm: &mut Vm, this: u32, w: i32, h: i32) {
                     k.h,
                     k.mt,
                     k.mb,
+                    k.match_h,
                 )
             };
         let (extent, pleading, ptrailing) = if horiz {
@@ -3398,8 +3533,25 @@ fn relative_layout_fallback(vm: &mut Vm, this: u32, w: i32, h: i32) {
         }
         match (lead, trail) {
             (Some(l), Some(t)) => Some((l, t)),
-            (Some(l), None) => Some((l, l + size)),
-            (None, Some(t)) => Some((t - size, t)),
+            (Some(l), None) => {
+                // match_parent anchored only on the leading edge fills
+                // the rest of the parent's content box.
+                if mp {
+                    Some((l, extent - ptrailing - mtrail))
+                } else {
+                    Some((l, l + size))
+                }
+            }
+            (None, Some(t)) => {
+                // match_parent anchored only on the trailing edge
+                // (`layout_above` + match_height) stretches up to the
+                // parent's leading edge instead of overflowing above it.
+                if mp {
+                    Some((pleading + mlead, t))
+                } else {
+                    Some((t - size, t))
+                }
+            }
             (None, None) => {
                 if truthy(rule(vm, ch, &["layout_centerInParent"]))
                     || truthy(rule(
