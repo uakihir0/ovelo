@@ -1004,7 +1004,12 @@ pub(crate) fn db_call(vm: &mut Vm, name: &str, args: &[V]) -> Rt<Option<Option<V
         _ => 0,
     };
     if std::env::var_os("OVELO_DBDBG").is_some() {
-        eprintln!("[db] {name}(h={h})");
+        let sql = args
+            .get(1)
+            .and_then(|v| sv(vm, *v))
+            .unwrap_or_default();
+        let sql: String = sql.chars().take(80).collect();
+        eprintln!("[db] {name}(h={h}) {sql}");
     }
     // A SQLiteStatement also lands here (database/* dispatch): it
     // carries P_SQL, so it takes the statement path.

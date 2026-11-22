@@ -1944,8 +1944,22 @@ fn thread_call(vm: &mut Vm, name: &str, _sig: &str, args: &[V]) -> Rt<Option<Opt
                     _ => 0,
                 }
                 .max(0);
+                // Short sleeps just block: execution continues after
+                // the call, which parking can't express — a re-run
+                // from the top would repeat the whole runnable.
+                if ms <= 500 {
+                    std::thread::sleep(std::time::Duration::from_millis(ms as u64));
+                    return Ok(Some(None));
+                }
                 let due = (now_ms().saturating_add(ms)).max(0) as u64;
                 if vm.cur_runnable != 0 {
+                    if vm.slept_once.remove(&vm.cur_runnable) {
+                        // Re-run past the waited-out deadline — the
+                        // first sleep after resume returns at once or
+                        // the task re-parks at this call forever.
+                        return Ok(Some(None));
+                    }
+                    vm.slept_once.insert(vm.cur_runnable);
                     vm.sleep_until.insert(vm.cur_runnable, due);
                 }
                 return Err(crate::E::Vm(crate::err("ovelo.park")));

@@ -304,6 +304,12 @@ pub struct Vm {
     /// wake at (`Thread.sleep` in worker context writes; the drain
     /// reads when requeueing into `delayed_runnables`).
     pub(crate) sleep_until: HashMap<u32, u64>,
+    /// Runnables whose re-run after a long `Thread.sleep` park must
+    /// skip the first sleep call: `run()` re-executes from the top,
+    /// so without the flag a one-shot task that sleeps mid-body
+    /// (`load(); sleep(200); post()`) re-parks at the same call on
+    /// every drain and never finishes.
+    pub(crate) slept_once: std::collections::HashSet<u32>,
     /// ViewTreeObserver handle -> registered onGlobalLayout listeners.
     pub(crate) vto_listeners: HashMap<u32, Vec<u32>>,
     /// ViewTreeObserver handle -> `OnPreDrawListener` handles — Glide's
@@ -477,6 +483,7 @@ impl Vm {
             thread_runnables: std::collections::HashSet::new(),
             cur_runnable: 0,
             sleep_until: HashMap::new(),
+            slept_once: std::collections::HashSet::new(),
             vto_listeners: HashMap::new(),
             vto_predraw: HashMap::new(),
             draining: false,
@@ -1684,6 +1691,7 @@ impl Vm {
                     // captured references.
                     self.thread_runnables.remove(&r);
                     self.sleep_until.remove(&r);
+                    self.slept_once.remove(&r);
                 }
             }
         }
