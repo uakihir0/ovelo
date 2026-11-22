@@ -436,16 +436,36 @@ pub(crate) fn value_eq(vm: &Vm, a: V, b: V) -> bool {
                 // Slot objects — `equals` compares the wrapped value,
                 // not the box identity, or `list.contains(Long.valueOf(x))`
                 // never matches (MediaStore id joins drop every row).
+                // Other Slot carriers (AtomicReference, Optional, …)
+                // inherit Object.equals — identity — so limit this to
+                // the value types, and only same-class boxes match
+                // (`Integer(5).equals(Long(5))` is false in Java).
                 (
                     Some(Obj::Host {
+                        desc: da,
                         state: HostState::Slot(a),
                         ..
                     }),
                     Some(Obj::Host {
+                        desc: db,
                         state: HostState::Slot(b),
                         ..
                     }),
-                ) => value_eq(vm, *a, *b),
+                ) => {
+                    da == db
+                        && matches!(
+                            da.as_str(),
+                            "Ljava/lang/Boolean;"
+                                | "Ljava/lang/Byte;"
+                                | "Ljava/lang/Character;"
+                                | "Ljava/lang/Short;"
+                                | "Ljava/lang/Integer;"
+                                | "Ljava/lang/Long;"
+                                | "Ljava/lang/Float;"
+                                | "Ljava/lang/Double;"
+                        )
+                        && value_eq(vm, *a, *b)
+                }
                 _ => false,
             }
         }
