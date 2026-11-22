@@ -178,6 +178,29 @@ unsafe fn mach_thread_id() -> u64 {
     id
 }
 
+/// Last TLS window transitions, for the segv dump: [entry site, entry
+/// tid, entry old, exit site, exit tid, exit old]. Read from the
+/// crashing thread's handler — single-writer per thread, no lock.
+#[cfg(target_arch = "aarch64")]
+static TLS_TRACE: [std::sync::atomic::AtomicU64; 6] = [
+    std::sync::atomic::AtomicU64::new(0),
+    std::sync::atomic::AtomicU64::new(0),
+    std::sync::atomic::AtomicU64::new(0),
+    std::sync::atomic::AtomicU64::new(0),
+    std::sync::atomic::AtomicU64::new(0),
+    std::sync::atomic::AtomicU64::new(0),
+];
+
+#[cfg(target_arch = "aarch64")]
+fn tls_site_id(site: &'static str) -> u64 {
+    match site {
+        "jni_call" => 1,
+        "call_native" => 2,
+        "ctors" => 3,
+        _ => 9,
+    }
+}
+
 /// Run `f` with TPIDR_EL0 pointing at this thread's guest TCB, then
 /// restore the thread pointer. Must wrap every entry into guest-native
 /// code (JNI_OnLoad, DT_INIT*, exported natives).
@@ -192,6 +215,10 @@ pub(crate) fn with_guest_tls_at<R>(site: &'static str, f: impl FnOnce() -> R) ->
         let tcb = guest_tcb();
         let mut old: usize;
         core::arch::asm!("mrs {}, tpidr_el0", out(reg) old);
+        TLS_TRACE[0].store(tls_site_id(site), std::sync::atomic::Ordering::Relaxed);
+        TLS_TRACE[1].store(mach_thread_id(), std::sync::atomic::Ordering::Relaxed);
+        TLS_TRACE[2].store(old as u64, std::sync::atomic::Ordering::Relaxed);
+        TLS_TRACE[3].store(0, std::sync::atomic::Ordering::Relaxed);
 
         *tcb.add(SLOT_HOST_TPIDR) = old as u64;
         core::arch::asm!("msr tpidr_el0, {}", in(reg) tcb as usize);
@@ -212,6 +239,9 @@ pub(crate) fn with_guest_tls_at<R>(site: &'static str, f: impl FnOnce() -> R) ->
             eprintln!("[tls] {site} window ended tid={} TPIDR={now:#x} (expected {:#x})\n{}", mach_thread_id(), tcb as usize, std::backtrace::Backtrace::capture());
         }
         core::arch::asm!("msr tpidr_el0, {}", in(reg) old);
+        TLS_TRACE[3].store(tls_site_id(site), std::sync::atomic::Ordering::Relaxed);
+        TLS_TRACE[4].store(mach_thread_id(), std::sync::atomic::Ordering::Relaxed);
+        TLS_TRACE[5].store(old as u64, std::sync::atomic::Ordering::Relaxed);
         r
     }
 }
@@ -256,11 +286,6 @@ extern "C" fn sh_pthread_create(
         unsafe { drop(Box::from_raw(b)) }
     }
     r
-}
-
-#[cfg(not(target_arch = "aarch64"))]
-pub(crate) fn with_guest_tls<R>(f: impl FnOnce() -> R) -> R {
-    f()
 }
 
 #[cfg(not(target_arch = "aarch64"))]
@@ -543,7 +568,7 @@ pub fn install_crash_dump() {
                 let x9 = *(mc.add(88) as *const usize);
                 let x16 = *(mc.add(144) as *const usize);
                 let x17 = *(mc.add(152) as *const usize);
-                let mut msg = [0u8; 640];
+                let mut msg = [0u8; 832];
                 let s = b"[segv] pc=";
                 msg[..s.len()].copy_from_slice(s);
                 let mut n = s.len();
@@ -672,6 +697,34 @@ pub fn install_crash_dump() {
                         break;
                     }
                     f = nf;
+                }
+                // TLS state at crash: live TPIDR_EL0, this thread's id,
+                // and the last with_guest_tls_at entry/exit records.
+                #[cfg(target_arch = "aarch64")]
+                {
+                    let mut tp: usize;
+                    core::arch::asm!("mrs {}, tpidr_el0", out(reg) tp);
+                    for c in b"tp=" { msg[n] = *c; n += 1; }
+                    for i in (0..16).rev() {
+                        msg[n] = b"0123456789abcdef"[(tp >> (i * 4)) & 0xf];
+                        n += 1;
+                    }
+                    for c in b" tid=" { msg[n] = *c; n += 1; }
+                    let tid = mach_thread_id() as usize;
+                    for i in (0..16).rev() {
+                        msg[n] = b"0123456789abcdef"[(tid >> (i * 4)) & 0xf];
+                        n += 1;
+                    }
+                    for c in b" win=" { msg[n] = *c; n += 1; }
+                    for cell in TLS_TRACE.iter() {
+                        let v = cell.load(std::sync::atomic::Ordering::Relaxed) as usize;
+                        for j in (0..16).rev() {
+                            msg[n] = b"0123456789abcdef"[(v >> (j * 4)) & 0xf];
+                            n += 1;
+                        }
+                        msg[n] = b' ';
+                        n += 1;
+                    }
                 }
                 msg[n] = b'\n';
                 write(2, msg.as_ptr() as *const c_void, n + 1);
