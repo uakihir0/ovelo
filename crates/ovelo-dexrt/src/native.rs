@@ -854,8 +854,9 @@ pub(crate) fn guest_zone() -> *mut c_void {
 /// zone functions with a `[so]` frame naming the culprit.
 #[cfg(target_os = "macos")]
 pub(crate) fn guest_malloc(size: usize) -> usize {
-    let p = unsafe { malloc_zone_malloc(guest_zone(), size.max(1)) as usize };
-    dbg_alloc(p);
+    let extra = if std::env::var_os("OVELO_FREEDBG").is_some() { 16 } else { 0 };
+    let p = unsafe { malloc_zone_malloc(guest_zone(), size.max(1) + extra) as usize };
+    dbg_alloc(p, size.max(1));
     p
 }
 
@@ -895,13 +896,45 @@ pub(crate) fn guest_free(p: usize) {
 }
 
 #[cfg(target_os = "macos")]
-static LIVE_ALLOCS: std::sync::LazyLock<std::sync::Mutex<std::collections::HashSet<usize>>> =
-    std::sync::LazyLock::new(|| std::sync::Mutex::new(std::collections::HashSet::new()));
+static LIVE_ALLOCS: std::sync::LazyLock<
+    std::sync::Mutex<std::collections::HashMap<usize, usize>>,
+> = std::sync::LazyLock::new(|| std::sync::Mutex::new(std::collections::HashMap::new()));
 #[cfg(target_os = "macos")]
-fn dbg_alloc(p: usize) {
-    if std::env::var_os("OVELO_FREEDBG").is_some() {
-        if let Ok(mut m) = LIVE_ALLOCS.lock() {
-            m.insert(p);
+const GDB_CANARY: u64 = 0x0e10_dead_c0de_f00d;
+/// Under OVELO_FREEDBG every guest allocation carries a tail canary,
+/// checked at free time and at every JNI env entry — the first env
+/// call after the corrupting write reports it, naming the window.
+#[cfg(target_os = "macos")]
+fn dbg_alloc(p: usize, size: usize) {
+    if p == 0 || std::env::var_os("OVELO_FREEDBG").is_none() {
+        return;
+    }
+    // size need not be 8-aligned — p+size can be an unaligned u64.
+    unsafe { ((p + size) as *mut u64).write_unaligned(GDB_CANARY) };
+    if let Ok(mut m) = LIVE_ALLOCS.lock() {
+        m.insert(p, size);
+    }
+}
+/// Check every live guest buffer's tail canary; report the first
+/// smashed one. Called at every env entry under OVELO_FREEDBG.
+#[cfg(target_os = "macos")]
+pub(crate) fn dbg_check_all(who: &'static str) {
+    if std::env::var_os("OVELO_FREEDBG").is_none() {
+        return;
+    }
+    if let Ok(m) = LIVE_ALLOCS.lock() {
+        for (p, size) in m.iter() {
+            let got = unsafe { ((*p + *size) as *const u64).read_unaligned() };
+            if got != GDB_CANARY {
+                let so = so_off(*p + *size);
+                eprintln!(
+                    "[freedbg] {who}: CANARY SMASHED at {:#x} (buf {:#x}+{}) (so_off={so:?})",
+                    *p + *size,
+                    *p,
+                    *size
+                );
+                break;
+            }
         }
     }
 }
@@ -922,16 +955,26 @@ fn dbg_free(p: usize, who: &'static str) {
         }
     }
     let mut m = LIVE_ALLOCS.lock().unwrap_or_else(|e| e.into_inner());
-    if !m.remove(&p) {
-        let so = so_off(p);
-        eprintln!("[freedbg] {who}: free of untracked/double {p:#x} (so_off={so:?})");
+    match m.remove(&p) {
+        Some(size) => {
+            let got = unsafe { ((p + size) as *const u64).read_unaligned() };
+            if got != GDB_CANARY {
+                let so = so_off(p + size);
+                eprintln!("[freedbg] {who}: canary smashed freeing {p:#x}+{size} (so_off={so:?})");
+            }
+        }
+        None => {
+            let so = so_off(p);
+            eprintln!("[freedbg] {who}: free of untracked/double {p:#x} (so_off={so:?})");
+        }
     }
 }
 
 #[cfg(target_os = "macos")]
 extern "C" fn sh_malloc(size: usize) -> *mut c_void {
-    let p = unsafe { malloc_zone_malloc(guest_zone(), size.max(1)) };
-    dbg_alloc(p as usize);
+    let extra = if std::env::var_os("OVELO_FREEDBG").is_some() { 16 } else { 0 };
+    let p = unsafe { malloc_zone_malloc(guest_zone(), size.max(1) + extra) };
+    dbg_alloc(p as usize, size.max(1));
     p
 }
 
@@ -960,13 +1003,33 @@ extern "C" fn sh_free(ptr: *mut c_void) {
 
 #[cfg(target_os = "macos")]
 extern "C" fn sh_calloc(n: usize, size: usize) -> *mut c_void {
-    let p = unsafe { malloc_zone_calloc(guest_zone(), n, size) };
-    dbg_alloc(p as usize);
+    let total = n.max(1) * size.max(1);
+    let extra = if std::env::var_os("OVELO_FREEDBG").is_some() { 16 } else { 0 };
+    let p = unsafe { malloc_zone_calloc(guest_zone(), 1, total + extra) };
+    dbg_alloc(p as usize, total);
     p
 }
 
 #[cfg(target_os = "macos")]
 extern "C" fn sh_realloc(ptr: *mut c_void, size: usize) -> *mut c_void {
+    if std::env::var_os("OVELO_FREEDBG").is_some() {
+        // realloc can't grow the tail canary in place — do alloc+copy+free
+        // so every live buffer keeps its canary at p+size.
+        if ptr.is_null() {
+            return sh_malloc(size);
+        }
+        let old_size = LIVE_ALLOCS
+            .lock()
+            .ok()
+            .and_then(|m| m.get(&(ptr as usize)).copied())
+            .unwrap_or(0);
+        let np = sh_malloc(size);
+        if !np.is_null() && old_size > 0 {
+            unsafe { std::ptr::copy_nonoverlapping(ptr, np, old_size.min(size)) };
+        }
+        sh_free(ptr);
+        return np;
+    }
     unsafe {
         if ptr.is_null() {
             malloc_zone_malloc(guest_zone(), size)
@@ -980,7 +1043,10 @@ extern "C" fn sh_realloc(ptr: *mut c_void, size: usize) -> *mut c_void {
 
 #[cfg(target_os = "macos")]
 extern "C" fn sh_memalign(align: usize, size: usize) -> *mut c_void {
-    unsafe { malloc_zone_memalign(guest_zone(), align.max(16), size) }
+    let extra = if std::env::var_os("OVELO_FREEDBG").is_some() { 16 } else { 0 };
+    let p = unsafe { malloc_zone_memalign(guest_zone(), align.max(16), size + extra) };
+    dbg_alloc(p as usize, size);
+    p
 }
 
 #[cfg(target_os = "macos")]
@@ -1023,10 +1089,12 @@ extern "C" fn sh_strdup(s: *const i8) -> *mut i8 {
     }
     unsafe {
         let n = strlen(s) + 1;
-        let p = malloc_zone_malloc(guest_zone(), n) as *mut i8;
+        let extra = if std::env::var_os("OVELO_FREEDBG").is_some() { 16 } else { 0 };
+        let p = malloc_zone_malloc(guest_zone(), n + extra) as *mut i8;
         if !p.is_null() {
             memcpy(p.cast(), s.cast(), n);
         }
+        dbg_alloc(p as usize, n);
         p
     }
 }
@@ -1043,11 +1111,13 @@ extern "C" fn sh_strndup(s: *const i8, n: usize) -> *mut i8 {
         while len < n && *s.add(len) != 0 {
             len += 1;
         }
-        let p = malloc_zone_malloc(guest_zone(), len + 1) as *mut i8;
+        let extra = if std::env::var_os("OVELO_FREEDBG").is_some() { 16 } else { 0 };
+        let p = malloc_zone_malloc(guest_zone(), len + 1 + extra) as *mut i8;
         if !p.is_null() {
             memcpy(p.cast(), s.cast(), len);
             *p.add(len) = 0;
         }
+        dbg_alloc(p as usize, len + 1);
         p
     }
 }

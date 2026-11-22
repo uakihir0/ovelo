@@ -182,6 +182,8 @@ pub(crate) fn env_enter(name: &'static str) {
         }
     }
     check_buf_canaries(name);
+    #[cfg(target_os = "macos")]
+    crate::native::dbg_check_all(name);
     LAST_ENV.set(name);
 }
 
@@ -1300,7 +1302,8 @@ fn libc_malloc(n: usize) -> usize {
     if p == 0 {
         return 0;
     }
-    unsafe { *((p + n) as *mut u64) = 0xdead_beef_cafe_f00d };
+    // p+n isn't necessarily 8-aligned — use unaligned access.
+    unsafe { ((p + n) as *mut u64).write_unaligned(0xdead_beef_cafe_f00d) };
     BUFS.with(|b| b.borrow_mut().insert(p, n));
     p
 }
@@ -1310,7 +1313,7 @@ fn libc_free(p: usize) {
     }
     let n = BUFS.with(|b| b.borrow_mut().remove(&p));
     if let Some(n) = n {
-        let m = unsafe { *((p + n) as *const u64) };
+        let m = unsafe { ((p + n) as *const u64).read_unaligned() };
         if m != 0xdead_beef_cafe_f00d {
             eprintln!("[bufdbg] canary dead at {p:#x}+{n} on free; last env {}", LAST_ENV.get());
         }
@@ -1327,7 +1330,7 @@ fn check_buf_canaries(name: &'static str) {
     }
     BUFS.with(|b| {
         for (&p, &n) in b.borrow().iter() {
-            let m = unsafe { *((p + n) as *const u64) };
+            let m = unsafe { ((p + n) as *const u64).read_unaligned() };
             if m != 0xdead_beef_cafe_f00d {
                 eprintln!("[bufdbg] overrun: buf {p:#x}+{n} bad on entry to {name}; previous env {}", LAST_ENV.get());
             }
