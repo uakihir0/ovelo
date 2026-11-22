@@ -1272,6 +1272,16 @@ fn run_app(store: &InstallStore, package: &str) -> Result<(), OveloError> {
                         let _ = std::fs::write(p, body);
                     }
                 }
+                // Music-player apps list tracks via the MediaStore
+                // audio cursor — give it real files to find.
+                let music = ext.join("Music");
+                let _ = std::fs::create_dir_all(&music);
+                for (i, freq) in [440.0f32, 550.0, 660.0].iter().enumerate() {
+                    let p = music.join(format!("seed-tone-{}.wav", i + 1));
+                    if !p.exists() {
+                        let _ = std::fs::write(p, wav_tone(*freq));
+                    }
+                }
                 v.apk_res = ovelo_dexrt::res::ApkResources::open(bytes.clone());
                 v.theme_id = info
                     .manifest
@@ -1565,6 +1575,32 @@ fn run_app(store: &InstallStore, package: &str) -> Result<(), OveloError> {
             }
         }
     })
+}
+
+/// A tiny valid WAV (8 kHz mono 8-bit, ~0.4 s sine) — big enough for
+/// MediaStore to index and players to probe, no asset file needed.
+fn wav_tone(freq_hz: f32) -> Vec<u8> {
+    const RATE: u32 = 8000;
+    let n = (RATE as f32 * 0.4) as usize;
+    let mut data = Vec::with_capacity(n + 44);
+    let data_len = n as u32;
+    data.extend_from_slice(b"RIFF");
+    data.extend_from_slice(&(36 + data_len).to_le_bytes());
+    data.extend_from_slice(b"WAVEfmt ");
+    data.extend_from_slice(&16u32.to_le_bytes());
+    data.extend_from_slice(&1u16.to_le_bytes()); // PCM
+    data.extend_from_slice(&1u16.to_le_bytes()); // mono
+    data.extend_from_slice(&RATE.to_le_bytes());
+    data.extend_from_slice(&RATE.to_le_bytes()); // byte rate
+    data.extend_from_slice(&1u16.to_le_bytes()); // block align
+    data.extend_from_slice(&8u16.to_le_bytes()); // bits/sample
+    data.extend_from_slice(b"data");
+    data.extend_from_slice(&data_len.to_le_bytes());
+    for i in 0..n {
+        let t = i as f32 / RATE as f32;
+        data.push((128.0 + 100.0 * (t * freq_hz * std::f32::consts::TAU).sin()) as u8);
+    }
+    data
 }
 
 fn cmd() -> Result<(), OveloError> {

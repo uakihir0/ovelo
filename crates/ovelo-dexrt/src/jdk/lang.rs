@@ -1511,7 +1511,14 @@ fn class_call(vm: &mut Vm, name: &str, _sig: &str, args: &[V]) -> Rt<Option<Opti
             Some(Some(V::I32(desc_is_a(&b, &a) as i32)))
         }
         "getSuperclass" => {
-            let d = s(
+            // `s()` returns None for `Obj::Class` mirrors — resolve the
+            // descriptor via `class_desc_of` so `SomeType.class` works,
+            // then walk the real dex superclass (`super_desc`) before
+            // host_supers/Object. Previously an `Obj::Class` argument
+            // yielded `d=""`, never matched `None=>Ref(0)` and returned
+            // `Object.class` for every class — guest loops like
+            // `while (c != null) c = c.getSuperclass()` never exited.
+            let d = class_desc_of(
                 vm,
                 match args[0] {
                     V::Ref(h) => h,
@@ -1519,9 +1526,15 @@ fn class_call(vm: &mut Vm, name: &str, _sig: &str, args: &[V]) -> Rt<Option<Opti
                 },
             )
             .unwrap_or_default();
-            match host_supers(&d).first() {
-                Some(sup) => Some(Some(class_obj(vm, sup.to_string()))),
-                None if d != OBJ => Some(Some(class_obj(vm, OBJ.into()))),
+            let sup = host_supers(&d)
+                .first()
+                .map(|x| (*x).to_string())
+                .or_else(|| vm.super_desc(&d));
+            match sup {
+                Some(sup) => Some(Some(class_obj(vm, sup))),
+                None if !d.is_empty() && d != OBJ => {
+                    Some(Some(class_obj(vm, OBJ.into())))
+                }
                 None => Some(Some(V::Ref(0))),
             }
         }
@@ -2665,9 +2678,12 @@ fn unsafe_write(vm: &mut Vm, obj: u32, off: i64, v: V) {
 
 /// CAS equality: guest `null` reaches us as `I32(0)` while an unset slot
 /// holds `Ref(0)` — both must count as null.
-fn cas_eq(vm: &mut Vm, a: V, b: V) -> bool {
+fn cas_eq(_vm: &mut Vm, a: V, b: V) -> bool {
+    // CAS semantics are `==` on the slot, not `equals` — two distinct
+    // boxed objects with equal payloads must NOT swap successfully
+    // (Unsafe.compareAndSwapObject / AtomicReference.compareAndSet).
     let nullish = |v: V| matches!(v, V::I32(0) | V::Ref(0));
-    (nullish(a) && nullish(b)) || crate::jdk::value_eq(vm, a, b)
+    (nullish(a) && nullish(b)) || a == b
 }
 
 fn unsafe_call(vm: &mut Vm, name: &str, args: &[V]) -> Rt<Option<Option<V>>> {
@@ -2858,6 +2874,53 @@ fn unsafe_call(vm: &mut Vm, name: &str, args: &[V]) -> Rt<Option<Option<V>>> {
             });
         }
         "park" => {
+            // `park(isAbsolute, time)`: isAbsolute → absolute ms epoch,
+            // else relative nanos. A bounded wait must NOT unwind —
+            // re-running the runnable from the top restarts the guest's
+            // wait (e.g. `AbstractFuture.get(t)` computes its deadline
+            // inside `get`), so its clock never advances and the
+            // TimeoutException never fires: drain queued work if any,
+            // then sleep a slice of the wait and return inside the same
+            // call so the guest's own deadline check eventually trips.
+            let time = i64v(args.get(2).copied().unwrap_or(V::I64(0)));
+            if time > 0 {
+                let absolute =
+                    i64v(args.get(1).copied().unwrap_or(V::I32(0))) != 0;
+                let remain_ms = if absolute {
+                    time.saturating_sub(now_ms())
+                } else {
+                    time / 1_000_000
+                };
+                // Delayed tasks that came due are runnable now — a
+                // completing task must reach the waiter before its
+                // deadline, or `get(t)` always times out.
+                let now = now_ms() as u64;
+                let (due, later): (Vec<_>, Vec<_>) = vm
+                    .delayed_runnables
+                    .drain(..)
+                    .partition(|(_, _, t)| *t <= now);
+                vm.delayed_runnables = later;
+                for (r, on_main, _) in due {
+                    vm.pending_runnables.push_back((r, on_main));
+                }
+                if !vm.pending_runnables.is_empty() {
+                    vm.park_drain()?;
+                } else {
+                    // Sleep at most until the next delayed task is due
+                    // so a future completion isn't slept through.
+                    let until_due = vm
+                        .delayed_runnables
+                        .iter()
+                        .map(|(_, _, t)| t.saturating_sub(now))
+                        .min()
+                        .unwrap_or(u64::MAX);
+                    let ms = (remain_ms.max(0) as u64)
+                        .min(until_due)
+                        .clamp(1, 64);
+                    std::thread::sleep(std::time::Duration::from_millis(ms));
+                }
+                return Ok(Some(None));
+            }
             // Parked threads can't resume their Java stack, so run
             // queued work inline (see `park_drain`); past the nesting
             // cap it falls back to the preempt-and-requeue unwind.

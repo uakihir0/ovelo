@@ -685,6 +685,49 @@ pub(crate) fn call(
             "getItemAt" => Some(Some(V::Ref(0))),
             _ => None,
         }
+    } else if class == "Landroid/content/ContentUris;" {
+        match name {
+            // withAppendedId(Uri, long) — players build per-track URIs
+            // like content://media/external/audio/media/<id> with it.
+            "withAppendedId" => {
+                let base = sv(vm, *args.first().unwrap_or(&V::Ref(0))).unwrap_or_default();
+                let id = i64v(*args.get(1).unwrap_or(&V::I64(0)));
+                let sep = if base.ends_with('/') { "" } else { "/" };
+                Some(Some(host(
+                    vm,
+                    "Landroid/net/Uri;",
+                    HostState::StrBuf(format!("{base}{sep}{id}")),
+                )))
+            }
+            // parseId(Uri) — AOSP reads the LAST path segment: -1 when
+            // the URI has no segment, NumberFormatException when the
+            // segment exists but isn't numeric.
+            "parseId" => {
+                let uri = sv(vm, *args.first().unwrap_or(&V::Ref(0))).unwrap_or_default();
+                match uri.rsplit('/').next().filter(|t| !t.is_empty()) {
+                    None => Some(Some(V::I64(-1))),
+                    Some(tail) => match tail.parse::<i64>() {
+                        Ok(id) => Some(Some(V::I64(id))),
+                        Err(_) => {
+                            return Err(vm.throw_builtin(
+                                "Ljava/lang/NumberFormatException;",
+                                tail,
+                            ));
+                        }
+                    },
+                }
+            }
+            _ => Some(Some(V::Ref(0))),
+        }
+    } else if class == "Landroid/app/NotificationManager;"
+        || class == "Landroid/app/NotificationManagerCompat;"
+    {
+        match name {
+            // notify/cancel are presentation-only — succeed silently.
+            "cancel" | "cancelAll" | "notify" => Some(None),
+            "areNotificationsEnabled" => Some(Some(V::I32(1))),
+            _ => Some(Some(V::Ref(0))),
+        }
     } else if class == "Landroid/database/Cursor;"
         || class.ends_with("Cursor;")
         || class.starts_with("Landroid/database/")

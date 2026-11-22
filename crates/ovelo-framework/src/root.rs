@@ -97,6 +97,23 @@ impl ViewRootImpl {
             v.draw(&mut c);
             c.restore();
         }
+        if std::env::var_os("OVELO_PIXDBG").is_some() {
+            let px = surf.pixels();
+            let non_white = px
+                .as_chunks::<4>()
+                .0
+                .iter()
+                .filter(|p| !(p[0] == 0xff && p[1] == 0xff && p[2] == 0xff))
+                .count();
+            eprintln!(
+                "[pixdbg] {}x{} nonwhite={} first={:02x?} mid={:02x?}",
+                surf.width(),
+                surf.height(),
+                non_white,
+                &px[..4],
+                &px[px.len() / 2..px.len() / 2 + 4]
+            );
+        }
         let id = win.unlock_and_post()?;
         Ok(Some(id))
     }

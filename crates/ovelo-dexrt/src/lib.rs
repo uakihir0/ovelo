@@ -1007,6 +1007,7 @@ impl Vm {
             class_idx: self.canon(ty),
             fields: HashMap::new(),
         });
+        self.mark_view_alloc(h, ty);
         // A real guest Application subclass IS the app object —
         // `getApplication[Context]` must hand it back so onCreate state
         // and custom methods are reachable. Overrides the interned
@@ -1052,6 +1053,7 @@ impl Vm {
             class_idx: self.canon(ty),
             fields: HashMap::new(),
         });
+        self.mark_view_alloc(h, ty);
         let slots: usize = args
             .iter()
             .map(|a| {
@@ -1076,6 +1078,26 @@ impl Vm {
             }
         }
         Ok(h)
+    }
+
+    /// Mark a freshly allocated object as a View/ViewGroup when its
+    /// class is assignable — objects created by dex `new`/`instantiate*`
+    /// never pass through `make_view_named`, so without this
+    /// `is_viewish` drops their View builtins (`measure`/`layout` become
+    /// silent no-ops and the subtree collapses to 0×0).
+    fn mark_view_alloc(&mut self, h: u32, ty: GIdx) {
+        let Some(view_ty) = self.type_index_of("Landroid/view/View;") else {
+            return;
+        };
+        if !self.assignable(ty, view_ty) {
+            return;
+        }
+        jdk::pseudo_set(self, h, jdk::view::P_IS_VIEW, V::I32(1));
+        if let Some(group_ty) = self.type_index_of("Landroid/view/ViewGroup;") {
+            if self.assignable(ty, group_ty) {
+                jdk::pseudo_set(self, h, jdk::view::P_IS_GROUP, V::I32(1));
+            }
+        }
     }
 
     /// Every `<init>` overload declared on `class_desc` as
@@ -1139,6 +1161,7 @@ impl Vm {
             class_idx: self.canon(ty),
             fields: HashMap::new(),
         });
+        self.mark_view_alloc(h, ty);
         let mut a = Vec::with_capacity(args.len() + 1);
         a.push(V::Ref(h));
         a.extend_from_slice(args);
@@ -1271,6 +1294,20 @@ impl Vm {
             // dispatcher so host arms still apply when the caller is
             // the host itself rather than a dex invoke site.
             let desc = self.type_desc_of(ci).unwrap_or_default();
+            // Views constructed by dex code (e.g. `TabLayout.TabView`)
+            // never passed through `make_view_named`, so P_IS_VIEW is
+            // unset and `is_viewish` drops every View builtin —
+            // `measure`/`layout` become silent no-ops and the whole
+            // subtree collapses to 0×0. Mark them structurally the
+            // same way inflation does.
+            if jdk::pseudo_get(self, this, jdk::view::P_IS_VIEW).is_none()
+                && self.assignable_desc(&desc, "Landroid/view/View;")
+            {
+                jdk::pseudo_set(self, this, jdk::view::P_IS_VIEW, V::I32(1));
+                if self.assignable_desc(&desc, "Landroid/view/ViewGroup;") {
+                    jdk::pseudo_set(self, this, jdk::view::P_IS_GROUP, V::I32(1));
+                }
+            }
             let mut a = Vec::with_capacity(args.len() + 1);
             a.push(V::Ref(this));
             a.extend_from_slice(args);
@@ -4086,6 +4123,7 @@ impl Vm {
                         fields: HashMap::new(),
                     })
                 };
+                self.mark_view_alloc(h, ty);
                 set!(regs[0], V::Ref(h));
             }
             0x23 => {
