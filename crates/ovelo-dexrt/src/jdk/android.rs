@@ -699,15 +699,23 @@ pub(crate) fn call(
                     HostState::StrBuf(format!("{base}{sep}{id}")),
                 )))
             }
-            // parseId(Uri) → trailing numeric segment, -1 when absent.
+            // parseId(Uri) — AOSP reads the LAST path segment: -1 when
+            // the URI has no segment, NumberFormatException when the
+            // segment exists but isn't numeric.
             "parseId" => {
                 let uri = sv(vm, *args.first().unwrap_or(&V::Ref(0))).unwrap_or_default();
-                let id = uri
-                    .rsplit('/')
-                    .next()
-                    .and_then(|tail| tail.parse::<i64>().ok())
-                    .unwrap_or(-1);
-                Some(Some(V::I64(id)))
+                match uri.rsplit('/').next().filter(|t| !t.is_empty()) {
+                    None => Some(Some(V::I64(-1))),
+                    Some(tail) => match tail.parse::<i64>() {
+                        Ok(id) => Some(Some(V::I64(id))),
+                        Err(_) => {
+                            return Err(vm.throw_builtin(
+                                "Ljava/lang/NumberFormatException;",
+                                tail,
+                            ));
+                        }
+                    },
+                }
             }
             _ => Some(Some(V::Ref(0))),
         }

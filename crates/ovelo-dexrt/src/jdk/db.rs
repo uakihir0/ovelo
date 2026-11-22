@@ -501,13 +501,27 @@ pub(crate) fn media_cursor(vm: &mut Vm, uri: &str, projection: &[String]) -> V {
 /// formats estimate from size at ~128kbps so the value stays plausible.
 fn audio_duration_ms(p: &std::path::Path, size: i64) -> i64 {
     use std::io::Read;
-    let mut b = [0u8; 64];
+    let mut b = [0u8; 4096];
     if let Ok(mut f) = std::fs::File::open(p) {
         if let Ok(n) = f.read(&mut b) {
             let b = &b[..n];
-            if b.starts_with(b"RIFF") && b.len() >= 44 {
-                let rate = u32::from_le_bytes(b[28..32].try_into().unwrap()) as u64;
-                let data = u32::from_le_bytes(b[40..44].try_into().unwrap()) as u64;
+            if b.len() >= 12 && b.starts_with(b"RIFF") && &b[8..12] == b"WAVE" {
+                // Walk RIFF chunks — JUNK/LIST/etc. may sit between fmt
+                // and data, so fixed offsets misread sizes.
+                let (mut rate, mut data) = (0u64, 0u64);
+                let mut i = 12usize;
+                while i + 8 <= b.len() {
+                    let tag = &b[i..i + 4];
+                    let len = u32::from_le_bytes(b[i + 4..i + 8].try_into().unwrap()) as usize;
+                    if tag == b"fmt " && i + 8 + len <= b.len() && len >= 16 {
+                        rate = u32::from_le_bytes(
+                            b[i + 8 + 8..i + 8 + 12].try_into().unwrap(),
+                        ) as u64;
+                    } else if tag == b"data" {
+                        data = len as u64;
+                    }
+                    i += 8 + len + (len & 1);
+                }
                 if rate > 0 && data > 0 {
                     return (data * 1000 / rate) as i64;
                 }
