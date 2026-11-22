@@ -347,10 +347,7 @@ impl Drop for NativeLib {
         // out addresses inside this image, after it is unmapped.
         PHDR_LIBS.lock().unwrap().retain(|l| l.bias != self.bias);
         let (lo, hi) = (self.map as usize, self.map as usize + self.span);
-        GLOBAL_SYMS
-            .lock()
-            .unwrap()
-            .retain(|_, a| !(*a >= lo && *a < hi));
+        globals_scrub(&mut GLOBAL_SYMS.lock().unwrap(), lo, hi);
         LOADED_RANGES
             .lock()
             .unwrap()
@@ -1196,12 +1193,23 @@ struct Dyn {
     needed: Vec<usize>,
 }
 
-/// Exports of every lib loaded in this process, in load order — the
-/// dynamic linker's "global scope" later relocations resolve against
-/// (a lib's DT_NEEDED deps are always loaded before it). First
-/// registration wins, matching breadth-first search order.
-static GLOBAL_SYMS: LazyLock<Mutex<HashMap<String, usize>>> =
+/// Exports of every lib loaded in this process: symbol → candidate
+/// addresses in load order — the dynamic linker's "global scope"
+/// later relocations resolve against (a lib's DT_NEEDED deps are
+/// always loaded before it). The FIRST candidate is the effective
+/// binding (first registration wins, matching breadth-first order);
+/// shadowed duplicates wait underneath so scrubbing a dead lib's
+/// range uncovers the next provider instead of losing the symbol.
+static GLOBAL_SYMS: LazyLock<Mutex<HashMap<String, Vec<usize>>>> =
     LazyLock::new(|| Mutex::new(HashMap::new()));
+/// Scrub every candidate inside `[map, map+span)` from `g`; empty
+/// buckets go away.
+fn globals_scrub(g: &mut HashMap<String, Vec<usize>>, lo: usize, hi: usize) {
+    g.retain(|_, cands| {
+        cands.retain(|a| !(*a >= lo && *a < hi));
+        !cands.is_empty()
+    });
+}
 /// Sonames already mapped — a second DT_NEEDED edge or `loadLibrary`
 /// call reuses the image instead of double-mapping it.
 static LOADED_SONAMES: LazyLock<Mutex<HashSet<String>>> =
@@ -1346,7 +1354,7 @@ fn load_tree_into(
         {
             let mut g = GLOBAL_SYMS.lock().unwrap();
             for (n, a) in &mapped.exports {
-                g.entry(n.clone()).or_insert(*a);
+                g.entry(n.clone()).or_default().push(*a);
             }
         }
         for soname in elf_needed(elf) {
@@ -1372,10 +1380,7 @@ fn load_tree_into(
         match finish_so(mapped, name) {
             Ok(x) => out.push(x),
             Err(e) => {
-                GLOBAL_SYMS
-                    .lock()
-                    .unwrap()
-                    .retain(|_, a| !(*a >= img.0 && *a < img.1));
+                globals_scrub(&mut GLOBAL_SYMS.lock().unwrap(), img.0, img.1);
                 return Err(e);
             }
         }
@@ -1650,7 +1655,12 @@ fn finish_so(m: MappedLib, name: &str) -> Result<(NativeLib, Vec<usize>)> {
         }
         // Already-loaded libs (DT_NEEDED deps, earlier loadLibrary
         // calls) — the global scope of the process link map.
-        if let Some(a) = GLOBAL_SYMS.lock().unwrap().get(&name).copied() {
+        if let Some(a) = GLOBAL_SYMS
+            .lock()
+            .unwrap()
+            .get(&name)
+            .and_then(|v| v.first().copied())
+        {
             return Ok(a);
         }
         if let Some(a) = builtin_shim(&name) {
@@ -1820,7 +1830,7 @@ fn finish_so(m: MappedLib, name: &str) -> Result<(NativeLib, Vec<usize>)> {
     {
         let mut g = GLOBAL_SYMS.lock().unwrap();
         for (n, a) in exports {
-            g.entry(n.clone()).or_insert(*a);
+            g.entry(n.clone()).or_default().push(*a);
         }
     }
 
