@@ -1535,6 +1535,7 @@ impl Vm {
         roots.extend(self.delayed_runnables.iter().map(|(h, _, _)| *h));
         roots.extend(self.parked_runnables.keys().copied());
         roots.extend(self.thread_runnables.iter().copied());
+        roots.extend(jdk::gl::live_handles());
         roots.extend(self.sleep_until.keys().copied());
         roots.extend(self.reparked.iter().copied());
         roots.extend(self.repark_counts.keys().copied());
@@ -1675,6 +1676,11 @@ impl Vm {
                     self.reparked.remove(&r);
                     self.repark_counts.remove(&r);
                     self.park_spins = 0;
+                    // A `Thread` runnable that returned (or threw) is
+                    // done — drop it so GC can reclaim it and its
+                    // captured references.
+                    self.thread_runnables.remove(&r);
+                    self.sleep_until.remove(&r);
                 }
             }
         }
