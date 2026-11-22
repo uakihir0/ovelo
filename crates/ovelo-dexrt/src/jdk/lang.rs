@@ -1937,7 +1937,9 @@ fn thread_call(vm: &mut Vm, name: &str, _sig: &str, args: &[V]) -> Rt<Option<Opt
             // at that deadline. On the main thread a real sleep would
             // freeze the UI, so stay a no-op.
             if vm.cur_thread != 0 && vm.cur_thread != vm.main_thread_h {
-                let ms = match args.get(1).copied().unwrap_or(V::I64(0)) {
+                // `sleep` is static: args[0] is the millisecond count
+                // (args[1] is the nanos of the (JI)V overload).
+                let ms = match args.first().copied().unwrap_or(V::I64(0)) {
                     V::I64(m) => m,
                     V::I32(m) => m as i64,
                     V::F64(m) => m as i64,
