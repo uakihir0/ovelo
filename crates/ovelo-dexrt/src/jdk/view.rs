@@ -2653,9 +2653,10 @@ fn linear_vertical(vm: &mut Vm, this: u32) -> bool {
 /// `getMinimum*`/`getSuggestedMinimum*`: explicit `setMinimum*` wins,
 /// else the inflated `android:minWidth`/`minHeight` attr.
 fn min_dim(vm: &mut Vm, this: u32, key: u32, attr: &str) -> i32 {
-    let explicit = pint(vm, this, key);
-    if explicit > 0 {
-        return explicit;
+    // A stored value wins even when it is 0 — `setMinimumWidth(0)`
+    // is how guest code *clears* the inflated minimum.
+    if let Some(v) = pseudo_get(vm, this, key) {
+        return i32v(v);
     }
     attr_find(vm, this, attr)
         .and_then(|v| lp_px(vm, v))
@@ -3050,6 +3051,41 @@ fn group_measure_fallback(vm: &mut Vm, this: u32, pw: i32, ph: i32) {
                 (0, 0)
             };
             let match_h = (ch_in - nonmatch_h - match_margins_h).max(0);
+            // Horizontal linears need the same fold on X — otherwise a
+            // match_parent-width child re-measures to the full parent
+            // width and everything after it lands past the right edge.
+            let (nonmatch_w, match_margins_w) = if linear_h {
+                kids.iter().copied().fold((0i32, 0i32), |(nm, mm), c| {
+                    let V::Ref(ch) = c else {
+                        return (nm, mm);
+                    };
+                    if ch == 0 {
+                        return (nm, mm);
+                    }
+                    let lp_obj = match pseudo_get(vm, ch, P_LP) {
+                        Some(V::Ref(l)) => l,
+                        _ => 0,
+                    };
+                    let lpw = lp_field(vm, lp_obj, "width")
+                        .and_then(|v| lp_px(vm, v))
+                        .or_else(|| attr_find(vm, ch, "layout_width").map(|v| len_v(vm, v)))
+                        .unwrap_or(-2);
+                    let mh = lp_field(vm, lp_obj, "leftMargin")
+                        .and_then(|v| lp_px(vm, v))
+                        .unwrap_or(0)
+                        + lp_field(vm, lp_obj, "rightMargin")
+                            .and_then(|v| lp_px(vm, v))
+                            .unwrap_or(0);
+                    if lpw == -1 {
+                        (nm, mm + mh)
+                    } else {
+                        (nm + (pint(vm, ch, P_MEAS_W) & 0x00FF_FFFF) + mh, mm)
+                    }
+                })
+            } else {
+                (0, 0)
+            };
+            let match_w = (cw_in - nonmatch_w - match_margins_w).max(0);
             for c in kids.iter().copied() {
                 let V::Ref(ch) = c else { continue };
                 if ch == 0 {
@@ -3077,7 +3113,12 @@ fn group_measure_fallback(vm: &mut Vm, this: u32, pw: i32, ph: i32) {
                 let mh = marg("leftMargin") + marg("rightMargin");
                 let mv = marg("topMargin") + marg("bottomMargin");
                 let ws = if lpw == -1 {
-                    EXACTLY | (cw_in - mh).max(0)
+                    EXACTLY
+                        | if linear_h {
+                            match_w
+                        } else {
+                            (cw_in - mh).max(0)
+                        }
                 } else {
                     child_measure_spec(pw, pad_w + mh, lpw)
                 };
@@ -3748,8 +3789,16 @@ fn expand_includes(vm: &Vm, elems: &[Element]) -> Vec<Element> {
 /// every attr except `layout` (the res reference itself) overrides or
 /// augments the root's attributes.
 fn merge_include_attrs(root: &mut Element, inc: &Element) {
+    // AOSP: the include must declare *both* `layout_width` and
+    // `layout_height` for either to apply; a one-sided declaration
+    // falls back to the included root's own LayoutParams.
+    let has_w = inc.attrs.iter().any(|a| a.name == "layout_width");
+    let has_h = inc.attrs.iter().any(|a| a.name == "layout_height");
+    let dims_merge = has_w && has_h;
     for a in &inc.attrs {
-        if a.name == "layout" {
+        if a.name == "layout"
+            || (!dims_merge && (a.name == "layout_width" || a.name == "layout_height"))
+        {
             continue;
         }
         match root.attrs.iter_mut().find(|ra| ra.name == a.name) {
