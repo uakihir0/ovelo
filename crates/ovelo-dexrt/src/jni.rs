@@ -15,7 +15,7 @@
 //!   `jni_call` trampoline.
 
 use std::cell::Cell;
-use std::ffi::{c_void, CString};
+use std::ffi::c_void;
 
 use crate::jdk;
 use crate::proto_sig;
@@ -1040,13 +1040,21 @@ extern "C" fn get_string_utf_chars(_e: u64, s: u64, _copy: u64) -> u64 {
     let Some(x) = vm().heap.str_val(s as u32).map(|x| x.to_string()) else {
         return 0;
     };
-    let c = CString::new(x).unwrap_or_default();
-    c.into_raw() as u64
+    let b = x.as_bytes();
+    let buf = libc_malloc(b.len() + 1) as *mut u8;
+    if buf.is_null() {
+        return 0;
+    }
+    unsafe {
+        std::ptr::copy_nonoverlapping(b.as_ptr(), buf, b.len());
+        *buf.add(b.len()) = 0;
+    }
+    buf as u64
 }
 extern "C" fn release_string_utf_chars(_e: u64, _s: u64, p: u64) -> u64 {
     env_enter("release_string_utf_chars");
     if p != 0 {
-        unsafe { drop(CString::from_raw(p as *mut i8)) };
+        libc_free(p as usize);
     }
     0
 }
@@ -1085,6 +1093,25 @@ extern "C" fn get_string_region(_e: u64, s: u64, start: u64, len: u64, buf: u64)
         unsafe { *((buf + i as u64 * 2) as *mut u16) = v };
     }
 }
+/// One UTF-16 code unit in modified UTF-8 — each unit encodes
+/// independently (surrogate pairs become two 3-byte sequences, never
+/// merged), and NUL is 0xC0 0x80.
+fn mutf8_unit(out: &mut Vec<u8>, u: u16) {
+    match u {
+        0 => out.extend_from_slice(&[0xC0, 0x80]),
+        1..=0x7F => out.push(u as u8),
+        0x80..=0x7FF => out.extend_from_slice(&[
+            0xC0 | (u >> 6) as u8,
+            0x80 | (u & 0x3F) as u8,
+        ]),
+        _ => out.extend_from_slice(&[
+            0xE0 | (u >> 12) as u8,
+            0x80 | ((u >> 6) & 0x3F) as u8,
+            0x80 | (u & 0x3F) as u8,
+        ]),
+    }
+}
+
 extern "C" fn get_string_utf_region(_e: u64, s: u64, start: u64, len: u64, buf: u64) {
     env_enter("get_string_utf_region");
     let Some(x) = vm().heap.str_val(s as u32).map(|x| x.to_string()) else {
@@ -1093,9 +1120,12 @@ extern "C" fn get_string_utf_region(_e: u64, s: u64, start: u64, len: u64, buf: 
     let u16s: Vec<u16> = x.encode_utf16().collect();
     let lo = (start as usize).min(u16s.len());
     let hi = (start as usize + len as usize).min(u16s.len());
-    let sub = String::from_utf16_lossy(&u16s[lo..hi]);
+    let mut out = Vec::with_capacity((hi - lo) * 3);
+    for &u in &u16s[lo..hi] {
+        mutf8_unit(&mut out, u);
+    }
     unsafe {
-        std::ptr::copy_nonoverlapping(sub.as_ptr(), buf as *mut u8, sub.len());
+        std::ptr::copy_nonoverlapping(out.as_ptr(), buf as *mut u8, out.len());
     }
 }
 
@@ -1240,15 +1270,13 @@ fn release_elems(a: u64, buf: u64, mode: u64) {
     }
 }
 
-extern "C" {
-    fn malloc(n: usize) -> *mut c_void;
-    fn free(p: *mut c_void);
-}
+/// Buffers handed to guest code live in the guest zone — a guest-side
+/// overrun then damages guest metadata, not the Rust heap.
 fn libc_malloc(n: usize) -> usize {
-    unsafe { malloc(n) as usize }
+    crate::native::guest_malloc(n)
 }
 fn libc_free(p: usize) {
-    unsafe { free(p as *mut c_void) }
+    crate::native::guest_free(p)
 }
 
 macro_rules! ga {

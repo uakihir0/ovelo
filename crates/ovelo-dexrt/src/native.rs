@@ -848,6 +848,49 @@ pub(crate) fn guest_zone() -> *mut c_void {
     *ZONE.get_or_init(|| unsafe { malloc_create_zone(0, 0) as usize }) as *mut c_void
 }
 
+/// Allocate in the guest zone — for buffers host code hands to guest
+/// code (Get*ArrayElements, GetStringCritical, …). A guest-side overrun
+/// then damages guest metadata, not the Rust heap, and faults inside
+/// zone functions with a `[so]` frame naming the culprit.
+#[cfg(target_os = "macos")]
+pub(crate) fn guest_malloc(size: usize) -> usize {
+    unsafe { malloc_zone_malloc(guest_zone(), size.max(1)) as usize }
+}
+
+/// Free wherever the pointer actually lives — buffers from either zone.
+#[cfg(target_os = "macos")]
+pub(crate) fn guest_free(p: usize) {
+    if p == 0 {
+        return;
+    }
+    unsafe {
+        let zone = malloc_zone_from_ptr(p as *const c_void);
+        if !zone.is_null() {
+            malloc_zone_free(zone, p as *mut c_void);
+        } else {
+            free(p as *mut c_void);
+        }
+    }
+}
+
+#[cfg(not(target_os = "macos"))]
+pub(crate) fn guest_malloc(size: usize) -> usize {
+    extern "C" {
+        fn malloc(n: usize) -> *mut c_void;
+    }
+    unsafe { malloc(size.max(1)) as usize }
+}
+
+#[cfg(not(target_os = "macos"))]
+pub(crate) fn guest_free(p: usize) {
+    extern "C" {
+        fn free(p: *mut c_void);
+    }
+    if p != 0 {
+        unsafe { free(p as *mut c_void) }
+    }
+}
+
 #[cfg(target_os = "macos")]
 extern "C" fn sh_malloc(size: usize) -> *mut c_void {
     unsafe { malloc_zone_malloc(guest_zone(), size.max(1)) }
