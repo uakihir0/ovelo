@@ -599,6 +599,34 @@ pub(crate) fn host_thunk(f: usize) -> usize {
 /// saved register and retry. Each smashed access heals itself once;
 /// thunk exits re-arm TPIDR via `msr x29` going forward.
 /// `mc` points at mcontext64: ss.x[] at +16 (xN = +16+8N).
+/// True when `insn` may write GPR `rn` — used while scanning back for
+/// the `mrs` that loaded a faulting base register. Over-inclusive by
+/// design: an ambiguous instruction ends the scan (no heal), which is
+/// the same outcome as before the heal existed.
+#[cfg(target_arch = "aarch64")]
+fn clobbers_gpr(insn: u32, rn: u32) -> bool {
+    let rd = insn & 31;
+    if (insn >> 25) & 0xF == 0x8 || (insn >> 25) & 0xF == 0x9 {
+        return rd == rn; // data-processing immediate group (adr … extract)
+    }
+    if (insn >> 25) & 0x7 == 0x5 {
+        return rd == rn; // data-processing register group
+    }
+    if (insn & 0x3B00_0000) == 0x3900_0000
+        || (insn & 0x3B20_0000) == 0x3820_0000
+        || (insn & 0x3B00_0000) == 0x1800_0000
+    {
+        return rd == rn; // unsigned-imm loads, ldur family, ldr literal
+    }
+    if (insn & 0x3A00_0000) == 0x2800_0000 {
+        return rd == rn || (insn >> 10) & 31 == rn; // ldp/stp class (Rt, Rt2)
+    }
+    if (insn >> 21) & 0x7FF == 0x6A9 {
+        return rd == rn; // MRS into a GPR
+    }
+    false
+}
+
 #[cfg(target_arch = "aarch64")]
 unsafe fn heal_tls_fault(si: usize, insn: u32, mc: *mut u8) -> bool {
     let is_ldr_str = (insn & 0xFFC0_0000) == 0xF940_0000 || (insn & 0xFFC0_0000) == 0xF900_0000;
@@ -606,9 +634,33 @@ unsafe fn heal_tls_fault(si: usize, insn: u32, mc: *mut u8) -> bool {
         return false;
     }
     let rn = ((insn >> 5) & 31) as usize;
-    let imm = (((insn >> 10) & 0xFFF) * 8) as usize;
+    let imm = (((insn >> 10) & 0xfff) * 8) as usize;
     let base = unsafe { *(mc.add(16 + rn * 8) as *const usize) };
     if base >= 0x1000 || si != base.wrapping_add(imm) {
+        return false;
+    }
+    // A smashed TPIDR is only a plausible diagnosis when the base
+    // register provably held the thread pointer: require an
+    // `mrs xN,TPIDR_EL0` to have loaded it, with no clobber and no
+    // control flow in between. Otherwise this is a genuine near-null
+    // deref and must fault normally — healing a store here would
+    // scribble into the guest TCB and keep running corrupted.
+    let pc = unsafe { *(mc.add(272) as *const usize) };
+    let want_mrs = 0xD53B_D040 | rn as u32;
+    let max_back = ((pc & 0xFFF) / 4).min(24);
+    let mut proven = false;
+    for i in 1..=max_back {
+        let b = unsafe { *((pc - i * 4) as *const u32) };
+        if b == want_mrs {
+            proven = true;
+            break;
+        }
+        if ((b >> 25) & 0x7) == 0x2 || (b & 0xFF00_0000) == 0xD600_0000 || clobbers_gpr(b, rn as u32)
+        {
+            break;
+        }
+    }
+    if !proven {
         return false;
     }
     let tcb = tcb_for(unsafe { mach_thread_id() });
