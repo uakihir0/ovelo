@@ -109,6 +109,10 @@ pub enum HostState {
     /// A readable byte stream (`InputStream` over real bytes — raw
     /// resources, asset files): buffer + read cursor.
     Bytes(std::rc::Rc<Vec<u8>>, usize),
+    /// A readable char stream (`Reader` over UTF-16 units —
+    /// `StringReader`/`CharArrayReader`/`InputStreamReader`):
+    /// buffer + read cursor + mark.
+    Chars(std::rc::Rc<Vec<u16>>, usize, usize),
     /// A real writable file (`FileOutputStream` — SAF
     /// `openOutputStream` resolves documents to host files).
     File(std::fs::File),

@@ -1,5 +1,6 @@
 //! java.io / java.net / java.nio / regex / SimpleDateFormat / org.json.
 
+use super::rx::{full_match, Rx};
 use super::*;
 use crate::value::{HostState, Obj, V};
 
@@ -81,6 +82,77 @@ pub(crate) fn call(
             if let Some(V::Ref(this)) = args.first() {
                 if let Some(Obj::Host { state, .. }) = vm.heap.get_mut(*this) {
                     *state = HostState::Bytes(std::rc::Rc::new(bytes), 0);
+                }
+            }
+            Some(None)
+        } else if name == "<init>" && class.ends_with("Reader;") {
+            // Char-stream constructors: materialize the source into a
+            // `Chars` payload (StringReader/CharArrayReader), eagerly
+            // decode a byte-backed stream (InputStreamReader), or keep
+            // the wrapped reader in `in` for delegation (wrapper readers
+            // like BufferedReader/FilterReader).
+            if let Some(V::Ref(this)) = args.first() {
+                let this = *this;
+                let arg = args.get(1).copied().unwrap_or(V::Ref(0));
+                let chars: Option<Vec<u16>> = if class == "Ljava/io/StringReader;" {
+                    let s = sv(vm, arg).unwrap_or_default();
+                    if let Some(p) = std::env::var_os("OVELO_DUMP_READER") {
+                        use std::io::Write as _;
+                        let _ = std::fs::OpenOptions::new()
+                            .create(true)
+                            .append(true)
+                            .open(&p)
+                            .map(|mut f| {
+                                let _ = write!(
+                                    f,
+                                    "=== StringReader #{} len={} tail={:?}\n{}\n",
+                                    this,
+                                    s.chars().count(),
+                                    s.chars().rev().take(80).collect::<String>(),
+                                    s
+                                );
+                            });
+                    }
+                    Some(s.encode_utf16().collect())
+                } else if class == "Ljava/io/CharArrayReader;" {
+                    match arg {
+                        V::Ref(h) => match vm.heap.get(h) {
+                            Some(Obj::Array { data, .. }) => Some(
+                                data.iter().map(|v| i32v(*v) as u16).collect(),
+                            ),
+                            _ => Some(Vec::new()),
+                        },
+                        _ => Some(Vec::new()),
+                    }
+                } else if class == "Ljava/io/InputStreamReader;" {
+                    match arg {
+                        V::Ref(h) => match vm.heap.get(h) {
+                            Some(Obj::Host {
+                                state: HostState::Bytes(b, p),
+                                ..
+                            }) => {
+                                let s = String::from_utf8_lossy(&b[*p..]).into_owned();
+                                Some(s.encode_utf16().collect())
+                            }
+                            _ => None,
+                        },
+                        _ => None,
+                    }
+                } else {
+                    None
+                };
+                match chars {
+                    Some(c) => {
+                        if let Some(Obj::Host { state, .. }) = vm.heap.get_mut(this) {
+                            *state = HostState::Chars(std::rc::Rc::new(c), 0, 0);
+                        }
+                    }
+                    None => {
+                        // Wrapper reader: remember the delegate.
+                        for owner in ["Ljava/io/FilterReader;", "Ljava/io/Reader;"] {
+                            field_set(vm, this, owner, "in", arg);
+                        }
+                    }
                 }
             }
             Some(None)
@@ -174,6 +246,14 @@ pub(crate) fn call(
             }
         } else if class == "Ljava/net/URLEncoder;" || class == "Ljava/net/URLDecoder;" {
             url_codec(vm, name, args)
+        } else if class == "Ljava/net/IDN;" {
+            match name {
+                // IDN.toASCII: ASCII input passes through unchanged; the
+                // punycode path only matters for non-ASCII domains.
+                "toASCII" | "toUnicode" => Some(args.first().copied().unwrap_or(V::Ref(0))),
+                _ => return Ok(None),
+            }
+            .map(Some)
         } else if class == "Ljava/net/URL;" || class == "Ljava/net/URI;" {
             url_call(vm, name, args)?
         } else if class == "Ljava/net/URLConnection;"
@@ -440,6 +520,75 @@ fn stream_call(vm: &mut Vm, name: &str, args: &[V]) -> Rt<Option<Option<V>>> {
             _ => {}
         }
     }
+    // Char-backed readers (StringReader & friends): real char reads.
+    if let Some(Obj::Host {
+        state: HostState::Chars(data, pos, mark),
+        ..
+    }) = vm.heap.get_mut(this)
+    {
+        match name {
+            "read" => {
+                if args.len() == 1 {
+                    return Ok(Some(Some(if *pos < data.len() {
+                        let c = data[*pos] as i32;
+                        *pos += 1;
+                        V::I32(c)
+                    } else {
+                        V::I32(-1)
+                    })));
+                }
+                // read(char[]) / read(char[], off, len)
+                let buf = match args.get(1) {
+                    Some(&V::Ref(h)) => h,
+                    _ => 0,
+                };
+                let (mut off, mut want) = (0usize, usize::MAX);
+                if args.len() > 3 {
+                    off = i64v(args[2]).max(0) as usize;
+                    want = i64v(args[3]).max(0) as usize;
+                }
+                let avail = data.len() - *pos;
+                if avail == 0 && want != 0 {
+                    return Ok(Some(Some(V::I32(-1))));
+                }
+                let n = want.min(avail);
+                let chunk: Vec<u16> = data[*pos..*pos + n].to_vec();
+                *pos += n;
+                if let Some(Obj::Array { data: dst, .. }) = vm.heap.get_mut(buf) {
+                    for (i, c) in chunk.iter().enumerate() {
+                        if let Some(slot) = dst.get_mut(off + i) {
+                            *slot = V::I32(*c as i32);
+                        }
+                    }
+                }
+                return Ok(Some(Some(V::I32(n as i32))));
+            }
+            "available" | "ready" => {
+                return Ok(Some(Some(V::I32(if *pos < data.len() {
+                    1
+                } else {
+                    0
+                }))));
+            }
+            "skip" => {
+                let n = i64v(args.get(1).copied().unwrap_or(V::I64(0))).max(0) as usize;
+                let took = n.min(data.len() - *pos);
+                *pos += took;
+                return Ok(Some(Some(V::I64(took as i64))));
+            }
+            "mark" => {
+                *mark = *pos;
+                return Ok(Some(None));
+            }
+            "reset" => {
+                *pos = *mark;
+                return Ok(Some(None));
+            }
+            "markSupported" => return Ok(Some(Some(V::I32(1)))),
+            "close" => return Ok(Some(None)),
+            _ => {}
+        }
+    }
     // `FilterInputStream`-style wrappers: the java methods we don't
     // model delegate to the protected `in` field (stored by the
     // `<init>` shim). A guest IOException propagates so the app's own
@@ -448,9 +597,20 @@ fn stream_call(vm: &mut Vm, name: &str, args: &[V]) -> Rt<Option<Option<V>>> {
         name,
         "read" | "available" | "skip" | "mark" | "reset" | "markSupported" | "ready" | "close"
     ) {
-        if let Some(V::Ref(inner)) =
-            field_get(vm, this, "Ljava/io/FilterInputStream;", "in")
-        {
+        let inner = [
+            "Ljava/io/FilterInputStream;",
+            "Ljava/io/FilterReader;",
+            "Ljava/io/Reader;",
+            "Ljava/io/BufferedReader;",
+            "Ljava/io/InputStreamReader;",
+        ]
+        .iter()
+        .find_map(|owner| field_get(vm, this, owner, "in"))
+        .and_then(|v| match v {
+            V::Ref(h) => Some(h),
+            _ => None,
+        });
+        if let Some(inner) = inner {
             if inner != 0 && inner != this {
                 if std::env::var_os("OVELO_STREAMDBG").is_some() {
                     let td = match vm.heap.get(this) {
@@ -961,7 +1121,9 @@ fn pattern_call(vm: &mut Vm, name: &str, args: &[V]) -> Option<Option<V>> {
             }
             let pat = sv(vm, args[0]).unwrap_or_default();
             let t = sv(vm, args[1]).unwrap_or_default();
-            Some(Some(V::I32(literal_match(&pat, &t) as i32)))
+            Some(Some(V::I32(
+                (full_match(&pat, &t) || literal_match(&pat, &t)) as i32,
+            )))
         }
         "matcher" => {
             let h = vm.alloc_host("Ljava/util/regex/Matcher;", HostState::Slot(args[1]));
@@ -994,10 +1156,50 @@ fn pattern_call(vm: &mut Vm, name: &str, args: &[V]) -> Option<Option<V>> {
             )
             .unwrap_or_default();
             let t = sv(vm, args[1]).unwrap_or_default();
-            let parts: Vec<V> = t.split(&pat).map(|x| jstr(vm, x)).collect();
+            let lim = args.get(2).map(|v| i32v(*v)).unwrap_or(0);
+            let parts: Vec<V> = rx::regex_split(&pat, &t, lim)
+                .into_iter()
+                .map(|x| jstr(vm, &x))
+                .collect();
             Some(Some(arr(vm, STRING, parts)))
         }
         "quote" => Some(args.first().copied()),
+        _ => None,
+    }
+}
+
+// Matcher state pseudo-fields (`P_*` sentinels live in mod.rs): the
+// last match's group spans, the match region, and find()'s resume point.
+const P_RX_SPANS: u64 = 0xFFFD_FEF4;
+const P_RX_LO: u64 = 0xFFFD_FEF5;
+const P_RX_HI: u64 = 0xFFFD_FEF6;
+const P_RX_FROM: u64 = 0xFFFD_FEF7;
+
+/// Persist a search result on the matcher: `Ref(0)` = searched, no
+/// match; `Ref([I)` = flat slot array `[g0s, g0e, g1s, g1e, …]`, -1 for
+/// a group that did not participate.
+fn rx_store(vm: &mut Vm, h: u32, m: Option<Vec<Option<usize>>>) {
+    match m {
+        None => pseudo_set(vm, h, P_RX_SPANS, V::Ref(0)),
+        Some(s) => {
+            let flat: Vec<V> = s
+                .iter()
+                .map(|o| V::I32(o.map(|x| x as i32).unwrap_or(-1)))
+                .collect();
+            let a = arr(vm, "I", flat);
+            pseudo_set(vm, h, P_RX_SPANS, a);
+        }
+    }
+}
+
+/// The stored span array, or None when no search ran yet.
+fn rx_spans(vm: &Vm, h: u32) -> Option<Vec<i32>> {
+    match pseudo_get(vm, h, P_RX_SPANS)? {
+        V::Ref(0) => None,
+        V::Ref(a) => match vm.heap.get(a) {
+            Some(Obj::Array { data, .. }) => Some(data.iter().map(|v| i32v(*v)).collect()),
+            _ => None,
+        },
         _ => None,
     }
 }
@@ -1007,24 +1209,89 @@ fn matcher_call(vm: &mut Vm, name: &str, args: &[V]) -> Rt<Option<Option<V>>> {
         return Ok(None);
     };
     let text = slot_of(vm, h).and_then(|v| sv(vm, v)).unwrap_or_default();
+    let t: Vec<char> = text.chars().collect();
     let pat = pseudo_get(vm, h, P_ACTION)
         .and_then(|v| sv(vm, v))
         .unwrap_or_default();
+    let lo = pseudo_get(vm, h, P_RX_LO)
+        .map(|v| i32v(v).max(0) as usize)
+        .unwrap_or(0);
+    let hi = pseudo_get(vm, h, P_RX_HI)
+        .map(|v| i32v(v).max(0) as usize)
+        .unwrap_or(t.len());
+    let rx = || Rx::compile(&pat).ok();
     Ok(match name {
-        "matches" => Some(Some(V::I32(literal_match(&pat, &text) as i32))),
-        "lookingAt" | "find" => {
-            let found = literal_match(&pat, &text) || (!pat.is_empty() && text.contains(&pat));
+        "matches" => {
+            let m = rx().and_then(|rx| rx.matches(&t, lo, hi));
+            let found = m.is_some() || literal_match(&pat, &text);
+            rx_store(vm, h, m);
+            Some(Some(V::I32(found as i32)))
+        }
+        "lookingAt" => {
+            let m = rx().and_then(|rx| rx.looking_at(&t, lo, lo, hi));
+            let found = m.is_some() || literal_match(&pat, &text);
+            rx_store(vm, h, m);
+            Some(Some(V::I32(found as i32)))
+        }
+        "find" => {
+            let from = if args.len() > 1 {
+                i32v(args[1]).max(0) as usize
+            } else {
+                pseudo_get(vm, h, P_RX_FROM)
+                    .map(|v| i32v(v).max(0) as usize)
+                    .unwrap_or(lo)
+            };
+            let m = rx().and_then(|rx| rx.find(&t, lo, from, hi));
+            let found = m.is_some() || (!pat.is_empty() && text.contains(&pat));
+            if let Some(s) = &m {
+                let st = s[0].unwrap_or(0) as i32;
+                let en = s[1].unwrap_or(0) as i32;
+                // Java resumes after the match; empty matches advance 1.
+                pseudo_set(vm, h, P_RX_FROM, V::I32(if en > st { en } else { en + 1 }));
+            }
+            rx_store(vm, h, m);
             Some(Some(V::I32(found as i32)))
         }
         "group" => {
-            let i = i32v(*args.get(1).unwrap_or(&V::I32(0)));
-            let g = if i == 0 { text.clone() } else { String::new() };
-            Some(Some(jstr(vm, &g)))
+            let i = i32v(*args.get(1).unwrap_or(&V::I32(0))).max(0) as usize;
+            let chars: Vec<char> = text.chars().collect();
+            let out = match rx_spans(vm, h) {
+                Some(sp) if 2 * i + 1 < sp.len() && sp[2 * i] >= 0 => {
+                    let (a, b) = (sp[2 * i] as usize, sp[2 * i + 1] as usize);
+                    jstr(vm, &chars[a.min(chars.len())..b.min(chars.len())].iter().collect::<String>())
+                }
+                _ => V::Ref(0),
+            };
+            Some(Some(out))
         }
-        "groupCount" => Some(Some(V::I32(0))),
+        "groupCount" => {
+            let n = rx().map(|rx| rx.ngroups()).unwrap_or(0) as i32;
+            Some(Some(V::I32(n)))
+        }
+        "start" | "end" => {
+            let i = i32v(*args.get(1).unwrap_or(&V::I32(0))).max(0) as usize;
+            let v = match rx_spans(vm, h) {
+                Some(sp) if 2 * i + 1 < sp.len() => {
+                    sp[if name == "start" { 2 * i } else { 2 * i + 1 }]
+                }
+                _ => -1,
+            };
+            Some(Some(V::I32(v)))
+        }
+        "region" => {
+            let a = i32v(*args.get(1).unwrap_or(&V::I32(0))).max(0);
+            let b = i32v(*args.get(2).unwrap_or(&V::I32(0))).max(0);
+            pseudo_set(vm, h, P_RX_LO, V::I32(a));
+            pseudo_set(vm, h, P_RX_HI, V::I32(b));
+            Some(Some(args[0]))
+        }
+        "regionStart" => Some(Some(V::I32(lo as i32))),
+        "regionEnd" => Some(Some(V::I32(hi as i32))),
         "replaceAll" | "replaceFirst" => {
             let rep = sv(vm, args[1]).unwrap_or_default();
-            let out = if pat.is_empty() {
+            let out = if let Some(rx) = rx() {
+                rx_replace(&rx, &t, &rep, name == "replaceFirst")
+            } else if pat.is_empty() {
                 text.clone()
             } else if name == "replaceFirst" {
                 text.replacen(&pat, &rep, 1)
@@ -1034,19 +1301,94 @@ fn matcher_call(vm: &mut Vm, name: &str, args: &[V]) -> Rt<Option<Option<V>>> {
             Some(Some(jstr(vm, &out)))
         }
         "quoteReplacement" => Some(args.first().copied()),
-        "start" | "end" => Some(Some(V::I32(0))),
         "reset" => Some(Some(args[0])),
-        "region"
-        | "useAnchoringBounds"
-        | "useTransparentBounds"
-        | "usePattern"
-        | "appendReplacement" => Some(Some(args[0])),
+        "usePattern" => {
+            if let Some(p2) = args.get(1).and_then(|v| sv(vm, *v)) {
+                let pv = jstr(vm, &p2);
+                pseudo_set(vm, h, P_ACTION, pv);
+            }
+            Some(Some(args[0]))
+        }
+        "useAnchoringBounds" | "useTransparentBounds" | "appendReplacement" => {
+            Some(Some(args[0]))
+        }
         "appendTail" => Some(Some(args[1])),
         "pattern" => Some(Some(args[0])),
         "requireEnd" | "hasAnchoringBounds" | "hasTransparentBounds" => Some(Some(V::I32(0))),
         "namedGroups" => Some(Some(host(vm, "Ljava/util/Set;", HostState::List(vec![])))),
         _ => None,
     })
+}
+
+/// `Matcher.replaceAll/First` over real match spans, expanding `$g` and
+/// `${g}` references in the replacement (Java semantics minus quoting —
+/// callers pass `quoteReplacement` output through already).
+fn rx_replace(rx: &Rx, t: &[char], rep: &str, first_only: bool) -> String {
+    let mut out: Vec<char> = Vec::new();
+    let rep_chars: Vec<char> = rep.chars().collect();
+    let mut pos = 0usize;
+    let hi = t.len();
+    while let Some(m) = rx.find(t, 0, pos, hi) {
+        let (ms, me) = (m[0].unwrap_or(pos), m[1].unwrap_or(pos));
+        out.extend_from_slice(&t[pos..ms]);
+        // expand $d / ${name-free digits}
+        let mut i = 0;
+        while i < rep_chars.len() {
+            if rep_chars[i] == '$' && i + 1 < rep_chars.len() {
+                if rep_chars[i + 1] == '{' {
+                    if let Some(close) = rep_chars[i + 2..].iter().position(|c| *c == '}') {
+                        let name: String = rep_chars[i + 2..i + 2 + close].iter().collect();
+                        if let Ok(g) = name.parse::<usize>() {
+                            if 2 * g + 1 < m.len() {
+                                if let (Some(a), Some(b)) = (m[2 * g], m[2 * g + 1]) {
+                                    out.extend_from_slice(&t[a..b]);
+                                }
+                            }
+                        }
+                        i += 3 + close;
+                        continue;
+                    }
+                } else if rep_chars[i + 1].is_ascii_digit() {
+                    let mut j = i + 1;
+                    while j < rep_chars.len() && rep_chars[j].is_ascii_digit() {
+                        j += 1;
+                    }
+                    // Longest valid group number wins ($12 → g12 else g1 + '2').
+                    let mut k = j;
+                    loop {
+                        let g: usize = rep_chars[i + 1..k].iter().collect::<String>().parse().unwrap_or(usize::MAX);
+                        if 2 * g + 1 < m.len() || k <= i + 2 {
+                            if 2 * g + 1 < m.len() {
+                                if let (Some(a), Some(b)) = (m[2 * g], m[2 * g + 1]) {
+                                    out.extend_from_slice(&t[a..b]);
+                                }
+                            }
+                            out.extend_from_slice(&rep_chars[k..j]);
+                            break;
+                        }
+                        k -= 1;
+                    }
+                    i = j;
+                    continue;
+                }
+            }
+            out.push(rep_chars[i]);
+            i += 1;
+        }
+        if first_only {
+            pos = me;
+            break;
+        }
+        pos = if me > ms { me } else { me + 1 };
+        if pos > hi {
+            pos = hi;
+            break;
+        }
+    }
+    if pos <= hi {
+        out.extend_from_slice(&t[pos.min(hi)..]);
+    }
+    out.into_iter().collect()
 }
 
 // ---------------------------------------------------------------------
@@ -1600,25 +1942,177 @@ fn url_codec(vm: &mut Vm, name: &str, args: &[V]) -> Option<Option<V>> {
     Some(Some(jstr(vm, &out)))
 }
 
+/// Split an absolute URL text into its JDK `URL` components. Missing
+/// parts come back empty/`-1`, matching the platform's lenient parse
+/// (no validation — `new URL` in the guest accepts anything).
+fn url_parts(u: &str) -> (String, String, i32, String, String, String) {
+    // scheme — text before "://" or, for opaque URIs, before ':'
+    let (scheme, rest) = match u.find("://") {
+        Some(i) => (&u[..i], &u[i + 3..]),
+        None => match u.find(':') {
+            Some(i) if i > 0 => (&u[..i], &u[i + 1..]),
+            _ => ("", u),
+        },
+    };
+    // authority ends at the first / ? #
+    let aend = rest.find(['/', '?', '#']).unwrap_or(rest.len());
+    let authority = &rest[..aend];
+    let after = &rest[aend..];
+    let (_userinfo, hostport) = match authority.rfind('@') {
+        Some(i) => (&authority[..i], &authority[i + 1..]),
+        None => ("", authority),
+    };
+    let (host_s, port) = match hostport.rfind(':') {
+        Some(i) if hostport[i + 1..].parse::<i32>().is_ok() => (
+            &hostport[..i],
+            hostport[i + 1..].parse::<i32>().unwrap_or(-1),
+        ),
+        _ => (hostport, -1),
+    };
+    // path / query / ref
+    let (no_ref, ref_s) = match after.find('#') {
+        Some(i) => (&after[..i], &after[i + 1..]),
+        None => (after, ""),
+    };
+    let (path, query) = match no_ref.find('?') {
+        Some(i) => (&no_ref[..i], &no_ref[i + 1..]),
+        None => (no_ref, ""),
+    };
+    (
+        scheme.to_string(),
+        host_s.to_string(),
+        port,
+        path.to_string(),
+        query.to_string(),
+        ref_s.to_string(),
+    )
+}
+
 fn url_call(vm: &mut Vm, name: &str, args: &[V]) -> Rt<Option<Option<V>>> {
+    let t = s(
+        vm,
+        match args.first() {
+            Some(V::Ref(h)) => *h,
+            _ => 0,
+        },
+    )
+    .unwrap_or_default();
     Ok(match name {
-        "openConnection" | "openStream" | "getContent" | "toURI" | "toURL" => {
-            Some(Some(host(vm, "Ljava/net/URLConnection;", HostState::Empty)))
+        "<init>" => {
+            // URL(String) / URL(URL, String) — keep the spec text so the
+            // component getters can parse it. A base URL resolves a
+            // relative spec by joining at the last '/' of its path.
+            let (spec, base) = if args.len() >= 3 {
+                (sv(vm, args[2]).unwrap_or_default(), t.clone())
+            } else {
+                (sv(vm, args.get(1).copied().unwrap_or(V::Ref(0)))
+                    .unwrap_or_default(), String::new())
+            };
+            let resolved = if spec.contains("://") || spec.starts_with('/')
+                || base.is_empty()
+            {
+                spec
+            } else {
+                let trim = match base.find(['?', '#']) {
+                    Some(i) => &base[..i],
+                    None => &base[..],
+                };
+                match trim.rfind('/') {
+                    Some(i) => format!("{}{spec}", &trim[..i + 1]),
+                    None => spec,
+                }
+            };
+            if let Some(V::Ref(h)) = args.first() {
+                if let Some(Obj::Host { state, .. }) = vm.heap.get_mut(*h) {
+                    *state = HostState::StrBuf(resolved);
+                }
+            }
+            Some(None)
         }
-        "getProtocol" | "getHost" | "getPath" | "getFile" | "getQuery" | "getAuthority"
-        | "getUserInfo" | "getRef" | "toExternalForm" | "toString" => {
-            let t = s(
+        "openConnection" | "openStream" | "getContent" => {
+            Some(Some(host(vm, "Ljava/net/URLConnection;", HostState::StrBuf(t))))
+        }
+        "toURI" => Some(Some(host(vm, "Ljava/net/URI;", HostState::StrBuf(t)))),
+        "toURL" => Some(Some(host(vm, "Ljava/net/URL;", HostState::StrBuf(t)))),
+        "getProtocol" => {
+            let (scheme, ..) = url_parts(&t);
+            Some(Some(jstr(vm, &scheme)))
+        }
+        "getHost" => {
+            let (_, host_s, ..) = url_parts(&t);
+            Some(Some(jstr(vm, &host_s)))
+        }
+        "getPort" => {
+            let (_, _, port, ..) = url_parts(&t);
+            Some(Some(V::I32(port)))
+        }
+        "getDefaultPort" => {
+            let p = match t.split("://").next().unwrap_or("") {
+                "https" | "wss" => 443,
+                "http" | "ws" | "ftp" => 80,
+                _ => -1,
+            };
+            Some(Some(V::I32(p)))
+        }
+        "getAuthority" => {
+            let authority = if let Some(i) = t.find("://") {
+                let rest = &t[i + 3..];
+                let e = rest.find(['/', '?', '#']).unwrap_or(rest.len());
+                rest[..e].to_string()
+            } else {
+                String::new()
+            };
+            Some(Some(jstr(vm, &authority)))
+        }
+        "getUserInfo" => {
+            let ui = if let Some(i) = t.find("://") {
+                let rest = &t[i + 3..];
+                let e = rest.find(['/', '?', '#']).unwrap_or(rest.len());
+                match rest[..e].rfind('@') {
+                    Some(j) => rest[..j].to_string(),
+                    None => String::new(),
+                }
+            } else {
+                String::new()
+            };
+            Some(Some(jstr(vm, &ui)))
+        }
+        "getPath" => {
+            let (_, _, _, path, ..) = url_parts(&t);
+            Some(Some(jstr(vm, &path)))
+        }
+        "getQuery" => {
+            let (_, _, _, _, query, _) = url_parts(&t);
+            Some(Some(jstr(vm, &query)))
+        }
+        "getRef" => {
+            let (_, _, _, _, _, ref_s) = url_parts(&t);
+            Some(Some(jstr(vm, &ref_s)))
+        }
+        "getFile" => {
+            let (_, _, _, path, query, _) = url_parts(&t);
+            let f = if query.is_empty() {
+                path
+            } else {
+                format!("{path}?{query}")
+            };
+            Some(Some(jstr(vm, &f)))
+        }
+        "toExternalForm" | "toString" => Some(Some(jstr(vm, &t))),
+        "sameFile" | "equals" => {
+            let other = s(
                 vm,
-                match args[0] {
-                    V::Ref(h) => h,
+                match args.get(1) {
+                    Some(V::Ref(h)) => *h,
                     _ => 0,
                 },
             )
             .unwrap_or_default();
-            Some(Some(jstr(vm, &t)))
+            Some(Some(V::I32((t == other) as i32)))
         }
-        "getPort" | "getDefaultPort" => Some(Some(V::I32(-1))),
-        "sameFile" | "equals" => Some(Some(V::I32(1))),
+        "hashCode" => Some(Some(V::I32(t.bytes().fold(0i32, |a, b| {
+            a.wrapping_mul(31).wrapping_add(b as i32)
+        })))),
         _ => None,
     })
 }
@@ -2389,6 +2883,17 @@ fn misc_fmt(vm: &mut Vm, class: &str, name: &str, args: &[V]) -> Option<Option<V
             "delimiter" | "locale" | "radix" | "match" | "ioException" => Some(V::Ref(0)),
             "tokens" => Some(host(vm, "Ljava/util/stream/Stream;", HostState::Empty)),
             "remove" => None,
+            _ => return None,
+        }
+        .map(Some);
+    }
+    if class == "Ljava/text/Normalizer;" {
+        return match name {
+            // NFC/NFD identity is wrong for real combining sequences,
+            // but OkHttp's host canonicalization only needs the ASCII
+            // fast path — return the input unchanged.
+            "normalize" => Some(args[0]),
+            "isNormalized" => Some(V::I32(1)),
             _ => return None,
         }
         .map(Some);

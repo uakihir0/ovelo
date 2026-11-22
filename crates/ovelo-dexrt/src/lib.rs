@@ -581,6 +581,7 @@ impl Vm {
             }
         }
         self.dexes.push(dex);
+        jdk::http::install(self);
         Ok(())
     }
 
@@ -792,6 +793,18 @@ impl Vm {
         // a collection wrapper. Be permissive there; the backing-field
         // search is the real test.
         self.type_index_of("Ljava/util/Collection;")
+            .map(|t| self.assignable(*class_idx, t))
+            .unwrap_or(true)
+    }
+
+    /// `is_guest_collection` for `java.util.Map` — dex subclasses of
+    /// `HashMap` (nanojson `JsonObject`, …) need a mutation backing
+    /// store the same way list subclasses do.
+    pub(crate) fn is_guest_map(&self, h: u32) -> bool {
+        let Some(Obj::Instance { class_idx, .. }) = self.heap.get(h) else {
+            return false;
+        };
+        self.type_index_of("Ljava/util/Map;")
             .map(|t| self.assignable(*class_idx, t))
             .unwrap_or(true)
     }
@@ -1255,7 +1268,10 @@ impl Vm {
                 return self.type_desc_of(gx(gd(cg), def.superclass_idx)).ok();
             }
         }
-        jdk::host_supers(desc).first().map(|s| (*s).to_string())
+        jdk::host_supers(desc)
+            .first()
+            .map(|s| (*s).to_string())
+            .or_else(|| Self::builtin_supers(desc).first().map(|s| (*s).to_string()))
     }
 
     /// Whether `desc` is, or descends from, a class whose simple name is
@@ -1656,6 +1672,15 @@ impl Vm {
                     // waits out its requested deadline, then re-runs —
                     // no repark budget: a game loop legitimately parks
                     // once per frame forever.
+                    let due = self.sleep_until.remove(&r).unwrap_or(now);
+                    self.delayed_runnables.push((r, on_main, due));
+                }
+                Err(e) if e.cause() == "ovelo.park"
+                    && self.sleep_until.contains_key(&r) =>
+                {
+                    // A non-thread runnable parked with a recorded
+                    // deadline (e.g. RealCall.execute polling a host
+                    // fetch) waits it out rather than burning reparks.
                     let due = self.sleep_until.remove(&r).unwrap_or(now);
                     self.delayed_runnables.push((r, on_main, due));
                 }
@@ -2332,7 +2357,10 @@ impl Vm {
     /// Superclass descriptor for a host-provided framework class (the
     /// first entry of [`jdk::host_supers`]; `None` at `Object`/unknown).
     fn framework_super(d: &str) -> Option<&'static str> {
-        jdk::host_supers(d).first().copied()
+        jdk::host_supers(d)
+            .first()
+            .copied()
+            .or_else(|| Self::builtin_supers(d).first().copied())
     }
 
     /// Known supers of builtin throwable descriptors.
@@ -2344,7 +2372,40 @@ impl Vm {
             | "Ljava/lang/ArithmeticException;"
             | "Ljava/lang/ClassCastException;"
             | "Ljava/lang/NegativeArraySizeException;"
-            | "Ljava/util/NoSuchElementException;" => &[
+            | "Ljava/util/NoSuchElementException;"
+            | "Ljava/util/ConcurrentModificationException;"
+            | "Ljava/util/EmptyStackException;"
+            | "Ljava/util/MissingResourceException;"
+            | "Ljava/util/InputMismatchException;"
+            | "Ljava/util/IllegalFormatException;"
+            | "Ljava/util/MissingFormatArgumentException;"
+            | "Ljava/util/CompletionException;"
+            | "Ljava/lang/IllegalStateException;"
+            | "Ljava/lang/IllegalArgumentException;"
+            | "Ljava/lang/IllegalMonitorStateException;"
+            | "Ljava/lang/UnsupportedOperationException;"
+            | "Ljava/lang/NumberFormatException;"
+            | "Ljava/lang/IllegalCallerException;"
+            | "Ljava/lang/SecurityException;"
+            | "Ljava/lang/StringIndexOutOfBoundsException;"
+            | "Ljava/lang/TypeNotPresentException;"
+            | "Ljava/lang/EnumConstantNotPresentException;"
+            | "Ljava/lang/reflect/UndeclaredThrowableException;"
+            | "Ljava/lang/reflect/MalformedParameterizedTypeException;"
+            | "Ljava/lang/annotation/AnnotationTypeMismatchException;"
+            | "Ljava/lang/invoke/WrongMethodTypeException;"
+            | "Ljava/nio/BufferOverflowException;"
+            | "Ljava/nio/BufferUnderflowException;"
+            | "Ljava/nio/ReadOnlyBufferException;"
+            | "Ljava/nio/file/ProviderMismatchException;"
+            | "Ljava/security/ProviderException;"
+            | "Ljava/time/DateTimeException;"
+            | "Ljava/io/UncheckedIOException;"
+            | "Ljava/util/regex/PatternSyntaxException;"
+            | "Ljava/util/concurrent/RejectedExecutionException;"
+            | "Ljava/util/concurrent/CompletionException;"
+            | "Ljava/util/concurrent/CancellationException;"
+            | "Ljava/lang/reflect/MalformedParametersException;" => &[
                 "Ljava/lang/RuntimeException;",
                 "Ljava/lang/Exception;",
                 "Ljava/lang/Throwable;",
@@ -2410,10 +2471,58 @@ impl Vm {
                 "Ljava/lang/Throwable;",
                 "Ljava/lang/Object;",
             ],
+            // Checked exceptions that map straight to `Exception`
+            // (skipping `RuntimeException` — `catch (RuntimeException)`
+            // must not catch these).
+            "Ljava/security/GeneralSecurityException;"
+            | "Ljava/security/NoSuchAlgorithmException;"
+            | "Ljava/security/NoSuchProviderException;"
+            | "Ljava/security/InvalidKeyException;"
+            | "Ljava/security/SignatureException;"
+            | "Ljava/security/KeyException;"
+            | "Ljava/security/cert/CertificateException;"
+            | "Ljavax/crypto/BadPaddingException;"
+            | "Ljavax/crypto/IllegalBlockSizeException;"
+            | "Ljavax/crypto/NoSuchPaddingException;"
+            | "Ljavax/crypto/ShortBufferException;"
+            | "Ljava/text/ParseException;"
+            | "Ljava/lang/instrument/IllegalClassFormatException;"
+            | "Ljava/lang/InterruptedException;"
+            | "Ljava/lang/CloneNotSupportedException;"
+            | "Ljava/lang/ReflectiveOperationException;"
+            | "Ljava/lang/ClassNotFoundException;"
+            | "Ljava/lang/InstantiationException;"
+            | "Ljava/lang/IllegalAccessException;"
+            | "Ljava/lang/NoSuchMethodException;"
+            | "Ljava/lang/NoSuchFieldException;"
+            | "Ljava/lang/reflect/InvocationTargetException;"
+            | "Ljava/util/concurrent/ExecutionException;"
+            | "Ljava/util/concurrent/TimeoutException;"
+            | "Ljava/util/zip/DataFormatException;"
+            | "Ljava/net/URISyntaxException;"
+            | "Landroid/os/RemoteException;" => &[
+                "Ljava/lang/Exception;",
+                "Ljava/lang/Throwable;",
+                "Ljava/lang/Object;",
+            ],
             "Ljava/lang/Exception;" | "Ljava/lang/Error;" => {
                 &["Ljava/lang/Throwable;", "Ljava/lang/Object;"]
             }
             "Ljava/lang/Throwable;" => &["Ljava/lang/Object;"],
+            // Unknown throwable descriptors absent from the dex: a
+            // framework `*Error` is an Error subclass, `*Exception` an
+            // Exception subclass (not RuntimeException — catching it
+            // must not claim unchecked-throwable semantics).
+            _ if d.ends_with("Error;") => &[
+                "Ljava/lang/Error;",
+                "Ljava/lang/Throwable;",
+                "Ljava/lang/Object;",
+            ],
+            _ if d.ends_with("Exception;") => &[
+                "Ljava/lang/Exception;",
+                "Ljava/lang/Throwable;",
+                "Ljava/lang/Object;",
+            ],
             _ => &[],
         }
     }
@@ -3038,14 +3147,25 @@ impl Vm {
                         let t = match args.get(1).copied() {
                             Some(V::Ref(ah)) => match self.heap.get(ah) {
                                 Some(Obj::Array { elem, data }) => {
+                                    // `String(x[], off, len, ...)` — the
+                                    // (off,len) pair bounds the decode;
+                                    // ignoring it leaks segment padding
+                                    // (okio reads share 8192-buf tails).
+                                    let (lo, hi) = if args.len() >= 4 {
+                                        let o = jdk::i64v(args[2]).max(0) as usize;
+                                        let n = jdk::i64v(args[3]).max(0) as usize;
+                                        (o.min(data.len()), (o + n).min(data.len()))
+                                    } else {
+                                        (0, data.len())
+                                    };
                                     if elem == "C" {
-                                        let units: Vec<u16> = data
+                                        let units: Vec<u16> = data[lo..hi]
                                             .iter()
                                             .map(|v| jdk::i64v(*v) as u16)
                                             .collect();
                                         Some(String::from_utf16_lossy(&units))
                                     } else {
-                                        let bytes: Vec<u8> = data
+                                        let bytes: Vec<u8> = data[lo..hi]
                                             .iter()
                                             .map(|v| jdk::i64v(*v) as u8)
                                             .collect();
@@ -3936,9 +4056,15 @@ impl Vm {
     ) -> Option<GIdx> {
         let mut name_hit = None;
         for _ in 0..64 {
-            let (cg, def) = self.def_loc_of(class_idx)?;
-            let d = self.dex_of(cg)?;
-            let cd = d.class_data_rc(def).ok()?;
+            let Some((cg, def)) = self.def_loc_of(class_idx) else {
+                return name_hit;
+            };
+            let Some(d) = self.dex_of(cg) else {
+                return name_hit;
+            };
+            let Ok(cd) = d.class_data_rc(def) else {
+                return name_hit;
+            };
             let it = if is_static {
                 &cd.static_fields
             } else {
@@ -3946,7 +4072,10 @@ impl Vm {
             };
             for f in it {
                 if let Ok(fi) = d.field(f.field_idx) {
-                    if d.string(fi.name_idx).ok()? != name {
+                    let Ok(fname) = d.string(fi.name_idx) else {
+                        continue;
+                    };
+                    if fname != name {
                         continue;
                     }
                     if let Some(want) = want_ty {
@@ -3980,19 +4109,37 @@ impl Vm {
             .map_err(E::Vm)?
             .ok_or_else(|| E::Vm(err("dexrt.method.no_code")))?;
         let nregs = code.registers_size as usize;
-        let start = nregs.saturating_sub(code.ins_size as usize);
+        let ins = code.ins_size as usize;
+        let start = nregs.saturating_sub(ins);
         let mut regs = vec![0i64; nregs];
-        for (i, a) in args.iter().enumerate() {
-            if start + i >= nregs {
-                break;
+        let write = |regs: &mut Vec<i64>, i: usize, a: &V| {
+            if i < regs.len() {
+                regs[i] = match a {
+                    V::I32(v) => *v as i64,
+                    V::I64(v) => *v,
+                    V::F32(v) => v.to_bits() as i64,
+                    V::F64(v) => v.to_bits() as i64,
+                    V::Ref(h) => *h as i64,
+                };
             }
-            regs[start + i] = match a {
-                V::I32(v) => *v as i64,
-                V::I64(v) => *v,
-                V::F32(v) => v.to_bits() as i64,
-                V::F64(v) => v.to_bits() as i64,
-                V::Ref(h) => *h as i64,
-            };
+        };
+        // Same reg-vs-param convention split as exec_frame: dex sites
+        // pass every register incl. wide high halves; host calls pass
+        // one V per parameter and J/D consume two registers.
+        if args.len() == ins {
+            for (i, a) in args.iter().enumerate() {
+                write(&mut regs, start + i, a);
+            }
+        } else {
+            let mut ri = start;
+            for a in &args {
+                write(&mut regs, ri, a);
+                ri += if matches!(a, V::I64(_) | V::F64(_)) {
+                    2
+                } else {
+                    1
+                };
+            }
         }
         let mut trap: u8 = 0;
         self.stack.push(midx);
@@ -4075,12 +4222,30 @@ impl Vm {
             loc,
             code,
         };
-        // Copy args into the last `ins_size` registers.
+        // Copy args into the last `ins_size` registers. Dex invoke
+        // sites pass one entry per *register* (a wide arg's high half
+        // is listed too, so args.len()==ins_size); host-side callers
+        // pass one V per *parameter* — a J/D arg then needs an extra
+        // register slot after it or every later arg shifts one reg.
         let ins = fr.code.ins_size as usize;
         let start = nregs.saturating_sub(ins);
-        for (i, a) in args.iter().enumerate() {
-            if start + i < nregs {
-                fr.regs[start + i] = *a;
+        if args.len() == ins {
+            for (i, a) in args.iter().enumerate() {
+                if start + i < nregs {
+                    fr.regs[start + i] = *a;
+                }
+            }
+        } else {
+            let mut ri = start;
+            for a in &args {
+                if ri < nregs {
+                    fr.regs[ri] = *a;
+                }
+                ri += if matches!(a, V::I64(_) | V::F64(_)) {
+                    2
+                } else {
+                    1
+                };
             }
         }
         let mut pc: usize = 0;
@@ -4125,16 +4290,7 @@ impl Vm {
                 }
                 Err(E::Throw(r)) => match self.find_handler(&fr, pc, r) {
                     _ if self.trace_throw => {
-                        let d = match self.heap.get(r) {
-                            Some(Obj::Throwable { descriptor, detail }) => {
-                                format!("{descriptor} {detail}")
-                            }
-                            Some(Obj::Host { desc, .. }) => desc.clone(),
-                            Some(Obj::Instance { class_idx, .. }) => self
-                                .type_desc_of(*class_idx)
-                                .unwrap_or_else(|_| format!("instance(class_idx={class_idx})")),
-                            _ => format!("h{r}"),
-                        };
+                        let d = self.describe_throw(r);
                         eprintln!(
                             "[throw] {} +{pc:04x} -> {d}",
                             self.describe_method(fr.loc.midx)

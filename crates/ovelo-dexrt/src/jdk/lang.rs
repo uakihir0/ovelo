@@ -370,15 +370,19 @@ fn string_call(vm: &mut Vm, name: &str, sig: &str, args: &[V]) -> Option<Option<
         }
         "matches" => {
             let pat = sv(vm, args[1]).unwrap_or_default();
-            Some(V::I32(io::literal_match(&pat, &t) as i32))
+            Some(V::I32(
+                (super::rx::full_match(&pat, &t) || io::literal_match(&pat, &t)) as i32,
+            ))
         }
         "split" => {
+            // Java takes a regex here (`"a.b".split("\\.")`), not a
+            // literal separator — NewPipe's Parser.getValue dot-paths
+            // came back as one un-split key when we split literally.
             let pat = sv(vm, args[1]).unwrap_or_default();
             let lim = args.get(2).map(|v| i32v(*v)).unwrap_or(0);
-            let parts: Vec<V> = t
-                .split(if pat == "." { "\\." } else { &pat })
-                .take(if lim > 0 { lim as usize } else { usize::MAX })
-                .map(|x| jstr(vm, x))
+            let parts: Vec<V> = super::rx::regex_split(&pat, &t, lim)
+                .into_iter()
+                .map(|x| jstr(vm, &x))
                 .collect();
             Some(arr(vm, STRING, parts))
         }
@@ -488,10 +492,23 @@ fn strbuf(vm: &mut Vm, name: &str, sig: &str, args: &[V]) -> Rt<Option<Option<V>
                 "F" | "D" => fmt_f64(f64v(args[1])),
                 "[C" => match args[1] {
                     V::Ref(ah) => match vm.heap.get(ah) {
-                        Some(Obj::Array { data, .. }) => data
-                            .iter()
-                            .filter_map(|v| char::from_u32(i32v(*v) as u32))
-                            .collect(),
+                        Some(Obj::Array { data, .. }) => {
+                            // `append(char[], off, len)` takes a slice —
+                            // tokener/scanner code passes a shared
+                            // buffer and bounds the view (nanojson
+                            // `JsonTokener.consumeTokenSemiString`).
+                            let slice: &[V] = if p.len() == 3 {
+                                let off = i32v(args[2]).max(0) as usize;
+                                let n = i32v(args[3]).max(0) as usize;
+                                &data[off.min(data.len())..(off + n).min(data.len())]
+                            } else {
+                                data
+                            };
+                            slice
+                                .iter()
+                                .filter_map(|v| char::from_u32(i32v(*v) as u32))
+                                .collect()
+                        }
                         _ => String::new(),
                     },
                     _ => String::new(),
@@ -994,7 +1011,18 @@ fn boxed_call(
                 }),
             )))
         }
-        "getInteger" => Some(Some(V::Ref(0))),
+        "getInteger" => {
+            // Integer.getInteger(nm[, val]) — the named system
+            // properties callers ask for (rx3.*-priority etc.) are
+            // never set in this runtime, so the answer is the
+            // caller's default: boxed when int, passed through when
+            // an Integer (or null).
+            match args.get(1) {
+                Some(&V::I32(v)) => Some(Some(host(vm, class, HostState::Slot(V::I32(v))))),
+                Some(v) => Some(Some(*v)),
+                None => Some(Some(V::Ref(0))),
+            }
+        }
         "isNaN" | "isInfinite" | "isFinite" => {
             let v = f64v(args[0]);
             let r = match name {
@@ -2887,6 +2915,14 @@ fn unsafe_call(vm: &mut Vm, name: &str, args: &[V]) -> Rt<Option<Option<V>>> {
                 args.get(4).copied().unwrap_or(V::I32(0)),
             );
             let cur = unsafe_read(vm, o, k);
+            // An unset field reads I32(0) while a long CAS expects
+            // I64 — coerce the raw read to the operand width or the
+            // CAS never succeeds and the retry loop spins.
+            let cur = match (cur, expect) {
+                (V::I32(i), V::I64(_)) => V::I64(i as i64),
+                (V::I64(i), V::I32(_)) => V::I32(i as i32),
+                _ => cur,
+            };
             Some(V::I32(if cas_eq(vm, cur, expect) {
                 unsafe_write(vm, o, k, new);
                 1

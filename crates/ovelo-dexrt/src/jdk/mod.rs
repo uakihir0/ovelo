@@ -9,9 +9,11 @@ mod android;
 mod collect;
 pub(crate) mod db;
 pub(crate) mod gfx;
+pub(crate) mod http;
 pub(crate) mod gl;
 mod io;
 mod lang;
+mod rx;
 pub(crate) mod time;
 mod util;
 pub(crate) mod vector;
@@ -63,6 +65,11 @@ pub(crate) const P_BBUF_ORD: u64 = 0xFFFD_FEE3;
 /// cursor positions are element indices, capacity is backing/esz.
 /// Absent or 1 = plain `ByteBuffer` (positions are bytes).
 pub(crate) const P_BBUF_ESZ: u64 = 0xFFFD_FEEF;
+/// Atomic-slot value on a dex `Obj::Instance` subclassing a host
+/// atomic (`AtomicReference`, `AtomicInteger`, `Optional`, …) — RxJava
+/// R8-merges subscribers into atomic subclasses, so the slot can't
+/// live only on `Obj::Host`.
+pub(crate) const P_SLOT: u64 = 0xFFFD_FEF0;
 /// Byte offset into the backing array where a typed view's content
 /// starts — `asIntBuffer` on a positioned ByteBuffer views it from its
 /// position, not from the array base. Absent/0 = no offset.
@@ -90,6 +97,13 @@ pub(crate) const P_NAV_DESC: u64 = 0xFFFD_FEEC;
 /// ProviderInfo.metaData — a Bundle handle carrying the manifest's
 /// provider meta-data (androidx.startup's initializer list).
 pub const P_META: u64 = 0xFFFD_FEEE;
+/// Backing element stores lazily minted for dex subclasses of host
+/// collections — nanojson's `JsonArray extends ArrayList` and
+/// `JsonObject extends HashMap` allocate as `Obj::Instance` with no
+/// `HostState`, so their `add`/`put` ops back onto a host `List`/`Map`
+/// whose handle lives under these keys.
+pub(crate) const P_LIST_BACKING: u64 = 0xFFFD_FEF1;
+pub(crate) const P_MAP_BACKING: u64 = 0xFFFD_FEF2;
 
 pub(crate) fn now_ms() -> i64 {
     std::time::SystemTime::now()
@@ -297,14 +311,17 @@ pub(crate) fn run_on_main(
     r: u32,
 ) -> std::result::Result<Option<V>, ovelo_error::OveloError> {
     let prev = vm.cur_thread;
+    let prev_r = vm.cur_runnable;
     main_thread(vm);
     vm.cur_thread = vm.main_thread_h;
+    vm.cur_runnable = r;
     let v = if is_message(vm, r) {
         dispatch_message(vm, r)
     } else {
         vm.call_virtual(r, "run", &[])
     };
     vm.cur_thread = prev;
+    vm.cur_runnable = prev_r;
     v
 }
 
@@ -558,12 +575,27 @@ pub fn pseudo_set(vm: &mut Vm, h: u32, key: impl Into<u64>, v: V) {
 }
 
 pub(crate) fn list_mut(vm: &mut Vm, h: u32) -> Option<&mut Vec<V>> {
-    match vm.heap.get_mut(h) {
-        Some(Obj::Host {
-            state: HostState::List(l),
-            ..
-        }) => Some(l),
-        _ => None,
+    match vm.heap.get(h) {
+        Some(Obj::Instance { .. }) => {
+            // Dex subclasses of host collections (nanojson `JsonArray
+            // extends ArrayList`, …) mutate a lazily-minted backing
+            // store — delegate fields win when the guest holds one.
+            let bh = backing_handle(vm, h, false)?;
+            match vm.heap.get_mut(bh) {
+                Some(Obj::Host {
+                    state: HostState::List(l),
+                    ..
+                }) => Some(l),
+                _ => None,
+            }
+        }
+        _ => match vm.heap.get_mut(h) {
+            Some(Obj::Host {
+                state: HostState::List(l),
+                ..
+            }) => Some(l),
+            _ => None,
+        },
     }
 }
 
@@ -629,6 +661,19 @@ fn guest_list_backing(vm: &Vm, h: u32, depth: u8) -> Option<u32> {
     if depth == 0 || !vm.is_guest_collection(h) {
         return None;
     }
+    // A lazily-minted mutation store (see `backing_handle`) takes
+    // priority — delegate fields only describe reads.
+    if let Some(V::Ref(bh)) = pseudo_get(vm, h, P_LIST_BACKING) {
+        if matches!(
+            vm.heap.get(bh),
+            Some(Obj::Host {
+                state: HostState::List(_),
+                ..
+            }) | Some(Obj::Array { .. })
+        ) {
+            return Some(bh);
+        }
+    }
     let Some(Obj::Instance { fields, .. }) = vm.heap.get(h) else {
         return None;
     };
@@ -660,13 +705,137 @@ fn guest_list_backing(vm: &Vm, h: u32, depth: u8) -> Option<u32> {
     None
 }
 
+/// Same search for a guest Map implementation (`JsonObject extends
+/// HashMap`, guest `Map` wrappers delegating a field).
+fn guest_map_backing(vm: &Vm, h: u32, depth: u8) -> Option<u32> {
+    if depth == 0 || !vm.is_guest_map(h) {
+        return None;
+    }
+    if let Some(V::Ref(bh)) = pseudo_get(vm, h, P_MAP_BACKING) {
+        if matches!(
+            vm.heap.get(bh),
+            Some(Obj::Host {
+                state: HostState::Map(_),
+                ..
+            })
+        ) {
+            return Some(bh);
+        }
+    }
+    let Some(Obj::Instance { fields, .. }) = vm.heap.get(h) else {
+        return None;
+    };
+    let cands: Vec<u32> = fields
+        .values()
+        .filter_map(|v| match v {
+            V::Ref(x) if *x != 0 && *x != h => Some(*x),
+            _ => None,
+        })
+        .collect();
+    for &x in &cands {
+        if matches!(
+            vm.heap.get(x),
+            Some(Obj::Host {
+                state: HostState::Map(_),
+                ..
+            })
+        ) {
+            return Some(x);
+        }
+    }
+    for &x in &cands {
+        if let Some(Obj::Instance { .. }) = vm.heap.get(x) {
+            if let Some(y) = guest_map_backing(vm, x, depth - 1) {
+                return Some(y);
+            }
+        }
+    }
+    None
+}
+
+/// The element-store handle a guest collection/map subclass mutates
+/// through: an existing delegate field's store, or a freshly minted
+/// `ArrayList`/`HashMap` host object remembered under the pseudo key.
+fn backing_handle(vm: &mut Vm, h: u32, map: bool) -> Option<u32> {
+    let key = if map { P_MAP_BACKING } else { P_LIST_BACKING };
+    if let Some(V::Ref(bh)) = pseudo_get(vm, h, key) {
+        return Some(bh);
+    }
+    if !map {
+        if let Some(x) = guest_list_backing(vm, h, 8) {
+            match vm.heap.get(x) {
+                Some(Obj::Host {
+                    state: HostState::List(_),
+                    ..
+                }) => return Some(x),
+                // Array backing is fixed-size — copy it into a
+                // growable store so add/remove keep working.
+                Some(Obj::Array { data, .. }) => {
+                    let data = data.clone();
+                    let bh = vm.alloc_host("Ljava/util/ArrayList;", HostState::List(data));
+                    pseudo_set(vm, h, key, V::Ref(bh));
+                    return Some(bh);
+                }
+                _ => {}
+            }
+        }
+        if !vm.is_guest_collection(h) {
+            return None;
+        }
+        let bh = vm.alloc_host("Ljava/util/ArrayList;", HostState::List(Vec::new()));
+        pseudo_set(vm, h, key, V::Ref(bh));
+        return Some(bh);
+    }
+    if let Some(x) = guest_map_backing(vm, h, 8) {
+        return Some(x);
+    }
+    if !vm.is_guest_map(h) {
+        return None;
+    }
+    let bh = vm.alloc_host("Ljava/util/HashMap;", HostState::Map(Vec::new()));
+    pseudo_set(vm, h, key, V::Ref(bh));
+    Some(bh)
+}
+
 pub(crate) fn map_mut(vm: &mut Vm, h: u32) -> Option<&mut Vec<(V, V)>> {
-    match vm.heap.get_mut(h) {
+    match vm.heap.get(h) {
+        Some(Obj::Instance { .. }) => {
+            let bh = backing_handle(vm, h, true)?;
+            match vm.heap.get_mut(bh) {
+                Some(Obj::Host {
+                    state: HostState::Map(m),
+                    ..
+                }) => Some(m),
+                _ => None,
+            }
+        }
+        _ => match vm.heap.get_mut(h) {
+            Some(Obj::Host {
+                state: HostState::Map(m),
+                ..
+            }) => Some(m),
+            _ => None,
+        },
+    }
+}
+
+/// Read-side pairs for any map-typed value — host maps and guest Map
+/// implementations whose backing store resolves (`map_pairs` in
+/// collect.rs covers the field-scanning views).
+pub(crate) fn map_pairs_of(vm: &Vm, h: u32) -> Vec<(V, V)> {
+    match vm.heap.get(h) {
         Some(Obj::Host {
             state: HostState::Map(m),
             ..
-        }) => Some(m),
-        _ => None,
+        }) => m.clone(),
+        Some(Obj::Instance { .. }) => match guest_map_backing(vm, h, 8).and_then(|bh| vm.heap.get(bh)) {
+            Some(Obj::Host {
+                state: HostState::Map(m),
+                ..
+            }) => m.clone(),
+            _ => Vec::new(),
+        },
+        _ => Vec::new(),
     }
 }
 
@@ -679,6 +848,31 @@ pub(crate) fn map_get(vm: &Vm, h: u32, k: V) -> Option<V> {
             .iter()
             .find(|(ek, _)| value_eq(vm, *ek, k))
             .map(|(_, v)| *v),
+        Some(Obj::Instance { .. }) => {
+            let hit = match guest_map_backing(vm, h, 8).and_then(|bh| vm.heap.get(bh)) {
+                Some(Obj::Host {
+                    state: HostState::Map(m),
+                    ..
+                }) => m
+                    .iter()
+                    .find(|(ek, _)| value_eq(vm, *ek, k))
+                    .map(|(_, v)| *v),
+                _ => None,
+            };
+            if std::env::var_os("OVELO_MAPDBG").is_some() {
+                let kd = match k {
+                    V::Ref(kh) => match vm.heap.get(kh) {
+                        Some(Obj::Str(s)) => s.clone(),
+                        _ => format!("{kh}"),
+                    },
+                    v => format!("{v:?}"),
+                };
+                if kd.contains("humbnail") || kd.contains("Renderer") {
+                    eprintln!("[mapdbg] get h{h} {kd} -> {hit:?} ({})", hit.map(|v| class_of(vm, v)).unwrap_or_else(|| "-".into()));
+                }
+            }
+            hit
+        }
         _ => None,
     }
 }
@@ -689,6 +883,15 @@ pub(crate) fn map_put(vm: &mut Vm, h: u32, k: V, v: V) -> Option<V> {
             state: HostState::Map(m),
             ..
         }) => m.iter().position(|(ek, _)| value_eq(vm, *ek, k)),
+        Some(Obj::Instance { .. }) => {
+            match guest_map_backing(vm, h, 8).and_then(|bh| vm.heap.get(bh)) {
+                Some(Obj::Host {
+                    state: HostState::Map(m),
+                    ..
+                }) => m.iter().position(|(ek, _)| value_eq(vm, *ek, k)),
+                _ => None,
+            }
+        }
         _ => None,
     };
     let m = map_mut(vm, h)?;
@@ -705,6 +908,15 @@ pub(crate) fn map_remove(vm: &mut Vm, h: u32, k: V) -> Option<V> {
             state: HostState::Map(m),
             ..
         }) => m.iter().position(|(ek, _)| value_eq(vm, *ek, k)),
+        Some(Obj::Instance { .. }) => {
+            match guest_map_backing(vm, h, 8).and_then(|bh| vm.heap.get(bh)) {
+                Some(Obj::Host {
+                    state: HostState::Map(m),
+                    ..
+                }) => m.iter().position(|(ek, _)| value_eq(vm, *ek, k)),
+                _ => None,
+            }
+        }
         _ => None,
     }?;
     let m = map_mut(vm, h)?;
@@ -717,6 +929,15 @@ pub(crate) fn map_len(vm: &Vm, h: u32) -> usize {
             state: HostState::Map(m),
             ..
         }) => m.len(),
+        Some(Obj::Instance { .. }) => {
+            match guest_map_backing(vm, h, 8).and_then(|bh| vm.heap.get(bh)) {
+                Some(Obj::Host {
+                    state: HostState::Map(m),
+                    ..
+                }) => m.len(),
+                _ => 0,
+            }
+        }
         _ => 0,
     }
 }
@@ -727,7 +948,25 @@ pub(crate) fn slot_of(vm: &Vm, h: u32) -> Option<V> {
             state: HostState::Slot(v),
             ..
         }) => Some(*v),
+        Some(Obj::Instance { .. }) | Some(Obj::Host { .. }) => pseudo_get(vm, h, P_SLOT),
         _ => None,
+    }
+}
+
+/// Write an atomic-style slot value — `HostState::Slot` on host
+/// objects, the `P_SLOT` pseudo field on dex instances and host
+/// objects without a dedicated slot state (e.g. a `new-instance`
+/// `BitSet` minted as `HostState::Empty`).
+pub(crate) fn slot_put(vm: &mut Vm, h: u32, v: V) {
+    match vm.heap.get_mut(h) {
+        Some(Obj::Host {
+            state: HostState::Slot(s),
+            ..
+        }) => *s = v,
+        Some(Obj::Instance { fields, .. }) | Some(Obj::Host { fields, .. }) => {
+            fields.insert(P_SLOT, v);
+        }
+        _ => {}
     }
 }
 
@@ -1078,6 +1317,9 @@ pub(crate) fn sfield(vm: &mut Vm, owner: &str, name: &str, ftype: &str) -> Optio
             ))
         }
         ("Ljava/lang/Void;", "TYPE") => return Some(class_obj(vm, "V".into())),
+        ("Ljava/lang/String;", "CASE_INSENSITIVE_ORDER") => {
+            return Some(host(vm, "Ljava/util/Comparator;", HostState::Empty))
+        }
         ("Ljava/nio/charset/StandardCharsets;", n) => {
             return Some(host(
                 vm,
