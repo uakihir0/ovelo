@@ -4071,14 +4071,18 @@ fn build_tree(vm: &mut Vm, elems: &[Element], ctx: V) -> V {
         }
         // ImageView sources declared in XML (`android:src` /
         // `app:srcCompat` — different namespaces, so match by local
-        // name) seed P_IMAGE; the renderer resolves the res-id.
-        if let Some(v) = el
-            .attrs
-            .iter()
-            .find(|a| a.name == "src" || a.name == "srcCompat")
-            .map(|a| attr_v(vm, &a.value))
-        {
-            pseudo_set(vm, h, P_IMAGE, v);
+        // name) seed P_IMAGE; the renderer resolves the res-id. A dex
+        // constructor that already set an image wins — in AOSP the
+        // XML default only applies when the ctor leaves it unset.
+        if pseudo_get(vm, h, P_IMAGE).is_none() {
+            if let Some(v) = el
+                .attrs
+                .iter()
+                .find(|a| a.name == "src" || a.name == "srcCompat")
+                .map(|a| attr_v(vm, &a.value))
+            {
+                pseudo_set(vm, h, P_IMAGE, v);
+            }
         }
         while stack.last().is_some_and(|(d, _)| *d >= el.depth) {
             stack.pop();
