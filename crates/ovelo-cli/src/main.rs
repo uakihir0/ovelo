@@ -93,13 +93,11 @@ mod rustzone {
     unsafe extern "C" {
         fn malloc_create_zone(start_size: usize, flags: u32) -> *mut c_void;
         fn malloc_zone_malloc(zone: *mut c_void, size: usize) -> *mut c_void;
-        fn malloc_zone_calloc(zone: *mut c_void, n: usize, size: usize) -> *mut c_void;
         fn malloc_zone_realloc(zone: *mut c_void, ptr: *mut c_void, size: usize) -> *mut c_void;
         fn malloc_zone_free(zone: *mut c_void, ptr: *mut c_void);
         fn malloc_zone_memalign(zone: *mut c_void, align: usize, size: usize) -> *mut c_void;
         fn malloc(size: usize) -> *mut c_void;
-        fn calloc(n: usize, size: usize) -> *mut c_void;
-        fn reallocf(ptr: *mut c_void, size: usize) -> *mut c_void;
+        fn realloc(ptr: *mut c_void, size: usize) -> *mut c_void;
         fn free(ptr: *mut c_void);
         fn posix_memalign(memptr: *mut *mut c_void, align: usize, size: usize) -> i32;
     }
@@ -173,10 +171,13 @@ mod rustzone {
             }
         }
         unsafe fn alloc_zeroed(&self, l: Layout) -> *mut u8 {
-            if nozone() {
-                return calloc(1, l.size()) as *mut u8;
+            // Route through `alloc` so >16-byte alignments are honored
+            // in every mode (calloc/malloc_zone_calloc cap at 16).
+            let p = self.alloc(l);
+            if !p.is_null() {
+                std::ptr::write_bytes(p, 0, l.size());
             }
-            malloc_zone_calloc(zone(), 1, l.size()) as *mut u8
+            p
         }
         unsafe fn dealloc(&self, p: *mut u8, _l: Layout) {
             if leak() {
@@ -195,8 +196,21 @@ mod rustzone {
                 }
                 return np;
             }
+            if l.align() > 16 {
+                // libc realloc doesn't preserve over-aligned storage —
+                // move through alloc so the new block honors `l.align()`.
+                let np = self.alloc(Layout::from_size_align_unchecked(n, l.align()));
+                if !np.is_null() {
+                    std::ptr::copy_nonoverlapping(p, np, l.size().min(n));
+                    self.dealloc(p, l);
+                }
+                return np;
+            }
             if nozone() {
-                return reallocf(p as *mut c_void, n) as *mut u8;
+                // realloc (not reallocf): on failure the old block must
+                // stay live — reallocf frees it and Rust would touch or
+                // double-free a dead pointer on the error path.
+                return realloc(p as *mut c_void, n) as *mut u8;
             }
             malloc_zone_realloc(zone(), p as *mut c_void, n) as *mut u8
         }
