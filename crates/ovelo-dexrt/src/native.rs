@@ -1303,16 +1303,19 @@ pub fn load_tree(
             Ok(out.into_iter().map(|(l, _)| l).collect())
         }
         Err(e) => {
-            // Deps that already loaded stay mapped: their exports are
-            // in GLOBAL_SYMS, so dropping (unmapping) them now would
-            // leave dangling addresses a later load could bind to.
-            // Every entry in `out` finished relocating, so run its
-            // ctors too — a lib kept loaded but never initialized
-            // would be reused by later loads in a corrupt state.
-            for (_, inits) in &out {
-                run_ctors(inits);
+            // Unwind the failed tree like bionic's failed dlopen:
+            // no ctors ran yet, so nothing outside `out` can have
+            // bound to these exports. Unmark the sonames so a later
+            // load re-maps fresh copies, then drop — NativeLib::drop
+            // scrubs each lib's exports from GLOBAL_SYMS before
+            // unmapping, so no dangling addresses survive.
+            {
+                let mut names = LOADED_SONAMES.lock().unwrap();
+                for (l, _) in &out {
+                    names.remove(l.name.rsplit('/').next().unwrap_or(&l.name));
+                }
             }
-            std::mem::forget(out);
+            drop(out);
             Err(e)
         }
     }
@@ -1362,7 +1365,20 @@ fn load_tree_into(
                 }
             }
         }
-        out.push(finish_so(mapped, name)?);
+        // Exports were published at map time; a failed finish must
+        // take them back — the image stays mapped but unfinished, so
+        // binding to its symbols would jump into an unrelocated body.
+        let img = (mapped.map as usize, mapped.map as usize + mapped.span);
+        match finish_so(mapped, name) {
+            Ok(x) => out.push(x),
+            Err(e) => {
+                GLOBAL_SYMS
+                    .lock()
+                    .unwrap()
+                    .retain(|_, a| !(*a >= img.0 && *a < img.1));
+                return Err(e);
+            }
+        }
         Ok(())
     })();
     if r.is_err() {
