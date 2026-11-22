@@ -1502,7 +1502,9 @@ impl Vm {
         roots.extend(self.content_views.values().copied());
         roots.extend(self.decor_roots.keys().copied());
         roots.extend(self.decor_roots.values().copied());
-        roots.extend(self.clock_views.iter().copied());
+        // clock_views is deliberately NOT rooted: a clock is kept alive
+        // by its view-tree parent; once detached and unreferenced it is
+        // collected and drain_runnables prunes the stale handle.
         roots.extend(self.db_handles.values().copied());
         // obj_db/throw_sites/unsafe_offsets are NOT rooted: entries whose
         // owner object is dead are pruned after the sweep instead, so the
