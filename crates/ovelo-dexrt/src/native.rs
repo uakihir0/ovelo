@@ -854,7 +854,9 @@ pub(crate) fn guest_zone() -> *mut c_void {
 /// zone functions with a `[so]` frame naming the culprit.
 #[cfg(target_os = "macos")]
 pub(crate) fn guest_malloc(size: usize) -> usize {
-    unsafe { malloc_zone_malloc(guest_zone(), size.max(1)) as usize }
+    let p = unsafe { malloc_zone_malloc(guest_zone(), size.max(1)) as usize };
+    dbg_alloc(p);
+    p
 }
 
 /// Free wherever the pointer actually lives — buffers from either zone.
@@ -863,6 +865,7 @@ pub(crate) fn guest_free(p: usize) {
     if p == 0 {
         return;
     }
+    dbg_free(p, "guest_free");
     unsafe {
         let zone = malloc_zone_from_ptr(p as *const c_void);
         if !zone.is_null() {
@@ -892,8 +895,44 @@ pub(crate) fn guest_free(p: usize) {
 }
 
 #[cfg(target_os = "macos")]
+static LIVE_ALLOCS: std::sync::LazyLock<std::sync::Mutex<std::collections::HashSet<usize>>> =
+    std::sync::LazyLock::new(|| std::sync::Mutex::new(std::collections::HashSet::new()));
+#[cfg(target_os = "macos")]
+fn dbg_alloc(p: usize) {
+    if std::env::var_os("OVELO_FREEDBG").is_some() {
+        if let Ok(mut m) = LIVE_ALLOCS.lock() {
+            m.insert(p);
+        }
+    }
+}
+/// A free of a pointer we never handed out — or a double free — is the
+/// classic zone corruptor; flag it under OVELO_FREEDBG.
+#[cfg(target_os = "macos")]
+fn dbg_free(p: usize, who: &'static str) {
+    if std::env::var_os("OVELO_FREEDBG").is_none() {
+        return;
+    }
+    unsafe {
+        let z = malloc_zone_from_ptr(p as *mut c_void);
+        if !z.is_null() && z != guest_zone() {
+            // The splice lands in a NON-guest zone — this is the write
+            // that corrupts the Rust/default heap.
+            let so = so_off(p);
+            eprintln!("[freedbg] {who}: free into FOREIGN zone ptr={p:#x} (so_off={so:?})");
+        }
+    }
+    let mut m = LIVE_ALLOCS.lock().unwrap_or_else(|e| e.into_inner());
+    if !m.remove(&p) {
+        let so = so_off(p);
+        eprintln!("[freedbg] {who}: free of untracked/double {p:#x} (so_off={so:?})");
+    }
+}
+
+#[cfg(target_os = "macos")]
 extern "C" fn sh_malloc(size: usize) -> *mut c_void {
-    unsafe { malloc_zone_malloc(guest_zone(), size.max(1)) }
+    let p = unsafe { malloc_zone_malloc(guest_zone(), size.max(1)) };
+    dbg_alloc(p as usize);
+    p
 }
 
 /// Route the free to whichever zone owns the pointer — covers the
@@ -905,6 +944,7 @@ extern "C" fn sh_free(ptr: *mut c_void) {
     if ptr.is_null() {
         return;
     }
+    dbg_free(ptr as usize, "sh_free");
     unsafe {
         let zone = malloc_zone_from_ptr(ptr);
         if zone.is_null() {
@@ -920,7 +960,9 @@ extern "C" fn sh_free(ptr: *mut c_void) {
 
 #[cfg(target_os = "macos")]
 extern "C" fn sh_calloc(n: usize, size: usize) -> *mut c_void {
-    unsafe { malloc_zone_calloc(guest_zone(), n, size) }
+    let p = unsafe { malloc_zone_calloc(guest_zone(), n, size) };
+    dbg_alloc(p as usize);
+    p
 }
 
 #[cfg(target_os = "macos")]

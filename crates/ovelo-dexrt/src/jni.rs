@@ -181,6 +181,7 @@ pub(crate) fn env_enter(name: &'static str) {
             }
         }
     }
+    check_buf_canaries(name);
     LAST_ENV.set(name);
 }
 
@@ -1287,11 +1288,51 @@ fn release_elems(a: u64, buf: u64, mode: u64) {
 
 /// Buffers handed to guest code live in the guest zone — a guest-side
 /// overrun then damages guest metadata, not the Rust heap.
+/// Under OVELO_BUFDBG every allocation gets a magic tail that is
+/// verified on free and on every env entry, naming the env call that
+/// first saw an overrun.
 fn libc_malloc(n: usize) -> usize {
-    crate::native::guest_malloc(n)
+    let dbg = std::env::var_os("OVELO_BUFDBG").is_some();
+    if !dbg {
+        return crate::native::guest_malloc(n);
+    }
+    let p = crate::native::guest_malloc(n + 8);
+    if p == 0 {
+        return 0;
+    }
+    unsafe { *((p + n) as *mut u64) = 0xdead_beef_cafe_f00d };
+    BUFS.with(|b| b.borrow_mut().insert(p, n));
+    p
 }
 fn libc_free(p: usize) {
+    if p == 0 {
+        return;
+    }
+    let n = BUFS.with(|b| b.borrow_mut().remove(&p));
+    if let Some(n) = n {
+        let m = unsafe { *((p + n) as *const u64) };
+        if m != 0xdead_beef_cafe_f00d {
+            eprintln!("[bufdbg] canary dead at {p:#x}+{n} on free; last env {}", LAST_ENV.get());
+        }
+    }
     crate::native::guest_free(p)
+}
+thread_local! {
+    static BUFS: std::cell::RefCell<std::collections::HashMap<usize, usize>> =
+        std::cell::RefCell::new(std::collections::HashMap::new());
+}
+fn check_buf_canaries(name: &'static str) {
+    if std::env::var_os("OVELO_BUFDBG").is_none() {
+        return;
+    }
+    BUFS.with(|b| {
+        for (&p, &n) in b.borrow().iter() {
+            let m = unsafe { *((p + n) as *const u64) };
+            if m != 0xdead_beef_cafe_f00d {
+                eprintln!("[bufdbg] overrun: buf {p:#x}+{n} bad on entry to {name}; previous env {}", LAST_ENV.get());
+            }
+        }
+    });
 }
 
 macro_rules! ga {
