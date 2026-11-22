@@ -208,6 +208,9 @@ pub struct Vm {
     /// Root of the tree that owns each activity's content frame —
     /// appcompat's real decor when it built one dex-side.
     pub(crate) decor_roots: HashMap<u32, u32>,
+    /// Attached `TextClock` views that tick — refreshed once per
+    /// `drain_runnables` pass (AOSP ticks them per postDelayed).
+    pub clock_views: Vec<u32>,
     /// Installed-APK resource index for `LayoutInflater.inflate` — `None`
     /// degrades inflation to bare placeholder views.
     pub apk_res: Option<res::ApkResources>,
@@ -436,6 +439,7 @@ impl Vm {
             cur_activity: 0,
             content_views: HashMap::new(),
             decor_roots: HashMap::new(),
+            clock_views: Vec::new(),
             apk_res: None,
             dbs: HashMap::new(),
             db_handles: HashMap::new(),
@@ -1498,6 +1502,7 @@ impl Vm {
         roots.extend(self.content_views.values().copied());
         roots.extend(self.decor_roots.keys().copied());
         roots.extend(self.decor_roots.values().copied());
+        roots.extend(self.clock_views.iter().copied());
         roots.extend(self.db_handles.values().copied());
         // obj_db/throw_sites/unsafe_offsets are NOT rooted: entries whose
         // owner object is dead are pruned after the sweep instead, so the
@@ -1599,6 +1604,17 @@ impl Vm {
                     self.repark_counts.remove(&r);
                     self.park_spins = 0;
                 }
+            }
+        }
+        // TextClock tick: AOSP reschedules the ticker runnable every
+        // second; the drain cadence is our clock signal. Dead handles
+        // are pruned; unchanged text doesn't dirty the tree.
+        if !self.clock_views.is_empty() {
+            self.clock_views
+                .retain(|h| self.heap.get(*h).is_some());
+            for i in 0..self.clock_views.len() {
+                let h = self.clock_views[i];
+                jdk::view::textclock_update(self, h);
             }
         }
         self.draining = false;

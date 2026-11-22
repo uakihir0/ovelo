@@ -1957,6 +1957,11 @@ pub(crate) fn call(
             let d = class_of(vm, V::Ref(this));
             if vm.assignable_desc(&d, "Landroid/widget/TextClock;") {
                 textclock_update(vm, this);
+                // AOSP postet den Ticker per postDelayed — bei uns
+                // re-frischt die Drain-Kadenz alle angemeldeten Uhren.
+                if !vm.clock_views.contains(&this) {
+                    vm.clock_views.push(this);
+                }
             }
             Some(None)
         }
@@ -1972,18 +1977,38 @@ pub(crate) fn call(
     })
 }
 
+/// String-Attr aus dem Inflation-AttributeSet: direkter String ODER
+/// `@string/`-Referenz (I32 res-id → arsc-Lookup). Zahlen/Bools liefern
+/// `None` — ein Format-Attribut ist immer ein String-Typ.
+fn attr_str(vm: &Vm, h: u32, name: &str) -> Option<String> {
+    match attr_find(vm, h, name)? {
+        v @ V::Ref(_) => sv(vm, v),
+        V::I32(id) if id > 0 => vm
+            .apk_res
+            .as_ref()
+            .and_then(|r| r.entry_value(id as u32))
+            .and_then(|e| e.string.clone()),
+        _ => None,
+    }
+}
+
 /// `TextClock.updateTime`: format `now` through the view's
 /// `format24Hour`/`format12Hour` pattern attr (a SimpleDateFormat
 /// pattern; apps like fossify clock set "EEE, d MMM" for the date
-/// line) and write it into the text pseudo-field.
-fn textclock_update(vm: &mut Vm, this: u32) {
-    let pat = attr_find(vm, this, "format24Hour")
-        .and_then(|v| sv(vm, v))
-        .or_else(|| attr_find(vm, this, "format12Hour").and_then(|v| sv(vm, v)))
+/// line) and write it into the text pseudo-field. Writes only when the
+/// rendered text actually changed — an unchanged string must not mark
+/// the view dirty every drain tick.
+pub(crate) fn textclock_update(vm: &mut Vm, this: u32) {
+    let pat = attr_str(vm, this, "format24Hour")
+        .or_else(|| attr_str(vm, this, "format12Hour"))
         .filter(|p| !p.is_empty())
         .unwrap_or_else(|| "H:mm:ss".into());
-    let text = jstr(vm, &clock_pattern(&pat, now_ms()));
-    pseudo_set(vm, this, P_TEXT, text);
+    let text = clock_pattern(&pat, now_ms());
+    let cur = pseudo_get(vm, this, P_TEXT).and_then(|v| sv(vm, v));
+    if cur.as_deref() != Some(text.as_str()) {
+        let text = jstr(vm, &text);
+        pseudo_set(vm, this, P_TEXT, text);
+    }
 }
 
 /// Minimal `SimpleDateFormat` pattern renderer (UTC — the VM's
@@ -3394,11 +3419,17 @@ fn relative_layout_fallback(vm: &mut Vm, this: u32, w: i32, h: i32) {
     }
     let mut ks: Vec<Kid> = Vec::with_capacity(n);
     for &ch in &kids {
-        let lp_dim = |name: &str| -> i32 {
-            match attr_find(vm, ch, name) {
-                Some(V::I32(v)) => v,
-                _ => 0,
-            }
+        let lp_obj = match pseudo_get(vm, ch, P_LP) {
+            Some(V::Ref(lp)) => lp,
+            _ => 0,
+        };
+        // LIVE LayoutParams schlägt das XML-Attr: `setLayoutParams` kann
+        // width/height nach der Inflation auf match_parent umstellen.
+        let lp_dim = |field: &str, xml: &str| -> i32 {
+            lp_field(vm, lp_obj, field)
+                .and_then(|v| lp_px(vm, v))
+                .or_else(|| attr_find(vm, ch, xml).map(|v| len_v(vm, v)))
+                .unwrap_or(-2)
         };
         ks.push(Kid {
             id: pint(vm, ch, P_VIEW_ID),
@@ -3408,8 +3439,8 @@ fn relative_layout_fallback(vm: &mut Vm, this: u32, w: i32, h: i32) {
             mt: margin(vm, ch, "topMargin"),
             mr: margin(vm, ch, "rightMargin"),
             mb: margin(vm, ch, "bottomMargin"),
-            match_w: lp_dim("layout_width") == -1,
-            match_h: lp_dim("layout_height") == -1,
+            match_w: lp_dim("width", "layout_width") == -1,
+            match_h: lp_dim("height", "layout_height") == -1,
         });
     }
     let idx_of = |id: i32| -> Option<usize> {
