@@ -1291,7 +1291,17 @@ pub fn load_tree(
 ) -> Result<Vec<NativeLib>> {
     let mut out = Vec::new();
     match load_tree_into(name, elf, lookup, &mut out, 0) {
-        Ok(()) => Ok(out),
+        Ok(()) => {
+            // Bionic order: the whole tree relocates first, then ctors
+            // run dependency-first. A dep's DT_INIT may legitimately
+            // call back into its dependent (callback registration) —
+            // running inits during the recursive load would hit a
+            // still-unrelocated, non-executable parent image.
+            for (_, inits) in &out {
+                run_ctors(inits);
+            }
+            Ok(out.into_iter().map(|(l, _)| l).collect())
+        }
         Err(e) => {
             // Deps that already loaded stay mapped: their exports are
             // in GLOBAL_SYMS, so dropping (unmapping) them now would
@@ -1306,7 +1316,7 @@ fn load_tree_into(
     name: &str,
     elf: &[u8],
     lookup: &mut dyn FnMut(&str) -> Option<Vec<u8>>,
-    out: &mut Vec<NativeLib>,
+    out: &mut Vec<(NativeLib, Vec<usize>)>,
     depth: usize,
 ) -> Result<()> {
     if depth > 16 {
@@ -1340,17 +1350,13 @@ fn load_tree_into(
             if LOADED_SONAMES.lock().unwrap().contains(&dep) {
                 continue;
             }
-            match lookup(&dep) {
-                Some(bytes) => {
-                    if let Err(e) = load_tree_into(&dep, &bytes, lookup, out, depth + 1) {
-                        eprintln!("[jni] dep {dep}: {e}");
-                    }
+            if let Some(bytes) = lookup(&dep) {
+                if let Err(e) = load_tree_into(&dep, &bytes, lookup, out, depth + 1) {
+                    eprintln!("[jni] dep {dep}: {e}");
                 }
-                None => {}
             }
         }
-        let lib = finish_so(mapped, name)?;
-        out.push(lib);
+        out.push(finish_so(mapped, name)?);
         Ok(())
     })();
     if r.is_err() {
@@ -1586,11 +1592,14 @@ fn map_so(elf: &[u8]) -> Result<MappedLib> {
     })
 }
 
-/// Relocate + protect + initialize a mapped image, then wrap it as a
-/// `NativeLib`. A lib that fails partway stays mapped: tree loads
-/// publish exports at map time (so dep→dependent edges resolve), so
-/// unmapping it would leave dangling addresses in `GLOBAL_SYMS`.
-fn finish_so(m: MappedLib, name: &str) -> Result<NativeLib> {
+/// Relocate + protect a mapped image, wrap it as a `NativeLib`, and
+/// collect its DT_INIT/DT_INIT_ARRAY entry points for `run_ctors`.
+/// Ctors are NOT run here: `load_tree` runs every tree member's ctors
+/// only after every member has relocated. A lib that fails partway
+/// stays mapped: tree loads publish exports at map time (so
+/// dep→dependent edges resolve), so unmapping it would leave dangling
+/// addresses in `GLOBAL_SYMS`.
+fn finish_so(m: MappedLib, name: &str) -> Result<(NativeLib, Vec<usize>)> {
     let map = m.map;
     let span = m.span;
     let bias = m.bias;
@@ -1767,9 +1776,12 @@ fn finish_so(m: MappedLib, name: &str) -> Result<NativeLib> {
         }
     }
 
+    // Collect initializers — run later by `run_ctors` once every lib
+    // in the tree is relocated. The INIT_ARRAY slots themselves were
+    // just relocated (R_AARCH64_RELATIVE), so read the real addresses.
+    let mut inits = Vec::new();
     if d.init != 0 {
-        let f: extern "C" fn() = unsafe { std::mem::transmute(d.init) };
-        with_guest_tls(|| f());
+        inits.push(d.init);
     }
     let n_init = if in_img(d.init_array, d.init_array_sz) {
         d.init_array_sz / 8
@@ -1777,8 +1789,7 @@ fn finish_so(m: MappedLib, name: &str) -> Result<NativeLib> {
         0
     };
     for k in 0..n_init {
-        let f: extern "C" fn() = unsafe { std::mem::transmute(((d.init_array + k * 8) as *const u64).read()) };
-        with_guest_tls(|| f());
+        inits.push(unsafe { ((d.init_array + k * 8) as *const u64).read() } as usize);
     }
 
     // Join the process global scope: later libs (and dep edges of
@@ -1791,21 +1802,34 @@ fn finish_so(m: MappedLib, name: &str) -> Result<NativeLib> {
         }
     }
 
-    Ok(NativeLib {
-        map: map as *mut u8,
-        span,
-        bias,
-        exports: m.exports,
-        registered: HashMap::new(),
-        name: name.to_string(),
-    })
+    Ok((
+        NativeLib {
+            map,
+            span,
+            bias,
+            exports: m.exports,
+            registered: HashMap::new(),
+            name: name.to_string(),
+        },
+        inits,
+    ))
+}
+
+/// DT_INIT then DT_INIT_ARRAY, each under the guest TLS window.
+fn run_ctors(inits: &[usize]) {
+    for &a in inits {
+        let f: extern "C" fn() = unsafe { std::mem::transmute(a) };
+        with_guest_tls(|| f());
+    }
 }
 
 /// Single-image load: map, relocate, initialize. `load_tree` is the
 /// entry point for libs with DT_NEEDED edges.
 #[allow(dead_code)]
 pub fn load_so(name: &str, elf: &[u8]) -> Result<NativeLib> {
-    finish_so(map_so(elf)?, name)
+    let (lib, inits) = finish_so(map_so(elf)?, name)?;
+    run_ctors(&inits);
+    Ok(lib)
 }
 
 fn gnu_sym_count(gh: usize) -> usize {

@@ -1,3 +1,4 @@
+//! Debug helper: print core type sizes.
 fn main() {
     println!("Obj={} HostState={} V={}",
         std::mem::size_of::<ovelo_dexrt::Obj>(),
