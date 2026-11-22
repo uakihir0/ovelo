@@ -331,8 +331,12 @@ fn request_spec(vm: &mut Vm, call_h: u32) -> Result<HttpSpec> {
                     .flatten()
                     .and_then(|v| sv(vm, v))
             });
+            // OkHttp keeps an explicit Content-Type header over the
+            // body's own media type — don't append a second one.
             if let Some(ct) = ct {
-                headers.push(("Content-Type".into(), ct));
+                if !headers.iter().any(|(k, _)| k.eq_ignore_ascii_case("content-type")) {
+                    headers.push(("Content-Type".into(), ct));
+                }
             }
         }
         if let Ok(buf) = vm.instantiate("Lokio/Buffer;") {
