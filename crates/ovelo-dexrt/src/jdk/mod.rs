@@ -315,6 +315,12 @@ pub(crate) fn stub_ret(vm: &mut Vm, sig: &str) -> V {
 
 /// `Class` mirror object carrying the named descriptor.
 pub(crate) fn class_obj(vm: &mut Vm, desc: String) -> V {
+    // Prefer the interned `Obj::Class` mirror so `getParameterTypes()[i]
+    // == Foo.class` (and Class equality generally) compares by identity.
+    // Non-DEX types keep the string-backed host form.
+    if let Some(ci) = vm.type_index_of(&desc) {
+        return V::Ref(vm.class_mirror(ci));
+    }
     host(vm, "Ljava/lang/Class;", HostState::StrBuf(desc))
 }
 

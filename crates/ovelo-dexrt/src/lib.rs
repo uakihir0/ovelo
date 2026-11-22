@@ -3190,6 +3190,34 @@ impl Vm {
     /// Invoke a STATIC method resolved by declaring-class desc + name
     /// — `Method.invoke` with a null receiver lands here (e.g.
     /// `Handler.createAsync` via HandlerCompat).
+    /// `Method.invoke` — dispatch the exact method the mirror stored in
+    /// `P_METH`, with virtual resolution on the target when present.
+    /// Mirrors from `getDeclaredMethods` carry the declaring method id;
+    /// re-resolving by name+arity picks the wrong overload.
+    pub(crate) fn invoke_method_mirror(
+        &mut self,
+        midx: GIdx,
+        target: u32,
+        args: Vec<V>,
+    ) -> Result<Option<V>> {
+        let res = if target != 0 {
+            let mut a = Vec::with_capacity(args.len() + 1);
+            a.push(V::Ref(target));
+            a.extend_from_slice(&args);
+            self.invoke(midx, a, InvokeKind::Virtual)
+        } else {
+            self.invoke(midx, args, InvokeKind::Static)
+        };
+        match res {
+            Ok(v) => Ok(v),
+            Err(E::Vm(e)) => Err(e),
+            Err(E::Throw(r)) => {
+                let d = self.describe_throw(r);
+                Err(errd("dexrt.exception.uncaught", d))
+            }
+        }
+    }
+
     pub(crate) fn call_static_named(
         &mut self,
         owner: &str,
@@ -3336,26 +3364,48 @@ impl Vm {
             .collect()
     }
 
-    /// `Method.getDefaultValue` — the `AnnotationDefault` annotation's
-    /// `value` element declared on an annotation-interface method.
+    /// `Method.getDefaultValue` — the `AnnotationDefault` element for an
+    /// annotation-interface method. DX stores it on the interface's
+    /// *class* annotation set with elements keyed by method name.
     pub(crate) fn method_default_value(&mut self, midx: GIdx) -> Option<V> {
-        let (cg, items) = self.method_annotation_items(midx);
-        for it in items {
+        let (cg, name) = {
+            let d = self.dex_of(midx)?;
+            let mid = d.method(gl(midx)).ok()?;
+            let cg = gx(gd(midx), mid.class_idx as u32);
+            (cg, d.string(mid.name_idx).ok()?)
+        };
+        self.annotation_default_element(cg, &name)
+    }
+
+    /// Element `name` of the `AnnotationDefault` item in the class
+    /// annotation set of `cg`, converted to a value.
+    fn annotation_default_element(&mut self, cg: GIdx, name: &str) -> Option<V> {
+        let (_, def) = self.def_loc_of(cg)?;
+        let dir = self.dex_of(cg)?.annotations_directory(def).ok()?;
+        if dir.class_annotations_off == 0 {
+            return None;
+        }
+        let items = self
+            .dex_of(cg)?
+            .annotation_set(dir.class_annotations_off)
+            .ok()?;
+        for it in &items {
             if self
                 .dex_of(cg)
                 .and_then(|d| d.type_descriptor(it.type_idx).ok())
                 .as_deref()
-                == Some("Ldalvik/annotation/AnnotationDefault;")
+                != Some("Ldalvik/annotation/AnnotationDefault;")
             {
-                for (ni, ev) in it.elements {
-                    if self
-                        .dex_of(cg)
-                        .and_then(|d| d.string(ni).ok())
-                        .as_deref()
-                        == Some("value")
-                    {
-                        return self.encoded_to_v(cg, &ev);
-                    }
+                continue;
+            }
+            for (ni, ev) in &it.elements {
+                if self
+                    .dex_of(cg)
+                    .and_then(|d| d.string(*ni).ok())
+                    .as_deref()
+                    == Some(name)
+                {
+                    return self.encoded_to_v(cg, ev);
                 }
             }
         }
@@ -3403,29 +3453,9 @@ impl Vm {
         } else {
             return None;
         }
-        // Declared default: the interface method's own annotation set
-        // holds an AnnotationDefault entry with a "value" element.
-        let (cg2, items) = self.method_annotation_items(midx);
-        for it in items {
-            if self
-                .dex_of(cg2)
-                .and_then(|d| d.type_descriptor(it.type_idx).ok())
-                .as_deref()
-                == Some("Ldalvik/annotation/AnnotationDefault;")
-            {
-                for (ni, ev) in it.elements {
-                    if self
-                        .dex_of(cg2)
-                        .and_then(|d| d.string(ni).ok())
-                        .as_deref()
-                        == Some("value")
-                    {
-                        return self.encoded_to_v(cg2, &ev);
-                    }
-                }
-            }
-        }
-        None
+        // Declared default: the interface's class annotation set holds
+        // an AnnotationDefault item keyed by method name.
+        self.annotation_default_element(cg, &name)
     }
 
     /// Mint `java.lang.reflect.Method` mirrors for every method a dex

@@ -35,6 +35,25 @@ pub(crate) fn call(
         intent_call(vm, name, sig, args)?
     } else if class == "Landroid/content/ComponentName;" {
         component_call(vm, name, args)?
+    } else if class == "Landroid/provider/DocumentsContract;" {
+        // SAF URI builders only mint content:// strings — like Uri.parse.
+        match name {
+            "buildTreeDocumentUri" | "buildDocumentUri"
+            | "buildDocumentUriUsingTree" | "buildChildDocumentsUri"
+            | "buildChildDocumentsUriUsingTree" => {
+                let auth = sv(vm, args.first().copied().unwrap_or(V::Ref(0)))
+                    .unwrap_or_default();
+                let id = sv(vm, args.get(1).copied().unwrap_or(V::Ref(0)))
+                    .unwrap_or_default();
+                let seg = if name == "buildTreeDocumentUri" { "tree" } else { "document" };
+                Some(Some(host(
+                    vm,
+                    "Landroid/net/Uri;",
+                    HostState::StrBuf(format!("content://{auth}/{seg}/{id}")),
+                )))
+            }
+            _ => None,
+        }
     } else if class == "Landroid/content/IntentFilter;" {
         match name {
             "addAction" | "addCategory" | "addDataScheme" | "addDataType" | "addDataAuthority"
@@ -181,12 +200,17 @@ pub(crate) fn call(
                     )))
                 }
             }
+            // SAF permission list: no persisted grants — guests iterate it.
+            "getPersistedUriPermissions" => Some(Some(host(
+                vm,
+                "Ljava/util/List;",
+                HostState::List(vec![]),
+            ))),
             "insert"
             | "call"
             | "openFile"
             | "getType"
             | "getStreamTypes"
-            | "getPersistedUriPermissions"
             | "takePersistableUriPermission"
             | "loadThumbnail" => Some(Some(V::Ref(0))),
             "delete"

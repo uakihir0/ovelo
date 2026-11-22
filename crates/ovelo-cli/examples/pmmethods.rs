@@ -23,7 +23,7 @@ fn main() {
             let name = d.string(m.name_idx).unwrap_or_default();
             let Ok(proto) = d.proto(m.proto_idx as u32) else { continue };
             let ret = d
-                .type_descriptor(proto.return_type_idx as u32)
+                .type_descriptor(proto.return_type_idx)
                 .unwrap_or_default();
             let mut sig = String::from("(");
             if let Ok(params) = d.proto_params(proto) {

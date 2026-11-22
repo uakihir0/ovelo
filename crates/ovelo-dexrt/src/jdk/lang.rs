@@ -2409,11 +2409,18 @@ fn reflect_call(
                 },
                 _ => vec![],
             };
-            let res = if target != 0 {
-                vm.call_virtual(target, &member, &argv)
-            } else {
-                // Static method — resolve by the mirror's declaring class.
-                vm.call_static_named(&owner, &member, argv.clone())
+            let res = match meth_idx(vm, h) {
+                // The mirror knows its exact method — dispatch it
+                // instead of re-resolving by name+arity (wrong overload).
+                Some(m) => vm.invoke_method_mirror(m, target, argv),
+                None => {
+                    if target != 0 {
+                        vm.call_virtual(target, &member, &argv)
+                    } else {
+                        // Static method — resolve by declaring class.
+                        vm.call_static_named(&owner, &member, argv.clone())
+                    }
+                }
             };
             match res {
                 Ok(Some(v)) => Some(Some(v)),

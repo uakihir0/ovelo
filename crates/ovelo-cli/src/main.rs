@@ -757,19 +757,30 @@ fn register_compat_shims(
     // reads ResolveInfo.serviceInfo — get real ResolveInfo objects
     // instead of the builtin's empty list. An Intent naming a specific
     // component filters to that class; no component means "all".
+    // The Intent's target class: the component lives in P_COMPONENT
+    // (setComponent/setClass/ctor) as a ComponentName, a Class mirror
+    // or a bare class-name string; ComponentName keeps it in P_DATA.
     fn intent_class(vm: &ovelo_dexrt::Vm, v: Option<ovelo_dexrt::V>) -> Option<String> {
         let V::Ref(ih) = v? else {
             return None;
         };
-        let c = vm.get_object_field(ih, "Landroid/content/Intent;", "mComponent")?;
-        let V::Ref(ch) = c else {
+        let V::Ref(ch) = ovelo_dexrt::pseudo_get(vm, ih, ovelo_dexrt::P_COMPONENT)?
+        else {
             return None;
         };
-        let m = vm.get_object_field(ch, "Landroid/content/ComponentName;", "mClass")?;
-        match m {
-            V::Ref(sh) => vm.heap.str_val(sh).map(|t| t.to_string()),
-            _ => None,
+        if let Some(t) = vm.heap.str_val(ch).map(|t| t.to_string()) {
+            return Some(t);
         }
+        if let Some(V::Ref(sh)) = ovelo_dexrt::pseudo_get(vm, ch, ovelo_dexrt::P_DATA) {
+            if let Some(t) = vm.heap.str_val(sh).map(|t| t.to_string()) {
+                return Some(t);
+            }
+        }
+        vm.class_descriptor_of(ch).map(|d| {
+            d.trim_start_matches('L')
+                .trim_end_matches(';')
+                .replace('/', ".")
+        })
     }
     fn mint_info(
         vm: &mut ovelo_dexrt::Vm,
@@ -838,7 +849,7 @@ fn register_compat_shims(
             meth,
             "(Landroid/content/Intent;I)Ljava/util/List;",
             Rc::new(RefCell::new(move |vm: &mut ovelo_dexrt::Vm, a: &[V]| {
-                let want = intent_class(vm, a.first().copied());
+                let want = intent_class(vm, a.get(1).copied());
                 let infos: Vec<V> = names
                     .iter()
                     .filter(|n| {
@@ -878,7 +889,7 @@ fn register_compat_shims(
             meth,
             "(Landroid/content/Intent;I)Landroid/content/pm/ResolveInfo;",
             Rc::new(RefCell::new(move |vm: &mut ovelo_dexrt::Vm, a: &[V]| {
-                let want = intent_class(vm, a.first().copied());
+                let want = intent_class(vm, a.get(1).copied());
                 let hit = names
                     .iter()
                     .find(|n| {
