@@ -2464,7 +2464,15 @@ impl Vm {
         }
         match (sub.strip_prefix('['), sup.strip_prefix('[')) {
             (Some(s), Some(p)) => self.elem_assignable(s, p),
-            (Some(_), None) | (None, Some(_)) => false,
+            // An array element is itself a reference type, so `T[][]`
+            // casts to `Object[]`/`Cloneable[]`/`Serializable[]`.
+            (Some(_), None) => {
+                matches!(
+                    sup,
+                    "Ljava/lang/Object;" | "Ljava/lang/Cloneable;" | "Ljava/io/Serializable;"
+                )
+            }
+            (None, Some(_)) => false,
             (None, None) => {
                 if !sub.starts_with('L') || !sup.starts_with('L') {
                     return false; // primitive element: equality only

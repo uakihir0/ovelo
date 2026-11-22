@@ -3049,7 +3049,10 @@ fn resources_call(vm: &mut Vm, name: &str, args: &[V]) -> Rt<Option<Option<V>>> 
                 // callers (ColorStateListInflaterCompat, …) branch on
                 // `tv.type`, so an unfilled value misroutes them.
                 let id = i64v(args.get(1).copied().unwrap_or(V::I32(0))) as u32;
-                if let Some(tv) = args.get(2).copied() {
+                // getValueForDensity(id, density, outValue, resolveRefs)
+                // has an extra density arg before the out TypedValue.
+                let tv_idx = if name == "getValueForDensity" { 3 } else { 2 };
+                if let Some(tv) = args.get(tv_idx).copied() {
                     if let Some(ev) = vm.apk_res.as_ref().and_then(|r| r.entry_value(id)) {
                         let ev = ev.clone();
                         fill_typed_value_ev(vm, tv, &ev, id);

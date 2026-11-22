@@ -2542,9 +2542,13 @@ pub(crate) fn host_supers(d: &str) -> &'static [&'static str] {
             "Ljava/io/Closeable;",
             OBJ,
         ],
-        "Landroid/content/res/Resources$NotFoundException;" => {
-            &["Ljava/lang/Exception;", THROWABLE, OBJ]
-        }
+        // AOSP: NotFoundException extends RuntimeException.
+        "Landroid/content/res/Resources$NotFoundException;" => &[
+            "Ljava/lang/RuntimeException;",
+            "Ljava/lang/Exception;",
+            THROWABLE,
+            OBJ,
+        ],
         // ----- android.net
         "Landroid/net/Uri;" => &["Landroid/os/Parcelable;", "Ljava/lang/Comparable;", OBJ],
         "Landroid/net/Uri$Builder;" => &[OBJ],
