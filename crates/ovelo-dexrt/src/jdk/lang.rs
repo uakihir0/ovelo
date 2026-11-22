@@ -2678,9 +2678,12 @@ fn unsafe_write(vm: &mut Vm, obj: u32, off: i64, v: V) {
 
 /// CAS equality: guest `null` reaches us as `I32(0)` while an unset slot
 /// holds `Ref(0)` — both must count as null.
-fn cas_eq(vm: &mut Vm, a: V, b: V) -> bool {
+fn cas_eq(_vm: &mut Vm, a: V, b: V) -> bool {
+    // CAS semantics are `==` on the slot, not `equals` — two distinct
+    // boxed objects with equal payloads must NOT swap successfully
+    // (Unsafe.compareAndSwapObject / AtomicReference.compareAndSet).
     let nullish = |v: V| matches!(v, V::I32(0) | V::Ref(0));
-    (nullish(a) && nullish(b)) || crate::jdk::value_eq(vm, a, b)
+    (nullish(a) && nullish(b)) || a == b
 }
 
 fn unsafe_call(vm: &mut Vm, name: &str, args: &[V]) -> Rt<Option<Option<V>>> {
@@ -2888,12 +2891,33 @@ fn unsafe_call(vm: &mut Vm, name: &str, args: &[V]) -> Rt<Option<Option<V>>> {
                 } else {
                     time / 1_000_000
                 };
+                // Delayed tasks that came due are runnable now — a
+                // completing task must reach the waiter before its
+                // deadline, or `get(t)` always times out.
+                let now = now_ms() as u64;
+                let (due, later): (Vec<_>, Vec<_>) = vm
+                    .delayed_runnables
+                    .drain(..)
+                    .partition(|(_, _, t)| *t <= now);
+                vm.delayed_runnables = later;
+                for (r, on_main, _) in due {
+                    vm.pending_runnables.push_back((r, on_main));
+                }
                 if !vm.pending_runnables.is_empty() {
                     vm.park_drain()?;
                 } else {
-                    std::thread::sleep(std::time::Duration::from_millis(
-                        remain_ms.clamp(1, 64) as u64,
-                    ));
+                    // Sleep at most until the next delayed task is due
+                    // so a future completion isn't slept through.
+                    let until_due = vm
+                        .delayed_runnables
+                        .iter()
+                        .map(|(_, _, t)| t.saturating_sub(now))
+                        .min()
+                        .unwrap_or(u64::MAX);
+                    let ms = (remain_ms.max(0) as u64)
+                        .min(until_due)
+                        .clamp(1, 64);
+                    std::thread::sleep(std::time::Duration::from_millis(ms));
                 }
                 return Ok(Some(None));
             }
