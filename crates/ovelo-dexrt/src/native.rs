@@ -671,8 +671,9 @@ fn writes_sp(insn: u32) -> bool {
     if insn & 31 != 31 {
         return false;
     }
-    // add/sub immediate (group 0b1001), S=0: rd=31 encodes SP.
-    if (insn >> 25) & 0xF == 0x9 && (insn >> 29) & 1 == 0 {
+    // add/sub immediate (groups 0b1000 plain / 0b1001 MTE-tagged),
+    // S=0: rd=31 encodes SP.
+    if ((insn >> 25) & 0xF == 0x8 || (insn >> 25) & 0xF == 0x9) && (insn >> 29) & 1 == 0 {
         return true;
     }
     // add/sub extended register (bit21=1 inside the DP-reg group),
