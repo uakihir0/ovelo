@@ -2368,6 +2368,36 @@ pub(crate) fn theme_attr_entry(vm: &mut Vm, attr_id: u32) -> Option<ovelo_apk::a
     Some(ev)
 }
 
+/// Resolve a TypedArray integer: `?attr/x` values surface as the attr's
+/// own res id, but the theme-binding step is supposed to rewrite them —
+/// chase those through the bound theme, then follow @ref hops to the
+/// final entry. Returns `(resolved res_id, final entry value)`.
+pub(crate) fn resolve_ta_id(
+    vm: &mut Vm,
+    id: u32,
+) -> Option<(u32, ovelo_apk::arsc::EntryValue)> {
+    let mut ev = match vm
+        .apk_res
+        .as_ref()
+        .and_then(|r| r.type_name(id))
+    {
+        Some("attr") => theme_attr_entry(vm, id)?,
+        _ => vm.apk_res.as_ref()?.entry_value(id)?.clone(),
+    };
+    let mut rid = id;
+    for _ in 0..8 {
+        if ev.data_type != 0x01 {
+            break;
+        }
+        rid = ev.data;
+        match vm.apk_res.as_ref().and_then(|r| r.entry_value(rid)) {
+            Some(next) => ev = next.clone(),
+            None => break,
+        }
+    }
+    Some((rid, ev))
+}
+
 /// Instantiate a dex-defined view class and run its best-matching
 /// constructor; `None` when the class isn't in the DEX or every
 /// overload dies (caller falls back to the host stub). Overloads are

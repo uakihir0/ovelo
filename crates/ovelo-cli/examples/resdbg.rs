@@ -31,6 +31,26 @@ fn main() {
     if let Some(hex) = std::env::args().nth(2) {
         let id = u32::from_str_radix(hex.trim_start_matches("0x"), 16).unwrap();
         println!("layout {id:#x} path={:?}", r.layout_path(id));
+        println!(
+            "  file_path={:?} type={:?} name={:?} entry={:?}",
+            r.file_path(id),
+            r.type_name(id),
+            r.entry_name(id),
+            r.entry_value(id)
+        );
+        match r.document(id) {
+            Some(els) => {
+                println!("  document: {} elements", els.len());
+                for e in els.iter().take(12) {
+                    let mut line = format!("    d{} {}", e.depth, e.name);
+                    for a in &e.attrs {
+                        line.push_str(&format!(" {:?}={:?}", a.name, a.value));
+                    }
+                    println!("{line}");
+                }
+            }
+            None => println!("  document: none"),
+        }
         match r.layout_elements(id) {
             Some(els) => {
                 println!("layout {id:#x}: {} elements", els.len());

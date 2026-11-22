@@ -16,22 +16,30 @@ const END_TAG: i32 = 3;
 
 const PARSER: &str = "Landroid/content/res/XmlResourceParser;";
 
-/// `Resources.getXml(resId)` → a pull parser over the resource's binary
-/// XML; `null` when the id isn't a file-backed XML resource.
-pub(crate) fn parser_of(vm: &mut Vm, res_id: u32) -> V {
-    let Some(elements) = vm.apk_res.as_ref().and_then(|r| r.document(res_id)) else {
-        return V::Ref(0);
-    };
-    let elements = Rc::new(elements);
-    let events = xml_events(&elements);
-    V::Ref(vm.alloc_host(
-        PARSER,
-        HostState::Xml {
-            elements,
-            events,
-            pos: 0,
-        },
-    ))
+/// `Resources.getXml(resId)` — a pull parser over the resource's binary
+/// XML; throws `Resources.NotFoundException` for ids that aren't
+/// file-backed XML, which is what callers
+/// (ResourcesCompat.getColorStateList, …) catch to fall back to the
+/// literal `getColor(id)` path.
+pub(crate) fn parser_or_throw(vm: &mut Vm, res_id: u32) -> Rt<V> {
+    match vm.apk_res.as_ref().and_then(|r| r.document(res_id)) {
+        Some(elements) => {
+            let elements = Rc::new(elements);
+            let events = xml_events(&elements);
+            Ok(V::Ref(vm.alloc_host(
+                PARSER,
+                HostState::Xml {
+                    elements,
+                    events,
+                    pos: 0,
+                },
+            )))
+        }
+        None => Err(vm.throw_builtin(
+            "Landroid/content/res/Resources$NotFoundException;",
+            &format!("resource id {res_id:#x}"),
+        )),
+    }
 }
 
 fn code_of(e: XmlEvent) -> i32 {
