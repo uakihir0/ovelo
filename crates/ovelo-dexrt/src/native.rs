@@ -643,14 +643,18 @@ fn clobbers_gpr(insn: u32, rn: u32) -> bool {
     if (insn >> 25) & 0x7 == 0x5 {
         return rd == rn; // data-processing register group
     }
-    if (insn & 0x3B00_0000) == 0x3900_0000
-        || (insn & 0x3B20_0000) == 0x3820_0000
-        || (insn & 0x3B00_0000) == 0x1800_0000
-    {
-        return rd == rn; // unsigned-imm loads, ldur family, ldr literal
+    if (insn & 0x3B00_0000) == 0x3900_0000 || (insn & 0x3B20_0000) == 0x3820_0000 {
+        // unsigned-imm / unscaled load-store group: only loads write —
+        // opc (bits 23:22) 0 is a store (str x8,[sp] between `mrs` and
+        // the faulting ldr is exactly the bionic prologue shape).
+        return rd == rn && (insn >> 22) & 3 != 0;
+    }
+    if (insn & 0x3B00_0000) == 0x1800_0000 {
+        return rd == rn; // ldr literal always writes
     }
     if (insn & 0x3A00_0000) == 0x2800_0000 {
-        return rd == rn || (insn >> 10) & 31 == rn; // ldp/stp class (Rt, Rt2)
+        // pair class: bit 22 is L — only loads (ldp) write Rt/Rt2.
+        return (insn >> 22) & 1 == 1 && (rd == rn || (insn >> 10) & 31 == rn);
     }
     if (insn >> 21) & 0x7FF == 0x6A9 {
         return rd == rn; // MRS into a GPR
@@ -678,6 +682,14 @@ unsafe fn heal_tls_fault(si: usize, insn: u32, mc: *mut u8) -> bool {
     // scribble into the guest TCB and keep running corrupted.
     let pc = unsafe { *(mc.add(272) as *const usize) };
     let want_mrs = 0xD53B_D040 | rn as u32;
+    // Stack slots the smashed value may have been spilled to between
+    // the `mrs` and the fault: `str xN,[sp/x29,#off]`. The register is
+    // patched by the retry, but a spilled copy stays corrupt — the
+    // stack-protector epilogue reloads it (`ldr x8,[sp]` then
+    // `ldr x8,[x8,#0x28]`) and faults unhealably. Patching the slot
+    // keeps the spilled TPIDR consistent with the register.
+    let mut spills: [(usize, usize); 4] = [(0, 0); 4]; // (base_reg, byte_offset)
+    let mut nspill = 0usize;
     let mut proven = false;
     for i in 1..=24usize {
         let addr = pc - i * 4;
@@ -690,6 +702,16 @@ unsafe fn heal_tls_fault(si: usize, insn: u32, mc: *mut u8) -> bool {
         if b == want_mrs {
             proven = true;
             break;
+        }
+        // `str xN,[xB,#imm]` scaled (opc=0): track sp/fp-relative spills
+        // of the suspect register.
+        if (b & 0xFFC0_0000) == 0xF900_0000 && (b & 31) as usize == rn {
+            let rb = ((b >> 5) & 31) as usize;
+            if (rb == 31 || rb == 29) && nspill < spills.len() {
+                spills[nspill] = (rb, (((b >> 10) & 0xFFF) * 8) as usize);
+                nspill += 1;
+            }
+            continue;
         }
         if ((b >> 25) & 0x7) == 0x2 || (b & 0xFF00_0000) == 0xD600_0000 || clobbers_gpr(b, rn as u32)
         {
@@ -705,6 +727,12 @@ unsafe fn heal_tls_fault(si: usize, insn: u32, mc: *mut u8) -> bool {
     }
     unsafe {
         *(mc.add(16 + rn * 8) as *mut usize) = tcb;
+        for (rb, off) in spills.iter().take(nspill) {
+            // mc+248 = saved fp (x29), mc+264 = saved sp.
+            let slot = *(mc.add(if *rb == 31 { 264 } else { 248 }) as *const usize)
+                .wrapping_add(*off) as *mut usize;
+            *slot = tcb;
+        }
         let s = b"[segv-heal]\n";
         write(2, s.as_ptr() as *const c_void, s.len());
     }
