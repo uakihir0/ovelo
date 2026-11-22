@@ -758,6 +758,15 @@ impl GuestUi {
                 info.text
             );
         }
+        // First attach to the window: AOSP's dispatchAttachedToWindow
+        // fires for every view in the hierarchy — including GONE/
+        // INVISIBLE ones (visibility is orthogonal to attachment), so
+        // a hidden view that loads data on attach and then reveals
+        // itself still gets its init. Queued: guest code re-enters
+        // bridged calls that borrow GuestUi, which materialize holds.
+        if self.dex_attached.insert(h) {
+            self.attach_pending.push(h);
+        }
         if !info.visible {
             return None;
         }
@@ -773,14 +782,6 @@ impl GuestUi {
                 .or_insert_with(|| Rc::new(RefCell::new(make_dex_view(vm, &info, &fonts))))
                 .clone(),
         };
-        // First attach to the window: AOSP's dispatchAttachedToWindow
-        // fires top-down when a view joins an attached hierarchy —
-        // guest views launch data loads (`loadRecordings` etc.) there.
-        // Queued: guest code re-enters bridged calls that borrow
-        // GuestUi, which this materialize already holds.
-        if self.dex_attached.insert(h) {
-            self.attach_pending.push(h);
-        }
         // Guest `onDraw`: a dex view class that overrides onDraw paints
         // through Canvas — record its ops for the host draw pass. Done
         // before `rc.borrow_mut` since it runs guest code.
