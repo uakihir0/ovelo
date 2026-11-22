@@ -688,8 +688,15 @@ unsafe fn heal_tls_fault(si: usize, insn: u32, mc: *mut u8) -> bool {
     // stack-protector epilogue reloads it (`ldr x8,[sp]` then
     // `ldr x8,[x8,#0x28]`) and faults unhealably. Patching the slot
     // keeps the spilled TPIDR consistent with the register.
+    // A recorded spill is only patched when the slot still holds the
+    // spilled TPIDR at fault time: skip it when sp/x29 was modified
+    // between the store and the fault (the slot address moved), or
+    // when a later store wrote the same slot (the value is stale).
     let mut spills: [(usize, usize); 4] = [(0, 0); 4]; // (base_reg, byte_offset)
     let mut nspill = 0usize;
+    let mut seen: [(usize, usize); 8] = [(0, 0); 8];
+    let mut nseen = 0usize;
+    let mut dirty = [false; 2]; // [sp(x31), x29]
     let mut proven = false;
     for i in 1..=24usize {
         let addr = pc - i * 4;
@@ -703,12 +710,43 @@ unsafe fn heal_tls_fault(si: usize, insn: u32, mc: *mut u8) -> bool {
             proven = true;
             break;
         }
-        // `str xN,[xB,#imm]` scaled (opc=0): track sp/fp-relative spills
-        // of the suspect register.
-        if (b & 0xFFC0_0000) == 0xF900_0000 && (b & 31) as usize == rn {
-            let rb = ((b >> 5) & 31) as usize;
-            if (rb == 31 || rb == 29) && nspill < spills.len() {
-                spills[nspill] = (rb, (((b >> 10) & 0xFFF) * 8) as usize);
+        // Writeback addressing on a sp/fp base changes that register:
+        // single load/store unscaled group with pre/post index (bit10),
+        // or load/store pair with pre/post index (bit23).
+        let rb = ((b >> 5) & 31) as usize;
+        if rb == 31 || rb == 29 {
+            let wb_single = (b & 0x3B20_0000) == 0x3820_0000 && (b >> 10) & 1 == 1;
+            let wb_pair = (b & 0x3A00_0000) == 0x2800_0000 && (b >> 23) & 1 == 1;
+            if wb_single || wb_pair {
+                dirty[usize::from(rb == 29)] = true;
+            }
+        }
+        if clobbers_gpr(b, 31) {
+            dirty[0] = true;
+        }
+        if clobbers_gpr(b, 29) {
+            dirty[1] = true;
+        }
+        // `str x*,[xB,#imm]` scaled (opc=0): any later store to an
+        // sp/fp slot invalidates an earlier spill of it; a store of the
+        // suspect register to a fresh, unmoved slot is a live spill.
+        if (b & 0xFFC0_0000) == 0xF900_0000 && (rb == 31 || rb == 29) {
+            let off = (((b >> 10) & 0xFFF) * 8) as usize;
+            let dup = seen[..nseen].contains(&(rb, off));
+            if !dup && nseen < seen.len() {
+                seen[nseen] = (rb, off);
+                nseen += 1;
+            }
+            // Only record when the slot was tracked — an untracked
+            // earlier store to it may exist once `seen` is full.
+            if (b & 31) as usize == rn
+                && !dup
+                && nseen <= seen.len()
+                && seen[..nseen].contains(&(rb, off))
+                && !dirty[usize::from(rb == 29)]
+                && nspill < spills.len()
+            {
+                spills[nspill] = (rb, off);
                 nspill += 1;
             }
             continue;
