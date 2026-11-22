@@ -697,6 +697,23 @@ pub(crate) fn call(
             lp_ctor(vm, class, sig, args);
             Some(None)
         }
+        // Dex-constructed views (`new PlayerFragment(ctx, attrs)` in an
+        // adapter) never see the inflater: their `View.<init>` invoke-super
+        // is the only place the Context reaches us. Record it so
+        // `getContext` returns the real Activity — `context as? Activity`
+        // (fossify's runOnUiThread hop) fails on the stub Context.
+        "<init>" if this != 0 => {
+            let is_view = pseudo_get(vm, this, P_IS_VIEW).is_some()
+                || vm.assignable_desc(&class_of(vm, V::Ref(this)), VIEW);
+            if is_view {
+                if let Some(V::Ref(c)) = args.get(1).copied() {
+                    if c != 0 {
+                        pseudo_set(vm, this, P_CONTEXT, V::Ref(c));
+                    }
+                }
+            }
+            Some(None)
+        }
         // AOSP `MarginLayoutParams.resolveLayoutDirection` — the
         // ConstraintLayout dex override resolves the start/end anchors
         // into its resolved* fields and invoke-supers here for the

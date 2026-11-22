@@ -46,8 +46,16 @@ pub(crate) fn call(
                 let id = sv(vm, args.get(1).copied().unwrap_or(V::Ref(0)))
                     .unwrap_or_default();
                 let s = if name.contains("UsingTree") {
-                    // a[0] is the tree Uri itself.
-                    format!("{a0}/{id}")
+                    // a[0] is the tree Uri itself — AOSP appends
+                    // `/document/{id}` (and `/children` for the
+                    // children listing), preserving /tree/{treeId}.
+                    if name.starts_with("buildChild") {
+                        format!("{a0}/document/{id}/children")
+                    } else {
+                        format!("{a0}/document/{id}")
+                    }
+                } else if name.starts_with("buildChild") {
+                    format!("content://{a0}/document/{id}/children")
                 } else {
                     let seg =
                         if name == "buildTreeDocumentUri" { "tree" } else { "document" };
@@ -56,12 +64,28 @@ pub(crate) fn call(
                 Some(Some(host(vm, "Landroid/net/Uri;", HostState::StrBuf(s))))
             }
             "getDocumentId" | "getTreeDocumentId" => {
-                // Last path segment — URIs we mint are
-                // `content://{auth}/{tree|document}/{id}`.
+                // A docId embeds `/` (`primary:Music/Recordings`): the
+                // document id is the whole remainder after the LAST
+                // `/document/`; the tree id is the remainder after the
+                // LAST `/tree/` up to the next `/document/` segment.
                 let u = sv(vm, args.first().copied().unwrap_or(V::Ref(0)))
                     .unwrap_or_default();
-                let id = u.rsplit('/').next().unwrap_or_default().to_string();
-                Some(Some(if u.is_empty() { V::Ref(0) } else { jstr(vm, &id) }))
+                let id = if name == "getTreeDocumentId" {
+                    u.rfind("/tree/")
+                        .map(|off| {
+                            let rest = &u[off + "/tree/".len()..];
+                            rest.find("/document/").map_or(rest, |e| &rest[..e])
+                        })
+                        .unwrap_or_default()
+                } else {
+                    ["/document/", "/tree/"]
+                        .iter()
+                        .find_map(|pat| {
+                            u.rfind(pat).map(|off| &u[off + pat.len()..])
+                        })
+                        .unwrap_or_default()
+                };
+                Some(Some(if u.is_empty() { V::Ref(0) } else { jstr(vm, id) }))
             }
             "isTreeUri" | "isDocumentUri" => {
                 let u = sv(vm, args.first().copied().unwrap_or(V::Ref(0)))
@@ -194,6 +218,8 @@ pub(crate) fn call(
                 };
                 if uri.starts_with("content://media/") {
                     Some(Some(db::media_cursor(vm, &uri, &projection)))
+                } else if uri.contains("externalstorage.documents") {
+                    Some(Some(db::saf_cursor(vm, &uri, &projection)))
                 } else {
                     Some(Some(host(vm, "Landroid/database/Cursor;", HostState::Empty)))
                 }
