@@ -25,9 +25,10 @@ Legend:
 | Fossify Voice Recorder | `org.fossify.voicerecorder` | 🟡 | Recorder page renders; SAF walk (`DocumentFile`/`DocumentsContract`) lists real recordings — list rows materialize on the Player tab |
 | Fossify Calendar | `org.fossify.calendar` | 🟡 | **Renders real data**: month grid draws 7-column day cells with real locale strings, today marker, month name |
 | Fossify Messages | `org.fossify.messages` | 🟡 | Lifecycle completes to correct end state: "No stored conversations" empty state + FAB render (DB is empty) |
+| Fossify Paint | `org.fossify.paint` | 🟡 | Full lifecycle; toolbar + canvas render, brush strokes register (stroke position offset from touch point) |
 | Bouncy (pinball, libGDX) | `com.dozingcatsoftware.bouncy` | 🟡 | **Playable**: menu → table select → live pinball table with bumpers rendering; box2d `.so` physics runs via JNI. TLS self-heal in the segv handler patches kernel-rewritten TPIDR_EL0 per access (Darwin rewrites it at signal/exception boundaries). Text labels and ball rendering still rough |
 | Tiny Weather Forecast Germany | `de.kaffeemitkoffein.tinyweatherforecastgermany` | 🟡 | `WelcomeActivity` renders to the window (first real APK first frame) |
-| NewPipe | `org.schabi.newpipe` | 🟡 | `MainActivity` full lifecycle; WorkManager runs real SQLite queries; error screen renders (no network layer yet) |
+| NewPipe | `org.schabi.newpipe` | 🟡 | `MainActivity` full lifecycle; WorkManager runs real SQLite queries; tab bar renders with real icons; feed empty (no network layer yet) |
 | F-Droid | `org.fdroid.fdroid` | 🟡 | Multi-dex + Hilt init runs without crashing; UI is Compose — no render path yet |
 
 ## Famous apps — assessment
