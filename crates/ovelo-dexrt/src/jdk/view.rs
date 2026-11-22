@@ -2938,11 +2938,15 @@ fn lp_resolve_dir_dex(vm: &mut Vm, lp: V) {
 /// Read an int field off a LayoutParams object under every canon key
 /// a writer could have used (owner obfuscation, LP subclasses).
 fn lp_field(vm: &Vm, lp: u32, name: &str) -> Option<V> {
+    lp_field_t(vm, lp, name, "I")
+}
+
+fn lp_field_t(vm: &Vm, lp: u32, name: &str, ty: &str) -> Option<V> {
     let fields = match vm.heap.get(lp) {
         Some(Obj::Instance { fields, .. }) | Some(Obj::Host { fields, .. }) => fields,
         _ => return None,
     };
-    vm.field_keys_named(name, "I")
+    vm.field_keys_named(name, ty)
         .iter()
         .find_map(|(_, g)| fields.get(g).copied())
 }
@@ -3216,7 +3220,10 @@ fn group_measure_fallback(vm: &mut Vm, this: u32, pw: i32, ph: i32) {
                     Some(V::Ref(l)) => l,
                     _ => 0,
                 };
-                let w = lp_field(vm, lp_obj, "weight")
+                // `weight` is a float LP field — try F first so a
+                // runtime `lp.weight = 0` overrides the XML attr.
+                let w = lp_field_t(vm, lp_obj, "weight", "F")
+                    .or_else(|| lp_field(vm, lp_obj, "weight"))
                     .or_else(|| attr_find(vm, ch, "layout_weight"))
                     .map(|v| match v {
                         V::F32(f) => f,
@@ -3266,31 +3273,40 @@ fn group_measure_fallback(vm: &mut Vm, this: u32, pw: i32, ph: i32) {
                         + lp_field(vm, lp_obj, "bottomMargin")
                             .and_then(|f| lp_px(vm, f))
                             .unwrap_or(0);
-                    // AOSP skipped-measure path: the weighted child's
-                    // axis extent IS its share (first+share would
-                    // compound across repeat passes — P_MEAS already
-                    // contains the previous share).
-                    let (ws, hs) = if linear_v {
-                        (
-                            child_measure_spec(pw, pad_w + ml, lp_dim("width", "layout_width")),
-                            EXACTLY | share,
-                        )
+                    // AOSP: `skippedMeasure` (axis lp dim == 0) gets
+                    // EXACTLY(share); a fixed axis dim wins via
+                    // getChildMeasureSpec and is left alone; a
+                    // wrap/match axis grows by content + share.
+                    let axis_dim = if linear_v {
+                        lp_dim("height", "layout_height")
                     } else {
-                        (
-                            EXACTLY | share,
-                            child_measure_spec(ph, pad_h + mv, lp_dim("height", "layout_height")),
-                        )
+                        lp_dim("width", "layout_width")
                     };
+                    if axis_dim > 0 {
+                        continue;
+                    }
                     let old_axis = if linear_v {
                         pint(vm, ch, P_MEAS_H) & 0x00FF_FFFF
                     } else {
                         pint(vm, ch, P_MEAS_W) & 0x00FF_FFFF
                     };
+                    let new_axis = old_axis + share;
+                    let (ws, hs) = if linear_v {
+                        (
+                            child_measure_spec(pw, pad_w + ml, lp_dim("width", "layout_width")),
+                            EXACTLY | new_axis,
+                        )
+                    } else {
+                        (
+                            EXACTLY | new_axis,
+                            child_measure_spec(ph, pad_h + mv, lp_dim("height", "layout_height")),
+                        )
+                    };
                     if vm
                         .call_virtual(ch, "measure", &[V::I32(ws), V::I32(hs)])
                         .is_ok()
                     {
-                        added += share - old_axis;
+                        added += new_axis - old_axis;
                         let new_cross = if linear_v {
                             pint(vm, ch, P_MEAS_W) & 0x00FF_FFFF
                         } else {
