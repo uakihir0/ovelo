@@ -1687,7 +1687,7 @@ fn run_app(store: &InstallStore, package: &str) -> Result<(), OveloError> {
             // as the layout pass — media scans, DB loads and adapter
             // fills all live on this queue after the lifecycle drains
             // end. Without it they stall once the window opens.
-            if dex_frame.is_multiple_of(30) {
+            if dex_frame.is_multiple_of(30) || vm.has_queued_runnables() {
                 let work = vm.drain_runnables(64);
                 // GC when the heap passes its growth mark — interpreter
                 // churn otherwise grows the heap unboundedly. Only runs

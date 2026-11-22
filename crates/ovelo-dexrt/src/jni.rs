@@ -316,7 +316,7 @@ pub(crate) fn call_native(
         }
     }
     without_vm_lock(|| {
-        crate::native::with_guest_tls(|| unsafe {
+        crate::native::with_guest_tls_at("jni_call", || unsafe {
             ovelo_jni_call(
                 fnptr,
                 iargs.as_ptr(),
@@ -598,6 +598,35 @@ pub(crate) fn init_tables() {
             if *s != 0 {
                 *s = crate::native::host_thunk(*s as usize) as u64;
             }
+        }
+
+        // Varargs entries (Call*Method, CallNonvirtual*Method,
+        // NewObject): each is a thunk → register-spill stub → Rust
+        // dispatcher. `va_thunk` already includes the outer TLS-swap
+        // thunk, so these are stored after the wrap loop.
+        let t = &mut JNI_TABLE;
+        for i in [34, 37, 40, 43, 46, 49, 52, 55, 58, 61] {
+            t[i] = crate::native::va_thunk(callv_dispatch as *const () as usize, 0) as u64;
+        }
+        for i in [35, 38, 41, 44, 47, 50, 53, 56, 59, 62] {
+            t[i] = crate::native::host_thunk(callv_v as *const () as usize) as u64;
+        }
+        for i in [64, 67, 70, 73, 76, 79, 82, 85, 88, 91] {
+            t[i] = crate::native::va_thunk(callv_dispatch as *const () as usize, 1) as u64;
+        }
+        for i in [65, 68, 71, 74, 77, 80, 83, 86, 89, 92] {
+            t[i] = crate::native::host_thunk(callnv_v as *const () as usize) as u64;
+        }
+        for i in [66, 69, 72, 75, 78, 81, 84, 87, 90, 93] {
+            t[i] = crate::native::host_thunk(callnv_a as *const () as usize) as u64;
+        }
+        t[28] = crate::native::va_thunk(callv_dispatch as *const () as usize, 2) as u64;
+        t[29] = crate::native::host_thunk(new_object_v as *const () as usize) as u64;
+        t[30] = crate::native::host_thunk(new_object_a as *const () as usize) as u64;
+        t[7] = crate::native::host_thunk(get_superclass as *const () as usize) as u64;
+        t[8] = crate::native::host_thunk(is_assignable_from as *const () as usize) as u64;
+        for i in [5, 9, 10, 11, 12, 18] {
+            t[i] = crate::native::host_thunk(ret0 as *const () as usize) as u64;
         }
     });
 }
@@ -948,6 +977,266 @@ call_static_a!(call_static_long_method_a);
 call_static_a!(call_static_float_method_a);
 call_static_a!(call_static_double_method_a);
 call_static_a!(call_static_void_method_a);
+
+// ---------- varargs Call*Method / NewObject ----------
+
+/// Arg streams for the register-spill stub: GP varargs land in saved
+/// x3-x7 then the caller stack; FP varargs in saved d0-d7, then the
+/// same stack stream (interleaved by argument order once registers
+/// run out — stack index is shared).
+struct VaRegs {
+    gp: [u64; 5],
+    gn: usize,
+    fp: [u64; 8],
+    stack: u64,
+    gi: usize,
+    fi: usize,
+    si: usize,
+}
+impl VaRegs {
+    unsafe fn next_gp(&mut self) -> u64 {
+        if self.gi < self.gn {
+            let v = self.gp[self.gi];
+            self.gi += 1;
+            v
+        } else {
+            let v = ((self.stack as *const u64).add(self.si)).read();
+            self.si += 1;
+            v
+        }
+    }
+    unsafe fn next_fp(&mut self) -> u64 {
+        if self.fi < 8 {
+            let v = self.fp[self.fi];
+            self.fi += 1;
+            v
+        } else {
+            let v = ((self.stack as *const u64).add(self.si)).read();
+            self.si += 1;
+            v
+        }
+    }
+}
+
+fn va_jargs(params: &[String], va: &mut VaRegs) -> Vec<V> {
+    params
+        .iter()
+        .map(|d| match d.as_str() {
+            "F" | "D" => jval(unsafe { va.next_fp() }, d),
+            _ => jval(unsafe { va.next_gp() }, d),
+        })
+        .collect()
+}
+
+/// Shared body for the varargs/`va_list`/`jvalue[]` call entries.
+/// kind: 0 = Call*Method(env,obj,mid,..), 1 = CallNonvirtual*Method
+/// (env,obj,clazz,mid,..), 2 = NewObject(env,clazz,mid,..).
+fn callv_run(obj: u64, mid: u64, args: &[V], new_obj: u64) -> u64 {
+    let Some(g) = mid_of(mid) else {
+        eprintln!("[jni] callv: bad mid {mid:#x}");
+        return new_obj;
+    };
+    let _ = g;
+    if new_obj != 0 {
+        // NewObject: <init> is a void instance method on the fresh object.
+        call_obj(new_obj, mid, args, false);
+        return new_obj;
+    }
+    call_obj(obj, mid, args, false).map(v_to_u64).unwrap_or(0)
+}
+
+/// Register-dump varargs dispatcher — called by the `emit_va` stub with
+/// a saved x0-x7 + d0-d7 buffer and the caller's stack-args pointer.
+extern "C" fn callv_dispatch(regs: u64, stack: u64, kind: u64) -> u64 {
+    env_enter("callv");
+    unsafe {
+        let r = regs as *const u64;
+        let (obj_or_clazz, mid, gn) = match kind {
+            1 => (r.add(1).read(), r.add(3).read(), 4usize), // env,obj,clazz,mid,...
+            _ => (r.add(1).read(), r.add(2).read(), 5usize), // env,obj/clazz,mid,...
+        };
+        let gp_start = 8 - gn;
+        let mut va = VaRegs {
+            gp: [0; 5],
+            gn,
+            fp: [0; 8],
+            stack,
+            gi: 0,
+            fi: 0,
+            si: 0,
+        };
+        for (i, slot) in va.gp.iter_mut().enumerate().take(gn) {
+            *slot = r.add(gp_start + i).read();
+        }
+        for (i, slot) in va.fp.iter_mut().enumerate() {
+            *slot = r.add(8 + i).read();
+        }
+        let Some(g) = mid_of(mid) else {
+            eprintln!("[jni] callv: bad mid {mid:#x}");
+            return 0;
+        };
+        let (_, params, _) = method_params(g);
+        let args = va_jargs(&params, &mut va);
+        if kind == 2 {
+            // NewObject: allocate, run <init>, return the object.
+            let mut v = vm();
+            let Some(ci) = v.class_for_jclass(obj_or_clazz as u32) else {
+                return 0;
+            };
+            let h = v.heap.alloc(Obj::Instance {
+                class_idx: ci,
+                fields: std::collections::HashMap::new(),
+            }) as u64;
+            drop(v);
+            callv_run(0, mid, &args, h)
+        } else {
+            callv_run(obj_or_clazz, mid, &args, 0)
+        }
+    }
+}
+
+/// Bionic aarch64 `va_list`: {stack, gr_top, vr_top, gr_offs, vr_offs}
+/// — 32 bytes, passed by reference. GP slots are 8B at gr_top+gr_offs
+/// (offs ≤ 0, +8 each); VR slots are 16B at vr_top+vr_offs (+16 each);
+/// past the end both streams continue on `stack` (8B each, sequential).
+struct VaList {
+    stack: u64,
+    gr_top: u64,
+    vr_top: u64,
+    gr_offs: i64,
+    vr_offs: i64,
+}
+impl VaList {
+    unsafe fn load(p: u64) -> Self {
+        let q = p as *const u64;
+        // gr_offs/vr_offs are 4-byte ints at byte offsets 24 and 28.
+        Self {
+            stack: q.read(),
+            gr_top: q.add(1).read(),
+            vr_top: q.add(2).read(),
+            gr_offs: ((p + 24) as *const i32).read() as i64,
+            vr_offs: ((p + 28) as *const i32).read() as i64,
+        }
+    }
+    unsafe fn next_gp(&mut self) -> u64 {
+        if self.gr_offs < 0 {
+            let v = ((self.gr_top as i64 + self.gr_offs) as *const u64).read();
+            self.gr_offs += 8;
+            v
+        } else {
+            let v = (self.stack as *const u64).read();
+            self.stack += 8;
+            v
+        }
+    }
+    unsafe fn next_fp(&mut self) -> u64 {
+        if self.vr_offs < 0 {
+            let v = ((self.vr_top as i64 + self.vr_offs) as *const u64).read();
+            self.vr_offs += 16;
+            v
+        } else {
+            let v = (self.stack as *const u64).read();
+            self.stack += 8;
+            v
+        }
+    }
+}
+
+fn valist_jargs(params: &[String], va: &mut VaList) -> Vec<V> {
+    params
+        .iter()
+        .map(|d| match d.as_str() {
+            "F" | "D" => jval(unsafe { va.next_fp() }, d),
+            _ => jval(unsafe { va.next_gp() }, d),
+        })
+        .collect()
+}
+
+extern "C" fn callv_v(_e: u64, obj: u64, mid: u64, va_p: u64) -> u64 {
+    env_enter("callv_v");
+    let Some(g) = mid_of(mid) else {
+        return 0;
+    };
+    let (_, params, _) = method_params(g);
+    let mut va = unsafe { VaList::load(va_p) };
+    let args = valist_jargs(&params, &mut va);
+    call_obj(obj, mid, &args, false).map(v_to_u64).unwrap_or(0)
+}
+extern "C" fn callnv_v(_e: u64, obj: u64, _clazz: u64, mid: u64, va_p: u64) -> u64 {
+    env_enter("callnv_v");
+    callv_v(_e, obj, mid, va_p)
+}
+extern "C" fn callnv_a(_e: u64, obj: u64, _clazz: u64, mid: u64, jvalues: u64) -> u64 {
+    env_enter("callnv_a");
+    let Some(g) = mid_of(mid) else {
+        return 0;
+    };
+    let (_, params, _) = method_params(g);
+    let args = jargs(&params, jvalues);
+    call_obj(obj, mid, &args, false).map(v_to_u64).unwrap_or(0)
+}
+
+fn new_object_body(clazz: u64, mid: u64, args: &[V]) -> u64 {
+    let mut v = vm();
+    let Some(ci) = v.class_for_jclass(clazz as u32) else {
+        return 0;
+    };
+    let h = v.heap.alloc(Obj::Instance {
+        class_idx: ci,
+        fields: std::collections::HashMap::new(),
+    }) as u64;
+    drop(v);
+    call_obj(h, mid, args, false);
+    h
+}
+extern "C" fn new_object_v(_e: u64, clazz: u64, mid: u64, va_p: u64) -> u64 {
+    env_enter("new_object_v");
+    let Some(g) = mid_of(mid) else {
+        return 0;
+    };
+    let (_, params, _) = method_params(g);
+    let mut va = unsafe { VaList::load(va_p) };
+    let args = valist_jargs(&params, &mut va);
+    new_object_body(clazz, mid, &args)
+}
+extern "C" fn new_object_a(_e: u64, clazz: u64, mid: u64, jvalues: u64) -> u64 {
+    env_enter("new_object_a");
+    let Some(g) = mid_of(mid) else {
+        return 0;
+    };
+    let (_, params, _) = method_params(g);
+    let args = jargs(&params, jvalues);
+    new_object_body(clazz, mid, &args)
+}
+
+extern "C" fn get_superclass(_e: u64, clazz: u64) -> u64 {
+    env_enter("get_superclass");
+    let mut v = vm();
+    let Some(ci) = v.class_for_jclass(clazz as u32) else {
+        return 0;
+    };
+    let Ok(own) = v.type_desc_of(ci) else {
+        return 0;
+    };
+    let Some(sd) = v.super_desc(&own) else {
+        return 0;
+    };
+    match v.type_index_of(&sd) {
+        Some(s) => v.class_mirror(s) as u64,
+        None => 0,
+    }
+}
+extern "C" fn is_assignable_from(_e: u64, sub: u64, sup: u64) -> u64 {
+    env_enter("is_assignable_from");
+    let v = vm();
+    match (
+        v.class_for_jclass(sub as u32),
+        v.class_for_jclass(sup as u32),
+    ) {
+        (Some(a), Some(b)) => u64::from(v.assignable(a, b)),
+        _ => 0,
+    }
+}
 
 fn field_get_v(obj: u64, id: u64) -> V {
     let Some(g) = fid_of(id) else { return V::I32(0) };

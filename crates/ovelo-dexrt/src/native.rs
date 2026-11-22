@@ -134,31 +134,66 @@ pub(crate) fn so_off(addr: usize) -> Option<usize> {
 /// the host `_pthread` struct — whose TSD region reaches several
 /// kilobytes past TPIDR — inside this block instead of clobbering
 /// whatever Rust statics happen to follow a small array in BSS.
+// Per-thread guest TCBs: Darwin leaves TPIDR_EL0 uninitialized on
+// spawned threads (observed: 0,1,3,5,8,9 — small garbage, not
+// pointers), so a single shared TCB + global saved-host cell raced
+// across VM worker threads and corrupted the guest thread pointer —
+// `ldr [tpidr,#0x28]` stack-guard reads then faulted on si=0x2c-style
+// addresses inside the `.so`. Each thread gets its own 64KiB block;
+// slot 4095 (+0x7ff8, the largest offset an `ldr` immediate reaches)
+// holds the thread's saved host TPIDR for the env-call thunks.
 #[cfg(target_arch = "aarch64")]
-static mut GUEST_TCB: [u64; 8192] = {
-    let mut t = [0u64; 8192];
-    t[5] = 0x9e3779b97f4a7c15; // arbitrary but nonzero stack guard
-    t
-};
+const TCB_WORDS: usize = 8192;
+#[cfg(target_arch = "aarch64")]
+const SLOT_HOST_TPIDR: usize = 4095;
+#[cfg(target_arch = "aarch64")]
+static TCB_MAP: std::sync::Mutex<Option<std::collections::HashMap<u64, usize>>> =
+    std::sync::Mutex::new(None);
 
-/// Run `f` with TPIDR_EL0 pointing at [`GUEST_TCB`], then restore the
-/// host thread pointer. Must wrap every entry into guest-native code
-/// (JNI_OnLoad, DT_INIT*, exported natives).
+/// This thread's guest TCB block — created on first use, leaked
+/// (threads outlive VM windows; freeing under a live TPIDR would be
+/// worse than the leak).
 #[cfg(target_arch = "aarch64")]
-pub(crate) fn with_guest_tls<R>(f: impl FnOnce() -> R) -> R {
+fn guest_tcb() -> *mut u64 {
+    let tid = unsafe { mach_thread_id() };
+    let mut g = TCB_MAP.lock().unwrap();
+    let m = g.get_or_insert_with(std::collections::HashMap::new);
+    if let Some(&p) = m.get(&tid) {
+        return p as *mut u64;
+    }
+    let tcb = Box::leak(Box::new([0u64; TCB_WORDS]));
+    tcb[0] = tcb.as_ptr() as u64; // TLS_SLOT_SELF
+    tcb[5] = 0x9e3779b97f4a7c15; // bionic stack guard slot
+    m.insert(tid, tcb.as_ptr() as usize);
+    tcb.as_ptr() as *mut u64
+}
+
+#[cfg(target_arch = "aarch64")]
+unsafe fn mach_thread_id() -> u64 {
+    extern "C" {
+        fn pthread_threadid_np(t: usize, id: *mut u64) -> i32;
+    }
+    let mut id = 0u64;
+    pthread_threadid_np(0, &mut id);
+    id
+}
+
+/// Run `f` with TPIDR_EL0 pointing at this thread's guest TCB, then
+/// restore the thread pointer. Must wrap every entry into guest-native
+/// code (JNI_OnLoad, DT_INIT*, exported natives).
+#[cfg(target_arch = "aarch64")]
+pub(crate) fn with_guest_tls_at<R>(site: &'static str, f: impl FnOnce() -> R) -> R {
     // OVELO_NOTLS: debug knob — run guest code on the host TPIDR_EL0 to
     // test whether the swap itself corrupts host state.
     if std::env::var_os("OVELO_NOTLS").is_some() {
         return f();
     }
     unsafe {
-        let tcb = std::ptr::addr_of_mut!(GUEST_TCB);
+        let tcb = guest_tcb();
         let mut old: usize;
         core::arch::asm!("mrs {}, tpidr_el0", out(reg) old);
-        #[cfg(target_os = "macos")]
-        thunk::set_host_tcb(old);
-        (*tcb)[0] = tcb as usize as u64; // TLS_SLOT_SELF
-        (*tcb)[5] = 0x9e3779b97f4a7c15; // bionic stack guard slot
+
+        *tcb.add(SLOT_HOST_TPIDR) = old as u64;
         core::arch::asm!("msr tpidr_el0, {}", in(reg) tcb as usize);
         // OVELO_TLSPROBE: allocation inside the swapped window — if the
         // crash is malloc's TPIDR-keyed per-thread magazine state, a
@@ -171,9 +206,56 @@ pub(crate) fn with_guest_tls<R>(f: impl FnOnce() -> R) -> R {
             eprintln!("[tlsprobe] alloc+drop under guest TLS survived");
         }
         let r = f();
+        let mut now: usize;
+        core::arch::asm!("mrs {}, tpidr_el0", out(reg) now);
+        if now != tcb as usize {
+            eprintln!("[tls] {site} window ended tid={} TPIDR={now:#x} (expected {:#x})\n{}", mach_thread_id(), tcb as usize, std::backtrace::Backtrace::capture());
+        }
         core::arch::asm!("msr tpidr_el0, {}", in(reg) old);
         r
     }
+}
+
+/// Guest `pthread_create`: the Bionic signature matches libsystem's, but
+/// the start routine must run under a guest TCB — Darwin never sets
+/// TPIDR_EL0 on the new thread, so the `.so`'s first
+/// `ldr [tpidr,#0x28]` stack-guard read would fault.
+#[cfg(target_arch = "aarch64")]
+extern "C" fn sh_pthread_create(
+    tid: *mut c_void,
+    attr: *const c_void,
+    entry: usize,
+    arg: usize,
+) -> i32 {
+    extern "C" {
+        fn pthread_create(
+            t: *mut c_void,
+            a: *const c_void,
+            f: extern "C" fn(*mut c_void) -> *mut c_void,
+            arg: *mut c_void,
+        ) -> i32;
+    }
+    extern "C" fn tramp(p: *mut c_void) -> *mut c_void {
+        let (entry, arg) = unsafe { *Box::from_raw(p as *mut (usize, usize)) };
+        eprintln!("[tls] guest pthread start entry={entry:#x} tid={}", unsafe { mach_thread_id() });
+        unsafe {
+            // Per-thread guest TCB; env thunks on this thread swap to
+            // whatever TPIDR the thread started with (host garbage).
+            let tcb = guest_tcb();
+            let mut old: usize;
+            core::arch::asm!("mrs {}, tpidr_el0", out(reg) old);
+            *tcb.add(SLOT_HOST_TPIDR) = old as u64;
+            core::arch::asm!("msr tpidr_el0, {}", in(reg) tcb as usize);
+            let f: extern "C" fn(usize) -> usize = std::mem::transmute(entry);
+            f(arg) as *mut c_void
+        }
+    }
+    let b = Box::into_raw(Box::new((entry, arg)));
+    let r = unsafe { pthread_create(tid, attr, tramp, b as *mut c_void) };
+    if r != 0 {
+        unsafe { drop(Box::from_raw(b)) }
+    }
+    r
 }
 
 #[cfg(not(target_arch = "aarch64"))]
@@ -184,22 +266,15 @@ pub(crate) fn with_guest_tls<R>(f: impl FnOnce() -> R) -> R {
 /// Host-TPIDR call thunks: every function pointer handed to guest
 /// code (JNIEnv/JavaVM vtable entries, builtin shims, dlsym'd
 /// libSystem imports) is wrapped in a 64-byte stub that swaps
-/// TPIDR_EL0 back to the host pthread block for the call's duration.
-/// libSystem reads TPIDR-keyed per-thread state (malloc magazine,
-/// TSD, stack_chk_guard); under the guest TCB those reads fault —
-/// observed as `ldr x9,[x3]` on wild addresses inside the first env
-/// call. Emitted lazily into a MAP_JIT page.
+/// TPIDR_EL0 to the calling thread's saved host value for the call's
+/// duration — read back out of slot +0x7ff8 of that thread's own guest
+/// TCB, so no global cell can race garbage across VM worker threads.
+/// Emitted lazily into a MAP_JIT page.
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 mod thunk {
     use std::collections::HashMap;
     use std::ffi::c_void;
-    use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::Mutex;
-
-    /// Saved host TPIDR_EL0 — written by `with_guest_tls` before each
-    /// swap. Native dispatch is serialized on the interpreter thread,
-    /// so one cell is enough.
-    static HOST_TCB: AtomicUsize = AtomicUsize::new(0);
 
     static MEMO: Mutex<Option<HashMap<usize, usize>>> = Mutex::new(None);
 
@@ -235,11 +310,13 @@ mod thunk {
     //   add  x9,  sp, #0             // dst = our frame
     //   ldp  x10, x11, [x17], #16    // ×10 pairs
     //   stp  x10, x11, [x9],  #16
-    //   mrs  x29, tpidr_el0          // guest TCB — callee-saved reg
-    //   ldr  x16, +36                // -> literal: &HOST_TCB
-    //   ldr  x16, [x16]
-    //   msr  tpidr_el0, x16          // host TCB
-    //   ldr  x16, +28                // -> literal: target
+    //   mrs  x29, tpidr_el0          // this thread's guest TCB
+    //   ldr  x16, [x29, #0x7ff8]     // saved host TPIDR (per-thread)
+    //   msr  tpidr_el0, x16          //   (TPIDRRO was tried: malloc
+    //                                  //   dereferences it as its own
+    //                                  //   per-thread state and dies)
+    //   nop
+    //   ldr  x16, +32                // -> literal: target at +140
     //   blr  x16
     //   msr  tpidr_el0, x29          // guest TCB again
     //   ldp  x29, x30, [sp, #160]
@@ -248,8 +325,72 @@ mod thunk {
     const SLOT: usize = 160;
     const PAGE: usize = 0x10000;
 
-    pub(super) fn set_host_tcb(v: usize) {
-        HOST_TCB.store(v, Ordering::Release);
+    /// Varargs-call spill stub: JNIEnv `Call*Method`/`NewObject` varargs
+    /// entries receive args in x3-x7, d0-d7 and the caller stack. This
+    /// stub (run under the host TCB, after the outer thunk swaps) saves
+    /// the full register set into a buffer and calls a Rust dispatcher:
+    ///   fn(regs: *const u64, stack_args: *const u64, kind: u64) -> u64
+    /// regs = [x0..x7 @ +0..64, d0..d7 @ +64..128]. kind selects the
+    /// argument layout (obj, obj+clazz or clazz receiver).
+    //   sub  sp, sp, #160
+    //   stp  x0,x1,[sp];   stp x2,x3,[sp,#16]; stp x4,x5,[sp,#32]; stp x6,x7,[sp,#48]
+    //   stp  d0,d1,[sp,#64]; stp d2,d3,[sp,#80]; stp d4,d5,[sp,#96]; stp d6,d7,[sp,#112]
+    //   stp  x29,x30,[sp,#128]
+    //   mov  x0, sp;  add x1, sp, #160   // regs buf + caller stack args
+    //   movz x2, #kind
+    //   ldr  x16, lit;  blr x16
+    //   fmov d0, x0        // deliver FP results for float/double entries
+    //   ldp  x29,x30,[sp,#128];  add sp,sp,#160;  ret
+    //   lit: .quad target
+    pub(super) fn emit_va(target: usize, kind: u16) -> usize {
+        let mut guard = ARENA.lock().unwrap();
+        let a = guard.get_or_insert_with(|| unsafe {
+            let p = mmap(
+                std::ptr::null_mut(),
+                PAGE,
+                PROT_RW | PROT_EXEC,
+                MAP_PRIV_ANON_JIT,
+                -1,
+                0,
+            );
+            assert_ne!(p as usize, usize::MAX, "thunk arena mmap failed");
+            Arena {
+                base: p as usize,
+                used: 0,
+            }
+        });
+        assert!(a.used + SLOT <= PAGE, "thunk arena exhausted");
+        let at = a.base + a.used;
+        a.used += SLOT;
+        unsafe {
+            pthread_jit_write_protect_np(0);
+            let w = at as *mut u32;
+            let ins: [u32; 20] = [
+                0xD102_83FF, // sub sp, sp, #160
+                0xA900_07E0, 0xA901_0FE2, 0xA902_17E4, 0xA903_1FE6, // stp x pairs
+                0x6D04_07E0, 0x6D05_0FE2, 0x6D06_17E4, 0x6D07_1FE6, // stp d pairs
+                0xA908_7BFD, // stp x29,x30,[sp,#128]
+                0x9100_03E0, // mov x0, sp
+                0x9102_83E1, // add x1, sp, #160
+                0xD280_0002 | ((kind as u32) << 5), // movz x2, #kind
+                0x5800_00D0, // ldr x16, +24 (lit at insn 15+... below)
+                0xD63F_0200, // blr x16
+                0x9E67_0000, // fmov d0, x0
+                0xA948_7BFD, // ldp x29,x30,[sp,#128]
+                0x9102_83FF, // add sp, sp, #160
+                0xD65F_03C0, // ret
+                0x0000_0000, // literal slot written below (as u32 pair)
+            ];
+            for (i, ins) in ins.iter().enumerate() {
+                w.add(i).write_volatile(*ins);
+            }
+            // ldr at insn 13 (byte 52) -> literal at insn 19 (byte 76): off 24
+            let lit = (at + 76) as *mut usize;
+            lit.write_volatile(target);
+            pthread_jit_write_protect_np(1);
+            sys_icache_invalidate(at as *mut c_void, SLOT);
+        }
+        at
     }
 
     pub(super) fn emit(target: usize) -> usize {
@@ -295,13 +436,13 @@ mod thunk {
                 ins.extend_from_slice(&[0xA8C1_2E2A, 0xA881_2D2A]);
             }
             ins.extend_from_slice(&[
-                0xD53B_D05D,
-                0x5800_0130,
-                0xF940_0210,
-                0xD51B_D050,
-                0x5800_0110,
-                0xD63F_0200,
-                0xD51B_D05D,
+                0xD53B_D05D, // mrs x29, tpidr_el0 — this thread's TCB
+                0xF97F_F3B0, // ldr x16, [x29, #0x7ff8] — saved host TPIDR
+                0xD51B_D050, // msr tpidr_el0, x16
+                0xD503_201F, // nop
+                0x5800_0110, // ldr x16, +32 -> target literal at byte 140
+                0xD63F_0200, // blr x16
+                0xD51B_D05D, // msr tpidr_el0, x29 — back to guest TCB
                 0xA94A_7BFD,
                 0x9103_03FF,
                 0xD65F_03C0,
@@ -310,8 +451,10 @@ mod thunk {
             for (i, ins) in ins.iter().enumerate() {
                 w.add(i).write_volatile(*ins);
             }
+            // Byte 136 is now unused padding; the target literal sits at
+            // byte 140, reached by `ldr x16, +32` from insn 28 (byte 112).
             let lit = (at + 136) as *mut usize;
-            lit.write_volatile(std::ptr::addr_of!(HOST_TCB) as usize);
+            lit.write_volatile(0);
             lit.add(1).write_volatile(target);
             pthread_jit_write_protect_np(1);
             sys_icache_invalidate(at as *mut c_void, SLOT);
@@ -323,6 +466,19 @@ mod thunk {
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 pub(crate) fn host_thunk(f: usize) -> usize {
     thunk::emit(f)
+}
+
+/// Thunk for JNIEnv varargs entries (`Call*Method`, `NewObject`): the
+/// outer `host_thunk` swaps TLS; this inner stub spills the variadic
+/// register state into a buffer a Rust dispatcher can read.
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+pub(crate) fn va_thunk(f: usize, kind: u16) -> usize {
+    thunk::emit(thunk::emit_va(f, kind))
+}
+
+#[cfg(not(all(target_os = "macos", target_arch = "aarch64")))]
+pub(crate) fn va_thunk(f: usize, _kind: u16) -> usize {
+    f
 }
 
 #[cfg(not(all(target_os = "macos", target_arch = "aarch64")))]
@@ -406,6 +562,45 @@ pub fn install_crash_dump() {
                     }
                     msg[n] = b' ';
                     n += 1;
+                }
+                // Resolve pc itself the same way lrs are below.
+                let pc_so = LOADED_RANGES
+                    .lock()
+                    .map(|v| {
+                        v.iter()
+                            .find(|(b, s)| pc >= *b && pc < b + s)
+                            .map(|(b, _)| pc - *b)
+                    })
+                    .unwrap_or(None);
+                if let Some(off) = pc_so {
+                    for c in b"pc=[so]" { msg[n] = *c; n += 1; }
+                    for i in (0..16).rev() {
+                        msg[n] = b"0123456789abcdef"[(off >> (i * 4)) & 0xf];
+                        n += 1;
+                    }
+                    msg[n] = b' ';
+                    n += 1;
+                } else {
+                    let mut di: DlInfo = std::mem::zeroed();
+                    if dladdr(pc as *const c_void, &mut di) != 0 && !di.dli_fname.is_null() {
+                        let off = pc - di.dli_fbase as usize;
+                        let mut p = di.dli_fname;
+                        let mut end = p;
+                        while *end != 0 { end = end.add(1) }
+                        let mut last = p;
+                        while p != end { if *p == b'/' as i8 { last = p.add(1) } p = p.add(1) }
+                        for c in b"pc=<" { msg[n] = *c; n += 1; }
+                        let l = (end as usize - last as usize).min(40);
+                        std::ptr::copy_nonoverlapping(last as *const u8, msg.as_mut_ptr().add(n), l);
+                        n += l;
+                        msg[n] = b'+'; n += 1;
+                        for i in (0..8).rev() {
+                            msg[n] = b"0123456789abcdef"[(off >> (i * 4)) & 0xf];
+                            n += 1;
+                        }
+                        msg[n] = b' ';
+                        n += 1;
+                    }
                 }
                 // Guest frame chain: fp → [prev_fp, saved_lr] — best-effort
                 // backtrace of the guest/native call path. Each lr is
@@ -971,7 +1166,7 @@ extern "C" fn sh_dl_iterate_phdr(cb: *const c_void, data: *mut c_void) -> i32 {
         };
         // The callback is guest code — it needs the guest TCB (the shim
         // itself runs on the host TCB inside the thunk).
-        let r = with_guest_tls(|| unsafe {
+        let r = with_guest_tls_at("call_native", || unsafe {
             cb(
                 &mut info as *mut _ as *mut c_void,
                 std::mem::size_of::<DlPhdrInfo>(),
@@ -1798,6 +1993,8 @@ fn builtin_shim(name: &str) -> Option<usize> {
         "sched_setaffinity" => sh_zero as *const () as usize,
         "syscall" => sh_neg1 as *const () as usize,
         "gettid" => sh_gettid as *const () as usize,
+        #[cfg(target_arch = "aarch64")]
+        "pthread_create" => sh_pthread_create as *const () as usize,
         "__open_2" => sh_open2 as *const () as usize,
         "open" => sh_open as *const () as usize,
         "__system_property_get" => sh_system_property_get as *const () as usize,
@@ -2520,7 +2717,7 @@ fn run_ctors(inits: &[usize]) {
         }
         check_all_zones("pre-ctor");
         let f: extern "C" fn() = unsafe { std::mem::transmute(a) };
-        with_guest_tls(|| f());
+        with_guest_tls_at("ctors", || f());
         check_all_zones("post-ctor");
     }
 }

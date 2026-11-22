@@ -244,6 +244,9 @@ pub struct GuestUi {
     /// Dex-view-tree handles → materialized host view. Persistent so
     /// per-view state (pressed, listeners) survives frame rebuilds.
     dex_views: HashMap<u32, Rc<RefCell<GuestView>>>,
+    /// Handles that belonged to the last materialized tree — the GL
+    /// frame pump must not drive renderers of detached views.
+    dex_live: HashSet<u32>,
     /// Last materialized child list per parent — (handle, dex frame)
     /// pairs. A changed set (removal, hide) or a late-arriving frame
     /// must dirty the group or stale pixels / misplaced children
@@ -413,6 +416,7 @@ impl GuestUi {
             clicks: Rc::new(RefCell::new(VecDeque::new())),
             click_listeners: HashMap::new(),
             dex_views: HashMap::new(),
+            dex_live: HashSet::new(),
             dex_kids: HashMap::new(),
             dex_root: 0,
             dex_mounted: None,
@@ -723,6 +727,7 @@ impl GuestUi {
             self.pump_gl_frames(vm);
             return true;
         }
+        self.dex_live.clear();
         let Some(rc) = self.materialize_dex(vm, root) else {
             // Content root went GONE/INVISIBLE: swap in an empty group
             // so the stale tree stops drawing and answering touches.
@@ -761,7 +766,7 @@ impl GuestUi {
     /// independent of view-tree generation changes.
     fn pump_gl_frames(&mut self, vm: &mut Vm) {
         for (&h, rc) in &self.dex_views {
-            if !vm.has_gl_renderer(h) {
+            if !self.dex_live.contains(&h) || !vm.has_gl_renderer(h) {
                 continue;
             }
             let Some((l, t, r, b)) = vm.dex_view(h).and_then(|i| i.frame) else {
@@ -773,15 +778,20 @@ impl GuestUi {
             }
             let ops = vm.guest_draw_ops(h, w, hh);
             let mut g = rc.borrow_mut();
-            g.view_mut().custom_ops = if ops.is_empty() {
+            let v = g.view_mut();
+            v.custom_ops = if ops.is_empty() {
                 None
             } else {
                 Some(Rc::new(ops))
             };
+            // New GL content must mark the view dirty or the next
+            // traversal skips the draw entirely.
+            v.invalidate();
         }
     }
 
     fn materialize_dex(&mut self, vm: &mut Vm, h: u32) -> Option<Rc<RefCell<GuestView>>> {
+        self.dex_live.insert(h);
         let info = vm.dex_view(h)?;
         if viewdbg() {
             eprintln!(

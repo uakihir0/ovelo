@@ -1534,7 +1534,7 @@ pub(crate) fn call(
             })
         }
         "performClick" | "callOnClick" => {
-            let fired = match pseudo_get(vm, this, P_LISTENER) {
+            let mut fired = match pseudo_get(vm, this, P_LISTENER) {
                 Some(V::Ref(l)) if l != 0 => vm
                     .call_virtual(l, "onClick", &[V::Ref(this)])
                     .ok()
@@ -1542,6 +1542,22 @@ pub(crate) fn call(
                     .is_some(),
                 _ => false,
             };
+            // `android:onClick="method"` in layout XML: AOSP's
+            // DeclaredOnClickListener invokes the named method on the
+            // Context. No listener object exists to attach, so invoke
+            // the Activity method straight from the attr.
+            if !fired {
+                if let Some(mname) = attr_find(vm, this, "onClick").and_then(|v| match v {
+                    V::Ref(r) if r != 0 => s(vm, r),
+                    _ => None,
+                }) {
+                    let act = vm.cur_activity;
+                    if act != 0 {
+                        let _ = vm.call_virtual(act, &mname, &[V::Ref(this)]);
+                        fired = true;
+                    }
+                }
+            }
             Some(Some(V::I32(fired as i32)))
         }
         "setVisibility" => {
@@ -1789,6 +1805,33 @@ pub(crate) fn call(
                 );
             }
             Some(Some(V::I32(pint(vm, this, P_MEAS_H) & 0x00FF_FFFF)))
+        }
+        "getLocalVisibleRect" | "getHitRect" | "getGlobalVisibleRect"
+        | "getDrawingRect" => {
+            // `new Rect()` arg gets (0,0,w,h) — local coords; global
+            // rect adds the view's absolute origin.
+            let w = pint(vm, this, P_RIGHT).saturating_sub(pint(vm, this, P_LEFT));
+            let h = pint(vm, this, P_BOTTOM).saturating_sub(pint(vm, this, P_TOP));
+            if let Some(V::Ref(rh)) = args.get(1) {
+                if *rh != 0 {
+                    let (ox, oy) = if name == "getGlobalVisibleRect" {
+                        let (mut x, mut y, mut v) = (0, 0, this);
+                        for _ in 0..64 {
+                            x += pint(vm, v, P_LEFT);
+                            y += pint(vm, v, P_TOP);
+                            v = match pseudo_get(vm, v, P_PARENT) {
+                                Some(V::Ref(p)) => p,
+                                _ => break,
+                            };
+                        }
+                        (x, y)
+                    } else {
+                        (0, 0)
+                    };
+                    super::android::rect_write(vm, *rh, ox, oy, ox + w, oy + h);
+                }
+            }
+            Some(Some(V::I32(1)))
         }
         "getMeasuredWidthAndState" => Some(Some(V::I32(pint(vm, this, P_MEAS_W)))),
         "getMeasuredHeightAndState" => Some(Some(V::I32(pint(vm, this, P_MEAS_H)))),
@@ -4477,6 +4520,10 @@ pub(crate) fn dispatch_touch(
     // (group_layout_fallback), so the hit test must carry each
     // ancestor's absolute origin down the recursion.
     fn deepest(vm: &Vm, h: u32, x: i32, y: i32, ox: i32, oy: i32) -> Option<u32> {
+        // AOSP: INVISIBLE/GONE views can't receive touches.
+        if pint(vm, h, P_VIS) != 0 {
+            return None;
+        }
         let l = ox + pint(vm, h, P_LEFT);
         let t = oy + pint(vm, h, P_TOP);
         let r = ox + pint(vm, h, P_RIGHT);
@@ -4597,6 +4644,33 @@ pub(crate) fn dispatch_touch(
                 }
                 let _ = vm.call_virtual(l, "onTouch", &[V::Ref(v), V::Ref(evt)]);
                 return Ok(());
+            }
+        }
+        // AOSP `View.onTouchEvent`: a clickable view consumes the touch
+        // and `performClick` fires the OnClickListener on ACTION_UP.
+        // The deepest ancestor with a listener wins.
+        if action == 1 {
+            if let Some(V::Ref(l)) = pseudo_get(vm, v, P_LISTENER) {
+                if l != 0 {
+                    if dbg {
+                        eprintln!("[touchdbg] h{v} OnClickListener.onClick l{l}");
+                    }
+                    let _ = vm.call_virtual(l, "onClick", &[V::Ref(v)]);
+                    return Ok(());
+                }
+            }
+            if let Some(mname) = attr_find(vm, v, "onClick").and_then(|a| match a {
+                V::Ref(r) if r != 0 => s(vm, r),
+                _ => None,
+            }) {
+                let act = vm.cur_activity;
+                if act != 0 {
+                    if dbg {
+                        eprintln!("[touchdbg] h{v} xml onClick {mname}");
+                    }
+                    let _ = vm.call_virtual(act, &mname, &[V::Ref(v)]);
+                    return Ok(());
+                }
             }
         }
         v = match pseudo_get(vm, v, P_PARENT) {

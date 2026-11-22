@@ -1920,8 +1920,35 @@ fn thread_call(vm: &mut Vm, name: &str, _sig: &str, args: &[V]) -> Rt<Option<Opt
             if let V::Ref(h) = args[0] {
                 let t = pseudo_get(vm, h, P_TARGET).unwrap_or(V::Ref(h));
                 if let V::Ref(r) = t {
+                    // Thread-spawned runnables get an unbounded park
+                    // budget — a `while (running)` game loop parks on
+                    // every Thread.sleep and must never hit the worker
+                    // repark cap.
+                    vm.thread_runnables.insert(r);
                     vm.enqueue_runnable(r, false);
                 }
+            }
+            Some(None)
+        }
+        "sleep" => {
+            // A guest thread can't really suspend: on a worker context
+            // record the requested wake time and unwind with ovelo.park
+            // — the drain requeues the runnable into delayed_runnables
+            // at that deadline. On the main thread a real sleep would
+            // freeze the UI, so stay a no-op.
+            if vm.cur_thread != 0 && vm.cur_thread != vm.main_thread_h {
+                let ms = match args.get(1).copied().unwrap_or(V::I64(0)) {
+                    V::I64(m) => m,
+                    V::I32(m) => m as i64,
+                    V::F64(m) => m as i64,
+                    _ => 0,
+                }
+                .max(0);
+                let due = (now_ms().saturating_add(ms)).max(0) as u64;
+                if vm.cur_runnable != 0 {
+                    vm.sleep_until.insert(vm.cur_runnable, due);
+                }
+                return Err(crate::E::Vm(crate::err("ovelo.park")));
             }
             Some(None)
         }
@@ -1929,7 +1956,6 @@ fn thread_call(vm: &mut Vm, name: &str, _sig: &str, args: &[V]) -> Rt<Option<Opt
         | "setDaemon"
         | "interrupt"
         | "join"
-        | "sleep"
         | "yield"
         | "setUncaughtExceptionHandler"
         | "setDefaultUncaughtExceptionHandler"

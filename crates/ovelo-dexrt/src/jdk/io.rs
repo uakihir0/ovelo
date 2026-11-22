@@ -215,7 +215,7 @@ pub(crate) fn call(
         {
             charset_call(vm, name, args)
         } else if desc_is_a(class, "Ljava/nio/Buffer;") || class.starts_with("Ljava/nio/") {
-            nio_call(vm, name, args)
+            nio_call(vm, class, name, args)
         } else if class == "Ljava/util/Base64;"
             || class == "Ljava/util/Base64$Encoder;"
             || class == "Ljava/util/Base64$Decoder;"
@@ -1665,7 +1665,7 @@ fn charset_call(vm: &mut Vm, name: &str, args: &[V]) -> Option<Option<V>> {
     }
 }
 
-fn nio_call(vm: &mut Vm, name: &str, args: &[V]) -> Option<Option<V>> {
+fn nio_call(vm: &mut Vm, class: &str, name: &str, args: &[V]) -> Option<Option<V>> {
     let this = match args.first() {
         Some(&V::Ref(h)) => h,
         _ => 0,
@@ -1683,6 +1683,12 @@ fn nio_call(vm: &mut Vm, name: &str, args: &[V]) -> Option<Option<V>> {
     let bpos = |vm: &Vm| i32v(pseudo_get(vm, this, P_BBUF_POS).unwrap_or(V::I32(0))).max(0) as usize;
     let little =
         |vm: &Vm| i32v(pseudo_get(vm, this, P_BBUF_ORD).unwrap_or(V::I32(0))) != 0;
+    // Typed views (`asIntBuffer`…) keep the same byte backing but
+    // address it in elements of `esz` bytes.
+    let esz = |vm: &Vm| {
+        i32v(pseudo_get(vm, this, P_BBUF_ESZ).unwrap_or(V::I32(1)))
+            .clamp(1, 8) as usize
+    };
     // Read `n` bytes at `pos`; None when out of bounds.
     let read_at = |vm: &Vm, pos: usize, n: usize| -> Option<Vec<u8>> {
         let b = backing(vm)?;
@@ -1704,16 +1710,49 @@ fn nio_call(vm: &mut Vm, name: &str, args: &[V]) -> Option<Option<V>> {
     };
     match name {
         "allocate" | "allocateDirect" => {
+            // `FloatBuffer.allocate(n)` allocates n ELEMENTS — the
+            // backing byte array is n * esz bytes.
+            let (desc, w) = match class {
+                c if c.contains("IntBuffer") => ("Ljava/nio/IntBuffer;", 4),
+                c if c.contains("FloatBuffer") => ("Ljava/nio/FloatBuffer;", 4),
+                c if c.contains("LongBuffer") => ("Ljava/nio/LongBuffer;", 8),
+                c if c.contains("DoubleBuffer") => ("Ljava/nio/DoubleBuffer;", 8),
+                c if c.contains("ShortBuffer") => ("Ljava/nio/ShortBuffer;", 2),
+                c if c.contains("CharBuffer") => ("Ljava/nio/CharBuffer;", 2),
+                _ => ("Ljava/nio/ByteBuffer;", 1),
+            };
             let n = i32v(*args.get(if args.len() > 1 { 1 } else { 0 }).unwrap_or(&V::I32(0)));
             let buf = vm.heap.alloc(Obj::Array {
                 elem: "B".into(),
-                data: vec![V::I32(0); n.max(0) as usize],
+                data: vec![V::I32(0); (n.max(0) as usize) * w],
             });
-            Some(Some(host(
-                vm,
-                "Ljava/nio/ByteBuffer;",
-                HostState::Slot(V::Ref(buf)),
-            )))
+            let v = host(vm, desc, HostState::Slot(V::Ref(buf)));
+            if let (V::Ref(h), true) = (v, w > 1) {
+                pseudo_set(vm, h, P_BBUF_ESZ, V::I32(w as i32));
+            }
+            Some(Some(v))
+        }
+        "asIntBuffer" | "asFloatBuffer" | "asLongBuffer" | "asDoubleBuffer"
+        | "asShortBuffer" | "asCharBuffer" => {
+            // Typed view over the same byte backing; positions/capacity
+            // are element-indexed via P_BBUF_ESZ.
+            let (desc, w) = match name {
+                "asIntBuffer" => ("Ljava/nio/IntBuffer;", 4),
+                "asFloatBuffer" => ("Ljava/nio/FloatBuffer;", 4),
+                "asLongBuffer" => ("Ljava/nio/LongBuffer;", 8),
+                "asDoubleBuffer" => ("Ljava/nio/DoubleBuffer;", 8),
+                "asShortBuffer" => ("Ljava/nio/ShortBuffer;", 2),
+                _ => ("Ljava/nio/CharBuffer;", 2),
+            };
+            let b = backing(vm).map(V::Ref).unwrap_or(V::I32(0));
+            let v = host(vm, desc, HostState::Slot(b));
+            if let V::Ref(h) = v {
+                pseudo_set(vm, h, P_BBUF_ESZ, V::I32(w));
+                if let Some(o) = pseudo_get(vm, this, P_BBUF_ORD) {
+                    pseudo_set(vm, h, P_BBUF_ORD, o);
+                }
+            }
+            Some(Some(v))
         }
         "wrap" => {
             // wrap(byte[]) / wrap(byte[], off, len) — keep the array so
@@ -1726,13 +1765,29 @@ fn nio_call(vm: &mut Vm, name: &str, args: &[V]) -> Option<Option<V>> {
             Some(Some(v))
         }
         "order" => {
+            if std::env::var("OVELO_ORDDBG").is_ok() {
+                eprintln!(
+                    "[orddbg] order arg={:?} heap={:?}",
+                    args.get(1),
+                    match args.get(1) {
+                        Some(&V::Ref(h)) => vm
+                            .heap
+                            .get(h)
+                            .map(|o| format!("{:?}", o))
+                            .unwrap_or("?".into()),
+                        _ => "not-ref".to_string(),
+                    }
+                );
+            }
             let ord = match args.get(1) {
                 Some(&V::Ref(bo)) => match vm.heap.get(bo) {
                     Some(Obj::Host {
                         state: HostState::Slot(v),
                         ..
                     }) => *v,
-                    _ => V::I32(0),
+                    // `nativeOrder()` (little on our targets) and any
+                    // unknown ByteOrder object — ARM64 is little-endian.
+                    _ => V::I32(1),
                 },
                 _ => V::I32(0),
             };
@@ -1755,7 +1810,8 @@ fn nio_call(vm: &mut Vm, name: &str, args: &[V]) -> Option<Option<V>> {
                     Some(Obj::Array { data, .. }) => Some(data.len()),
                     _ => None,
                 })
-                .unwrap_or(0);
+                .unwrap_or(0)
+                / esz(vm);
             if args.len() > 1 {
                 Some(Some(args[0]))
             } else {
@@ -1768,7 +1824,8 @@ fn nio_call(vm: &mut Vm, name: &str, args: &[V]) -> Option<Option<V>> {
                     Some(Obj::Array { data, .. }) => Some(data.len()),
                     _ => None,
                 })
-                .unwrap_or(0);
+                .unwrap_or(0)
+                / esz(vm);
             Some(Some(V::I32(n.saturating_sub(bpos(vm)) as i32)))
         }
         "position" => {
@@ -1783,12 +1840,32 @@ fn nio_call(vm: &mut Vm, name: &str, args: &[V]) -> Option<Option<V>> {
             pseudo_set(vm, this, P_BBUF_POS, V::I32(0));
             Some(Some(args[0]))
         }
+        "nativeOrder" => Some(Some(host(
+            vm,
+            "Ljava/nio/ByteOrder;",
+            HostState::Slot(V::I32(1)),
+        ))),
         "mark" | "compact" | "slice" | "duplicate" | "asReadOnlyBuffer" => {
             Some(Some(args[0]))
         }
         "putInt" | "putLong" | "putShort" | "putDouble" | "putFloat" | "putChar" | "putByte"
         | "put" => {
-            let pos0 = bpos(vm);
+            let (pos0, es) = (bpos(vm), esz(vm));
+            // One V -> `es` bytes, endian-adjusted like `put`'s reverse.
+            let elem_bytes = |vm: &Vm, v: V| -> Vec<u8> {
+                let mut b = match (v, es) {
+                    (V::F32(f), 4) => f.to_be_bytes().to_vec(),
+                    (V::F64(d), 8) => d.to_be_bytes().to_vec(),
+                    (V::I64(l), 8) => l.to_be_bytes().to_vec(),
+                    (_, 4) => i32v(v).to_be_bytes().to_vec(),
+                    (_, 2) => (i32v(v) as u16).to_be_bytes().to_vec(),
+                    _ => vec![i32v(v) as u8],
+                };
+                if little(vm) {
+                    b.reverse();
+                }
+                b
+            };
             let put = |vm: &mut Vm, pos: usize, bytes: &[u8]| {
                 let mut b = bytes.to_vec();
                 if little(vm) {
@@ -1808,9 +1885,19 @@ fn nio_call(vm: &mut Vm, name: &str, args: &[V]) -> Option<Option<V>> {
                 "put" => {
                     if args.len() > 2 && matches!(args[1], V::I32(_) | V::I64(_)) {
                         // put(index, byte) — absolute, no cursor move.
-                        let pos = i32v(args[1]).max(0) as usize;
-                        let x = i32v(args[2]) as u8;
-                        put(vm, pos, &[x]);
+                        let pos = i32v(args[1]).max(0) as usize * es;
+                        // elem_bytes is already endian-adjusted — the
+                        // `put` closure would reverse it again.
+                        let x = elem_bytes(vm, args[2]);
+                        if let Some(bh) = backing(vm) {
+                            if let Some(Obj::Array { data, .. }) = vm.heap.get_mut(bh) {
+                                for (i, b) in x.iter().enumerate() {
+                                    if let Some(slot) = data.get_mut(pos + i) {
+                                        *slot = V::I32(*b as i8 as i32);
+                                    }
+                                }
+                            }
+                        }
                     } else if args.len() > 2 {
                         // put(byte[], off, len)
                         let (src, off, len) = (
@@ -1824,16 +1911,24 @@ fn nio_call(vm: &mut Vm, name: &str, args: &[V]) -> Option<Option<V>> {
                                     .iter()
                                     .skip(off)
                                     .take(len)
-                                    .map(|v| i32v(*v) as u8)
+                                    .flat_map(|v| elem_bytes(vm, *v))
                                     .collect(),
                                 _ => Vec::new(),
                             },
                             _ => Vec::new(),
                         };
+                        if std::env::var("OVELO_ORDDBG").is_ok() {
+                            eprintln!(
+                                "[orddbg] bulk-put class={class} es={es} little={} ord={:?} nbytes={}",
+                                little(vm),
+                                pseudo_get(vm, this, P_BBUF_ORD),
+                                bytes.len()
+                            );
+                        }
                         if let Some(bh) = backing(vm) {
                             if let Some(Obj::Array { data, .. }) = vm.heap.get_mut(bh) {
                                 for (i, x) in bytes.iter().enumerate() {
-                                    if let Some(slot) = data.get_mut(pos0 + i) {
+                                    if let Some(slot) = data.get_mut(pos0 * es + i) {
                                         *slot = V::I32(*x as i8 as i32);
                                     }
                                 }
@@ -1844,9 +1939,10 @@ fn nio_call(vm: &mut Vm, name: &str, args: &[V]) -> Option<Option<V>> {
                         // put(byte[]) / put(srcBuffer) / put(byte).
                         let bytes: Vec<u8> = match args.get(1).copied() {
                             Some(V::Ref(sh)) => match vm.heap.get(sh) {
-                                Some(Obj::Array { data, .. }) => {
-                                    data.iter().map(|v| i32v(*v) as u8).collect()
-                                }
+                                Some(Obj::Array { data, .. }) => data
+                                    .iter()
+                                    .flat_map(|v| elem_bytes(vm, *v))
+                                    .collect(),
                                 _ => {
                                     // Another ByteBuffer: drain its
                                     // remaining bytes and move its cursor.
@@ -1865,12 +1961,19 @@ fn nio_call(vm: &mut Vm, name: &str, args: &[V]) -> Option<Option<V>> {
                                     };
                                     let mut v = Vec::new();
                                     if let Some(sb) = src_backing {
+                                        let ses = i32v(
+                                            pseudo_get(vm, sh, P_BBUF_ESZ)
+                                                .unwrap_or(V::I32(1)),
+                                        )
+                                        .clamp(1, 8)
+                                            as usize;
                                         let sp = i32v(
                                             pseudo_get(vm, sh, P_BBUF_POS)
                                                 .unwrap_or(V::I32(0)),
                                         )
                                         .max(0)
-                                            as usize;
+                                            as usize
+                                            * ses;
                                         if let Some(Obj::Array { data, .. }) = vm.heap.get(sb) {
                                             v = data
                                                 .iter()
@@ -1883,27 +1986,30 @@ fn nio_call(vm: &mut Vm, name: &str, args: &[V]) -> Option<Option<V>> {
                                             vm,
                                             sh,
                                             P_BBUF_POS,
-                                            V::I32((sp + n) as i32),
+                                            V::I32((sp / ses + n / ses) as i32),
                                         );
                                     }
                                     v
                                 }
                             },
-                            v => vec![i32v(v.unwrap_or(V::I32(0))) as u8],
+                            v => elem_bytes(vm, v.unwrap_or(V::I32(0))),
                         };
                         let len = bytes.len();
-                        // Byte-order applies to multi-byte primitives,
-                        // not bulk copies — write through directly.
                         if let Some(bh) = backing(vm) {
                             if let Some(Obj::Array { data, .. }) = vm.heap.get_mut(bh) {
                                 for (i, x) in bytes.iter().enumerate() {
-                                    if let Some(slot) = data.get_mut(pos0 + i) {
+                                    if let Some(slot) = data.get_mut(pos0 * es + i) {
                                         *slot = V::I32(*x as i8 as i32);
                                     }
                                 }
                             }
                         }
-                        pseudo_set(vm, this, P_BBUF_POS, V::I32((pos0 + len) as i32));
+                        pseudo_set(
+                            vm,
+                            this,
+                            P_BBUF_POS,
+                            V::I32((pos0 + len / es) as i32),
+                        );
                     }
                 }
                 _ => {
@@ -1918,9 +2024,9 @@ fn nio_call(vm: &mut Vm, name: &str, args: &[V]) -> Option<Option<V>> {
                     };
                     // Index form putInt(i, v) etc.: 3 args.
                     let (pos, adv) = if args.len() > 2 {
-                        (i32v(args[1]).max(0) as usize, 0)
+                        (i32v(args[1]).max(0) as usize * es, 0)
                     } else {
-                        (pos0, bytes.len())
+                        (pos0 * es, bytes.len() / es)
                     };
                     let v2 = if args.len() > 2 { args[2] } else { v };
                     let bytes = if args.len() > 2 {
@@ -1943,7 +2049,7 @@ fn nio_call(vm: &mut Vm, name: &str, args: &[V]) -> Option<Option<V>> {
                             vm,
                             this,
                             P_BBUF_POS,
-                            V::I32((pos0 + bytes.len()) as i32),
+                            V::I32((pos0 + adv) as i32),
                         );
                     }
                 }
@@ -1958,13 +2064,15 @@ fn nio_call(vm: &mut Vm, name: &str, args: &[V]) -> Option<Option<V>> {
                 "getShort" | "getChar" => 2,
                 _ => 1,
             };
+            let es = esz(vm);
             let pos = if args.len() > 1 && matches!(args[1], V::I32(_) | V::I64(_)) {
-                i32v(args[1]).max(0) as usize
+                i32v(args[1]).max(0) as usize * es
             } else {
-                bpos(vm)
+                bpos(vm) * es
             };
             if name == "get" && args.len() > 1 && matches!(args[1], V::Ref(_)) {
-                // get(byte[], off, len) — bulk read.
+                // get(dst[], off, len) — bulk read; `len` is in
+                // elements for typed views.
                 let (dst, off, len) = (
                     args[1],
                     args.get(2).map(|v| i32v(*v).max(0) as usize).unwrap_or(0),
@@ -1972,29 +2080,92 @@ fn nio_call(vm: &mut Vm, name: &str, args: &[V]) -> Option<Option<V>> {
                         .map(|v| i32v(*v).max(0) as usize)
                         .unwrap_or(usize::MAX),
                 );
-                if let Some(bytes) = read_at(vm, pos, len.min(usize::MAX / 2).min(len)) {
+                let is_float = matches!(
+                    vm.heap.get(this),
+                    Some(Obj::Host { desc, .. }) if desc.contains("Float")
+                );
+                if let Some(bytes) =
+                    read_at(vm, pos, len.min(usize::MAX / 8).saturating_mul(es))
+                {
                     let n = bytes.len();
+                    let le = little(vm);
                     if let V::Ref(dh) = dst {
                         if let Some(Obj::Array { data, .. }) = vm.heap.get_mut(dh) {
-                            for (i, x) in bytes.iter().enumerate() {
-                                if let Some(slot) = data.get_mut(off + i) {
-                                    *slot = V::I32(*x as i8 as i32);
+                            for (i, slot) in data.iter_mut().enumerate().skip(off) {
+                                let at = (i - off) * es;
+                                let mut e = vec![0u8; es];
+                                if let Some(src) = bytes.get(at..at + es) {
+                                    e.copy_from_slice(src);
                                 }
+                                if le {
+                                    e.reverse();
+                                }
+                                *slot = match (es, is_float) {
+                                    (8, true) => V::F64(f64::from_be_bytes(
+                                        e[..8].try_into().unwrap_or([0; 8]),
+                                    )),
+                                    (8, false) => V::I64(i64::from_be_bytes(
+                                        e[..8].try_into().unwrap_or([0; 8]),
+                                    )),
+                                    (4, true) => V::F32(f32::from_be_bytes(
+                                        e[..4].try_into().unwrap_or([0; 4]),
+                                    )),
+                                    (4, false) => V::I32(i32::from_be_bytes(
+                                        e[..4].try_into().unwrap_or([0; 4]),
+                                    )),
+                                    (2, _) => V::I32(i16::from_be_bytes(
+                                        e[..2].try_into().unwrap_or([0; 2]),
+                                    ) as i32),
+                                    _ => V::I32(e[0] as i8 as i32),
+                                };
                             }
                         }
                     }
-                    pseudo_set(vm, this, P_BBUF_POS, V::I32((pos + n) as i32));
+                    pseudo_set(vm, this, P_BBUF_POS, V::I32((pos / es + n / es) as i32));
                 }
                 return Some(Some(args[0]));
             }
+            // A `get()`/`get(index)` on a typed view reads one element.
+            let size = if es > 1 && (name == "get" || name == "getByte") {
+                es
+            } else {
+                size
+            };
+            let is_float = matches!(
+                vm.heap.get(this),
+                Some(Obj::Host { desc, .. }) if desc.contains("Float")
+            );
             let mut bytes = read_at(vm, pos, size).unwrap_or_else(|| vec![0; size]);
             if little(vm) {
                 bytes.reverse();
             }
             if args.len() == 1 {
-                pseudo_set(vm, this, P_BBUF_POS, V::I32((pos + size) as i32));
+                pseudo_set(
+                    vm,
+                    this,
+                    P_BBUF_POS,
+                    V::I32((pos / es + size / es) as i32),
+                );
             }
             let v = match name {
+                "get" if es > 1 => match (es, is_float) {
+                    (8, true) => V::F64(f64::from_be_bytes(
+                        bytes[..8].try_into().unwrap_or([0; 8]),
+                    )),
+                    (8, false) => V::I64(i64::from_be_bytes(
+                        bytes[..8].try_into().unwrap_or([0; 8]),
+                    )),
+                    (4, true) => V::F32(f32::from_be_bytes(
+                        bytes[..4].try_into().unwrap_or([0; 4]),
+                    )),
+                    (4, false) => V::I32(i32::from_be_bytes(
+                        bytes[..4].try_into().unwrap_or([0; 4]),
+                    )),
+                    (2, _) => {
+                        V::I32(i16::from_be_bytes(bytes[..2].try_into().unwrap_or([0; 2])) as i32)
+                    }
+                    _ => V::I32(bytes[0] as i8 as i32),
+                },
                 "getInt" => V::I32(i32::from_be_bytes(
                     bytes[..4].try_into().unwrap_or([0; 4]),
                 )),

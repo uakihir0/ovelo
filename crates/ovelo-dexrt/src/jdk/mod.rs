@@ -59,6 +59,10 @@ pub(crate) const P_DRAW_COLOR: u64 = 0xFFFD_FEE1;
 /// backing bytes live in `HostState::Slot`.
 pub(crate) const P_BBUF_POS: u64 = 0xFFFD_FEE2;
 pub(crate) const P_BBUF_ORD: u64 = 0xFFFD_FEE3;
+/// Element width (bytes) for a typed buffer view (`asIntBuffer`…):
+/// cursor positions are element indices, capacity is backing/esz.
+/// Absent or 1 = plain `ByteBuffer` (positions are bytes).
+pub(crate) const P_BBUF_ESZ: u64 = 0xFFFD_FEEF;
 /// `Message` routing: target `Handler`, payload `obj`, `callback`
 /// `Runnable` — and a `Handler`'s own `Handler.Callback` — so
 /// `obtainMessage(...).sendToTarget()`/`sendMessage` actually deliver
@@ -267,14 +271,17 @@ pub(crate) fn run_on_worker(
     r: u32,
 ) -> std::result::Result<Option<V>, ovelo_error::OveloError> {
     let prev = vm.cur_thread;
+    let prev_r = vm.cur_runnable;
     worker_thread(vm);
     vm.cur_thread = vm.worker_thread_h;
+    vm.cur_runnable = r;
     let v = if is_message(vm, r) {
         dispatch_message(vm, r)
     } else {
         vm.call_virtual(r, "run", &[])
     };
     vm.cur_thread = prev;
+    vm.cur_runnable = prev_r;
     v
 }
 
@@ -814,6 +821,9 @@ pub(crate) fn call(
     if let Some(r) = gfx::call(vm, class, name, sig, args)? {
         return Ok(Some(r));
     }
+    if let Some(r) = gl::call_static(vm, class, name, sig, args)? {
+        return Ok(Some(r));
+    }
     if let Some(r) = gl::call(vm, class, name, sig, args)? {
         return Ok(Some(r));
     }
@@ -892,7 +902,28 @@ fn universal(vm: &mut Vm, class: &str, name: &str, sig: &str, args: &[V]) -> Rt<
         // kotlinx MainCoroutineDispatcher.getImmediate() returns the
         // dispatcher itself.
         "getImmediate" => Some(Some(args[0])),
-        "notify" | "notifyAll" | "wait" | "finalize" => Some(None),
+        "notify" | "notifyAll" | "finalize" => Some(None),
+        "wait" => {
+            // A worker thread's `wait()` can't really suspend — yield
+            // with ovelo.park so the drain lets other runnables (the
+            // render task that will set the flag it waits on) run, then
+            // re-enter. On the main thread stay a no-op.
+            if vm.cur_thread != 0 && vm.cur_thread != vm.main_thread_h {
+                // wait() / wait(ms): record a wake deadline — with no
+                // timeout use a short retry slice.
+                let ms = match args.get(1).copied().unwrap_or(V::I64(1)) {
+                    V::I64(m) => m.max(1),
+                    V::I32(m) => (m as i64).max(1),
+                    _ => 1,
+                };
+                let due = (now_ms().saturating_add(ms)).max(0) as u64;
+                if vm.cur_runnable != 0 {
+                    vm.sleep_until.insert(vm.cur_runnable, due);
+                }
+                return Err(crate::E::Vm(crate::err("ovelo.park")));
+            }
+            Some(None)
+        }
         "compareTo" if args.len() == 2 && !desc_is_a(class, "Ljava/lang/Enum;") => {
             // Generic compareTo: boxed numbers and strings only;
             // enums compare by ordinal in `enum_call`.
@@ -2295,9 +2326,15 @@ pub(crate) fn host_supers(d: &str) -> &'static [&'static str] {
         "Landroid/widget/FrameLayout;"
         | "Landroid/widget/RelativeLayout;"
         | "Landroid/widget/AbsoluteLayout;"
-        | "Landroid/widget/GridLayout;"
-        | "Landroid/widget/TableLayout;"
-        | "Landroid/widget/TableRow;" => &["Landroid/view/ViewGroup;", "Landroid/view/View;", OBJ],
+        | "Landroid/widget/GridLayout;" => &["Landroid/view/ViewGroup;", "Landroid/view/View;", OBJ],
+        // AOSP: TableLayout extends LinearLayout (always vertical),
+        // TableRow extends LinearLayout (always horizontal).
+        "Landroid/widget/TableLayout;" | "Landroid/widget/TableRow;" => &[
+            "Landroid/widget/LinearLayout;",
+            "Landroid/view/ViewGroup;",
+            "Landroid/view/View;",
+            OBJ,
+        ],
         "Landroid/widget/ScrollView;" | "Landroid/widget/HorizontalScrollView;" => &[
             "Landroid/widget/FrameLayout;",
             "Landroid/view/ViewGroup;",

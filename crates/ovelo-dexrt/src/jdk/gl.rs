@@ -54,6 +54,24 @@ struct Prim {
     colors: Vec<u32>,
 }
 
+/// A `glVertexAttribPointer` binding (VBO or direct-buffer form).
+#[derive(Clone, Default)]
+struct Attrib {
+    /// Location name from `glGetAttribLocation` — identifies semantics
+    /// ("position", "inColor", "inCenter", …).
+    name: String,
+    size: i32,
+    ty: i32,
+    normalized: bool,
+    stride: i32,
+    /// Byte offset in the bound VBO, or 0 when `buf` is set.
+    off: usize,
+    /// Direct `Buffer` handle (non-VBO form) when positive; negative
+    /// = the negated id of the VBO bound at pointer time; 0 = none.
+    buf: i32,
+    enabled: bool,
+}
+
 struct GlState {
     mode: i32,
     proj: [f32; 16],
@@ -70,6 +88,20 @@ struct GlState {
     /// Last size `onSurfaceChanged` reported; (0,0) = not yet called.
     size: (i32, i32),
     prims: Vec<Prim>,
+    // ----- GLES20 program-pipeline state -----
+    attribs: HashMap<i32, Attrib>,
+    attrib_names: HashMap<i32, String>,
+    vbos: HashMap<i32, Vec<u8>>,
+    vbo_arr: i32,
+    vbo_idx: i32,
+    next_id: i32,
+    /// Uniform locations -> uploaded values (matrix uniforms are
+    /// 16-float; `uni_names` holds the shader names).
+    uniforms: HashMap<i32, Vec<f32>>,
+    uni_names: HashMap<i32, String>,
+    /// `GL_BLEND` enable — when off, source alpha is ignored
+    /// (framebuffer write is opaque), so recorded colors force a=1.
+    blend: bool,
 }
 
 impl GlState {
@@ -89,6 +121,15 @@ impl GlState {
             created: false,
             size: (0, 0),
             prims: Vec::new(),
+            attribs: HashMap::new(),
+            attrib_names: HashMap::new(),
+            vbos: HashMap::new(),
+            vbo_arr: 0,
+            vbo_idx: 0,
+            next_id: 1,
+            uniforms: HashMap::new(),
+            uni_names: HashMap::new(),
+            blend: false,
         }
     }
 }
@@ -201,7 +242,11 @@ fn elem_at(vm: &Vm, arr: u32, off: usize) -> V {
 }
 
 fn bbuf_pos(vm: &Vm, buf: u32) -> usize {
-    i32v(pseudo_get(vm, buf, super::P_BBUF_POS).unwrap_or(V::I32(0))).max(0) as usize
+    // Typed views store element-indexed positions — GL paths read raw
+    // bytes, so convert via the element width.
+    let esz = i32v(pseudo_get(vm, buf, super::P_BBUF_ESZ).unwrap_or(V::I32(1))).clamp(1, 8)
+        as usize;
+    i32v(pseudo_get(vm, buf, super::P_BBUF_POS).unwrap_or(V::I32(0))).max(0) as usize * esz
 }
 
 fn bbuf_le(vm: &Vm, buf: u32) -> bool {
@@ -221,7 +266,8 @@ fn elem_w(ty: i32) -> usize {
 /// is the entry index (vertex number); returns the component values
 /// packed into a `[f32; 4]` (unused lanes 0).
 fn read_arr(vm: &Vm, a: &Arr, idx: i32) -> [f32; 4] {
-    let mut o = [0.0f32; 4];
+    // GL default for missing components is (0, 0, 0, 1).
+    let mut o = [0.0f32, 0.0, 0.0, 1.0];
     let pos = bbuf_pos(vm, a.buf);
     if let Some(arr) = elem_arr(vm, a.buf) {
         // Typed view (FloatBuffer/IntBuffer): one element per
@@ -439,6 +485,10 @@ fn to_ops(st: &GlState) -> Vec<CanvasOp> {
                     });
                 }
             }
+            -2 => {
+                // Reconstructed circle — verts form a closed fan.
+                fill(&mut ops, &(0..n).collect::<Vec<_>>());
+            }
             _ => {}
         }
     }
@@ -506,18 +556,26 @@ pub(crate) fn gl_frame(vm: &mut Vm, view: u32, w: i32, h: i32) -> Vec<CanvasOp> 
         });
     }
     state(gl, |s| s.prims.clear());
+    // GLES20 draws record onto the shared state (key 0) — clear it too.
+    if gl != GL20 {
+        state(GL20, |s| s.prims.clear());
+    }
     let r = vm.call_virtual_sig(
         renderer,
         "onDrawFrame",
         &["Ljavax/microedition/khronos/opengles/GL10;"],
         &[V::Ref(gl)],
     );
-    let ops = state(gl, |s| to_ops(s));
+    let mut ops = state(gl, |s| to_ops(s));
+    if gl != GL20 {
+        ops.extend(state(GL20, |s| to_ops(s)));
+    }
     if std::env::var_os("OVELO_DRAWDBG").is_some() {
         eprintln!(
-            "[gldbg] onDrawFrame {w}x{h} -> {} ops err={:?}",
+            "[gldbg] onDrawFrame {w}x{h} -> {} ops err={:?} first={:?}",
             ops.len(),
-            r.is_err()
+            r.is_err(),
+            ops.iter().take(3).collect::<Vec<_>>()
         );
     }
     ops
@@ -821,4 +879,725 @@ fn read_mat(vm: &Vm, v: Option<&V>, off: Option<&V>, fixed: bool) -> [f32; 16] {
         }
     }
     m
+}
+
+// ---------------------------------------------------------------------
+// GLES20 program-pipeline statics + android.opengl.Matrix. Programs and
+// shaders are opaque ids; vertex data arrives via VBO uploads or direct
+// buffers, the MVP via `glUniformMatrix4fv`. All GLES20 state hangs off
+// the single shared GL object (STATES key 0).
+//
+// Static methods have no receiver — params start at args[0].
+
+const GL20: u32 = 0;
+
+/// Guest string arg → String.
+fn gstr(vm: &Vm, v: &V) -> String {
+    match v {
+        V::Ref(h) => match vm.heap.get(*h) {
+            Some(Obj::Str(s)) => s.clone(),
+            _ => String::new(),
+        },
+        _ => String::new(),
+    }
+}
+
+/// `float[]` arg → Vec<f32> (`v` is the array, `off` its offset arg).
+/// Also accepts a `FloatBuffer`/`ByteBuffer` host object.
+fn farr(vm: &Vm, v: &V, off: &V, n: usize) -> Vec<f32> {
+    let o = i32v(*off).max(0) as usize;
+    match v {
+        V::Ref(h) => match vm.heap.get(*h) {
+            Some(Obj::Array { data, .. }) => (0..n)
+                .map(|k| data.get(o + k).map(f32v).unwrap_or(0.0))
+                .collect(),
+            Some(Obj::Host {
+                state: HostState::Slot(_) | HostState::Bytes(..),
+                ..
+            }) => {
+                let pos = bbuf_pos(vm, *h);
+                let le = bbuf_le(vm, *h);
+                (0..n)
+                    .map(|k| {
+                        let b: Vec<u8> =
+                            (0..4).map(|j| byte_at(vm, *h, pos + o * 4 + k * 4 + j)).collect();
+                        let a: [u8; 4] = b.try_into().unwrap_or([0; 4]);
+                        if le {
+                            f32::from_le_bytes(a)
+                        } else {
+                            f32::from_be_bytes(a)
+                        }
+                    })
+                    .collect()
+            }
+            _ => vec![0.0; n],
+        },
+        _ => vec![0.0; n],
+    }
+}
+
+/// Copy `size` bytes out of a guest `Buffer` into a VBO byte store.
+fn buf_bytes(vm: &Vm, buf: &V, size: usize) -> Vec<u8> {
+    let V::Ref(h) = buf else { return vec![0; size] };
+    if let Some(arr) = elem_arr(vm, *h) {
+        // Typed view (IntBuffer/FloatBuffer): one element per 4-byte
+        // word stored little-endian — matches how the buffer was
+        // populated from guest ints/floats.
+        if let Some(Obj::Array { data, .. }) = vm.heap.get(arr) {
+            let pos = bbuf_pos(vm, *h);
+            let mut out = Vec::with_capacity(size);
+            for i in 0..size / 4 {
+                let v = i32v(data.get(pos + i).copied().unwrap_or(V::I32(0)));
+                out.extend_from_slice(&v.to_le_bytes());
+            }
+            out.resize(size, 0);
+            return out;
+        }
+    }
+    let pos = bbuf_pos(vm, *h);
+    (0..size).map(|i| byte_at(vm, *h, pos + i)).collect()
+}
+
+/// Read one attribute's component set at vertex `i` — VBO or direct.
+fn attr_at(vm: &Vm, st: &GlState, a: &Attrib, i: usize) -> [f32; 4] {
+    if a.buf > 0 {
+        // Direct buffer/array path — same decoding as glVertexPointer.
+        let arr = Arr {
+            buf: a.buf as u32,
+            size: a.size,
+            ty: a.ty,
+            stride: a.stride,
+        };
+        let mut c = read_arr(vm, &arr, i as i32);
+        if a.ty == 0x1401 && !a.normalized {
+            for v in &mut c {
+                *v /= 255.0;
+            }
+        }
+        return c;
+    }
+    // VBO path: `buf` is the negated bound buffer id, `off` the byte
+    // offset into it.
+    let Some(data) = st.vbos.get(&(-a.buf)) else {
+        return [0.0; 4];
+    };
+    // GL default for missing components is (0, 0, 0, 1).
+    let mut o = [0.0f32, 0.0, 0.0, 1.0];
+    let w = elem_w(a.ty);
+    let stride = if a.stride > 0 {
+        a.stride as usize
+    } else {
+        a.size.max(1) as usize * w
+    };
+    let base = a.off + i * stride;
+    for (k, o) in o.iter_mut().enumerate().take(a.size.clamp(0, 4) as usize) {
+        let at = base + k * w;
+        *o = match a.ty {
+            0x1406 => data
+                .get(at..at + 4)
+                .map(|b| f32::from_le_bytes([b[0], b[1], b[2], b[3]]))
+                .unwrap_or(0.0),
+            0x1401 => {
+                let b = data.get(at).copied().unwrap_or(0) as f32;
+                if a.normalized {
+                    b / 255.0
+                } else {
+                    b
+                }
+            }
+            _ => 0.0,
+        };
+    }
+    o
+}
+
+/// The first 16-float uniform whose name mentions "mvp" — the model
+/// view projection matrix guests upload via `glUniformMatrix4fv`.
+fn mvp_uniform(st: &GlState) -> Option<[f32; 16]> {
+    for (&loc, name) in &st.uni_names {
+        if name.to_lowercase().contains("mvp") {
+            if let Some(v) = st.uniforms.get(&loc) {
+                if v.len() >= 16 {
+                    let mut m = [0.0f32; 16];
+                    m.copy_from_slice(&v[..16]);
+                    return Some(m);
+                }
+            }
+        }
+    }
+    None
+}
+
+/// GLES20 draw: resolve position/color/circle attribs per vertex and
+/// record a Prim exactly like the fixed-function path. `idxs` are the
+/// vertex indices to emit (glDrawArrays: a range; glDrawElements: the
+/// decoded index list).
+fn record20(vm: &Vm, st: &mut GlState, mode: i32, idxs: &[i32]) {
+    let find = |n: &str| -> Option<Attrib> {
+        st.attribs
+            .values()
+            .find(|a| a.enabled && a.name == n)
+            .cloned()
+    };
+    if std::env::var_os("OVELO_DRAWDBG").is_some() {
+        static N: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        if N.fetch_add(1, std::sync::atomic::Ordering::Relaxed) < 3 {
+            for (k, a) in &st.attribs {
+                eprintln!(
+                    "[gldbg] attr {k} name={} sz={} ty={:#x} nrm={} str={} off={} buf={} en={}",
+                    a.name, a.size, a.ty, a.normalized, a.stride, a.off, a.buf, a.enabled
+                );
+            }
+            eprintln!("[gldbg] vbos={:?} unames={:?}", st.vbos.keys().map(|k| (*k, st.vbos[k].len())).collect::<Vec<_>>(), st.uni_names);
+            if let Some(pa) = st.attribs.values().find(|a| a.enabled && a.name == "position").cloned() {
+                for i in 0..4usize {
+                    eprintln!("[gldbg] v{i} pos={:?} col={:?}", attr_at(vm, st, &pa, i), st.attribs.values().find(|a| a.enabled && a.name.contains("olor")).cloned().map(|a| attr_at(vm, st, &a, i)));
+                }
+                eprintln!("[gldbg] idxs0={:?} mvp={:?}", &idxs[..idxs.len().min(8)], mvp_uniform(st).map(|m| m[..4].to_vec()));
+            }
+        }
+    }
+    let Some(pos_a) = find("position") else { return };
+    let col_a = st
+        .attribs
+        .values()
+        .find(|a| a.enabled && a.name.contains("olor"))
+        .cloned();
+    let ctr_a = find("inCenter");
+    let rad_a = find("inRadiusSquared");
+    let mvp = mvp_uniform(st);
+    let (vx, vy, vw, vh) = st.vp;
+    let to_px = |v: [f32; 4]| -> (f32, f32) {
+        let o = match &mvp {
+            Some(m) => apply(m, v),
+            None => v,
+        };
+        let w = if o[3] != 0.0 { o[3] } else { 1.0 };
+        (
+            vx as f32 + (o[0] / w + 1.0) * vw as f32 / 2.0,
+            vy as f32 + vh as f32 - (o[1] / w + 1.0) * vh as f32 / 2.0,
+        )
+    };
+    let mut verts = Vec::with_capacity(idxs.len());
+    let mut colors = Vec::with_capacity(idxs.len());
+    // Circle quads repeat one circle's center/radius per vertex —
+    // dedupe consecutive repeats into a single fan (mode -2).
+    let mut last_c: Option<(f32, f32, f32)> = None;
+    for &i in idxs {
+        let i = i.max(0) as usize;
+        let p = attr_at(vm, st, &pos_a, i);
+        let mut col = match &col_a {
+            Some(a) => argb(&attr_at(vm, st, a, i)),
+            None => st.color,
+        };
+        if !st.blend {
+            col |= 0xFF00_0000;
+        }
+        if let (Some(ca), Some(ra)) = (&ctr_a, &rad_a) {
+            let c = attr_at(vm, st, ca, i);
+            let r = attr_at(vm, st, ra, i);
+            // inCenter/inRadiusSquared are already pixel-space (the
+            // renderer world->px-transforms them on the guest side).
+            let cir = (c[0], c[1], r[0].max(0.0).sqrt());
+            if last_c != Some(cir) {
+                last_c = Some(cir);
+                let mut v = Vec::with_capacity(25);
+                for k in 0..=24 {
+                    let a = k as f32 * std::f32::consts::TAU / 24.0;
+                    v.push((cir.0 + a.cos() * cir.2, cir.1 - a.sin() * cir.2));
+                }
+                st.prims.push(Prim {
+                    mode: -2,
+                    verts: v,
+                    colors: vec![col],
+                });
+            }
+        }
+        verts.push(to_px([p[0], p[1], p[2], 1.0]));
+        colors.push(col);
+    }
+    if mode >= 0 {
+        st.prims.push(Prim { mode, verts, colors });
+    }
+}
+
+/// GLES20 statics — handled names return, the rest falls through to
+/// dex execution (real Java for the Matrix helpers we don't intercept).
+pub(crate) fn call_static(
+    vm: &mut Vm,
+    class: &str,
+    name: &str,
+    _sig: &str,
+    args: &[V],
+) -> Rt<Option<Option<V>>> {
+    if class == "Landroid/opengl/Matrix;" {
+        return Ok(matrix_call(vm, name, args));
+    }
+    if class != "Landroid/opengl/GLES20;" && class != "Landroid/opengl/GLES11Ext;" {
+        return Ok(None);
+    }
+    if std::env::var_os("OVELO_DRAWDBG").is_some() {
+        static N: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        if N.fetch_add(1, std::sync::atomic::Ordering::Relaxed) < 200 {
+            eprintln!("[gldbg] gles20 {name} args={args:?}");
+        }
+    }
+    let i = |n: usize| args.get(n).map(|v| i32v(*v)).unwrap_or(0);
+    let f = |n: usize| args.get(n).map(f32v).unwrap_or(0.0);
+    Ok(Some(match name {
+        "glCreateShader" | "glCreateProgram" | "glGetAttribLocation" | "glGetUniformLocation" => {
+            Some(V::I32(state(GL20, |s| {
+                if name.starts_with("glGet") {
+                    let key = gstr(vm, args.get(1).unwrap_or(&V::I32(0)));
+                    let map = if name.contains("Attrib") {
+                        &mut s.attrib_names
+                    } else {
+                        &mut s.uni_names
+                    };
+                    if let Some((&loc, _)) = map.iter().find(|(_, n)| **n == key) {
+                        return loc;
+                    }
+                    let loc = s.next_id;
+                    s.next_id += 1;
+                    map.insert(loc, key);
+                    loc
+                } else {
+                    let id = s.next_id;
+                    s.next_id += 1;
+                    id
+                }
+            })))
+        }
+        "glGenBuffers" | "glGenTextures" | "glGenFramebuffers" | "glGenRenderbuffers" => {
+            let n = i(0).max(0);
+            if let V::Ref(h) = args.get(1).copied().unwrap_or(V::I32(0)) {
+                let off = i(2).max(0) as usize;
+                let ids: Vec<i32> = state(GL20, |s| {
+                    (0..n)
+                        .map(|_| {
+                            let id = s.next_id;
+                            s.next_id += 1;
+                            id
+                        })
+                        .collect()
+                });
+                if let Some(Obj::Array { data, .. }) = vm.heap.get_mut(h) {
+                    for (k, id) in ids.iter().enumerate() {
+                        if let Some(slot) = data.get_mut(off + k) {
+                            *slot = V::I32(*id);
+                        }
+                    }
+                }
+            }
+            None
+        }
+        "glBindBuffer" => {
+            let (t, id) = (i(0), i(1));
+            state(GL20, |s| {
+                if t == 0x8892 {
+                    s.vbo_arr = id;
+                } else if t == 0x8893 {
+                    s.vbo_idx = id;
+                }
+                if id > 0 {
+                    s.vbos.entry(id).or_default();
+                }
+            });
+            None
+        }
+        "glBufferData" => {
+            let (t, size) = (i(0), i(1).max(0) as usize);
+            if std::env::var_os("OVELO_DRAWDBG").is_some() {
+                if let V::Ref(h) = args.get(2).copied().unwrap_or(V::I32(0)) {
+                    eprintln!(
+                        "[gldbg] bufferData size={size} obj={:?}",
+                        vm.heap.get(h).map(|o| match o {
+                            Obj::Host { desc, state, .. } =>
+                                format!("Host {desc} {state:?}"),
+                            Obj::Instance { .. } => "Instance".into(),
+                            Obj::Array { elem, .. } => format!("Array[{elem}]"),
+                            _ => "other".into(),
+                        })
+                    );
+                }
+            }
+            let data = buf_bytes(vm, args.get(2).unwrap_or(&V::I32(0)), size);
+            state(GL20, |s| {
+                let id = if t == 0x8893 { s.vbo_idx } else { s.vbo_arr };
+                s.vbos.insert(id, data);
+            });
+            None
+        }
+        "glBufferSubData" => {
+            let (t, off, size) = (i(0), i(1).max(0) as usize, i(2).max(0) as usize);
+            let data = buf_bytes(vm, args.get(3).unwrap_or(&V::I32(0)), size);
+            state(GL20, |s| {
+                let id = if t == 0x8893 { s.vbo_idx } else { s.vbo_arr };
+                let v = s.vbos.entry(id).or_default();
+                if v.len() < off + size {
+                    v.resize(off + size, 0);
+                }
+                v[off..off + size].copy_from_slice(&data);
+            });
+            None
+        }
+        "glVertexAttribPointer" => {
+            // (indx, size, type, normalized, stride, Buffer | vbo offset)
+            let idx = i(0);
+            state(GL20, |s| {
+                let (buf, off) = match args.get(5).copied().unwrap_or(V::I32(0)) {
+                    V::Ref(h) => (h as i32, 0),
+                    o => (-s.vbo_arr, i32v(o).max(0) as usize),
+                };
+                s.attribs.insert(
+                    idx,
+                    Attrib {
+                        name: s.attrib_names.get(&idx).cloned().unwrap_or_default(),
+                        size: i(1),
+                        ty: i(2),
+                        normalized: i(3) != 0,
+                        stride: i(4),
+                        off,
+                        buf,
+                        enabled: true,
+                    },
+                );
+            });
+            None
+        }
+        "glEnableVertexAttribArray" | "glDisableVertexAttribArray" => {
+            let idx = i(0);
+            state(GL20, |s| {
+                if let Some(a) = s.attribs.get_mut(&idx) {
+                    a.enabled = name.starts_with("glEnable");
+                }
+            });
+            None
+        }
+        "glEnable" | "glDisable" => {
+            let cap = i(0);
+            if cap == 0x0BE2 {
+                // GL_BLEND
+                state(GL20, |s| s.blend = name.starts_with("glEnable"));
+            }
+            None
+        }
+        "glUniformMatrix4fv" => {
+            let (loc, n) = (i(0), (i(1) * 16).max(0) as usize);
+            let vals = farr(
+                vm,
+                args.get(3).unwrap_or(&V::I32(0)),
+                args.get(4).unwrap_or(&V::I32(0)),
+                n,
+            );
+            state(GL20, |s| {
+                s.uniforms.insert(loc, vals);
+            });
+            None
+        }
+        "glDrawArrays" => {
+            let (mode, first, count) = (i(0), i(1), i(2).max(0));
+            let idxs: Vec<i32> = (first..first + count).collect();
+            state(GL20, |s| record20(vm, s, mode, &idxs));
+            None
+        }
+        "glDrawElements" => {
+            let (mode, count, ty) = (i(0), i(1).max(0), i(2));
+            match args.get(3) {
+                Some(V::Ref(b)) if *b != 0 => {
+                    let idxs: Vec<i32> = (0..count as usize)
+                        .map(|k| read_idx(vm, *b, ty, k))
+                        .collect();
+                    state(GL20, |s| record20(vm, s, mode, &idxs));
+                }
+                _ => {
+                    let off = i(3).max(0) as usize;
+                    let idxs: Vec<i32> = state(GL20, |s| {
+                        let w = elem_w(ty);
+                        match s.vbos.get(&s.vbo_idx) {
+                            Some(d) => (0..count as usize)
+                                .map(|k| {
+                                    let at = off + k * w;
+                                    let mut v = 0u64;
+                                    for j in 0..w {
+                                        v |= (d.get(at + j).copied().unwrap_or(0) as u64)
+                                            << (8 * j);
+                                    }
+                                    v as i32
+                                })
+                                .collect(),
+                            None => Vec::new(),
+                        }
+                    });
+                    state(GL20, |s| record20(vm, s, mode, &idxs));
+                }
+            }
+            let _ = mode;
+            None
+        }
+        "glClear" => {
+            if i(0) & 0x4000 != 0 {
+                state(GL20, |s| {
+                    s.prims.push(Prim {
+                        mode: -1,
+                        verts: Vec::new(),
+                        colors: vec![s.clear],
+                    });
+                });
+            }
+            None
+        }
+        "glClearColor" => {
+            let a = argb(&[f(0), f(1), f(2), f(3)]);
+            state(GL20, |s| s.clear = a);
+            None
+        }
+        "glViewport" => {
+            state(GL20, |s| s.vp = (i(0), i(1), i(2), i(3)));
+            None
+        }
+        "glLineWidth" => {
+            state(GL20, |s| s.line_w = f(0).max(0.5));
+            None
+        }
+        "glGetError" => Some(V::I32(0)),
+        "glGetIntegerv" => {
+            if let V::Ref(h) = args.get(1).copied().unwrap_or(V::I32(0)) {
+                if let Some(Obj::Array { data, .. }) = vm.heap.get_mut(h) {
+                    for e in data.iter_mut() {
+                        *e = V::I32(0);
+                    }
+                }
+            }
+            None
+        }
+        // Shader source/compile/link, blending, depth — harmless no-ops
+        // for a recorded-pipeline renderer.
+        _ => None,
+    }))
+}
+
+/// `android.opengl.Matrix` — column-major 4x4 helpers.
+/// `Some(None)` = handled void; `None` = let dex run the real method.
+fn matrix_call(vm: &mut Vm, name: &str, args: &[V]) -> Option<Option<V>> {
+    if std::env::var_os("OVELO_DRAWDBG").is_some() {
+        static N: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        if N.fetch_add(1, std::sync::atomic::Ordering::Relaxed) < 30 {
+            eprintln!("[gldbg] matrix {name} args={args:?}");
+        }
+    }
+    match name {
+        "setIdentityM" => {
+            farr_write(vm, args.first()?, args.get(1)?, &ident());
+        }
+        "orthoM" => {
+            let (l, r, b, t, n, fa) = (
+                f32v(args.get(2)?),
+                f32v(args.get(3)?),
+                f32v(args.get(4)?),
+                f32v(args.get(5)?),
+                f32v(args.get(6)?),
+                f32v(args.get(7)?),
+            );
+            farr_write(vm, 
+                args.first()?,
+                args.get(1)?,
+                &[
+                    2.0 / (r - l),
+                    0.0,
+                    0.0,
+                    0.0,
+                    0.0,
+                    2.0 / (t - b),
+                    0.0,
+                    0.0,
+                    0.0,
+                    0.0,
+                    -2.0 / (fa - n),
+                    0.0,
+                    -(r + l) / (r - l),
+                    -(t + b) / (t - b),
+                    -(fa + n) / (fa - n),
+                    1.0,
+                ],
+            );
+        }
+        "frustumM" => {
+            let (l, r, b, t, n, fa) = (
+                f32v(args.get(2)?),
+                f32v(args.get(3)?),
+                f32v(args.get(4)?),
+                f32v(args.get(5)?),
+                f32v(args.get(6)?),
+                f32v(args.get(7)?),
+            );
+            let mut m = [0.0f32; 16];
+            m[0] = 2.0 * n / (r - l);
+            m[5] = 2.0 * n / (t - b);
+            m[8] = (r + l) / (r - l);
+            m[9] = (t + b) / (t - b);
+            m[10] = -(fa + n) / (fa - n);
+            m[11] = -1.0;
+            m[14] = -2.0 * fa * n / (fa - n);
+            farr_write(vm, args.first()?, args.get(1)?, &m);
+        }
+        "perspectiveM" => {
+            let (fovy, aspect, near, far) = (
+                f32v(args.get(2)?),
+                f32v(args.get(3)?),
+                f32v(args.get(4)?),
+                f32v(args.get(5)?),
+            );
+            let f = 1.0 / (fovy.to_radians() / 2.0).tan();
+            let mut m = [0.0f32; 16];
+            m[0] = f / aspect;
+            m[5] = f;
+            m[10] = (far + near) / (near - far);
+            m[11] = -1.0;
+            m[14] = 2.0 * far * near / (near - far);
+            farr_write(vm, args.first()?, args.get(1)?, &m);
+        }
+        "setLookAtM" => {
+            let (ex, ey, ez) = (
+                f32v(args.get(2)?),
+                f32v(args.get(3)?),
+                f32v(args.get(4)?),
+            );
+            let (cx, cy, cz) = (
+                f32v(args.get(5)?),
+                f32v(args.get(6)?),
+                f32v(args.get(7)?),
+            );
+            let (ux, uy, uz) = (
+                f32v(args.get(8)?),
+                f32v(args.get(9)?),
+                f32v(args.get(10)?),
+            );
+            let mut f = [cx - ex, cy - ey, cz - ez];
+            let fl = (f[0] * f[0] + f[1] * f[1] + f[2] * f[2]).sqrt();
+            if fl > 0.0 {
+                f = [f[0] / fl, f[1] / fl, f[2] / fl];
+            }
+            // s = f × up
+            let mut s = [
+                f[1] * uz - f[2] * uy,
+                f[2] * ux - f[0] * uz,
+                f[0] * uy - f[1] * ux,
+            ];
+            let sl = (s[0] * s[0] + s[1] * s[1] + s[2] * s[2]).sqrt();
+            if sl > 0.0 {
+                s = [s[0] / sl, s[1] / sl, s[2] / sl];
+            }
+            // u = s × f
+            let u = [
+                s[1] * f[2] - s[2] * f[1],
+                s[2] * f[0] - s[0] * f[2],
+                s[0] * f[1] - s[1] * f[0],
+            ];
+            let m = [
+                s[0],
+                u[0],
+                -f[0],
+                0.0,
+                s[1],
+                u[1],
+                -f[1],
+                0.0,
+                s[2],
+                u[2],
+                -f[2],
+                0.0,
+                -(s[0] * ex + s[1] * ey + s[2] * ez),
+                -(u[0] * ex + u[1] * ey + u[2] * ez),
+                f[0] * ex + f[1] * ey + f[2] * ez,
+                1.0,
+            ];
+            farr_write(vm, args.first()?, args.get(1)?, &m);
+        }
+        "setRotateM" | "rotateM" => {
+            let (deg, x, y, z) = (
+                f32v(args.get(2)?),
+                f32v(args.get(3)?),
+                f32v(args.get(4)?),
+                f32v(args.get(5)?),
+            );
+            let mut m = ident();
+            if x != 0.0 || y != 0.0 || z != 0.0 {
+                let len = (x * x + y * y + z * z).sqrt();
+                let (x, y, z) = (x / len, y / len, z / len);
+                let (c, s) = (deg.to_radians().cos(), deg.to_radians().sin());
+                let nc = 1.0 - c;
+                m[0] = x * x * nc + c;
+                m[4] = x * y * nc - z * s;
+                m[8] = x * z * nc + y * s;
+                m[1] = y * x * nc + z * s;
+                m[5] = y * y * nc + c;
+                m[9] = y * z * nc - x * s;
+                m[2] = x * z * nc - y * s;
+                m[6] = y * z * nc + x * s;
+                m[10] = z * z * nc + c;
+            }
+            if name == "rotateM" {
+                let base = mat16(vm, args.first()?, args.get(1)?);
+                m = mul(&base, &m);
+            }
+            farr_write(vm, args.first()?, args.get(1)?, &m);
+        }
+        "multiplyMM" => {
+            let a = mat16(vm, args.get(2)?, args.get(3)?);
+            let b = mat16(vm, args.get(4)?, args.get(5)?);
+            farr_write(vm, args.first()?, args.get(1)?, &mul(&a, &b));
+        }
+        "multiplyMV" => {
+            let m = mat16(vm, args.get(2)?, args.get(3)?);
+            let vin = farr(vm, args.get(4)?, args.get(5)?, 4);
+            farr_write(vm, 
+                args.first()?,
+                args.get(1)?,
+                &apply(&m, [vin[0], vin[1], vin[2], vin[3]]),
+            );
+        }
+        "translateM" | "scaleM" => {
+            let m = mat16(vm, args.first()?, args.get(1)?);
+            let (x, y, z) = (
+                f32v(args.get(2)?),
+                f32v(args.get(3)?),
+                f32v(args.get(4)?),
+            );
+            let t = if name == "translateM" {
+                [
+                    1.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0, x, y, z, 1.0,
+                ]
+            } else {
+                [
+                    x, 0.0, 0.0, 0.0, 0.0, y, 0.0, 0.0, 0.0, 0.0, z, 0.0, 0.0, 0.0, 0.0, 1.0,
+                ]
+            };
+            farr_write(vm, args.first()?, args.get(1)?, &mul(&m, &t));
+        }
+        _ => return None,
+    }
+    Some(None)
+}
+
+/// Read a guest `float[]` into a column-major 4x4.
+fn mat16(vm: &Vm, v: &V, off: &V) -> [f32; 16] {
+    let v = farr(vm, v, off, 16);
+    let mut m = [0.0; 16];
+    m.copy_from_slice(&v);
+    m
+}
+
+/// Write `m` into a guest `float[]` at `off`.
+fn farr_write(vm: &mut Vm, v: &V, off: &V, m: &[f32]) {
+    if let V::Ref(h) = v {
+        if let Some(Obj::Array { data, .. }) = vm.heap.get_mut(*h) {
+            let o = i32v(*off).max(0) as usize;
+            for (k, e) in m.iter().enumerate() {
+                if let Some(slot) = data.get_mut(o + k) {
+                    *slot = V::F32(*e);
+                }
+            }
+        }
+    }
 }

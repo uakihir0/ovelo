@@ -292,6 +292,18 @@ pub struct Vm {
     /// `drain_runnables` once due; without this a self-rescheduling
     /// handler floods every drain tick regardless of its delay.
     pub(crate) delayed_runnables: Vec<(u32, bool, u64)>,
+    /// Runnables spawned by `Thread.start` — long-lived loops that
+    /// legitimately park/reschedule forever (game loops like bouncy's
+    /// FieldDriver), unlike executor workers which the repark budget
+    /// exists to stop. Keyed by runnable handle.
+    pub(crate) thread_runnables: std::collections::HashSet<u32>,
+    /// The runnable `run_on_worker` is executing right now — lets
+    /// `Thread.sleep(ms)` record a wake deadline against it.
+    pub(crate) cur_runnable: u32,
+    /// Runnable handle -> wall-clock ms the parked thread asked to
+    /// wake at (`Thread.sleep` in worker context writes; the drain
+    /// reads when requeueing into `delayed_runnables`).
+    pub(crate) sleep_until: HashMap<u32, u64>,
     /// ViewTreeObserver handle -> registered onGlobalLayout listeners.
     pub(crate) vto_listeners: HashMap<u32, Vec<u32>>,
     /// ViewTreeObserver handle -> `OnPreDrawListener` handles — Glide's
@@ -462,6 +474,9 @@ impl Vm {
             pending_activity: None,
             pending_runnables: std::collections::VecDeque::new(),
             delayed_runnables: Vec::new(),
+            thread_runnables: std::collections::HashSet::new(),
+            cur_runnable: 0,
+            sleep_until: HashMap::new(),
             vto_listeners: HashMap::new(),
             vto_predraw: HashMap::new(),
             draining: false,
@@ -1467,6 +1482,13 @@ impl Vm {
         self.pending_runnables.push_back((r, on_main));
     }
 
+    /// True while any runnable is queued or waiting on its wake time —
+    /// the frame loop drains continuously then (game threads sleep in
+    /// `delayed_runnables` between ticks) instead of on the idle cadence.
+    pub fn has_queued_runnables(&self) -> bool {
+        !self.pending_runnables.is_empty() || !self.delayed_runnables.is_empty()
+    }
+
     /// `enqueue_runnable` with a millisecond delay — the runnable sits
     /// in `delayed_runnables` until `drain_runnables` sees it due.
     pub(crate) fn enqueue_runnable_delayed(&mut self, r: u32, on_main: bool, delay_ms: i64) {
@@ -1512,6 +1534,8 @@ impl Vm {
         roots.extend(self.pending_runnables.iter().map(|(h, _)| *h));
         roots.extend(self.delayed_runnables.iter().map(|(h, _, _)| *h));
         roots.extend(self.parked_runnables.keys().copied());
+        roots.extend(self.thread_runnables.iter().copied());
+        roots.extend(self.sleep_until.keys().copied());
         roots.extend(self.reparked.iter().copied());
         roots.extend(self.repark_counts.keys().copied());
         roots.extend(self.vto_listeners.keys().copied());
@@ -1614,6 +1638,16 @@ impl Vm {
                 }
             }
             match &out {
+                Err(e) if e.cause() == "ovelo.park"
+                    && self.thread_runnables.contains(&r) =>
+                {
+                    // A `Thread` runnable that parked on Thread.sleep
+                    // waits out its requested deadline, then re-runs —
+                    // no repark budget: a game loop legitimately parks
+                    // once per frame forever.
+                    let due = self.sleep_until.remove(&r).unwrap_or(now);
+                    self.delayed_runnables.push((r, on_main, due));
+                }
                 Err(e) if e.cause() == "ovelo.park" => {
                     // A parked worker yields its slot and reschedules —
                     // the runnable re-enters `run()` on a later drain
