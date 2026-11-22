@@ -333,9 +333,13 @@ fn make_dex_view(vm: &Vm, info: &ovelo_dexrt::DexViewInfo, fonts: &Rc<FontSet>) 
         GuestView::Group(g)
     } else if info.desc.contains("Button") {
         GuestView::Btn(Button::new("", 16.0, dark, fonts.clone()))
-    } else if info.desc.contains("TextView")
+    } else if info.text.is_some()
+        || info.desc.contains("TextView")
         || info.desc.contains("EditText")
-        || info.text.is_some()
+        // Name checks miss TextView descendants whose names don't
+        // contain it (`MyTextClock` → TextClock → TextView): a view
+        // that gains text later must already be a Text widget.
+        || vm.extends_named(&info.desc, "TextView")
     {
         GuestView::Text(TextView::new("", 16.0, dark, fonts.clone()))
     } else {
@@ -751,11 +755,15 @@ impl GuestUi {
         let info = vm.dex_view(h)?;
         if viewdbg() {
             eprintln!(
-                "[viewdbg] node {} h{h} vis={} kids={} text={:?}",
+                "[viewdbg] node {} h{h} vis={} kids={} text={:?} frame={:?} tc={:?} lp={}x{}",
                 info.desc,
                 info.visible as u8,
                 info.children.len(),
-                info.text
+                info.text,
+                info.frame,
+                info.text_color,
+                info.lp_w,
+                info.lp_h,
             );
         }
         // First attach to the window: AOSP's dispatchAttachedToWindow

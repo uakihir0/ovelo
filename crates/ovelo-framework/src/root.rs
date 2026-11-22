@@ -97,6 +97,14 @@ impl ViewRootImpl {
             v.draw(&mut c);
             c.restore();
         }
+        if let Some(p) = std::env::var_os("OVELO_FRAMEDUMP") {
+            let px = surf.pixels();
+            let mut out = format!("P6\n{} {}\n255\n", surf.width(), surf.height()).into_bytes();
+            for c in px.as_chunks::<4>().0 {
+                out.extend_from_slice(&c[..3]);
+            }
+            let _ = std::fs::write(p, out);
+        }
         if std::env::var_os("OVELO_PIXDBG").is_some() {
             let px = surf.pixels();
             let non_white = px

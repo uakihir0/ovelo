@@ -208,6 +208,9 @@ pub struct Vm {
     /// Root of the tree that owns each activity's content frame —
     /// appcompat's real decor when it built one dex-side.
     pub(crate) decor_roots: HashMap<u32, u32>,
+    /// Attached `TextClock` views that tick — refreshed once per
+    /// `drain_runnables` pass (AOSP ticks them per postDelayed).
+    pub clock_views: Vec<u32>,
     /// Installed-APK resource index for `LayoutInflater.inflate` — `None`
     /// degrades inflation to bare placeholder views.
     pub apk_res: Option<res::ApkResources>,
@@ -436,6 +439,7 @@ impl Vm {
             cur_activity: 0,
             content_views: HashMap::new(),
             decor_roots: HashMap::new(),
+            clock_views: Vec::new(),
             apk_res: None,
             dbs: HashMap::new(),
             db_handles: HashMap::new(),
@@ -1498,6 +1502,9 @@ impl Vm {
         roots.extend(self.content_views.values().copied());
         roots.extend(self.decor_roots.keys().copied());
         roots.extend(self.decor_roots.values().copied());
+        // clock_views is deliberately NOT rooted: a clock is kept alive
+        // by its view-tree parent; once detached and unreferenced it is
+        // collected and drain_runnables prunes the stale handle.
         roots.extend(self.db_handles.values().copied());
         // obj_db/throw_sites/unsafe_offsets are NOT rooted: entries whose
         // owner object is dead are pruned after the sweep instead, so the
@@ -1600,6 +1607,29 @@ impl Vm {
                     self.park_spins = 0;
                 }
             }
+        }
+        // TextClock tick: AOSP reschedules the ticker runnable every
+        // second; the drain cadence is our clock signal. Handles are
+        // re-validated against the class chain — a GC'd slot recycled
+        // for a non-clock object must be dropped, not overwritten.
+        if !self.clock_views.is_empty() {
+            let mut live: Vec<u32> = Vec::with_capacity(self.clock_views.len());
+            for i in 0..self.clock_views.len() {
+                let h = self.clock_views[i];
+                // Same classification the registration site uses —
+                // `jdk::class_of` covers host-backed clocks whose
+                // class_idx is GX_NONE, which `heap.class_of` misses.
+                let is_clock = self.heap.get(h).is_some()
+                    && self.assignable_desc(
+                        &jdk::class_of(self, V::Ref(h)),
+                        "Landroid/widget/TextClock;",
+                    );
+                if is_clock {
+                    live.push(h);
+                    jdk::view::textclock_update(self, h);
+                }
+            }
+            self.clock_views = live;
         }
         self.draining = false;
         ran
