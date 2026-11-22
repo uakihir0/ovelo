@@ -1443,21 +1443,32 @@ fn run_app(store: &InstallStore, package: &str) -> Result<(), OveloError> {
     let ui2 = ui.clone();
     let mut dex_frame = 0u32;
     ovelo_host::run(win, move |w| {
+        let mut dex_touch: Vec<(i32, i32, i32)> = Vec::new();
         {
             let mut u = ui2.borrow_mut();
             for ev in w.take_input() {
                 let Some(pt) = ev.pointers.get(ev.action_index) else {
                     continue;
                 };
-                match ev.action {
+                // Android MotionEvent action codes — also forwarded to
+                // the dex view tree below (host widgets only cover
+                // host-materialized views).
+                let a = match ev.action {
                     ovelo_host::MotionAction::Down => {
                         u.root.dispatch_touch(true, pt.x as i32, pt.y as i32);
+                        0
                     }
                     ovelo_host::MotionAction::Up => {
                         u.root.dispatch_touch(false, pt.x as i32, pt.y as i32);
+                        1
                     }
-                    _ => {}
-                }
+                    ovelo_host::MotionAction::Move => 2,
+                    ovelo_host::MotionAction::PointerDown => 5,
+                    ovelo_host::MotionAction::PointerUp => 6,
+                    ovelo_host::MotionAction::Cancel => 3,
+                    _ => continue,
+                };
+                dex_touch.push((pt.x as i32, pt.y as i32, a));
             }
         }
         // Deferred onClick dispatches — queued during touch handling,
@@ -1466,6 +1477,21 @@ fn run_app(store: &InstallStore, package: &str) -> Result<(), OveloError> {
         let pending = ui2.borrow().drain_clicks();
         let mut dead = false;
         if let Some((vm, this)) = &mut guest {
+            // Forward pointer events into the dex view tree
+            // (MotionEvent → dex dispatchTouchEvent/onTouchEvent).
+            for (tx, ty, ta) in dex_touch.drain(..) {
+                match sup.supervise("touch", || vm.dispatch_touch(tx, ty, ta)) {
+                    worker::Outcome::Ok(Err(e)) => {
+                        println!("touch crashed: {}", e.cause());
+                    }
+                    worker::Outcome::Ok(_) => {}
+                    worker::Outcome::Crashed(p) => {
+                        println!("touch panic -> {}", p.display());
+                        dead = true;
+                        break;
+                    }
+                }
+            }
             for (l, vh) in pending {
                 match sup.supervise("onClick", || {
                     vm.call_virtual(l, "onClick", &[ovelo_dexrt::V::Ref(vh)])

@@ -136,6 +136,13 @@ const P_LP_DIR: u32 = u32::MAX - 29;
 /// by dex, so they get no canon field key to store under.
 const P_MSTART: u32 = u32::MAX - 42;
 const P_MEND: u32 = u32::MAX - 43;
+/// `setOnTouchListener` target — kept apart from P_LISTENER (click)
+/// so a view can carry both.
+const P_TOUCH_L: u32 = u32::MAX - 44;
+/// MotionEvent pseudo fields (host-bridged pointer events).
+const P_ME_ACTION: u32 = u32::MAX - 45;
+const P_ME_X: u32 = u32::MAX - 46;
+const P_ME_Y: u32 = u32::MAX - 47;
 
 /// Lazily mint a per-view `ViewTreeObserver` — guests register
 /// `OnGlobalLayoutListener`s on it; `fire_global_layout` (called from
@@ -668,6 +675,7 @@ pub(crate) fn is_viewish(vm: &Vm, class: &str, args: &[V]) -> bool {
             | "Landroidx/appcompat/view/menu/MenuBuilder;"
             | "Landroidx/appcompat/view/menu/MenuItemImpl;"
             | "Landroid/view/ViewTreeObserver;"
+            | "Landroid/view/MotionEvent;"
     ) || class.ends_with("LayoutParams;")
         || desc_is_a(class, VIEW)
         || class.ends_with("$DecorView;")
@@ -697,6 +705,46 @@ pub(crate) fn call(
             lp_ctor(vm, class, sig, args);
             Some(None)
         }
+        // ---------- MotionEvent ----------
+        "<init>" if class == "Landroid/view/MotionEvent;" => Some(None),
+        "obtain" if class == "Landroid/view/MotionEvent;" => {
+            let h = vm.instantiate("Landroid/view/MotionEvent;").unwrap_or(0);
+            if h != 0 {
+                // Copy-overload (obtain(MotionEvent)) inherits the
+                // source's fields; the canonical (JJIFF…) overload
+                // takes them positionally.
+                if let Some(V::Ref(src)) =
+                    args.iter().find(|a| matches!(a, V::Ref(h) if *h != 0)).copied()
+                {
+                    for k in [P_ME_ACTION, P_ME_X, P_ME_Y] {
+                        if let Some(v) = pseudo_get(vm, src, k) {
+                            pseudo_set(vm, h, k, v);
+                        }
+                    }
+                } else {
+                    if let Some(V::I32(a)) = args.get(2).copied() {
+                        pseudo_set(vm, h, P_ME_ACTION, V::I32(a));
+                    }
+                    if let Some(V::F32(x)) = args.get(3).copied() {
+                        pseudo_set(vm, h, P_ME_X, V::F32(x));
+                    }
+                    if let Some(V::F32(y)) = args.get(4).copied() {
+                        pseudo_set(vm, h, P_ME_Y, V::F32(y));
+                    }
+                }
+            }
+            Some(Some(V::Ref(h)))
+        }
+        "getAction" | "getActionMasked" if class == "Landroid/view/MotionEvent;" => {
+            Some(Some(V::I32(pint(vm, this, P_ME_ACTION))))
+        }
+        "getX" if class == "Landroid/view/MotionEvent;" => {
+            Some(Some(pseudo_get(vm, this, P_ME_X).unwrap_or(V::F32(0.0))))
+        }
+        "getY" if class == "Landroid/view/MotionEvent;" => {
+            Some(Some(pseudo_get(vm, this, P_ME_Y).unwrap_or(V::F32(0.0))))
+        }
+        "recycle" if class == "Landroid/view/MotionEvent;" => Some(None),
         // Dex-constructed views (`new PlayerFragment(ctx, attrs)` in an
         // adapter) never see the inflater: their `View.<init>` invoke-super
         // is the only place the Context reaches us. Record it so
@@ -1428,9 +1476,20 @@ pub(crate) fn call(
             Some(None)
         }
         "getDrawable" => Some(Some(image_drawable(vm, this))),
+        "setOnTouchListener" => {
+            pseudo_set(
+                vm,
+                this,
+                P_TOUCH_L,
+                args.get(1).copied().unwrap_or(V::Ref(0)),
+            );
+            Some(match ret(sig) {
+                "V" => None,
+                _ => Some(V::I32(1)),
+            })
+        }
         "setOnClickListener"
         | "setOnLongClickListener"
-        | "setOnTouchListener"
         | "setOnFocusChangeListener"
         | "setOnKeyListener"
         | "setOnAttachStateChangeListener"
@@ -3221,14 +3280,26 @@ fn group_measure_fallback(vm: &mut Vm, this: u32, pw: i32, ph: i32) {
                     _ => 0,
                 };
                 // `weight` is a float LP field — try F first so a
-                // runtime `lp.weight = 0` overrides the XML attr.
+                // runtime `lp.weight = 0` overrides the XML attr. Dex
+                // registers are untyped: an F field write can land as
+                // raw I32 bits — reinterpret via from_bits (1065353216
+                // must read as 1.0, not a billion).
                 let w = lp_field_t(vm, lp_obj, "weight", "F")
-                    .or_else(|| lp_field(vm, lp_obj, "weight"))
-                    .or_else(|| attr_find(vm, ch, "layout_weight"))
                     .map(|v| match v {
                         V::F32(f) => f,
-                        V::I32(i) => i as f32,
+                        V::F64(f) => f as f32,
+                        V::I32(i) => f32::from_bits(i as u32),
+                        V::I64(l) => f64::from_bits(l as u64) as f32,
                         _ => 0.0,
+                    })
+                    .or_else(|| {
+                        lp_field(vm, lp_obj, "weight")
+                            .or_else(|| attr_find(vm, ch, "layout_weight"))
+                            .map(|v| match v {
+                                V::F32(f) => f,
+                                V::I32(i) => i as f32,
+                                _ => 0.0,
+                            })
                     })
                     .unwrap_or(0.0);
                 if w > 0.0 {
@@ -4337,6 +4408,84 @@ fn view_id(vm: &Vm, h: u32) -> i32 {
         Some(V::I32(i)) => i,
         _ => -1,
     }
+}
+
+/// Route a host pointer event into the dex view tree: the deepest view
+/// whose frame contains (x,y) gets a MotionEvent, propagated up the
+/// parent chain until handled — dex `dispatchTouchEvent` /
+/// `onTouchEvent` first, then a registered `OnTouchListener`. Without
+/// this bridge, dex-materialized views (games: libGDX's input view)
+/// never see host input.
+pub(crate) fn dispatch_touch(
+    vm: &mut Vm,
+    x: i32,
+    y: i32,
+    action: i32,
+) -> ovelo_error::Result<()> {
+    fn deepest(vm: &Vm, h: u32, x: i32, y: i32, check: bool) -> Option<u32> {
+        if check {
+            let l = pint(vm, h, P_LEFT);
+            let t = pint(vm, h, P_TOP);
+            let r = pint(vm, h, P_RIGHT);
+            let b = pint(vm, h, P_BOTTOM);
+            if !(x >= l && x < r && y >= t && y < b) {
+                return None;
+            }
+        }
+        // Later children draw on top — hit-test them first.
+        for c in children(vm, h).iter().rev() {
+            if let V::Ref(ch) = c {
+                if *ch != 0 {
+                    if let Some(v) = deepest(vm, *ch, x, y, true) {
+                        return Some(v);
+                    }
+                }
+            }
+        }
+        Some(h)
+    }
+    let mut target = 0u32;
+    for r in vm.view_roots.clone().iter().rev() {
+        // Root bounds may be unset before its first layout — accept
+        // the root unconditionally so taps during early frames land.
+        if let Some(v) = deepest(vm, *r, x, y, false) {
+            target = v;
+            break;
+        }
+    }
+    if target == 0 {
+        return Ok(());
+    }
+    let evt = vm.instantiate("Landroid/view/MotionEvent;")?;
+    pseudo_set(vm, evt, P_ME_ACTION, V::I32(action));
+    pseudo_set(vm, evt, P_ME_X, V::F32(x as f32));
+    pseudo_set(vm, evt, P_ME_Y, V::F32(y as f32));
+    let mut v = target;
+    for _ in 0..32 {
+        if v == 0 {
+            break;
+        }
+        if vm.has_dex_virtual(v, "dispatchTouchEvent", &["Landroid/view/MotionEvent;"]) {
+            if vm.call_virtual(v, "dispatchTouchEvent", &[V::Ref(evt)]).is_ok() {
+                return Ok(());
+            }
+        }
+        if vm.has_dex_virtual(v, "onTouchEvent", &["Landroid/view/MotionEvent;"]) {
+            let _ = vm.call_virtual(v, "onTouchEvent", &[V::Ref(evt)]);
+            return Ok(());
+        }
+        if let Some(V::Ref(l)) = pseudo_get(vm, v, P_TOUCH_L) {
+            if l != 0 {
+                let _ = vm.call_virtual(l, "onTouch", &[V::Ref(v), V::Ref(evt)]);
+                return Ok(());
+            }
+        }
+        v = match pseudo_get(vm, v, P_PARENT) {
+            Some(V::Ref(p)) => p,
+            _ => break,
+        };
+    }
+    Ok(())
 }
 
 pub(crate) fn attach(vm: &mut Vm, parent: u32, child: V) {

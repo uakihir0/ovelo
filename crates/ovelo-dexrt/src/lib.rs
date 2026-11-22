@@ -1283,6 +1283,14 @@ impl Vm {
         self.cur_activity = activity;
     }
 
+    /// Deliver a host pointer event into the dex view tree
+    /// (action: 0=down, 1=up, 2=move). Dex-materialized views —
+    /// including games' input views — only see input through this
+    /// bridge; the host view tree's own dispatch does not reach them.
+    pub fn dispatch_touch(&mut self, x: i32, y: i32, action: i32) -> Result<()> {
+        jdk::view::dispatch_touch(self, x, y, action)
+    }
+
     /// Invoke `name` on the object at `this` — resolves the method on
     /// its class chain by name and arg count. `Ok(None)` when the
     /// object's class doesn't declare it — the platform base class
