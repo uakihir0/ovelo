@@ -8,9 +8,9 @@
 // code. Safety invariants are documented at each site.
 #![allow(unsafe_code)]
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::ffi::{c_void, CString};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, LazyLock, Mutex};
 #[cfg(target_os = "macos")]
 use std::sync::OnceLock;
 
@@ -1190,6 +1190,149 @@ struct Dyn {
     needed: Vec<usize>,
 }
 
+/// Exports of every lib loaded in this process, in load order — the
+/// dynamic linker's "global scope" later relocations resolve against
+/// (a lib's DT_NEEDED deps are always loaded before it). First
+/// registration wins, matching breadth-first search order.
+static GLOBAL_SYMS: LazyLock<Mutex<HashMap<String, usize>>> =
+    LazyLock::new(|| Mutex::new(HashMap::new()));
+/// Sonames already mapped — a second DT_NEEDED edge or `loadLibrary`
+/// call reuses the image instead of double-mapping it.
+static LOADED_SONAMES: LazyLock<Mutex<HashSet<String>>> =
+    LazyLock::new(|| Mutex::new(HashSet::new()));
+
+/// DT_NEEDED sonames of `elf` (dependencies), in declared order.
+/// Names live in the file's dynstr; DT_STRTAB is a vaddr converted
+/// back to a file offset via the PT_LOAD table.
+fn elf_needed(elf: &[u8]) -> Vec<String> {
+    let mut out = Vec::new();
+    if elf.len() < 64 || &elf[0..4] != b"\x7fELF" {
+        return out;
+    }
+    let phoff = rd64(elf, 32) as usize;
+    let phentsize = rd16(elf, 54) as usize;
+    let phnum = rd16(elf, 56) as usize;
+    let mut loads: Vec<(usize, usize, usize)> = Vec::new(); // (vaddr, off, filesz)
+    let mut dyn_off = 0usize;
+    for i in 0..phnum {
+        let p = phoff + i * phentsize;
+        if p + 56 > elf.len() {
+            break;
+        }
+        match rd32(elf, p) {
+            PT_LOAD => loads.push((
+                rd64(elf, p + 16) as usize,
+                rd64(elf, p + 8) as usize,
+                rd64(elf, p + 32) as usize,
+            )),
+            PT_DYNAMIC => dyn_off = rd64(elf, p + 8) as usize,
+            _ => {}
+        }
+    }
+    if dyn_off == 0 {
+        return out;
+    }
+    let v2o = |va: usize| -> Option<usize> {
+        loads
+            .iter()
+            .find_map(|&(v, o, s)| (va >= v && va < v + s).then_some(o + (va - v)))
+    };
+    let mut strtab = 0usize;
+    let mut strsz = 0usize;
+    let mut need_offs = Vec::new();
+    let mut e = dyn_off;
+    while e + 16 <= elf.len() {
+        let tag = rd64(elf, e) as i64;
+        let val = rd64(elf, e + 8) as usize;
+        if tag == DT_NULL {
+            break;
+        }
+        match tag {
+            DT_NEEDED => need_offs.push(val),
+            DT_STRTAB => strtab = v2o(val).unwrap_or(0),
+            DT_STRSZ => strsz = val,
+            _ => {}
+        }
+        e += 16;
+    }
+    for off in need_offs {
+        if off >= strsz {
+            continue;
+        }
+        let start = strtab + off;
+        if start >= elf.len() {
+            continue;
+        }
+        let end = elf[start..]
+            .iter()
+            .position(|&b| b == 0)
+            .map(|n| start + n)
+            .unwrap_or(elf.len());
+        out.push(String::from_utf8_lossy(&elf[start..end]).into_owned());
+    }
+    out
+}
+
+/// Load `elf` plus, recursively, every DT_NEEDED library `lookup`
+/// can supply (APK-bundled dependencies). Returns libs in
+/// dependency-first order; the tail is the requested lib. Each
+/// dep's exports join `GLOBAL_SYMS` before the dependent relocates,
+/// so `libjxlcoder.so` finds `Jxl*` in `libjxl.so` etc.
+pub fn load_tree(
+    name: &str,
+    elf: &[u8],
+    lookup: &mut dyn FnMut(&str) -> Option<Vec<u8>>,
+) -> Result<Vec<NativeLib>> {
+    let mut out = Vec::new();
+    load_tree_into(name, elf, lookup, &mut out, 0)?;
+    Ok(out)
+}
+
+fn load_tree_into(
+    name: &str,
+    elf: &[u8],
+    lookup: &mut dyn FnMut(&str) -> Option<Vec<u8>>,
+    out: &mut Vec<NativeLib>,
+    depth: usize,
+) -> Result<()> {
+    if depth > 16 {
+        return Err(err("elf.depdepth"));
+    }
+    for soname in elf_needed(elf) {
+        let base = soname.rsplit('/').next().unwrap_or(&soname).to_string();
+        // A bundled bionic would collide with the host/shim libc —
+        // its symbols resolve via builtin_shim/host_dlsym anyway.
+        if matches!(base.as_str(), "libc.so" | "libm.so" | "libdl.so" | "libstdc++.so") {
+            continue;
+        }
+        if !LOADED_SONAMES.lock().unwrap().insert(base.clone()) {
+            continue; // already mapped (diamond dep or earlier loadLibrary)
+        }
+        let ok = match lookup(&base) {
+            Some(bytes) => match load_tree_into(&base, &bytes, lookup, out, depth + 1) {
+                Ok(()) => true,
+                Err(e) => {
+                    eprintln!("[jni] dep {base}: {e}");
+                    false
+                }
+            },
+            None => false,
+        };
+        if !ok {
+            // Failed/missing dep: leave it retryable and let the
+            // dependent's relocations fall through to shims/dlsym.
+            LOADED_SONAMES.lock().unwrap().remove(&base);
+        }
+    }
+    let lib = load_so(name, elf)?;
+    LOADED_SONAMES
+        .lock()
+        .unwrap()
+        .insert(name.rsplit('/').next().unwrap_or(name).to_string());
+    out.push(lib);
+    Ok(())
+}
+
 /// Parse + map + relocate an ELF64 ET_DYN aarch64 image.
 pub fn load_so(name: &str, elf: &[u8]) -> Result<NativeLib> {
     install_crash_dump();
@@ -1392,6 +1535,11 @@ pub fn load_so(name: &str, elf: &[u8]) -> Result<NativeLib> {
         if let Some(&a) = exports.get(&name) {
             return Ok(a);
         }
+        // Already-loaded libs (DT_NEEDED deps, earlier loadLibrary
+        // calls) — the global scope of the process link map.
+        if let Some(a) = GLOBAL_SYMS.lock().unwrap().get(&name).copied() {
+            return Ok(a);
+        }
         if let Some(a) = builtin_shim(&name) {
             return Ok(a);
         }
@@ -1551,6 +1699,16 @@ pub fn load_so(name: &str, elf: &[u8]) -> Result<NativeLib> {
     for k in 0..n_init {
         let f: extern "C" fn() = unsafe { std::mem::transmute(((d.init_array + k * 8) as *const u64).read()) };
         with_guest_tls(|| f());
+    }
+
+    // Join the process global scope: later libs (and dep edges of
+    // siblings) resolve against these exports. First registration
+    // wins — keeps breadth-first precedence when names collide.
+    {
+        let mut g = GLOBAL_SYMS.lock().unwrap();
+        for (n, a) in &exports {
+            g.entry(n.clone()).or_insert(*a);
+        }
     }
 
     Ok(NativeLib {
