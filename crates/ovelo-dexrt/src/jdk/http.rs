@@ -62,36 +62,27 @@ fn agent() -> &'static ureq::Agent {
 
 fn do_fetch(spec: HttpSpec) -> std::result::Result<HttpResp, String> {
     let a = agent();
-    // GET/HEAD/DELETE/OPTIONS are bodyless builders; write methods
-    // take `send` — an empty body vec still forces Content-Length: 0.
-    let mut resp = match spec.method.as_str() {
-        "POST" | "PUT" | "PATCH" => {
-            let mut rb = match spec.method.as_str() {
-                "PUT" => a.put(&spec.url),
-                "PATCH" => a.patch(&spec.url),
-                _ => a.post(&spec.url),
-            };
-            for (k, v) in &spec.headers {
-                if !k.eq_ignore_ascii_case("accept-encoding") {
-                    rb = rb.header(k, v);
-                }
-            }
-            rb.send(spec.body.clone()).map_err(|e| e.to_string())?
+    // Build through `http::Request` so arbitrary methods (DELETE with a
+    // body, PROPFIND, ...) keep their verb — the per-method Agent
+    // helpers silently remap anything unlisted to GET.
+    let mut req = ureq::http::Request::builder()
+        .method(spec.method.as_str())
+        .uri(spec.url.as_str());
+    for (k, v) in &spec.headers {
+        if !k.eq_ignore_ascii_case("accept-encoding") {
+            req = req.header(k.as_str(), v.as_str());
         }
-        m => {
-            let mut rb = match m {
-                "DELETE" => a.delete(&spec.url),
-                "HEAD" => a.head(&spec.url),
-                "OPTIONS" => a.options(&spec.url),
-                _ => a.get(&spec.url),
-            };
-            for (k, v) in &spec.headers {
-                if !k.eq_ignore_ascii_case("accept-encoding") {
-                    rb = rb.header(k, v);
-                }
-            }
-            rb.call().map_err(|e| e.to_string())?
-        }
+    }
+    let mut resp = if spec.body.is_empty()
+        && !matches!(spec.method.as_str(), "POST" | "PUT" | "PATCH")
+    {
+        let req = req.body(ureq::SendBody::none()).map_err(|e| e.to_string())?;
+        a.run(req).map_err(|e| e.to_string())?
+    } else {
+        // An empty body vec still forces Content-Length: 0 — the write
+        // methods expect it.
+        let req = req.body(spec.body.clone()).map_err(|e| e.to_string())?;
+        a.run(req).map_err(|e| e.to_string())?
     };
     let code = resp.status().as_u16();
     let message = resp
@@ -189,6 +180,9 @@ fn park_or_block(vm: &mut Vm, call_h: u32, ticket: u64) -> Result<Option<V>> {
             if httpdbg() {
                 eprintln!("[http] deadline ticket={ticket}");
             }
+            // Drop the slot too — `take_result` is never called for this
+            // ticket again, so the entry would sit in the map forever.
+            slots().lock().unwrap().remove(&ticket);
             let req = request_of(vm, call_h).unwrap_or(0);
             return Ok(Some(V::Ref(fake_failure(vm, req, "timeout")?)));
         }
@@ -328,8 +322,18 @@ fn request_spec(vm: &mut Vm, call_h: u32) -> Result<HttpSpec> {
     // app's own okio.Buffer, then read the bytes back out.
     let mut body = Vec::new();
     if let Some(bh) = member_ref(vm, req, "body", None) {
-        if let Some(ct) = member_str(vm, bh, "contentType") {
-            headers.push(("Content-Type".into(), ct));
+        // `contentType()` returns a MediaType — read its `mediaType`
+        // field, or stringify when the field layout differs.
+        if let Ok(Some(V::Ref(mh))) = vm.call_virtual(bh, "contentType", &[]) {
+            let ct = member_str(vm, mh, "mediaType").or_else(|| {
+                vm.call_virtual(mh, "toString", &[])
+                    .ok()
+                    .flatten()
+                    .and_then(|v| sv(vm, v))
+            });
+            if let Some(ct) = ct {
+                headers.push(("Content-Type".into(), ct));
+            }
         }
         if let Ok(buf) = vm.instantiate("Lokio/Buffer;") {
             // OkHttp 5's `toRequestBody` bodies take a `RealBufferedSink`
@@ -342,27 +346,15 @@ fn request_spec(vm: &mut Vm, call_h: u32) -> Result<HttpSpec> {
             if httpdbg() {
                 eprintln!("[http] writeTo buf={buf} sink={sink} ok={:?}", w.is_ok());
             }
-            if w.is_ok() {
-                let drain = member_ref(vm, sink, "bufferField", None).unwrap_or(buf);
-                // This okio only exposes `readByteArray(long)` — pull
-                // the size field ourselves.
-                let n = match field_v(vm, drain, "size", Some("J")) {
-                    Some(v) => i64v(v),
-                    _ => match vm.call_virtual(drain, "size", &[]) {
-                        Ok(Some(v)) => i64v(v),
-                        _ => 0,
-                    },
-                };
-                let r = vm.call_virtual_sig(drain, "readByteArray", &["J"], &[V::I64(n)]);
-                if httpdbg() {
-                    eprintln!("[http] readByteArray drain={drain} n={n} -> {r:?}");
-                }
-                if let Ok(Some(V::Ref(arr))) = r {
-                    if let Some(Obj::Array { data, .. }) = vm.heap.get(arr) {
-                        body = data.iter().map(|v| i64v(*v) as u8).collect();
-                    }
-                }
-            }
+            // A failed writeTo must fail the request — sending the empty
+            // body silently corrupts every mutating call.
+            w?;
+            // `flush()` pushes chunks to our downstream `buf`; the
+            // unflushed tail stays in the sink's `bufferField`. The
+            // flushed bytes come first, so drain buf then bufferField.
+            let drain = member_ref(vm, sink, "bufferField", None).unwrap_or(buf);
+            body = drain_buffer(vm, buf);
+            body.extend(drain_buffer(vm, drain));
         }
     }
     Ok(HttpSpec {
@@ -371,6 +363,28 @@ fn request_spec(vm: &mut Vm, call_h: u32) -> Result<HttpSpec> {
         headers,
         body,
     })
+}
+
+/// Read all bytes out of an okio `Buffer` — this okio only exposes
+/// `readByteArray(long)`, so pull the size field ourselves.
+fn drain_buffer(vm: &mut Vm, h: u32) -> Vec<u8> {
+    let n = match field_v(vm, h, "size", Some("J")) {
+        Some(v) => i64v(v),
+        _ => match vm.call_virtual(h, "size", &[]) {
+            Ok(Some(v)) => i64v(v),
+            _ => 0,
+        },
+    };
+    if n <= 0 {
+        return Vec::new();
+    }
+    match vm.call_virtual_sig(h, "readByteArray", &["J"], &[V::I64(n)]) {
+        Ok(Some(V::Ref(arr))) => match vm.heap.get(arr) {
+            Some(Obj::Array { data, .. }) => data.iter().map(|v| i64v(*v) as u8).collect(),
+            _ => Vec::new(),
+        },
+        _ => Vec::new(),
+    }
 }
 
 /// Invoke a static by exact parameter list (`name` is shared across
