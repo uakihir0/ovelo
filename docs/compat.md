@@ -20,9 +20,11 @@ Legend:
 |-----|---------|--------|-------------------------|
 | Fossify File Manager | `org.fossify.filemanager` | 🟡 | **Renders real data**: lifecycle completes, RecyclerView rows bind actual filenames from the seeded external root (Pictures/Download/Documents/readme.md). Row layout positions are still rough |
 | Fossify Notes | `org.fossify.notes` | 🟡 | Full lifecycle + window render; toolbar and search menu draw; note list rows bind real SQLite data (Burmese text renders with fallback fonts) |
-| Fossify Gallery | `org.fossify.gallery` | 🟡 | Lifecycle completes end-to-end (Splash → MainActivity, no crashes); window opens; RecyclerView waits for its adapter (media-query data path pending) |
-| Fossify Calendar | `org.fossify.calendar` | 🟡 | Launches and renders the search/toolbar UI; month-view adapter attach path pending |
-| Fossify Messages | `org.fossify.messages` | 🟡 | Launches and renders the search/toolbar UI; conversation-list adapter attach path pending |
+| Fossify Gallery | `org.fossify.gallery` | 🟡 | **Renders real data**: grid cell shows the actual "Pictures" folder with item count and a real decoded PNG thumbnail (Glide fetch→decode→transform→draw chain works) |
+| Fossify Music Player | `org.fossify.musicplayer` | 🟡 | **Renders real data**: MediaStore scan → Room DB (tracks/albums/artists tables populated) → tab bar + track list bound with real `Lfu4` rows ("All 3" tab) |
+| Fossify Voice Recorder | `org.fossify.voicerecorder` | 🟡 | Lifecycle completes; player UI renders ("0:0" timer). Recordings list adapter attaches; list rows pending |
+| Fossify Calendar | `org.fossify.calendar` | 🟡 | **Renders real data**: month grid draws 7-column day cells with real locale strings, today marker, month name |
+| Fossify Messages | `org.fossify.messages` | 🟡 | Lifecycle completes to correct end state: "No stored conversations" empty state + FAB render (DB is empty) |
 | Bouncy (pinball, libGDX) | `com.dozingcatsoftware.bouncy` | 🟡 | Full lifecycle; menu screen renders with real resource strings ("Cambiar tablero"/"INICIAR"); GL game surface not wired yet |
 | Tiny Weather Forecast Germany | `de.kaffeemitkoffein.tinyweatherforecastgermany` | 🟡 | `WelcomeActivity` renders to the window (first real APK first frame) |
 | NewPipe | `org.schabi.newpipe` | 🟡 | `MainActivity` full lifecycle; WorkManager runs real SQLite queries; error screen renders (no network layer yet) |
