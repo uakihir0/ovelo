@@ -225,30 +225,27 @@ mod thunk {
     const PROT_EXEC: i32 = 4;
     const MAP_PRIV_ANON_JIT: i32 = 0x0002 | 0x1000 | 0x0800;
 
-    // 10 insns + 8B pad + 2 literal quads = 64B:
-    //   stp x29, x30, [sp, #-32]!
-    //   mrs x29, tpidr_el0          // guest TCB — callee-saved reg
-    //   ldr x16, +40                // -> literal: &HOST_TCB
-    //   ldr x16, [x16]
-    //   msr tpidr_el0, x16          // host TCB
-    //   ldr x16, +36                // -> literal: target
-    //   blr x16
-    //   msr tpidr_el0, x29          // guest TCB again
-    //   ldp x29, x30, [sp], #32
+    // AAPCS64 callers place stack args (9th+) at [sp] for the callee —
+    // the thunk must shuttle them past its own frame or the callee
+    // would read saved fp/lr as arguments. Frame: 192B = 160B arg copy
+    // (up to 20 stack args) + fp/lr at +160.
+    //   sub  sp, sp, #192
+    //   stp  x29, x30, [sp, #160]
+    //   add  x17, sp, #192           // src = caller's stack args
+    //   add  x9,  sp, #0             // dst = our frame
+    //   ldp  x10, x11, [x17], #16    // ×10 pairs
+    //   stp  x10, x11, [x9],  #16
+    //   mrs  x29, tpidr_el0          // guest TCB — callee-saved reg
+    //   ldr  x16, +36                // -> literal: &HOST_TCB
+    //   ldr  x16, [x16]
+    //   msr  tpidr_el0, x16          // host TCB
+    //   ldr  x16, +28                // -> literal: target
+    //   blr  x16
+    //   msr  tpidr_el0, x29          // guest TCB again
+    //   ldp  x29, x30, [sp, #160]
+    //   add  sp, sp, #192
     //   ret
-    const INS: [u32; 10] = [
-        0xA9BE_7BFD,
-        0xD53B_D05D,
-        0x5800_0150,
-        0xF940_0210,
-        0xD51B_D050,
-        0x5800_0130,
-        0xD63F_0200,
-        0xD51B_D05D,
-        0xA8C2_7BFD,
-        0xD65F_03C0,
-    ];
-    const SLOT: usize = 64;
+    const SLOT: usize = 160;
     const PAGE: usize = 0x10000;
 
     pub(super) fn set_host_tcb(v: usize) {
@@ -292,10 +289,28 @@ mod thunk {
         unsafe {
             pthread_jit_write_protect_np(0);
             let w = at as *mut u32;
-            for (i, &ins) in INS.iter().enumerate() {
-                w.add(i).write_volatile(ins);
+            let mut ins = Vec::with_capacity(36);
+            ins.extend_from_slice(&[0xD103_03FF, 0xA90A_7BFD, 0x9103_03F1, 0x9100_03E9]);
+            for _ in 0..10 {
+                ins.extend_from_slice(&[0xA8C1_2E2A, 0xA881_2D2A]);
             }
-            let lit = (at + 48) as *mut usize;
+            ins.extend_from_slice(&[
+                0xD53B_D05D,
+                0x5800_0130,
+                0xF940_0210,
+                0xD51B_D050,
+                0x5800_0110,
+                0xD63F_0200,
+                0xD51B_D05D,
+                0xA94A_7BFD,
+                0x9103_03FF,
+                0xD65F_03C0,
+            ]);
+            debug_assert_eq!(ins.len(), 34);
+            for (i, ins) in ins.iter().enumerate() {
+                w.add(i).write_volatile(*ins);
+            }
+            let lit = (at + 136) as *mut usize;
             lit.write_volatile(std::ptr::addr_of!(HOST_TCB) as usize);
             lit.add(1).write_volatile(target);
             pthread_jit_write_protect_np(1);
@@ -920,6 +935,19 @@ struct DlPhdrInfo {
 
 type PhdrCb = unsafe extern "C" fn(*mut c_void, usize, *mut c_void) -> i32;
 
+/// Host symbols a guest may import as *data* — dlsym can't tell
+/// OBJECT from FUNC, so keep the classic libc/Bionic variable list:
+/// these are read, never called, and must bypass the host-TCB thunk.
+fn is_data_sym(name: &str) -> bool {
+    matches!(
+        name,
+        "optarg" | "opterr" | "optind" | "optopt" | "optreset"
+            | "environ" | "__progname" | "sys_nerr" | "sys_errlist"
+            | "timezone" | "daylight" | "altzone" | "tzname"
+            | "signgam" | "stdin" | "stdout" | "stderr"
+    )
+}
+
 extern "C" fn sh_dl_iterate_phdr(cb: *const c_void, data: *mut c_void) -> i32 {
     if cb.is_null() {
         return -1;
@@ -941,13 +969,15 @@ extern "C" fn sh_dl_iterate_phdr(cb: *const c_void, data: *mut c_void) -> i32 {
             dlpi_tls_modid: 0,
             dlpi_tls_data: 0,
         };
-        let r = unsafe {
+        // The callback is guest code — it needs the guest TCB (the shim
+        // itself runs on the host TCB inside the thunk).
+        let r = with_guest_tls(|| unsafe {
             cb(
                 &mut info as *mut _ as *mut c_void,
                 std::mem::size_of::<DlPhdrInfo>(),
                 data,
             )
-        };
+        });
         if r != 0 {
             return r;
         }
@@ -1011,7 +1041,7 @@ extern "C" fn sh_ab_get_info(_env: usize, bitmap: usize, info: *mut AndroidBitma
 /// guest `.so` keeps writing through the raw pointer for the whole
 /// lock, so the Rc must outlive the Bitmap object even if GC reclaims
 /// the host object mid-decode.
-struct PinnedRc(#[allow(dead_code)] std::rc::Rc<Vec<u8>>);
+struct PinnedRc(#[allow(dead_code)] std::rc::Rc<Vec<u8>>, usize);
 // Stored in a static: the value is only pushed/dropped from threads
 // that already entered the VM — the refcount is never raced from two
 // threads at once in practice.
@@ -1030,8 +1060,10 @@ extern "C" fn sh_ab_lock_pixels(_env: usize, bitmap: usize, addr: *mut *mut c_vo
             // make_mut clones on shared refs (COW) — the returned
             // pointer then stays stable through unlockPixels.
             unsafe { *addr = std::rc::Rc::make_mut(rgba).as_mut_ptr().cast() };
+            let p = unsafe { *addr } as usize;
+            allow_guest_dst(p, rgba.len());
             if let Ok(mut l) = LOCKED_PIXELS.lock() {
-                l.push(PinnedRc(rgba.clone()));
+                l.push(PinnedRc(rgba.clone(), p));
             }
             0
         }
@@ -1042,7 +1074,9 @@ extern "C" fn sh_ab_lock_pixels(_env: usize, bitmap: usize, addr: *mut *mut c_vo
 extern "C" fn sh_ab_unlock_pixels(_env: usize, _bitmap: usize) -> i32 {
     // Release one pinned buffer — a leaked pin only wastes memory.
     if let Ok(mut l) = LOCKED_PIXELS.lock() {
-        l.pop();
+        if let Some(PinnedRc(_, p)) = l.pop() {
+            deny_guest_dst(p);
+        }
     }
     0
 }
@@ -1113,6 +1147,13 @@ pub(crate) fn guest_dst_ok(p: usize, len: usize) -> bool {
     {
         return true;
     }
+    if EXTRA_DST
+        .lock()
+        .map(|v| v.iter().any(|(b, s)| p >= *b && p + len <= b + s))
+        .unwrap_or(false)
+    {
+        return true;
+    }
     unsafe {
         let t = pthread_self();
         let top = pthread_get_stackaddr_np(t) as usize;
@@ -1121,6 +1162,34 @@ pub(crate) fn guest_dst_ok(p: usize, len: usize) -> bool {
     }
 }
 
+/// Host-owned ranges the guest may legitimately write through —
+/// buffers we hand it, like AndroidBitmap_lockPixels' pixel Vec
+/// (not in the guest zone, not in a .so, not on the stack).
+#[cfg(target_os = "macos")]
+static EXTRA_DST: Mutex<Vec<(usize, usize)>> = Mutex::new(Vec::new());
+
+/// Permit guest writes through `p..p+len` (a host buffer we own).
+#[cfg(target_os = "macos")]
+pub(crate) fn allow_guest_dst(p: usize, len: usize) {
+    if let Ok(mut v) = EXTRA_DST.lock() {
+        v.push((p, len));
+    }
+}
+
+/// Drop a previously allowed range (e.g. on unlockPixels).
+#[cfg(target_os = "macos")]
+pub(crate) fn deny_guest_dst(p: usize) {
+    if let Ok(mut v) = EXTRA_DST.lock() {
+        v.retain(|(b, _)| *b != p);
+    }
+}
+
+/// Non-macOS: no guest-dst bookkeeping.
+#[cfg(not(target_os = "macos"))]
+pub(crate) fn allow_guest_dst(_p: usize, _len: usize) {}
+/// Non-macOS: no guest-dst bookkeeping.
+#[cfg(not(target_os = "macos"))]
+fn deny_guest_dst(_p: usize) {}
 /// Non-macOS: no zone bookkeeping — accept everything.
 #[cfg(not(target_os = "macos"))]
 pub(crate) fn guest_dst_ok(_p: usize, _len: usize) -> bool {
@@ -2258,7 +2327,14 @@ fn finish_so(m: MappedLib, name: &str) -> Result<(NativeLib, Vec<usize>)> {
                 if std::env::var_os("OVELO_DLSYMLOG").is_some() {
                     eprintln!("[dlsym] {name}");
                 }
-                return Ok(host_thunk(a));
+                // Data symbols must stay raw addresses — wrapping them in
+                // a code thunk would have the guest read machine code
+                // where the variable's value belongs.
+                return Ok(if is_data_sym(&name) {
+                    a
+                } else {
+                    host_thunk(a)
+                });
             }
         }
         // Weak undefined symbols resolve to 0 (legal — the callee checks).
