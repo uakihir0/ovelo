@@ -1306,6 +1306,12 @@ pub fn load_tree(
             // Deps that already loaded stay mapped: their exports are
             // in GLOBAL_SYMS, so dropping (unmapping) them now would
             // leave dangling addresses a later load could bind to.
+            // Every entry in `out` finished relocating, so run its
+            // ctors too — a lib kept loaded but never initialized
+            // would be reused by later loads in a corrupt state.
+            for (_, inits) in &out {
+                run_ctors(inits);
+            }
             std::mem::forget(out);
             Err(e)
         }
