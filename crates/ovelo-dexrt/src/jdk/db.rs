@@ -467,10 +467,14 @@ pub(crate) fn media_cursor(vm: &mut Vm, uri: &str, projection: &[String]) -> V {
             // `audio/albums` rows must expose `album_id` as `_id` —
             // apps join `track.album_id == album._id` (and likewise
             // artists/genres); a media rowid would fail that join.
+            // `…/{id}/members` lists tracks — those rows keep their own
+            // media rowid or playback URIs break.
             let album_id = java_hash(&rel_dir.to_lowercase()) as i64;
             let artist_id = 1i64;
             let genre_id = 0i64;
-            let scoped_id = if uri.contains("/albums") {
+            let scoped_id = if uri.contains("/members") {
+                row_id
+            } else if uri.contains("/albums") {
                 album_id
             } else if uri.contains("/artists") {
                 artist_id
