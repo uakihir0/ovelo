@@ -113,8 +113,10 @@ pub(crate) static LOADED_RANGES: Mutex<Vec<(usize, usize)>> = Mutex::new(Vec::ne
 /// Bounds of the JIT thunk arena, published so the crash handler's
 /// instruction scan-back knows which addresses it may read. Written
 /// once when the arena is first mapped.
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 pub(crate) static JIT_CODE_BASE: std::sync::atomic::AtomicUsize =
     std::sync::atomic::AtomicUsize::new(0);
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 pub(crate) static JIT_CODE_END: std::sync::atomic::AtomicUsize =
     std::sync::atomic::AtomicUsize::new(0);
 
@@ -122,7 +124,7 @@ pub(crate) static JIT_CODE_END: std::sync::atomic::AtomicUsize =
 /// loaded `.so` or the thunk arena. `try_lock` keeps it deadlock-free
 /// — when the range list is busy we conservatively report unmapped,
 /// which only shrinks the provenance scan.
-#[cfg(target_arch = "aarch64")]
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 fn code_mapped(addr: usize) -> bool {
     let base = JIT_CODE_BASE.load(std::sync::atomic::Ordering::Acquire);
     let end = JIT_CODE_END.load(std::sync::atomic::Ordering::Acquire);
@@ -632,7 +634,7 @@ pub(crate) fn host_thunk(f: usize) -> usize {
 /// the `mrs` that loaded a faulting base register. Over-inclusive by
 /// design: an ambiguous instruction ends the scan (no heal), which is
 /// the same outcome as before the heal existed.
-#[cfg(target_arch = "aarch64")]
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 fn clobbers_gpr(insn: u32, rn: u32) -> bool {
     let rd = insn & 31;
     if (insn >> 25) & 0xF == 0x8 || (insn >> 25) & 0xF == 0x9 {
@@ -656,7 +658,7 @@ fn clobbers_gpr(insn: u32, rn: u32) -> bool {
     false
 }
 
-#[cfg(target_arch = "aarch64")]
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 unsafe fn heal_tls_fault(si: usize, insn: u32, mc: *mut u8) -> bool {
     let is_ldr_str = (insn & 0xFFC0_0000) == 0xF940_0000 || (insn & 0xFFC0_0000) == 0xF900_0000;
     if !is_ldr_str {
@@ -709,7 +711,7 @@ unsafe fn heal_tls_fault(si: usize, insn: u32, mc: *mut u8) -> bool {
     true
 }
 
-#[cfg(not(target_arch = "aarch64"))]
+#[cfg(all(target_os = "macos", not(target_arch = "aarch64")))]
 unsafe fn heal_tls_fault(_si: usize, _insn: u32, _mc: *mut u8) -> bool {
     false
 }
