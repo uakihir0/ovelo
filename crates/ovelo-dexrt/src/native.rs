@@ -662,6 +662,24 @@ fn clobbers_gpr(insn: u32, rn: u32) -> bool {
     false
 }
 
+/// Whether the instruction writes the architectural SP (x31). rd==31
+/// is XZR, not SP, for everything except add/sub with S=0 (immediate
+/// or extended-register form) — `cmp`/`subs` and logical ops discard
+/// into XZR and must not mark SP dirty.
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+fn writes_sp(insn: u32) -> bool {
+    if insn & 31 != 31 {
+        return false;
+    }
+    // add/sub immediate (group 0b1001), S=0: rd=31 encodes SP.
+    if (insn >> 25) & 0xF == 0x9 && (insn >> 29) & 1 == 0 {
+        return true;
+    }
+    // add/sub extended register (bit21=1 inside the DP-reg group),
+    // S=0: rd=31 encodes SP. Shifted-register forms always use XZR.
+    (insn >> 25) & 7 == 5 && (insn >> 21) & 1 == 1 && (insn >> 29) & 1 == 0
+}
+
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 unsafe fn heal_tls_fault(si: usize, insn: u32, mc: *mut u8) -> bool {
     let is_ldr_str = (insn & 0xFFC0_0000) == 0xF940_0000 || (insn & 0xFFC0_0000) == 0xF900_0000;
@@ -721,7 +739,7 @@ unsafe fn heal_tls_fault(si: usize, insn: u32, mc: *mut u8) -> bool {
                 dirty[usize::from(rb == 29)] = true;
             }
         }
-        if clobbers_gpr(b, 31) {
+        if writes_sp(b) {
             dirty[0] = true;
         }
         if clobbers_gpr(b, 29) {
