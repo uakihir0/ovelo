@@ -17,7 +17,7 @@ use ovelo_dexrt::{HostCall, Vm, V};
 use ovelo_error::Result;
 use ovelo_ui::{Color, FontSet};
 use std::cell::RefCell;
-use std::collections::{HashMap, VecDeque};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::rc::Rc;
 
 /// Click queue: `(listener handle, view handle)` awaiting
@@ -257,6 +257,16 @@ pub struct GuestUi {
     /// `vm.view_gen` the mounted tree was materialized against —
     /// re-materialize only when the view store actually changed.
     dex_gen_seen: u64,
+    /// Dex handles that already received `onAttachedToWindow` — the
+    /// callback fires once per attach, like ViewRootImpl's
+    /// dispatchAttachedToWindow (fossify views start their data loads
+    /// there; without it adapters never populate).
+    dex_attached: HashSet<u32>,
+    /// Handles awaiting their first `onAttachedToWindow` dispatch —
+    /// collected during materialize (the GuestUi borrow is held) and
+    /// fired by the frame loop once the borrow is released, since the
+    /// callback runs guest code that re-enters bridged host calls.
+    attach_pending: Vec<u32>,
     /// True once the guest set a real `GuestView` content view — the
     /// dex-tree renderer must not clobber it.
     guest_content_set: bool,
@@ -403,6 +413,8 @@ impl GuestUi {
             dex_root: 0,
             dex_mounted: None,
             dex_gen_seen: u64::MAX,
+            dex_attached: HashSet::new(),
+            attach_pending: Vec::new(),
             guest_content_set: false,
         }))
     }
@@ -412,6 +424,14 @@ impl GuestUi {
     /// dispatch (not inside it, which would re-enter the VM).
     pub fn drain_clicks(&self) -> Vec<(u32, u32)> {
         self.clicks.borrow_mut().drain(..).collect()
+    }
+
+    /// Dex handles awaiting `onAttachedToWindow`, collected during
+    /// materialize. The caller dispatches them via
+    /// `vm.call_virtual(h, "onAttachedToWindow", &[])` after releasing
+    /// the GuestUi borrow — the callback re-enters bridged host calls.
+    pub fn take_attach_pending(&mut self) -> Vec<u32> {
+        std::mem::take(&mut self.attach_pending)
     }
 
     /// Every guest heap handle the UI keeps alive — GC roots for
@@ -701,6 +721,7 @@ impl GuestUi {
                 self.dex_root = 0;
                 self.dex_mounted = None;
                 self.dex_gen_seen = u64::MAX;
+                self.dex_attached.clear();
                 self.root.set_content_view(Box::new(ViewGroup::new(
                     Length::MatchParent,
                     Length::MatchParent,
@@ -752,6 +773,14 @@ impl GuestUi {
                 .or_insert_with(|| Rc::new(RefCell::new(make_dex_view(vm, &info, &fonts))))
                 .clone(),
         };
+        // First attach to the window: AOSP's dispatchAttachedToWindow
+        // fires top-down when a view joins an attached hierarchy —
+        // guest views launch data loads (`loadRecordings` etc.) there.
+        // Queued: guest code re-enters bridged calls that borrow
+        // GuestUi, which this materialize already holds.
+        if self.dex_attached.insert(h) {
+            self.attach_pending.push(h);
+        }
         // Guest `onDraw`: a dex view class that overrides onDraw paints
         // through Canvas — record its ops for the host draw pass. Done
         // before `rc.borrow_mut` since it runs guest code.

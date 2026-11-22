@@ -1554,6 +1554,13 @@ fn run_app(store: &InstallStore, package: &str) -> Result<(), OveloError> {
                 }
             }
             ui2.borrow_mut().refresh_dex_tree(vm, *this);
+            // View attachments queued during materialize — dispatch
+            // outside the GuestUi borrow: the callback runs guest code
+            // (data loads, runOnUiThread) that re-enters bridged calls.
+            let attaches = ui2.borrow_mut().take_attach_pending();
+            for h in attaches {
+                let _ = vm.call_virtual(h, "onAttachedToWindow", &[]);
+            }
         }
         let mut u = ui2.borrow_mut();
         if let Ok(prod) = w.presenter().producer(sid) {
