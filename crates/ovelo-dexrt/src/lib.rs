@@ -18,7 +18,7 @@ mod value;
 pub use aot::Aot;
 pub use jdk::view::{fire_global_layout, DexViewInfo, P_TCOLOR, P_TEXT, P_TSIZE};
 pub use value::{CanvasOp, PaintState};
-pub use jdk::{pseudo_get, pseudo_set};
+pub use jdk::{pseudo_get, pseudo_set, P_META};
 pub use value::{Heap, HostState, Obj, V};
 
 use aot::{AotFn, TRAP_DIV_ZERO, TRAP_REM_ZERO};

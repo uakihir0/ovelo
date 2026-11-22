@@ -73,6 +73,9 @@ pub(crate) const P_MSG_ARG2: u64 = 0xFFFD_FEEB;
 /// Marks a `TreeMap` view created by `descendingMap()` — key navigation
 /// (`firstKey`, `ceilingKey`, `subMap` bounds, …) inverts.
 pub(crate) const P_NAV_DESC: u64 = 0xFFFD_FEEC;
+/// ProviderInfo.metaData — a Bundle handle carrying the manifest's
+/// provider meta-data (androidx.startup's initializer list).
+pub const P_META: u64 = 0xFFFD_FEEE;
 
 pub(crate) fn now_ms() -> i64 {
     std::time::SystemTime::now()
@@ -1355,6 +1358,11 @@ pub(crate) fn ifield(vm: &Vm, h: u32, owner: &str, name: &str) -> Option<V> {
         ("Landroid/util/DisplayMetrics;", "widthPixels") => Some(V::I32(1080)),
         ("Landroid/util/DisplayMetrics;", "heightPixels") => Some(V::I32(1920)),
         ("Landroid/util/DisplayMetrics;", "xdpi" | "ydpi") => Some(V::F32(320.0)),
+        // androidx.startup reads `getProviderInfo(...).metaData` for the
+        // manifest <meta-data> bundle — the handle our CLI attaches.
+        ("Landroid/content/pm/ProviderInfo;", "metaData") => {
+            Some(pseudo_get(vm, h, P_META).unwrap_or(V::Ref(0)))
+        }
         ("Landroid/content/pm/PackageInfo;", "versionCode") => Some(V::I32(1)),
         ("Landroid/content/pm/PackageInfo;", "versionName") => {
             Some(V::Ref(0)) // caller lacks str context; guests tolerate null

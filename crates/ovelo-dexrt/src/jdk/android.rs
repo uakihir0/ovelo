@@ -233,6 +233,34 @@ pub(crate) fn call(
                 })
             }
         }
+    } else if class == "Landroid/content/ContentProvider;"
+        || vm.assignable_desc(class, "Landroid/content/ContentProvider;")
+    {
+        // Guest providers (androidx.startup.InitializationProvider & co.)
+        // are dex classes; assignable_desc walks the dex chain to the
+        // framework base. `attachInfo` stashes the Context for
+        // `getContext` — the real ContentProvider path.
+        match name {
+            "attachInfo" => {
+                if let V::Ref(this) = args[0] {
+                    view::set_dialog_ctx(vm, this, args.get(1).copied().unwrap_or(V::Ref(0)));
+                }
+                Some(None)
+            }
+            "getContext" => {
+                if let V::Ref(this) = args[0] {
+                    Some(Some(view::dialog_ctx(vm, this)))
+                } else {
+                    Some(Some(V::Ref(0)))
+                }
+            }
+            "getContentResolver" => Some(Some(host(
+                vm,
+                "Landroid/content/ContentResolver;",
+                HostState::Empty,
+            ))),
+            _ => None,
+        }
     } else if class == "Landroid/content/res/Resources;" || class.ends_with("Resources;") {
         resources_call(vm, name, args)?
     } else if class == "Landroid/util/Xml;" {

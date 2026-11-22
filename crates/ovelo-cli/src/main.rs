@@ -659,6 +659,46 @@ fn register_compat_shims(
             Ok(Some(ai))
         })) as ovelo_dexrt::HostCall,
     );
+    // androidx.startup's `InitializationProvider.onCreate` reads
+    // `getProviderInfo(component, GET_META_DATA).metaData` — the
+    // manifest <meta-data> bundle mapping each initializer's class
+    // name to "androidx.startup". The builtin arm hands back an
+    // empty ProviderInfo, so attach the real manifest data here;
+    // then the provider's own `discoverAndInitialize` populates
+    // the (obfuscated) AppInitializer fields genuinely.
+    let meta_names: Vec<String> = initializers.to_vec();
+    let _ = v.register_host(
+        "Landroid/content/pm/PackageManager;",
+        "getProviderInfo",
+        "(Landroid/content/ComponentName;I)Landroid/content/pm/ProviderInfo;",
+        Rc::new(RefCell::new(move |vm: &mut ovelo_dexrt::Vm, _a: &[V]| {
+            let pairs: Vec<(ovelo_dexrt::V, ovelo_dexrt::V)> = meta_names
+                .iter()
+                .map(|n| {
+                    (
+                        V::Ref(vm.heap.intern_str(n)),
+                        V::Ref(vm.heap.intern_str("androidx.startup")),
+                    )
+                })
+                .collect();
+            let bundle = V::Ref(vm.heap.alloc(Obj::Host {
+                class_idx: u64::MAX,
+                desc: "Landroid/os/Bundle;".to_string(),
+                fields: HashMap::new(),
+                state: HostState::Map(pairs),
+            }));
+            let pi = V::Ref(vm.heap.alloc(Obj::Host {
+                class_idx: u64::MAX,
+                desc: "Landroid/content/pm/ProviderInfo;".to_string(),
+                fields: HashMap::new(),
+                state: HostState::Empty,
+            }));
+            if let (V::Ref(h), V::Ref(b)) = (pi, bundle) {
+                ovelo_dexrt::pseudo_set(vm, h, ovelo_dexrt::P_META, V::Ref(b));
+            }
+            Ok(Some(pi))
+        })) as ovelo_dexrt::HostCall,
+    );
 }
 
 /// Launch any Activity a guest queued via `startActivity` (component
@@ -1003,7 +1043,40 @@ fn run_app(store: &InstallStore, package: &str) -> Result<(), OveloError> {
                                 state: ovelo_dexrt::HostState::Empty,
                             })
                         });
+                    // Prefer the real ContentProvider path: run the
+                    // manifest's androidx.startup InitializationProvider
+                    // onCreate so `discoverAndInitialize` populates
+                    // AppInitializer's own discovered/initialized sets —
+                    // lazy `initializeComponent` callers (e.g.
+                    // ProcessLifecycleInitializer) depend on them, and
+                    // the fields are R8-obfuscated so host writes can't
+                    // reach them. Fall back to driving the initializers
+                    // directly when the provider path fails.
+                    let mut provider_ran = false;
+                    if info
+                        .manifest
+                        .providers
+                        .iter()
+                        .any(|p| p.ends_with("InitializationProvider"))
                     {
+                        match v.instantiate("Landroidx/startup/InitializationProvider;") {
+                            Ok(ph) => {
+                                let _ = v.call_virtual(
+                                    ph,
+                                    "attachInfo",
+                                    &[ovelo_dexrt::V::Ref(app_h), ovelo_dexrt::V::Ref(0)],
+                                );
+                                match v.call_virtual(ph, "onCreate", &[]) {
+                                    Ok(_) => provider_ran = true,
+                                    Err(e) => {
+                                        println!("startup provider onCreate failed: {e}")
+                                    }
+                                }
+                            }
+                            Err(e) => println!("startup provider not instantiated: {e}"),
+                        }
+                    }
+                    if !provider_ran {
                         let mut seen = std::collections::HashSet::new();
                         for init in &info.manifest.startup_initializers {
                             run_initializer(
