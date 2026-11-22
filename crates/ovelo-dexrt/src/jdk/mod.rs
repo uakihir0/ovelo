@@ -904,6 +904,53 @@ pub(crate) fn sfield(vm: &mut Vm, owner: &str, name: &str, ftype: &str) -> Optio
         ("Ljava/lang/Float;", "BYTES") => V::I32(4),
         ("Ljava/lang/Math;", "PI") => V::F64(std::f64::consts::PI),
         ("Ljava/lang/Math;", "E") => V::F64(std::f64::consts::E),
+        ("Ljava/io/File;", "separator") => {
+            return Some(jstr(vm, "/"));
+        }
+        ("Ljava/io/File;", "pathSeparator") => {
+            return Some(jstr(vm, ":"));
+        }
+        ("Ljava/io/File;", "separatorChar") => V::I32('/' as i32),
+        ("Ljava/io/File;", "pathSeparatorChar") => V::I32(':' as i32),
+        ("Landroid/os/Environment;", "DIRECTORY_MUSIC") => {
+            return Some(jstr(vm, "Music"));
+        }
+        ("Landroid/os/Environment;", "DIRECTORY_PODCASTS") => {
+            return Some(jstr(vm, "Podcasts"));
+        }
+        ("Landroid/os/Environment;", "DIRECTORY_RINGTONES") => {
+            return Some(jstr(vm, "Ringtones"));
+        }
+        ("Landroid/os/Environment;", "DIRECTORY_ALARMS") => {
+            return Some(jstr(vm, "Alarms"));
+        }
+        ("Landroid/os/Environment;", "DIRECTORY_NOTIFICATIONS") => {
+            return Some(jstr(vm, "Notifications"));
+        }
+        ("Landroid/os/Environment;", "DIRECTORY_PICTURES") => {
+            return Some(jstr(vm, "Pictures"));
+        }
+        ("Landroid/os/Environment;", "DIRECTORY_DCIM") => {
+            return Some(jstr(vm, "DCIM"));
+        }
+        ("Landroid/os/Environment;", "DIRECTORY_DOWNLOADS") => {
+            return Some(jstr(vm, "Download"));
+        }
+        ("Landroid/os/Environment;", "DIRECTORY_MOVIES") => {
+            return Some(jstr(vm, "Movies"));
+        }
+        ("Landroid/os/Environment;", "DIRECTORY_DOCUMENTS") => {
+            return Some(jstr(vm, "Documents"));
+        }
+        ("Landroid/os/Environment;", "DIRECTORY_RECORDINGS") => {
+            return Some(jstr(vm, "Recordings"));
+        }
+        ("Landroid/os/Environment;", "DIRECTORY_SCREENSHOTS") => {
+            return Some(jstr(vm, "Screenshots"));
+        }
+        ("Landroid/os/Environment;", "DIRECTORY_AUDIOBOOKS") => {
+            return Some(jstr(vm, "Audiobooks"));
+        }
         ("Ljava/lang/Boolean;", "TRUE") => {
             return Some(host(vm, "Ljava/lang/Boolean;", HostState::Slot(V::I32(1))))
         }
@@ -2536,16 +2583,22 @@ pub(crate) fn host_supers(d: &str) -> &'static [&'static str] {
         | "Landroid/telephony/TelephonyManager;"
         | "Landroid/nfc/NfcAdapter;" => &[OBJ],
         // ----- android.database / provider
+        // `Cursor`/`SQLiteClosable` implement `Closeable` — kotlin's
+        // `use`-extension close helpers reject anything else.
         "Landroid/database/Cursor;"
-        | "Landroid/database/DatabaseUtils;"
         | "Landroid/database/MatrixCursor;"
         | "Landroid/database/CursorWrapper;"
-        | "Landroid/database/ContentObserver;"
-        | "Landroid/database/DataSetObserver;"
         | "Landroid/database/sqlite/SQLiteDatabase;"
         | "Landroid/database/sqlite/SQLiteOpenHelper;"
         | "Landroid/database/sqlite/SQLiteStatement;"
         | "Landroid/database/sqlite/SQLiteProgram;"
+        | "Landroid/database/sqlite/SQLiteQuery;"
+        | "Landroid/database/sqlite/SQLiteClosable;" => {
+            &["Ljava/io/Closeable;", "Ljava/lang/AutoCloseable;", OBJ]
+        }
+        "Landroid/database/DatabaseUtils;"
+        | "Landroid/database/ContentObserver;"
+        | "Landroid/database/DataSetObserver;"
         | "Landroid/database/sqlite/SQLiteQueryBuilder;"
         | "Landroid/database/CursorIndexOutOfBoundsException;" => &[OBJ],
         // android.database exceptions — SQLite*Exception extends

@@ -3234,10 +3234,27 @@ impl Vm {
                     Err(errd("dexrt.exception.uncaught", d))
                 }
             },
-            _ => Err(errd(
-                "dexrt.invoke.unresolved",
-                format!("{owner}.{name}"),
-            )),
+            _ => {
+                // Non-dex class (Looper, System, …): the declaring
+                // descriptor can't resolve on a dex chain, but the
+                // builtin surface can still answer it — same fallback
+                // `call_virtual_sig` uses.
+                if let Some(r) = jdk::call(self, owner, name, "", &args)
+                    .map_err(|e| match e {
+                        E::Vm(v) => v,
+                        E::Throw(h) => {
+                            let d = self.describe_throw(h);
+                            errd("dexrt.exception.uncaught", d)
+                        }
+                    })?
+                {
+                    return Ok(r);
+                }
+                Err(errd(
+                    "dexrt.invoke.unresolved",
+                    format!("{owner}.{name}"),
+                ))
+            }
         }
     }
 
@@ -4073,7 +4090,10 @@ impl Vm {
                 let desc = self.dexes[di]
                     .type_descriptor(ins.idx.unwrap_or(0))
                     .map_err(E::Vm)?;
-                let elem = desc.trim_start_matches('[').to_string();
+                let elem = desc
+                    .strip_prefix('[')
+                    .unwrap_or(&desc)
+                    .to_string();
                 let h = self.heap.alloc(Obj::Array {
                     data: vec![V::default_for(&elem); len as usize],
                     elem,
@@ -4086,7 +4106,10 @@ impl Vm {
                 let desc = self.dexes[di]
                     .type_descriptor(ins.idx.unwrap_or(0))
                     .map_err(E::Vm)?;
-                let elem = desc.trim_start_matches('[').to_string();
+                let elem = desc
+                    .strip_prefix('[')
+                    .unwrap_or(&desc)
+                    .to_string();
                 let arg_regs: Vec<usize> = if ins.opcode == 0x25 {
                     // {vCCCC..+AA}: `regs`=[range start], `lit`=reg count
                     let (first, n) = (regs[0] as usize, ins.lit.unwrap_or(0) as usize);

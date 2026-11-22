@@ -2515,11 +2515,28 @@ fn reflect_call(
             }
         }
         _ if class.contains("Array") => match name {
-            "newInstance" => Some(Some(arr(
-                vm,
-                OBJ,
-                vec![V::Ref(0); i32v(args.get(1).copied().unwrap_or(V::I32(0))) as usize],
-            ))),
+            "newInstance" => {
+                // `Array.newInstance(componentType, dims…)`: the
+                // component may itself be an array (`int[].class` →
+                // `int[][]`) or a primitive (`int.class` → `int[]`).
+                let comp = match args.first() {
+                    Some(V::Ref(h)) => {
+                        class_desc_of(vm, *h).unwrap_or_else(|| OBJ.to_string())
+                    }
+                    _ => OBJ.to_string(),
+                };
+                let dims: Vec<i32> = match args.get(1) {
+                    Some(V::Ref(dh)) => match vm.heap.get(*dh) {
+                        Some(Obj::Array { data, .. }) => {
+                            data.iter().map(|v| i32v(*v)).collect()
+                        }
+                        _ => vec![0],
+                    },
+                    Some(v) => vec![i32v(*v)],
+                    None => vec![0],
+                };
+                Some(Some(new_array_dims(vm, &comp, &dims)))
+            }
             "getLength" => {
                 let n = match args.get(1) {
                     Some(V::Ref(a)) => match vm.heap.get(*a) {
@@ -2859,4 +2876,23 @@ fn unsafe_call(vm: &mut Vm, name: &str, args: &[V]) -> Rt<Option<Option<V>>> {
         _ => return Ok(None),
     };
     Ok(Some(v))
+}
+
+/// `Array.newInstance` array builder: `comp` is the component
+/// descriptor, `dims` the sizes outermost-first. The innermost array's
+/// element type is `comp` itself — which may already be `[I` — while
+/// outer levels nest one `[` per remaining dimension.
+fn new_array_dims(vm: &mut Vm, comp: &str, dims: &[i32]) -> V {
+    let n = dims.first().copied().unwrap_or(0).max(0) as usize;
+    let elem = if dims.len() <= 1 {
+        comp.to_string()
+    } else {
+        format!("{}{}", "[".repeat(dims.len() - 1), comp)
+    };
+    let data = if dims.len() <= 1 {
+        vec![V::default_for(&elem); n]
+    } else {
+        (0..n).map(|_| new_array_dims(vm, comp, &dims[1..])).collect()
+    };
+    arr(vm, &elem, data)
 }

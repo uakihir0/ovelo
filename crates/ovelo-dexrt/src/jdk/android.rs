@@ -41,16 +41,37 @@ pub(crate) fn call(
             "buildTreeDocumentUri" | "buildDocumentUri"
             | "buildDocumentUriUsingTree" | "buildChildDocumentsUri"
             | "buildChildDocumentsUriUsingTree" => {
-                let auth = sv(vm, args.first().copied().unwrap_or(V::Ref(0)))
+                let a0 = sv(vm, args.first().copied().unwrap_or(V::Ref(0)))
                     .unwrap_or_default();
                 let id = sv(vm, args.get(1).copied().unwrap_or(V::Ref(0)))
                     .unwrap_or_default();
-                let seg = if name == "buildTreeDocumentUri" { "tree" } else { "document" };
-                Some(Some(host(
-                    vm,
-                    "Landroid/net/Uri;",
-                    HostState::StrBuf(format!("content://{auth}/{seg}/{id}")),
-                )))
+                let s = if name.contains("UsingTree") {
+                    // a[0] is the tree Uri itself.
+                    format!("{a0}/{id}")
+                } else {
+                    let seg =
+                        if name == "buildTreeDocumentUri" { "tree" } else { "document" };
+                    format!("content://{a0}/{seg}/{id}")
+                };
+                Some(Some(host(vm, "Landroid/net/Uri;", HostState::StrBuf(s))))
+            }
+            "getDocumentId" | "getTreeDocumentId" => {
+                // Last path segment — URIs we mint are
+                // `content://{auth}/{tree|document}/{id}`.
+                let u = sv(vm, args.first().copied().unwrap_or(V::Ref(0)))
+                    .unwrap_or_default();
+                let id = u.rsplit('/').next().unwrap_or_default().to_string();
+                Some(Some(if u.is_empty() { V::Ref(0) } else { jstr(vm, &id) }))
+            }
+            "isTreeUri" | "isDocumentUri" => {
+                let u = sv(vm, args.first().copied().unwrap_or(V::Ref(0)))
+                    .unwrap_or_default();
+                let yes = if name == "isTreeUri" {
+                    u.contains("/tree/")
+                } else {
+                    u.contains("/document/")
+                };
+                Some(Some(V::I32(yes as i32)))
             }
             _ => None,
         }
@@ -2933,10 +2954,10 @@ fn resources_call(vm: &mut Vm, name: &str, args: &[V]) -> Rt<Option<Option<V>>> 
         | "getSystem"
         | "newTheme"
         | "getMovie" => match name {
-            "getLayout" => Some(Some(xml::parser_of(
+            "getLayout" => Some(Some(xml::parser_or_throw(
                 vm,
                 i64v(args.get(1).copied().unwrap_or(V::I32(0))) as u32,
-            ))),
+            )?)),
             "openRawResource" | "getRawResource" => {
                 let id = i64v(args.get(1).copied().unwrap_or(V::I32(0))) as u32;
                 let bytes = vm
@@ -3019,10 +3040,23 @@ fn resources_call(vm: &mut Vm, name: &str, args: &[V]) -> Rt<Option<Option<V>>> 
                     .map(str::to_string);
                 Some(Some(jstr(vm, n.as_deref().unwrap_or(""))))
             }
-            "getXml" => Some(Some(xml::parser_of(
+            "getXml" => Some(Some(xml::parser_or_throw(
                 vm,
                 i64v(args.get(1).copied().unwrap_or(V::I32(0))) as u32,
-            ))),
+            )?)),
+            "getValue" | "getValueForDensity" => {
+                // Fill the caller's TypedValue from the arsc entry —
+                // callers (ColorStateListInflaterCompat, …) branch on
+                // `tv.type`, so an unfilled value misroutes them.
+                let id = i64v(args.get(1).copied().unwrap_or(V::I32(0))) as u32;
+                if let Some(tv) = args.get(2).copied() {
+                    if let Some(ev) = vm.apk_res.as_ref().and_then(|r| r.entry_value(id)) {
+                        let ev = ev.clone();
+                        fill_typed_value_ev(vm, tv, &ev, id);
+                    }
+                }
+                Some(None)
+            }
             _ => Some(Some(V::Ref(0))),
         },
         "updateConfiguration"
@@ -3161,23 +3195,34 @@ fn res_misc(vm: &mut Vm, class: &str, name: &str, args: &[V]) -> Rt<Option<Optio
                     // type byte is 0 (e.g. color 0x7f00_0000) is a
                     // value, not a reference.
                     V::I32(id)
-                        if (id as u32) >> 24 == 0x7f
-                            && (id as u32) >> 16 & 0xff != 0
-                            && name != "getResourceId" =>
+                        if (id as u32) >> 24 == 0x7f && (id as u32) >> 16 & 0xff != 0 =>
                     {
-                        let entry = vm
-                            .apk_res
-                            .as_ref()
-                            .and_then(|r| r.entry_value(id as u32).cloned());
-                        match entry {
-                            Some(v)
-                                if name.starts_with("getDimension")
-                                    || name == "getLayoutDimension" =>
-                            {
-                                V::I32(crate::res::typed_px(&v) as i32)
+                        // `?attr/x` entries arrive as the attr's res id;
+                        // the theme bind rewrites them to the real
+                        // resource/value (AOSP resolveAttributeReference).
+                        let (rid, entry) =
+                            match view::resolve_ta_id(vm, id as u32) {
+                                Some((r, ev)) => (r, Some(ev)),
+                                None => (
+                                    id as u32,
+                                    vm.apk_res
+                                        .as_ref()
+                                        .and_then(|r| r.entry_value(id as u32).cloned()),
+                                ),
+                            };
+                        if name == "getResourceId" {
+                            V::I32(rid as i32)
+                        } else {
+                            match entry {
+                                Some(v)
+                                    if name.starts_with("getDimension")
+                                        || name == "getLayoutDimension" =>
+                                {
+                                    V::I32(crate::res::typed_px(&v) as i32)
+                                }
+                                Some(v) => V::I32(v.data as i32),
+                                None => V::I32(id),
                             }
-                            Some(v) => V::I32(v.data as i32),
-                            None => V::I32(id),
                         }
                     }
                     V::I32(_) | V::I64(_) => V::I32(i64v(v) as i32),
