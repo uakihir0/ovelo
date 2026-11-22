@@ -387,6 +387,61 @@ fn stream_call(vm: &mut Vm, name: &str, args: &[V]) -> Rt<Option<Option<V>>> {
         }
     }
     let _ = vm;
+    // Real writable files (SAF `openOutputStream` → FileOutputStream):
+    // `write`/`flush`/`close` hit the host file so guest writes persist.
+    if matches!(name, "write" | "flush" | "close")
+        && matches!(
+            vm.heap.get(this),
+            Some(Obj::Host {
+                state: HostState::File(_),
+                ..
+            })
+        )
+    {
+        if name == "write" {
+            let bytes: Vec<u8> = if args.len() == 2 {
+                vec![i64v(args[1]) as u8]
+            } else {
+                let arr_h = match args.get(1) {
+                    Some(&V::Ref(h)) => h,
+                    _ => 0,
+                };
+                let (off, len) = if args.len() > 3 {
+                    (
+                        i64v(args[2]).max(0) as usize,
+                        i64v(args[3]).max(0) as usize,
+                    )
+                } else {
+                    (0, usize::MAX)
+                };
+                match vm.heap.get(arr_h) {
+                    Some(Obj::Array { data, .. }) => data
+                        .iter()
+                        .skip(off)
+                        .take(len)
+                        .map(|v| i64v(*v) as u8)
+                        .collect(),
+                    _ => Vec::new(),
+                }
+            };
+            if let Some(Obj::Host {
+                state: HostState::File(f),
+                ..
+            }) = vm.heap.get_mut(this)
+            {
+                use std::io::Write as _;
+                let _ = f.write_all(&bytes);
+            }
+        } else if let Some(Obj::Host {
+            state: HostState::File(f),
+            ..
+        }) = vm.heap.get_mut(this)
+        {
+            use std::io::Write as _;
+            let _ = f.flush();
+        }
+        return Ok(Some(None));
+    }
     Ok(match name {
         "read" => {
             // Streams without a byte payload report EOF so callers exit

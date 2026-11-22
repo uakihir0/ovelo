@@ -45,6 +45,12 @@ pub(crate) fn call(
                     .unwrap_or_default();
                 let id = sv(vm, args.get(1).copied().unwrap_or(V::Ref(0)))
                     .unwrap_or_default();
+                // DocIds are percent-encoded into the URI segment
+                // (`primary:Music/Recordings` → `primary%3AMusic%2FRecordings`)
+                // so embedded `/` never forges a `/document/` or
+                // `/children` boundary — `DocumentFile` calls
+                // `getDocumentId` which decodes it back.
+                let id = db::pct_enc(&id);
                 let s = if name.contains("UsingTree") {
                     // a[0] is the tree Uri itself — AOSP appends
                     // `/document/{id}` (and `/children` for the
@@ -85,7 +91,8 @@ pub(crate) fn call(
                         })
                         .unwrap_or_default()
                 };
-                Some(Some(if u.is_empty() { V::Ref(0) } else { jstr(vm, id) }))
+                let id = db::pct_dec(id);
+                Some(Some(if u.is_empty() { V::Ref(0) } else { jstr(vm, &id) }))
             }
             "isTreeUri" | "isDocumentUri" => {
                 let u = sv(vm, args.first().copied().unwrap_or(V::Ref(0)))
@@ -282,11 +289,44 @@ pub(crate) fn call(
                     HostState::Bytes(std::rc::Rc::new(bytes), 0),
                 )))
             }
-            "openOutputStream" => Some(Some(host(
-                vm,
-                "Ljava/io/FileOutputStream;",
-                HostState::Empty,
-            ))),
+            "openOutputStream" => {
+                let uri = sv(vm, args.get(1).copied().unwrap_or(V::Ref(0)))
+                    .unwrap_or_default();
+                // SAF documents resolve to real files under
+                // external_root so `canWrite()` documents actually
+                // persist bytes. mode: "w" truncate (default),
+                // "wa" append, "rw"/"rwt" read+write.
+                let mode = sv(vm, args.get(2).copied().unwrap_or(V::Ref(0)))
+                    .unwrap_or_default();
+                if uri.contains("externalstorage.documents") {
+                    let (_id, rel) = db::saf_doc_rel(&uri);
+                    let path = vm.external_root.join(&rel);
+                    if let Some(parent) = path.parent() {
+                        let _ = std::fs::create_dir_all(parent);
+                    }
+                    let f = std::fs::OpenOptions::new()
+                        .write(true)
+                        .read(mode.starts_with("rw"))
+                        .create(true)
+                        .truncate(mode != "wa" && !mode.starts_with("rw"))
+                        .append(mode == "wa")
+                        .open(&path)
+                        .ok();
+                    return Ok(Some(match f {
+                        Some(f) => Some(host(
+                            vm,
+                            "Ljava/io/FileOutputStream;",
+                            HostState::File(f),
+                        )),
+                        None => Some(V::Ref(0)),
+                    }));
+                }
+                Some(Some(host(
+                    vm,
+                    "Ljava/io/FileOutputStream;",
+                    HostState::Empty,
+                )))
+            }
             "isSyncActive"
             | "getSyncAutomatically"
             | "getMasterSyncAutomatically"
@@ -4623,6 +4663,15 @@ pub(crate) fn media_uri_path(vm: &Vm, uri: &str) -> Option<String> {
                 }
             }
         }
+    }
+    if uri.contains("externalstorage.documents") {
+        let (_id, rel) = db::saf_doc_rel(uri);
+        return Some(
+            vm.external_root
+                .join(&rel)
+                .to_string_lossy()
+                .to_string(),
+        );
     }
     None
 }

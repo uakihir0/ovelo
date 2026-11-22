@@ -578,6 +578,74 @@ pub(crate) fn media_cursor(vm: &mut Vm, uri: &str, projection: &[String]) -> V {
     V::Ref(c)
 }
 
+/// Percent-decode (`%XX`) — byte-wise so multi-byte UTF-8 names
+/// (`%E9%8C%B2%E9%9F%B3.wav` → `録音.wav`) survive the round-trip.
+pub(crate) fn pct_dec(s: &str) -> String {
+    let b = s.as_bytes();
+    let mut out = Vec::with_capacity(b.len());
+    let mut i = 0;
+    while i < b.len() {
+        if b[i] == b'%' && i + 3 <= b.len() {
+            let hex = |c: u8| (c as char).to_digit(16).map(|d| d as u8);
+            if let (Some(h), Some(l)) = (hex(b[i + 1]), hex(b[i + 2])) {
+                out.push(h * 16 + l);
+                i += 3;
+                continue;
+            }
+        }
+        out.push(b[i]);
+        i += 1;
+    }
+    String::from_utf8_lossy(&out).into_owned()
+}
+
+/// Percent-encode a docId for a URI path segment — every byte outside
+/// the RFC 3986 unreserved set is escaped so a docId's `/` never forges
+/// a `/document/` or `/children` boundary and names containing `%` or
+/// reserved words stay opaque.
+pub(crate) fn pct_enc(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    const HEX: &[u8; 16] = b"0123456789ABCDEF";
+    for &b in s.as_bytes() {
+        match b {
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'.' | b'_' | b'~' => {
+                out.push(b as char)
+            }
+            _ => {
+                out.push('%');
+                out.push(HEX[(b >> 4) as usize] as char);
+                out.push(HEX[(b & 0xf) as usize] as char);
+            }
+        }
+    }
+    out
+}
+
+/// Parse a `content://com.android.externalstorage.documents/…` URI into
+/// `(doc_id, rel_path)`: the docId is the remainder after the last
+/// `/document/` (or `/tree/` for a bare tree URI), percent-decoded —
+/// docIds embed `/` (`primary:Music/Recordings`). `rel_path` drops
+/// empty, `.` and `..` components so a guest-supplied id like
+/// `primary:../../etc` cannot escape `external_root`.
+pub(crate) fn saf_doc_rel(uri: &str) -> (String, String) {
+    let doc_part = uri.strip_suffix("/children").unwrap_or(uri);
+    let after = |pat: &str| -> Option<String> {
+        doc_part
+            .rfind(pat)
+            .map(|off| pct_dec(&doc_part[off + pat.len()..]))
+    };
+    let doc_id = after("/document/")
+        .or_else(|| after("/tree/"))
+        .unwrap_or_default();
+    let rel_raw = doc_id.split_once(':').map(|(_, p)| p).unwrap_or_default();
+    let rel = rel_raw
+        .split('/')
+        .filter(|c| !c.is_empty() && *c != "." && *c != "..")
+        .collect::<Vec<_>>()
+        .join("/");
+    (doc_id, rel)
+}
+
 /// `ContentResolver.query(content://com.android.externalstorage.documents/...)`
 /// — SAF `DocumentsContract.Document` rows over `external_root`, used by
 /// androidx `DocumentFile.fromTreeUri`/`findFile`/`listFiles` (fossify's
@@ -588,8 +656,10 @@ pub(crate) fn media_cursor(vm: &mut Vm, uri: &str, projection: &[String]) -> V {
 ///   `…/tree/{treeDocId}/document/{docId}`      — single document row
 ///   `…/tree/{treeDocId}/document/{docId}/children` — directory listing
 ///   `…/document/{docId}`                       — bare document row
-/// DocIds are `{volume}:{relPath}` ("primary:Recordings"); the colon may
-/// arrive literal or %3A-encoded.
+/// DocIds are `{volume}:{relPath}` percent-encoded in the URI
+/// (`primary%3AMusic%2FRecordings`), so a document literally named
+/// `children` or containing `%`/`/document/` cannot collide with the
+/// reserved path segments.
 pub(crate) fn saf_cursor(vm: &mut Vm, uri: &str, projection: &[String]) -> V {
     const COLS: &[&str] = &[
         "document_id",
@@ -604,39 +674,12 @@ pub(crate) fn saf_cursor(vm: &mut Vm, uri: &str, projection: &[String]) -> V {
     // DocumentFile's `listFiles`/`findFile`/`exists`/`isDirectory` read
     // exactly these columns; unknown projection names yield null cells
     // like `media_cursor`.
-    let pct = |s: &str| -> String {
-        let b = s.as_bytes();
-        let mut out = String::with_capacity(s.len());
-        let mut i = 0;
-        while i < b.len() {
-            if b[i] == b'%' && i + 2 < b.len() {
-                if let Ok(hex) = u8::from_str_radix(&s[i + 1..i + 3], 16) {
-                    out.push(hex as char);
-                    i += 3;
-                    continue;
-                }
-            }
-            out.push(b[i] as char);
-            i += 1;
-        }
-        out
-    };
-    // The docId runs to the end of the URI (or up to `/children`): it
-    // embeds `/` itself (`primary:Music/Recordings`), so do NOT split it
-    // on slashes — take the remainder after the last `/document/`.
     let children = uri.ends_with("/children");
-    let doc_part = if children { &uri[..uri.len() - "/children".len()] } else { uri };
-    let after = |pat: &str| -> Option<String> {
-        let off = doc_part.rfind(pat)? + pat.len();
-        Some(pct(&doc_part[off..]))
-    };
-    let doc_id = after("/document/").or_else(|| after("/tree/")).unwrap_or_default();
-    let rel = doc_id.split_once(':').map(|(_, p)| p).unwrap_or_default();
-    let rel = rel.trim_matches('/');
+    let (doc_id, rel) = saf_doc_rel(uri);
     let base = if rel.is_empty() {
         vm.external_root.clone()
     } else {
-        vm.external_root.join(rel)
+        vm.external_root.join(&rel)
     };
     let doc_mime = |p: &std::path::Path| -> &'static str {
         if p.is_dir() {
