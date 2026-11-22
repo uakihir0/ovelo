@@ -3077,6 +3077,26 @@ fn group_measure_fallback(vm: &mut Vm, this: u32, pw: i32, ph: i32) {
                 .unwrap_or_default(),
             _ => String::new(),
         };
+        // The `android:text` attr lives in P_ATTRS until the dex ctor
+        // calls setText — measure from it or XML-inflated TextViews
+        // wrap to 0 wide.
+        let text = if text.is_empty() {
+            attr_find(vm, this, "text")
+                .or_else(|| attr_find(vm, this, "hint"))
+                .map(|v| match v {
+                    V::Ref(th) if th != 0 => s(vm, th).unwrap_or_default(),
+                    V::I32(id) if id > 0 => vm
+                        .apk_res
+                        .as_ref()
+                        .and_then(|r| r.string_of(id as u32))
+                        .map(|s| s.to_string())
+                        .unwrap_or_default(),
+                    _ => String::new(),
+                })
+                .unwrap_or_default()
+        } else {
+            text
+        };
         let ts = match pseudo_get(vm, this, P_TSIZE) {
             Some(V::F32(f)) => f,
             Some(V::I32(b)) => f32::from_bits(b as u32),
@@ -3087,10 +3107,24 @@ fn group_measure_fallback(vm: &mut Vm, this: u32, pw: i32, ph: i32) {
         let (cw, chh) = if text.is_empty() {
             (0, 0)
         } else {
-            (
-                (text.chars().count() as f32 * ts * 0.6) as i32,
-                (ts * 1.3) as i32,
-            )
+            // Wrapping: when the unbroken text overflows the available
+            // width it folds to `ceil(cw/avail)` lines — a single-line
+            // height lets the overflow draw over the next sibling.
+            // Width is estimated per-char; the renderer's real glyph
+            // advance runs wider than a naive 0.6·size, so the wrap
+            // check uses a fatter factor than the extent itself or a
+            // frame measured "one line" renders two.
+            let line_h = (ts * 1.3) as i32;
+            let raw_w = (text.chars().count() as f32 * ts * 0.6) as i32;
+            let avail = (pw & 0x3FFF_FFFF) - pad_w;
+            let frame_w = if avail > 0 { raw_w.min(avail) } else { raw_w };
+            let real_w = (text.chars().count() as f32 * ts * 0.85) as i32;
+            let lines = if frame_w > 0 {
+                ((real_w + frame_w - 1) / frame_w).max(1)
+            } else {
+                1
+            };
+            (frame_w, line_h * lines)
         };
         pseudo_set(vm, this, P_MEAS_W, V::I32(resolve_size(cw + pad_w, pw, true)));
         pseudo_set(vm, this, P_MEAS_H, V::I32(resolve_size(chh + pad_h, ph, true)));
@@ -3159,6 +3193,122 @@ fn group_measure_fallback(vm: &mut Vm, this: u32, pw: i32, ph: i32) {
         } else {
             cw = cw.max(w);
             chh = chh.max(hh + mv);
+        }
+    }
+    // AOSP LinearLayout weight pass: children with `layout_weight`
+    // get a second measure that adds their share of the parent's
+    // leftover axis space — the classic `0dp`+weight pattern stays
+    // at zero extent without it.
+    if linear_v || linear_h {
+        let axis_size = (if linear_v { ph } else { pw }) & 0x3FFF_FFFF;
+        let axis_total = if linear_v { chh } else { cw };
+        let axis_pad = if linear_v { pad_h } else { pad_w };
+        let remaining = (axis_size - axis_pad - axis_total).max(0);
+        if remaining > 0 {
+            let mut total_weight = 0f32;
+            let mut shares: Vec<(u32, f32)> = Vec::new();
+            for c in kids.iter().copied() {
+                let V::Ref(ch) = c else { continue };
+                if ch == 0 {
+                    continue;
+                }
+                let lp_obj = match pseudo_get(vm, ch, P_LP) {
+                    Some(V::Ref(l)) => l,
+                    _ => 0,
+                };
+                let w = lp_field(vm, lp_obj, "weight")
+                    .or_else(|| attr_find(vm, ch, "layout_weight"))
+                    .map(|v| match v {
+                        V::F32(f) => f,
+                        V::I32(i) => i as f32,
+                        _ => 0.0,
+                    })
+                    .unwrap_or(0.0);
+                if w > 0.0 {
+                    shares.push((ch, w));
+                    total_weight += w;
+                }
+            }
+            if total_weight > 0.0 {
+                let wsum = attr_find(vm, this, "weightSum")
+                    .map(|v| match v {
+                        V::F32(f) => f,
+                        V::I32(i) => i as f32,
+                        _ => 0.0,
+                    })
+                    .unwrap_or(0.0);
+                let wsum = if wsum > 0.0 { wsum } else { total_weight };
+                let mut added = 0i32;
+                for (ch, w) in shares {
+                    let share = (remaining as f32 * w / wsum) as i32;
+                    if share <= 0 {
+                        continue;
+                    }
+                    let lp_obj = match pseudo_get(vm, ch, P_LP) {
+                        Some(V::Ref(l)) => l,
+                        _ => 0,
+                    };
+                    let lp_dim = |field: &str, xml: &str| -> i32 {
+                        lp_field(vm, lp_obj, field)
+                            .and_then(|v| lp_px(vm, v))
+                            .or_else(|| attr_find(vm, ch, xml).map(|v| len_v(vm, v)))
+                            .unwrap_or(-2)
+                    };
+                    let ml = lp_field(vm, lp_obj, "leftMargin")
+                        .and_then(|f| lp_px(vm, f))
+                        .unwrap_or(0)
+                        + lp_field(vm, lp_obj, "rightMargin")
+                            .and_then(|f| lp_px(vm, f))
+                            .unwrap_or(0);
+                    let mv = lp_field(vm, lp_obj, "topMargin")
+                        .and_then(|f| lp_px(vm, f))
+                        .unwrap_or(0)
+                        + lp_field(vm, lp_obj, "bottomMargin")
+                            .and_then(|f| lp_px(vm, f))
+                            .unwrap_or(0);
+                    // AOSP skipped-measure path: the weighted child's
+                    // axis extent IS its share (first+share would
+                    // compound across repeat passes — P_MEAS already
+                    // contains the previous share).
+                    let (ws, hs) = if linear_v {
+                        (
+                            child_measure_spec(pw, pad_w + ml, lp_dim("width", "layout_width")),
+                            EXACTLY | share,
+                        )
+                    } else {
+                        (
+                            EXACTLY | share,
+                            child_measure_spec(ph, pad_h + mv, lp_dim("height", "layout_height")),
+                        )
+                    };
+                    let old_axis = if linear_v {
+                        pint(vm, ch, P_MEAS_H) & 0x00FF_FFFF
+                    } else {
+                        pint(vm, ch, P_MEAS_W) & 0x00FF_FFFF
+                    };
+                    if vm
+                        .call_virtual(ch, "measure", &[V::I32(ws), V::I32(hs)])
+                        .is_ok()
+                    {
+                        added += share - old_axis;
+                        let new_cross = if linear_v {
+                            pint(vm, ch, P_MEAS_W) & 0x00FF_FFFF
+                        } else {
+                            pint(vm, ch, P_MEAS_H) & 0x00FF_FFFF
+                        };
+                        if linear_v {
+                            cw = cw.max(new_cross + ml);
+                        } else {
+                            chh = chh.max(new_cross + mv);
+                        }
+                    }
+                }
+                if linear_v {
+                    chh += added;
+                } else {
+                    cw += added;
+                }
+            }
         }
     }
     let self_w = resolve_size(cw + pad_w, pw, true).max(0);
