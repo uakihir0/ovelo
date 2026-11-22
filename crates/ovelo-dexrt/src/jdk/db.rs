@@ -578,6 +578,231 @@ pub(crate) fn media_cursor(vm: &mut Vm, uri: &str, projection: &[String]) -> V {
     V::Ref(c)
 }
 
+/// Percent-decode (`%XX`) — byte-wise so multi-byte UTF-8 names
+/// (`%E9%8C%B2%E9%9F%B3.wav` → `録音.wav`) survive the round-trip.
+pub(crate) fn pct_dec(s: &str) -> String {
+    let b = s.as_bytes();
+    let mut out = Vec::with_capacity(b.len());
+    let mut i = 0;
+    while i < b.len() {
+        if b[i] == b'%' && i + 3 <= b.len() {
+            let hex = |c: u8| (c as char).to_digit(16).map(|d| d as u8);
+            if let (Some(h), Some(l)) = (hex(b[i + 1]), hex(b[i + 2])) {
+                out.push(h * 16 + l);
+                i += 3;
+                continue;
+            }
+        }
+        out.push(b[i]);
+        i += 1;
+    }
+    String::from_utf8_lossy(&out).into_owned()
+}
+
+/// Percent-encode a docId for a URI path segment — every byte outside
+/// the RFC 3986 unreserved set is escaped so a docId's `/` never forges
+/// a `/document/` or `/children` boundary and names containing `%` or
+/// reserved words stay opaque.
+pub(crate) fn pct_enc(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    const HEX: &[u8; 16] = b"0123456789ABCDEF";
+    for &b in s.as_bytes() {
+        match b {
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'.' | b'_' | b'~' => {
+                out.push(b as char)
+            }
+            _ => {
+                out.push('%');
+                out.push(HEX[(b >> 4) as usize] as char);
+                out.push(HEX[(b & 0xf) as usize] as char);
+            }
+        }
+    }
+    out
+}
+
+/// Parse a `content://com.android.externalstorage.documents/…` URI into
+/// `(doc_id, rel_path)`: the docId is the remainder after the last
+/// `/document/` (or `/tree/` for a bare tree URI), percent-decoded —
+/// docIds embed `/` (`primary:Music/Recordings`). `rel_path` drops
+/// empty, `.` and `..` components so a guest-supplied id like
+/// `primary:../../etc` cannot escape `external_root`.
+pub(crate) fn saf_doc_rel(uri: &str) -> (String, String) {
+    let doc_part = uri.strip_suffix("/children").unwrap_or(uri);
+    let after = |pat: &str| -> Option<String> {
+        doc_part
+            .rfind(pat)
+            .map(|off| pct_dec(&doc_part[off + pat.len()..]))
+    };
+    let doc_id = after("/document/")
+        .or_else(|| after("/tree/"))
+        .unwrap_or_default();
+    let rel_raw = doc_id.split_once(':').map(|(_, p)| p).unwrap_or_default();
+    let rel = rel_raw
+        .split('/')
+        .filter(|c| !c.is_empty() && *c != "." && *c != "..")
+        .collect::<Vec<_>>()
+        .join("/");
+    (doc_id, rel)
+}
+
+/// `ContentResolver.query(content://com.android.externalstorage.documents/...)`
+/// — SAF `DocumentsContract.Document` rows over `external_root`, used by
+/// androidx `DocumentFile.fromTreeUri`/`findFile`/`listFiles` (fossify's
+/// `getDocumentSdk30` walk).
+///
+/// URI shapes served (see the minting in `DocumentsContract` builtins):
+///   `…/tree/{treeDocId}`                       — tree root document
+///   `…/tree/{treeDocId}/document/{docId}`      — single document row
+///   `…/tree/{treeDocId}/document/{docId}/children` — directory listing
+///   `…/document/{docId}`                       — bare document row
+/// DocIds are `{volume}:{relPath}` percent-encoded in the URI
+/// (`primary%3AMusic%2FRecordings`), so a document literally named
+/// `children` or containing `%`/`/document/` cannot collide with the
+/// reserved path segments.
+pub(crate) fn saf_cursor(vm: &mut Vm, uri: &str, projection: &[String]) -> V {
+    const COLS: &[&str] = &[
+        "document_id",
+        "mime_type",
+        "_display_name",
+        "last_modified",
+        "flags",
+        "_size",
+        "summary",
+        "icon",
+    ];
+    // DocumentFile's `listFiles`/`findFile`/`exists`/`isDirectory` read
+    // exactly these columns; unknown projection names yield null cells
+    // like `media_cursor`.
+    let children = uri.ends_with("/children");
+    let (doc_id, rel) = saf_doc_rel(uri);
+    let base = if rel.is_empty() {
+        vm.external_root.clone()
+    } else {
+        vm.external_root.join(&rel)
+    };
+    let doc_mime = |p: &std::path::Path| -> &'static str {
+        if p.is_dir() {
+            return "vnd.android.document/directory";
+        }
+        match p
+            .extension()
+            .and_then(|x| x.to_str())
+            .unwrap_or("")
+            .to_lowercase()
+            .as_str()
+        {
+            "jpg" | "jpeg" => "image/jpeg",
+            "png" => "image/png",
+            "gif" => "image/gif",
+            "webp" => "image/webp",
+            "bmp" => "image/bmp",
+            "mp4" | "m4v" => "video/mp4",
+            "mkv" => "video/x-matroska",
+            "webm" => "video/webm",
+            "3gp" => "video/3gpp",
+            "mp3" => "audio/mpeg",
+            "m4a" | "aac" => "audio/mp4a-latm",
+            "ogg" | "opus" => "audio/ogg",
+            "flac" => "audio/flac",
+            "wav" => "audio/x-wav",
+            "txt" | "md" | "log" => "text/plain",
+            "pdf" => "application/pdf",
+            "zip" => "application/zip",
+            _ => "application/octet-stream",
+        }
+    };
+    let vol = doc_id
+        .split_once(':')
+        .map(|(v, _)| v)
+        .unwrap_or("primary");
+    let push_row = |vm: &mut Vm, rows: &mut Vec<Vec<V>>, p: &std::path::Path, id: String| {
+        let meta = std::fs::metadata(p).ok();
+        let size = meta.as_ref().map(|m| m.len() as i64).unwrap_or(0);
+        let mtime_ms = meta
+            .and_then(|m| m.modified().ok())
+            .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+            .map(|d| d.as_millis() as i64)
+            .unwrap_or(0);
+        let name = p
+            .file_name()
+            .map(|n| n.to_string_lossy().to_string())
+            .unwrap_or_else(|| "primary".to_string());
+        let mime = doc_mime(p);
+        // Document flags: dir → supports create/write/delete;
+        // file → write/delete.
+        let flags = if p.is_dir() { 14i64 } else { 6 };
+        rows.push(vec![
+            jstr(vm, &id),
+            jstr(vm, mime),
+            jstr(vm, &name),
+            V::I64(mtime_ms),
+            V::I64(flags),
+            V::I64(if p.is_dir() { 0 } else { size }),
+            V::Ref(0),
+            V::I64(0),
+        ]);
+    };
+    let mut rows: Vec<Vec<V>> = Vec::new();
+    if children {
+        if let Ok(rd) = std::fs::read_dir(&base) {
+            for e in rd.flatten() {
+                let p = e.path();
+                let name = p
+                    .file_name()
+                    .map(|n| n.to_string_lossy().to_string())
+                    .unwrap_or_default();
+                let cid = if rel.is_empty() {
+                    format!("{vol}:{name}")
+                } else {
+                    format!("{vol}:{rel}/{name}")
+                };
+                push_row(vm, &mut rows, &p, cid);
+            }
+        }
+    } else if base.exists() {
+        push_row(vm, &mut rows, &base, doc_id.clone());
+    }
+    if std::env::var_os("OVELO_DRAINDBG").is_some() {
+        eprintln!("[saf_cursor] {uri} rows={} projection={projection:?}", rows.len());
+    }
+    let (cols, rows) = if projection.is_empty() || projection.iter().any(|c| c == "*") {
+        (COLS.iter().map(|c| c.to_string()).collect(), rows)
+    } else {
+        let idxs: Vec<Option<usize>> = projection
+            .iter()
+            .map(|name| {
+                COLS.iter()
+                    .position(|c| c == name)
+                    .or_else(|| COLS.iter().position(|c| c.eq_ignore_ascii_case(name)))
+            })
+            .collect();
+        let proj_rows: Vec<Vec<V>> = rows
+            .iter()
+            .map(|r| {
+                idxs.iter()
+                    .map(|i| i.map(|i| r[i]).unwrap_or(V::Ref(0)))
+                    .collect()
+            })
+            .collect();
+        (projection.to_vec(), proj_rows)
+    };
+    let col_v: Vec<V> = cols.iter().map(|c| jstr(vm, c)).collect();
+    let col_arr = arr(vm, "Ljava/lang/String;", col_v);
+    let row_refs: Vec<V> = rows
+        .into_iter()
+        .map(|r| arr(vm, "Ljava/lang/Object;", r))
+        .collect();
+    let rows_l = host(vm, "Ljava/util/ArrayList;", HostState::List(row_refs));
+    let V::Ref(c) = host(vm, "Landroid/database/Cursor;", HostState::Empty) else {
+        unreachable!()
+    };
+    pseudo_set(vm, c, P_CUR_COLS, col_arr);
+    pseudo_set(vm, c, P_CUR_ROWS, rows_l);
+    pseudo_set(vm, c, P_CUR_POS, V::I32(-1));
+    V::Ref(c)
+}
+
 /// MediaStore `duration` (ms) — zero makes music apps filter the row
 /// out ("0 tracks"). WAV parses the real fmt/data chunks; compressed
 /// formats estimate from size at ~128kbps so the value stays plausible.

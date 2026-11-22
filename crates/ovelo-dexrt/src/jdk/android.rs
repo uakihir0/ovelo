@@ -45,9 +45,23 @@ pub(crate) fn call(
                     .unwrap_or_default();
                 let id = sv(vm, args.get(1).copied().unwrap_or(V::Ref(0)))
                     .unwrap_or_default();
+                // DocIds are percent-encoded into the URI segment
+                // (`primary:Music/Recordings` → `primary%3AMusic%2FRecordings`)
+                // so embedded `/` never forges a `/document/` or
+                // `/children` boundary — `DocumentFile` calls
+                // `getDocumentId` which decodes it back.
+                let id = db::pct_enc(&id);
                 let s = if name.contains("UsingTree") {
-                    // a[0] is the tree Uri itself.
-                    format!("{a0}/{id}")
+                    // a[0] is the tree Uri itself — AOSP appends
+                    // `/document/{id}` (and `/children` for the
+                    // children listing), preserving /tree/{treeId}.
+                    if name.starts_with("buildChild") {
+                        format!("{a0}/document/{id}/children")
+                    } else {
+                        format!("{a0}/document/{id}")
+                    }
+                } else if name.starts_with("buildChild") {
+                    format!("content://{a0}/document/{id}/children")
                 } else {
                     let seg =
                         if name == "buildTreeDocumentUri" { "tree" } else { "document" };
@@ -56,11 +70,28 @@ pub(crate) fn call(
                 Some(Some(host(vm, "Landroid/net/Uri;", HostState::StrBuf(s))))
             }
             "getDocumentId" | "getTreeDocumentId" => {
-                // Last path segment — URIs we mint are
-                // `content://{auth}/{tree|document}/{id}`.
+                // A docId embeds `/` (`primary:Music/Recordings`): the
+                // document id is the whole remainder after the LAST
+                // `/document/`; the tree id is the remainder after the
+                // LAST `/tree/` up to the next `/document/` segment.
                 let u = sv(vm, args.first().copied().unwrap_or(V::Ref(0)))
                     .unwrap_or_default();
-                let id = u.rsplit('/').next().unwrap_or_default().to_string();
+                let id = if name == "getTreeDocumentId" {
+                    u.rfind("/tree/")
+                        .map(|off| {
+                            let rest = &u[off + "/tree/".len()..];
+                            rest.find("/document/").map_or(rest, |e| &rest[..e])
+                        })
+                        .unwrap_or_default()
+                } else {
+                    ["/document/", "/tree/"]
+                        .iter()
+                        .find_map(|pat| {
+                            u.rfind(pat).map(|off| &u[off + pat.len()..])
+                        })
+                        .unwrap_or_default()
+                };
+                let id = db::pct_dec(id);
                 Some(Some(if u.is_empty() { V::Ref(0) } else { jstr(vm, &id) }))
             }
             "isTreeUri" | "isDocumentUri" => {
@@ -194,6 +225,8 @@ pub(crate) fn call(
                 };
                 if uri.starts_with("content://media/") {
                     Some(Some(db::media_cursor(vm, &uri, &projection)))
+                } else if uri.contains("externalstorage.documents") {
+                    Some(Some(db::saf_cursor(vm, &uri, &projection)))
                 } else {
                     Some(Some(host(vm, "Landroid/database/Cursor;", HostState::Empty)))
                 }
@@ -256,11 +289,46 @@ pub(crate) fn call(
                     HostState::Bytes(std::rc::Rc::new(bytes), 0),
                 )))
             }
-            "openOutputStream" => Some(Some(host(
-                vm,
-                "Ljava/io/FileOutputStream;",
-                HostState::Empty,
-            ))),
+            "openOutputStream" => {
+                let uri = sv(vm, args.get(1).copied().unwrap_or(V::Ref(0)))
+                    .unwrap_or_default();
+                // SAF documents resolve to real files under
+                // external_root so `canWrite()` documents actually
+                // persist bytes. mode: "w" truncate (default),
+                // "wa" append, "rw"/"rwt" read+write.
+                let mode = sv(vm, args.get(2).copied().unwrap_or(V::Ref(0)))
+                    .unwrap_or_default();
+                if uri.contains("externalstorage.documents") {
+                    let (_id, rel) = db::saf_doc_rel(&uri);
+                    let path = vm.external_root.join(&rel);
+                    if let Some(parent) = path.parent() {
+                        let _ = std::fs::create_dir_all(parent);
+                    }
+                    // Modes: "w" truncate, "wa" append, "rw" r/w no
+                    // truncate, "rwt" r/w + truncate.
+                    let f = std::fs::OpenOptions::new()
+                        .write(true)
+                        .read(mode.starts_with("rw"))
+                        .create(true)
+                        .truncate(mode != "wa" && mode != "rw")
+                        .append(mode == "wa")
+                        .open(&path)
+                        .ok();
+                    return Ok(Some(match f {
+                        Some(f) => Some(host(
+                            vm,
+                            "Ljava/io/FileOutputStream;",
+                            HostState::File(f),
+                        )),
+                        None => Some(V::Ref(0)),
+                    }));
+                }
+                Some(Some(host(
+                    vm,
+                    "Ljava/io/FileOutputStream;",
+                    HostState::Empty,
+                )))
+            }
             "isSyncActive"
             | "getSyncAutomatically"
             | "getMasterSyncAutomatically"
@@ -4597,6 +4665,12 @@ pub(crate) fn media_uri_path(vm: &Vm, uri: &str) -> Option<String> {
                 }
             }
         }
+    }
+    if uri.contains("externalstorage.documents") {
+        // Return the GUEST path — callers pass it through `io::fspath`
+        // which maps the external-storage alias back to external_root.
+        let (_id, rel) = db::saf_doc_rel(uri);
+        return Some(format!("/storage/emulated/0/{rel}"));
     }
     None
 }
