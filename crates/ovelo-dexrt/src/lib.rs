@@ -1609,15 +1609,26 @@ impl Vm {
             }
         }
         // TextClock tick: AOSP reschedules the ticker runnable every
-        // second; the drain cadence is our clock signal. Dead handles
-        // are pruned; unchanged text doesn't dirty the tree.
+        // second; the drain cadence is our clock signal. Handles are
+        // re-validated against the class chain — a GC'd slot recycled
+        // for a non-clock object must be dropped, not overwritten.
         if !self.clock_views.is_empty() {
-            self.clock_views
-                .retain(|h| self.heap.get(*h).is_some());
+            let mut live: Vec<u32> = Vec::with_capacity(self.clock_views.len());
             for i in 0..self.clock_views.len() {
                 let h = self.clock_views[i];
-                jdk::view::textclock_update(self, h);
+                let is_clock = match self.heap.class_of(h) {
+                    Some(ci) => self
+                        .type_desc_of(ci)
+                        .map(|d| self.assignable_desc(&d, "Landroid/widget/TextClock;"))
+                        .unwrap_or(false),
+                    None => false,
+                };
+                if is_clock {
+                    live.push(h);
+                    jdk::view::textclock_update(self, h);
+                }
             }
+            self.clock_views = live;
         }
         self.draining = false;
         ran
