@@ -63,6 +63,10 @@ pub(crate) const P_BBUF_ORD: u64 = 0xFFFD_FEE3;
 /// cursor positions are element indices, capacity is backing/esz.
 /// Absent or 1 = plain `ByteBuffer` (positions are bytes).
 pub(crate) const P_BBUF_ESZ: u64 = 0xFFFD_FEEF;
+/// Byte offset into the backing array where a typed view's content
+/// starts — `asIntBuffer` on a positioned ByteBuffer views it from its
+/// position, not from the array base. Absent/0 = no offset.
+pub(crate) const P_BBUF_BASE: u64 = 0xFFFD_FF00;
 /// `Message` routing: target `Handler`, payload `obj`, `callback`
 /// `Runnable` — and a `Handler`'s own `Handler.Callback` — so
 /// `obtainMessage(...).sendToTarget()`/`sendMessage` actually deliver

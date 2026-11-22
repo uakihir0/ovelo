@@ -1689,8 +1689,14 @@ fn nio_call(vm: &mut Vm, class: &str, name: &str, args: &[V]) -> Option<Option<V
         i32v(pseudo_get(vm, this, P_BBUF_ESZ).unwrap_or(V::I32(1)))
             .clamp(1, 8) as usize
     };
+    // A typed view's content starts at the parent's byte position when
+    // it was created — `read_at`/`put` index `base + pos`.
+    let base = |vm: &Vm| {
+        i32v(pseudo_get(vm, this, P_BBUF_BASE).unwrap_or(V::I32(0))).max(0) as usize
+    };
     // Read `n` bytes at `pos`; None when out of bounds.
     let read_at = |vm: &Vm, pos: usize, n: usize| -> Option<Vec<u8>> {
+        let pos = base(vm) + pos;
         let b = backing(vm)?;
         match vm.heap.get(b) {
             Some(Obj::Array { data, .. }) => {
@@ -1745,9 +1751,13 @@ fn nio_call(vm: &mut Vm, class: &str, name: &str, args: &[V]) -> Option<Option<V
                 _ => ("Ljava/nio/CharBuffer;", 2),
             };
             let b = backing(vm).map(V::Ref).unwrap_or(V::I32(0));
+            let base0 = base(vm) + bpos(vm) * esz(vm);
             let v = host(vm, desc, HostState::Slot(b));
             if let V::Ref(h) = v {
                 pseudo_set(vm, h, P_BBUF_ESZ, V::I32(w));
+                if base0 != 0 {
+                    pseudo_set(vm, h, P_BBUF_BASE, V::I32(base0 as i32));
+                }
                 if let Some(o) = pseudo_get(vm, this, P_BBUF_ORD) {
                     pseudo_set(vm, h, P_BBUF_ORD, o);
                 }
@@ -1811,6 +1821,7 @@ fn nio_call(vm: &mut Vm, class: &str, name: &str, args: &[V]) -> Option<Option<V
                     _ => None,
                 })
                 .unwrap_or(0)
+                .saturating_sub(base(vm))
                 / esz(vm);
             if args.len() > 1 {
                 Some(Some(args[0]))
@@ -1825,6 +1836,7 @@ fn nio_call(vm: &mut Vm, class: &str, name: &str, args: &[V]) -> Option<Option<V
                     _ => None,
                 })
                 .unwrap_or(0)
+                .saturating_sub(base(vm))
                 / esz(vm);
             Some(Some(V::I32(n.saturating_sub(bpos(vm)) as i32)))
         }
@@ -1871,6 +1883,7 @@ fn nio_call(vm: &mut Vm, class: &str, name: &str, args: &[V]) -> Option<Option<V
                 if little(vm) {
                     b.reverse();
                 }
+                let pos = base(vm) + pos;
                 if let Some(bh) = backing(vm) {
                     if let Some(Obj::Array { data, .. }) = vm.heap.get_mut(bh) {
                         for (i, x) in b.iter().enumerate() {
@@ -1926,9 +1939,10 @@ fn nio_call(vm: &mut Vm, class: &str, name: &str, args: &[V]) -> Option<Option<V
                             );
                         }
                         if let Some(bh) = backing(vm) {
+                            let bb = base(vm);
                             if let Some(Obj::Array { data, .. }) = vm.heap.get_mut(bh) {
                                 for (i, x) in bytes.iter().enumerate() {
-                                    if let Some(slot) = data.get_mut(pos0 * es + i) {
+                                    if let Some(slot) = data.get_mut(bb + pos0 * es + i) {
                                         *slot = V::I32(*x as i8 as i32);
                                     }
                                 }
@@ -1974,10 +1988,16 @@ fn nio_call(vm: &mut Vm, class: &str, name: &str, args: &[V]) -> Option<Option<V
                                         .max(0)
                                             as usize
                                             * ses;
+                                        let sb_off = i32v(
+                                            pseudo_get(vm, sh, P_BBUF_BASE)
+                                                .unwrap_or(V::I32(0)),
+                                        )
+                                        .max(0)
+                                            as usize;
                                         if let Some(Obj::Array { data, .. }) = vm.heap.get(sb) {
                                             v = data
                                                 .iter()
-                                                .skip(sp)
+                                                .skip(sb_off + sp)
                                                 .map(|x| i32v(*x) as u8)
                                                 .collect();
                                         }
@@ -1996,9 +2016,10 @@ fn nio_call(vm: &mut Vm, class: &str, name: &str, args: &[V]) -> Option<Option<V
                         };
                         let len = bytes.len();
                         if let Some(bh) = backing(vm) {
+                            let bb = base(vm);
                             if let Some(Obj::Array { data, .. }) = vm.heap.get_mut(bh) {
                                 for (i, x) in bytes.iter().enumerate() {
-                                    if let Some(slot) = data.get_mut(pos0 * es + i) {
+                                    if let Some(slot) = data.get_mut(bb + pos0 * es + i) {
                                         *slot = V::I32(*x as i8 as i32);
                                     }
                                 }
@@ -2091,7 +2112,9 @@ fn nio_call(vm: &mut Vm, class: &str, name: &str, args: &[V]) -> Option<Option<V
                     let le = little(vm);
                     if let V::Ref(dh) = dst {
                         if let Some(Obj::Array { data, .. }) = vm.heap.get_mut(dh) {
-                            for (i, slot) in data.iter_mut().enumerate().skip(off) {
+                            for (i, slot) in
+                                data.iter_mut().enumerate().skip(off).take(len)
+                            {
                                 let at = (i - off) * es;
                                 let mut e = vec![0u8; es];
                                 if let Some(src) = bytes.get(at..at + es) {

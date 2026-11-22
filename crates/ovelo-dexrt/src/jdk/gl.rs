@@ -178,6 +178,21 @@ fn state<R>(gl: u32, f: impl FnOnce(&mut GlState) -> R) -> R {
     f(st)
 }
 
+/// Guest heap handles GL state references but GC cannot see —
+/// `glVertexAttribPointer` direct buffers stay alive for later draws.
+pub(crate) fn live_handles() -> Vec<u32> {
+    let g = STATES.lock().unwrap();
+    g.as_ref()
+        .map(|m| {
+            m.values()
+                .flat_map(|s| s.attribs.values().map(|a| a.buf))
+                .filter(|&b| b > 0)
+                .map(|b| b as u32)
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
 fn has_state(gl: u32) -> bool {
     STATES
         .lock()
@@ -243,10 +258,14 @@ fn elem_at(vm: &Vm, arr: u32, off: usize) -> V {
 
 fn bbuf_pos(vm: &Vm, buf: u32) -> usize {
     // Typed views store element-indexed positions — GL paths read raw
-    // bytes, so convert via the element width.
+    // bytes, so convert via the element width; a view's content starts
+    // at P_BBUF_BASE (the parent position when the view was made).
     let esz = i32v(pseudo_get(vm, buf, super::P_BBUF_ESZ).unwrap_or(V::I32(1))).clamp(1, 8)
         as usize;
-    i32v(pseudo_get(vm, buf, super::P_BBUF_POS).unwrap_or(V::I32(0))).max(0) as usize * esz
+    let base = i32v(pseudo_get(vm, buf, super::P_BBUF_BASE).unwrap_or(V::I32(0))).max(0)
+        as usize;
+    base + i32v(pseudo_get(vm, buf, super::P_BBUF_POS).unwrap_or(V::I32(0))).max(0) as usize
+        * esz
 }
 
 fn bbuf_le(vm: &Vm, buf: u32) -> bool {
