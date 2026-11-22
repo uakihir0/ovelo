@@ -2871,6 +2871,32 @@ fn unsafe_call(vm: &mut Vm, name: &str, args: &[V]) -> Rt<Option<Option<V>>> {
             });
         }
         "park" => {
+            // `park(isAbsolute, time)`: isAbsolute → absolute ms epoch,
+            // else relative nanos. A bounded wait must NOT unwind —
+            // re-running the runnable from the top restarts the guest's
+            // wait (e.g. `AbstractFuture.get(t)` computes its deadline
+            // inside `get`), so its clock never advances and the
+            // TimeoutException never fires: drain queued work if any,
+            // then sleep a slice of the wait and return inside the same
+            // call so the guest's own deadline check eventually trips.
+            let time = i64v(args.get(2).copied().unwrap_or(V::I64(0)));
+            if time > 0 {
+                let absolute =
+                    i64v(args.get(1).copied().unwrap_or(V::I32(0))) != 0;
+                let remain_ms = if absolute {
+                    time.saturating_sub(now_ms())
+                } else {
+                    time / 1_000_000
+                };
+                if !vm.pending_runnables.is_empty() {
+                    vm.park_drain()?;
+                } else {
+                    std::thread::sleep(std::time::Duration::from_millis(
+                        remain_ms.clamp(1, 64) as u64,
+                    ));
+                }
+                return Ok(Some(None));
+            }
             // Parked threads can't resume their Java stack, so run
             // queued work inline (see `park_drain`); past the nesting
             // cap it falls back to the preempt-and-requeue unwind.

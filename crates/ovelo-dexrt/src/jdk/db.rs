@@ -463,8 +463,24 @@ pub(crate) fn media_cursor(vm: &mut Vm, uri: &str, projection: &[String]) -> V {
                 vm.next_media_id
             };
             let bucket_id = java_hash(&rel_dir.to_lowercase()) as i64;
+            // Scoped aggregate URIs key `_id` by their own entity:
+            // `audio/albums` rows must expose `album_id` as `_id` —
+            // apps join `track.album_id == album._id` (and likewise
+            // artists/genres); a media rowid would fail that join.
+            let album_id = java_hash(&rel_dir.to_lowercase()) as i64;
+            let artist_id = 1i64;
+            let genre_id = 0i64;
+            let scoped_id = if uri.contains("/albums") {
+                album_id
+            } else if uri.contains("/artists") {
+                artist_id
+            } else if uri.contains("/genres") {
+                genre_id
+            } else {
+                row_id
+            };
             rows.push(vec![
-                V::I64(row_id),
+                V::I64(scoped_id),
                 jstr(vm, &data),
                 jstr(vm, &name),
                 jstr(vm, &title),
@@ -490,7 +506,9 @@ pub(crate) fn media_cursor(vm: &mut Vm, uri: &str, projection: &[String]) -> V {
                 jstr(vm, &bucket),
                 V::I64(java_hash(&rel_dir.to_lowercase()) as i64),
                 V::I64(1),
-                V::I64(0),
+                // `track` = disc*1000 + number (MediaStore encoding);
+                // apps filter `track > 0` — 0 drops the row entirely.
+                V::I64(if mtype == 2 { 1001 } else { 0 }),
                 V::I64(0),
                 V::I64(0),
                 jstr(vm, "<unknown>"),

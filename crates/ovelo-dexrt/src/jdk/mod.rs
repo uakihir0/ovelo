@@ -432,6 +432,20 @@ pub(crate) fn value_eq(vm: &Vm, a: V, b: V) -> bool {
                             _ => false,
                         }
                 }
+                // Boxed primitives (Integer/Long/Double/...) are host
+                // Slot objects — `equals` compares the wrapped value,
+                // not the box identity, or `list.contains(Long.valueOf(x))`
+                // never matches (MediaStore id joins drop every row).
+                (
+                    Some(Obj::Host {
+                        state: HostState::Slot(a),
+                        ..
+                    }),
+                    Some(Obj::Host {
+                        state: HostState::Slot(b),
+                        ..
+                    }),
+                ) => value_eq(vm, *a, *b),
                 _ => false,
             }
         }
