@@ -14,7 +14,6 @@
 //! * Java calls into native: dex `native` method → symbol lookup →
 //!   `jni_call` trampoline.
 
-use std::cell::Cell;
 use std::ffi::c_void;
 
 use crate::jdk;
@@ -22,12 +21,13 @@ use crate::proto_sig;
 use crate::value::{HostState, Obj, V};
 use crate::{gl, GIdx, Rt, Vm};
 
-thread_local! {
-    static CUR_VM: Cell<*mut Vm> = const { Cell::new(std::ptr::null_mut()) };
-}
 // Guest `.so`s can spawn real pthreads (pthread_create resolves to
 // libsystem); JNI entry points reached from those threads have no
 // thread-local binding, so they read the last Vm bound anywhere.
+// No thread_local here: while `with_guest_tls` swaps TPIDR_EL0 to the
+// guest TCB, every #[thread_local] read resolves into *guest* memory —
+// a nonzero CUR_VM there would build `&mut Vm` at a wild address.
+static VM_DEPTH: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
 static FALLBACK_VM: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
 
 // All Vm access from JNI entry points serializes on a recursive mutex:
@@ -81,12 +81,9 @@ fn vm_mtx() -> *mut c_void {
 /// while the interpreter is inside `call_native` — where
 /// `without_vm_lock` releases all levels — or between dispatches.
 pub(crate) struct VmLock;
-thread_local! {
-    static VM_DEPTH: std::cell::Cell<u32> = const { std::cell::Cell::new(0) };
-}
 impl Drop for VmLock {
     fn drop(&mut self) {
-        VM_DEPTH.with(|d| d.set(d.get() - 1));
+        VM_DEPTH.fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
         unsafe {
             pthread_mutex_unlock(vm_mtx());
         }
@@ -99,7 +96,7 @@ pub(crate) fn vm_lock() -> VmLock {
             std::process::abort();
         }
     }
-    VM_DEPTH.with(|d| d.set(d.get() + 1));
+    VM_DEPTH.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     VmLock
 }
 
@@ -110,7 +107,10 @@ pub(crate) fn vm_lock() -> VmLock {
 /// during exactly that window.
 #[cfg_attr(not(target_arch = "aarch64"), allow(dead_code))]
 pub(crate) fn without_vm_lock<R>(f: impl FnOnce() -> R) -> R {
-    let n = VM_DEPTH.with(|d| d.replace(0));
+    // VM_DEPTH is a process-global counter, not per-thread — sound
+    // because the recursive pthread mutex serializes holders anyway:
+    // only one thread can have a nonzero depth at a time.
+    let n = VM_DEPTH.swap(0, std::sync::atomic::Ordering::Relaxed);
     let m = vm_mtx();
     for _ in 0..n {
         unsafe {
@@ -125,7 +125,7 @@ pub(crate) fn without_vm_lock<R>(f: impl FnOnce() -> R) -> R {
             }
         }
     }
-    VM_DEPTH.with(|d| d.set(n));
+    VM_DEPTH.fetch_add(n, std::sync::atomic::Ordering::Relaxed);
     r
 }
 
@@ -149,8 +149,16 @@ impl std::ops::DerefMut for VmGuard {
 
 // Track the last env-fn entry (set by `env_enter`); used to name the
 // caller whose preceding work corrupted the malloc zone.
-thread_local! {
-    static LAST_ENV: std::cell::Cell<&'static str> = const { std::cell::Cell::new("?") };
+// Mutex not thread_local: env fns run under the guest TCB where
+// thread_local storage resolves to guest memory.
+static LAST_ENV: std::sync::Mutex<&'static str> = std::sync::Mutex::new("?");
+fn last_env_get() -> &'static str {
+    LAST_ENV.lock().map(|g| *g).unwrap_or("?")
+}
+fn last_env_set(name: &'static str) {
+    if let Ok(mut g) = LAST_ENV.lock() {
+        *g = name;
+    }
 }
 
 /// Env-fn entry hook: `env_enter("FindClass")` at the top of each fn.
@@ -169,32 +177,47 @@ pub(crate) fn env_enter(name: &'static str) {
             extern "C" {
                 fn malloc_default_zone() -> *mut std::ffi::c_void;
                 fn malloc_zone_check(zone: *mut std::ffi::c_void) -> bool;
+                fn malloc_get_all_zones(
+                    task: u32,
+                    reader: usize,
+                    zones: *mut *mut std::ffi::c_void,
+                    count: *mut u32,
+                ) -> i32;
+                fn mach_task_self() -> u32;
             }
-            for (zname, z) in [
-                ("default", malloc_default_zone()),
-                ("guest", crate::native::guest_zone()),
-            ] {
+            // Check EVERY zone the process knows about — Rust's own
+            // allocations live in a private zone that neither
+            // malloc_default_zone nor guest_zone names.
+            let mut zs: *mut std::ffi::c_void = std::ptr::null_mut();
+            let mut n: u32 = 0;
+            let nr = malloc_get_all_zones(mach_task_self(), 0, &mut zs, &mut n);
+            if nr != 0 {
+                eprintln!("[zonecheck] malloc_get_all_zones -> {nr}");
+            }
+            for i in 0..n as usize {
+                let z = *(zs as *mut *mut std::ffi::c_void).add(i);
                 if !malloc_zone_check(z) {
-                    eprintln!("[zonecheck] BAD {zname} ZONE on entry to {name}; previous env call: {}", LAST_ENV.get());
+                    eprintln!(
+                        "[zonecheck] BAD ZONE {z:?} on entry to {name}; previous env call: {}",
+                        last_env_get()
+                    );
                     std::process::abort();
                 }
             }
+            let _ = malloc_default_zone;
         }
     }
     check_buf_canaries(name);
     #[cfg(target_os = "macos")]
     crate::native::dbg_check_all(name);
-    LAST_ENV.set(name);
+    last_env_set(name);
 }
 
 pub(crate) fn vm() -> VmGuard {
     let lock = vm_lock();
-    let p = CUR_VM.get() as usize;
-    let p = if p != 0 {
-        p
-    } else {
-        FALLBACK_VM.load(std::sync::atomic::Ordering::Acquire)
-    };
+    // FALLBACK_VM only: under the guest-TLS window any thread_local
+    // read is a read of guest-controlled memory.
+    let p = FALLBACK_VM.load(std::sync::atomic::Ordering::Acquire);
     VmGuard {
         vm: unsafe { &mut *(p as *mut Vm) },
         _lock: lock,
@@ -204,12 +227,8 @@ pub(crate) fn vm() -> VmGuard {
 /// Run `f` with the JNIEnv bound to `vm` — every native call holds this
 /// for the duration so env functions can reach the heap.
 pub(crate) fn with_vm<R>(vm: &mut Vm, f: impl FnOnce(&mut Vm) -> R) -> R {
-    let prev = CUR_VM.get();
-    CUR_VM.set(vm as *mut Vm);
     FALLBACK_VM.store(vm as *mut Vm as usize, std::sync::atomic::Ordering::Release);
-    let r = f(vm);
-    CUR_VM.set(prev);
-    r
+    f(vm)
 }
 
 // ---------- trampoline ----------
@@ -568,6 +587,18 @@ pub(crate) fn init_tables() {
             }
         }
         let _ = ENV_NAMES.set(names);
+
+        // Every table entry is a host fn that guest code calls while
+        // TPIDR_EL0 points at the guest TCB — wrap each in a thunk
+        // that restores the host pthread block for the call's
+        // duration (libSystem's TPIDR-keyed per-thread state —
+        // malloc magazine, TSD, stack_chk_guard — faults on the
+        // guest TCB; observed as wild derefs inside the first call).
+        for s in JNI_TABLE.iter_mut().chain(JAVAVM_TABLE.iter_mut()) {
+            if *s != 0 {
+                *s = crate::native::host_thunk(*s as usize) as u64;
+            }
+        }
     });
 }
 
@@ -1106,6 +1137,10 @@ extern "C" fn get_string_region(_e: u64, s: u64, start: u64, len: u64, buf: u64)
         return;
     };
     let u16s: Vec<u16> = x.encode_utf16().collect();
+    if !crate::native::guest_dst_ok(buf as usize, len as usize * 2) {
+        eprintln!("[guestptr] get_string_region: write {buf:#x}+{len}*2 not guest/stack/image");
+        return;
+    }
     for i in 0..len as usize {
         let v = u16s.get(start as usize + i).copied().unwrap_or(0);
         unsafe { *((buf + i as u64 * 2) as *mut u16) = v };
@@ -1141,6 +1176,10 @@ extern "C" fn get_string_utf_region(_e: u64, s: u64, start: u64, len: u64, buf: 
     let mut out = Vec::with_capacity((hi - lo) * 3);
     for &u in &u16s[lo..hi] {
         mutf8_unit(&mut out, u);
+    }
+    if !crate::native::guest_dst_ok(buf as usize, out.len()) {
+        eprintln!("[guestptr] get_string_utf_region: write {buf:#x}+{} not guest/stack/image", out.len());
+        return;
     }
     unsafe {
         std::ptr::copy_nonoverlapping(out.as_ptr(), buf as *mut u8, out.len());
@@ -1304,38 +1343,41 @@ fn libc_malloc(n: usize) -> usize {
     }
     // p+n isn't necessarily 8-aligned — use unaligned access.
     unsafe { ((p + n) as *mut u64).write_unaligned(0xdead_beef_cafe_f00d) };
-    BUFS.with(|b| b.borrow_mut().insert(p, n));
+    if let Ok(mut b) = bufs().lock() {
+        b.insert(p, n);
+    }
     p
 }
 fn libc_free(p: usize) {
     if p == 0 {
         return;
     }
-    let n = BUFS.with(|b| b.borrow_mut().remove(&p));
+    let n = bufs().lock().ok().and_then(|mut b| b.remove(&p));
     if let Some(n) = n {
         let m = unsafe { ((p + n) as *const u64).read_unaligned() };
         if m != 0xdead_beef_cafe_f00d {
-            eprintln!("[bufdbg] canary dead at {p:#x}+{n} on free; last env {}", LAST_ENV.get());
+            eprintln!("[bufdbg] canary dead at {p:#x}+{n} on free; last env {}", last_env_get());
         }
     }
     crate::native::guest_free(p)
 }
-thread_local! {
-    static BUFS: std::cell::RefCell<std::collections::HashMap<usize, usize>> =
-        std::cell::RefCell::new(std::collections::HashMap::new());
+fn bufs() -> &'static std::sync::Mutex<std::collections::HashMap<usize, usize>> {
+    static B: std::sync::OnceLock<std::sync::Mutex<std::collections::HashMap<usize, usize>>> =
+        std::sync::OnceLock::new();
+    B.get_or_init(|| std::sync::Mutex::new(std::collections::HashMap::new()))
 }
 fn check_buf_canaries(name: &'static str) {
     if std::env::var_os("OVELO_BUFDBG").is_none() {
         return;
     }
-    BUFS.with(|b| {
-        for (&p, &n) in b.borrow().iter() {
+    if let Ok(b) = bufs().lock() {
+        for (&p, &n) in b.iter() {
             let m = unsafe { ((p + n) as *const u64).read_unaligned() };
             if m != 0xdead_beef_cafe_f00d {
-                eprintln!("[bufdbg] overrun: buf {p:#x}+{n} bad on entry to {name}; previous env {}", LAST_ENV.get());
+                eprintln!("[bufdbg] overrun: buf {p:#x}+{n} bad on entry to {name}; previous env {}", last_env_get());
             }
         }
-    });
+    }
 }
 
 macro_rules! ga {
@@ -1385,6 +1427,10 @@ fn get_region(a: u64, start: u64, len: u64, out: u64) {
     let h = a as u32;
     let Some(d) = arr_data(h) else { return };
     let sz = elem_size(h);
+    if !crate::native::guest_dst_ok(out as usize, len as usize * sz) {
+        eprintln!("[guestptr] get_region: write {out:#x}+{len}*{sz} not guest/stack/image");
+        return;
+    }
     for i in 0..len as usize {
         let v = d.get(start as usize + i).copied().unwrap_or(V::I32(0));
         // Write exactly `sz` bytes — a full u64 store at a narrower
@@ -1510,6 +1556,9 @@ extern "C" fn vm_attach(_vm: u64, a: u64, _b: u64) -> u64 {
 
 extern "C" fn new_direct_byte_buffer(_e: u64, addr: u64, cap: u64) -> u64 {
     env_enter("new_direct_byte_buffer");
+    if !crate::native::guest_dst_ok(addr as usize, cap as usize) {
+        eprintln!("[guestptr] new_direct_byte_buffer: {addr:#x}+{cap} not guest/stack/image");
+    }
     let mut v = vm();
     let ci = v.type_index_of("Ljava/nio/ByteBuffer;").unwrap_or(crate::GX_NONE);
     let mut fields = std::collections::HashMap::new();
@@ -1673,6 +1722,8 @@ pub(crate) fn dispatch_native(
     is_static: bool,
     args: &[V],
 ) -> Rt<Option<V>> {
+    #[cfg(target_os = "macos")]
+    crate::native::check_all_zones("dispatch_native");
     let mut iargs = [0u64; 8];
     let mut fargs = [0f64; 8];
     let mut sargs: Vec<u64> = Vec::new();

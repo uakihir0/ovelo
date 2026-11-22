@@ -48,6 +48,12 @@ extern "C" {
     #[cfg(target_os = "macos")]
     fn pthread_threadid_np(t: usize, id: *mut u64) -> i32;
     #[cfg(target_os = "macos")]
+    fn pthread_self() -> usize;
+    #[cfg(target_os = "macos")]
+    fn pthread_get_stackaddr_np(t: usize) -> *mut c_void;
+    #[cfg(target_os = "macos")]
+    fn pthread_get_stacksize_np(t: usize) -> usize;
+    #[cfg(target_os = "macos")]
     fn __error() -> *mut i32;
     #[cfg(not(target_os = "macos"))]
     fn __errno_location() -> *mut i32;
@@ -78,6 +84,8 @@ extern "C" {
     fn malloc_zone_from_ptr(ptr: *const c_void) -> *mut c_void;
     #[cfg(target_os = "macos")]
     fn malloc_size(ptr: *const c_void) -> usize;
+    #[cfg(target_os = "macos")]
+    fn malloc_default_zone() -> *mut c_void;
     #[cfg(target_os = "macos")]
     fn free(ptr: *mut c_void);
 }
@@ -138,12 +146,30 @@ static mut GUEST_TCB: [u64; 8192] = {
 /// (JNI_OnLoad, DT_INIT*, exported natives).
 #[cfg(target_arch = "aarch64")]
 pub(crate) fn with_guest_tls<R>(f: impl FnOnce() -> R) -> R {
+    // OVELO_NOTLS: debug knob — run guest code on the host TPIDR_EL0 to
+    // test whether the swap itself corrupts host state.
+    if std::env::var_os("OVELO_NOTLS").is_some() {
+        return f();
+    }
     unsafe {
         let tcb = std::ptr::addr_of_mut!(GUEST_TCB);
-        (*tcb)[0] = tcb as usize as u64; // TLS_SLOT_SELF
         let mut old: usize;
         core::arch::asm!("mrs {}, tpidr_el0", out(reg) old);
+        #[cfg(target_os = "macos")]
+        thunk::set_host_tcb(old);
+        (*tcb)[0] = tcb as usize as u64; // TLS_SLOT_SELF
+        (*tcb)[5] = 0x9e3779b97f4a7c15; // bionic stack guard slot
         core::arch::asm!("msr tpidr_el0, {}", in(reg) tcb as usize);
+        // OVELO_TLSPROBE: allocation inside the swapped window — if the
+        // crash is malloc's TPIDR-keyed per-thread magazine state, a
+        // plain Vec alloc+drop dies here with the same signature.
+        if std::env::var_os("OVELO_TLSPROBE").is_some() {
+            let mut v: Vec<u8> = Vec::with_capacity(4096);
+            v.extend_from_slice(&[1u8, 2, 3, 4]);
+            std::hint::black_box(v.as_ptr());
+            drop(v);
+            eprintln!("[tlsprobe] alloc+drop under guest TLS survived");
+        }
         let r = f();
         core::arch::asm!("msr tpidr_el0, {}", in(reg) old);
         r
@@ -153,6 +179,140 @@ pub(crate) fn with_guest_tls<R>(f: impl FnOnce() -> R) -> R {
 #[cfg(not(target_arch = "aarch64"))]
 pub(crate) fn with_guest_tls<R>(f: impl FnOnce() -> R) -> R {
     f()
+}
+
+/// Host-TPIDR call thunks: every function pointer handed to guest
+/// code (JNIEnv/JavaVM vtable entries, builtin shims, dlsym'd
+/// libSystem imports) is wrapped in a 64-byte stub that swaps
+/// TPIDR_EL0 back to the host pthread block for the call's duration.
+/// libSystem reads TPIDR-keyed per-thread state (malloc magazine,
+/// TSD, stack_chk_guard); under the guest TCB those reads fault —
+/// observed as `ldr x9,[x3]` on wild addresses inside the first env
+/// call. Emitted lazily into a MAP_JIT page.
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+mod thunk {
+    use std::collections::HashMap;
+    use std::ffi::c_void;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::Mutex;
+
+    /// Saved host TPIDR_EL0 — written by `with_guest_tls` before each
+    /// swap. Native dispatch is serialized on the interpreter thread,
+    /// so one cell is enough.
+    static HOST_TCB: AtomicUsize = AtomicUsize::new(0);
+
+    static MEMO: Mutex<Option<HashMap<usize, usize>>> = Mutex::new(None);
+
+    struct Arena {
+        base: usize,
+        used: usize,
+    }
+    static ARENA: Mutex<Option<Arena>> = Mutex::new(None);
+
+    extern "C" {
+        fn pthread_jit_write_protect_np(enable: i32);
+        fn mmap(
+            addr: *mut c_void,
+            len: usize,
+            prot: i32,
+            flags: i32,
+            fd: i32,
+            off: i64,
+        ) -> *mut c_void;
+        fn sys_icache_invalidate(start: *mut c_void, len: usize);
+    }
+    const PROT_RW: i32 = 3;
+    const PROT_EXEC: i32 = 4;
+    const MAP_PRIV_ANON_JIT: i32 = 0x0002 | 0x1000 | 0x0800;
+
+    // 10 insns + 8B pad + 2 literal quads = 64B:
+    //   stp x29, x30, [sp, #-32]!
+    //   mrs x29, tpidr_el0          // guest TCB — callee-saved reg
+    //   ldr x16, +40                // -> literal: &HOST_TCB
+    //   ldr x16, [x16]
+    //   msr tpidr_el0, x16          // host TCB
+    //   ldr x16, +36                // -> literal: target
+    //   blr x16
+    //   msr tpidr_el0, x29          // guest TCB again
+    //   ldp x29, x30, [sp], #32
+    //   ret
+    const INS: [u32; 10] = [
+        0xA9BE_7BFD,
+        0xD53B_D05D,
+        0x5800_0150,
+        0xF940_0210,
+        0xD51B_D050,
+        0x5800_0130,
+        0xD63F_0200,
+        0xD51B_D05D,
+        0xA8C2_7BFD,
+        0xD65F_03C0,
+    ];
+    const SLOT: usize = 64;
+    const PAGE: usize = 0x10000;
+
+    pub(super) fn set_host_tcb(v: usize) {
+        HOST_TCB.store(v, Ordering::Release);
+    }
+
+    pub(super) fn emit(target: usize) -> usize {
+        if let Some(&t) = MEMO.lock().unwrap().as_ref().and_then(|m| m.get(&target)) {
+            return t;
+        }
+        let t = emit_slow(target);
+        MEMO
+            .lock()
+            .unwrap()
+            .get_or_insert_with(HashMap::new)
+            .insert(target, t);
+        t
+    }
+
+    #[cold]
+    fn emit_slow(target: usize) -> usize {
+        let mut guard = ARENA.lock().unwrap();
+        let a = guard.get_or_insert_with(|| unsafe {
+            let p = mmap(
+                std::ptr::null_mut(),
+                PAGE,
+                PROT_RW | PROT_EXEC,
+                MAP_PRIV_ANON_JIT,
+                -1,
+                0,
+            );
+            assert_ne!(p as usize, usize::MAX, "thunk arena mmap failed");
+            Arena {
+                base: p as usize,
+                used: 0,
+            }
+        });
+        assert!(a.used + SLOT <= PAGE, "thunk arena exhausted");
+        let at = a.base + a.used;
+        a.used += SLOT;
+        unsafe {
+            pthread_jit_write_protect_np(0);
+            let w = at as *mut u32;
+            for (i, &ins) in INS.iter().enumerate() {
+                w.add(i).write_volatile(ins);
+            }
+            let lit = (at + 48) as *mut usize;
+            lit.write_volatile(std::ptr::addr_of!(HOST_TCB) as usize);
+            lit.add(1).write_volatile(target);
+            pthread_jit_write_protect_np(1);
+            sys_icache_invalidate(at as *mut c_void, SLOT);
+        }
+        at
+    }
+}
+
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+pub(crate) fn host_thunk(f: usize) -> usize {
+    thunk::emit(f)
+}
+
+#[cfg(not(all(target_os = "macos", target_arch = "aarch64")))]
+pub(crate) fn host_thunk(f: usize) -> usize {
+    f
 }
 
 /// Debug crash dump: guest `.so`s run REAL arm64 code — a guest
@@ -184,12 +344,47 @@ pub fn install_crash_dump() {
                     .lock()
                     .map(|v| v.iter().any(|(b, s)| pc >= *b && pc < b + s))
                     .unwrap_or(false);
-                let insn = if inlib { *(pc as *const u32) } else { 0 };
-                let mut msg = [0u8; 512];
+                let insn = *(pc as *const u32);
+                // Classify the fault victim: which malloc zone (if any)
+                // claims si_addr — g = guest zone, d = default, ? = none.
+                // Tells a targeted heap hit apart from a wild address.
+                let z = malloc_zone_from_ptr(si as *const c_void);
+                let zt = if z == guest_zone() {
+                    b'g'
+                } else if z == malloc_default_zone() {
+                    b'd'
+                } else if z.is_null() {
+                    b'?'
+                } else {
+                    b'o'
+                };
+                // Also which zone owns the faulting PAGE for context.
+                let si_img = LOADED_RANGES
+                    .lock()
+                    .map(|v| v.iter().any(|(b, s)| si >= *b && si < b + s))
+                    .unwrap_or(false);
+                let x2 = *(mc.add(32) as *const usize);
+                let x9 = *(mc.add(88) as *const usize);
+                let x16 = *(mc.add(144) as *const usize);
+                let x17 = *(mc.add(152) as *const usize);
+                let mut msg = [0u8; 640];
                 let s = b"[segv] pc=";
                 msg[..s.len()].copy_from_slice(s);
                 let mut n = s.len();
                 for v in [pc, si, sp, x0, x8, x20, x30, insn as usize, inlib as usize] {
+                    for i in (0..16).rev() {
+                        msg[n] = b"0123456789abcdef"[(v >> (i * 4)) & 0xf];
+                        n += 1;
+                    }
+                    msg[n] = b' ';
+                    n += 1;
+                }
+                // Zone tag, image flag, then extra registers.
+                for c in [b'z', b'=', zt, b' ', b'i', b'=', if si_img { b'1' } else { b'0' }, b' '] {
+                    msg[n] = c;
+                    n += 1;
+                }
+                for v in [x2, x9, x16, x17] {
                     for i in (0..16).rev() {
                         msg[n] = b"0123456789abcdef"[(v >> (i * 4)) & 0xf];
                         n += 1;
@@ -268,13 +463,15 @@ pub fn install_crash_dump() {
                 _exit(139);
             }
         }
-        let sa = Sigaction {
-            sa_sigaction: on_segv as *const () as usize,
-            sa_mask: 0,
-            sa_flags: 0x40, // SA_SIGINFO
-        };
-        sigaction(11, &sa, std::ptr::null_mut());
-        sigaction(10, &sa, std::ptr::null_mut()); // SIGBUS — writes to non-writable guest pages
+        if std::env::var_os("OVELO_NOSEGV").is_none() {
+            let sa = Sigaction {
+                sa_sigaction: on_segv as *const () as usize,
+                sa_mask: 0,
+                sa_flags: 0x40, // SA_SIGINFO
+            };
+            sigaction(11, &sa, std::ptr::null_mut());
+            sigaction(10, &sa, std::ptr::null_mut()); // SIGBUS — writes to non-writable guest pages
+        }
         let _ = dladdr as *const (); // keep decl referenced
     }
 }
@@ -630,6 +827,49 @@ extern "C" fn sh_open(path: *const i8, flags: i32, mode: i32) -> i32 {
 extern "C" fn sh_open2(path: *const i8, flags: i32) -> i32 {
     unsafe { open(path, guest_oflags(flags)) }
 }
+/// `memcpy`/`memset` resolved through `host_dlsym` run blind: a guest
+/// with a bad dst or length writes straight into host heap. Wrapping
+/// them lets `guest_dst_ok` reject (and log) destinations that aren't
+/// guest-zone, `.so` image, or stack — the write is skipped so the
+/// app keeps running and we see who asked for it.
+extern "C" fn sh_memcpy(d: *mut c_void, s: *const c_void, n: usize) -> *mut c_void {
+    if !guest_dst_ok(d as usize, n) {
+        eprintln!("[guestptr] memcpy dst {d:p}+{n:#x} not guest/stack/image — skipped");
+        return d;
+    }
+    unsafe { memcpy(d, s, n) }
+}
+extern "C" fn sh_memmove(d: *mut c_void, s: *const c_void, n: usize) -> *mut c_void {
+    if !guest_dst_ok(d as usize, n) {
+        eprintln!("[guestptr] memmove dst {d:p}+{n:#x} not guest/stack/image — skipped");
+        return d;
+    }
+    unsafe { memmove(d, s, n) }
+}
+extern "C" fn sh_memset(d: *mut c_void, c: i32, n: usize) -> *mut c_void {
+    if !guest_dst_ok(d as usize, n) {
+        eprintln!("[guestptr] memset dst {d:p}+{n:#x} not guest/stack/image — skipped");
+        return d;
+    }
+    unsafe { memset(d, c, n) }
+}
+extern "C" fn sh_strcpy(d: *mut c_void, s: *const c_void) -> *mut c_void {
+    unsafe {
+        let n = strlen(s as *const i8) + 1;
+        if !guest_dst_ok(d as usize, n) {
+            eprintln!("[guestptr] strcpy dst {d:p}+{n:#x} not guest/stack/image — skipped");
+            return d;
+        }
+        memcpy(d, s, n)
+    }
+}
+extern "C" fn sh_strncpy(d: *mut c_void, s: *const c_void, n: usize) -> *mut c_void {
+    if !guest_dst_ok(d as usize, n) {
+        eprintln!("[guestptr] strncpy dst {d:p}+{n:#x} not guest/stack/image — skipped");
+        return d;
+    }
+    unsafe { strncpy(d as *mut i8, s as *const i8, n) as *mut c_void }
+}
 extern "C" fn sh_memcpy_chk(d: *mut c_void, s: *const c_void, n: usize, dlen: usize) -> *mut c_void {
     if n > dlen {
         sh_chk_fail();
@@ -848,6 +1088,96 @@ pub(crate) fn guest_zone() -> *mut c_void {
     *ZONE.get_or_init(|| unsafe { malloc_create_zone(0, 0) as usize }) as *mut c_void
 }
 
+/// Is `p..p+len` a place guest code may legitimately have us write?
+/// Guest buffers live in the guest zone, inside a loaded `.so` image
+/// (BSS/statics), or on the calling thread's stack — guest natives
+/// run on the host stack. Anything else means the guest handed us a
+/// wild pointer; writing through it lands in host heap metadata.
+#[cfg(target_os = "macos")]
+pub(crate) fn guest_dst_ok(p: usize, len: usize) -> bool {
+    if p == 0 || len == 0 {
+        return p != 0 || len == 0;
+    }
+    if unsafe { malloc_zone_from_ptr(p as *const c_void) } == guest_zone() {
+        return true;
+    }
+    if LOADED_RANGES
+        .lock()
+        .map(|v| v.iter().any(|(b, s)| p >= *b && p + len <= b + s))
+        .unwrap_or(false)
+    {
+        return true;
+    }
+    unsafe {
+        let t = pthread_self();
+        let top = pthread_get_stackaddr_np(t) as usize;
+        let size = pthread_get_stacksize_np(t);
+        p >= top.saturating_sub(size) && p.saturating_add(len) <= top
+    }
+}
+
+/// Non-macOS: no zone bookkeeping — accept everything.
+#[cfg(not(target_os = "macos"))]
+pub(crate) fn guest_dst_ok(_p: usize, _len: usize) -> bool {
+    true
+}
+
+/// `malloc_zone_check` every zone in the process; abort at the first
+/// bad one with the milestone tag. Any caller is a milestone — the
+/// tag it prints bounds the corruption window to "since the previous
+/// milestone". OVELO_ZONECHECK-gated.
+#[cfg(target_os = "macos")]
+pub(crate) fn check_all_zones(tag: &str) {
+    if std::env::var_os("OVELO_ZONECHECK").is_none() {
+        return;
+    }
+    unsafe {
+        extern "C" {
+            fn malloc_zone_check(zone: *mut c_void) -> bool;
+            fn malloc_get_all_zones(
+                task: u32,
+                reader: usize,
+                zones: *mut *mut c_void,
+                count: *mut u32,
+            ) -> i32;
+            fn mach_task_self() -> u32;
+        }
+        let mut zs: *mut c_void = std::ptr::null_mut();
+        let mut n: u32 = 0;
+        if malloc_get_all_zones(mach_task_self(), 0, &mut zs, &mut n) != 0 {
+            eprintln!("[zonecheck] {tag}: get_all_zones failed");
+            return;
+        }
+        let rz = crate::RUST_ZONE.load(std::sync::atomic::Ordering::Relaxed)
+            as *mut c_void;
+        let dz = malloc_default_zone();
+        let gz = guest_zone();
+        for i in 0..n as usize {
+            let z = *(zs as *mut *mut c_void).add(i);
+            let nm = if z == rz {
+                "rust"
+            } else if z == dz {
+                "default"
+            } else if z == gz {
+                "guest"
+            } else {
+                "?"
+            };
+            // Print BEFORE checking — when the check itself faults
+            // inside the corrupt freelist, the last printed name is
+            // the bad zone.
+            eprintln!("[zonecheck] {tag}: checking {nm} zone {z:?}");
+            if !malloc_zone_check(z) {
+                eprintln!("[zonecheck] {tag}: BAD {nm} ZONE {z:?}");
+                std::process::abort();
+            }
+        }
+    }
+}
+
+#[cfg(not(target_os = "macos"))]
+pub(crate) fn check_all_zones(_tag: &str) {}
+
 /// Allocate in the guest zone — for buffers host code hands to guest
 /// code (Get*ArrayElements, GetStringCritical, …). A guest-side overrun
 /// then damages guest metadata, not the Rust heap, and faults inside
@@ -866,7 +1196,9 @@ pub(crate) fn guest_free(p: usize) {
     if p == 0 {
         return;
     }
-    dbg_free(p, "guest_free");
+    if dbg_free(p, "guest_free") {
+        return; // quarantined
+    }
     unsafe {
         let zone = malloc_zone_from_ptr(p as *const c_void);
         if !zone.is_null() {
@@ -897,6 +1229,14 @@ pub(crate) fn guest_free(p: usize) {
 
 #[cfg(target_os = "macos")]
 static LIVE_ALLOCS: std::sync::LazyLock<
+    std::sync::Mutex<std::collections::HashMap<usize, usize>>,
+> = std::sync::LazyLock::new(|| std::sync::Mutex::new(std::collections::HashMap::new()));
+/// ptr -> poisoned region length. Under OVELO_FREEDBG frees are
+/// quarantined: the block is poisoned and STAYS allocated, so a
+/// use-after-free write lands in memory malloc no longer manages and
+/// shows up as a poison violation instead of freelist damage.
+#[cfg(target_os = "macos")]
+static FREED_ALLOCS: std::sync::LazyLock<
     std::sync::Mutex<std::collections::HashMap<usize, usize>>,
 > = std::sync::LazyLock::new(|| std::sync::Mutex::new(std::collections::HashMap::new()));
 #[cfg(target_os = "macos")]
@@ -940,13 +1280,38 @@ pub(crate) fn dbg_check_all(who: &'static str) {
             }
         }
     }
+    if let Ok(m) = FREED_ALLOCS.lock() {
+        for (p, len) in m.iter() {
+            // Sample the whole poisoned body (cap 64KiB): any non-0xEE
+            // byte is a stale write into a quarantined block.
+            let scan = (*len).min(65536);
+            let bad = unsafe {
+                std::slice::from_raw_parts(*p as *const u8, scan)
+                    .iter()
+                    .position(|b| *b != 0xEE)
+            };
+            if let Some(d) = bad {
+                let so = so_off(*p + d);
+                eprintln!(
+                    "[freedbg] {who}: WRITE-AFTER-FREE at {:#x} (buf {:#x}+{d} of {len}) (so_off={so:?})",
+                    *p + d,
+                    *p
+                );
+                break;
+            }
+        }
+    }
 }
 /// A free of a pointer we never handed out — or a double free — is the
 /// classic zone corruptor; flag it under OVELO_FREEDBG.
 #[cfg(target_os = "macos")]
-fn dbg_free(p: usize, who: &'static str) {
+/// Returns true when the caller should SKIP the real free — tracked
+/// blocks are poisoned and kept (quarantine), so use-after-free
+/// writes trip dbg_check_all instead of corrupting the freelist.
+#[cfg(target_os = "macos")]
+fn dbg_free(p: usize, who: &'static str) -> bool {
     if std::env::var_os("OVELO_FREEDBG").is_none() {
-        return;
+        return false;
     }
     unsafe {
         let z = malloc_zone_from_ptr(p as *mut c_void);
@@ -955,6 +1320,7 @@ fn dbg_free(p: usize, who: &'static str) {
             // that corrupts the Rust/default heap.
             let so = so_off(p);
             eprintln!("[freedbg] {who}: free into FOREIGN zone ptr={p:#x} (so_off={so:?})");
+            return false;
         }
     }
     let mut m = LIVE_ALLOCS.lock().unwrap_or_else(|e| e.into_inner());
@@ -965,10 +1331,17 @@ fn dbg_free(p: usize, who: &'static str) {
                 let so = so_off(p + off);
                 eprintln!("[freedbg] {who}: canary smashed freeing {p:#x}+{off} (so_off={so:?})");
             }
+            unsafe { std::ptr::write_bytes(p as *mut u8, 0xEE, off) };
+            FREED_ALLOCS
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .insert(p, off);
+            true
         }
         None => {
             let so = so_off(p);
             eprintln!("[freedbg] {who}: free of untracked/double {p:#x} (so_off={so:?})");
+            false
         }
     }
 }
@@ -990,7 +1363,9 @@ extern "C" fn sh_free(ptr: *mut c_void) {
     if ptr.is_null() {
         return;
     }
-    dbg_free(ptr as usize, "sh_free");
+    if dbg_free(ptr as usize, "sh_free") {
+        return; // quarantined
+    }
     unsafe {
         let zone = malloc_zone_from_ptr(ptr);
         if zone.is_null() {
@@ -1136,33 +1511,45 @@ extern "C" fn sh_guest_new(size: usize) -> *mut c_void {
     // operator new must not return null — spin until it succeeds is
     // what libc++ does under -fno-exceptions; for us a null means the
     // guest heap is genuinely exhausted, so abort loudly instead.
-    let p = unsafe { malloc_zone_malloc(guest_zone(), size.max(1)) };
+    let extra = if std::env::var_os("OVELO_FREEDBG").is_some() { 16 } else { 0 };
+    let p = unsafe { malloc_zone_malloc(guest_zone(), size.max(1) + extra) };
     if p.is_null() {
         eprintln!("[shim] guest operator new({size}) failed");
         std::process::abort();
     }
+    dbg_alloc(p as usize, size.max(1));
     p
 }
 
 #[cfg(target_os = "macos")]
 extern "C" fn sh_guest_new_aligned(size: usize, align: usize) -> *mut c_void {
-    let p = unsafe { malloc_zone_memalign(guest_zone(), align.max(16), size.max(1)) };
+    let extra = if std::env::var_os("OVELO_FREEDBG").is_some() { 16 } else { 0 };
+    let p =
+        unsafe { malloc_zone_memalign(guest_zone(), align.max(16), size.max(1) + extra) };
     if p.is_null() {
         eprintln!("[shim] guest aligned operator new({size},{align}) failed");
         std::process::abort();
     }
+    dbg_alloc(p as usize, size.max(1));
     p
 }
 
 /// nothrow new variants must return null on failure, never abort.
 #[cfg(target_os = "macos")]
 extern "C" fn sh_guest_new_nothrow(size: usize) -> *mut c_void {
-    unsafe { malloc_zone_malloc(guest_zone(), size.max(1)) }
+    let extra = if std::env::var_os("OVELO_FREEDBG").is_some() { 16 } else { 0 };
+    let p = unsafe { malloc_zone_malloc(guest_zone(), size.max(1) + extra) };
+    dbg_alloc(p as usize, size.max(1));
+    p
 }
 
 #[cfg(target_os = "macos")]
 extern "C" fn sh_guest_new_aligned_nothrow(size: usize, align: usize) -> *mut c_void {
-    unsafe { malloc_zone_memalign(guest_zone(), align.max(16), size.max(1)) }
+    let extra = if std::env::var_os("OVELO_FREEDBG").is_some() { 16 } else { 0 };
+    let p =
+        unsafe { malloc_zone_memalign(guest_zone(), align.max(16), size.max(1) + extra) };
+    dbg_alloc(p as usize, size.max(1));
+    p
 }
 
 #[cfg(target_os = "macos")]
@@ -1313,6 +1700,16 @@ fn builtin_shim(name: &str) -> Option<usize> {
         "strndup" => sh_strndup as *const () as usize,
         "sincosf" => sh_sincosf as *const () as usize,
         "sincos" => sh_sincos as *const () as usize,
+        #[cfg(target_os = "macos")]
+        "memcpy" => sh_memcpy as *const () as usize,
+        #[cfg(target_os = "macos")]
+        "memmove" => sh_memmove as *const () as usize,
+        #[cfg(target_os = "macos")]
+        "memset" => sh_memset as *const () as usize,
+        #[cfg(target_os = "macos")]
+        "strcpy" => sh_strcpy as *const () as usize,
+        #[cfg(target_os = "macos")]
+        "strncpy" => sh_strncpy as *const () as usize,
         "__strlen_chk" => sh_strlen_chk as *const () as usize,
         "__strcpy_chk" => sh_strcpy_chk as *const () as usize,
         "__strncpy_chk2" => sh_strncpy_chk2 as *const () as usize,
@@ -1481,9 +1878,11 @@ pub fn load_tree(
             // call back into its dependent (callback registration) —
             // running inits during the recursive load would hit a
             // still-unrelocated, non-executable parent image.
+            check_all_zones("load_tree.reloc");
             for (_, inits) in &out {
                 run_ctors(inits);
             }
+            check_all_zones("load_tree.done");
             Ok(out.into_iter().map(|(l, _)| l).collect())
         }
         Err(e) => {
@@ -1840,13 +2239,22 @@ fn finish_so(m: MappedLib, name: &str) -> Result<(NativeLib, Vec<usize>)> {
             return Ok(a);
         }
         if let Some(a) = builtin_shim(&name) {
-            return Ok(a);
+            return Ok(host_thunk(a));
         }
         if let Some(a) = data_shim(&name) {
             return Ok(a);
         }
-        if let Some(a) = host_dlsym(&name) {
-            return Ok(a);
+        // OVELO_NOHOSTDLSYM: debug bisection — refuse to hand guest code
+        // real libSystem entry points, so every import lands on a shim.
+        if std::env::var_os("OVELO_NOHOSTDLSYM").is_some() {
+            eprintln!("[dlsym-deny] {name}");
+        } else {
+            if let Some(a) = host_dlsym(&name) {
+                if std::env::var_os("OVELO_DLSYMLOG").is_some() {
+                    eprintln!("[dlsym] {name}");
+                }
+                return Ok(host_thunk(a));
+            }
         }
         // Weak undefined symbols resolve to 0 (legal — the callee checks).
         if sym_bind(i) == STB_WEAK {
@@ -2026,8 +2434,13 @@ fn finish_so(m: MappedLib, name: &str) -> Result<(NativeLib, Vec<usize>)> {
 /// DT_INIT then DT_INIT_ARRAY, each under the guest TLS window.
 fn run_ctors(inits: &[usize]) {
     for &a in inits {
+        if std::env::var_os("OVELO_ZONECHECK").is_some() {
+            eprintln!("[zonecheck] ctor {a:#x}");
+        }
+        check_all_zones("pre-ctor");
         let f: extern "C" fn() = unsafe { std::mem::transmute(a) };
         with_guest_tls(|| f());
+        check_all_zones("post-ctor");
     }
 }
 

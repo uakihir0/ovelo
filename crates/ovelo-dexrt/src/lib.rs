@@ -382,6 +382,19 @@ pub const NORMAL_PERMISSIONS: &[&str] = &[
     "android.permission.BLUETOOTH_ADMIN",
 ];
 
+/// Diagnostics: when the embedding binary runs all Rust allocations
+/// through a private malloc zone (ovelo-cli's ZoneAlloc), it publishes
+/// that zone's pointer here so OVELO_ZONECHECK can name it.
+#[doc(hidden)]
+pub static RUST_ZONE: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
+/// Diagnostics: `malloc_zone_check` every process zone; aborts at the
+/// first corrupt one naming `tag` — a milestone in OVELO_ZONECHECK runs.
+#[doc(hidden)]
+pub fn check_zones(tag: &str) {
+    native::check_all_zones(tag)
+}
+
 /// Hold the VM's recursive mutex for a batch of driver-side work.
 /// `invoke` self-locks, but the driver also touches `&mut Vm` between
 /// invokes (runnable-drain bookkeeping, GC, dex-tree refresh) — wrap
@@ -1567,6 +1580,7 @@ impl Vm {
         if self.draining {
             return 0;
         }
+        native::check_all_zones("drain");
         let now = jdk::now_ms() as u64;
         let (due, later): (Vec<_>, Vec<_>) =
             self.delayed_runnables.drain(..).partition(|(_, _, t)| *t <= now);
@@ -3401,6 +3415,25 @@ impl Vm {
             let args = self.compact_args(loc.midx, &args, !matches!(kind, InvokeKind::Static));
             if let Some(r) = jdk::call(self, &class, &name, &sig, &args)? {
                 return Ok(r);
+            }
+            // Debug bisection: OVELO_STUB_NATIVE=<substring> skips the
+            // native call entirely, returning a zero value for its
+            // return type — used to isolate which guest `.so` entry
+            // point's execution corrupts state.
+            static STUB_PAT: std::sync::OnceLock<Option<String>> = std::sync::OnceLock::new();
+            let stub = STUB_PAT
+                .get_or_init(|| std::env::var("OVELO_STUB_NATIVE").ok())
+                .as_deref();
+            if stub.is_some_and(|p| name.contains(p)) {
+                eprintln!("[stubnative] {class}.{name}{sig} skipped");
+                return Ok(void_resolved(match ret_desc.as_str() {
+                    "V" => None,
+                    "Z" | "B" | "C" | "S" | "I" => Some(V::I32(0)),
+                    "J" => Some(V::I64(0)),
+                    "F" => Some(V::F32(0.0)),
+                    "D" => Some(V::F64(0.0)),
+                    _ => Some(V::Ref(0)),
+                }));
             }
             // A dex `native` method resolves to a loaded `.so`: the
             // `Java_<cls>_<name>` symbol or a RegisterNatives binding.

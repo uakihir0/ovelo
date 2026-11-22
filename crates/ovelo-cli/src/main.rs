@@ -77,6 +77,135 @@ mod gate;
 mod ledger;
 mod worker;
 
+/// Private malloc zone for Rust allocations (macOS): guest `.so`
+/// code can write wildly through bad pointers; when that damage
+/// lands in the *default* zone's freelists the next `Vec`/`HashMap`
+/// growth segfaults inside `malloc`. Parking Rust's heap in its own
+/// zone both hardens the runtime and narrows diagnosis — if crashes
+/// stop, the corruptor targets default-zone pages specifically.
+#[cfg(target_os = "macos")]
+#[allow(unsafe_code)]
+mod rustzone {
+    use std::alloc::{GlobalAlloc, Layout};
+    use std::ffi::c_void;
+    use std::sync::OnceLock;
+
+    unsafe extern "C" {
+        fn malloc_create_zone(start_size: usize, flags: u32) -> *mut c_void;
+        fn malloc_zone_malloc(zone: *mut c_void, size: usize) -> *mut c_void;
+        fn malloc_zone_calloc(zone: *mut c_void, n: usize, size: usize) -> *mut c_void;
+        fn malloc_zone_realloc(zone: *mut c_void, ptr: *mut c_void, size: usize) -> *mut c_void;
+        fn malloc_zone_free(zone: *mut c_void, ptr: *mut c_void);
+        fn malloc_zone_memalign(zone: *mut c_void, align: usize, size: usize) -> *mut c_void;
+        fn malloc(size: usize) -> *mut c_void;
+        fn calloc(n: usize, size: usize) -> *mut c_void;
+        fn reallocf(ptr: *mut c_void, size: usize) -> *mut c_void;
+        fn free(ptr: *mut c_void);
+        fn posix_memalign(memptr: *mut *mut c_void, align: usize, size: usize) -> i32;
+    }
+
+    /// Reentrancy-safe env flag read: OnceLock::get_or_init would
+    /// deadlock — env::var_os allocates, and its temporaries' dealloc
+    /// re-enters this flag check from inside the allocator. A tri-state
+    /// atomic (0 unset, 1 probing, 2 on, 3 off) defaults to `false`
+    /// while another thread probes.
+    fn env_flag(name: &str, cell: &std::sync::atomic::AtomicU8) -> bool {
+        use std::sync::atomic::Ordering::Relaxed;
+        match cell.load(Relaxed) {
+            2 => true,
+            3 => false,
+            _ => {
+                if cell.compare_exchange(0, 1, Relaxed, Relaxed).is_ok() {
+                    let v = std::env::var_os(name).is_some();
+                    cell.store(if v { 2 } else { 3 }, Relaxed);
+                    v
+                } else {
+                    false
+                }
+            }
+        }
+    }
+
+    /// OVELO_NOZONE bypasses the private zone so GuardMalloc
+    /// (`DYLD_INSERT_LIBRARIES=/usr/lib/libgmalloc.dylib`) can page-guard
+    /// every Rust allocation and catch the corrupting write red-handed.
+    fn nozone() -> bool {
+        static S: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(0);
+        env_flag("OVELO_NOZONE", &S)
+    }
+
+    /// OVELO_LEAK: never return memory to the zone — freed chunks are
+    /// where a stray write gets picked up as a "freelist node"; if the
+    /// crash signature changes/disappears, the corruptor's damage lives
+    /// in free-chunk metadata rather than live allocations.
+    fn leak() -> bool {
+        static S: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(0);
+        env_flag("OVELO_LEAK", &S)
+    }
+
+    fn zone() -> *mut c_void {
+        static Z: OnceLock<usize> = OnceLock::new();
+        *Z.get_or_init(|| unsafe { malloc_create_zone(0, 0) as usize }) as *mut c_void
+    }
+
+    /// Publish the zone pointer for dexrt's OVELO_ZONECHECK tagging.
+    pub fn publish() {
+        ovelo_dexrt::RUST_ZONE.store(zone() as usize, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    pub struct ZoneAlloc;
+    unsafe impl GlobalAlloc for ZoneAlloc {
+        unsafe fn alloc(&self, l: Layout) -> *mut u8 {
+            if nozone() {
+                if l.align() > 16 {
+                    let mut p: *mut c_void = std::ptr::null_mut();
+                    if posix_memalign(&mut p, l.align(), l.size()) == 0 {
+                        return p as *mut u8;
+                    }
+                    return std::ptr::null_mut();
+                }
+                return malloc(l.size()) as *mut u8;
+            }
+            if l.align() > 16 {
+                malloc_zone_memalign(zone(), l.align(), l.size()) as *mut u8
+            } else {
+                malloc_zone_malloc(zone(), l.size()) as *mut u8
+            }
+        }
+        unsafe fn alloc_zeroed(&self, l: Layout) -> *mut u8 {
+            if nozone() {
+                return calloc(1, l.size()) as *mut u8;
+            }
+            malloc_zone_calloc(zone(), 1, l.size()) as *mut u8
+        }
+        unsafe fn dealloc(&self, p: *mut u8, _l: Layout) {
+            if leak() {
+                return;
+            }
+            if nozone() {
+                return free(p as *mut c_void);
+            }
+            malloc_zone_free(zone(), p as *mut c_void)
+        }
+        unsafe fn realloc(&self, p: *mut u8, l: Layout, n: usize) -> *mut u8 {
+            if leak() {
+                let np = self.alloc(Layout::from_size_align_unchecked(n, l.align()));
+                if !np.is_null() {
+                    std::ptr::copy_nonoverlapping(p, np, l.size().min(n));
+                }
+                return np;
+            }
+            if nozone() {
+                return reallocf(p as *mut c_void, n) as *mut u8;
+            }
+            malloc_zone_realloc(zone(), p as *mut c_void, n) as *mut u8
+        }
+    }
+
+    #[global_allocator]
+    static A: ZoneAlloc = ZoneAlloc;
+}
+
 enum Cmd {
     Inspect {
         apk: PathBuf,
@@ -1109,6 +1238,8 @@ fn run_initializer(
 }
 
 fn run_app(store: &InstallStore, package: &str) -> Result<(), OveloError> {
+    #[cfg(target_os = "macos")]
+    rustzone::publish();
     let rec = find_record(store, package)?;
     let bytes = store.apk_bytes(&rec)?;
     let info = inspect_apk(&bytes)?;
