@@ -911,7 +911,8 @@ fn dbg_alloc(p: usize, size: usize) {
     if p == 0 || std::env::var_os("OVELO_FREEDBG").is_none() {
         return;
     }
-    let off = unsafe { malloc_size(p as *const c_void) }.saturating_sub(8);
+    let usable = unsafe { malloc_size(p as *const c_void) }.max(size);
+    let off = usable.saturating_sub(8);
     unsafe { ((p + off) as *mut u64).write_unaligned(GDB_CANARY) };
     if let Ok(mut m) = LIVE_ALLOCS.lock() {
         m.insert(p, off);
