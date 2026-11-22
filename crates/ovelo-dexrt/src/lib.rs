@@ -1616,13 +1616,14 @@ impl Vm {
             let mut live: Vec<u32> = Vec::with_capacity(self.clock_views.len());
             for i in 0..self.clock_views.len() {
                 let h = self.clock_views[i];
-                let is_clock = match self.heap.class_of(h) {
-                    Some(ci) => self
-                        .type_desc_of(ci)
-                        .map(|d| self.assignable_desc(&d, "Landroid/widget/TextClock;"))
-                        .unwrap_or(false),
-                    None => false,
-                };
+                // Same classification the registration site uses —
+                // `jdk::class_of` covers host-backed clocks whose
+                // class_idx is GX_NONE, which `heap.class_of` misses.
+                let is_clock = self.heap.get(h).is_some()
+                    && self.assignable_desc(
+                        &jdk::class_of(self, V::Ref(h)),
+                        "Landroid/widget/TextClock;",
+                    );
                 if is_clock {
                     live.push(h);
                     jdk::view::textclock_update(self, h);
