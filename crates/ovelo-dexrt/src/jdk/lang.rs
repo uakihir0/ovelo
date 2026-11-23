@@ -39,7 +39,13 @@ pub(crate) fn call(
         threadlocal_call(vm, name, args)
     } else if desc_is_a(class, THROWABLE) {
         throwable_call(vm, name, sig, args)?
-    } else if class == "Ljava/lang/Enum;" || vm.assignable_desc(class, "Ljava/lang/Enum;") {
+    } else if class == "Ljava/lang/Enum;"
+        || (!class.starts_with("Ljava/time/") && vm.assignable_desc(class, "Ljava/lang/Enum;"))
+    {
+        // java.time's enums carry the Enum super but have dedicated
+        // (interned, correctly-ordinal'd) handling in jtime_call —
+        // routing them through enum_call would return empty values()
+        // and panic on 1-arg valueOf.
         enum_call(vm, class, name, args)?
     } else if class == "Lsun/misc/Unsafe;" {
         unsafe_call(vm, name, args)?
