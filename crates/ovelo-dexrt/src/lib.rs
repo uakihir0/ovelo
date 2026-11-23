@@ -1035,6 +1035,18 @@ impl Vm {
         Ok(found)
     }
 
+    /// Intern a string value — for host code and probes that need to
+    /// hand a `String` to a dex call.
+    pub fn intern_str(&mut self, s: &str) -> u32 {
+        self.heap.intern_str(s)
+    }
+
+    /// Allocate a dex array — for host code and probes passing array
+    /// args to dex calls.
+    pub fn alloc_array(&mut self, elem: &str, data: Vec<V>) -> V {
+        jdk::arr(self, elem, data)
+    }
+
     /// Heap borrow.
     pub fn heap(&self) -> &Heap {
         &self.heap

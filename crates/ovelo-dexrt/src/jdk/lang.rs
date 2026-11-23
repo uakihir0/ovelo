@@ -399,8 +399,16 @@ fn string_call(vm: &mut Vm, name: &str, sig: &str, args: &[V]) -> Option<Option<
         "intern" => Some(args[0]),
         "toString" => Some(args[0]),
         "valueOf" => {
-            // static: valueOf(x) → string of arg (or char array slice)
+            // static: valueOf(x) → string of arg. `valueOf(char)` must
+            // render the character — a bare int falls through to
+            // v_to_s which prints the digits ("|" → "124"), breaking
+            // every caller that relies on the char overload (kotlin's
+            // StringsKt.split delimiter conversion did).
             let s = match args[0] {
+                V::I32(c) if p.first() == Some(&"C") => char::from_u32(c as u32)
+                    .map(|c| c.to_string())
+                    .unwrap_or_default(),
+                V::I32(b) if p.first() == Some(&"Z") => (b != 0).to_string(),
                 V::Ref(h) => match vm.heap.get(h) {
                     Some(Obj::Array { data, .. }) => {
                         let a = args.get(1).map(|v| i32v(*v) as usize).unwrap_or(0);

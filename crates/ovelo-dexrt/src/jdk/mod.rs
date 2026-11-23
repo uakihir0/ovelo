@@ -409,8 +409,13 @@ pub(crate) fn v_to_s(vm: &mut Vm, v: V) -> String {
                     format!("{{{}}}", parts.join(", "))
                 }
                 _ => {
-                    let d = desc.trim_start_matches('L').trim_end_matches(';');
-                    format!("{d}@{h:x}")
+                    // `new String(x)` and other P_DATA-backed mirrors
+                    // keep their real text in the field table — s()
+                    // reads it; the identity string is the last resort.
+                    s(vm, h).unwrap_or_else(|| {
+                        let d = desc.trim_start_matches('L').trim_end_matches(';');
+                        format!("{d}@{h:x}")
+                    })
                 }
             },
             Some(Obj::Instance { .. }) => match vm.call_virtual(h, "toString", &[]) {
