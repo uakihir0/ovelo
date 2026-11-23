@@ -310,6 +310,13 @@ pub(crate) fn call(
                 vm.park_drain()?;
                 Some(None)
             }
+            "unpark" => {
+                // LockSupport.unpark — revive workers that parked out
+                // of the live queue, and cut delayed interruptible
+                // sleeps short (same coarse wake as Unsafe.unpark).
+                vm.wake_parked();
+                Some(None)
+            }
             "offer" | "add" | "put" | "take" | "poll" | "remove" => {
                 if matches!(name, "add" | "offer") {
                     list_call(vm, name, sig, args)?
