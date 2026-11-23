@@ -38,6 +38,7 @@ Legend:
 | F-Droid | `org.fdroid.fdroid` | 🟡 | Multi-dex + Hilt init runs without crashing; UI is Compose — no render path yet |
 | 2048 (AndStatus) | `org.andstatus.game2048` | 🟡 | Lifecycle completes (KorGE engine); GLSurfaceView opens but GLES2 pipeline is not implemented — blank window |
 | Snakes (drugi) | `red.drugi.snakes` | 🟡 | Lifecycle completes (Godot engine); host `Lifecycle` throwable on onCreate, blank GL window |
+| Privacy Friendly Sudoku | `org.secuso.privacyfriendlysudoku` | 🟡 | SplashActivity → TutorialActivity transition runs fully in dex; Welcome screen renders real text (layout rough — overlapping strings). Unblocked by dex-enum `compareTo` fix (LifecycleRegistry sync) |
 
 ## Famous apps — assessment
 
