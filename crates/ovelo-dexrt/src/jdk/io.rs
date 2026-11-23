@@ -695,6 +695,94 @@ fn stream_call(vm: &mut Vm, name: &str, args: &[V]) -> Rt<Option<Option<V>>> {
         }
         return Ok(Some(None));
     }
+    // StringWriter/CharArrayWriter accumulate into a StrBuf — writes
+    // append text and toString()/getBuffer() hand it back. A bare
+    // `toString` that returned the identity string poisoned resource
+    // strings in tasks.org (Okio.Utf8 getString via StringWriter).
+    let is_strbuf = matches!(
+        vm.heap.get(this),
+        Some(Obj::Host {
+            state: HostState::StrBuf(_),
+            ..
+        })
+    );
+    if is_strbuf {
+        match name {
+            "write" => {
+                let t = match args.get(1).copied() {
+                    Some(V::I32(c)) => char::from_u32(c as u32)
+                        .map(|c| c.to_string())
+                        .unwrap_or_default(),
+                    Some(V::Ref(ah)) => match vm.heap.get(ah) {
+                        Some(Obj::Array { data, .. }) => {
+                            let lo = args.get(2).map(|v| i64v(*v).max(0) as usize).unwrap_or(0);
+                            let hi = args
+                                .get(3)
+                                .map(|v| (lo + i64v(*v).max(0) as usize).min(data.len()))
+                                .unwrap_or(data.len());
+                            data[lo.min(data.len())..hi]
+                                .iter()
+                                .filter_map(|v| char::from_u32(i64v(*v) as u32))
+                                .collect()
+                        }
+                        _ => {
+                            let t = sv(vm, args[1]).unwrap_or_default();
+                            let lo = args.get(2).map(|v| i64v(*v).max(0) as usize).unwrap_or(0);
+                            let hi = args
+                                .get(3)
+                                .map(|v| lo + i64v(*v).max(0) as usize)
+                                .unwrap_or(t.chars().count());
+                            t.chars().skip(lo).take(hi - lo.min(hi)).collect()
+                        }
+                    },
+                    _ => String::new(),
+                };
+                if let Some(Obj::Host {
+                    state: HostState::StrBuf(b),
+                    ..
+                }) = vm.heap.get_mut(this)
+                {
+                    b.push_str(&t);
+                }
+                return Ok(Some(None));
+            }
+            "append" => {
+                let t = args
+                    .get(1)
+                    .map(|v| match v {
+                        V::I32(c) => char::from_u32(*c as u32)
+                            .map(|c| c.to_string())
+                            .unwrap_or_default(),
+                        _ => v_to_s(vm, *v),
+                    })
+                    .unwrap_or_default();
+                if let Some(Obj::Host {
+                    state: HostState::StrBuf(b),
+                    ..
+                }) = vm.heap.get_mut(this)
+                {
+                    b.push_str(&t);
+                }
+                return Ok(Some(Some(args[0])));
+            }
+            "toString" | "getBuffer" | "toCharArray" => {
+                let t = match vm.heap.get(this) {
+                    Some(Obj::Host {
+                        state: HostState::StrBuf(b),
+                        ..
+                    }) => b.clone(),
+                    _ => String::new(),
+                };
+                if name == "toCharArray" {
+                    let cs: Vec<V> = t.chars().map(|c| V::I32(c as i32)).collect();
+                    return Ok(Some(Some(arr(vm, "C", cs))));
+                }
+                return Ok(Some(Some(jstr(vm, &t))));
+            }
+            "flush" | "close" => return Ok(Some(None)),
+            _ => {}
+        }
+    }
     Ok(match name {
         "read" => {
             // Streams without a byte payload report EOF so callers exit

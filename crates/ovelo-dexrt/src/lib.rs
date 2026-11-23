@@ -2733,6 +2733,11 @@ impl Vm {
             "Ljava/lang/StringBuilder;" | "Ljava/lang/StringBuffer;" => {
                 HostState::StrBuf(String::new())
             }
+            // Writers that accumulate characters in memory — writes
+            // append to the buffer and toString() yields it back.
+            "Ljava/io/StringWriter;" | "Ljava/io/CharArrayWriter;" => {
+                HostState::StrBuf(String::new())
+            }
             "Ljava/util/ArrayList;"
             | "Ljava/util/LinkedList;"
             | "Ljava/util/Vector;"
