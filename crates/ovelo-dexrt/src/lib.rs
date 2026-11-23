@@ -1667,6 +1667,13 @@ impl Vm {
         }
         roots.extend(self.pending_runnables.iter().map(|(h, _)| *h));
         roots.extend(self.delayed_runnables.iter().map(|(h, _, _)| *h));
+        // Callback registries are the only owners of their objects —
+        // ReportFragment's ALC, Choreographer frame callbacks and the
+        // cached Choreographer itself must outlive the guest refs that
+        // registered them (those die with their registering frame).
+        roots.extend(self.activity_callbacks.iter().copied());
+        roots.extend(self.frame_callbacks.iter().map(|(h, _)| *h));
+        roots.push(self.choreographer_h);
         roots.extend(self.parked_runnables.keys().copied());
         roots.extend(self.thread_runnables.iter().copied());
         roots.extend(jdk::gl::live_handles());
