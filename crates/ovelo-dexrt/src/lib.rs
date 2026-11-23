@@ -221,6 +221,16 @@ pub struct Vm {
     pub(crate) db_handles: HashMap<String, u32>,
     /// Object handle (db or statement) -> database name it talks to.
     pub(crate) obj_db: HashMap<u32, String>,
+    /// androidx.sqlite `BundledSQLite*` JNI handle spaces — Room3's
+    /// `ConnectionPool` talks straight to these natives, bypassing the
+    /// `android.database` layer. Connections share the `dbs` pool.
+    pub(crate) bundled_conns: HashMap<u64, std::rc::Rc<std::cell::RefCell<jdk::db::Db>>>,
+    pub(crate) bundled_stmts: HashMap<u64, jdk::db::BundledStmt>,
+    /// Next bundled-driver handle (conns and stmts share one counter).
+    pub(crate) bundled_h: u64,
+    /// Running Service instances by class descriptor — `startService`
+    /// reuses the live object so `onCreate` runs once per service.
+    pub(crate) services: HashMap<String, u32>,
     /// The Activity/theme res id (`android:theme` from the manifest) that
     /// theme-scoped `obtainStyledAttributes` resolves attributes against.
     pub theme_id: u32,
@@ -475,6 +485,10 @@ impl Vm {
             dbs: HashMap::new(),
             db_handles: HashMap::new(),
             obj_db: HashMap::new(),
+            bundled_conns: HashMap::new(),
+            bundled_stmts: HashMap::new(),
+            bundled_h: 0,
+            services: HashMap::new(),
             theme_id: 0,
             total_steps: 0,
             pending_activity: None,
@@ -635,6 +649,13 @@ impl Vm {
     /// DEFINING dex, whose index is `gd(canon_g)`.
     pub(crate) fn def_loc_of(&self, class_idx: GIdx) -> Option<(GIdx, &ClassDef)> {
         let desc = self.type_desc_of(class_idx).ok()?;
+        // APKs ship D8-generated `android.*` stub defs whose every method
+        // throws NoClassDefFoundError (minSdk gating for post-release
+        // platform APIs). On a real device the platform class wins, so
+        // shadow the dex def the same way: treat it as not defined.
+        if desc.starts_with("Landroid/") {
+            return None;
+        }
         let &(di, i) = self.defs.get(&desc)?;
         let def = &self.dexes[di].class_defs()[i];
         Some((gx(di, def.class_idx), def))

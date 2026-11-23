@@ -59,18 +59,30 @@ fn safe_name(name: &str) -> String {
     }
 }
 
-/// Open (or fetch) the connection for `name`; `:memory:` stays in RAM.
+/// Open (or fetch) the pooled connection for `name`; `:memory:` stays
+/// in RAM. Callers that need an independent handle (the bundled
+/// androidx driver — Room puts reader connections under
+/// `PRAGMA query_only`, which must not poison the writer) use
+/// `open_raw` instead.
 fn conn_for(vm: &mut Vm, name: &str) -> Result<Rc<RefCell<Db>>, E> {
     let name = safe_name(name);
     if let Some(d) = vm.dbs.get(&name) {
         return Ok(d.clone());
     }
+    let d = open_raw(vm, &name)?;
+    vm.dbs.insert(name, d.clone());
+    Ok(d)
+}
+
+/// A fresh connection to `name` — same sandboxing, collations and
+/// authorizer as the pooled path, but not shared with `vm.dbs`.
+fn open_raw(vm: &mut Vm, name: &str) -> Result<Rc<RefCell<Db>>, E> {
     let conn = if name == ":memory:" {
         Connection::open_in_memory()
     } else {
         let dir = db_dir(vm);
         let _ = std::fs::create_dir_all(&dir);
-        Connection::open(dir.join(&name))
+        Connection::open(dir.join(name))
     }
     .map_err(|e| {
         vm.throw_builtin(
@@ -100,13 +112,11 @@ fn conn_for(vm: &mut Vm, name: &str) -> Result<Rc<RefCell<Db>>, E> {
             an.cmp(&bn)
         });
     }
-    let d = Rc::new(RefCell::new(Db {
+    Ok(Rc::new(RefCell::new(Db {
         conn,
         tx_stack: Vec::new(),
         tx_failed: false,
-    }));
-    vm.dbs.insert(name, d.clone());
-    Ok(d)
+    })))
 }
 
 /// The `SQLiteDatabase` object for `name` — one per name (AOSP caches
@@ -238,13 +248,7 @@ fn run_query(vm: &mut Vm, h: u32, sql: &str, binds: V) -> Result<V, E> {
             let mut row = Vec::with_capacity(cols.len());
             for i in 0..cols.len() {
                 let v = r.get_ref(i).map_err(|e| sql_err(vm, e))?;
-                row.push(match v {
-                    ValueRef::Null => SV::Null,
-                    ValueRef::Integer(i) => SV::Integer(i),
-                    ValueRef::Real(f) => SV::Real(f),
-                    ValueRef::Text(t) => SV::Text(String::from_utf8_lossy(t).to_string()),
-                    ValueRef::Blob(b) => SV::Blob(b.to_vec()),
-                });
+                row.push(sv_ref(v));
             }
             cells.push(row);
         }
@@ -1717,4 +1721,398 @@ fn cursor_call(vm: &mut Vm, name: &str, args: &[V]) -> Rt<Option<Option<V>>> {
         | "setExtras" => Some(None),
         _ => None,
     })
+}
+
+fn sv_ref(v: ValueRef) -> SV {
+    match v {
+        ValueRef::Null => SV::Null,
+        ValueRef::Integer(i) => SV::Integer(i),
+        ValueRef::Real(f) => SV::Real(f),
+        ValueRef::Text(t) => SV::Text(String::from_utf8_lossy(t).to_string()),
+        ValueRef::Blob(b) => SV::Blob(b.to_vec()),
+    }
+}
+
+/// androidx.sqlite `BundledSQLite*` driver — JNI natives backed by the
+/// same rusqlite connection pool as `SQLiteDatabase`. Room3's
+/// `ConnectionPool` talks straight to these (the app's `libsqliteJni.so`
+/// is never touched), so without them every Room query no-ops.
+///
+/// A statement handle carries its sql + pending binds; the whole result
+/// is materialized on the first `step` (`run_query` semantics), later
+/// steps walk the rows.
+pub(crate) struct BundledStmt {
+    pub conn: Rc<RefCell<Db>>,
+    pub sql: String,
+    pub params: Vec<SV>,
+    pub cols: Vec<String>,
+    pub rows: Vec<Vec<SV>>,
+    /// Row a successful `step` landed on.
+    pub cur: Option<usize>,
+    /// The statement ran at least once since prepare/reset.
+    pub executed: bool,
+}
+
+impl BundledStmt {
+    fn exec(&mut self) -> rusqlite::Result<()> {
+        let d = self.conn.borrow();
+        if std::env::var_os("OVELO_DBDBG").is_some() {
+            let sql: String = self.sql.chars().take(400).collect();
+            eprintln!("[bundled] exec: {sql} | params={:?}", self.params);
+        }
+        let mut st = d.conn.prepare(&self.sql)?;
+        if st.column_count() > 0 {
+            self.cols = st.column_names().iter().map(|c| c.to_string()).collect();
+            let mut rows = st.query(params_from_iter(self.params.clone()))?;
+            self.rows.clear();
+            while let Some(r) = rows.next()? {
+                let mut row = Vec::with_capacity(self.cols.len());
+                for i in 0..self.cols.len() {
+                    row.push(sv_ref(r.get_ref(i)?));
+                }
+                self.rows.push(row);
+            }
+            if std::env::var_os("OVELO_DBDBG").is_some() {
+                eprintln!("[bundled] query -> {} rows: {:?}", self.rows.len(), self.rows.first());
+            }
+        } else {
+            let r = st.execute(params_from_iter(self.params.clone()))?;
+            if std::env::var_os("OVELO_DBDBG").is_some() {
+                eprintln!("[bundled] exec -> {r} rows rowid={}", d.conn.last_insert_rowid());
+            }
+            self.cols = Vec::new();
+            self.rows = Vec::new();
+        }
+        self.cur = None;
+        self.executed = true;
+        Ok(())
+    }
+
+    fn cur_row(&self) -> Option<&[SV]> {
+        self.cur.and_then(|i| self.rows.get(i)).map(|r| r.as_slice())
+    }
+
+    fn cell(&self, col: i64) -> SV {
+        self.cur_row()
+            .and_then(|r| r.get(col.max(0) as usize))
+            .cloned()
+            .unwrap_or(SV::Null)
+    }
+}
+
+fn sv_long(v: &SV) -> i64 {
+    match v {
+        SV::Integer(i) => *i,
+        SV::Real(f) => *f as i64,
+        SV::Text(t) => t.trim().parse().unwrap_or(0),
+        _ => 0,
+    }
+}
+
+fn sv_double(v: &SV) -> f64 {
+    match v {
+        SV::Integer(i) => *i as f64,
+        SV::Real(f) => *f,
+        SV::Text(t) => t.trim().parse().unwrap_or(0.0),
+        _ => 0.0,
+    }
+}
+
+/// SQLITE_COLUMN_* type of a cell (5 = NULL before/without a row).
+fn sv_coltype(v: &SV) -> i32 {
+    match v {
+        SV::Integer(_) => 1,
+        SV::Real(_) => 2,
+        SV::Text(_) => 3,
+        SV::Blob(_) => 4,
+        SV::Null => 5,
+    }
+}
+
+fn bconn(vm: &mut Vm, h: i64) -> Result<Rc<RefCell<Db>>, E> {
+    vm.bundled_conns
+        .get(&(h as u64))
+        .cloned()
+        .ok_or_else(|| sql_err(vm, format!("connection {h} is closed")))
+}
+
+fn next_bundled_h(vm: &mut Vm) -> i64 {
+    vm.bundled_h += 1;
+    vm.bundled_h as i64
+}
+
+/// `Landroidx/sqlite/driver/bundled/*Kt;` native declarations.
+pub(crate) fn bundled_call(vm: &mut Vm, name: &str, args: &[V]) -> Rt<Option<Option<V>>> {
+    let r: Result<Option<V>, E> = (|| {
+        Ok(match name {
+            "nativeThreadSafeMode" => Some(V::I32(1)),
+            "nativeOpen" => {
+                let p = args
+                    .first()
+                    .and_then(|v| sv(vm, *v))
+                    .unwrap_or_default();
+                let dbname = if p.contains(":memory:") {
+                    ":memory:".to_string()
+                } else {
+                    let path = p.strip_prefix("file:").unwrap_or(&p);
+                    safe_name(path.split('?').next().unwrap_or(path))
+                };
+                // NOT conn_for: every bundled open gets its own
+                // Connection — Room's reader pool sets
+                // `PRAGMA query_only = 1`, which would turn the shared
+                // handle readonly for the writer too.
+                let d = open_raw(vm, &dbname)?;
+                let h = next_bundled_h(vm);
+                vm.bundled_conns.insert(h as u64, d);
+                Some(V::I64(h))
+            }
+            "nativeClose" => {
+                let h = i64v(args[0]);
+                if vm.bundled_stmts.remove(&(h as u64)).is_none() {
+                    vm.bundled_conns.remove(&(h as u64));
+                }
+                None
+            }
+            "nativeInTransaction" => {
+                let d = bconn(vm, i64v(args[0]))?;
+                let auto = d.borrow().conn.is_autocommit();
+                Some(V::I32(!auto as i32))
+            }
+            "nativeLoadExtension" => None,
+            "nativePrepare" => {
+                let d = bconn(vm, i64v(args[0]))?;
+                let sql = args
+                    .get(1)
+                    .and_then(|v| sv(vm, *v))
+                    .unwrap_or_default();
+                if std::env::var_os("OVELO_DBDBG").is_some() {
+                    let t: String = sql.chars().take(100).collect();
+                    eprintln!("[bundled] prepare: {t}");
+                }
+                // Compile now: the real JNI surfaces syntax errors here,
+                // not at first step.
+                d.borrow()
+                    .conn
+                    .prepare(&sql)
+                    .map_err(|e| sql_err(vm, e))?;
+                let h = next_bundled_h(vm);
+                vm.bundled_stmts.insert(
+                    h as u64,
+                    BundledStmt {
+                        conn: d,
+                        sql,
+                        params: Vec::new(),
+                        cols: Vec::new(),
+                        rows: Vec::new(),
+                        cur: None,
+                        executed: false,
+                    },
+                );
+                Some(V::I64(h))
+            }
+            "nativeStep" => {
+                let h = i64v(args[0]);
+                if !vm.bundled_stmts.contains_key(&(h as u64)) {
+                    return Err(sql_err(vm, format!("statement {h} is closed")));
+                }
+                let mut err = None;
+                let has = {
+                    let s = vm.bundled_stmts.get_mut(&(h as u64)).unwrap();
+                    if !s.executed {
+                        err = s.exec().err();
+                        if std::env::var_os("OVELO_DBDBG").is_some() {
+                            if let Some(e) = &err {
+                                eprintln!("[bundled] exec ERR: {e}");
+                            }
+                        }
+                    }
+                    if err.is_none() {
+                        let next = s.cur.map(|i| i + 1).unwrap_or(0);
+                        let has = next < s.rows.len();
+                        s.cur = if has { Some(next) } else { None };
+                        has
+                    } else {
+                        false
+                    }
+                };
+                if let Some(e) = err {
+                    return Err(sql_err(vm, e));
+                }
+                if std::env::var_os("OVELO_DBDBG").is_some() {
+                    eprintln!("[bundled] step h={h} -> {has} (rows={}, cur={:?})", vm.bundled_stmts.get(&(h as u64)).map(|s| s.rows.len()).unwrap_or(0), vm.bundled_stmts.get(&(h as u64)).and_then(|s| s.cur));
+                }
+                Some(V::I32(has as i32))
+            }
+            "nativeReset" => {
+                let h = i64v(args[0]);
+                if let Some(s) = vm.bundled_stmts.get_mut(&(h as u64)) {
+                    s.cur = None;
+                    s.executed = false;
+                }
+                None
+            }
+            "nativeClearBindings" => {
+                let h = i64v(args[0]);
+                if let Some(s) = vm.bundled_stmts.get_mut(&(h as u64)) {
+                    s.params.clear();
+                }
+                None
+            }
+            "nativeBindNull" => {
+                let (h, idx) = (i64v(args[0]), i64v(args[1]).max(1) as usize);
+                if std::env::var_os("OVELO_DBDBG").is_some() {
+                    eprintln!("[bundled] bindNull h={h} idx={idx}");
+                }
+                if let Some(s) = vm.bundled_stmts.get_mut(&(h as u64)) {
+                    s.params.resize(s.params.len().max(idx), SV::Null);
+                }
+                None
+            }
+            "nativeBindLong" => {
+                let (h, idx, v) = (i64v(args[0]), i64v(args[1]).max(1) as usize, i64v(args[2]));
+                if std::env::var_os("OVELO_DBDBG").is_some() {
+                    eprintln!("[bundled] bindLong h={h} idx={idx} v={v}");
+                }
+                if let Some(s) = vm.bundled_stmts.get_mut(&(h as u64)) {
+                    s.params.resize(s.params.len().max(idx), SV::Null);
+                    s.params[idx - 1] = SV::Integer(v);
+                }
+                None
+            }
+            "nativeBindDouble" => {
+                let (h, idx, v) = (i64v(args[0]), i64v(args[1]).max(1) as usize, f64v(args[2]));
+                if let Some(s) = vm.bundled_stmts.get_mut(&(h as u64)) {
+                    s.params.resize(s.params.len().max(idx), SV::Null);
+                    s.params[idx - 1] = SV::Real(v);
+                }
+                None
+            }
+            "nativeBindText" => {
+                let (h, idx) = (i64v(args[0]), i64v(args[1]).max(1) as usize);
+                if std::env::var_os("OVELO_DBDBG").is_some() {
+                    eprintln!("[bundled] bindText h={h} idx={idx}");
+                }
+                let t = args.get(2).and_then(|v| sv(vm, *v)).unwrap_or_default();
+                if let Some(s) = vm.bundled_stmts.get_mut(&(h as u64)) {
+                    s.params.resize(s.params.len().max(idx), SV::Null);
+                    s.params[idx - 1] = SV::Text(t);
+                }
+                None
+            }
+            "nativeBindBlob" => {
+                let (h, idx) = (i64v(args[0]), i64v(args[1]).max(1) as usize);
+                let b = match args.get(2) {
+                    Some(V::Ref(h)) => match vm.heap.get(*h) {
+                        Some(Obj::Array { data, .. }) => {
+                            data.iter().map(|b| i32v(*b) as u8).collect()
+                        }
+                        _ => Vec::new(),
+                    },
+                    _ => Vec::new(),
+                };
+                if let Some(s) = vm.bundled_stmts.get_mut(&(h as u64)) {
+                    s.params.resize(s.params.len().max(idx), SV::Null);
+                    s.params[idx - 1] = SV::Blob(b);
+                }
+                None
+            }
+            "nativeGetColumnCount" => {
+                let h = i64v(args[0]);
+                if !vm.bundled_stmts.contains_key(&(h as u64)) {
+                    return Err(sql_err(vm, format!("statement {h} is closed")));
+                }
+                let (err, n) = {
+                    let s = vm.bundled_stmts.get_mut(&(h as u64)).unwrap();
+                    let err = if s.executed { None } else { s.exec().err() };
+                    (err, s.cols.len() as i32)
+                };
+                if let Some(e) = err {
+                    return Err(sql_err(vm, e));
+                }
+                Some(V::I32(n))
+            }
+            "nativeGetColumnName" => {
+                let (h, col) = (i64v(args[0]), i64v(args[1]));
+                if !vm.bundled_stmts.contains_key(&(h as u64)) {
+                    return Err(sql_err(vm, format!("statement {h} is closed")));
+                }
+                let (err, n) = {
+                    let s = vm.bundled_stmts.get_mut(&(h as u64)).unwrap();
+                    let err = if s.executed { None } else { s.exec().err() };
+                    (
+                        err,
+                        s.cols.get(col.max(0) as usize).cloned().unwrap_or_default(),
+                    )
+                };
+                if let Some(e) = err {
+                    return Err(sql_err(vm, e));
+                }
+                Some(jstr(vm, &n))
+            }
+            "nativeGetColumnType" => {
+                let (h, col) = (i64v(args[0]), i64v(args[1]));
+                let t = vm
+                    .bundled_stmts
+                    .get(&(h as u64))
+                    .map(|s| sv_coltype(&s.cell(col)))
+                    .unwrap_or(5);
+                Some(V::I32(t))
+            }
+            "nativeGetLong" => {
+                let (h, col) = (i64v(args[0]), i64v(args[1]));
+                let v = vm
+                    .bundled_stmts
+                    .get(&(h as u64))
+                    .map(|s| s.cell(col))
+                    .unwrap_or(SV::Null);
+                if std::env::var_os("OVELO_DBDBG").is_some() {
+                    eprintln!("[bundled] getLong h={h} col={col} -> {:?}", v);
+                }
+                Some(V::I64(sv_long(&v)))
+            }
+            "nativeGetDouble" => {
+                let (h, col) = (i64v(args[0]), i64v(args[1]));
+                let v = vm
+                    .bundled_stmts
+                    .get(&(h as u64))
+                    .map(|s| s.cell(col))
+                    .unwrap_or(SV::Null);
+                Some(V::F64(sv_double(&v)))
+            }
+            "nativeGetText" => {
+                let (h, col) = (i64v(args[0]), i64v(args[1]));
+                let v = vm
+                    .bundled_stmts
+                    .get(&(h as u64))
+                    .map(|s| s.cell(col))
+                    .unwrap_or(SV::Null);
+                Some(match v {
+                    SV::Null => V::Ref(0),
+                    SV::Text(t) => jstr(vm, &t),
+                    SV::Integer(i) => jstr(vm, &i.to_string()),
+                    SV::Real(f) => jstr(vm, &f.to_string()),
+                    SV::Blob(b) => jstr(vm, &String::from_utf8_lossy(&b)),
+                })
+            }
+            "nativeGetBlob" => {
+                let (h, col) = (i64v(args[0]), i64v(args[1]));
+                let v = vm
+                    .bundled_stmts
+                    .get(&(h as u64))
+                    .map(|s| s.cell(col))
+                    .unwrap_or(SV::Null);
+                Some(match v {
+                    SV::Blob(b) => {
+                        arr(vm, "B", b.iter().map(|&x| V::I32(x as i32)).collect())
+                    }
+                    _ => V::Ref(0),
+                })
+            }
+            _ => return Ok(None),
+        })
+    })();
+    match r {
+        Ok(v) => Ok(Some(v)),
+        Err(e) => Err(e),
+    }
 }

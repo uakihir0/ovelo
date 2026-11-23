@@ -1323,7 +1323,7 @@ fn matcher_call(vm: &mut Vm, name: &str, args: &[V]) -> Rt<Option<Option<V>>> {
 /// `Matcher.replaceAll/First` over real match spans, expanding `$g` and
 /// `${g}` references in the replacement (Java semantics minus quoting —
 /// callers pass `quoteReplacement` output through already).
-fn rx_replace(rx: &Rx, t: &[char], rep: &str, first_only: bool) -> String {
+pub(crate) fn rx_replace(rx: &Rx, t: &[char], rep: &str, first_only: bool) -> String {
     let mut out: Vec<char> = Vec::new();
     let rep_chars: Vec<char> = rep.chars().collect();
     let mut pos = 0usize;

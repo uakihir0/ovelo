@@ -1040,6 +1040,14 @@ pub(crate) fn call(
     } else {
         class
     };
+    // androidx.sqlite bundled-driver JNI natives — Room3 bypasses the
+    // android.database layer entirely, so route them before the generic
+    // modules (which never see androidx owners).
+    if class.starts_with("Landroidx/sqlite/driver/bundled/") {
+        if let Some(r) = db::bundled_call(vm, name, args)? {
+            return Ok(Some(r));
+        }
+    }
     if let Some(r) = universal(vm, class, name, sig, args)? {
         return Ok(Some(r));
     }
@@ -1666,6 +1674,23 @@ pub(crate) fn sfield(vm: &mut Vm, owner: &str, name: &str, ftype: &str) -> Optio
             if let V::Ref(hh) = h {
                 let n = jstr(vm, name);
                 pseudo_set(vm, hh, P_DATA, n);
+                // JDK enum ordinals by declaration order — needed by
+                // TimeUnit.convert/ordinal/compareTo (kotlin.time's
+                // Duration encoding is built on them).
+                let ord = match (owner, name) {
+                    ("Ljava/util/concurrent/TimeUnit;", n) => match n {
+                        "NANOSECONDS" => 0,
+                        "MICROSECONDS" => 1,
+                        "MILLISECONDS" => 2,
+                        "SECONDS" => 3,
+                        "MINUTES" => 4,
+                        "HOURS" => 5,
+                        "DAYS" => 6,
+                        _ => 0,
+                    },
+                    _ => 0,
+                };
+                pseudo_set(vm, hh, P_FLAGS, V::I32(ord));
             }
             return Some(h);
         }

@@ -676,6 +676,10 @@ pub(crate) fn is_viewish(vm: &Vm, class: &str, args: &[V]) -> bool {
             | "Landroidx/appcompat/view/menu/MenuItemImpl;"
             | "Landroid/view/ViewTreeObserver;"
             | "Landroid/view/MotionEvent;"
+            | "Landroid/view/WindowManager;"
+            | "Landroid/view/WindowMetrics;"
+            | "Landroid/view/WindowInsets;"
+            | "Landroid/graphics/Insets;"
     ) || class.ends_with("LayoutParams;")
         || desc_is_a(class, VIEW)
         || class.ends_with("$DecorView;")
@@ -1061,22 +1065,15 @@ pub(crate) fn call(
             } else {
                 this
             };
+            // AOSP: `View.findViewById` searches this view's subtree
+            // only. Generated ViewBinding `bind` implementations rely
+            // on that — they iterate a merged root's children calling
+            // `child.findViewById(id)` and treat a miss as "try the
+            // next child". Widening a miss to the whole window hands
+            // back a view from a *different* page (NewPipe's feed
+            // binding bound its adapter onto the kiosk page's
+            // RecyclerView), so no top-of-tree retry here.
             let mut hit = find_in_tree(vm, root, id).unwrap_or(0);
-            if hit == 0 && class != WINDOW {
-                // View-binding lookups sometimes run on a child of the
-                // real root (obfuscated `j(root, id)` callers seen
-                // passing an inner view): retry from the tree's top.
-                let mut top = this;
-                for _ in 0..64 {
-                    match pseudo_get(vm, top, P_PARENT) {
-                        Some(V::Ref(p)) if p != 0 && p != top => top = p,
-                        _ => break,
-                    }
-                }
-                if top != this {
-                    hit = find_in_tree(vm, top, id).unwrap_or(0);
-                }
-            }
             if hit == 0 && class == WINDOW {
                 // Window searches span trees: appcompat content lives
                 // in its own decor tree, so retry across inflated roots
@@ -2073,6 +2070,47 @@ pub(crate) fn call(
         | "setHideOverlayWindows"
         | "setDecorFitsSystemWindows" => Some(None),
         "isFloating" | "isActive" | "hasFeature" => Some(Some(V::I32(0))),
+        // WindowMetrics carries a Rect of the display bounds — androidx
+        // (WindowInsetsAnimationCompat$Impl30's <clinit>, BottomSheet)
+        // reads it for inset math. Matches the DisplayMetrics default.
+        "getCurrentWindowMetrics" | "getMaximumWindowMetrics"
+            if class == "Landroid/view/WindowManager;" =>
+        {
+            let m = host(vm, "Landroid/view/WindowMetrics;", HostState::Empty);
+            if let V::Ref(mh) = m {
+                let r = host(vm, "Landroid/graphics/Rect;", HostState::Empty);
+                if let V::Ref(rh) = r {
+                    pseudo_set(vm, rh, P_RECT_L, V::I32(0));
+                    pseudo_set(vm, rh, P_RECT_T, V::I32(0));
+                    pseudo_set(vm, rh, P_RECT_R, V::I32(1080));
+                    pseudo_set(vm, rh, P_RECT_B, V::I32(1920));
+                }
+                slot_put(vm, mh, r);
+            }
+            Some(Some(m))
+        }
+        "getBounds" if class == "Landroid/view/WindowMetrics;" => {
+            Some(Some(slot_of(vm, this).unwrap_or(V::Ref(0))))
+        }
+        "getWindowInsets" if class == "Landroid/view/WindowMetrics;" => {
+            Some(Some(host(
+                vm,
+                "Landroid/view/WindowInsets;",
+                HostState::Empty,
+            )))
+        }
+        "getInsets" | "getInsetsIgnoringVisibility" | "isVisible"
+            if class == "Landroid/view/WindowInsets;" =>
+        {
+            // Zero insets: no system bars are carved out of our window.
+            Some(Some(match ret(sig) {
+                "Z" => V::I32(0),
+                "Landroid/graphics/Insets;" => {
+                    host(vm, "Landroid/graphics/Insets;", HostState::Empty)
+                }
+                _ => V::I32(0),
+            }))
+        }
         "getWindowManager"
         | "getContainer"
         | "getCurrentFocus"
@@ -4541,10 +4579,16 @@ pub(crate) fn dispatch_touch(
         if std::env::var_os("OVELO_TOUCHDBG").is_some() {
             eprintln!("[touchdbg]   try h{h} {} {l},{t},{r},{b}", vm.dbg_class_of(h));
         }
-        if !(x >= l && x < r && y >= t && y < b) {
+        let inside = x >= l && x < r && y >= t && y < b;
+        if !inside && r > l && b > t {
             return None;
         }
-        // Later children draw on top — hit-test them first.
+        // Later children draw on top — hit-test them first. A node
+        // with a degenerate frame (r<=l || b<=t — the layout pass
+        // never ran or produced 0×0, e.g. a FragmentContainerView
+        // whose fragment tree was materialized without a real layout)
+        // still descends: its children can carry real frames, and
+        // pruning here leaves the whole subtree untouchable.
         for c in children(vm, h).iter().rev() {
             if let V::Ref(ch) = c {
                 if *ch != 0 {
@@ -4553,6 +4597,10 @@ pub(crate) fn dispatch_touch(
                     }
                 }
             }
+        }
+        // A degenerate-frame node claims nothing by itself.
+        if !inside {
+            return None;
         }
         Some(h)
     }

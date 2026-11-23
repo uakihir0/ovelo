@@ -2162,8 +2162,49 @@ fn context_call(
             }
             Some(Some(V::I32(0)))
         }
-        "startService"
-        | "stopService"
+        "startService" | "startForegroundService" => {
+            // Launch the named Service for real — apps like NewPipe do
+            // their feed fetch in `FeedLoadService.onStartCommand`, so a
+            // stub here means the whole feature never runs. The Intent's
+            // P_COMPONENT holds a ComponentName (class name in P_DATA),
+            // a Class mirror or a bare class-name string.
+            let mut component = V::Ref(0);
+            let svc = (|| -> Option<u32> {
+                let V::Ref(ih) = args.get(1).copied()? else {
+                    return None;
+                };
+                let V::Ref(ch) = pseudo_get(vm, ih, P_COMPONENT)? else {
+                    return None;
+                };
+                component = V::Ref(ch);
+                let desc = vm
+                    .class_descriptor_of(ch)
+                    .or_else(|| sv(vm, V::Ref(ch)))
+                    .or_else(|| pseudo_get(vm, ch, P_DATA).and_then(|v| sv(vm, v)))?;
+                let desc = if desc.starts_with('L') {
+                    desc
+                } else {
+                    format!("L{};", desc.replace('.', "/"))
+                };
+                let sh = match vm.services.get(&desc) {
+                    Some(&h) => h,
+                    None => {
+                        let h = vm.instantiate(&desc).ok()?;
+                        let _ = vm.call_virtual(h, "onCreate", &[]);
+                        vm.services.insert(desc.clone(), h);
+                        h
+                    }
+                };
+                let _ = vm.call_virtual(
+                    sh,
+                    "onStartCommand",
+                    &[V::Ref(ih), V::I32(0), V::I32(1)],
+                );
+                Some(sh)
+            })();
+            Some(Some(if svc.is_some() { component } else { V::Ref(0) }))
+        }
+        "stopService"
         | "bindService"
         | "unbindService"
         | "sendBroadcast"
@@ -2173,7 +2214,6 @@ fn context_call(
         | "unregisterReceiver"
         | "startInstrumentation"
         | "startIntentSender"
-        | "startForegroundService"
         | "startIntentSenderFromChild"
         | "revokeUriPermission"
         | "grantUriPermission"
@@ -3383,6 +3423,17 @@ fn res_misc(vm: &mut Vm, class: &str, name: &str, args: &[V]) -> Rt<Option<Optio
                     .iter()
                     .map(|v| match v.string.as_deref() {
                         Some(s) => jstr(vm, s),
+                        // A string-array may hold @string/ references —
+                        // chase them so callers see the resolved text,
+                        // not a decimal res id.
+                        None if v.data_type == 0x01 => {
+                            let resolved = vm
+                                .apk_res
+                                .as_ref()
+                                .and_then(|r| r.string_of(v.data))
+                                .map(|s| s.to_string());
+                            jstr(vm, &resolved.unwrap_or_else(|| v.data.to_string()))
+                        }
                         None => jstr(vm, &v.data.to_string()),
                     })
                     .collect()

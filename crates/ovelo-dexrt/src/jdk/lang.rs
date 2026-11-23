@@ -342,7 +342,13 @@ fn string_call(vm: &mut Vm, name: &str, sig: &str, args: &[V]) -> Option<Option<
         "replaceAll" | "replaceFirst" => {
             let pat = sv(vm, args[1]).unwrap_or_default();
             let rep = sv(vm, args[2]).unwrap_or_default();
-            let out = if name == "replaceFirst" {
+            // `String.replaceAll` takes a regex, not a literal —
+            // `replaceAll("\\D+", "")` is how callers scrub digits out
+            // of strings (NewPipe view-count parsing depends on this).
+            let out = if let Ok(rx) = super::rx::Rx::compile(&pat) {
+                let chars: Vec<char> = t.chars().collect();
+                super::io::rx_replace(&rx, &chars, &rep, name == "replaceFirst")
+            } else if name == "replaceFirst" {
                 t.replacen(&pat, &rep, 1)
             } else {
                 t.replace(&pat, &rep)
@@ -725,6 +731,38 @@ fn boxed_call(
     args: &[V],
 ) -> Rt<Option<Option<V>>> {
     Ok(match name {
+        "<init>" => {
+            // `new Integer(1)` allocates a dex `Obj::Instance` — without
+            // this the boxed value never lands and intValue() reads 0.
+            let arg = args.get(1).copied().unwrap_or(V::I32(0));
+            let v = match arg {
+                V::Ref(h) => match sv(vm, arg) {
+                    Some(t) if class != "Ljava/lang/Character;" => {
+                        let t = t.trim();
+                        match class {
+                            "Ljava/lang/Long;" => t
+                                .parse::<i64>()
+                                .map(V::I64)
+                                .unwrap_or(V::I64(0)),
+                            "Ljava/lang/Double;" => {
+                                t.parse::<f64>().map(V::F64).unwrap_or(V::F64(0.0))
+                            }
+                            "Ljava/lang/Float;" => {
+                                t.parse::<f32>().map(V::F32).unwrap_or(V::F32(0.0))
+                            }
+                            "Ljava/lang/Boolean;" => V::I32((t == "true") as i32),
+                            _ => t.parse::<i32>().map(V::I32).unwrap_or(V::I32(0)),
+                        }
+                    }
+                    _ => V::Ref(h),
+                },
+                other => other,
+            };
+            if let V::Ref(this) = args[0] {
+                slot_put(vm, this, v);
+            }
+            Some(None)
+        }
         "intValue" | "longValue" | "shortValue" | "byteValue" | "charValue" | "booleanValue"
         | "doubleValue" | "floatValue" => {
             let v = prim(vm, args[0]);

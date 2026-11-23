@@ -1549,6 +1549,34 @@ fn run_app(store: &InstallStore, package: &str) -> Result<(), OveloError> {
         }
     };
     println!("dispatch done — opening window");
+    // Debug hook: OVELO_AUTOSTART_SERVICE=<descriptor> instantiates the
+    // service and runs onCreate+onStartCommand once the window is up —
+    // exercises the service path without a UI trigger.
+    if let Some(desc) = std::env::var("OVELO_AUTOSTART_SERVICE").ok().filter(|d| !d.is_empty()) {
+        if let Some((vm, _)) = &mut guest {
+            let intent = {
+                let ih = vm.heap.alloc(ovelo_dexrt::Obj::Host {
+                    class_idx: u64::MAX,
+                    desc: "Landroid/content/Intent;".into(),
+                    fields: std::collections::HashMap::new(),
+                    state: ovelo_dexrt::HostState::Empty,
+                });
+                ovelo_dexrt::V::Ref(ih)
+            };
+            match vm.instantiate(&desc) {
+                Ok(sh) => {
+                    let _ = vm.call_virtual(sh, "onCreate", &[]);
+                    let r = vm.call_virtual(
+                        sh,
+                        "onStartCommand",
+                        &[intent, ovelo_dexrt::V::I32(0), ovelo_dexrt::V::I32(1)],
+                    );
+                    println!("[autosvc] {desc} onStartCommand -> {r:?}");
+                }
+                Err(e) => println!("[autosvc] {desc} instantiate failed: {e}"),
+            }
+        }
+    }
     let mut presenter = ovelo_host::Presenter::new();
     let sid = presenter.attach(3, 720, 1280)?;
     let win = ovelo_host::HostWindow::new(&disp(&rec.app.package), sid, presenter);

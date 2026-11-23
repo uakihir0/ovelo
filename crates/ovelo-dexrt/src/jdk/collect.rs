@@ -186,7 +186,7 @@ pub(crate) fn call(
         || class == "Ljava/util/concurrent/atomic/AtomicIntegerFieldUpdater;"
         || class == "Ljava/util/concurrent/atomic/AtomicLongFieldUpdater;"
     {
-        fieldupdater_call(vm, name, args)?
+        fieldupdater_call(vm, class, name, args)?
     } else if class.starts_with("Ljava/util/concurrent/atomic/") {
         atomic_call(vm, class, name, args)
     } else if class == "Ljava/util/concurrent/CountDownLatch;" {
@@ -209,8 +209,30 @@ pub(crate) fn call(
         sparse_call(vm, class, name, args)?
     } else if class == "Ljava/util/concurrent/TimeUnit;" {
         match name {
-            "convert" | "toMillis" | "toNanos" | "toMicros" | "toSeconds" | "toMinutes"
-            | "toHours" | "toDays" => Some(Some(V::I64(i64v(*args.last().unwrap_or(&V::I64(0)))))),
+            // `dst.convert(d, src)` — real unit math (kotlin.time
+            // Duration builds its whole encoding on these; returning
+            // the raw arg turns Room's 30s pool timeout into 0).
+            "convert" => {
+                let dst = lang::enum_ordinal(vm, args[0]);
+                let src = lang::enum_ordinal(vm, *args.get(2).unwrap_or(&args[0]));
+                let d = i64v(args.get(1).copied().unwrap_or(V::I64(0)));
+                Some(Some(V::I64(timeunit_convert(dst, src, d))))
+            }
+            "toNanos" | "toMicros" | "toMillis" | "toSeconds" | "toMinutes"
+            | "toHours" | "toDays" => {
+                let dst = match name {
+                    "toNanos" => 0,
+                    "toMicros" => 1,
+                    "toSeconds" => 3,
+                    "toMinutes" => 4,
+                    "toHours" => 5,
+                    "toDays" => 6,
+                    _ => 2,
+                };
+                let src = lang::enum_ordinal(vm, args[0]);
+                let d = i64v(args.get(1).copied().unwrap_or(V::I64(0)));
+                Some(Some(V::I64(timeunit_convert(dst, src, d))))
+            }
             "sleep" | "timedWait" | "timedJoin" => Some(None),
             _ => None,
         }
@@ -621,6 +643,33 @@ fn list_call(vm: &mut Vm, name: &str, sig: &str, args: &[V]) -> Rt<Option<Option
                     c = true;
                     break;
                 }
+            }
+            if std::env::var("OVELO_CONTAINSDBG").is_ok() {
+                let kind = |e: &V| match e {
+                    V::Ref(eh) => {
+                        let k = match vm.heap.get(*eh) {
+                            Some(Obj::Str(_)) => "Str",
+                            Some(Obj::Instance { .. }) => "Inst",
+                            Some(Obj::Host { .. }) => "Host",
+                            Some(Obj::Array { .. }) => "Arr",
+                            Some(Obj::Class { .. }) => "Cls",
+                            _ => "?",
+                        };
+                        format!(
+                            "h{eh}:{}[{k}]sv={:?}",
+                            vm.dbg_class_of(*eh),
+                            super::sv(vm, *e)
+                        )
+                    }
+                    o => format!("{o:?}"),
+                };
+                let item0 = items.first().map(kind);
+                let arg = kind(&args[1]);
+                eprintln!(
+                    "[containsdbg] h{h} {} n={} item0={item0:?} arg={arg} -> {c}",
+                    vm.dbg_class_of(h),
+                    items.len()
+                );
             }
             Some(Some(V::I32(c as i32)))
         }
@@ -2347,7 +2396,7 @@ fn latch_call(vm: &mut Vm, name: &str, args: &[V]) -> Option<Option<V>> {
     }
 }
 
-fn fieldupdater_call(vm: &mut Vm, name: &str, args: &[V]) -> Rt<Option<Option<V>>> {
+fn fieldupdater_call(vm: &mut Vm, class: &str, name: &str, args: &[V]) -> Rt<Option<Option<V>>> {
     Ok(match name {
         "newUpdater" | "newUpdaterWithImpl" => {
             let h = vm.alloc_host(
@@ -2398,22 +2447,37 @@ fn fieldupdater_call(vm: &mut Vm, name: &str, args: &[V]) -> Rt<Option<Option<V>
                     };
                     (u64::from(P_DATA) << 32) | u64::from(key)
                 });
+            // The default for a never-written field must match the
+            // field's stored width: `get` on a J field returning Ref(0)
+            // breaks the very next `and-long`/`cmp-long` consumer
+            // (kotlinx CoroutineScheduler.tryUnpark reads
+            // parkedWorkersStack before init), and CAS on an unset J
+            // slot must see I64(0) or it can never succeed.
+            let unset = if class == "Ljava/util/concurrent/atomic/AtomicLongFieldUpdater;"
+                || num_wide(vm, fid)
+            {
+                V::I64(0)
+            } else if class == "Ljava/util/concurrent/atomic/AtomicIntegerFieldUpdater;" {
+                V::I32(0)
+            } else {
+                V::Ref(0)
+            };
             match name {
                 "get" => {
                     let v = match vm.heap.get(obj) {
                         Some(Obj::Instance { fields, .. }) | Some(Obj::Host { fields, .. }) => {
-                            fields.get(&fid).copied().unwrap_or(V::Ref(0))
+                            fields.get(&fid).copied().unwrap_or(unset)
                         }
-                        _ => V::Ref(0),
+                        _ => unset,
                     };
                     Some(Some(v))
                 }
                 "compareAndSet" | "weakCompareAndSet" => {
                     let cur = match vm.heap.get(obj) {
                         Some(Obj::Instance { fields, .. }) | Some(Obj::Host { fields, .. }) => {
-                            fields.get(&fid).copied().unwrap_or(V::Ref(0))
+                            fields.get(&fid).copied().unwrap_or(unset)
                         }
-                        _ => V::Ref(0),
+                        _ => unset,
                     };
                     // Guest `null` arrives as `I32(0)` (const/4) while an
                     // unset slot holds `Ref(0)` — both count as null, or
@@ -2441,9 +2505,9 @@ fn fieldupdater_call(vm: &mut Vm, name: &str, args: &[V]) -> Rt<Option<Option<V>
                 | "getAndIncrement" | "decrementAndGet" | "getAndDecrement" => {
                     let cur = match vm.heap.get(obj) {
                         Some(Obj::Instance { fields, .. }) | Some(Obj::Host { fields, .. }) => {
-                            fields.get(&fid).copied().unwrap_or(V::Ref(0))
+                            fields.get(&fid).copied().unwrap_or(unset)
                         }
-                        _ => V::Ref(0),
+                        _ => unset,
                     };
                     // Keep the stored width: an AtomicLongFieldUpdater
                     // must not shrink a `J` field to I32 or a later
@@ -2476,9 +2540,9 @@ fn fieldupdater_call(vm: &mut Vm, name: &str, args: &[V]) -> Rt<Option<Option<V>
                     // `set`/`lazySet` — coerce to the stored width as in CAS.
                     let cur = match vm.heap.get(obj) {
                         Some(Obj::Instance { fields, .. }) | Some(Obj::Host { fields, .. }) => {
-                            fields.get(&fid).copied().unwrap_or(V::Ref(0))
+                            fields.get(&fid).copied().unwrap_or(unset)
                         }
-                        _ => V::Ref(0),
+                        _ => unset,
                     };
                     let nv = match (cur, args[2]) {
                         (V::I64(_), V::I32(i)) => V::I64(i as i64),
@@ -2495,6 +2559,24 @@ fn fieldupdater_call(vm: &mut Vm, name: &str, args: &[V]) -> Rt<Option<Option<V>
         }
         _ => None,
     })
+}
+
+/// `TimeUnit` unit math: ordinals run NANOSECONDS..DAYS; convert via
+/// the nanos scale with saturation (JDK truncates toward zero).
+fn timeunit_convert(dst_ord: i32, src_ord: i32, d: i64) -> i64 {
+    const R: [i64; 7] = [
+        1,
+        1_000,
+        1_000_000,
+        1_000_000_000,
+        60_000_000_000,
+        3_600_000_000_000,
+        86_400_000_000_000,
+    ];
+    let s = R.get(src_ord as usize).copied().unwrap_or(1);
+    let dd = R.get(dst_ord as usize).copied().unwrap_or(1);
+    let nanos = ((d as i128) * (s as i128)).clamp(i64::MIN as i128, i64::MAX as i128) as i64;
+    nanos / dd
 }
 
 /// Whether the resolved dex field is declared `J`/`D` — used to pick
