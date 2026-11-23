@@ -752,36 +752,38 @@ mod thunk {
                 0xD53B_D05D, // 25: mrs x29, tpidr_el0 — this thread's TCB
                 0xF93F_EFB0, // 26: str x16, [x29, #0x7fd8] — guest fp
                 0xF93F_FBBE, // 27: str x30, [x29, #0x7ff0] — guest call site
-                0xF97F_FFB0, // 28: ldr x16, [x29, #0x7ff8] — saved host TPIDR
-                0xD51B_D050, // 29: msr tpidr_el0, x16
+                0x9103_03F0, // 28: add x16, sp, #192 — guest sp at thunk entry
+                0xF93F_EBB0, // 29: str x16, [x29, #0x7fd0] — guest sp
+                0xF97F_FFB0, // 30: ldr x16, [x29, #0x7ff8] — saved host TPIDR
+                0xD51B_D050, // 31: msr tpidr_el0, x16
             ]);
-            ins.extend_from_slice(&trace_stores(at, 120, 6, 16)); // 30-31: TRACE[6]=swap val
+            ins.extend_from_slice(&trace_stores(at, 128, 6, 16)); // 32-33: TRACE[6]=swap val
             ins.extend_from_slice(&[
-                0x5800_0210, // 32: ldr x16, +64 -> target literal at byte 192
-                0xF93F_F7B0, // 33: str x16, [x29, #0x7fe8] — import target
-                0xF97F_F3B1, // 34: ldr x17, [x29, #0x7fe0] — in-call depth
-                0x9100_0631, // 35: add x17, x17, #1
-                0xF93F_F3B1, // 36: str x17, [x29, #0x7fe0]
-                0xD63F_0200, // 37: blr x16
-                0xD51B_D05D, // 38: msr tpidr_el0, x29 — back to guest TCB
-                0xF97F_F3B1, // 39: ldr x17, [x29, #0x7fe0] — depth--
-                0xD100_0631, // 40: sub x17, x17, #1
-                0xF93F_F3B1, // 41: str x17, [x29, #0x7fe0]
+                0x5800_0210, // 34: ldr x16, +64 -> target literal at byte 200
+                0xF93F_F7B0, // 35: str x16, [x29, #0x7fe8] — import target
+                0xF97F_F3B1, // 36: ldr x17, [x29, #0x7fe0] — in-call depth
+                0x9100_0631, // 37: add x17, x17, #1
+                0xF93F_F3B1, // 38: str x17, [x29, #0x7fe0]
+                0xD63F_0200, // 39: blr x16
+                0xD51B_D05D, // 40: msr tpidr_el0, x29 — back to guest TCB
+                0xF97F_F3B1, // 41: ldr x17, [x29, #0x7fe0] — depth--
+                0xD100_0631, // 42: sub x17, x17, #1
+                0xF93F_F3B1, // 43: str x17, [x29, #0x7fe0]
             ]);
-            ins.extend_from_slice(&trace_stores(at, 168, 7, 29)); // 42-43: TRACE[7]=restore val
+            ins.extend_from_slice(&trace_stores(at, 176, 7, 29)); // 44-45: TRACE[7]=restore val
             ins.extend_from_slice(&[
-                0xA94A_7BFD, // 44: ldp x29,x30,[sp,#168]
-                0x9103_03FF, // 45: add sp, sp, #192
-                0xD65F_03C0, // 46: ret
-                0xD503_201F, // 47: pad before literal
+                0xA94A_7BFD, // 46: ldp x29,x30,[sp,#168]
+                0x9103_03FF, // 47: add sp, sp, #192
+                0xD65F_03C0, // 48: ret
+                0xD503_201F, // 49: pad before literal
             ]);
-            debug_assert_eq!(ins.len(), 48);
+            debug_assert_eq!(ins.len(), 50);
             for (i, ins) in ins.iter().enumerate() {
                 w.add(i).write_volatile(*ins);
             }
-            // Target literal at byte 192, reached by `ldr x16, +64` from
-            // insn 32 (byte 128).
-            let lit = (at + 192) as *mut usize;
+            // Target literal at byte 200, reached by `ldr x16, +64` from
+            // insn 34 (byte 136).
+            let lit = (at + 200) as *mut usize;
             lit.write_volatile(target);
             pthread_jit_write_protect_np(1);
             sys_icache_invalidate(at as *mut c_void, SLOT);
@@ -1083,10 +1085,17 @@ unsafe fn heal_dead_thunk_call(mc: *mut u8) -> bool {
         return false;
     }
     let target = unsafe { *base.add(0x7fe8 / 8) };
+    let gsp = unsafe { *base.add(0x7fd0 / 8) };
     unsafe {
         *(tcb as *mut usize).add(0x7fe0 / 8) = depth - 1;
         if gfp != 0 {
             *(mc.add(248) as *mut usize) = gfp; // x29: guest fp
+        }
+        // Guest sp recorded by the thunk at entry — without it the
+        // caller resumes on the interrupted host-frame sp and every
+        // sp-relative access reads host stack garbage.
+        if gsp != 0 && gsp % 16 == 0 {
+            *(mc.add(264) as *mut usize) = gsp; // sp: guest stack
         }
         *(mc.add(16) as *mut usize) = 0; // x0: NULL-ish return
         *(mc.add(256) as *mut usize) = site; // lr
@@ -4807,6 +4816,15 @@ pub(crate) mod excport {
                                 state: *mut u32,
                                 cnt: *mut u32,
                             ) -> i32;
+                            fn mach_vm_region(
+                                task: u32,
+                                addr: *mut u64,
+                                size: *mut u64,
+                                flavor: i32,
+                                info: *mut i32,
+                                count: *mut u32,
+                                object: *mut u32,
+                            ) -> i32;
                         }
                         // arm64_thread_state64 (flavor 6): x0..x28,
                         // fp, lr, sp, pc — words 60..64 hold
@@ -4841,8 +4859,36 @@ pub(crate) mod excport {
                             let je = super::JIT_CODE_END
                                 .load(std::sync::atomic::Ordering::Relaxed);
                             let injit = rpc >= jb as u64 && rpc < je as u64;
+                            // Region fingerprint: base + head bytes of
+                            // the VM region holding pc — distinguishes
+                            // guest .so / thunk arena / other maps.
+                            let (mut rbase, mut rsize) = (rpc, 0u64);
+                            let mut rinfo = [0i32; 9];
+                            let mut rc = 9u32;
+                            let mut robj = 0u32;
+                            let rkr = mach_vm_region(
+                                super::mach_task_self(),
+                                &mut rbase,
+                                &mut rsize,
+                                9,
+                                rinfo.as_mut_ptr(),
+                                &mut rc,
+                                &mut robj,
+                            );
+                            let mut head = [0u32; 4];
+                            if rkr == 0 {
+                                let mut nb = 0u64;
+                                super::mach_vm_read_overwrite(
+                                    super::mach_task_self(),
+                                    rbase,
+                                    16,
+                                    head.as_mut_ptr() as u64,
+                                    &mut nb,
+                                );
+                            }
                             eprintln!(
-                                "[mach-exc] tport={thread_port} unrecoverable pc={rpc:#x}({:#x?}) jit={injit} insn={:#x?} lr={lr:#x}({:#x?}) sp={sp:#x} fp={fp:#x} x16={x16:#x}({tname}) l1={:#x} l2={:#x}; suspending",
+                                "[mach-exc] tport={thread_port} unrecoverable pc={rpc:#x}({:#x?}) jit={injit} insn={:#x?} reg=[{rbase:#x}+{rsize:#x} {:#x?}] lr={lr:#x}({:#x?}) sp={sp:#x} fp={fp:#x} x16={x16:#x}({tname}) l1={:#x} l2={:#x}; suspending",
+                                head,
                                 insw,
                                 super::so_off(rpc as usize),
                                 super::so_off(lr as usize),
@@ -5077,11 +5123,11 @@ pub(crate) mod glctx {
                 let fbo_attach: unsafe extern "C" fn(i32, i32, i32, u32) =
                     glp("glFramebufferRenderbuffer").unwrap_or(noop_attach);
                 gen_fbo(1, &mut s.fbo);
-                bind_fbo(0x8D88, s.fbo); // GL_FRAMEBUFFER
+                bind_fbo(0x8D40, s.fbo); // GL_FRAMEBUFFER
                 gen_rb(1, &mut s.rb);
                 bind_rb(0x8D41, s.rb); // GL_RENDERBUFFER
                 rb_store(0x8D41, 0x8058, w, h); // GL_RGBA8
-                fbo_attach(0x8D88, 0x8CE0, 0x8D41, s.rb); // COLOR_ATTACHMENT0
+                fbo_attach(0x8D40, 0x8CE0, 0x8D41, s.rb); // COLOR_ATTACHMENT0
                 s.w = w;
                 s.h = h;
             }
@@ -5110,7 +5156,7 @@ pub(crate) mod glctx {
             let bind_fbo: unsafe extern "C" fn(i32, u32) = glp("glBindFramebuffer")?;
             let read: unsafe extern "C" fn(i32, i32, i32, i32, i32, i32, *mut c_void) =
                 glp("glReadPixels")?;
-            bind_fbo(0x8D88, s.fbo);
+            bind_fbo(0x8D40, s.fbo);
             let mut buf = vec![0u8; (s.w * s.h * 4) as usize];
             read(
                 0,

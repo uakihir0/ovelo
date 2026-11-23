@@ -726,6 +726,7 @@ pub(crate) fn is_viewish(vm: &Vm, class: &str, args: &[V]) -> bool {
             | "Landroid/view/ViewTreeObserver;"
             | "Landroid/view/MotionEvent;"
             | "Landroid/view/WindowManager;"
+            | "Landroid/view/SurfaceHolder;"
             | "Landroid/view/WindowMetrics;"
             | "Landroid/view/WindowInsets;"
             | "Landroid/view/Choreographer;"
