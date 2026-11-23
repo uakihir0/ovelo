@@ -1,7 +1,7 @@
 //! Probe kotlin.io.encoding.Base64.decode$default on a known string.
 use ovelo_apk::zip::{parse_central_directory, read_entry, ZipLimits};
 use ovelo_dex::DexFile;
-use ovelo_dexrt::{V, Vm};
+use ovelo_dexrt::{Vm, V};
 fn main() {
     let apk = std::env::args().nth(1).unwrap();
     let input = std::env::args().nth(2).unwrap_or_else(|| "QUJD".into());

@@ -1,7 +1,7 @@
 //! Probe kotlin.text.StringsKt dex functions directly.
 use ovelo_apk::zip::{parse_central_directory, read_entry, ZipLimits};
 use ovelo_dex::DexFile;
-use ovelo_dexrt::{Obj, V, Vm};
+use ovelo_dexrt::{Obj, Vm, V};
 fn main() {
     let apk = std::env::args().nth(1).unwrap();
     let bytes = std::fs::read(&apk).unwrap();
@@ -23,7 +23,7 @@ fn main() {
     let chars = vm.alloc_array("C", vec![V::I32(124)]);
     for nargs in 2..=6 {
         let mut args = vec![V::Ref(inp), chars];
-        args.extend(std::iter::repeat(V::I32(0)).take(nargs - 2));
+        args.extend(std::iter::repeat_n(V::I32(0), nargs - 2));
         let r = vm.run("Lkotlin/text/StringsKt;", "split$default", &args);
         match r {
             Ok(Some(V::Ref(h))) => match vm.heap().get(h) {

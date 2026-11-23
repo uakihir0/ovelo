@@ -1,7 +1,10 @@
+//! Probes `RangesKt.replacePlaceholdersForQuery` end-to-end inside the real
+//! tasks.org dex — verifies NOW()/EOD() template rewriting.
+
 use ovelo_apk::zip::{parse_central_directory, read_entry, ZipLimits};
 use ovelo_dex::DexFile;
 use ovelo_dexrt::Obj;
-use ovelo_dexrt::{V, Vm};
+use ovelo_dexrt::{Vm, V};
 fn main() {
     let apk = std::env::args().nth(1).unwrap();
     let bytes = std::fs::read(&apk).unwrap();
