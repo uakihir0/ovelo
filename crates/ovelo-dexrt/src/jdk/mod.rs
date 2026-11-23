@@ -618,7 +618,7 @@ pub(crate) fn list_ref(vm: &Vm, h: u32) -> Option<&Vec<V>> {
         // so matching is structural, not by name): resolve the backing
         // store they delegate element access to.
         Some(Obj::Instance { .. }) => match guest_list_backing(vm, h, 8) {
-            Some(x) => match vm.heap.get(x) {
+            Some((x, _)) => match vm.heap.get(x) {
                 Some(Obj::Host {
                     state: HostState::List(l),
                     ..
@@ -644,13 +644,37 @@ pub(crate) fn list_snapshot(vm: &Vm, h: u32) -> Option<Vec<V>> {
         }) => Some(l.clone()),
         Some(Obj::Array { data, .. }) => Some(data.clone()),
         Some(Obj::Instance { .. }) => {
-            let x = guest_list_backing(vm, h, 8)?;
+            let (x, size) = guest_list_backing(vm, h, 8)?;
+            if std::env::var("OVELO_ITERDBG").is_ok() {
+                let fs = match vm.heap.get(h) {
+                    Some(Obj::Instance { fields, .. }) => fields
+                        .iter()
+                        .map(|(g, v)| format!("{}={v:?}", vm.dbg_field_name(*g)))
+                        .collect::<Vec<_>>()
+                        .join(","),
+                    _ => String::new(),
+                };
+                eprintln!(
+                    "[iterdbg] list_snapshot h{h} {} store=h{x} size={size:?} fields={fs}",
+                    vm.dbg_class_of(h)
+                );
+            }
             match vm.heap.get(x) {
                 Some(Obj::Host {
                     state: HostState::List(l),
                     ..
                 }) => Some(l.clone()),
-                Some(Obj::Array { data, .. }) => Some(data.clone()),
+                Some(Obj::Array { data, .. }) => {
+                    // `elementData` capacity can exceed the collection's
+                    // logical size — the tail is unused null slots, not
+                    // elements. Truncate when a sibling `size` field pins
+                    // the real length.
+                    let mut d = data.clone();
+                    if let Some(n) = size {
+                        d.truncate(n.min(d.len()));
+                    }
+                    Some(d)
+                }
                 _ => None,
             }
         }
@@ -665,7 +689,7 @@ pub(crate) fn list_snapshot(vm: &Vm, h: u32) -> Option<Vec<V>> {
 /// delegates, and the depth budget ends reference cycles. A `SubList`
 /// collapses to its parent — slightly wrong (offset/size lost) but
 /// strictly better than empty.
-fn guest_list_backing(vm: &Vm, h: u32, depth: u8) -> Option<u32> {
+fn guest_list_backing(vm: &Vm, h: u32, depth: u8) -> Option<(u32, Option<usize>)> {
     if depth == 0 || !vm.is_guest_collection(h) {
         return None;
     }
@@ -679,12 +703,27 @@ fn guest_list_backing(vm: &Vm, h: u32, depth: u8) -> Option<u32> {
                 ..
             }) | Some(Obj::Array { .. })
         ) {
-            return Some(bh);
+            return Some((bh, None));
         }
     }
     let Some(Obj::Instance { fields, .. }) = vm.heap.get(h) else {
         return None;
     };
+    // An int field naming the logical element count pins the real
+    // length when the array's capacity over-allocates (`size` on
+    // ArrayList-likes, `length` on kotlin ListBuilder).
+    let size_field = fields.iter().find_map(|(g, v)| match v {
+        V::I32(n)
+            if *n >= 0
+                && matches!(
+                    vm.dbg_field_name(*g).rsplit('.').next().unwrap_or_default(),
+                    "size" | "length"
+                ) =>
+        {
+            Some(*n as usize)
+        }
+        _ => None,
+    });
     let cands: Vec<u32> = fields
         .values()
         .filter_map(|v| match v {
@@ -693,14 +732,15 @@ fn guest_list_backing(vm: &Vm, h: u32, depth: u8) -> Option<u32> {
         })
         .collect();
     for &x in &cands {
-        if matches!(
-            vm.heap.get(x),
+        match vm.heap.get(x) {
             Some(Obj::Host {
                 state: HostState::List(_),
                 ..
-            }) | Some(Obj::Array { .. })
-        ) {
-            return Some(x);
+            }) => return Some((x, None)),
+            Some(Obj::Array { data, .. }) => {
+                return Some((x, size_field.filter(|n| *n <= data.len())))
+            }
+            _ => {}
         }
     }
     for &x in &cands {
@@ -770,16 +810,21 @@ fn backing_handle(vm: &mut Vm, h: u32, map: bool) -> Option<u32> {
         return Some(bh);
     }
     if !map {
-        if let Some(x) = guest_list_backing(vm, h, 8) {
+        if let Some((x, size)) = guest_list_backing(vm, h, 8) {
             match vm.heap.get(x) {
                 Some(Obj::Host {
                     state: HostState::List(_),
                     ..
                 }) => return Some(x),
                 // Array backing is fixed-size — copy it into a
-                // growable store so add/remove keep working.
+                // growable store so add/remove keep working. The copy is
+                // capped at the guest's logical size: `elementData`
+                // capacity beyond it holds unused null slots.
                 Some(Obj::Array { data, .. }) => {
-                    let data = data.clone();
+                    let mut data = data.clone();
+                    if let Some(n) = size {
+                        data.truncate(n.min(data.len()));
+                    }
                     let bh = vm.alloc_host("Ljava/util/ArrayList;", HostState::List(data));
                     pseudo_set(vm, h, key, V::Ref(bh));
                     return Some(bh);

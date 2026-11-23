@@ -427,6 +427,9 @@ fn list_call(vm: &mut Vm, name: &str, sig: &str, args: &[V]) -> Rt<Option<Option
             } else if dup {
                 Some(Some(V::I32(0)))
             } else {
+                if std::env::var("OVELO_ITERDBG").is_ok() && matches!(args[1], V::Ref(0)) {
+                    eprintln!("[iterdbg] add(null) on h{h} len={}", l.len());
+                }
                 l.push(args[1]);
                 Some(Some(V::I32(1)))
             }
@@ -1402,6 +1405,12 @@ fn iter_call(vm: &mut Vm, name: &str, args: &[V]) -> Rt<Option<Option<V>>> {
                 }) => {
                     if *pos < items.len() {
                         let v = items[*pos];
+                        if std::env::var("OVELO_ITERDBG").is_ok() && matches!(v, V::Ref(0)) {
+                            eprintln!(
+                                "[iterdbg] next on h{h} pos={pos} yields null; items={:?}",
+                                items.iter().map(|x| format!("{x:?}")).collect::<Vec<_>>()
+                            );
+                        }
                         *pos += 1;
                         (v, true)
                     } else {
