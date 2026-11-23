@@ -708,7 +708,13 @@ impl Vm {
         if desc.starts_with("Landroid/") && !desc.starts_with("Landroid/support/") {
             return None;
         }
-        let &(di, i) = self.defs.get(&desc)?;
+        let hit = self.defs.get(&desc).copied();
+        if std::env::var_os("OVELO_ANNDBG").is_some()
+            && (desc.contains("Navigator$Name") || desc.contains("ComposeNavigator"))
+        {
+            eprintln!("[anndbg] def_loc_of {desc} -> {hit:?}");
+        }
+        let (di, i) = hit?;
         let def = &self.dexes[di].class_defs()[i];
         Some((gx(di, def.class_idx), def))
     }
@@ -3774,6 +3780,13 @@ impl Vm {
             if let Some(r) = jdk::call(self, &class, &name, &sig, &args)? {
                 return Ok(r);
             }
+            // Annotation-interface calls (`Navigator.Name.value()`,
+            // `Subscribe.threadMode()`) are bodiless decls too — answer
+            // from the receiver mirror's elements (or declared
+            // AnnotationDefault) before falling to the stub path.
+            if let Some(v) = self.annotation_method_value(loc.midx, &args) {
+                return Ok(Some(v));
+            }
             // Debug bisection: OVELO_STUB_NATIVE=<substring> skips the
             // native call entirely, returning a zero value for its
             // return type — used to isolate which guest `.so` entry
@@ -4017,6 +4030,67 @@ impl Vm {
             .collect()
     }
 
+    /// The annotation set declared on a class — items are local to
+    /// the class's defining dex (`cg` pairs them back).
+    pub(crate) fn class_annotation_items(
+        &self,
+        cg: GIdx,
+    ) -> (GIdx, Vec<ovelo_dex::AnnotationItem>) {
+        let fallback = (cg, Vec::new());
+        let Some((_, def)) = self.def_loc_of(cg) else {
+            return fallback;
+        };
+        let Some(d) = self.dex_of(cg) else {
+            return fallback;
+        };
+        let Ok(dir) = d.annotations_directory(def) else {
+            return (cg, Vec::new());
+        };
+        if dir.class_annotations_off == 0 {
+            return (cg, Vec::new());
+        }
+        let items = d
+            .annotation_set(dir.class_annotations_off)
+            .unwrap_or_default();
+        (cg, items)
+    }
+
+    /// `Class.getAnnotation(Class)`: the declared class-level
+    /// annotation whose type descriptor matches, minted on demand.
+    pub(crate) fn class_annotation(&mut self, cg: GIdx, annot_desc: &str) -> V {
+        let (cg, items) = self.class_annotation_items(cg);
+        for it in &items {
+            if self
+                .dex_of(cg)
+                .and_then(|d| d.type_descriptor(it.type_idx).ok())
+                .as_deref()
+                == Some(annot_desc)
+            {
+                return self
+                    .annotation_mirror(cg, it.type_idx, &it.elements)
+                    .unwrap_or(V::Ref(0));
+            }
+        }
+        V::Ref(0)
+    }
+
+    /// All declared class-level annotations as minted mirrors.
+    pub(crate) fn class_annotations(&mut self, cg: GIdx) -> Vec<V> {
+        let (cg, items) = self.class_annotation_items(cg);
+        items
+            .iter()
+            .filter_map(|it| self.annotation_mirror(cg, it.type_idx, &it.elements))
+            .collect()
+    }
+
+    /// Canonical class GIdx for a type descriptor, when the dex
+    /// defines it — class-annotation lookups key off this.
+    pub(crate) fn class_gidx_of(&self, desc: &str) -> Option<GIdx> {
+        let &(di, i) = self.defs.get(desc)?;
+        let def = &self.dexes[di].class_defs()[i];
+        Some(gx(di, def.class_idx))
+    }
+
     /// `Method.getDefaultValue` — the `AnnotationDefault` element for an
     /// annotation-interface method. DX stores it on the interface's
     /// *class* annotation set with elements keyed by method name.
@@ -4064,13 +4138,35 @@ impl Vm {
     /// from the receiver mirror's elements, then its declared
     /// `AnnotationDefault`. `None` when this isn't an annotation call.
     fn annotation_method_value(&mut self, midx: GIdx, args: &[V]) -> Option<V> {
+        let dbg = std::env::var_os("OVELO_ANNDBG").is_some();
+        if dbg {
+            eprintln!("[anndbg] enter {}", self.describe_method(midx));
+        }
         let (cg, name) = {
             let d = self.dex_of(midx)?;
             let mid = d.method(gl(midx)).ok()?;
             let cg = gx(gd(midx), mid.class_idx as u32);
-            let (_, def) = self.def_loc_of(cg)?;
+            let (_, def) = match self.def_loc_of(cg) {
+                Some(x) => x,
+                None => {
+                    if dbg {
+                        eprintln!(
+                            "[anndbg] no def for {}",
+                            self.type_desc_of(cg).unwrap_or_default()
+                        );
+                    }
+                    return None;
+                }
+            };
             // ACC_ANNOTATION — only interface-style dex classes qualify.
             if def.access_flags & 0x2000 == 0 {
+                if dbg {
+                    eprintln!(
+                        "[anndbg] {} not annotation flags={:#x}",
+                        self.type_desc_of(cg).unwrap_or_default(),
+                        def.access_flags
+                    );
+                }
                 return None;
             }
             (cg, d.string(mid.name_idx).ok()?)
@@ -4079,6 +4175,18 @@ impl Vm {
             return None;
         };
         let owner_desc = self.type_desc_of(cg).ok()?;
+        if dbg {
+            let recv = self.heap.get(h).map(|o| match o {
+                Obj::Host { desc, .. } => desc.clone(),
+                Obj::Instance { class_idx, .. } => {
+                    self.type_desc_of(*class_idx).unwrap_or_else(|_| "?".into())
+                }
+                _ => "?".to_string(),
+            });
+            eprintln!(
+                "[anndbg] annotation_method_value owner={owner_desc} name={name} recv={recv:?}"
+            );
+        }
         if let Some(Obj::Host {
             desc,
             state: HostState::Map(m),

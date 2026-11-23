@@ -1089,6 +1089,37 @@ fn log_call(vm: &mut Vm, name: &str, args: &[V]) -> Option<Option<V>> {
             let tag = sv(vm, args[0]).unwrap_or_default();
             let msg = sv(vm, args[1]).unwrap_or_default();
             eprintln!("[{}/{}] {}", name.to_uppercase(), tag, msg);
+            // Log.e(tag, msg, Throwable) — the throwable is where the
+            // real failure lives; render its toString so captures like
+            // Compose's "Error was captured in composition" aren't opaque.
+            if matches!(name, "w" | "e" | "wtf") {
+                if let Some(V::Ref(th)) = args.get(2).copied() {
+                    if th != 0 {
+                        let mut s = vm
+                            .call_virtual(th, "getMessage", &[])
+                            .ok()
+                            .flatten()
+                            .and_then(|v| sv(vm, v))
+                            .unwrap_or_default();
+                        if s.is_empty() {
+                            if let Some(Obj::Throwable { detail, .. }) = vm.heap.get(th) {
+                                s = detail.clone();
+                            }
+                        }
+                        let site = vm
+                            .throw_sites
+                            .get(&th)
+                            .map(|t| format!(" at {t}"))
+                            .unwrap_or_default();
+                        eprintln!(
+                            "[{}/{}]   {}: {s}{site}",
+                            name.to_uppercase(),
+                            tag,
+                            class_of(vm, V::Ref(th))
+                        );
+                    }
+                }
+            }
             Some(Some(V::I32(msg.len() as i32)))
         }
         "println" => Some(Some(V::I32(0))),
@@ -1548,8 +1579,22 @@ fn intent_call(vm: &mut Vm, name: &str, sig: &str, args: &[V]) -> Rt<Option<Opti
         }
         "replaceExtras" => Some(Some(args[0])),
         "getExtras" => {
-            // reuse self as the Bundle for simplicity
-            Some(Some(args[0]))
+            // AOSP returns the Bundle (or null), never the Intent —
+            // `createSavedStateHandle` check-casts the result to
+            // Bundle, so an Intent here throws ClassCastException.
+            let m = match vm.heap.get(h) {
+                Some(Obj::Host {
+                    state: HostState::Map(m),
+                    ..
+                }) => m.clone(),
+                _ => vec![],
+            };
+            if m.is_empty() {
+                Some(Some(V::Ref(0)))
+            } else {
+                let b = vm.alloc_host("Landroid/os/Bundle;", HostState::Map(m));
+                Some(Some(V::Ref(b)))
+            }
         }
         "putExtras" => {
             if let V::Ref(bh) = args[1] {

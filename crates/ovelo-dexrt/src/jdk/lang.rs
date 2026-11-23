@@ -1524,18 +1524,9 @@ fn class_call(vm: &mut Vm, name: &str, _sig: &str, args: &[V]) -> Rt<Option<Opti
                 )))
             }
         }
-        "isInterface"
-        | "isPrimitive"
-        | "isEnum"
-        | "isAnnotation"
-        | "isSynthetic"
-        | "isAnonymousClass"
-        | "isLocalClass"
-        | "isMemberClass"
-        | "isSealed"
-        | "isRecord"
-        | "isHidden"
-        | "isAnnotationPresent" => Some(Some(V::I32(0))),
+        "isInterface" | "isPrimitive" | "isEnum" | "isAnnotation" | "isSynthetic"
+        | "isAnonymousClass" | "isLocalClass" | "isMemberClass" | "isSealed" | "isRecord"
+        | "isHidden" => Some(Some(V::I32(0))),
         "isArray" => {
             let d = class_desc_of(
                 vm,
@@ -1675,8 +1666,6 @@ fn class_call(vm: &mut Vm, name: &str, _sig: &str, args: &[V]) -> Rt<Option<Opti
         | "getInterfaces"
         | "getDeclaredClasses"
         | "getClasses"
-        | "getAnnotations"
-        | "getDeclaredAnnotations"
         | "getEnumConstants"
         | "getPermittedSubclasses"
         | "getSigners"
@@ -1811,11 +1800,73 @@ fn class_call(vm: &mut Vm, name: &str, _sig: &str, args: &[V]) -> Rt<Option<Opti
         | "getDeclaringClass"
         | "getModule"
         | "getNestHost"
-        | "getAnnotation"
-        | "getDeclaredAnnotation"
         | "describeConstable"
         | "getModifiers0" => Some(Some(V::Ref(0))),
         "getModifiers" => Some(Some(V::I32(1))),
+        // Class-level dex annotations — Navigator.@Name, DI scopes,
+        // retrofit annotations all ride getAnnotation; a null stub
+        // throws IllegalArgumentException in getNameForNavigator.
+        "getAnnotation" | "getDeclaredAnnotation" => {
+            let cdesc = class_desc_of(
+                vm,
+                match args[0] {
+                    V::Ref(h) => h,
+                    _ => 0,
+                },
+            )
+            .unwrap_or_default();
+            let adesc = class_desc_of(
+                vm,
+                match args[1] {
+                    V::Ref(h) => h,
+                    _ => 0,
+                },
+            )
+            .unwrap_or_default();
+            let v = vm
+                .class_gidx_of(&cdesc)
+                .map(|cg| vm.class_annotation(cg, &adesc))
+                .unwrap_or(V::Ref(0));
+            Some(Some(v))
+        }
+        "getAnnotations" | "getDeclaredAnnotations" => {
+            let cdesc = class_desc_of(
+                vm,
+                match args[0] {
+                    V::Ref(h) => h,
+                    _ => 0,
+                },
+            )
+            .unwrap_or_default();
+            let items = vm
+                .class_gidx_of(&cdesc)
+                .map(|cg| vm.class_annotations(cg))
+                .unwrap_or_default();
+            Some(Some(arr(vm, "Ljava/lang/annotation/Annotation;", items)))
+        }
+        "isAnnotationPresent" => {
+            let cdesc = class_desc_of(
+                vm,
+                match args[0] {
+                    V::Ref(h) => h,
+                    _ => 0,
+                },
+            )
+            .unwrap_or_default();
+            let adesc = class_desc_of(
+                vm,
+                match args[1] {
+                    V::Ref(h) => h,
+                    _ => 0,
+                },
+            )
+            .unwrap_or_default();
+            let v = vm
+                .class_gidx_of(&cdesc)
+                .map(|cg| vm.class_annotation(cg, &adesc))
+                .unwrap_or(V::Ref(0));
+            Some(Some(V::I32((v != V::Ref(0)) as i32)))
+        }
         // `cast(obj)` yields the object arg; `asSubclass(Class)` yields
         // `this` Class (the arg is the bound to check, not the result).
         "cast" => Some(Some(args.get(1).copied().unwrap_or(args[0]))),
