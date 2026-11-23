@@ -3320,13 +3320,17 @@ extern "C" fn sh_mutex_lock(m: usize) -> usize {
                 }
                 g = cv.wait(g).unwrap();
             }
-            // An object that was never inited acts like a zeroed
-            // NORMAL mutex (Bionic zero-init semantics).
+            // An object that was never inited reads its type from the
+            // guest word: Bionic static initializers encode it in bits
+            // 14-15 (NORMAL=0, RECURSIVE=0x4000, ERRORCHECK=0x8000) — a
+            // static recursive mutex must not register as NORMAL or the
+            // second lock by the same thread deadlocks.
             None => {
+                let ty = unsafe { (*(m as *const u32) >> 14) & 3 };
                 g.insert(
                     m,
                     Bobj::Mutex {
-                        ty: 0,
+                        ty,
                         owner: t,
                         count: 1,
                     },
@@ -3359,10 +3363,11 @@ extern "C" fn sh_mutex_trylock(m: usize) -> usize {
             }
         }
         None => {
+            let ty = unsafe { (*(m as *const u32) >> 14) & 3 };
             g.insert(
                 m,
                 Bobj::Mutex {
-                    ty: 0,
+                    ty,
                     owner: t,
                     count: 1,
                 },
@@ -3529,7 +3534,9 @@ extern "C" fn sh_cond_broadcast(c: usize) -> usize {
 
 #[cfg(target_os = "macos")]
 extern "C" fn sh_rwlock_init(r: usize, _attr: usize) -> usize {
-    unsafe { std::ptr::write_bytes(r as *mut u8, 0, 200) };
+    // pthread_rwlock_t is 56 bytes on arm64 Bionic — zeroing more
+    // scribbles over whatever follows the lock in guest memory.
+    unsafe { std::ptr::write_bytes(r as *mut u8, 0, 56) };
     bsync::SYNC.0.lock().unwrap().insert(
         r,
         Bobj::Rw {
@@ -3759,6 +3766,59 @@ extern "C" fn sh_fprintf(fp: usize, fmt: usize, _a3: usize, _a4: usize) -> usize
     let shown = if f.len() > 80 { &f[..80] } else { &f };
     eprintln!("[fprintf] fp={fp:#x} caller={off:#x?} fmt={shown:?}");
     0
+}
+
+/// `exit`/`abort` reach libSystem directly through host_dlsym, killing
+/// the process with no trace. Log the guest caller (.so offset via lr)
+/// and the status first, then honor the request — Godot's setup path
+/// calls exit() when an early check fails, which previously looked
+/// like a silent clean exit.
+#[cfg(target_os = "macos")]
+extern "C" fn sh_exit(code: i32) -> ! {
+    let mut lr = 0usize;
+    unsafe { core::arch::asm!("mov {}, x30", out(reg) lr) };
+    eprintln!("[exit] code={code} caller={:#x?}", so_off(lr));
+    unsafe { exit(code) }
+}
+
+#[cfg(target_os = "macos")]
+extern "C" fn sh_abort() -> ! {
+    let mut lr = 0usize;
+    unsafe { core::arch::asm!("mov {}, x30", out(reg) lr) };
+    eprintln!("[abort] caller={:#x?}", so_off(lr));
+    unsafe { libc_abort() }
+}
+
+#[cfg(target_os = "macos")]
+unsafe extern "C" {
+    fn exit(code: i32) -> !;
+    #[link_name = "abort"]
+    fn libc_abort() -> !;
+}
+
+/// `kill`/`raise` likewise pass straight through — a guest that fires
+/// SIGKILL at itself vanishes with no trace. Log target/signal/caller,
+/// then deliver.
+#[cfg(target_os = "macos")]
+extern "C" fn sh_kill(pid: i32, sig: i32) -> i32 {
+    let mut lr = 0usize;
+    unsafe { core::arch::asm!("mov {}, x30", out(reg) lr) };
+    eprintln!("[kill] pid={pid} sig={sig} caller={:#x?}", so_off(lr));
+    unsafe { kill(pid, sig) }
+}
+
+#[cfg(target_os = "macos")]
+extern "C" fn sh_raise(sig: i32) -> i32 {
+    let mut lr = 0usize;
+    unsafe { core::arch::asm!("mov {}, x30", out(reg) lr) };
+    eprintln!("[raise] sig={sig} caller={:#x?}", so_off(lr));
+    unsafe { raise(sig) }
+}
+
+#[cfg(target_os = "macos")]
+unsafe extern "C" {
+    fn kill(pid: i32, sig: i32) -> i32;
+    fn raise(sig: i32) -> i32;
 }
 
 /// `__emutls_get_address(struct __emutls_control*)` — Bionic's emulated
@@ -4012,6 +4072,14 @@ fn builtin_shim(name: &str) -> Option<usize> {
         "AndroidBitmap_unlockPixels" => sh_ab_unlock_pixels as *const () as usize,
         "__android_log_print" | "__android_log_vprint" => sh_log_print as *const () as usize,
         "__android_log_write" => sh_log_write as *const () as usize,
+        #[cfg(target_os = "macos")]
+        "exit" | "_exit" | "_Exit" => sh_exit as *const () as usize,
+        #[cfg(target_os = "macos")]
+        "abort" => sh_abort as *const () as usize,
+        #[cfg(target_os = "macos")]
+        "kill" | "killpg" | "tgkill" => sh_kill as *const () as usize,
+        #[cfg(target_os = "macos")]
+        "raise" | "pthread_kill" => sh_raise as *const () as usize,
         #[cfg(target_os = "macos")]
         "__emutls_get_address" => sh_emutls_addr as *const () as usize,
         _ => return None,
