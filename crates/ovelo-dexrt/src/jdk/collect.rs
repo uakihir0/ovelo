@@ -726,7 +726,12 @@ fn list_call(vm: &mut Vm, name: &str, sig: &str, args: &[V]) -> Rt<Option<Option
             Some(Some(V::I32(i.map(|x| x as i32).unwrap_or(-1))))
         }
         "iterator" | "listIterator" | "descendingIterator" | "spliterator" => {
-            let items: Vec<V> = match list_ref(vm, h) {
+            // `list_snapshot`, not `list_ref`: guest collections backed
+            // by an `Obj::Array` (kotlin ArrayDeque's `elementData`
+            // ring) are invisible to `list_ref`, which only sees
+            // Host::List stores — they'd iterate empty (navigation
+            // `getBackStackEntry` found nothing and threw).
+            let items: Vec<V> = match list_snapshot(vm, h) {
                 Some(l) => {
                     if std::env::var("OVELO_ITERDBG").is_ok() {
                         eprintln!(
@@ -735,7 +740,7 @@ fn list_call(vm: &mut Vm, name: &str, sig: &str, args: &[V]) -> Rt<Option<Option
                             l.len()
                         );
                     }
-                    l.clone()
+                    l
                 }
                 None => {
                     if std::env::var("OVELO_ITERDBG").is_ok() {
@@ -748,15 +753,27 @@ fn list_call(vm: &mut Vm, name: &str, sig: &str, args: &[V]) -> Rt<Option<Option
                             Some(Obj::Array { data, .. }) => format!("arr:{}", data.len()),
                             other => format!("{other:?}"),
                         };
-                        eprintln!("[iterdbg] iterator on h{h} {cls} {kind} -> empty");
+                        eprintln!("[iterdbg] iterator on h{h} {cls} {kind} -> dex");
                     }
-                    vec![]
+                    return Ok(None);
                 }
             };
+            // `listIterator(I)` starts positioned at `I` (navigation
+            // walks the back stack in reverse from the end) and
+            // `descendingIterator` yields last-to-first.
+            let (items, pos) = if name == "descendingIterator" {
+                (items.into_iter().rev().collect::<Vec<_>>(), 0)
+            } else if name == "listIterator" {
+                let p = i32v(args.get(1).copied().unwrap_or(V::I32(0))).max(0) as usize;
+                (items, p)
+            } else {
+                (items, 0)
+            };
+            let pos = pos.min(items.len());
             Some(Some(host(
                 vm,
                 "Ljava/util/Iterator;",
-                HostState::Iter(Rc::new(items), 0),
+                HostState::Iter(Rc::new(items), pos),
             )))
         }
         "toArray" => {
@@ -816,6 +833,18 @@ fn map_call(vm: &mut Vm, name: &str, sig: &str, args: &[V]) -> Rt<Option<Option<
     };
     let class = class_of(vm, args[0]);
     Ok(match name {
+        "<init>" => {
+            // Copy ctor HashMap(Map)/LinkedHashMap(Map) — kotlin
+            // `Map.toMap` materializes its copy through it; without a
+            // copy the destination starts empty and callers iterate
+            // nothing (navigation NavigatorProvider attach loop).
+            if let Some(V::Ref(sh)) = args.get(1).copied() {
+                for (k, v) in map_pairs_of(vm, sh) {
+                    map_put(vm, h, k, v);
+                }
+            }
+            Some(None)
+        }
         "put" => {
             if std::env::var_os("OVELO_MAPDBG").is_some() {
                 let ks = s(
@@ -1460,8 +1489,52 @@ fn iter_call(vm: &mut Vm, name: &str, args: &[V]) -> Rt<Option<Option<V>>> {
             }
             Some(Some(v))
         }
-        "hasPrevious" => Some(Some(V::I32(0))),
-        "previous" | "nextIndex" | "previousIndex" => Some(Some(V::I32(0))),
+        "hasPrevious" => {
+            let n = match vm.heap.get(h) {
+                Some(Obj::Host {
+                    state: HostState::Iter(_, pos),
+                    ..
+                }) => (*pos > 0) as i32,
+                _ => 0,
+            };
+            Some(Some(V::I32(n)))
+        }
+        "previous" => {
+            let (v, ok) = match vm.heap.get_mut(h) {
+                Some(Obj::Host {
+                    state: HostState::Iter(items, pos),
+                    ..
+                }) => {
+                    if *pos > 0 {
+                        *pos -= 1;
+                        (items[*pos], true)
+                    } else {
+                        (V::Ref(0), false)
+                    }
+                }
+                _ => (V::Ref(0), false),
+            };
+            if !ok {
+                let e = vm.throw_builtin("Ljava/util/NoSuchElementException;", "previous at start");
+                return Err(e);
+            }
+            Some(Some(v))
+        }
+        "nextIndex" | "previousIndex" => {
+            let n = match vm.heap.get(h) {
+                Some(Obj::Host {
+                    state: HostState::Iter(items, pos),
+                    ..
+                }) => if name == "nextIndex" {
+                    *pos as i32
+                } else {
+                    *pos as i32 - 1
+                }
+                .clamp(-1, items.len() as i32),
+                _ => -1,
+            };
+            Some(Some(V::I32(n)))
+        }
         "remove" | "set" | "add" | "forEachRemaining" => Some(None),
         "getKey" => Some(Some(
             slot_of(vm, h)

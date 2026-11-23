@@ -1699,13 +1699,33 @@ fn class_call(vm: &mut Vm, name: &str, _sig: &str, args: &[V]) -> Rt<Option<Opti
             let items = vm.declared_method_mirrors(&owner);
             Some(Some(arr(vm, "Ljava/lang/reflect/Method;", items)))
         }
-        "getFields"
-        | "getDeclaredFields"
-        | "getConstructors"
+        "getFields" | "getDeclaredFields" => {
+            let owner = class_desc_of(
+                vm,
+                match args[0] {
+                    V::Ref(h) => h,
+                    _ => 0,
+                },
+            )
+            .unwrap_or_default();
+            let items = vm.declared_field_mirrors(&owner);
+            Some(Some(arr(vm, "Ljava/lang/reflect/Field;", items)))
+        }
+        "getDeclaredClasses" | "getClasses" => {
+            let owner = class_desc_of(
+                vm,
+                match args[0] {
+                    V::Ref(h) => h,
+                    _ => 0,
+                },
+            )
+            .unwrap_or_default();
+            let items = vm.nested_class_mirrors(&owner);
+            Some(Some(arr(vm, "Ljava/lang/Class;", items)))
+        }
+        "getConstructors"
         | "getDeclaredConstructors"
         | "getInterfaces"
-        | "getDeclaredClasses"
-        | "getClasses"
         | "getEnumConstants"
         | "getPermittedSubclasses"
         | "getSigners"
@@ -1723,6 +1743,23 @@ fn class_call(vm: &mut Vm, name: &str, _sig: &str, args: &[V]) -> Rt<Option<Opti
             )
             .unwrap_or_default();
             let fname = sv(vm, args[1]).unwrap_or_default();
+            // Missing field → NoSuchFieldException: reflective probes
+            // (kotlinx.serialization's Companion/INSTANCE lookup) branch
+            // on the throw, not on null. Host classes (`sun.misc.Unsafe`)
+            // have no dex field table — always mirror them.
+            if !fname.is_empty()
+                && vm.is_dex_class(&owner)
+                && vm.field_index_of(&owner, &fname).is_none()
+            {
+                if std::env::var_os("OVELO_REFDBG").is_some() {
+                    eprintln!("[refdbg] NoSuchField {owner}.{fname}");
+                }
+                let t = vm.throw_builtin(
+                    "Ljava/lang/NoSuchFieldException;",
+                    &format!("{owner}.{fname}"),
+                );
+                return Err(t);
+            }
             let cv = jstr(vm, &owner);
             let hv = host(
                 vm,
@@ -1744,6 +1781,22 @@ fn class_call(vm: &mut Vm, name: &str, _sig: &str, args: &[V]) -> Rt<Option<Opti
             )
             .unwrap_or_default();
             let mname = sv(vm, args[1]).unwrap_or_default();
+            // Missing method → NoSuchMethodException: reflective
+            // serializer lookup branches on the throw.
+            if !mname.is_empty()
+                && !mname.starts_with('<')
+                && vm.is_dex_class(&owner)
+                && !vm.has_method_named(&owner, &mname)
+            {
+                if std::env::var_os("OVELO_REFDBG").is_some() {
+                    eprintln!("[refdbg] NoSuchMethod {owner}.{mname}");
+                }
+                let t = vm.throw_builtin(
+                    "Ljava/lang/NoSuchMethodException;",
+                    &format!("{owner}.{mname}"),
+                );
+                return Err(t);
+            }
             let cv = jstr(vm, &owner);
             let hv = host(
                 vm,
@@ -2559,7 +2612,12 @@ fn reflect_call(
             // java.lang.reflect.Modifier bit set; bare mirrors default
             // to public (the stub behavior they had before).
             let f = match pseudo_get(vm, h, P_FLAGS) {
-                Some(V::I32(x)) if pseudo_get(vm, h, P_METH).is_some() => x & 0xffff,
+                Some(V::I32(x))
+                    if pseudo_get(vm, h, P_METH).is_some()
+                        || pseudo_get(vm, h, P_DATA).is_some() =>
+                {
+                    x & 0xffff
+                }
                 _ => 1,
             };
             Some(Some(V::I32(f)))
@@ -2589,7 +2647,14 @@ fn reflect_call(
             Some(Some(V::I32(if f & bit != 0 { 1 } else { 0 })))
         }
         "getType" | "getReturnType" | "getGenericType" | "getGenericReturnType" => {
-            let d = meth_idx(vm, h).and_then(|m| vm.method_return_desc(m));
+            // Method mirror → declared return type; Field mirror (P_DATA
+            // carries the field index) → declared field type.
+            let d = meth_idx(vm, h)
+                .and_then(|m| vm.method_return_desc(m))
+                .or_else(|| match pseudo_get(vm, h, P_DATA) {
+                    Some(V::I64(f)) => vm.field_type_desc(f as crate::GIdx),
+                    _ => None,
+                });
             Some(Some(class_obj(vm, d.unwrap_or_else(|| OBJ.into()))))
         }
         "getParameterTypes" | "getGenericParameterTypes" => {
@@ -2671,9 +2736,22 @@ fn reflect_call(
                 }
             };
             match res {
-                Ok(Some(v)) => Some(Some(v)),
-                Ok(None) => Some(Some(V::Ref(0))),
+                Ok(Some(v)) => {
+                    if std::env::var_os("OVELO_REFDBG").is_some() {
+                        eprintln!("[refdbg] invoke {owner}.{member} ok");
+                    }
+                    Some(Some(v))
+                }
+                Ok(None) => {
+                    if std::env::var_os("OVELO_REFDBG").is_some() {
+                        eprintln!("[refdbg] invoke {owner}.{member} ok(void)");
+                    }
+                    Some(Some(V::Ref(0)))
+                }
                 Err(e) => {
+                    if std::env::var_os("OVELO_REFDBG").is_some() {
+                        eprintln!("[refdbg] invoke {owner}.{member} ERR {e}");
+                    }
                     let t = vm.throw_builtin(
                         "Ljava/lang/reflect/InvocationTargetException;",
                         &format!("{member}: {e}"),
@@ -2722,10 +2800,13 @@ fn reflect_call(
             }
         }
         _ if class.contains("Field") => {
-            let fid = vm
-                .field_index_of(&owner, &member)
-                .map(|g| vm.canon_field(g))
-                .unwrap_or(P_DATA as u64);
+            let fid = match pseudo_get(vm, h, P_DATA) {
+                Some(V::I64(f)) => vm.canon_field(f as crate::GIdx),
+                _ => vm
+                    .field_index_of(&owner, &member)
+                    .map(|g| vm.canon_field(g))
+                    .unwrap_or(P_DATA as u64),
+            };
             match name {
                 "get" | "getInt" | "getLong" | "getBoolean" | "getByte" | "getShort"
                 | "getChar" | "getFloat" | "getDouble" => {
@@ -2737,10 +2818,21 @@ fn reflect_call(
                             }
                             _ => V::Ref(0),
                         },
-                        // `Field.get(null)` reads a static field — the
-                        // field id is guest-owned (`Unsafe.theUnsafe` etc.),
-                        // so hand back an opaque placeholder.
-                        _ if name == "get" => host(vm, OBJ, HostState::Empty),
+                        // `Field.get(null)` reads a static field — pull the
+                        // real stored value first (kotlinx.serialization's
+                        // `INSTANCE`/`Companion` probes depend on it),
+                        // then fall back to an opaque placeholder for
+                        // guest-owned fields we can't decode.
+                        _ if name == "get" => {
+                            let v = vm
+                                .probe_static_named(&owner, &member)
+                                .or_else(|| crate::jdk::sfield(vm, &owner, &member, OBJ));
+                            if std::env::var_os("OVELO_REFDBG").is_some() {
+                                let hit = v.map(|v| !matches!(v, V::Ref(0))).unwrap_or(false);
+                                eprintln!("[refdbg] Field.get(null) {owner}.{member} hit={hit}");
+                            }
+                            v.unwrap_or_else(|| host(vm, OBJ, HostState::Empty))
+                        }
                         _ if name == "getLong" => V::I64(0),
                         _ if name == "getFloat" => V::F32(0.0),
                         _ if name == "getDouble" => V::F64(0.0),

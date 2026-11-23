@@ -2383,6 +2383,32 @@ impl Vm {
         Ok(None)
     }
 
+    /// Whether `class_desc` declares a method named `name` at all —
+    /// the existence probe `Class.getDeclaredMethod` needs (it throws
+    /// NoSuchMethodException on a miss, unlike a name+arity resolve).
+    pub(crate) fn has_method_named(&self, class_desc: &str, name: &str) -> bool {
+        let Some(&(di, def_i)) = self.defs.get(class_desc) else {
+            return false;
+        };
+        let d = &self.dexes[di];
+        let Some(def) = d.class_defs().get(def_i) else {
+            return false;
+        };
+        let Ok(cd) = d.class_data_rc(def) else {
+            return false;
+        };
+        cd.direct_methods
+            .iter()
+            .chain(cd.virtual_methods.iter())
+            .any(|m| {
+                d.method(m.method_idx)
+                    .ok()
+                    .and_then(|mid| d.string(mid.name_idx).ok())
+                    .map(|n| n == name)
+                    .unwrap_or(false)
+            })
+    }
+
     /// Whether `desc` names a class defined by a loaded dex — host
     /// classes (`Ljava/lang/String;`, `Landroid/view/View;`, …) have
     /// no def, so signature-based lookups can't apply to them.
@@ -3196,6 +3222,17 @@ impl Vm {
         self.classes.get_mut(&class_idx).unwrap().clinit = 1;
         let fail = |this: &mut Self, e: E| -> Rt<()> {
             this.classes.get_mut(&class_idx).unwrap().clinit = 3;
+            if std::env::var_os("OVELO_CLINITDBG").is_some() {
+                eprintln!(
+                    "[clinit] {} FAILED: {}",
+                    this.type_desc_of(class_idx)
+                        .unwrap_or_else(|_| format!("class#{class_idx}")),
+                    match &e {
+                        E::Throw(h) => format!("guest throwable {}", this.describe_throw(*h)),
+                        E::Vm(v) => format!("{v}"),
+                    }
+                );
+            }
             Err(e)
         };
         // Superclasses initialize before their subclasses. `sup` is a
@@ -3454,7 +3491,34 @@ impl Vm {
             let Ok(mut g) = f.try_borrow_mut() else {
                 return vm("dexrt.host.reentrant");
             };
-            return g(self, args).map_err(E::Vm);
+            let r = g(self, args).map_err(E::Vm);
+            // A registered host ctor bypasses view::call's Context
+            // capture — record the ctx arg here too so `getContext()`
+            // resolves to the real Activity for dex-instantiated views
+            // (Compose's AndroidComposeView ctor hits this path).
+            if r.is_ok() {
+                let is_init = self
+                    .dex_of(midx)
+                    .and_then(|d| {
+                        let mid = d.method(gl(midx)).ok()?;
+                        d.string(mid.name_idx).ok()
+                    })
+                    .map(|n| n == "<init>")
+                    .unwrap_or(false);
+                if is_init {
+                    if let (Some(V::Ref(this)), Some(V::Ref(c))) = (args.first(), args.get(1)) {
+                        if *c != 0
+                            && self.assignable_desc(
+                                &jdk::class_of(self, V::Ref(*this)),
+                                "Landroid/view/View;",
+                            )
+                        {
+                            jdk::pseudo_set(self, *this, jdk::view::P_CONTEXT, V::Ref(*c));
+                        }
+                    }
+                }
+            }
+            return r;
         }
         let Some(d) = self.dex_of(midx) else {
             return vm("dexrt.invoke.unresolved");
@@ -4427,6 +4491,70 @@ impl Vm {
             .collect()
     }
 
+    /// `Class.getDeclaredFields`/`getFields`: mint a `Field` mirror per
+    /// declared dex field (statics first, like the dex class data). The
+    /// mirror carries the exact field index in `P_DATA` so `Field.get`
+    /// and `getType`/`getModifiers` answer for the real member.
+    pub(crate) fn declared_field_mirrors(&mut self, owner: &str) -> Vec<V> {
+        let mut specs: Vec<(GIdx, String, u32)> = Vec::new();
+        {
+            let Some(ci) = self.type_index_of(owner) else {
+                return Vec::new();
+            };
+            let Some((cg, def)) = self.def_loc_of(ci) else {
+                return Vec::new();
+            };
+            let Some(d) = self.dex_of(cg) else {
+                return Vec::new();
+            };
+            let Ok(cd) = d.class_data_rc(def) else {
+                return Vec::new();
+            };
+            for ef in cd.static_fields.iter().chain(cd.instance_fields.iter()) {
+                let name = d
+                    .field(ef.field_idx)
+                    .ok()
+                    .and_then(|f| d.string(f.name_idx).ok())
+                    .unwrap_or_default();
+                specs.push((gx(gd(cg), ef.field_idx), name, ef.access_flags));
+            }
+        }
+        let cv = jdk::jstr(self, owner);
+        specs
+            .into_iter()
+            .map(|(fidx, name, flags)| {
+                let hv = jdk::host(self, "Ljava/lang/reflect/Field;", HostState::StrBuf(name));
+                if let V::Ref(h) = hv {
+                    jdk::pseudo_set(self, h, jdk::P_COMPONENT, cv);
+                    jdk::pseudo_set(self, h, jdk::P_DATA, V::I64(fidx as i64));
+                    jdk::pseudo_set(self, h, jdk::P_FLAGS, V::I32(flags as i32));
+                }
+                hv
+            })
+            .collect()
+    }
+
+    /// `Class.getDeclaredClasses`: `Class` objects for the nested classes
+    /// defined in the dex (`Foo$Inner`, `Foo$$serializer`, ...).
+    pub(crate) fn nested_class_mirrors(&mut self, owner: &str) -> Vec<V> {
+        let prefix = format!("{}$", owner.trim_end_matches(';'));
+        let names: Vec<String> = self
+            .defs
+            .keys()
+            .filter(|k| k.starts_with(prefix.as_str()))
+            .cloned()
+            .collect();
+        names.into_iter().map(|n| jdk::class_obj(self, n)).collect()
+    }
+
+    /// A field's declared type descriptor.
+    pub(crate) fn field_type_desc(&self, fidx: GIdx) -> Option<String> {
+        let fidx = self.canon_field(fidx);
+        let d = self.dex_of(fidx)?;
+        let f = d.field(gl(fidx)).ok()?;
+        d.type_descriptor(f.type_idx as u32).ok()
+    }
+
     /// A method's declared parameter type descriptors (proto order).
     pub(crate) fn method_param_descs(&self, midx: GIdx) -> Vec<String> {
         let Some(d) = self.dex_of(midx) else {
@@ -4458,6 +4586,54 @@ impl Vm {
     pub fn get_static_named(&mut self, owner: &str, name: &str) -> Option<V> {
         let g = self.field_index_of(owner, name)?;
         self.sget_pub(g)
+    }
+
+    /// Reflective static read for `Field.get(null)`. Unlike `sget`, a
+    /// `<clinit>` failure triggered by the probe is rolled back: a
+    /// reflective miss (kotlinx.serialization's `INSTANCE`/`Companion`
+    /// probes touch many classes) must not poison the class for the
+    /// real `sget`s that run later.
+    pub(crate) fn probe_static_named(&mut self, owner: &str, name: &str) -> Option<V> {
+        let f = self
+            .field_index_of(owner, name)
+            .map(|g| self.canon_field(g))?;
+        let owner_idx = self
+            .dex_of(f)
+            .and_then(|d| d.field(gl(f)).ok())
+            .map(|fi| self.canon(gx(gd(f), fi.class_idx as u32)))
+            .unwrap_or(f);
+        match self.classes.get(&owner_idx).map(|c| c.clinit) {
+            Some(2) => {}
+            // In-progress or already-failed: probing more is wrong.
+            _ if self.classes.contains_key(&owner_idx) => return None,
+            _ => {
+                let prev3: std::collections::HashSet<GIdx> = self
+                    .classes
+                    .iter()
+                    .filter(|(_, c)| c.clinit == 3)
+                    .map(|(k, _)| *k)
+                    .collect();
+                if self.ensure_init(owner_idx).is_err() {
+                    for (k, c) in self.classes.iter_mut() {
+                        if c.clinit == 3 && !prev3.contains(k) {
+                            c.clinit = 0;
+                        }
+                    }
+                    return None;
+                }
+            }
+        }
+        self.classes
+            .get(&owner_idx)
+            .and_then(|c| c.statics.get(&f))
+            .copied()
+            .or_else(|| {
+                if self.def_of(owner_idx).is_none() {
+                    self.builtin_sfield(f).or_else(|| self.field_default(f))
+                } else {
+                    self.encoded_static(owner_idx, f)
+                }
+            })
     }
 
     /// Read a static like the `sget` opcode: guest-encoded value,
@@ -5268,7 +5444,7 @@ impl Vm {
                 let h = Self::refv(r(1)?)?;
                 if h == 0 {
                     let d = format!(
-                        "iget {} in {}",
+                        "iget {} @{pc:04x} in {}",
                         self.describe_field(gi(ins.idx.unwrap_or(0))),
                         self.describe_method(fr.loc.midx),
                     );

@@ -48,7 +48,9 @@ pub(crate) const P_IS_VIEW: u32 = u32::MAX - 14;
 pub(crate) const P_IS_GROUP: u32 = u32::MAX - 15;
 const P_DECOR: u32 = u32::MAX - 16;
 const P_LISTENER: u32 = u32::MAX - 17;
-const P_CONTEXT: u32 = u32::MAX - 18;
+/// The `Context` a view was constructed with — read by `getContext`.
+/// pub(crate): `call_builtin` sets it for host-registered ctors too.
+pub(crate) const P_CONTEXT: u32 = u32::MAX - 18;
 const P_VIS: u32 = u32::MAX - 19;
 /// Pseudo key: root element was `<merge>` — splice children on attach.
 const P_MERGE: u32 = u32::MAX - 21;

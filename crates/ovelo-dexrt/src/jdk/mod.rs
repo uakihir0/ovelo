@@ -729,7 +729,10 @@ fn guest_list_backing(vm: &Vm, h: u32, depth: u8) -> Option<(u32, usize, Option<
         }
         match vm.dbg_field_name(*g).rsplit('.').next().unwrap_or_default() {
             "size" | "length" | "_size" => size_field = Some(*n as usize),
-            "offset" | "fromIndex" => off_field = *n as usize,
+            // `head` too: kotlin ArrayDeque is a ring — elements live
+            // at [head, head+size), so an un-offset snapshot reads the
+            // stale null slots at index 0 (navigation backQueue).
+            "offset" | "fromIndex" | "head" => off_field = *n as usize,
             _ => {}
         }
     }
@@ -1292,6 +1295,11 @@ fn universal(vm: &mut Vm, class: &str, name: &str, sig: &str, args: &[V]) -> Rt<
 /// (`TimeUnit.SECONDS: Ljava/util/concurrent/TimeUnit;`) is an enum
 /// constant and gets a stable host object carrying its name.
 pub(crate) fn sfield(vm: &mut Vm, owner: &str, name: &str, ftype: &str) -> Option<V> {
+    // Reflective static reads (`Field.get(null)`) on host classes reach
+    // here by name — the dex field index never sees them.
+    if (owner, name) == ("Lsun/misc/Unsafe;", "theUnsafe") {
+        return Some(host(vm, "Lsun/misc/Unsafe;", HostState::Empty));
+    }
     let v: V = match (owner, name) {
         ("Ljava/lang/Integer;", "MAX_VALUE") => V::I32(i32::MAX),
         ("Ljava/lang/Integer;", "MIN_VALUE") => V::I32(i32::MIN),
