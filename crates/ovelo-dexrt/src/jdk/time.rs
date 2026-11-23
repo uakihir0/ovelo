@@ -499,6 +499,11 @@ fn jtime_call(vm: &mut Vm, class: &str, name: &str, args: &[V]) -> Rt<Option<Opt
             Some(Some(arr(vm, "Ljava/time/Month;", vals)))
         }
         ("Ljava/time/Month;", "valueOf") => {
+            // Enum.valueOf(null) throws NPE, not IAE — callers catching
+            // "bad enum name" on IAE see a different failure shape.
+            if matches!(args.first(), Some(V::Ref(0))) {
+                return Err(vm.throw_builtin("Ljava/lang/NullPointerException;", ""));
+            }
             let n = sv(vm, args.first().copied().unwrap_or(V::Ref(0))).unwrap_or_default();
             let Some(i) = MONTH_NAMES.iter().position(|m| *m == n) else {
                 return Err(vm.throw_builtin(
@@ -525,6 +530,9 @@ fn jtime_call(vm: &mut Vm, class: &str, name: &str, args: &[V]) -> Rt<Option<Opt
             Some(Some(arr(vm, "Ljava/time/DayOfWeek;", vals)))
         }
         ("Ljava/time/DayOfWeek;", "valueOf") => {
+            if matches!(args.first(), Some(V::Ref(0))) {
+                return Err(vm.throw_builtin("Ljava/lang/NullPointerException;", ""));
+            }
             let n = sv(vm, args.first().copied().unwrap_or(V::Ref(0))).unwrap_or_default();
             let Some(i) = DAY_NAMES.iter().position(|d| *d == n) else {
                 return Err(vm.throw_builtin(
