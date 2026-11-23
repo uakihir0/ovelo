@@ -2179,8 +2179,44 @@ fn context_call(
             })();
             Some(Some(if svc.is_some() { component } else { V::Ref(0) }))
         }
-        "stopService"
-        | "bindService"
+        "stopSelf" | "stopSelfResult" => {
+            // AOSP: stopSelf marks the service stopped — without
+            // dropping the cached instance the next startService would
+            // reuse a service that already finished its work (NewPipe's
+            // FeedLoadService calls stopSelf when the fetch is done;
+            // the next refresh then got no onStartCommand work cycle).
+            let this = i64v(args[0]).max(0) as u32;
+            vm.services.retain(|_, sh| *sh != this);
+            let _ = vm.call_virtual(this, "onDestroy", &[]);
+            Some(Some(V::I32(1)))
+        }
+        "stopService" => {
+            let desc = args
+                .get(1)
+                .and_then(|a| {
+                    let V::Ref(ih) = *a else { return None };
+                    let V::Ref(ch) = pseudo_get(vm, ih, P_COMPONENT)? else {
+                        return None;
+                    };
+                    vm.class_descriptor_of(ch)
+                        .or_else(|| sv(vm, V::Ref(ch)))
+                        .or_else(|| pseudo_get(vm, ch, P_DATA).and_then(|v| sv(vm, v)))
+                })
+                .map(|d| {
+                    if d.starts_with('L') {
+                        d
+                    } else {
+                        format!("L{};", d.replace('.', "/"))
+                    }
+                });
+            if let Some(desc) = desc {
+                if let Some(sh) = vm.services.remove(&desc) {
+                    let _ = vm.call_virtual(sh, "onDestroy", &[]);
+                }
+            }
+            Some(Some(V::I32(1)))
+        }
+        "bindService"
         | "unbindService"
         | "sendBroadcast"
         | "sendOrderedBroadcast"
