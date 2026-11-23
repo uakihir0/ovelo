@@ -327,6 +327,28 @@ fn attr_find(vm: &Vm, h: u32, name: &str) -> Option<V> {
     None
 }
 
+/// `@bool/x` (possibly chained) → the boolean it holds.
+fn attr_bool_ref(vm: &Vm, id: u32) -> Option<bool> {
+    let res = vm.apk_res.as_ref()?;
+    let mut ev = res.entry_value(id)?;
+    for _ in 0..8 {
+        match ev.data_type {
+            // TYPE_INT_BOOLEAN / ints / floats — truthiness on data.
+            0x12 | 0x10 | 0x11 | 0x04 => return Some(ev.data != 0),
+            // TYPE_REFERENCE — follow one level.
+            0x01 => ev = res.entry_value(ev.data)?,
+            0x03 => {
+                return ev
+                    .string
+                    .as_deref()
+                    .map(|t| t.trim() != "false" && t.trim() != "0")
+            }
+            _ => return None,
+        }
+    }
+    None
+}
+
 /// Resolve an ARGB color from an int literal or a color resource ref.
 fn color_v(vm: &Vm, v: V) -> Option<i32> {
     match v {
@@ -539,6 +561,11 @@ pub(crate) fn dex_view_info(vm: &Vm, h: u32) -> Option<DexViewInfo> {
         clip_children: match pseudo_get(vm, h, P_CLIP_CHILDREN) {
             Some(v) => i32v(v) != 0,
             None => match attr_find(vm, h, "clipChildren") {
+                // A `@bool/x` reference arrives as its res-id — a
+                // nonzero I32 that must be resolved to the real bool.
+                Some(V::I32(n)) if (n as u32) >= 0x7f00_0000 => {
+                    attr_bool_ref(vm, n as u32).unwrap_or(true)
+                }
                 Some(V::I32(n)) => n != 0,
                 Some(V::Ref(r)) => s(vm, r).as_deref() != Some("false"),
                 _ => true,
@@ -1570,7 +1597,12 @@ pub(crate) fn call(
         }
         "getVisibility" => Some(Some(pseudo_get(vm, this, P_VIS).unwrap_or(V::I32(0)))),
         "setClipChildren" => {
-            pseudo_set(vm, this, P_CLIP_CHILDREN, args.get(1).copied().unwrap_or(V::I32(1)));
+            pseudo_set(
+                vm,
+                this,
+                P_CLIP_CHILDREN,
+                args.get(1).copied().unwrap_or(V::I32(1)),
+            );
             Some(None)
         }
         "isShown"
