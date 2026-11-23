@@ -39,8 +39,8 @@ Legend:
 | 2048 (AndStatus) | `org.andstatus.game2048` | 🟡 | Lifecycle completes (KorGE engine); GLSurfaceView opens but GLES2 pipeline is not implemented — blank window |
 | Snakes (drugi) | `red.drugi.snakes` | 🟡 | Lifecycle completes (Godot engine); host `Lifecycle` throwable on onCreate, blank GL window |
 | Privacy Friendly Sudoku | `org.secuso.privacyfriendlysudoku` | 🟡 | SplashActivity → TutorialActivity transition runs fully in dex; Welcome screen renders real text (layout rough — overlapping strings). Unblocked by dex-enum `compareTo` fix (LifecycleRegistry sync) |
-| Aegis Authenticator | `com.beemdevelopment.aegis` | 🟡 | MainActivity → IntroActivity transition runs; intro pager chrome renders (dots + button) but page text/images missing; two non-fatal inflater NPEs in MainActivity.onCreate (EntryListView/SearchView not found) |
-| Markor | `net.gsantner.markor` | 🟡 | Full lifecycle clean (MainActivity → IntroActivity); window opens but no content views materialize (inflater gap, same class as aegis) |
+| Aegis Authenticator | `com.beemdevelopment.aegis` | 🟢 | Intro wizard renders real content (Welcome slide + logo + import prompt); ViewPager2 page containers materialize. Layout rough (overlapping header) |
+| Markor | `net.gsantner.markor` | 🟢 | **Renders real UI**: Documents file list with real entries + dates, preview pane, FAB, bottom nav (Files/To-Do/QuickNote/LinkBox/More) |
 | Tasks.org | `org.tasks` | 🟡 | Hilt DI graph init fails: `dexrt.type` inside `SingletonCImpl.httpClientFactory` provider chain (KeyStoreEncryptionProvider); window opens blank |
 
 ## Famous apps — assessment
