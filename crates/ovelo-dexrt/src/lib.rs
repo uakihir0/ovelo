@@ -1615,6 +1615,17 @@ impl Vm {
         self.activity_callbacks.clone()
     }
 
+    /// Whether this view already received `onAttachedToWindow` — the
+    /// flag is set by `call_virtual` dispatch and by addView into an
+    /// already-attached parent, so the host's first-materialize attach
+    /// queue must skip flagged views or the callback fires twice.
+    pub fn view_is_attached(&self, h: u32) -> bool {
+        matches!(
+            jdk::pseudo_get(self, h, jdk::view::P_ATTACHED),
+            Some(V::I32(1))
+        )
+    }
+
     /// `View.removeCallbacks`/`Handler.removeCallbacks`/`Choreographer.remove*` —
     /// drop a queued runnable without running it.
     pub(crate) fn remove_runnable(&mut self, r: u32) {

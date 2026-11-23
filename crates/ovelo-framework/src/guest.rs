@@ -819,7 +819,10 @@ impl GuestUi {
         // a hidden view that loads data on attach and then reveals
         // itself still gets its init. Queued: guest code re-enters
         // bridged calls that borrow GuestUi, which materialize holds.
-        if self.dex_attached.insert(h) {
+        // Skip views addView already notified (P_ATTACHED): dispatching
+        // attach again double-runs onAttachedToWindow — AbstractComposeView
+        // would register its observer twice.
+        if self.dex_attached.insert(h) && !vm.view_is_attached(h) {
             self.attach_pending.push(h);
         }
         if !info.visible {
