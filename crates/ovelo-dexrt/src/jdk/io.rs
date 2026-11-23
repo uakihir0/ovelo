@@ -314,26 +314,18 @@ pub(crate) fn call(
 fn print_call(vm: &mut Vm, name: &str, _sig: &str, args: &[V]) -> Option<Option<V>> {
     match name {
         "print" | "println" => {
-            let t = if args.len() > 1 {
+            let mut t = if args.len() > 1 {
                 v_to_s(vm, args[1])
             } else {
                 String::new()
             };
-            if let Some(w) = wrapped_writer(vm, h_of(args[0])) {
-                let mut t = t;
-                if name == "println" {
-                    t.push('\n');
-                }
-                if let Some(Obj::Host {
-                    state: HostState::StrBuf(b),
-                    ..
-                }) = vm.heap.get_mut(w)
-                {
-                    b.push_str(&t);
-                }
-            } else if name == "println" {
-                eprintln!("{t}");
-            } else {
+            if name == "println" {
+                t.push('\n');
+            }
+            // Forward into the wrapped writer's buffer when there is
+            // one; a non-buffered sink (e.g. PrintWriter(System.out))
+            // mirrors to stderr instead of dropping the text.
+            if !push_strbuf(vm, h_of(args[0]), &t) {
                 eprint!("{t}");
             }
             Some(None)
@@ -355,16 +347,16 @@ fn print_call(vm: &mut Vm, name: &str, _sig: &str, args: &[V]) -> Option<Option<
         "write" | "append" => {
             // PrintWriter(Writer) forwards — the wrapped writer is under
             // P_DATA so prints land in its buffer.
-            if let Some(t) = args.get(1) {
-                if let Some(w) = wrapped_writer(vm, h_of(args[0])) {
-                    let t = v_to_s(vm, *t);
-                    if let Some(Obj::Host {
-                        state: HostState::StrBuf(b),
-                        ..
-                    }) = vm.heap.get_mut(w)
-                    {
-                        b.push_str(&t);
-                    }
+            if let Some(&a1) = args.get(1) {
+                let t = writer_text(
+                    vm,
+                    a1,
+                    args.get(2).copied(),
+                    args.get(3).copied(),
+                    name == "write",
+                );
+                if !push_strbuf(vm, h_of(args[0]), &t) {
+                    eprint!("{t}");
                 }
             }
             if name == "append" {
@@ -411,6 +403,78 @@ fn h_of(v: V) -> u32 {
     match v {
         V::Ref(h) => h,
         _ => 0,
+    }
+}
+
+/// Append `t` to the innermost wrapped writer's StrBuf — returns false
+/// when the chain ends somewhere that cannot hold text.
+fn push_strbuf(vm: &mut Vm, this: u32, t: &str) -> bool {
+    let Some(w) = wrapped_writer(vm, this) else {
+        return false;
+    };
+    match vm.heap.get_mut(w) {
+        Some(Obj::Host {
+            state: HostState::StrBuf(b),
+            ..
+        }) => {
+            b.push_str(t);
+            true
+        }
+        _ => false,
+    }
+}
+
+/// The text a writer's `write`/`append` argument denotes: an int is a
+/// single UTF-16 unit, a char[] is decoded as UTF-16 (surrogate pairs
+/// survive), anything else is its CharSequence view. `lo_v`/`hi_v` are
+/// the optional (off,len) bounds of `write` or the (start,end) bounds
+/// of `append` — `len_mode` picks which.
+fn writer_text(vm: &mut Vm, v: V, lo_v: Option<V>, hi_v: Option<V>, len_mode: bool) -> String {
+    match v {
+        V::I32(c) => char::from_u32(c as u32)
+            .map(|c| c.to_string())
+            .unwrap_or_default(),
+        V::Ref(ah) if matches!(vm.heap.get(ah), Some(Obj::Array { .. })) => {
+            let Some(Obj::Array { data, .. }) = vm.heap.get(ah) else {
+                return String::new();
+            };
+            let lo = lo_v
+                .map(|v| i64v(v).max(0) as usize)
+                .unwrap_or(0)
+                .min(data.len());
+            let hi = if len_mode {
+                hi_v.map(|v| lo + i64v(v).max(0) as usize)
+            } else {
+                hi_v.map(|v| i64v(v).max(0) as usize)
+            }
+            .unwrap_or(data.len())
+            .min(data.len());
+            let units: Vec<u16> = data[lo..hi.max(lo)]
+                .iter()
+                .map(|v| i64v(*v) as u16)
+                .collect();
+            String::from_utf16_lossy(&units)
+        }
+        _ => {
+            let t = v_to_s(vm, v);
+            let n = t.chars().count();
+            let lo = lo_v
+                .map(|v| i64v(v).max(0) as usize)
+                .unwrap_or(0)
+                .min(n);
+            let hi = if len_mode {
+                hi_v.map(|v| lo + i64v(v).max(0) as usize)
+            } else {
+                hi_v.map(|v| i64v(v).max(0) as usize)
+            }
+            .unwrap_or(n)
+            .min(n);
+            if lo == 0 && hi == n {
+                t
+            } else {
+                t.chars().skip(lo).take(hi.max(lo) - lo).collect()
+            }
+        }
     }
 }
 
@@ -785,15 +849,18 @@ fn stream_call(vm: &mut Vm, name: &str, args: &[V]) -> Rt<Option<Option<V>>> {
                         .unwrap_or_default(),
                     Some(V::Ref(ah)) => match vm.heap.get(ah) {
                         Some(Obj::Array { data, .. }) => {
+                            // char[] is UTF-16 — decode code units so
+                            // surrogate pairs (emoji) survive.
                             let lo = args.get(2).map(|v| i64v(*v).max(0) as usize).unwrap_or(0);
                             let hi = args
                                 .get(3)
                                 .map(|v| (lo + i64v(*v).max(0) as usize).min(data.len()))
                                 .unwrap_or(data.len());
-                            data[lo.min(data.len())..hi]
+                            let units: Vec<u16> = data[lo.min(data.len())..hi]
                                 .iter()
-                                .filter_map(|v| char::from_u32(i64v(*v) as u32))
-                                .collect()
+                                .map(|v| i64v(*v) as u16)
+                                .collect();
+                            String::from_utf16_lossy(&units)
                         }
                         _ => {
                             let t = sv(vm, args[1]).unwrap_or_default();
@@ -819,12 +886,7 @@ fn stream_call(vm: &mut Vm, name: &str, args: &[V]) -> Rt<Option<Option<V>>> {
             "append" => {
                 let t = args
                     .get(1)
-                    .map(|v| match v {
-                        V::I32(c) => char::from_u32(*c as u32)
-                            .map(|c| c.to_string())
-                            .unwrap_or_default(),
-                        _ => v_to_s(vm, *v),
-                    })
+                    .map(|v| writer_text(vm, *v, args.get(2).copied(), args.get(3).copied(), false))
                     .unwrap_or_default();
                 if let Some(Obj::Host {
                     state: HostState::StrBuf(b),
@@ -835,7 +897,18 @@ fn stream_call(vm: &mut Vm, name: &str, args: &[V]) -> Rt<Option<Option<V>>> {
                 }
                 return Ok(Some(Some(args[0])));
             }
-            "toString" | "getBuffer" | "toCharArray" => {
+            "getBuffer" => {
+                // StringWriter.getBuffer() returns the *shared* buffer:
+                // hand back a StringBuffer view that delegates through
+                // P_DATA to this writer's StrBuf so guest-side appends
+                // land in the same storage.
+                let b = host(vm, "Ljava/lang/StringBuffer;", HostState::Empty);
+                if let V::Ref(bh) = b {
+                    pseudo_set(vm, bh, P_DATA, V::Ref(wthis));
+                }
+                return Ok(Some(Some(b)));
+            }
+            "toString" | "toCharArray" => {
                 let t = match vm.heap.get(wthis) {
                     Some(Obj::Host {
                         state: HostState::StrBuf(b),
@@ -844,7 +917,8 @@ fn stream_call(vm: &mut Vm, name: &str, args: &[V]) -> Rt<Option<Option<V>>> {
                     _ => String::new(),
                 };
                 if name == "toCharArray" {
-                    let cs: Vec<V> = t.chars().map(|c| V::I32(c as i32)).collect();
+                    // char[] is UTF-16 units, not scalar values.
+                    let cs: Vec<V> = t.encode_utf16().map(|u| V::I32(u as i32)).collect();
                     return Ok(Some(Some(arr(vm, "C", cs))));
                 }
                 return Ok(Some(Some(jstr(vm, &t))));
