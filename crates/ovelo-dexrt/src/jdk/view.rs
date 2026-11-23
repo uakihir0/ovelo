@@ -727,6 +727,16 @@ pub(crate) fn is_viewish(vm: &Vm, class: &str, args: &[V]) -> bool {
     ) || class.ends_with("LayoutParams;")
         || desc_is_a(class, VIEW)
         || class.ends_with("$DecorView;")
+        // Dex View subclasses (ConstraintLayout, appcompat Toolbar):
+        // static calls like the inherited
+        // `ViewGroup.getChildMeasureSpec` carry an int receiver slot,
+        // so the args check below can't see them — walk the dex
+        // superclass chain instead.
+        || vm
+            .type_index_of(class)
+            .zip(vm.type_index_of("Landroid/view/View;"))
+            .map(|(ci, v)| vm.assignable(ci, v))
+            .unwrap_or(false)
     {
         return true;
     }
