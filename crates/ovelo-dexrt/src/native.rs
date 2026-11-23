@@ -1254,6 +1254,11 @@ extern "C" fn sh_strlen_chk(s: *const i8, slen: usize) -> usize {
     }
     n
 }
+// Bionic locale query used by libc++/godot ctype paths; the runtime
+// always runs a UTF-8 locale where MB_CUR_MAX is 4.
+extern "C" fn sh_mb_cur_max() -> usize {
+    4
+}
 extern "C" fn sh_strcpy_chk(d: *mut i8, s: *const i8, dlen: usize) -> *mut i8 {
     unsafe {
         if strlen(s) + 1 > dlen {
@@ -2443,6 +2448,7 @@ fn builtin_shim(name: &str) -> Option<usize> {
         #[cfg(target_os = "macos")]
         "strncpy" => sh_strncpy as *const () as usize,
         "__strlen_chk" => sh_strlen_chk as *const () as usize,
+        "__ctype_get_mb_cur_max" => sh_mb_cur_max as *const () as usize,
         "__strcpy_chk" => sh_strcpy_chk as *const () as usize,
         "__strncpy_chk2" => sh_strncpy_chk2 as *const () as usize,
         "__strchr_chk" => sh_strchr_chk as *const () as usize,
