@@ -618,7 +618,7 @@ pub(crate) fn list_ref(vm: &Vm, h: u32) -> Option<&Vec<V>> {
         // so matching is structural, not by name): resolve the backing
         // store they delegate element access to.
         Some(Obj::Instance { .. }) => match guest_list_backing(vm, h, 8) {
-            Some((x, _)) => match vm.heap.get(x) {
+            Some((x, ..)) => match vm.heap.get(x) {
                 Some(Obj::Host {
                     state: HostState::List(l),
                     ..
@@ -644,7 +644,7 @@ pub(crate) fn list_snapshot(vm: &Vm, h: u32) -> Option<Vec<V>> {
         }) => Some(l.clone()),
         Some(Obj::Array { data, .. }) => Some(data.clone()),
         Some(Obj::Instance { .. }) => {
-            let (x, size) = guest_list_backing(vm, h, 8)?;
+            let (x, off, size) = guest_list_backing(vm, h, 8)?;
             if std::env::var("OVELO_ITERDBG").is_ok() {
                 let fs = match vm.heap.get(h) {
                     Some(Obj::Instance { fields, .. }) => fields
@@ -655,7 +655,7 @@ pub(crate) fn list_snapshot(vm: &Vm, h: u32) -> Option<Vec<V>> {
                     _ => String::new(),
                 };
                 eprintln!(
-                    "[iterdbg] list_snapshot h{h} {} store=h{x} size={size:?} fields={fs}",
+                    "[iterdbg] list_snapshot h{h} {} store=h{x} off={off} size={size:?} fields={fs}",
                     vm.dbg_class_of(h)
                 );
             }
@@ -663,17 +663,25 @@ pub(crate) fn list_snapshot(vm: &Vm, h: u32) -> Option<Vec<V>> {
                 Some(Obj::Host {
                     state: HostState::List(l),
                     ..
-                }) => Some(l.clone()),
+                }) => Some(
+                    l.iter()
+                        .skip(off)
+                        .take(size.unwrap_or(usize::MAX))
+                        .cloned()
+                        .collect(),
+                ),
                 Some(Obj::Array { data, .. }) => {
                     // `elementData` capacity can exceed the collection's
                     // logical size — the tail is unused null slots, not
-                    // elements. Truncate when a sibling `size` field pins
-                    // the real length.
-                    let mut d = data.clone();
-                    if let Some(n) = size {
-                        d.truncate(n.min(d.len()));
-                    }
-                    Some(d)
+                    // elements — and a SubList window sits partway in.
+                    // Apply the (offset, size) window when found.
+                    Some(
+                        data.iter()
+                            .skip(off)
+                            .take(size.unwrap_or(usize::MAX))
+                            .cloned()
+                            .collect(),
+                    )
                 }
                 _ => None,
             }
@@ -683,13 +691,13 @@ pub(crate) fn list_snapshot(vm: &Vm, h: u32) -> Option<Vec<V>> {
 }
 
 /// The `HostState::List` or `Obj::Array` a guest Collection
-/// implementation delegates to, or None. Verified `instanceof
-/// Collection` so arbitrary guest objects holding collection fields
-/// are not misread; direct backing fields are preferred over nested
-/// delegates, and the depth budget ends reference cycles. A `SubList`
-/// collapses to its parent — slightly wrong (offset/size lost) but
-/// strictly better than empty.
-fn guest_list_backing(vm: &Vm, h: u32, depth: u8) -> Option<(u32, Option<usize>)> {
+/// implementation delegates to, as `(store, offset, size)` — a `SubList`
+/// narrows its parent's window (`offset`/`fromIndex` and `size`/`_size`
+/// int fields), composed through each delegation level. Verified
+/// `instanceof Collection` so arbitrary guest objects holding collection
+/// fields are not misread; direct backing fields are preferred over
+/// nested delegates, and the depth budget ends reference cycles.
+fn guest_list_backing(vm: &Vm, h: u32, depth: u8) -> Option<(u32, usize, Option<usize>)> {
     if depth == 0 || !vm.is_guest_collection(h) {
         return None;
     }
@@ -703,27 +711,28 @@ fn guest_list_backing(vm: &Vm, h: u32, depth: u8) -> Option<(u32, Option<usize>)
                 ..
             }) | Some(Obj::Array { .. })
         ) {
-            return Some((bh, None));
+            return Some((bh, 0, None));
         }
     }
     let Some(Obj::Instance { fields, .. }) = vm.heap.get(h) else {
         return None;
     };
-    // An int field naming the logical element count pins the real
-    // length when the array's capacity over-allocates (`size` on
-    // ArrayList-likes, `length` on kotlin ListBuilder).
-    let size_field = fields.iter().find_map(|(g, v)| match v {
-        V::I32(n)
-            if *n >= 0
-                && matches!(
-                    vm.dbg_field_name(*g).rsplit('.').next().unwrap_or_default(),
-                    "size" | "length"
-                ) =>
-        {
-            Some(*n as usize)
+    // Int fields pinning the logical window: the element count (`size`
+    // on ArrayList-likes, `length`/`_size` on kotlin ListBuilder/SubList)
+    // and, for sublists, the start index (`offset`, `fromIndex`).
+    let mut size_field = None;
+    let mut off_field = 0usize;
+    for (g, v) in fields.iter() {
+        let V::I32(n) = v else { continue };
+        if *n < 0 {
+            continue;
         }
-        _ => None,
-    });
+        match vm.dbg_field_name(*g).rsplit('.').next().unwrap_or_default() {
+            "size" | "length" | "_size" => size_field = Some(*n as usize),
+            "offset" | "fromIndex" => off_field = *n as usize,
+            _ => {}
+        }
+    }
     let cands: Vec<u32> = fields
         .values()
         .filter_map(|v| match v {
@@ -732,21 +741,33 @@ fn guest_list_backing(vm: &Vm, h: u32, depth: u8) -> Option<(u32, Option<usize>)
         })
         .collect();
     for &x in &cands {
-        match vm.heap.get(x) {
+        let len = match vm.heap.get(x) {
             Some(Obj::Host {
-                state: HostState::List(_),
+                state: HostState::List(l),
                 ..
-            }) => return Some((x, None)),
-            Some(Obj::Array { data, .. }) => {
-                return Some((x, size_field.filter(|n| *n <= data.len())))
-            }
-            _ => {}
+            }) => Some(l.len()),
+            Some(Obj::Array { data, .. }) => Some(data.len()),
+            _ => None,
+        };
+        if let Some(len) = len {
+            let off = off_field.min(len);
+            let size = size_field.map(|n| n.min(len - off));
+            return Some((x, off, size));
         }
     }
     for &x in &cands {
         if let Some(Obj::Instance { .. }) = vm.heap.get(x) {
-            if let Some(y) = guest_list_backing(vm, x, depth - 1) {
-                return Some(y);
+            if let Some((y, inner_off, inner_size)) = guest_list_backing(vm, x, depth - 1) {
+                // Compose windows: this level's `off` sits inside the
+                // delegate window, and its `size` is clipped to the
+                // delegate's remaining span.
+                let bound = inner_size.map(|inner| inner.saturating_sub(off_field));
+                let size = match (size_field, bound) {
+                    (Some(s), Some(b)) => Some(s.min(b)),
+                    (Some(s), None) => Some(s),
+                    (None, b) => b,
+                };
+                return Some((y, inner_off.saturating_add(off_field), size));
             }
         }
     }
@@ -810,21 +831,24 @@ fn backing_handle(vm: &mut Vm, h: u32, map: bool) -> Option<u32> {
         return Some(bh);
     }
     if !map {
-        if let Some((x, size)) = guest_list_backing(vm, h, 8) {
+        if let Some((x, off, size)) = guest_list_backing(vm, h, 8) {
             match vm.heap.get(x) {
                 Some(Obj::Host {
                     state: HostState::List(_),
                     ..
                 }) => return Some(x),
                 // Array backing is fixed-size — copy it into a
-                // growable store so add/remove keep working. The copy is
-                // capped at the guest's logical size: `elementData`
-                // capacity beyond it holds unused null slots.
+                // growable store so add/remove keep working. The copy
+                // keeps only the guest's logical window: `elementData`
+                // capacity beyond `size` holds unused null slots, and a
+                // SubList's `offset` skips its parent's head.
                 Some(Obj::Array { data, .. }) => {
-                    let mut data = data.clone();
-                    if let Some(n) = size {
-                        data.truncate(n.min(data.len()));
-                    }
+                    let data: Vec<V> = data
+                        .iter()
+                        .skip(off)
+                        .take(size.unwrap_or(usize::MAX))
+                        .cloned()
+                        .collect();
                     let bh = vm.alloc_host("Ljava/util/ArrayList;", HostState::List(data));
                     pseudo_set(vm, h, key, V::Ref(bh));
                     return Some(bh);
