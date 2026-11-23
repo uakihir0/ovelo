@@ -619,6 +619,84 @@ fn do_execute(vm: &mut Vm, call_h: u32) -> Result<Option<V>> {
     }
 }
 
+/// Host-side `coil3.RealImageLoader.enqueue`: coil's own pipeline is a
+/// suspend chain (`execute` → `withContext`) whose continuations park
+/// on a dispatcher that never resumes under our scheduler. Read the
+/// request's `data` URL + `target.view` directly, fetch on the host
+/// thread, and let `drain_coil` deliver a `BitmapDrawable` via
+/// `setImageDrawable` once the bytes land.
+fn coil_enqueue(vm: &mut Vm, a: &[V]) -> Result<Option<V>> {
+    let req = match a.get(1) {
+        Some(V::Ref(h)) => *h,
+        _ => return Ok(Some(V::Ref(0))),
+    };
+    let url = field_v(vm, req, "data", Some("Ljava/lang/Object;")).and_then(|v| sv(vm, v));
+    let target = field_v(vm, req, "target", Some("Lcoil3/target/Target;"));
+    let view = match target {
+        Some(V::Ref(t)) => field_v(vm, t, "view", Some("Landroid/widget/ImageView;")),
+        _ => None,
+    };
+    let (Some(url), Some(V::Ref(view))) = (url, view) else {
+        // Not a simple url→ImageView request (resource, Uri, listener
+        // target): fall through to a null Disposable like a cancelled
+        // load rather than fetching the wrong thing.
+        return Ok(Some(V::Ref(0)));
+    };
+    if httpdbg() {
+        eprintln!("[http] coil fetch {url}");
+    }
+    let ticket = spawn_fetch(HttpSpec {
+        method: "GET".into(),
+        url,
+        headers: vec![("User-Agent".into(), "NewPipe/0.28".into())],
+        body: vec![],
+    });
+    vm.coil_jobs.push((ticket, view));
+    Ok(Some(V::Ref(0)))
+}
+
+/// Deliver finished coil fetches — called from `drain_runnables` each
+/// pass. A completed ticket's body decodes through `image` (PNG/JPEG/
+/// WebP) into a `BitmapDrawable` handed to the view.
+pub(crate) fn drain_coil(vm: &mut Vm) {
+    let jobs = std::mem::take(&mut vm.coil_jobs);
+    for (ticket, view) in jobs {
+        let Some(res) = take_result(ticket) else {
+            vm.coil_jobs.push((ticket, view));
+            continue;
+        };
+        let Ok(resp) = res else { continue };
+        if resp.code != 200 || resp.body.is_empty() {
+            continue;
+        }
+        let Ok(img) = image::load_from_memory(&resp.body) else {
+            continue;
+        };
+        let rgba = img.to_rgba8();
+        let (w, h) = rgba.dimensions();
+        let bmp = vm.alloc_host(
+            "Landroid/graphics/Bitmap;",
+            HostState::Bitmap {
+                w,
+                h,
+                rgba: std::rc::Rc::new(rgba.into_raw()),
+            },
+        );
+        let d = host(
+            vm,
+            "Landroid/graphics/drawable/BitmapDrawable;",
+            HostState::Empty,
+        );
+        if let V::Ref(dh) = d {
+            super::pseudo_set(vm, dh, P_BITMAP_SLOT, V::Ref(bmp));
+            if httpdbg() {
+                eprintln!("[http] coil delivered ticket={ticket} -> view={view}");
+            }
+            let _ = vm.call_virtual(view, "setImageDrawable", &[V::Ref(dh)]);
+        }
+    }
+}
+
 /// Called from `Vm::add_dex` — intercept the single method every
 /// okhttp call path funnels through (`execute`, `enqueue` via
 /// `RealCall$AsyncCall.run`, coil's `await`, Rx wrappers).
@@ -642,6 +720,20 @@ pub(crate) fn install(vm: &mut Vm) {
         if httpdbg() {
             eprintln!("[http] registered {class} interceptorChain={ok:?}");
         }
+    }
+    // Coil3's suspend pipeline parks on a dispatcher we never resume —
+    // the host bridge fetches `request.data` straight to the target's
+    // ImageView instead (`drain_coil` delivers).
+    let ok = vm.register_host(
+        "Lcoil3/RealImageLoader;",
+        "enqueue",
+        "(Lcoil3/request/ImageRequest;)Lcoil3/request/Disposable;",
+        std::rc::Rc::new(std::cell::RefCell::new(|vm: &mut Vm, a: &[V]| {
+            coil_enqueue(vm, a)
+        })),
+    );
+    if httpdbg() {
+        eprintln!("[http] registered coil3 enqueue={ok:?}");
     }
     // OkHttp 5's `toCanonicalHost` runs a bundled punycode/IDNA dex
     // pipeline; a miss anywhere in it rejects every host with

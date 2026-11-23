@@ -231,6 +231,23 @@ pub struct Vm {
     /// Running Service instances by class descriptor — `startService`
     /// reuses the live object so `onCreate` runs once per service.
     pub(crate) services: HashMap<String, u32>,
+    /// In-flight Coil3 `RealImageLoader.enqueue` jobs the host fetch
+    /// bridge owns: `(http_ticket, image_view)`. `drain_runnables`
+    /// delivers decoded bitmaps as drawables — coil's own coroutine
+    /// pipeline suspends on a dispatcher our loop never resumes.
+    pub(crate) coil_jobs: Vec<(u64, u32)>,
+    /// Last `startId` delivered to each running Service — `stopSelf(id)`
+    /// only stops when the id matches the most recent request.
+    pub(crate) service_start_id: HashMap<u32, i64>,
+    /// Monotonic `startId` source for `onStartCommand` dispatches.
+    pub(crate) service_seq: i64,
+    /// Services that called `stopSelf` before `startService` finished
+    /// registering them (self-stop inside `onCreate`) — the starter
+    /// must not insert or start them.
+    pub(crate) service_stop_pending: std::collections::HashSet<u32>,
+    /// Services whose `onDestroy` is owed on the next drain — deferred
+    /// so `onStartCommand`/`startService` finish before teardown runs.
+    pub(crate) pending_destroy: Vec<u32>,
     /// The Activity/theme res id (`android:theme` from the manifest) that
     /// theme-scoped `obtainStyledAttributes` resolves attributes against.
     pub theme_id: u32,
@@ -489,6 +506,11 @@ impl Vm {
             bundled_stmts: HashMap::new(),
             bundled_h: 0,
             services: HashMap::new(),
+            coil_jobs: Vec::new(),
+            service_start_id: HashMap::new(),
+            service_seq: 0,
+            service_stop_pending: std::collections::HashSet::new(),
+            pending_destroy: Vec::new(),
             theme_id: 0,
             total_steps: 0,
             pending_activity: None,
@@ -1656,6 +1678,14 @@ impl Vm {
             return 0;
         }
         native::check_all_zones("drain");
+        // Host-side async deliveries that run before guest work:
+        // finished coil image fetches become drawables, and services
+        // that stopped since the last pass get their onDestroy here —
+        // not inline inside their own callback.
+        jdk::http::drain_coil(self);
+        for h in std::mem::take(&mut self.pending_destroy) {
+            let _ = self.call_virtual(h, "onDestroy", &[]);
+        }
         let now = jdk::now_ms() as u64;
         let (due, later): (Vec<_>, Vec<_>) = self
             .delayed_runnables

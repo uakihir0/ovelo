@@ -2170,11 +2170,24 @@ fn context_call(
                     None => {
                         let h = vm.instantiate(&desc).ok()?;
                         let _ = vm.call_virtual(h, "onCreate", &[]);
+                        if vm.service_stop_pending.remove(&h) {
+                            // onCreate already self-stopped: AOSP runs
+                            // onDestroy without onStartCommand and
+                            // never registers the service.
+                            return None;
+                        }
                         vm.services.insert(desc.clone(), h);
                         h
                     }
                 };
-                let _ = vm.call_virtual(sh, "onStartCommand", &[V::Ref(ih), V::I32(0), V::I32(1)]);
+                vm.service_seq += 1;
+                let sid = vm.service_seq;
+                vm.service_start_id.insert(sh, sid);
+                let _ = vm.call_virtual(
+                    sh,
+                    "onStartCommand",
+                    &[V::Ref(ih), V::I32(0), V::I32(sid as i32)],
+                );
                 Some(sh)
             })();
             Some(Some(if svc.is_some() { component } else { V::Ref(0) }))
@@ -2186,8 +2199,28 @@ fn context_call(
             // FeedLoadService calls stopSelf when the fetch is done;
             // the next refresh then got no onStartCommand work cycle).
             let this = i64v(args[0]).max(0) as u32;
-            vm.services.retain(|_, sh| *sh != this);
-            let _ = vm.call_virtual(this, "onDestroy", &[]);
+            // stopSelf(startId)/stopSelfResult(startId) only stop when
+            // the id matches the latest delivered start request — an
+            // earlier request finishing must not tear down a service
+            // a newer onStartCommand still needs.
+            if args.len() > 1 && vm.service_start_id.get(&this).copied() != Some(i64v(args[1])) {
+                return Ok(Some(Some(V::I32(0))));
+            }
+            if vm.services.values().any(|sh| *sh == this) {
+                vm.services.retain(|_, sh| *sh != this);
+                vm.service_start_id.remove(&this);
+            } else {
+                // Self-stop before startService registered the handle
+                // (inside onCreate): the starter consults this set and
+                // skips insert/onStartCommand entirely.
+                vm.service_stop_pending.insert(this);
+            }
+            // Defer onDestroy to the drain loop: running it inline
+            // tears the service down while its own onStartCommand (or
+            // the startService call) is still on the stack.
+            if !vm.pending_destroy.contains(&this) {
+                vm.pending_destroy.push(this);
+            }
             Some(Some(V::I32(1)))
         }
         "stopService" => {
@@ -2211,7 +2244,12 @@ fn context_call(
                 });
             if let Some(desc) = desc {
                 if let Some(sh) = vm.services.remove(&desc) {
-                    let _ = vm.call_virtual(sh, "onDestroy", &[]);
+                    vm.service_start_id.remove(&sh);
+                    // Same deferred-teardown rule as stopSelf: the
+                    // caller may be this service's own callback.
+                    if !vm.pending_destroy.contains(&sh) {
+                        vm.pending_destroy.push(sh);
+                    }
                 }
             }
             Some(Some(V::I32(1)))
