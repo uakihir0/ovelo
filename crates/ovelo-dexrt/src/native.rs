@@ -5160,8 +5160,13 @@ pub(crate) mod glctx {
         }
         unsafe {
             let bind_fbo: unsafe extern "C" fn(i32, u32) = glp("glBindFramebuffer")?;
+            let get_iv: unsafe extern "C" fn(i32, *mut i32) = glp("glGetIntegerv")?;
             let read: unsafe extern "C" fn(i32, i32, i32, i32, i32, i32, *mut c_void) =
                 glp("glReadPixels")?;
+            // Save the app's current binding — leaving our screen FBO
+            // bound leaks guest draws into the readback target.
+            let mut prev = 0i32;
+            get_iv(0x8CA6, &mut prev); // GL_FRAMEBUFFER_BINDING
             bind_fbo(0x8D40, s.fbo);
             let mut buf = vec![0u8; (s.w * s.h * 4) as usize];
             read(
@@ -5173,6 +5178,7 @@ pub(crate) mod glctx {
                 0x1401,
                 buf.as_mut_ptr() as *mut c_void,
             );
+            bind_fbo(0x8D40, prev as u32);
             let stride = (s.w * 4) as usize;
             let mut out = vec![0u8; buf.len()];
             for y in 0..s.h as usize {
