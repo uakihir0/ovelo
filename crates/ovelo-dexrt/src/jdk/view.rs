@@ -43,6 +43,9 @@ const P_CONTEXT: u32 = u32::MAX - 18;
 const P_VIS: u32 = u32::MAX - 19;
 /// Pseudo key: root element was `<merge>` — splice children on attach.
 const P_MERGE: u32 = u32::MAX - 21;
+/// `setClipChildren(bool)` / `android:clipChildren` — I32 1 clips
+/// (default), 0 lets children draw outside their bounds.
+const P_CLIP_CHILDREN: u32 = u32::MAX - 29;
 /// Pseudo keys: drawables given to `setIndeterminateDrawable` /
 /// `setProgressDrawable` — ProgressBar getters must hand them back (not
 /// a zero-init stub) or their dex fields read null downstream.
@@ -280,6 +283,9 @@ pub struct DexViewInfo {
     /// CENTER_HORIZONTAL=1, TOP=0x30, BOTTOM=0x50, CENTER_VERTICAL=0x10).
     /// 0 = unset — treat as top|start.
     pub gravity: i32,
+    /// `android:clipChildren` / `setClipChildren` — when false the
+    /// parent's draw pass doesn't clip children to their bounds.
+    pub clip_children: bool,
 }
 
 /// The activity's content view handle (what `setContentView` attached).
@@ -530,6 +536,14 @@ pub(crate) fn dex_view_info(vm: &Vm, h: u32) -> Option<DexViewInfo> {
         },
         children: kids,
         gravity,
+        clip_children: match pseudo_get(vm, h, P_CLIP_CHILDREN) {
+            Some(v) => i32v(v) != 0,
+            None => match attr_find(vm, h, "clipChildren") {
+                Some(V::I32(n)) => n != 0,
+                Some(V::Ref(r)) => s(vm, r).as_deref() != Some("false"),
+                _ => true,
+            },
+        },
     })
 }
 
@@ -1555,6 +1569,10 @@ pub(crate) fn call(
             Some(None)
         }
         "getVisibility" => Some(Some(pseudo_get(vm, this, P_VIS).unwrap_or(V::I32(0)))),
+        "setClipChildren" => {
+            pseudo_set(vm, this, P_CLIP_CHILDREN, args.get(1).copied().unwrap_or(V::I32(1)));
+            Some(None)
+        }
         "isShown"
         | "isAttachedToWindow"
         | "hasWindowFocus"
@@ -1888,7 +1906,6 @@ pub(crate) fn call(
         | "setFocusableInTouchMode"
         | "setWillNotDraw"
         | "setDescendantFocusability"
-        | "setClipChildren"
         | "setClipToPadding"
         | "setNestedScrollingEnabled"
         | "startNestedScroll"

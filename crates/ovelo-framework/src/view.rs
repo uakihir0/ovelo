@@ -154,6 +154,9 @@ pub struct ViewGroup {
     pub pressed_child: Option<usize>,
     /// Overlay (frame) layout instead of vertical stacking.
     pub overlay: bool,
+    /// `android:clipChildren` — when true (default) each child draws
+    /// clipped to its own bounds; false lets children overflow.
+    pub clip_children: bool,
 }
 
 impl ViewGroup {
@@ -164,6 +167,7 @@ impl ViewGroup {
             children: Vec::new(),
             pressed_child: None,
             overlay: false,
+            clip_children: true,
         }
     }
 

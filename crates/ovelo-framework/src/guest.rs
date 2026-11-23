@@ -331,11 +331,12 @@ fn make_dex_view(vm: &Vm, info: &ovelo_dexrt::DexViewInfo, fonts: &Rc<FontSet>) 
         // Ancestry, not name substring — a custom `MyLayout extends
         // LinearLayout` stacks its children even when its own name
         // doesn't say so.
-        let g = if STACK.iter().any(|s| vm.extends_named(&info.desc, s)) {
+        let mut g = if STACK.iter().any(|s| vm.extends_named(&info.desc, s)) {
             ViewGroup::new(lp.0, lp.1)
         } else {
             ViewGroup::overlay(lp.0, lp.1)
         };
+        g.clip_children = info.clip_children;
         GuestView::Group(g)
     } else if info.desc.contains("Button") {
         GuestView::Btn(Button::new("", 16.0, dark, fonts.clone()))
@@ -379,6 +380,9 @@ fn update_dex_view(g: &mut GuestView, info: &ovelo_dexrt::DexViewInfo) {
             v.image = info.image.clone();
             changed = true;
         }
+    }
+    if let GuestView::Group(gr) = g {
+        gr.clip_children = info.clip_children;
     }
     if let Some(tv) = g.text_mut() {
         if let Some(t) = &info.text {

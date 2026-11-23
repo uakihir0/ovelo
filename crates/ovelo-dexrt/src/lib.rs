@@ -4911,9 +4911,24 @@ impl Vm {
                         return Err(E::Vm(errd(
                             "dexrt.type",
                             format!(
-                                "iget h{h} field={} kind={:?}",
+                                "iget h{h} field={} kind={:?} arr={:?}",
                                 self.describe_field(gi(ins.idx.unwrap_or(0))),
-                                self.heap.get(h).map(std::mem::discriminant)
+                                self.heap.get(h).map(std::mem::discriminant),
+                                match self.heap.get(h) {
+                                    Some(Obj::Array { elem, data }) => format!(
+                                        "elem={elem} len={} e0={:?}",
+                                        data.len(),
+                                        data.first()
+                                            .and_then(|v| match v {
+                                                V::Ref(eh) => self
+                                                    .heap
+                                                    .get(*eh)
+                                                    .map(std::mem::discriminant),
+                                                _ => None,
+                                            })
+                                    ),
+                                    _ => "-".into(),
+                                }
                             ),
                         )));
                     }

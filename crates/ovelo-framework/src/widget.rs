@@ -109,13 +109,10 @@ impl Drawable for View {
         }
         if let Some(ops) = self.custom_ops.clone() {
             // Guest `onDraw` ops are view-local — translate into the
-            // view's absolute origin and clip to its bounds (AOSP
-            // clips the child canvas when clipChildren is on, which is
-            // the default); a `drawColor` then fills the view, not the
-            // window.
+            // view's absolute origin before replaying. Clipping to the
+            // view's bounds is the parent's job (clipChildren).
             c.save();
             c.translate(self.left, self.top);
-            c.clip_rect(Rect::new(0, 0, s.w, s.h));
             replay_guest_ops(c, &ops);
             c.restore();
         }
@@ -177,13 +174,23 @@ impl Drawable for ViewGroup {
         if let Some(ops) = self.view.custom_ops.clone() {
             c.save();
             c.translate(self.view.left, self.view.top);
-            c.clip_rect(Rect::new(0, 0, s.w, s.h));
             replay_guest_ops(c, &ops);
             c.restore();
         }
-        // Children draw at their own laid-out origins (absolute coords).
+        // Children draw at their own laid-out origins (absolute
+        // coords), clipped to their bounds unless the app opted out
+        // with clipChildren=false (overflowing menus, FABs, …).
         for ch in &mut self.children {
-            ch.draw(c);
+            if self.clip_children {
+                let (cl, ct) = ch.origin();
+                let cs = ch.measured();
+                c.save();
+                c.clip_rect(Rect::new(cl, ct, cs.w, cs.h));
+                ch.draw(c);
+                c.restore();
+            } else {
+                ch.draw(c);
+            }
         }
     }
     fn invalidate(&mut self) {
