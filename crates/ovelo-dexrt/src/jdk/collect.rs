@@ -937,7 +937,10 @@ fn map_call(vm: &mut Vm, name: &str, sig: &str, args: &[V]) -> Rt<Option<Option<
         | "getCharSequenceArray"
         | "getClassLoader" => {
             Some(Some(
-                map_get(vm, h, args[1])
+                // `getClassLoader` takes no key arg — a zero-arg
+                // call must not index args[1].
+                args.get(1)
+                    .and_then(|k| map_get(vm, h, *k))
                     .or_else(|| match args.get(2) {
                         // `getParcelable(key, Class)` and friends take a type
                         // token as the last arg, not a default value — a miss
