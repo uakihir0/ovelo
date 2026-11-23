@@ -820,7 +820,13 @@ fn guest_list_backing(vm: &Vm, h: u32, depth: u8) -> Option<(u32, usize, Option<
                         }
                     };
                     let (a, b) = (ints[0], ints[1]);
-                    if nulls(a.min(len), b) <= nulls(b.min(len), a) {
+                    // Fewer nulls wins; on a tie (e.g. a dense window
+                    // starting at 0 vs an empty window at its end)
+                    // prefer the interpretation with the larger size —
+                    // the empty window is never the useful read.
+                    let ab = (nulls(a.min(len), b), -(b as isize));
+                    let ba = (nulls(b.min(len), a), -(a as isize));
+                    if ab <= ba {
                         (off_field, size_field) = (a, Some(b));
                     } else {
                         (off_field, size_field) = (b, Some(a));
