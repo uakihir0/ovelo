@@ -28,6 +28,7 @@ Legend:
 | Fossify Messages | `org.fossify.messages` | 🟡 | Lifecycle completes to correct end state: "No stored conversations" empty state + FAB render (DB is empty) |
 | Fossify Paint | `org.fossify.paint` | 🟡 | Full lifecycle; toolbar + canvas render, brush strokes register (stroke position offset from touch point) |
 | Bouncy (pinball, libGDX) | `com.dozingcatsoftware.bouncy` | 🟡 | **Playable**: menu → table select → live pinball table with bumpers rendering; box2d `.so` physics runs via JNI. TLS self-heal in the segv handler patches kernel-rewritten TPIDR_EL0 per access (Darwin rewrites it at signal/exception boundaries). Text labels and ball rendering still rough |
+| Open Sudoku | `org.moire.opensudoku` | 🟢 | **Renders real data**: full 9×9 board drawn with given digits, pencil-mark notes and cell coloring; custom `View.onDraw` path works end to end |
 | Tiny Weather Forecast Germany | `de.kaffeemitkoffein.tinyweatherforecastgermany` | 🟡 | `WelcomeActivity` renders to the window (first real APK first frame) |
 | NewPipe | `org.schabi.newpipe` | 🟢 | **Renders real data**: kiosk "Live" tab lists actual Innertube-fetched videos with titles/channels and real image thumbnails (host-bridged Coil3 `enqueue` → HTTP → WebP decode → `setImageDrawable`). Feed tab empty is expected without subscriptions |
 | F-Droid | `org.fdroid.fdroid` | 🟡 | Multi-dex + Hilt init runs without crashing; UI is Compose — no render path yet |
