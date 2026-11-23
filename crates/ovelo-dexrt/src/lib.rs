@@ -4476,27 +4476,27 @@ impl Vm {
     fn i32v(v: V) -> Rt<i32> {
         match v {
             V::I32(i) => Ok(i),
-            _ => vm("dexrt.type"),
+            _ => Err(E::Vm(errd("dexrt.type", format!("i32v {v:?}")))),
         }
     }
     fn i64v(v: V) -> Rt<i64> {
         match v {
             V::I64(i) => Ok(i),
-            _ => vm("dexrt.type"),
+            _ => Err(E::Vm(errd("dexrt.type", format!("i64v {v:?}")))),
         }
     }
     fn f32v(v: V) -> Rt<f32> {
         match v {
             V::F32(f) => Ok(f),
             V::I32(i) => Ok(f32::from_bits(i as u32)),
-            _ => vm("dexrt.type"),
+            _ => Err(E::Vm(errd("dexrt.type", format!("f32v {v:?}")))),
         }
     }
     fn f64v(v: V) -> Rt<f64> {
         match v {
             V::F64(f) => Ok(f),
             V::I64(i) => Ok(f64::from_bits(i as u64)),
-            _ => vm("dexrt.type"),
+            _ => Err(E::Vm(errd("dexrt.type", format!("f64v {v:?}")))),
         }
     }
     fn refv(v: V) -> Rt<u32> {
@@ -4504,7 +4504,7 @@ impl Vm {
             V::Ref(h) => Ok(h),
             // `const/4 vx, 0` is how dex puts a null reference in a register.
             V::I32(0) => Ok(0),
-            _ => vm("dexrt.type"),
+            _ => Err(E::Vm(errd("dexrt.type", format!("refv {v:?}")))),
         }
     }
 
@@ -4656,7 +4656,12 @@ impl Vm {
                 self.null_check(h, "array-length")?;
                 let n = match self.heap.get(h) {
                     Some(Obj::Array { data, .. }) => data.len() as i32,
-                    _ => return vm("dexrt.type"),
+                    other => {
+                        return Err(E::Vm(errd(
+                            "dexrt.type",
+                            format!("array-length h{h} {:?}", other.map(std::mem::discriminant)),
+                        )))
+                    }
                 };
                 set!(regs[0], V::I32(n));
             }
@@ -4903,7 +4908,14 @@ impl Vm {
                                 self.describe_method(fr.loc.midx)
                             );
                         }
-                        return vm("dexrt.type");
+                        return Err(E::Vm(errd(
+                            "dexrt.type",
+                            format!(
+                                "iget h{h} field={} kind={:?}",
+                                self.describe_field(gi(ins.idx.unwrap_or(0))),
+                                self.heap.get(h).map(std::mem::discriminant)
+                            ),
+                        )));
                     }
                 };
                 if self
@@ -4967,7 +4979,16 @@ impl Vm {
                     Some(Obj::Instance { fields, .. }) | Some(Obj::Host { fields, .. }) => {
                         fields.insert(f, r(0)?);
                     }
-                    _ => return vm("dexrt.type"),
+                    _ => {
+                        return Err(E::Vm(errd(
+                            "dexrt.type",
+                            format!(
+                                "iput h{h} field={} v={:?}",
+                                self.describe_field(gi(ins.idx.unwrap_or(0))),
+                                r(0).ok()
+                            ),
+                        )))
+                    }
                 }
             }
             // ---- static fields ----
@@ -5333,7 +5354,7 @@ impl Vm {
                 }
                 Ok(data[i])
             }
-            _ => vm("dexrt.type"),
+            _ => Err(E::Vm(errd("dexrt.type", format!("aget h{h}")))),
         }
     }
 
@@ -5350,7 +5371,7 @@ impl Vm {
                 data[i as usize] = v;
                 Ok(())
             }
-            _ => vm("dexrt.type"),
+            _ => Err(E::Vm(errd("dexrt.type", format!("aput h{h}")))),
         }
     }
 
@@ -5394,7 +5415,7 @@ impl Vm {
                 "Ljava/lang/ArrayIndexOutOfBoundsException;",
                 "fill-array-data",
             )),
-            _ => vm("dexrt.type"),
+            _ => Err(E::Vm(errd("dexrt.type", format!("fill-array h{h}")))),
         }
     }
 

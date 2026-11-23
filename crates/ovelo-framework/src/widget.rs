@@ -167,6 +167,15 @@ impl Drawable for ViewGroup {
                 Paint::color(bg),
             );
         }
+        // AOSP order: background → onDraw → children. A group whose
+        // dex class overrides onDraw still paints itself first —
+        // e.g. ViewPager2's page containers carrying recorded ops.
+        if let Some(ops) = self.view.custom_ops.clone() {
+            c.save();
+            c.translate(self.view.left, self.view.top);
+            replay_guest_ops(c, &ops);
+            c.restore();
+        }
         // Children draw at their own laid-out origins (absolute coords).
         for ch in &mut self.children {
             ch.draw(c);
