@@ -214,6 +214,10 @@ pub struct Vm {
     /// moves its own ContentFrameLayout in, so an id-search can't be
     /// trusted to find the attachment point afterwards.
     pub(crate) content_frames: HashMap<u32, u32>,
+    /// Interned host enum constants, keyed (desc, ordinal) — so
+    /// `Month.of(1) == Month.JANUARY` and `date.getMonth()` return the
+    /// same handle the static constant did.
+    pub(crate) enum_cache: HashMap<(String, i32), u32>,
     /// Attached `TextClock` views that tick — refreshed once per
     /// `drain_runnables` pass (AOSP ticks them per postDelayed).
     pub clock_views: Vec<u32>,
@@ -504,6 +508,7 @@ impl Vm {
             content_views: HashMap::new(),
             decor_roots: HashMap::new(),
             content_frames: HashMap::new(),
+            enum_cache: HashMap::new(),
             clock_views: Vec::new(),
             apk_res: None,
             dbs: HashMap::new(),

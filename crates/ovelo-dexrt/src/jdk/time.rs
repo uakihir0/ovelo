@@ -492,30 +492,84 @@ fn jtime_call(vm: &mut Vm, class: &str, name: &str, args: &[V]) -> Rt<Option<Opt
         ("Ljava/time/Month;", "getValue") => Some(Some(V::I32(month_of(vm, args[0])))),
         ("Ljava/time/Month;", "of") => Some(Some(month_obj(
             vm,
-            i64v(args.get(1).copied().unwrap_or(V::I32(1))),
+            i64v(args.first().copied().unwrap_or(V::I32(1))),
         ))),
         ("Ljava/time/Month;", "values") => {
             let vals = (1..=12).map(|m| month_obj(vm, m)).collect();
             Some(Some(arr(vm, "Ljava/time/Month;", vals)))
         }
         ("Ljava/time/Month;", "valueOf") => {
-            let n = sv(vm, args.get(1).copied().unwrap_or(V::Ref(0))).unwrap_or_default();
+            let n = sv(vm, args.first().copied().unwrap_or(V::Ref(0))).unwrap_or_default();
             let i = MONTH_NAMES.iter().position(|m| *m == n).unwrap_or(0) as i64;
             Some(Some(month_obj(vm, i + 1)))
+        }
+        ("Ljava/time/Month;", "plus" | "minus") => {
+            let s = if name == "plus" { 1 } else { -1 };
+            Some(Some(month_obj(
+                vm,
+                month_of(vm, args[0]) as i64 + s * i64v(args.get(1).copied().unwrap_or(V::I64(0))),
+            )))
         }
         ("Ljava/time/DayOfWeek;", "getValue") => Some(Some(V::I32(day_of_week_of(vm, args[0])))),
         ("Ljava/time/DayOfWeek;", "of") => Some(Some(day_of_week_obj(
             vm,
-            i64v(args.get(1).copied().unwrap_or(V::I32(1))),
+            i64v(args.first().copied().unwrap_or(V::I32(1))),
         ))),
         ("Ljava/time/DayOfWeek;", "values") => {
             let vals = (1..=7).map(|d| day_of_week_obj(vm, d)).collect();
             Some(Some(arr(vm, "Ljava/time/DayOfWeek;", vals)))
         }
         ("Ljava/time/DayOfWeek;", "valueOf") => {
-            let n = sv(vm, args.get(1).copied().unwrap_or(V::Ref(0))).unwrap_or_default();
+            let n = sv(vm, args.first().copied().unwrap_or(V::Ref(0))).unwrap_or_default();
             let i = DAY_NAMES.iter().position(|d| *d == n).unwrap_or(0) as i64;
             Some(Some(day_of_week_obj(vm, i + 1)))
+        }
+        ("Ljava/time/DayOfWeek;", "plus" | "minus") => {
+            let s = if name == "plus" { 1 } else { -1 };
+            Some(Some(day_of_week_obj(
+                vm,
+                day_of_week_of(vm, args[0]) as i64
+                    + s * i64v(args.get(1).copied().unwrap_or(V::I64(0))),
+            )))
+        }
+        // Enum API on the two java.time enums — they carry the
+        // `Ljava/lang/Enum;` super but route here (lang excludes
+        // java.time), so name()/ordinal()/compareTo need local arms.
+        ("Ljava/time/Month;" | "Ljava/time/DayOfWeek;", "name" | "toString") => {
+            let h = match args[0] {
+                V::Ref(h) => h,
+                _ => 0,
+            };
+            let n = pseudo_get(vm, h, P_DATA)
+                .and_then(|v| sv(vm, v))
+                .unwrap_or_default();
+            Some(Some(jstr(vm, &n)))
+        }
+        ("Ljava/time/Month;" | "Ljava/time/DayOfWeek;", "ordinal") => Some(Some(match args[0] {
+            V::Ref(h) => pseudo_get(vm, h, P_FLAGS).unwrap_or(V::I32(0)),
+            _ => V::I32(0),
+        })),
+        ("Ljava/time/Month;" | "Ljava/time/DayOfWeek;", "compareTo") => {
+            let ord = |v: V| match v {
+                V::Ref(h) => i64v(pseudo_get(vm, h, P_FLAGS).unwrap_or(V::I32(0))),
+                _ => 0,
+            };
+            let d = ord(args[0]) - ord(*args.get(1).unwrap_or(&V::I32(0)));
+            Some(Some(V::I32(d.signum() as i32)))
+        }
+        ("Ljava/time/Month;" | "Ljava/time/DayOfWeek;", "equals" | "hashCode") => {
+            let a = args[0];
+            Some(Some(if name == "equals" {
+                V::I32((a == *args.get(1).unwrap_or(&V::I32(0))) as i32)
+            } else {
+                match a {
+                    V::Ref(h) => pseudo_get(vm, h, P_FLAGS).unwrap_or(V::I32(0)),
+                    _ => V::I32(0),
+                }
+            }))
+        }
+        ("Ljava/time/Month;" | "Ljava/time/DayOfWeek;", "getDeclaringClass") => {
+            Some(Some(class_obj(vm, class.into())))
         }
         ("Ljava/time/LocalDate;", _) => localdate_call(vm, name, args)?,
         ("Ljava/time/LocalTime;", _) => localtime_call(vm, name, args)?,
@@ -563,15 +617,34 @@ const DAY_NAMES: [&str; 7] = [
 ];
 
 /// Mint a java.time enum constant: StrBuf name + P_FLAGS ordinal —
-/// the slots Enum.name()/ordinal()/compareTo read.
-fn jtime_enum(vm: &mut Vm, desc: &str, name: &str, ordinal: i32) -> V {
+/// the slots Enum.name()/ordinal()/compareTo read. Interned in
+/// `vm.enum_cache` so `date.getMonth() == Month.JANUARY` holds.
+pub(crate) fn jtime_enum(vm: &mut Vm, desc: &str, name: &str, ordinal: i32) -> V {
+    if let Some(&h) = vm.enum_cache.get(&(desc.to_string(), ordinal)) {
+        return V::Ref(h);
+    }
     let v = host(vm, desc, HostState::StrBuf(name.into()));
     if let V::Ref(h) = v {
         let nm = jstr(vm, name);
         pseudo_set(vm, h, P_DATA, nm);
         pseudo_set(vm, h, P_FLAGS, V::I32(ordinal));
+        vm.enum_cache.insert((desc.to_string(), ordinal), h);
     }
     v
+}
+
+/// Ordinal of a Month/DayOfWeek constant by name — used by the
+/// self-typed static field path (`Month.JANUARY`) so constants carry
+/// the right ordinal and share handles with `Month.of(1)` results.
+pub(crate) fn jtime_enum_ordinal(owner: &str, name: &str) -> Option<i32> {
+    match owner {
+        "Ljava/time/Month;" => MONTH_NAMES
+            .iter()
+            .position(|n| *n == name)
+            .map(|i| i as i32),
+        "Ljava/time/DayOfWeek;" => DAY_NAMES.iter().position(|n| *n == name).map(|i| i as i32),
+        _ => None,
+    }
 }
 
 fn month_obj(vm: &mut Vm, m1_12: i64) -> V {
@@ -623,53 +696,68 @@ fn dim(y: i64, m: i64) -> i64 {
 }
 
 fn localdate_call(vm: &mut Vm, name: &str, args: &[V]) -> Rt<Option<Option<V>>> {
+    // Static factories have no receiver — args[0] is the first param.
+    if matches!(
+        name,
+        "now" | "ofInstant" | "of" | "ofEpochDay" | "ofYearDay" | "parse"
+    ) {
+        return Ok(match name {
+            "now" => Some(Some(host(
+                vm,
+                "Ljava/time/LocalDate;",
+                HostState::Millis(ldate_days(now_ms()) * 86_400_000),
+            ))),
+            "ofInstant" => Some(Some(host(
+                vm,
+                "Ljava/time/LocalDate;",
+                HostState::Millis(
+                    ldate_days(millis_of(vm, *args.first().unwrap_or(&V::I64(0)))) * 86_400_000,
+                ),
+            ))),
+            "of" => {
+                // of(year, month|Month, day) — month may be the enum.
+                let mv = match args.get(1) {
+                    Some(V::Ref(h)) => month_of(vm, V::Ref(*h)) as i64,
+                    _ => i64v(args.get(1).copied().unwrap_or(V::I32(1))),
+                };
+                let ms = days_from_civil(
+                    i64v(args.first().copied().unwrap_or(V::I32(1970))),
+                    mv,
+                    i64v(args.get(2).copied().unwrap_or(V::I32(1))),
+                ) * 86_400_000;
+                Some(Some(host(
+                    vm,
+                    "Ljava/time/LocalDate;",
+                    HostState::Millis(ms),
+                )))
+            }
+            "ofEpochDay" => Some(Some(host(
+                vm,
+                "Ljava/time/LocalDate;",
+                HostState::Millis(i64v(args.first().copied().unwrap_or(V::I64(0))) * 86_400_000),
+            ))),
+            "ofYearDay" => {
+                let y = i64v(args.first().copied().unwrap_or(V::I32(1970)));
+                let doy = i64v(args.get(1).copied().unwrap_or(V::I32(1)));
+                Some(Some(host(
+                    vm,
+                    "Ljava/time/LocalDate;",
+                    HostState::Millis((days_from_civil(y, 1, 1) + doy - 1) * 86_400_000),
+                )))
+            }
+            _ => {
+                let t = sv(vm, args.first().copied().unwrap_or(V::Ref(0))).unwrap_or_default();
+                Some(Some(host(
+                    vm,
+                    "Ljava/time/LocalDate;",
+                    HostState::Millis(ldate_days(parse_date(&t)) * 86_400_000),
+                )))
+            }
+        });
+    }
     let ms = millis_of(vm, args[0]);
     let (y, mo, d, ..) = ms_fields(ms);
     Ok(match name {
-        "now" | "ofInstant" => Some(Some(host(
-            vm,
-            "Ljava/time/LocalDate;",
-            HostState::Millis(ldate_days(now_ms()) * 86_400_000),
-        ))),
-        "of" => {
-            // of(year, month|Month, day) — month may be the enum.
-            let mv = match args.get(2) {
-                Some(V::Ref(h)) => month_of(vm, V::Ref(*h)) as i64,
-                _ => i64v(args.get(2).copied().unwrap_or(V::I32(1))),
-            };
-            let ms = days_from_civil(
-                i64v(args.get(1).copied().unwrap_or(V::I32(1970))),
-                mv,
-                i64v(args.get(3).copied().unwrap_or(V::I32(1))),
-            ) * 86_400_000;
-            Some(Some(host(
-                vm,
-                "Ljava/time/LocalDate;",
-                HostState::Millis(ms),
-            )))
-        }
-        "ofEpochDay" => Some(Some(host(
-            vm,
-            "Ljava/time/LocalDate;",
-            HostState::Millis(i64v(args.get(1).copied().unwrap_or(V::I64(0))) * 86_400_000),
-        ))),
-        "ofYearDay" => {
-            let y = i64v(args.get(1).copied().unwrap_or(V::I32(1970)));
-            let doy = i64v(args.get(2).copied().unwrap_or(V::I32(1)));
-            Some(Some(host(
-                vm,
-                "Ljava/time/LocalDate;",
-                HostState::Millis((days_from_civil(y, 1, 1) + doy - 1) * 86_400_000),
-            )))
-        }
-        "parse" => {
-            let t = sv(vm, args.get(1).copied().unwrap_or(V::Ref(0))).unwrap_or_default();
-            Some(Some(host(
-                vm,
-                "Ljava/time/LocalDate;",
-                HostState::Millis(ldate_days(parse_date(&t)) * 86_400_000),
-            )))
-        }
         "getYear" => Some(Some(V::I32(y as i32))),
         "getMonth" => Some(Some(month_obj(vm, mo))),
         "getMonthValue" => Some(Some(V::I32(mo as i32))),
@@ -757,46 +845,54 @@ fn localdate_call(vm: &mut Vm, name: &str, args: &[V]) -> Rt<Option<Option<V>>> 
 }
 
 fn localtime_call(vm: &mut Vm, name: &str, args: &[V]) -> Rt<Option<Option<V>>> {
+    // Static factories have no receiver — args[0] is the first param.
+    if matches!(
+        name,
+        "now" | "of" | "ofSecondOfDay" | "ofNanoOfDay" | "parse"
+    ) {
+        return Ok(match name {
+            "now" => Some(Some(host(
+                vm,
+                "Ljava/time/LocalTime;",
+                HostState::Millis(now_ms().rem_euclid(86_400_000)),
+            ))),
+            "of" | "ofSecondOfDay" | "ofNanoOfDay" => {
+                let ms = match name {
+                    "of" => {
+                        i64v(args.first().copied().unwrap_or(V::I32(0))) * 3_600_000
+                            + i64v(args.get(1).copied().unwrap_or(V::I32(0))) * 60_000
+                            + i64v(args.get(2).copied().unwrap_or(V::I32(0))) * 1000
+                            + i64v(args.get(3).copied().unwrap_or(V::I32(0))) / 1_000_000
+                    }
+                    "ofSecondOfDay" => i64v(args.first().copied().unwrap_or(V::I64(0))) * 1000,
+                    _ => i64v(args.first().copied().unwrap_or(V::I64(0))) / 1_000_000,
+                };
+                Some(Some(host(
+                    vm,
+                    "Ljava/time/LocalTime;",
+                    HostState::Millis(ms),
+                )))
+            }
+            _ => {
+                let t = sv(vm, args.first().copied().unwrap_or(V::Ref(0))).unwrap_or_default();
+                let mut tp = t.split(':');
+                let ms = tp.next().and_then(|x| x.parse::<i64>().ok()).unwrap_or(0) * 3_600_000
+                    + tp.next().and_then(|x| x.parse::<i64>().ok()).unwrap_or(0) * 60_000
+                    + tp.next()
+                        .and_then(|x| x.split('.').next().and_then(|v| v.parse::<i64>().ok()))
+                        .unwrap_or(0)
+                        * 1000;
+                Some(Some(host(
+                    vm,
+                    "Ljava/time/LocalTime;",
+                    HostState::Millis(ms),
+                )))
+            }
+        });
+    }
     // Stored as ms-of-day.
     let ms = millis_of(vm, args[0]);
     Ok(match name {
-        "now" => Some(Some(host(
-            vm,
-            "Ljava/time/LocalTime;",
-            HostState::Millis(now_ms().rem_euclid(86_400_000)),
-        ))),
-        "of" | "ofSecondOfDay" | "ofNanoOfDay" => {
-            let ms = match name {
-                "of" => {
-                    i64v(args.get(1).copied().unwrap_or(V::I32(0))) * 3_600_000
-                        + i64v(args.get(2).copied().unwrap_or(V::I32(0))) * 60_000
-                        + i64v(args.get(3).copied().unwrap_or(V::I32(0))) * 1000
-                        + i64v(args.get(4).copied().unwrap_or(V::I32(0))) / 1_000_000
-                }
-                "ofSecondOfDay" => i64v(args.get(1).copied().unwrap_or(V::I64(0))) * 1000,
-                _ => i64v(args.get(1).copied().unwrap_or(V::I64(0))) / 1_000_000,
-            };
-            Some(Some(host(
-                vm,
-                "Ljava/time/LocalTime;",
-                HostState::Millis(ms),
-            )))
-        }
-        "parse" => {
-            let t = sv(vm, args.get(1).copied().unwrap_or(V::Ref(0))).unwrap_or_default();
-            let mut tp = t.split(':');
-            let ms = tp.next().and_then(|x| x.parse::<i64>().ok()).unwrap_or(0) * 3_600_000
-                + tp.next().and_then(|x| x.parse::<i64>().ok()).unwrap_or(0) * 60_000
-                + tp.next()
-                    .and_then(|x| x.split('.').next().and_then(|v| v.parse::<i64>().ok()))
-                    .unwrap_or(0)
-                    * 1000;
-            Some(Some(host(
-                vm,
-                "Ljava/time/LocalTime;",
-                HostState::Millis(ms),
-            )))
-        }
         "getHour" => Some(Some(V::I32((ms / 3_600_000) as i32))),
         "getMinute" => Some(Some(V::I32(((ms / 60_000) % 60) as i32))),
         "getSecond" => Some(Some(V::I32(((ms / 1000) % 60) as i32))),
@@ -819,46 +915,51 @@ fn localtime_call(vm: &mut Vm, name: &str, args: &[V]) -> Rt<Option<Option<V>>> 
 }
 
 fn localdatetime_call(vm: &mut Vm, name: &str, args: &[V]) -> Rt<Option<Option<V>>> {
+    // Static factories have no receiver — args[0] is the first param.
+    if matches!(name, "now" | "of" | "parse" | "ofInstant") {
+        return Ok(match name {
+            "now" => Some(Some(host(
+                vm,
+                "Ljava/time/LocalDateTime;",
+                HostState::Millis(now_ms()),
+            ))),
+            "ofInstant" => Some(Some(host(
+                vm,
+                "Ljava/time/LocalDateTime;",
+                HostState::Millis(millis_of(vm, *args.first().unwrap_or(&V::I64(0)))),
+            ))),
+            "of" => {
+                let ms = days_from_civil(
+                    i64v(args.first().copied().unwrap_or(V::I32(1970))),
+                    match args.get(1) {
+                        Some(V::Ref(h)) => month_of(vm, V::Ref(*h)) as i64,
+                        _ => i64v(args.get(1).copied().unwrap_or(V::I32(1))),
+                    },
+                    i64v(args.get(2).copied().unwrap_or(V::I32(1))),
+                ) * 86_400_000
+                    + i64v(args.get(3).copied().unwrap_or(V::I32(0))) * 3_600_000
+                    + i64v(args.get(4).copied().unwrap_or(V::I32(0))) * 60_000
+                    + i64v(args.get(5).copied().unwrap_or(V::I32(0))) * 1000
+                    + i64v(args.get(6).copied().unwrap_or(V::I32(0))) / 1_000_000;
+                Some(Some(host(
+                    vm,
+                    "Ljava/time/LocalDateTime;",
+                    HostState::Millis(ms),
+                )))
+            }
+            _ => {
+                let t = sv(vm, args.first().copied().unwrap_or(V::Ref(0))).unwrap_or_default();
+                Some(Some(host(
+                    vm,
+                    "Ljava/time/LocalDateTime;",
+                    HostState::Millis(parse_date(&t)),
+                )))
+            }
+        });
+    }
     let ms = millis_of(vm, args[0]);
     let (y, mo, d, h, mi, s, n) = ms_fields(ms);
     Ok(match name {
-        "now" => Some(Some(host(
-            vm,
-            "Ljava/time/LocalDateTime;",
-            HostState::Millis(now_ms()),
-        ))),
-        "of" => {
-            let ms = days_from_civil(
-                i64v(args.get(1).copied().unwrap_or(V::I32(1970))),
-                match args.get(2) {
-                    Some(V::Ref(h)) => month_of(vm, V::Ref(*h)) as i64,
-                    _ => i64v(args.get(2).copied().unwrap_or(V::I32(1))),
-                },
-                i64v(args.get(3).copied().unwrap_or(V::I32(1))),
-            ) * 86_400_000
-                + i64v(args.get(4).copied().unwrap_or(V::I32(0))) * 3_600_000
-                + i64v(args.get(5).copied().unwrap_or(V::I32(0))) * 60_000
-                + i64v(args.get(6).copied().unwrap_or(V::I32(0))) * 1000
-                + i64v(args.get(7).copied().unwrap_or(V::I32(0))) / 1_000_000;
-            Some(Some(host(
-                vm,
-                "Ljava/time/LocalDateTime;",
-                HostState::Millis(ms),
-            )))
-        }
-        "parse" => {
-            let t = sv(vm, args.get(1).copied().unwrap_or(V::Ref(0))).unwrap_or_default();
-            Some(Some(host(
-                vm,
-                "Ljava/time/LocalDateTime;",
-                HostState::Millis(parse_date(&t)),
-            )))
-        }
-        "ofInstant" => Some(Some(host(
-            vm,
-            "Ljava/time/LocalDateTime;",
-            HostState::Millis(millis_of(vm, args[1])),
-        ))),
         "getYear" => Some(Some(V::I32(y as i32))),
         "getMonth" => Some(Some(month_obj(vm, mo))),
         "getMonthValue" => Some(Some(V::I32(mo as i32))),
