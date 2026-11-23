@@ -97,6 +97,51 @@ extern "C" {
         data: u64,
         out_size: *mut u64,
     ) -> i32;
+    #[cfg(target_os = "macos")]
+    fn mach_vm_region(
+        task: u32,
+        addr: *mut u64,
+        size: *mut u64,
+        flavor: i32,
+        info: *mut i32,
+        count: *mut u32,
+        object: *mut u32,
+    ) -> i32;
+}
+
+/// Is `p..p+n` writable user memory? Used to admit guest writes into
+/// real buffers that aren't in the guest zone (host-heap or mmap'd
+/// allocations the guest legitimately owns). Page-granular via Mach.
+#[cfg(target_os = "macos")]
+fn mem_writable(p: *const c_void, n: usize) -> bool {
+    // vm_region_basic_info_data_64_t, flavor VM_REGION_BASIC_INFO_64,
+    // count = 9 ints.
+    const FLAVOR: i32 = 9; // VM_REGION_BASIC_INFO_64
+    const VM_PROT_WRITE: i32 = 0x2;
+    let mut a = p as u64;
+    let end = a.saturating_add(n.max(1) as u64);
+    while a < end {
+        let mut size = 0u64;
+        let mut info = [0i32; 9];
+        let mut count = 9u32;
+        let mut obj = 0u32;
+        let kr = unsafe {
+            mach_vm_region(
+                mach_task_self(),
+                &mut a,
+                &mut size,
+                FLAVOR,
+                info.as_mut_ptr(),
+                &mut count,
+                &mut obj,
+            )
+        };
+        if kr != 0 || size == 0 || info[0] & VM_PROT_WRITE == 0 {
+            return false;
+        }
+        a = a.saturating_add(size);
+    }
+    true
 }
 
 /// Read `size` bytes of OUR address space via Mach — safe inside the
@@ -221,7 +266,7 @@ static TCB_MAP: std::sync::Mutex<Option<std::collections::HashMap<u64, usize>>> 
 /// (threads outlive VM windows; freeing under a live TPIDR would be
 /// worse than the leak).
 #[cfg(target_arch = "aarch64")]
-fn guest_tcb() -> *mut u64 {
+pub(crate) fn guest_tcb() -> *mut u64 {
     let tid = unsafe { mach_thread_id() };
     let mut g = TCB_MAP.lock().unwrap();
     let m = g.get_or_insert_with(std::collections::HashMap::new);
@@ -232,15 +277,25 @@ fn guest_tcb() -> *mut u64 {
     tcb[0] = tcb.as_ptr() as u64; // TLS_SLOT_SELF
     tcb[5] = 0x9e3779b97f4a7c15; // bionic stack guard slot
     m.insert(tid, tcb.as_ptr() as usize);
-    // Lock-free parallel list the signal handler can scan: tcb stored
-    // before tid so a torn read never pairs a tid with a stale tcb.
+    // Lock-free parallel list the signal handler can scan: the tid
+    // slot is claimed by CAS (check-then-store raced — two threads
+    // could take one slot and drop a TCB), then the tcb pointer is
+    // filled in. A scanner matching the tid before the store lands
+    // sees tcb=0 and falls through to the map.
     for i in (0..TCB_LIST.len()).step_by(2) {
-        if TCB_LIST[i + 1].load(std::sync::atomic::Ordering::Acquire) == 0 {
+        if TCB_LIST[i + 1]
+            .compare_exchange(
+                0,
+                tid,
+                std::sync::atomic::Ordering::AcqRel,
+                std::sync::atomic::Ordering::Acquire,
+            )
+            .is_ok()
+        {
             TCB_LIST[i].store(
                 tcb.as_ptr() as usize as u64,
                 std::sync::atomic::Ordering::Release,
             );
-            TCB_LIST[i + 1].store(tid, std::sync::atomic::Ordering::Release);
             break;
         }
     }
@@ -249,15 +304,47 @@ fn guest_tcb() -> *mut u64 {
 
 /// (tcb, tid) pairs appended at TCB creation; never removed.
 #[cfg(target_arch = "aarch64")]
-static TCB_LIST: [std::sync::atomic::AtomicU64; 256] =
-    [const { std::sync::atomic::AtomicU64::new(0) }; 256];
+static TCB_LIST: [std::sync::atomic::AtomicU64; 4096] =
+    [const { std::sync::atomic::AtomicU64::new(0) }; 4096];
+
+/// Shared zeroed TCB used by the segv healers when the faulting
+/// thread's own TCB can't be located (list full, map contended).
+#[cfg(target_arch = "aarch64")]
+static FALLBACK_TCB: [u64; TCB_WORDS] = [0; TCB_WORDS];
+
+/// Address of FALLBACK_TCB with the self pointer and stack-guard
+/// cookie primed (a zero guard trips `__stack_chk_fail` on retry).
+#[cfg(target_arch = "aarch64")]
+fn fallback_tcb() -> usize {
+    let tcb = FALLBACK_TCB.as_ptr() as *mut u64;
+    unsafe {
+        if *tcb.add(5) == 0 {
+            *tcb.add(5) = 0x9e37_79b9_7f4a_7c15;
+            *tcb = tcb as u64;
+        }
+    }
+    tcb as usize
+}
 
 /// TCB for `tid`, scannable from the async-signal handler.
 #[cfg(target_arch = "aarch64")]
 fn tcb_for(tid: u64) -> usize {
     for i in (0..TCB_LIST.len()).step_by(2) {
         if TCB_LIST[i + 1].load(std::sync::atomic::Ordering::Acquire) == tid {
-            return TCB_LIST[i].load(std::sync::atomic::Ordering::Acquire) as usize;
+            let p = TCB_LIST[i].load(std::sync::atomic::Ordering::Acquire) as usize;
+            if p != 0 {
+                return p;
+            }
+        }
+    }
+    // Fallback: the lock-free list can fill before a thread's slot
+    // insert runs; the map is authoritative when we can take it
+    // without blocking (deadlock risk is why this is only a fallback).
+    if let Ok(g) = TCB_MAP.try_lock() {
+        if let Some(m) = g.as_ref() {
+            if let Some(&p) = m.get(&tid) {
+                return p;
+            }
         }
     }
     0
@@ -324,8 +411,15 @@ pub(crate) fn with_guest_tls_at<R>(site: &'static str, f: impl FnOnce() -> R) ->
         TLS_TRACE[2].store(old as u64, std::sync::atomic::Ordering::Relaxed);
         TLS_TRACE[3].store(0, std::sync::atomic::Ordering::Relaxed);
 
-        *tcb.add(SLOT_HOST_TPIDR) = old as u64;
-        core::arch::asm!("msr tpidr_el0, {}", in(reg) tcb as usize);
+        // A clobbered TPIDR (<4KiB) must not be saved as the thread's
+        // host TPIDR — the thunk would reinstall garbage on every call.
+        if old >= 0x1000 {
+            *tcb.add(SLOT_HOST_TPIDR) = old as u64;
+        }
+        core::arch::asm!(
+            "msr tpidr_el0, {t}\nmov x18, {t}",
+            t = in(reg) tcb as usize
+        );
         TLS_TRACE[8].store(tcb as usize as u64, std::sync::atomic::Ordering::Relaxed);
         // OVELO_TLSPROBE: allocation inside the swapped window — if the
         // crash is malloc's TPIDR-keyed per-thread magazine state, a
@@ -390,13 +484,43 @@ extern "C" fn sh_pthread_create(
             unsafe { mach_thread_id() }
         );
         unsafe {
+            // BSD signal delivery pushes a frame on the faulting
+            // thread's SP; with a corrupt SP and no alternate stack
+            // the kernel declares the exception unrecoverable and
+            // SIGKILLs the task. Every guest thread gets its own
+            // sigaltstack so the segv handler always runs.
+            #[cfg(target_os = "macos")]
+            {
+                let mut old = SigStack {
+                    ss_sp: std::ptr::null_mut(),
+                    ss_size: 0,
+                    ss_flags: 0,
+                };
+                sigaltstack(std::ptr::null(), &mut old);
+                if old.ss_sp.is_null() {
+                    let stk = mmap(std::ptr::null_mut(), 128 * 1024, 3, 0x1002, -1, 0);
+                    if stk as isize != -1 {
+                        let ss = SigStack {
+                            ss_sp: stk,
+                            ss_size: 128 * 1024,
+                            ss_flags: 0,
+                        };
+                        sigaltstack(&ss, std::ptr::null_mut());
+                    }
+                }
+            }
+        }
+        unsafe {
             // Per-thread guest TCB; env thunks on this thread swap to
             // whatever TPIDR the thread started with (host garbage).
             let tcb = guest_tcb();
             let mut old: usize;
             core::arch::asm!("mrs {}, tpidr_el0", out(reg) old);
             *tcb.add(SLOT_HOST_TPIDR) = old as u64;
-            core::arch::asm!("msr tpidr_el0, {}", in(reg) tcb as usize);
+            core::arch::asm!(
+                "msr tpidr_el0, {t}\nmov x18, {t}",
+                t = in(reg) tcb as usize
+            );
             TLS_TRACE[10].store(tcb as usize as u64, std::sync::atomic::Ordering::Relaxed);
             let f: extern "C" fn(usize) -> usize = std::mem::transmute(entry);
             let r = f(arg) as *mut c_void;
@@ -480,7 +604,7 @@ mod thunk {
     //   ldp  x29, x30, [sp, #160]
     //   add  sp, sp, #192
     //   ret
-    const SLOT: usize = 160;
+    const SLOT: usize = 256;
     // One thunk per resolved import — big .so trees (godot+libc++)
     // need tens of thousands.
     const PAGE: usize = 0x400000;
@@ -624,36 +748,69 @@ mod thunk {
                 ins.extend_from_slice(&[0xA8C1_2E2A, 0xA881_2D2A]);
             }
             ins.extend_from_slice(&[
-                0xD53B_D05D, // 24: mrs x29, tpidr_el0 — this thread's TCB
-                0xF97F_FFB0, // 25: ldr x16, [x29, #0x7ff8] — saved host TPIDR
-                0xD51B_D050, // 26: msr tpidr_el0, x16
+                0xAA1D_03F0, // 24: mov x16, x29 — guest fp
+                0xD53B_D05D, // 25: mrs x29, tpidr_el0 — this thread's TCB
+                0xF93F_EFB0, // 26: str x16, [x29, #0x7fd8] — guest fp
+                0xF93F_FBBE, // 27: str x30, [x29, #0x7ff0] — guest call site
+                0xF97F_FFB0, // 28: ldr x16, [x29, #0x7ff8] — saved host TPIDR
+                0xD51B_D050, // 29: msr tpidr_el0, x16
             ]);
-            ins.extend_from_slice(&trace_stores(at, 108, 6, 16)); // 27-28: TRACE[6]=swap val
+            ins.extend_from_slice(&trace_stores(at, 120, 6, 16)); // 30-31: TRACE[6]=swap val
             ins.extend_from_slice(&[
-                0x5800_0130, // 29: ldr x16, +36 -> target literal at byte 152
-                0xD63F_0200, // 30: blr x16
-                0xD51B_D05D, // 31: msr tpidr_el0, x29 — back to guest TCB
+                0x5800_0210, // 32: ldr x16, +64 -> target literal at byte 192
+                0xF93F_F7B0, // 33: str x16, [x29, #0x7fe8] — import target
+                0xF97F_F3B1, // 34: ldr x17, [x29, #0x7fe0] — in-call depth
+                0x9100_0631, // 35: add x17, x17, #1
+                0xF93F_F3B1, // 36: str x17, [x29, #0x7fe0]
+                0xD63F_0200, // 37: blr x16
+                0xD51B_D05D, // 38: msr tpidr_el0, x29 — back to guest TCB
+                0xF97F_F3B1, // 39: ldr x17, [x29, #0x7fe0] — depth--
+                0xD100_0631, // 40: sub x17, x17, #1
+                0xF93F_F3B1, // 41: str x17, [x29, #0x7fe0]
             ]);
-            ins.extend_from_slice(&trace_stores(at, 128, 7, 29)); // 32-33: TRACE[7]=restore val
+            ins.extend_from_slice(&trace_stores(at, 168, 7, 29)); // 42-43: TRACE[7]=restore val
             ins.extend_from_slice(&[
-                0xA94A_7BFD, // 34: ldp x29,x30,[sp,#168]
-                0x9103_03FF, // 35: add sp, sp, #192
-                0xD65F_03C0, // 36: ret
-                0xD503_201F, // 37: pad before literal
+                0xA94A_7BFD, // 44: ldp x29,x30,[sp,#168]
+                0x9103_03FF, // 45: add sp, sp, #192
+                0xD65F_03C0, // 46: ret
+                0xD503_201F, // 47: pad before literal
             ]);
-            debug_assert_eq!(ins.len(), 38);
+            debug_assert_eq!(ins.len(), 48);
             for (i, ins) in ins.iter().enumerate() {
                 w.add(i).write_volatile(*ins);
             }
-            // Target literal at byte 152, reached by `ldr x16, +36` from
-            // insn 29 (byte 116).
-            let lit = (at + 152) as *mut usize;
+            // Target literal at byte 192, reached by `ldr x16, +64` from
+            // insn 32 (byte 128).
+            let lit = (at + 192) as *mut usize;
             lit.write_volatile(target);
             pthread_jit_write_protect_np(1);
             sys_icache_invalidate(at as *mut c_void, SLOT);
         }
         at
     }
+}
+
+/// Symbol names of thunk targets, for the watchdog's last-call
+/// attribution: target addr -> import/shim name.
+#[cfg(target_os = "macos")]
+static TARGET_NAMES: Mutex<Option<HashMap<usize, String>>> = Mutex::new(None);
+
+/// Record the import name a resolved address belongs to.
+#[cfg(target_os = "macos")]
+pub(crate) fn name_target(addr: usize, name: &str) {
+    if let Ok(mut g) = TARGET_NAMES.lock() {
+        g.get_or_insert_with(HashMap::new)
+            .insert(addr, name.to_string());
+    }
+}
+
+/// Import name for a thunk target, if registered.
+#[cfg(target_os = "macos")]
+pub(crate) fn target_name(addr: usize) -> Option<String> {
+    TARGET_NAMES
+        .try_lock()
+        .ok()
+        .and_then(|g| g.as_ref().and_then(|m| m.get(&addr).cloned()))
 }
 
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
@@ -748,7 +905,7 @@ unsafe fn heal_tls_fault(si: usize, insn: u32, mc: *mut u8) -> bool {
     let rn = ((insn >> 5) & 31) as usize;
     let imm = (((insn >> 10) & 0xfff) * 8) as usize;
     let base = unsafe { *(mc.add(16 + rn * 8) as *const usize) };
-    if base >= 0x1000 || si != base.wrapping_add(imm) {
+    if si != base.wrapping_add(imm) {
         return false;
     }
     // A smashed TPIDR is only a plausible diagnosis when the base
@@ -756,9 +913,17 @@ unsafe fn heal_tls_fault(si: usize, insn: u32, mc: *mut u8) -> bool {
     // `mrs xN,TPIDR_EL0` to have loaded it, with no clobber and no
     // control flow in between. Otherwise this is a genuine near-null
     // deref and must fault normally — healing a store here would
-    // scribble into the guest TCB and keep running corrupted.
+    // scribble into the guest TCB and keep running corrupted. (The
+    // smashed value is not always small — Darwin can leave any
+    // garbage in TPIDR, including a pointer into an unmapped hole.)
     let pc = unsafe { *(mc.add(272) as *const usize) };
     let want_mrs = 0xD53B_D040 | rn as u32;
+    // `.so` text patched at load reads the TLS base from x18 instead
+    // (`mrs xN,TPIDR_EL0` → `mov xN,x18`); both forms prove the base
+    // held the thread pointer. The mov form additionally means x18
+    // itself was unset — restore it in the context on heal.
+    let want_mov = 0xAA12_03E0 | rn as u32;
+    let mut x18_heal = false;
     // Stack slots the smashed value may have been spilled to between
     // the `mrs` and the fault: `str xN,[sp/x29,#off]`. The register is
     // patched by the retry, but a spilled copy stays corrupt — the
@@ -784,6 +949,11 @@ unsafe fn heal_tls_fault(si: usize, insn: u32, mc: *mut u8) -> bool {
         }
         let b = unsafe { *(addr as *const u32) };
         if b == want_mrs {
+            proven = true;
+            break;
+        }
+        if b == want_mov {
+            x18_heal = true;
             proven = true;
             break;
         }
@@ -838,14 +1008,18 @@ unsafe fn heal_tls_fault(si: usize, insn: u32, mc: *mut u8) -> bool {
     if !proven {
         return false;
     }
-    let tcb = tcb_for(unsafe { mach_thread_id() });
-    if tcb == 0 {
-        return false;
-    }
     // The value the thread expects depends on whose code faulted:
     // guest `.so`/thunk code runs on the guest TCB, while a host lib
     // entered through a thunk runs on the host TPIDR stashed in the
     // TCB slot — Darwin's boundary rewrite clobbers either one.
+    // When the faulting thread's TCB can't be found (list full, map
+    // contended), fall back to a shared zeroed block: thunk stores
+    // land harmlessly, and the host-TPIDR slot reads 0 so a host-call
+    // fault resolves via the dead-call heal.
+    let mut tcb = tcb_for(unsafe { mach_thread_id() });
+    if tcb == 0 {
+        tcb = fallback_tcb();
+    }
     let restore = if code_mapped(pc) {
         tcb
     } else {
@@ -862,6 +1036,14 @@ unsafe fn heal_tls_fault(si: usize, insn: u32, mc: *mut u8) -> bool {
                 .wrapping_add(*off) as *mut usize;
             *slot = restore;
         }
+        // Durable fix: restore the thread's real TPIDR too — patching
+        // only this register leaves TPIDR smashed, so every later TLS
+        // read faults again (thousands of signal round-trips) or reads
+        // silently wrong data when the smashed value happens to map.
+        core::arch::asm!("msr tpidr_el0, {}", in(reg) restore);
+        if x18_heal {
+            *(mc.add(16 + 18 * 8) as *mut usize) = restore;
+        }
         let s = b"[segv-heal]\n";
         write(2, s.as_ptr() as *const c_void, s.len());
     }
@@ -870,6 +1052,70 @@ unsafe fn heal_tls_fault(si: usize, insn: u32, mc: *mut u8) -> bool {
 
 #[cfg(all(target_os = "macos", not(target_arch = "aarch64")))]
 unsafe fn heal_tls_fault(_si: usize, _insn: u32, _mc: *mut u8) -> bool {
+    false
+}
+
+/// Dead-call heal: the fault sits inside a host routine the guest
+/// reached through an import thunk (the thunk's in-call depth at
+/// TCB+0x7fe0 is nonzero), with an argument that is already wild —
+/// retrying the faulting instruction cannot help, and TPIDR healing
+/// is irrelevant because the bad pointer was computed earlier. Skip
+/// the call instead: return NULL to the guest call site (TCB+0x7ff0),
+/// restore the guest fp (TCB+0x7fd8) and this thread's guest TPIDR
+/// (the handler runs on the faulting thread), and pop the depth the
+/// thunk's epilogue would have. Better a stubbed call than a dead
+/// process.
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+unsafe fn heal_dead_thunk_call(mc: *mut u8) -> bool {
+    let pc = unsafe { *(mc.add(272) as *const usize) };
+    if code_mapped(pc) {
+        return false;
+    }
+    let mut tcb = tcb_for(unsafe { mach_thread_id() });
+    if tcb == 0 {
+        tcb = fallback_tcb();
+    }
+    let base = tcb as *const usize;
+    let depth = unsafe { *base.add(0x7fe0 / 8) };
+    let site = unsafe { *base.add(0x7ff0 / 8) };
+    let gfp = unsafe { *base.add(0x7fd8 / 8) };
+    if depth == 0 || site == 0 || !code_mapped(site) {
+        return false;
+    }
+    let target = unsafe { *base.add(0x7fe8 / 8) };
+    unsafe {
+        *(tcb as *mut usize).add(0x7fe0 / 8) = depth - 1;
+        if gfp != 0 {
+            *(mc.add(248) as *mut usize) = gfp; // x29: guest fp
+        }
+        *(mc.add(16) as *mut usize) = 0; // x0: NULL-ish return
+        *(mc.add(256) as *mut usize) = site; // lr
+        *(mc.add(272) as *mut usize) = site; // pc: insn after `blr thunk`
+        core::arch::asm!("msr tpidr_el0, {}", in(reg) tcb);
+        let mut msg = [0u8; 128];
+        let p = b"[segv-skipcall] t=";
+        msg[..p.len()].copy_from_slice(p);
+        let mut n = p.len();
+        for i in (0..16).rev() {
+            msg[n] = b"0123456789abcdef"[(target >> (i * 4)) & 0xf];
+            n += 1;
+        }
+        msg[n] = b' ';
+        n += 1;
+        if let Some(name) = target_name(target) {
+            for &c in name.as_bytes().iter().take(48) {
+                msg[n] = c;
+                n += 1;
+            }
+        }
+        msg[n] = b'\n';
+        write(2, msg.as_ptr() as *const c_void, n + 1);
+    }
+    true
+}
+
+#[cfg(all(target_os = "macos", not(target_arch = "aarch64")))]
+unsafe fn heal_dead_thunk_call(_mc: *mut u8) -> bool {
     false
 }
 
@@ -884,6 +1130,11 @@ pub fn install_crash_dump() {
         // macOS arm64: ucontext_t → uc_mcontext → mcontext64.
         extern "C" fn on_segv(_sig: i32, _info: *mut c_void, ctx: *mut c_void) {
             unsafe {
+                // Prove BSD delivery happened before any op that could
+                // itself fault (lock/malloc in eprintln is not safe).
+                let mut tag = *b"[segv-in sig=0]\n";
+                tag[12] = b'0' + (_sig.clamp(0, 9) as u8);
+                write(2, tag.as_ptr() as *const c_void, tag.len());
                 // ucontext_t: uc_mcontext at offset 48 → mcontext64:
                 // es(16) then ss: x[0..28](232) fp lr sp pc — so
                 // sp=+264, pc=+272 from uc_mcontext.
@@ -906,6 +1157,41 @@ pub fn install_crash_dump() {
                 // branch): read through Mach, never dereference.
                 let insn = safe_read_u32(pc).unwrap_or(0);
                 if insn != 0 && heal_tls_fault(si, insn, mc as *mut u8) {
+                    return;
+                }
+                if heal_dead_thunk_call(mc as *mut u8) {
+                    return;
+                }
+                // Branch to a null target (pc 0..~4KiB, fault addr 0):
+                // nothing on this thread can recover — its own retry
+                // just livelocks on the exception port at ~20k/s and
+                // BSD delivery can stop entirely. Dump the caller
+                // (x30 = return address past the `blr`) and the first
+                // guest-frame links, then suspend the thread.
+                if pc < 0x1000 && si < 0x1000 {
+                    let mut m = *b"[segv-null] lr=................ fp=................ l1=................ l2=................\n";
+                    let mut put = |off: usize, v: usize| {
+                        for i in 0..16 {
+                            m[off + i] = b"0123456789abcdef"[(v >> ((15 - i) * 4)) & 0xf];
+                        }
+                    };
+                    put(14, x30);
+                    put(30, fp);
+                    for (k, off) in [(0usize, 50usize), (1, 68)] {
+                        if fp != 0
+                            && fp.is_multiple_of(8)
+                            && safe_read_u32(fp + 16 * k + 8).is_some()
+                        {
+                            let l = *(fp as *const usize).add(1 + 2 * k);
+                            put(off, l);
+                        }
+                    }
+                    write(2, m.as_ptr() as *const c_void, m.len());
+                    extern "C" {
+                        fn mach_thread_self() -> u32;
+                        fn thread_suspend(t: u32) -> i32;
+                    }
+                    thread_suspend(mach_thread_self());
                     return;
                 }
                 // Classify the fault victim: which malloc zone (if any)
@@ -1151,21 +1437,29 @@ pub fn install_crash_dump() {
             // ideally get its own but the main thread covers the dex
             // dispatch path and .so-spawned pthreads rarely fault on
             // a broken stack.
-            let stk = mmap(
-                std::ptr::null_mut(),
-                128 * 1024,
-                3,      // PROT_READ|PROT_WRITE
-                0x1002, // MAP_PRIVATE|MAP_ANON
-                -1,
-                0,
-            );
-            if !stk.is_null() && stk as isize != -1 {
-                let ss = SigStack {
-                    ss_sp: stk,
-                    ss_size: 128 * 1024,
-                    ss_flags: 0,
-                };
-                sigaltstack(&ss, std::ptr::null_mut());
+            let mut old = SigStack {
+                ss_sp: std::ptr::null_mut(),
+                ss_size: 0,
+                ss_flags: 0,
+            };
+            sigaltstack(std::ptr::null(), &mut old);
+            if old.ss_sp.is_null() {
+                let stk = mmap(
+                    std::ptr::null_mut(),
+                    128 * 1024,
+                    3,      // PROT_READ|PROT_WRITE
+                    0x1002, // MAP_PRIVATE|MAP_ANON
+                    -1,
+                    0,
+                );
+                if !stk.is_null() && stk as isize != -1 {
+                    let ss = SigStack {
+                        ss_sp: stk,
+                        ss_size: 128 * 1024,
+                        ss_flags: 0,
+                    };
+                    sigaltstack(&ss, std::ptr::null_mut());
+                }
             }
             let sa = Sigaction {
                 sa_sigaction: on_segv as *const () as usize,
@@ -1175,6 +1469,8 @@ pub fn install_crash_dump() {
             sigaction(11, &sa, std::ptr::null_mut());
             sigaction(10, &sa, std::ptr::null_mut()); // SIGBUS — writes to non-writable guest pages
             sigaction(4, &sa, std::ptr::null_mut()); // SIGILL — bad guest insn
+            excport::start();
+            excport::start_watchdog();
         }
         let _ = dladdr as *const (); // keep decl referenced
     }
@@ -1326,7 +1622,13 @@ extern "C" fn sh_pure_virtual() -> ! {
     std::process::abort()
 }
 extern "C" fn sh_stack_chk_fail() -> ! {
-    eprintln!("[native] __stack_chk_fail");
+    let tcb = tcb_for(unsafe { mach_thread_id() });
+    let site = if tcb != 0 {
+        unsafe { *(tcb as *const usize).add(0x7ff0 / 8) }
+    } else {
+        0
+    };
+    eprintln!("[native] __stack_chk_fail site={:#x?}", so_off(site));
     std::process::abort()
 }
 extern "C" fn sh_cxa_finalize(_p: *mut c_void) {}
@@ -1354,6 +1656,16 @@ extern "C" fn sh_chk_fail() -> ! {
     std::process::abort()
 }
 extern "C" fn sh_strlen_chk(s: *const i8, slen: usize) -> usize {
+    #[cfg(target_os = "macos")]
+    let n = if guest_dst_ok(s as usize, 1) {
+        unsafe { strlen(s) }
+    } else {
+        match safe_strlen(s as *const c_void) {
+            Some(n) => n,
+            None => return 0,
+        }
+    };
+    #[cfg(not(target_os = "macos"))]
     let n = unsafe { strlen(s) };
     if n >= slen {
         sh_chk_fail();
@@ -1367,6 +1679,14 @@ extern "C" fn sh_mb_cur_max() -> usize {
 }
 extern "C" fn sh_strcpy_chk(d: *mut i8, s: *const i8, dlen: usize) -> *mut i8 {
     unsafe {
+        #[cfg(target_os = "macos")]
+        if !guest_dst_ok(s as usize, 1) {
+            match safe_strlen(s as *const c_void) {
+                Some(n) if n < dlen => return strncpy(d, s, n + 1),
+                Some(_) => sh_chk_fail(),
+                None => return d,
+            }
+        }
         if strlen(s) + 1 > dlen {
             sh_chk_fail();
         }
@@ -1379,6 +1699,10 @@ extern "C" fn sh_strchr_chk(s: *const i8, c: i32, slen: usize) -> *mut i8 {
     let p = s as *const u8;
     unsafe {
         for i in 0..slen {
+            #[cfg(target_os = "macos")]
+            if !guest_dst_ok(p as usize, 1) && !src_readable(p.add(i) as *const c_void, 1) {
+                return std::ptr::null_mut();
+            }
             let b = *p.add(i);
             if b == c as u8 {
                 return p.add(i) as *mut i8;
@@ -1402,6 +1726,19 @@ extern "C" fn sh_memmove_chk(
     unsafe { memmove(d, s, n) }
 }
 extern "C" fn sh_strcat_chk(d: *mut i8, s: *const i8, dlen: usize) -> *mut i8 {
+    #[cfg(target_os = "macos")]
+    {
+        let (dl, sl) = (
+            safe_strlen(d as *const c_void),
+            safe_strlen(s as *const c_void),
+        );
+        match (dl, sl) {
+            (Some(dl), Some(sl)) if dl + sl < dlen => unsafe { strcat(d, s) },
+            (Some(_), Some(_)) => sh_chk_fail(),
+            _ => d,
+        }
+    }
+    #[cfg(not(target_os = "macos"))]
     unsafe {
         if strlen(d) + strlen(s) + 1 > dlen {
             sh_chk_fail();
@@ -1485,10 +1822,60 @@ extern "C" fn sh_strncpy_chk2(
     if n > dlen || n > max_n {
         sh_chk_fail();
     }
+    #[cfg(target_os = "macos")]
+    if !guest_dst_ok(s as usize, 1) && !src_readable(s as *const c_void, n) {
+        guestptr_log("strncpy_chk2-src", s as *mut c_void, n);
+        return d;
+    }
     unsafe { strncpy(d, s, n) }
 }
 extern "C" fn sh_system_property_get(_name: *const i8, value: *mut i8) -> i32 {
     unsafe { *value = 0 };
+    0
+}
+/// Bionic `pthread_once_t` is a bare int — handing it to Darwin's
+/// `pthread_once` makes the host validate a signature word the guest
+/// never wrote and then `__libc_fatal`-trap (a `BRK`: uncatchable,
+/// observed as the silent SIGKILL inside `GodotLib_setup`). Keyed
+/// guest-side once instead, like the mutex/cond/rwlock shims.
+#[cfg(target_os = "macos")]
+extern "C" fn sh_pthread_once(ctrl: *mut i32, init: extern "C" fn()) -> i32 {
+    if ctrl.is_null() || (init as usize) == 0 {
+        return -1;
+    }
+    static DONE: Mutex<Option<HashMap<usize, bool>>> = Mutex::new(None);
+    let key = ctrl as usize;
+    if DONE
+        .lock()
+        .map(|m| m.as_ref().and_then(|h| h.get(&key)) == Some(&true))
+        .unwrap_or(false)
+    {
+        return 0;
+    }
+    static GATE: Mutex<()> = Mutex::new(());
+    let _g = match GATE.lock() {
+        Ok(g) => g,
+        Err(_) => return -1,
+    };
+    if let Ok(mut m) = DONE.lock() {
+        let h = m.get_or_insert_with(HashMap::new);
+        if h.get(&key) == Some(&true) {
+            return 0;
+        }
+        h.insert(key, false);
+    }
+    // `init` is a guest function pointer — it must run with this
+    // thread's guest TCB installed, exactly like DT_INIT entries.
+    #[cfg(target_arch = "aarch64")]
+    with_guest_tls_at("pthread_once", || init());
+    #[cfg(not(target_arch = "aarch64"))]
+    init();
+    if let Ok(mut m) = DONE.lock() {
+        m.get_or_insert_with(HashMap::new).insert(key, true);
+    }
+    unsafe {
+        *ctrl = 1; // bionic done marker
+    }
     0
 }
 extern "C" fn sh_getaffinity(_pid: i32, size: usize, mask: *mut u8) -> i32 {
@@ -1553,9 +1940,116 @@ extern "C" fn sh_open2(path: *const i8, flags: i32) -> i32 {
 /// guest-zone, `.so` image, or stack — the write is skipped so the
 /// app keeps running and we see who asked for it.
 #[cfg(target_os = "macos")]
+fn guestptr_log(tag: &str, d: *mut c_void, n: usize) {
+    static N: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    if N.fetch_add(1, std::sync::atomic::Ordering::Relaxed) < 20 {
+        let tcb = tcb_for(unsafe { mach_thread_id() });
+        let site = if tcb != 0 {
+            unsafe { *(tcb as *const usize).add(0x7ff0 / 8) }
+        } else {
+            0
+        };
+        eprintln!(
+            "[guestptr] {tag} dst {d:p}+{n:#x} rd={} not guest/stack/image — skipped (from {:#x?})",
+            src_readable(d, n.min(16)),
+            so_off(site)
+        );
+    }
+}
+/// Read-probe for a possibly-wild memcpy source: a src that fails the
+/// guest/stack/image test is usually a legit host pointer, but a wild
+/// one crashes inside the real memcpy (observed in Godot's step loop).
+/// Probe one byte per page via Mach and cache the verdict per page.
+#[cfg(target_os = "macos")]
+fn src_readable(p: *const c_void, n: usize) -> bool {
+    use std::collections::HashSet;
+    static GOOD: std::sync::LazyLock<Mutex<HashSet<usize>>> =
+        std::sync::LazyLock::new(|| Mutex::new(HashSet::new()));
+    static BAD: std::sync::LazyLock<Mutex<HashSet<usize>>> =
+        std::sync::LazyLock::new(|| Mutex::new(HashSet::new()));
+    if n == 0 {
+        return true;
+    }
+    let a = p as usize;
+    let last = a.saturating_add(n - 1) & !0xfff;
+    let mut page = a & !0xfff;
+    loop {
+        let ok = if GOOD.lock().map(|g| g.contains(&page)).unwrap_or(false) {
+            true
+        } else if BAD.lock().map(|b| b.contains(&page)).unwrap_or(false) {
+            false
+        } else {
+            let mut got = 0u64;
+            let mut byte = 0u8;
+            let kr = unsafe {
+                mach_vm_read_overwrite(
+                    mach_task_self(),
+                    page as u64,
+                    1,
+                    &mut byte as *mut u8 as u64,
+                    &mut got,
+                )
+            };
+            let ok = kr == 0 && got == 1;
+            let _ = (if ok { &GOOD } else { &BAD }).lock().map(|mut s| {
+                if s.len() < 8192 {
+                    s.insert(page);
+                }
+            });
+            ok
+        };
+        if !ok {
+            return false;
+        }
+        if page >= last || page > usize::MAX - 0x1000 {
+            return true;
+        }
+        page += 0x1000;
+    }
+}
+/// strlen that cannot fault: scans through `mach_vm_read_overwrite`
+/// page chunks instead of dereferencing. `None` = first page unreadable
+/// (wild pointer); a string hitting an unmapped page mid-scan returns
+/// the truncated length (caller copies what's there).
+#[cfg(target_os = "macos")]
+fn safe_strlen(s: *const c_void) -> Option<usize> {
+    let mut buf = [0u8; 4096];
+    let mut off = 0usize;
+    loop {
+        let mut got = 0u64;
+        let kr = unsafe {
+            mach_vm_read_overwrite(
+                mach_task_self(),
+                s.add(off) as u64,
+                4096,
+                buf.as_mut_ptr() as u64,
+                &mut got,
+            )
+        };
+        if kr != 0 || got == 0 {
+            return if off == 0 { None } else { Some(off) };
+        }
+        let n = got as usize;
+        if let Some(i) = buf[..n].iter().position(|&b| b == 0) {
+            return Some(off + i);
+        }
+        if n < 4096 {
+            return Some(off + n);
+        }
+        off += 4096;
+        if off > 64 * 1024 * 1024 {
+            return Some(off);
+        }
+    }
+}
+#[cfg(target_os = "macos")]
 extern "C" fn sh_memcpy(d: *mut c_void, s: *const c_void, n: usize) -> *mut c_void {
     if !guest_dst_ok(d as usize, n) {
-        eprintln!("[guestptr] memcpy dst {d:p}+{n:#x} not guest/stack/image — skipped");
+        guestptr_log("memcpy", d, n);
+        return d;
+    }
+    if !guest_dst_ok(s as usize, 1) && !src_readable(s, n) {
+        guestptr_log("memcpy-src", s as *mut c_void, n);
         return d;
     }
     unsafe { memcpy(d, s, n) }
@@ -1563,7 +2057,11 @@ extern "C" fn sh_memcpy(d: *mut c_void, s: *const c_void, n: usize) -> *mut c_vo
 #[cfg(target_os = "macos")]
 extern "C" fn sh_memmove(d: *mut c_void, s: *const c_void, n: usize) -> *mut c_void {
     if !guest_dst_ok(d as usize, n) {
-        eprintln!("[guestptr] memmove dst {d:p}+{n:#x} not guest/stack/image — skipped");
+        guestptr_log("memmove", d, n);
+        return d;
+    }
+    if !guest_dst_ok(s as usize, 1) && !src_readable(s, n) {
+        guestptr_log("memmove-src", s as *mut c_void, n);
         return d;
     }
     unsafe { memmove(d, s, n) }
@@ -1571,26 +2069,38 @@ extern "C" fn sh_memmove(d: *mut c_void, s: *const c_void, n: usize) -> *mut c_v
 #[cfg(target_os = "macos")]
 extern "C" fn sh_memset(d: *mut c_void, c: i32, n: usize) -> *mut c_void {
     if !guest_dst_ok(d as usize, n) {
-        eprintln!("[guestptr] memset dst {d:p}+{n:#x} not guest/stack/image — skipped");
+        guestptr_log("memset", d, n);
         return d;
     }
     unsafe { memset(d, c, n) }
 }
 #[cfg(target_os = "macos")]
 extern "C" fn sh_strcpy(d: *mut c_void, s: *const c_void) -> *mut c_void {
-    unsafe {
-        let n = strlen(s as *const i8) + 1;
-        if !guest_dst_ok(d as usize, n) {
-            eprintln!("[guestptr] strcpy dst {d:p}+{n:#x} not guest/stack/image — skipped");
-            return d;
+    let n = if guest_dst_ok(s as usize, 1) {
+        unsafe { strlen(s as *const i8) + 1 }
+    } else {
+        match safe_strlen(s) {
+            Some(n) => n + 1,
+            None => {
+                guestptr_log("strcpy-src", s as *mut c_void, 0);
+                return d;
+            }
         }
-        memcpy(d, s, n)
+    };
+    if !guest_dst_ok(d as usize, n) {
+        guestptr_log("strcpy", d, n);
+        return d;
     }
+    unsafe { memcpy(d, s, n) }
 }
 #[cfg(target_os = "macos")]
 extern "C" fn sh_strncpy(d: *mut c_void, s: *const c_void, n: usize) -> *mut c_void {
     if !guest_dst_ok(d as usize, n) {
-        eprintln!("[guestptr] strncpy dst {d:p}+{n:#x} not guest/stack/image — skipped");
+        guestptr_log("strncpy", d, n);
+        return d;
+    }
+    if !guest_dst_ok(s as usize, 1) && !src_readable(s, n) {
+        guestptr_log("strncpy-src", s as *mut c_void, n);
         return d;
     }
     unsafe { strncpy(d as *mut i8, s as *const i8, n) as *mut c_void }
@@ -1822,10 +2332,10 @@ extern "C" fn sh_log_print(
     prio: i32,
     tag: *const i8,
     fmt: *const i8,
-    _a3: usize,
-    _a4: usize,
-    _a5: usize,
-    _a6: usize,
+    a3: usize,
+    a4: usize,
+    a5: usize,
+    a6: usize,
 ) -> i32 {
     unsafe {
         let t = if tag.is_null() {
@@ -1838,7 +2348,81 @@ extern "C" fn sh_log_print(
         } else {
             std::ffi::CStr::from_ptr(fmt).to_string_lossy()
         };
-        eprintln!("[alog:{prio}] {t}: {f}");
+        // Minimal %s/%d/%i/%u/%x/%p/%f substitution over the four
+        // captured register args — enough to read Godot's error text.
+        let arg_arr = [a3, a4, a5, a6];
+        let mut args = arg_arr.iter().copied();
+        let mut out = String::with_capacity(f.len() + 64);
+        let mut ch = f.chars().peekable();
+        while let Some(c) = ch.next() {
+            if c != '%' {
+                out.push(c);
+                continue;
+            }
+            if ch.peek() == Some(&'%') {
+                ch.next();
+                out.push('%');
+                continue;
+            }
+            // Skip flags/width/precision/length modifiers.
+            while matches!(ch.peek(), Some(&m) if m.is_ascii_alphanumeric() && !matches!(m, 's'|'d'|'i'|'u'|'x'|'X'|'p'|'f'|'c') || matches!(m, '.'|'-'|'+'|' '|'#'))
+            {
+                ch.next();
+            }
+            match ch.next() {
+                Some('s') => {
+                    let p = args.next().unwrap_or(0) as *const u8;
+                    let s = if p.is_null() {
+                        "(null)".into()
+                    } else if safe_strlen(p as *const c_void).is_none() {
+                        format!("({:#x}?)", p as usize)
+                    } else {
+                        // Godot error args are CharString/Char16 — sniff
+                        // UTF-16/32 (ASCII followed by NULs) and decode.
+                        let b0 = *p;
+                        let b1 = *p.add(1);
+                        let b2 = *p.add(2);
+                        let b3 = *p.add(3);
+                        if b1 == 0 && b2 == 0 && b3 == 0 && b0.is_ascii_graphic() {
+                            (0..256usize)
+                                .map(|i| *(p as *const u32).add(i))
+                                .take_while(|&c| c != 0)
+                                .filter_map(char::from_u32)
+                                .collect()
+                        } else if b1 == 0 && b0.is_ascii_graphic() {
+                            (0..512usize)
+                                .map(|i| *(p as *const u16).add(i))
+                                .take_while(|&c| c != 0)
+                                .map(|c| char::from_u32(c as u32).unwrap_or('?'))
+                                .collect()
+                        } else {
+                            std::ffi::CStr::from_ptr(p as *const i8)
+                                .to_string_lossy()
+                                .to_string()
+                        }
+                    };
+                    out.push_str(&s);
+                }
+                Some('d') | Some('i') => {
+                    out.push_str(&(args.next().unwrap_or(0) as i64).to_string());
+                }
+                Some('u') | Some('x') | Some('X') | Some('p') => {
+                    out.push_str(&format!("{:x}", args.next().unwrap_or(0)));
+                }
+                Some('f') => {
+                    out.push_str(&format!("{}", args.next().unwrap_or(0) as f64));
+                }
+                Some('c') => {
+                    out.push(char::from_u32(args.next().unwrap_or(0) as u32).unwrap_or('?'));
+                }
+                Some(other) => {
+                    out.push('%');
+                    out.push(other);
+                }
+                None => out.push('%'),
+            }
+        }
+        eprintln!("[alog:{prio}] {t}: {out}");
     }
     0
 }
@@ -1873,6 +2457,13 @@ pub(crate) fn guest_dst_ok(p: usize, len: usize) -> bool {
     if unsafe { malloc_zone_from_ptr(p as *const c_void) } == guest_zone() {
         return true;
     }
+    // Host-heap buffers handed to the guest (strdup, realpath, host
+    // callback buffers): malloc_zone_from_ptr resolves any address
+    // inside a zone's bookkeeping — a wild pointer almost never lands
+    // in one, so this admits real allocations only.
+    if !unsafe { malloc_zone_from_ptr(p as *const c_void) }.is_null() {
+        return true;
+    }
     if LOADED_RANGES
         .lock()
         .map(|v| v.iter().any(|(b, s)| p >= *b && p + len <= b + s))
@@ -1891,8 +2482,13 @@ pub(crate) fn guest_dst_ok(p: usize, len: usize) -> bool {
         let t = pthread_self();
         let top = pthread_get_stackaddr_np(t) as usize;
         let size = pthread_get_stacksize_np(t);
-        p >= top.saturating_sub(size) && p.saturating_add(len) <= top
+        if p >= top.saturating_sub(size) && p.saturating_add(len) <= top {
+            return true;
+        }
     }
+    // Cold path: a real writable mapping the other tests missed —
+    // guest mmap/arena buffers. Wild pointers fail the region probe.
+    mem_writable(p as *const c_void, len)
 }
 
 /// Host-owned ranges the guest may legitimately write through —
@@ -2351,7 +2947,14 @@ extern "C" fn sh_strdup(s: *const i8) -> *mut i8 {
         return std::ptr::null_mut();
     }
     unsafe {
-        let n = strlen(s) + 1;
+        let n = if guest_dst_ok(s as usize, 1) {
+            strlen(s) + 1
+        } else {
+            match safe_strlen(s as *const c_void) {
+                Some(l) => l + 1,
+                None => return std::ptr::null_mut(),
+            }
+        };
         let extra = if std::env::var_os("OVELO_FREEDBG").is_some() {
             16
         } else {
@@ -2375,7 +2978,13 @@ extern "C" fn sh_strndup(s: *const i8, n: usize) -> *mut i8 {
         // strnlen semantics: stop at n even without a terminator —
         // strlen could read past the caller's bounded buffer.
         let mut len = 0;
-        while len < n && *s.add(len) != 0 {
+        while len < n {
+            if !guest_dst_ok(s as usize, 1) && !src_readable(s.add(len) as *const c_void, 1) {
+                break;
+            }
+            if *s.add(len) == 0 {
+                break;
+            }
             len += 1;
         }
         let extra = if std::env::var_os("OVELO_FREEDBG").is_some() {
@@ -3864,6 +4473,31 @@ extern "C" fn sh_underscore_exit(code: i32) -> ! {
 }
 
 #[cfg(target_os = "macos")]
+/// `__cxa_throw`: log the exception's typeinfo name before handing to
+/// the real runtime — guest `.eh_frame` isn't registered so the unwind
+/// terminates, but the type name identifies what failed.
+#[cfg(target_os = "macos")]
+extern "C" fn sh_cxa_throw(_thrown: *mut c_void, tinfo: *const usize, _dest: *mut c_void) -> ! {
+    let name = if tinfo.is_null() {
+        0
+    } else {
+        unsafe { *tinfo.add(1) }
+    } as *const i8;
+    let s = if name.is_null() || !src_readable(name as *const c_void, 1) {
+        "?".to_string()
+    } else {
+        unsafe { std::ffi::CStr::from_ptr(name) }
+            .to_string_lossy()
+            .to_string()
+    };
+    let mut lr = 0usize;
+    unsafe { core::arch::asm!("mov {}, x30", out(reg) lr) };
+    eprintln!("[cxa-throw] type={} caller={:#x?}", s, so_off(lr));
+    // Guest unwinding can't run (its .eh_frame is unregistered), so a
+    // throw always lands in terminate — go straight to abort.
+    sh_abort()
+}
+
 extern "C" fn sh_abort() -> ! {
     let mut lr = 0usize;
     unsafe { core::arch::asm!("mov {}, x30", out(reg) lr) };
@@ -3881,6 +4515,389 @@ unsafe extern "C" {
 /// `kill`/`raise` likewise pass straight through — a guest that fires
 /// SIGKILL at itself vanishes with no trace. Log target/signal/caller,
 /// then deliver.
+/// Guest `sigaction`: Godot installs a crash handler on SEGV/BUS/ILL,
+/// which would replace our TLS-healing handler with guest code — a
+/// fault then delivers into guest code running under a garbage TPIDR
+/// and the nested exception kills the task as unrecoverable. Record
+/// the guest handler for diagnostics; keep ours installed. Other
+/// signals forward to the real sigaction.
+#[cfg(target_os = "macos")]
+extern "C" fn sh_sigaction(sig: i32, act: usize, oact: usize) -> i32 {
+    let mut lr = 0usize;
+    unsafe { core::arch::asm!("mov {}, x30", out(reg) lr) };
+    // Bionic layout: {sa_flags:i32, pad, sa_handler:u64, sa_mask:u32,
+    // sa_sigaction:u64 (old variants)} — flags at +0, handler at +8.
+    // Linux flag values differ from Darwin's, so translate.
+    let (bflags, handler) = if act != 0 {
+        unsafe { (*(act as *const i32), *(act as *const usize).add(1)) }
+    } else {
+        (0, 0)
+    };
+    eprintln!(
+        "[sigaction] sig={sig} flags={bflags:#x} handler={handler:#x} caller={:#x?}",
+        so_off(lr)
+    );
+    if oact != 0 {
+        unsafe { std::ptr::write_bytes(oact as *mut u8, 0, 32) };
+    }
+    if matches!(sig, 4 | 6 | 10 | 11) {
+        if act != 0 && handler > 1 {
+            if let Ok(mut g) = GUEST_SIG_HANDLERS.lock() {
+                g.get_or_insert_with(HashMap::new).insert(sig, handler);
+            }
+        }
+        return 0;
+    }
+    // Linux->Darwin flag map: only the bits Bionic actually uses.
+    let mut dflags = 0i32;
+    if bflags & 0x0800_0000 != 0 {
+        dflags |= 0x0001; // SA_ONSTACK
+    }
+    if bflags & 0x1000_0000 != 0 {
+        dflags |= 0x0002; // SA_RESTART
+    }
+    if bflags & 0x4 != 0 {
+        dflags |= 0x0040; // SA_SIGINFO
+    }
+    if bflags & 0x8000_0000u32 as i32 != 0 {
+        dflags |= 0x0004; // SA_RESETHAND
+    }
+    if bflags & 0x4000_0000 != 0 {
+        dflags |= 0x0010; // SA_NODEFER
+    }
+    if bflags & 0x1 != 0 {
+        dflags |= 0x0008; // SA_NOCLDSTOP
+    }
+    if bflags & 0x2 != 0 {
+        dflags |= 0x0020; // SA_NOCLDWAIT
+    }
+    let dact = if act != 0 {
+        Sigaction {
+            sa_sigaction: handler,
+            sa_mask: 0,
+            sa_flags: dflags,
+        }
+    } else {
+        Sigaction {
+            sa_sigaction: 0,
+            sa_mask: 0,
+            sa_flags: 0,
+        }
+    };
+    unsafe {
+        sigaction(
+            sig,
+            if act != 0 { &dact } else { std::ptr::null() },
+            std::ptr::null_mut(),
+        )
+    }
+}
+
+/// Guest-requested signal handlers we declined to install (sig ->
+/// sa_handler address), kept for diagnostics/chaining.
+#[cfg(target_os = "macos")]
+static GUEST_SIG_HANDLERS: std::sync::Mutex<Option<std::collections::HashMap<i32, usize>>> =
+    std::sync::Mutex::new(None);
+
+/// Task-level Mach exception port: the kernel consults it before BSD
+/// signal delivery, so it observes faults that never reach a signal
+/// handler (unrecoverable -> SIGKILL). Each request is logged
+/// (type/codes/thread-port/pc) and answered with a failure code so
+/// delivery continues down the normal BSD chain — nothing is stolen.
+#[cfg(target_os = "macos")]
+pub(crate) mod excport {
+    use std::ffi::c_void;
+
+    extern "C" {
+        fn mach_port_allocate(task: u32, right: i32, port: *mut u32) -> i32;
+        fn mach_port_insert_right(task: u32, name: u32, poly: u32, ptype: u32) -> i32;
+        fn task_set_exception_ports(
+            task: u32,
+            mask: u32,
+            port: u32,
+            behavior: u32,
+            flavor: u32,
+        ) -> i32;
+        fn mach_msg(
+            msg: *mut u8,
+            opt: u32,
+            snd: u32,
+            rcv: u32,
+            port: u32,
+            timeout: u32,
+            notify: u32,
+        ) -> i32;
+    }
+
+    const RCV: u32 = 2;
+    const SND: u32 = 1;
+
+    /// Mach port name of the thread currently inside a JNI
+    /// `call_native` fnptr call (0 = idle). The watchdog samples this
+    /// thread at high rate while guest code runs.
+    pub static JNI_ACT_PORT: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+    /// Guest TCB of the thread currently inside a JNI call — the
+    /// watchdog reads the call-attribution slots out of it.
+    pub static JNI_ACT_TCB: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
+    /// Watchdog: samples the JNI-calling thread's pc every ~200us
+    /// while guest code runs. A thread suspended mid-exception-
+    /// delivery still yields its state, so the last samples before
+    /// the kernel's SIGKILL name the faulting insn — the record BSD
+    /// delivery can never show us.
+    pub fn start_watchdog() {
+        // Debug-only: task_for_pid/thread_get_state needs a Developer
+        // Tools grant and the sampling loop burns a core.
+        if std::env::var_os("OVELO_WATCH").is_none() {
+            return;
+        }
+        extern "C" {
+            fn thread_get_state(t: u32, flavor: u32, state: *mut u32, cnt: *mut u32) -> i32;
+        }
+        std::thread::Builder::new()
+            .name("exc-watch".into())
+            .spawn(|| unsafe {
+                let mut last: u64 = u64::MAX;
+                let mut last_call = [0u64; 2];
+                loop {
+                    let t = JNI_ACT_PORT.load(std::sync::atomic::Ordering::Acquire);
+                    if t == 0 {
+                        std::hint::spin_loop();
+                        continue;
+                    }
+                    let mut st = [0u32; 68];
+                    let mut n = 68u32;
+                    let gkr = thread_get_state(t, 6, st.as_mut_ptr(), &mut n);
+                    if gkr != 0 {
+                        eprintln!("[watch] tport={t} get_state kr={gkr}");
+                    } else {
+                        let pc = (st[64] as u64) | ((st[65] as u64) << 32);
+                        if pc != last {
+                            last = pc;
+                            eprintln!("[watch] pc={pc:#x} so={:#x?}", super::so_off(pc as usize));
+                        }
+                    }
+                    // Call attribution: the thunk wrote the import target
+                    // and the guest call site into TCB+0x7fe8/+0x7ff0.
+                    let tcb = JNI_ACT_TCB.load(std::sync::atomic::Ordering::Acquire);
+                    if tcb != 0 {
+                        let mut buf = [0u64; 2];
+                        let mut got = 0u64;
+                        let kr = super::mach_vm_read_overwrite(
+                            super::mach_task_self(),
+                            (tcb + 0x7fe8) as u64,
+                            16,
+                            buf.as_mut_ptr() as u64,
+                            &mut got,
+                        );
+                        if kr == 0 && got == 16 && buf != last_call {
+                            last_call = buf;
+                            let name = super::target_name(buf[0] as usize)
+                                .unwrap_or_else(|| format!("{:#x}", buf[0]));
+                            eprintln!("[call] {name} <- so={:#x?}", super::so_off(buf[1] as usize));
+                        }
+                    }
+                    // Spin: a fatal BRK is processed faster than any
+                    // sleep granularity — every pc change matters.
+                }
+            })
+            .ok();
+    }
+
+    // All mach exception types except EXC_RPC_ALERT / EXC_MACHINE /
+    // EXC_CORPSE — includes SYSCALL/MACH_SYSCALL/GUARD/RESOURCE, any
+    // of which could be the undeliverable kill we're hunting.
+    const MASK: u32 = 0x0000_2FFE;
+    // MACH_EXCEPTION_CODES | EXCEPTION_STATE
+    const BEHAVIOR: u32 = 0x8000_0001;
+    const ARM_THREAD_STATE64: u32 = 6;
+    const STATE_CNT: usize = 68; // u32 words; pc = word 64..66 pair
+
+    pub fn start() {
+        unsafe {
+            let me = super::mach_task_self();
+            let mut port = 0u32;
+            let kr = mach_port_allocate(me, 1 /* RECEIVE */, &mut port);
+            if kr != 0 {
+                eprintln!("[mach-exc] port_allocate failed kr={kr}");
+                return;
+            }
+            let kr = mach_port_insert_right(me, port, port, 20 /* MAKE_SEND */);
+            if kr != 0 {
+                eprintln!("[mach-exc] insert_right failed kr={kr}");
+                return;
+            }
+            let kr = task_set_exception_ports(me, MASK, port, BEHAVIOR, ARM_THREAD_STATE64);
+            eprintln!("[mach-exc] task_set_exception_ports kr={kr} port={port}");
+            if kr != 0 {
+                return;
+            }
+            std::thread::Builder::new()
+                .name("exc-listen".into())
+                .spawn(move || loop {
+                    let mut req = [0u8; 4096];
+                    let kr = mach_msg(
+                        req.as_mut_ptr() as *mut c_void as *mut u8,
+                        RCV,
+                        0,
+                        req.len() as u32,
+                        port,
+                        0,
+                        0,
+                    );
+                    if kr != 0 {
+                        continue;
+                    }
+                    let rd = |o: usize| u32::from_ne_bytes(req[o..o + 4].try_into().unwrap());
+                    let bits = rd(0);
+                    let remote = rd(8);
+                    // MACH_MSGH_BITS_COMPLEX: body descriptor count +
+                    // port descriptors precede the NDR record.
+                    let arg0 = if bits & 0x8000_0000 != 0 {
+                        24 + 4 + rd(24) as usize * 12
+                    } else {
+                        24
+                    };
+                    let ndr = arg0;
+                    let exc = rd(ndr + 8) as i32;
+                    // thread port name is in the first body descriptor.
+                    let thread_port = rd(28);
+                    let code0 = i64::from_ne_bytes(req[ndr + 16..ndr + 24].try_into().unwrap());
+                    let code1 = i64::from_ne_bytes(req[ndr + 24..ndr + 32].try_into().unwrap());
+                    let flavor = rd(ndr + 32);
+                    let scnt = rd(ndr + 36) as usize;
+                    let st_off = ndr + 40;
+                    let pc = if scnt >= STATE_CNT {
+                        u64::from_ne_bytes(req[st_off + 256..st_off + 264].try_into().unwrap())
+                    } else {
+                        0
+                    };
+                    // A thread faulting in a way the BSD handler can't
+                    // recover (e.g. branch to a null pc) re-faults the
+                    // instant the reply lands — a ~20k/s exception
+                    // livelock. After a few identical reports suspend
+                    // the thread: it cannot make progress anyway.
+                    static SEEN: std::sync::atomic::AtomicU64 =
+                        std::sync::atomic::AtomicU64::new(0);
+                    static REPEATS: std::sync::atomic::AtomicU64 =
+                        std::sync::atomic::AtomicU64::new(0);
+                    let key = (thread_port as u64) << 32 ^ code0 as u64 ^ code1 as u64;
+                    let n = if key == SEEN.swap(key, std::sync::atomic::Ordering::Relaxed) {
+                        REPEATS.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1
+                    } else {
+                        REPEATS.store(0, std::sync::atomic::Ordering::Relaxed);
+                        0
+                    };
+                    if n < 8 {
+                        eprintln!(
+                            "[mach-exc] type={exc} code=({code0:#x},{code1:#x}) pc={pc:#x} tport={thread_port} so={:#x?}",
+                            super::so_off(pc as usize)
+                        );
+                    }
+                    // Only the null-branch signature (fault addr 0)
+                    // is unrecoverable by definition; anything else
+                    // may still be a healable TLS/data fault the BSD
+                    // handler recovers — never suspend those.
+                    if n == 8 && code1 == 0 {
+                        extern "C" {
+                            fn thread_suspend(t: u32) -> i32;
+                            fn thread_get_state(
+                                t: u32,
+                                flavor: u32,
+                                state: *mut u32,
+                                cnt: *mut u32,
+                            ) -> i32;
+                        }
+                        // arm64_thread_state64 (flavor 6): x0..x28,
+                        // fp, lr, sp, pc — words 60..64 hold
+                        // fp/lr/sp/pc pairs.
+                        let mut st = [0u32; 68];
+                        let mut cnt = 68u32;
+                        let gkr =
+                            thread_get_state(thread_port, 6, st.as_mut_ptr(), &mut cnt);
+                        if gkr == 0 {
+                            let w = |i: usize| {
+                                u64::from(st[i]) | (u64::from(st[i + 1]) << 32)
+                            };
+                            // x0..x28 = words 0..57; fp=58, lr=60,
+                            // sp=62, pc=64 (each reg = 2 words).
+                            let (fp, lr, sp, rpc) = (w(58), w(60), w(62), w(64));
+                            let x16 = w(32);
+                            let tname = super::target_name(x16 as usize)
+                                .unwrap_or_else(|| "?".into());
+                            let mut insw = [0u32; 8];
+                            {
+                                let mut nb = 0u64;
+                                super::mach_vm_read_overwrite(
+                                    super::mach_task_self(),
+                                    rpc.wrapping_sub(16),
+                                    32,
+                                    insw.as_mut_ptr() as u64,
+                                    &mut nb,
+                                );
+                            }
+                            let jb = super::JIT_CODE_BASE
+                                .load(std::sync::atomic::Ordering::Relaxed);
+                            let je = super::JIT_CODE_END
+                                .load(std::sync::atomic::Ordering::Relaxed);
+                            let injit = rpc >= jb as u64 && rpc < je as u64;
+                            eprintln!(
+                                "[mach-exc] tport={thread_port} unrecoverable pc={rpc:#x}({:#x?}) jit={injit} insn={:#x?} lr={lr:#x}({:#x?}) sp={sp:#x} fp={fp:#x} x16={x16:#x}({tname}) l1={:#x} l2={:#x}; suspending",
+                                insw,
+                                super::so_off(rpc as usize),
+                                super::so_off(lr as usize),
+                                if fp != 0
+                                    && super::mem_writable(fp as *const c_void, 24)
+                                {
+                                    *(fp as *const u64).add(1)
+                                } else {
+                                    0
+                                },
+                                if fp != 0
+                                    && super::mem_writable(fp as *const c_void, 40)
+                                {
+                                    *(fp as *const u64).add(3)
+                                } else {
+                                    0
+                                },
+                            );
+                        } else {
+                            eprintln!(
+                                "[mach-exc] tport={thread_port} unrecoverable at pc={pc:#x} (get_state kr={gkr}); suspending"
+                            );
+                        }
+                        thread_suspend(thread_port);
+                    }
+                    // Reply: echo state verbatim, nonzero RetCode ->
+                    // "not handled" -> kernel continues to BSD signals.
+                    let mut rep = [0u8; 512];
+                    rep[0..4]
+                        .copy_from_slice(&((bits & 0xFF) | ((bits >> 8) & 0xFF) << 8).to_ne_bytes());
+                    let rep_size = 44 + scnt * 4;
+                    rep[4..8].copy_from_slice(&(rep_size as u32).to_ne_bytes());
+                    rep[8..12].copy_from_slice(&remote.to_ne_bytes());
+                    // msgh_local_port = NULL, voucher = NULL
+                    rep[20..24].copy_from_slice(&(rd(20) + 100).to_ne_bytes());
+                    rep[24..32].copy_from_slice(&req[ndr..ndr + 8]); // NDR
+                    rep[32..36].copy_from_slice(&5u32.to_ne_bytes()); // RetCode: EIO -> chain on
+                    rep[36..40].copy_from_slice(&flavor.to_ne_bytes());
+                    rep[40..44].copy_from_slice(&(scnt as u32).to_ne_bytes());
+                    rep[44..44 + scnt * 4].copy_from_slice(&req[st_off..st_off + scnt * 4]);
+                    mach_msg(
+                        rep.as_mut_ptr() as *mut c_void as *mut u8,
+                        SND,
+                        rep_size as u32,
+                        0,
+                        0,
+                        0,
+                        0,
+                    );
+                })
+                .ok();
+        }
+    }
+}
+
 #[cfg(target_os = "macos")]
 extern "C" fn sh_kill(pid: i32, sig: i32) -> i32 {
     let mut lr = 0usize;
@@ -3963,6 +4980,170 @@ extern "C" fn sh_emutls_addr(ctrl: usize) -> usize {
 }
 
 /// glClearDepthf/glDepthRangef — ES names for the desktop-GL doubles.
+// ----------------------------------------------------------------
+// Real GL for native renderers (Godot): guest `gl*` imports resolve
+// to macOS OpenGL.framework (dlopen'd RTLD_GLOBAL by
+// ensure_gl_framework). A CGL context plus a renderbuffer-backed FBO
+// masquerades as framebuffer 0 — the guest draws into it, and
+// `glctx_read_rgba` pulls pixels that the dex-side eglSwapBuffers
+// feeds to the presenter as a Bitmap op.
+// ----------------------------------------------------------------
+#[cfg(target_os = "macos")]
+pub(crate) mod glctx {
+    use std::ffi::c_void;
+    use std::sync::Mutex;
+
+    type CGLCtx = *mut c_void;
+    type Cglpf = *mut c_void;
+    #[link(name = "OpenGL", kind = "framework")]
+    extern "C" {
+        fn CGLChoosePixelFormat(attribs: *const i32, fmt: *mut Cglpf, n: *mut i32) -> i32;
+        fn CGLCreateContext(fmt: Cglpf, share: CGLCtx, ctx: *mut CGLCtx) -> i32;
+        fn CGLSetCurrentContext(ctx: CGLCtx) -> i32;
+    }
+
+    fn glp<T>(name: &str) -> Option<T> {
+        super::host_dlsym(name).map(|p| unsafe { std::mem::transmute_copy::<usize, T>(&p) })
+    }
+
+    struct S {
+        ctx: usize,
+        fbo: u32,
+        rb: u32,
+        vao: u32,
+        w: i32,
+        h: i32,
+    }
+    static G: Mutex<Option<S>> = Mutex::new(None);
+
+    /// Create the context on first use and (re)build the screen FBO
+    /// at `w`×`h`; leaves it bound as GL_FRAMEBUFFER.
+    pub fn make_current(w: i32, h: i32) {
+        super::ensure_gl_framework();
+        let mut g = G.lock().unwrap();
+        if g.is_none() {
+            unsafe {
+                // kCglpfAAccelerated(72) + kCglpfAOpenGLProfile(99)=
+                // kCGLOGLPVersion_4_1_Core(0x3200), terminator. Core
+                // profile gives GLSL 410 (uint, texture(), in/out)
+                // which the ES->GLSL rewrite in sh_gl_shader_source
+                // targets; the legacy profile caps at GLSL 1.20 and
+                // can't express Godot's uint-packing shaders.
+                let attrs = [72i32, 99, 0x3200, 0];
+                let mut pf = std::ptr::null_mut();
+                let mut npix = 0i32;
+                CGLChoosePixelFormat(attrs.as_ptr(), &mut pf, &mut npix);
+                let mut ctx = std::ptr::null_mut();
+                CGLCreateContext(pf, std::ptr::null_mut(), &mut ctx);
+                CGLSetCurrentContext(ctx);
+                // Core profile draws need a VAO bound; the guest's
+                // GLES2 path never creates one, so bind ours forever.
+                let mut vao = 0u32;
+                let gen_vao: Option<unsafe extern "C" fn(i32, *mut u32)> = glp("glGenVertexArrays");
+                let bind_vao: Option<unsafe extern "C" fn(u32)> = glp("glBindVertexArray");
+                if let (Some(gv), Some(bv)) = (gen_vao, bind_vao) {
+                    gv(1, &mut vao);
+                    bv(vao);
+                }
+                *g = Some(S {
+                    ctx: ctx as usize,
+                    fbo: 0,
+                    rb: 0,
+                    vao,
+                    w: 0,
+                    h: 0,
+                });
+            }
+        }
+        let s = g.as_mut().unwrap();
+        unsafe { CGLSetCurrentContext(s.ctx as CGLCtx) };
+        // Keep our VAO bound — GLES2 guests never call
+        // glBindVertexArray, and core profile draws need one.
+        if let Some(bv) = glp::<unsafe extern "C" fn(u32)>("glBindVertexArray") {
+            unsafe { bv(s.vao) };
+        }
+        if s.w != w || s.h != h {
+            unsafe {
+                let gen_fbo: unsafe extern "C" fn(i32, *mut u32) =
+                    glp("glGenFramebuffers").unwrap_or(noop_fbo_gen);
+                let bind_fbo: unsafe extern "C" fn(i32, u32) =
+                    glp("glBindFramebuffer").unwrap_or(noop_fbo_bind);
+                let gen_rb: unsafe extern "C" fn(i32, *mut u32) =
+                    glp("glGenRenderbuffers").unwrap_or(noop_fbo_gen);
+                let bind_rb: unsafe extern "C" fn(i32, u32) =
+                    glp("glBindRenderbuffer").unwrap_or(noop_fbo_bind);
+                let rb_store: unsafe extern "C" fn(i32, i32, i32, i32) =
+                    glp("glRenderbufferStorage").unwrap_or(noop_rbs);
+                let fbo_attach: unsafe extern "C" fn(i32, i32, i32, u32) =
+                    glp("glFramebufferRenderbuffer").unwrap_or(noop_attach);
+                gen_fbo(1, &mut s.fbo);
+                bind_fbo(0x8D88, s.fbo); // GL_FRAMEBUFFER
+                gen_rb(1, &mut s.rb);
+                bind_rb(0x8D41, s.rb); // GL_RENDERBUFFER
+                rb_store(0x8D41, 0x8058, w, h); // GL_RGBA8
+                fbo_attach(0x8D88, 0x8CE0, 0x8D41, s.rb); // COLOR_ATTACHMENT0
+                s.w = w;
+                s.h = h;
+            }
+        }
+    }
+
+    unsafe extern "C" fn noop_fbo_gen(_: i32, _: *mut u32) {}
+    unsafe extern "C" fn noop_fbo_bind(_: i32, _: u32) {}
+    unsafe extern "C" fn noop_rbs(_: i32, _: i32, _: i32, _: i32) {}
+    unsafe extern "C" fn noop_attach(_: i32, _: i32, _: i32, _: u32) {}
+
+    /// The FBO id the guest sees as 0.
+    pub fn screen_fbo() -> u32 {
+        G.lock().unwrap().as_ref().map(|s| s.fbo).unwrap_or(0)
+    }
+
+    /// Bottom-up RGBA8 readback of the screen FBO, flipped to
+    /// top-down for the presenter.
+    pub fn read_rgba() -> Option<(Vec<u8>, i32, i32)> {
+        let g = G.lock().unwrap();
+        let s = g.as_ref()?;
+        if s.fbo == 0 || s.w <= 0 || s.h <= 0 {
+            return None;
+        }
+        unsafe {
+            let bind_fbo: unsafe extern "C" fn(i32, u32) = glp("glBindFramebuffer")?;
+            let read: unsafe extern "C" fn(i32, i32, i32, i32, i32, i32, *mut c_void) =
+                glp("glReadPixels")?;
+            bind_fbo(0x8D88, s.fbo);
+            let mut buf = vec![0u8; (s.w * s.h * 4) as usize];
+            read(
+                0,
+                0,
+                s.w,
+                s.h,
+                0x1908,
+                0x1401,
+                buf.as_mut_ptr() as *mut c_void,
+            );
+            let stride = (s.w * 4) as usize;
+            let mut out = vec![0u8; buf.len()];
+            for y in 0..s.h as usize {
+                let src = y * stride;
+                let dst = (s.h as usize - 1 - y) * stride;
+                out[dst..dst + stride].copy_from_slice(&buf[src..src + stride]);
+            }
+            Some((out, s.w, s.h))
+        }
+    }
+}
+
+/// Guest `glBindFramebuffer(target, fbo)` — 0 is the on-screen
+/// framebuffer; route it to our offscreen FBO.
+#[cfg(target_os = "macos")]
+extern "C" fn sh_gl_bind_framebuffer(target: i32, fbo: u32) {
+    let real = if fbo == 0 { glctx::screen_fbo() } else { fbo };
+    if let Some(f) = host_dlsym("glBindFramebuffer") {
+        type F = unsafe extern "C" fn(i32, u32);
+        unsafe { std::mem::transmute::<usize, F>(f)(target, real) };
+    }
+}
+
 #[cfg(target_os = "macos")]
 extern "C" fn sh_gl_clear_depthf(d: f32) {
     ensure_gl_framework();
@@ -3978,6 +5159,161 @@ extern "C" fn sh_gl_depth_rangef(n: f32, f: f32) {
     type F = unsafe extern "C" fn(f64, f64);
     if let Some(p) = host_dlsym("glDepthRanged") {
         unsafe { std::mem::transmute::<usize, F>(p)(n as f64, f as f64) };
+    }
+}
+
+/// Shader id -> GL_*_SHADER, from glCreateShader calls.
+#[cfg(target_os = "macos")]
+static SHADER_TYPES: Mutex<Option<HashMap<u32, i32>>> = Mutex::new(None);
+
+#[cfg(target_os = "macos")]
+extern "C" fn sh_gl_create_shader(ty: i32) -> u32 {
+    ensure_gl_framework();
+    let id = host_dlsym("glCreateShader")
+        .map(|f| unsafe { std::mem::transmute::<usize, unsafe extern "C" fn(i32) -> u32>(f)(ty) })
+        .unwrap_or(0);
+    if let Ok(mut g) = SHADER_TYPES.lock() {
+        g.get_or_insert_with(HashMap::new).insert(id, ty);
+    }
+    id
+}
+
+/// Rewrite an ES shader body for GLSL 410 core: drop
+/// `#version`/`#extension`/`precision` lines and precision keywords,
+/// map `attribute`/`varying` to `in`/`out`, `texture2D`/`textureCube`
+/// to `texture`, and `gl_FragColor`/`gl_FragData` to declared outs.
+#[cfg(target_os = "macos")]
+fn glsl_es_to_gl(src: &str, frag: bool) -> String {
+    let mut out = String::with_capacity(src.len() + 96);
+    out.push_str("#version 410 core\n");
+    if frag {
+        if src.contains("gl_FragData") {
+            out.push_str("out vec4 ovelo_fragdata[8];\n");
+        } else if src.contains("gl_FragColor") {
+            out.push_str("layout(location=0) out vec4 ovelo_frag;\n");
+        }
+    }
+    for line in src.split('\n') {
+        let t = line.trim_start();
+        if t.starts_with("#version") || t.starts_with("#extension") || t.starts_with("precision") {
+            continue;
+        }
+        let mut l = line.to_string();
+        for kw in ["highp", "mediump", "lowp"] {
+            l = l
+                .replace(&format!("{kw} "), "")
+                .replace(&format!("{kw}\t"), "")
+                .replace(&format!("{kw}\n"), "");
+        }
+        if frag {
+            l = l
+                .replace("gl_FragColor", "ovelo_frag")
+                .replace("gl_FragData", "ovelo_fragdata")
+                .replace("varying ", "in ")
+                .replace("varying\t", "in\t");
+        } else {
+            l = l
+                .replace("attribute ", "in ")
+                .replace("attribute\t", "in\t")
+                .replace("varying ", "out ")
+                .replace("varying\t", "out\t");
+        }
+        l = l
+            .replace("texture2DProj", "textureProj")
+            .replace("texture2DLodEXT", "textureLod")
+            .replace("textureCubeLodEXT", "textureLod")
+            .replace("texture2D", "texture")
+            .replace("textureCube", "texture")
+            .replace("gl_FragDepthEXT", "gl_FragDepth");
+        out.push_str(&l);
+        out.push('\n');
+    }
+    out
+}
+
+#[cfg(target_os = "macos")]
+extern "C" fn sh_gl_shader_source(shader: u32, count: i32, strings: usize, lengths: usize) {
+    ensure_gl_framework();
+    unsafe {
+        let mut src = String::new();
+        for i in 0..count.clamp(0, 4096) as usize {
+            let p = *(strings as *const usize).add(i) as *const i8;
+            if p.is_null() {
+                continue;
+            }
+            let len = if lengths != 0 {
+                *(lengths as *const i32).add(i)
+            } else {
+                -1
+            };
+            if std::env::var("OVELO_GLSLSRC").is_ok() {
+                eprintln!(
+                    "[glsl-part shader={shader} i={i} p={:#x} len={len}]",
+                    p as usize
+                );
+            }
+            if len >= 0 {
+                if !src_readable(p as *const c_void, len as usize) {
+                    continue;
+                }
+                let b = std::slice::from_raw_parts(p as *const u8, len as usize);
+                src.push_str(&String::from_utf8_lossy(b));
+            } else if src_readable(p as *const c_void, 1) {
+                src.push_str(&std::ffi::CStr::from_ptr(p).to_string_lossy());
+                if std::env::var("OVELO_GLSLSRC").is_ok() && src_readable(p as *const c_void, 65536)
+                {
+                    // A truncated-looking string may just hold an
+                    // embedded NUL: probe past it for more text.
+                    let b = std::slice::from_raw_parts(p as *const u8, 65536);
+                    if let Some(nul) = b.iter().position(|&c| c == 0) {
+                        let tail = &b[nul + 1..(nul + 1 + 512).min(65536)];
+                        let show: String = tail
+                            .iter()
+                            .take_while(|&&c| c.is_ascii() && c != 0)
+                            .map(|&c| c as char)
+                            .collect();
+                        if !show.is_empty() {
+                            eprintln!("[glsl-nul shader={shader} at={nul} tail={show:?}]");
+                        }
+                    }
+                }
+            }
+        }
+        if let Some(f) = host_dlsym("glShaderSource") {
+            type F = unsafe extern "C" fn(u32, i32, *const usize, usize);
+            let frag = SHADER_TYPES
+                .lock()
+                .ok()
+                .and_then(|g| g.as_ref().and_then(|m| m.get(&shader).copied()))
+                .map(|t| t == 0x8B30) // GL_FRAGMENT_SHADER
+                .unwrap_or_else(|| src.contains("gl_FragColor") || src.contains("gl_FragData"));
+            let t_src = glsl_es_to_gl(&src, frag);
+            if std::env::var("OVELO_GLSLSRC").is_ok() {
+                eprintln!("[glsl-src shader={shader}]\n{t_src}");
+            }
+            let t = std::ffi::CString::new(t_src).unwrap_or_default();
+            let arr = [t.as_ptr() as usize];
+            std::mem::transmute::<usize, F>(f)(shader, 1, arr.as_ptr(), 0);
+        }
+    }
+}
+
+/// Log the real info log once per shader/program so Godot's
+/// "shader failed to compile" diagnostics carry the GL error.
+#[cfg(target_os = "macos")]
+extern "C" fn sh_gl_get_shader_info_log(shader: u32, bufsize: i32, length: usize, log: usize) {
+    ensure_gl_framework();
+    if let Some(f) = host_dlsym("glGetShaderInfoLog") {
+        type F = unsafe extern "C" fn(u32, i32, *mut i32, *mut i8);
+        unsafe {
+            std::mem::transmute::<usize, F>(f)(shader, bufsize, length as *mut i32, log as *mut i8)
+        };
+        if log != 0 {
+            let s = unsafe { std::ffi::CStr::from_ptr(log as *const i8).to_string_lossy() };
+            if !s.trim().is_empty() {
+                eprintln!("[glsl] {s}");
+            }
+        }
     }
 }
 
@@ -4100,9 +5436,19 @@ fn builtin_shim(name: &str) -> Option<usize> {
         #[cfg(target_os = "macos")]
         "eglGetProcAddress" => sh_egl_get_proc as *const () as usize,
         #[cfg(target_os = "macos")]
+        "glBindFramebuffer" | "glBindFramebufferEXT" | "glBindFramebufferOES" => {
+            sh_gl_bind_framebuffer as *const () as usize
+        }
+        #[cfg(target_os = "macos")]
         "glClearDepthf" => sh_gl_clear_depthf as *const () as usize,
         #[cfg(target_os = "macos")]
         "glDepthRangef" => sh_gl_depth_rangef as *const () as usize,
+        #[cfg(target_os = "macos")]
+        "glShaderSource" | "glShaderSourceARB" => sh_gl_shader_source as *const () as usize,
+        #[cfg(target_os = "macos")]
+        "glCreateShader" => sh_gl_create_shader as *const () as usize,
+        #[cfg(target_os = "macos")]
+        "glGetShaderInfoLog" => sh_gl_get_shader_info_log as *const () as usize,
         #[cfg(target_os = "macos")]
         "ZSTD_trace_compress_begin"
         | "ZSTD_trace_compress_end"
@@ -4120,6 +5466,8 @@ fn builtin_shim(name: &str) -> Option<usize> {
         "__FD_SET_chk" => sh_fd_set_chk as *const () as usize,
         #[cfg(target_os = "macos")]
         "pthread_gettid_np" => sh_gettid as *const () as usize,
+        #[cfg(target_os = "macos")]
+        "pthread_once" => sh_pthread_once as *const () as usize,
         // Bionic pthread sync objects have a different layout than
         // Darwin's — keyed guest-side implementation, not host calls.
         #[cfg(target_os = "macos")]
@@ -4195,6 +5543,10 @@ fn builtin_shim(name: &str) -> Option<usize> {
         "_exit" | "_Exit" => sh_underscore_exit as *const () as usize,
         #[cfg(target_os = "macos")]
         "abort" => sh_abort as *const () as usize,
+        #[cfg(target_os = "macos")]
+        "__cxa_throw" => sh_cxa_throw as *const () as usize,
+        #[cfg(target_os = "macos")]
+        "sigaction" => sh_sigaction as *const () as usize,
         #[cfg(target_os = "macos")]
         "kill" => sh_kill as *const () as usize,
         #[cfg(target_os = "macos")]
@@ -4722,6 +6074,7 @@ fn finish_so(m: MappedLib, name: &str) -> Result<(NativeLib, Vec<usize>)> {
             return Ok(a);
         }
         if let Some(a) = builtin_shim(&name) {
+            name_target(a, &name);
             return Ok(host_thunk(a));
         }
         if let Some(a) = data_shim(&name) {
@@ -4739,7 +6092,12 @@ fn finish_so(m: MappedLib, name: &str) -> Result<(NativeLib, Vec<usize>)> {
                 // Data symbols must stay raw addresses — wrapping them in
                 // a code thunk would have the guest read machine code
                 // where the variable's value belongs.
-                return Ok(if is_data_sym(&name) { a } else { host_thunk(a) });
+                return Ok(if is_data_sym(&name) {
+                    a
+                } else {
+                    name_target(a, &name);
+                    host_thunk(a)
+                });
             }
         }
         // Weak undefined symbols resolve to 0 (legal — the callee checks).
@@ -4821,6 +6179,40 @@ fn finish_so(m: MappedLib, name: &str) -> Result<(NativeLib, Vec<usize>)> {
     }
     // RELR packed relocation.
     apply_relr(bias, d.relr, d.relrsz, map as usize, map_end)?;
+
+    // Patch guest TLS access: `mrs xN,TPIDR_EL0` → `mov xN,x18` and
+    // `msr TPIDR_EL0,xN` → `mov x18,xN`. Darwin clobbers TPIDR_EL0 at
+    // exception/signal boundaries, so a guest that keeps its Bionic
+    // TCB pointer there reads garbage (crashes or silent corruption).
+    // x18 is the platform-reserved register on arm64 — neither host
+    // nor guest codegen allocates it — so it survives every boundary
+    // and every host call. The image is still RW here; pages promote
+    // to RX just below.
+    #[cfg(target_arch = "aarch64")]
+    {
+        let mut npatch = 0usize;
+        for &(va, memsz, flags) in segs {
+            if flags & 1 == 0 {
+                continue; // PF_X
+            }
+            let mut a = bias + va;
+            let e = a + memsz;
+            while a + 4 <= e {
+                let w = unsafe { *(a as *const u32) };
+                if w & 0xFFFF_FFE0 == 0xD53B_D040 {
+                    unsafe { *(a as *mut u32) = 0xAA12_03E0 | (w & 31) }; // mov xN, x18
+                    npatch += 1;
+                } else if w & 0xFFFF_FFE0 == 0xD51B_D040 {
+                    unsafe { *(a as *mut u32) = 0xAA00_03F2 | ((w & 31) << 16) }; // mov x18, xN
+                    npatch += 1;
+                }
+                a += 4;
+            }
+        }
+        if npatch > 0 {
+            eprintln!("[tls-patch] {name}: {npatch} tpidr accesses → x18");
+        }
+    }
 
     // Apply each segment's declared permissions — writable data and
     // bss must stay writable after relocation, executable pages go RX.

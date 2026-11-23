@@ -883,6 +883,24 @@ pub(crate) fn guest_draw_ops(vm: &mut Vm, view: u32, w: i32, h: i32) -> Vec<Canv
     if pseudo_get(vm, view, super::gl::P_GLES_RENDERER).is_some() {
         return super::gl::gl_frame(vm, view, w, h);
     }
+    // A native-renderer surface (Godot's GLThread) swaps into the
+    // readback stash — present those pixels on the surface's view.
+    if let Some((px, sw, sh)) = super::gl::swap_frame() {
+        let n = super::class_of(vm, V::Ref(view));
+        let glish =
+            n.contains("GLSurfaceView") || n.contains("GLRenderView") || n.contains("SurfaceView");
+        if glish {
+            return vec![CanvasOp::Bitmap {
+                x: 0.0,
+                y: 0.0,
+                w: sw,
+                h: sh,
+                src_w: sw,
+                src_h: sh,
+                rgba: std::rc::Rc::new(px),
+            }];
+        }
+    }
     let Some(ci) = vm.heap.class_of(view) else {
         return Vec::new();
     };

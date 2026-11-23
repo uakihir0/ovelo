@@ -42,6 +42,12 @@ pub const P_CDESC: u32 = u32::MAX - 28;
 const P_HINT: u32 = u32::MAX - 26;
 const P_CONTENT: u32 = u32::MAX - 12;
 const P_WINDOW: u32 = u32::MAX - 13;
+/// The SurfaceHolder pseudo object handed out by `getHolder` — held
+/// per SurfaceView so callbacks registered on it survive.
+const P_HOLDER: u32 = u32::MAX - 46;
+/// Callbacks registered via `SurfaceHolder.addCallback` — Array of Refs
+/// plus a "created" flag so surfaceCreated/surfaceChanged fire once.
+const P_HOLDER_CBS: u32 = u32::MAX - 47;
 // Marker keys are pub(crate): `is_instance` consults them so inflated
 // views pass `instanceof View`/`ViewGroup` checks.
 pub(crate) const P_IS_VIEW: u32 = u32::MAX - 14;
@@ -1425,7 +1431,83 @@ pub(crate) fn call(
         "getHolder" | "getSurface"
             if class.contains("SurfaceView") || desc_is_a(class, "Landroid/view/SurfaceView;") =>
         {
-            Some(Some(V::Ref(0)))
+            eprintln!("[holder] getHolder called class={class}");
+            let h = match pseudo_get(vm, this, P_HOLDER) {
+                Some(V::Ref(h)) if h != 0 => h,
+                _ => {
+                    let V::Ref(h) = host(vm, "Landroid/view/SurfaceHolder;", HostState::Empty)
+                    else {
+                        return Ok(Some(Some(V::Ref(0))));
+                    };
+                    // Back-ref: eglCreateWindowSurface sizes the
+                    // surface from the owning view's frame.
+                    pseudo_set(vm, h, crate::jdk::P_TARGET, V::Ref(this));
+                    pseudo_set(vm, this, P_HOLDER, V::Ref(h));
+                    h
+                }
+            };
+            Some(Some(V::Ref(h)))
+        }
+        // ---------- SurfaceHolder ----------
+        "addCallback" | "removeCallback"
+            if class.contains("SurfaceHolder")
+                || desc_is_a(class, "Landroid/view/SurfaceHolder;") =>
+        {
+            eprintln!("[holder] {name} called class={class} nargs={}", args.len());
+            if name == "addCallback" {
+                if let Some(V::Ref(cb)) = args.get(1).copied() {
+                    if cb != 0 {
+                        pseudo_set(vm, this, P_HOLDER_CBS, V::Ref(cb));
+                        // The host window already exists — the surface
+                        // is live the moment the view has a holder, so
+                        // deliver created+changed immediately (Godot
+                        // starts its render threads off these).
+                        let wh = host(vm, "Landroid/view/SurfaceHolder;", HostState::Empty);
+                        // Size from the owning view's frame — GL threads
+                        // (GLSurfaceView.guardedRun) hold `wait()` until
+                        // surfaceChanged reports a non-zero w/h.
+                        let (sw, sh) = pseudo_get(vm, this, crate::jdk::P_TARGET)
+                            .and_then(|v| {
+                                if let V::Ref(vh) = v {
+                                    vm.dex_view(vh).and_then(|i| i.frame)
+                                } else {
+                                    None
+                                }
+                            })
+                            .map(|(l, t, r, b)| (r - l, b - t))
+                            .unwrap_or((720, 1280));
+                        let r1 = vm.call_virtual(cb, "surfaceCreated", &[wh]);
+                        let r2 = vm.call_virtual(
+                            cb,
+                            "surfaceChanged",
+                            &[wh, V::I32(0), V::I32(sw), V::I32(sh)],
+                        );
+                        eprintln!("[holder] addCallback {sw}x{sh} created={r1:?} changed={r2:?}");
+                    }
+                }
+            }
+            Some(None)
+        }
+        "isCreating"
+        | "setType"
+        | "setFixedSize"
+        | "setFormat"
+        | "setSizeFromLayout"
+        | "getSurfaceFrame"
+        | "lockCanvas"
+        | "lockHardwareCanvas"
+        | "unlockCanvasAndPost"
+        | "setKeepScreenOn"
+            if class.contains("SurfaceHolder")
+                || desc_is_a(class, "Landroid/view/SurfaceHolder;") =>
+        {
+            Some(if name == "isCreating" {
+                Some(V::I32(0))
+            } else if name.starts_with("lock") || name == "getSurfaceFrame" {
+                Some(V::Ref(0))
+            } else {
+                None
+            })
         }
         "setAdapter" if class.contains("ViewPager") => {
             // Drive the PagerAdapter the way populate() would: count,

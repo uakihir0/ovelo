@@ -33,6 +33,19 @@ const GL_PROJECTION: i32 = 0x1701;
 
 const GL_COLOR_ARRAY: i32 = 0x8076;
 
+// ----- native-renderer swap path (Godot) -----
+/// Surface size learned at `eglCreateWindowSurface` (from the
+/// holder's owning view frame, else a phone-sized default).
+static EGL_SURF: Mutex<(i32, i32)> = Mutex::new((0, 0));
+/// Pixels read back at `eglSwapBuffers` — picked up by
+/// `guest_draw_ops` on the surface's view each present frame.
+static SWAP_FRAME: Mutex<Option<(Vec<u8>, u32, u32)>> = Mutex::new(None);
+
+/// Latest swapped frame `(rgba, w, h)`.
+pub(crate) fn swap_frame() -> Option<(Vec<u8>, u32, u32)> {
+    SWAP_FRAME.lock().unwrap().clone()
+}
+
 #[derive(Clone, Default)]
 struct Arr {
     /// Host buffer object handle (FloatBuffer/ByteBuffer).
@@ -583,6 +596,11 @@ pub(crate) fn gl_frame(vm: &mut Vm, view: u32, w: i32, h: i32) -> Vec<CanvasOp> 
     if gl != GL20 {
         state(GL20, |s| s.prims.clear());
     }
+    // Native renderers (Godot) draw through real host GL during
+    // onDrawFrame: make the CGL context + screen FBO current first so
+    // their `glBindFramebuffer(0)` lands in the readable buffer.
+    #[cfg(target_os = "macos")]
+    crate::native::glctx::make_current(w, h);
     let r = vm.call_virtual_sig(
         renderer,
         "onDrawFrame",
@@ -590,6 +608,18 @@ pub(crate) fn gl_frame(vm: &mut Vm, view: u32, w: i32, h: i32) -> Vec<CanvasOp> 
         &[V::Ref(gl)],
     );
     let mut ops = state(gl, |s| to_ops(s));
+    #[cfg(target_os = "macos")]
+    if let Some((px, rw, rh)) = crate::native::glctx::read_rgba() {
+        ops.push(CanvasOp::Bitmap {
+            x: 0.0,
+            y: 0.0,
+            w: rw as u32,
+            h: rh as u32,
+            src_w: rw as u32,
+            src_h: rh as u32,
+            rgba: std::rc::Rc::new(px),
+        });
+    }
     if gl != GL20 {
         ops.extend(state(GL20, |s| to_ops(s)));
     }
@@ -612,6 +642,145 @@ pub(crate) fn call(
     _sig: &str,
     args: &[V],
 ) -> Rt<Option<Option<V>>> {
+    // ----- javax.microedition.khronos.egl (EGL10) -----
+    // Godot's EglHelper runs the full EGL bring-up; hand out pseudo
+    // handles and success codes so its GLThread proceeds to the draw
+    // loop instead of restarting on EglConfigException forever.
+    if name == "getEGL" {
+        return Ok(Some(Some(host(
+            vm,
+            "Ljavax/microedition/khronos/egl/EGL10;",
+            HostState::Empty,
+        ))));
+    }
+    if name.starts_with("egl") {
+        {
+            static N: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+            let k = N.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            if k < 40 || (k & 0x3ff) == 0 {
+                eprintln!("[egl] {name} #{k}");
+            }
+        }
+        let put_ints = |vm: &mut Vm, i: usize, vals: &[i32]| {
+            if let Some(V::Ref(ah)) = args.get(i).copied() {
+                if ah != 0 {
+                    if let Some(Obj::Array { data, .. }) = vm.heap.get_mut(ah) {
+                        for (d, v) in data.iter_mut().zip(vals.iter()) {
+                            *d = V::I32(*v);
+                        }
+                    }
+                }
+            }
+        };
+        let obj = |vm: &mut Vm, d: &str| Some(host(vm, d, HostState::Empty));
+        return Ok(Some(match name {
+            "eglGetDisplay" => obj(vm, "Ljavax/microedition/khronos/egl/EGLDisplay;"),
+            "eglInitialize" => {
+                put_ints(vm, 2, &[1, 4]);
+                Some(V::I32(1))
+            }
+            "eglGetConfigs" | "eglChooseConfig" => {
+                // eglGetConfigs(disp, configs, size, num) / eglChooseConfig
+                // (disp, attrs, configs, size, num) — args[0] is `this`.
+                let (cfg_at, num_at) = if name == "eglGetConfigs" {
+                    (2usize, 4usize)
+                } else {
+                    (3usize, 5usize)
+                };
+                let cfg = host(
+                    vm,
+                    "Ljavax/microedition/khronos/egl/EGLConfig;",
+                    HostState::Empty,
+                );
+                if let V::Ref(cfg) = cfg {
+                    if let Some(V::Ref(ah)) = args.get(cfg_at).copied() {
+                        if ah != 0 {
+                            if let Some(Obj::Array { data, .. }) = vm.heap.get_mut(ah) {
+                                if let Some(d) = data.first_mut() {
+                                    *d = V::Ref(cfg);
+                                }
+                            }
+                        }
+                    }
+                }
+                put_ints(vm, num_at, &[1]);
+                Some(V::I32(1))
+            }
+            "eglCreateContext" => obj(vm, "Ljavax/microedition/khronos/egl/EGLContext;"),
+            "eglCreateWindowSurface" | "eglCreatePbufferSurface" | "eglCreatePixmapSurface" => {
+                // Window surfaces bind a SurfaceHolder — back-trace it
+                // to the owning view for the surface size.
+                if name == "eglCreateWindowSurface" {
+                    if let Some(V::Ref(hh)) = args.get(3).copied() {
+                        if let Some(V::Ref(vh)) = pseudo_get(vm, hh, crate::jdk::P_TARGET) {
+                            if let Some((l, t, r, b)) = vm.dex_view(vh).and_then(|i| i.frame) {
+                                *EGL_SURF.lock().unwrap() = (r - l, b - t);
+                            }
+                        }
+                    }
+                }
+                obj(vm, "Ljavax/microedition/khronos/egl/EGLSurface;")
+            }
+            "eglMakeCurrent" => {
+                #[cfg(target_os = "macos")]
+                {
+                    let (w, h) = *EGL_SURF.lock().unwrap();
+                    crate::native::glctx::make_current(
+                        if w > 0 { w } else { 720 },
+                        if h > 0 { h } else { 1280 },
+                    );
+                }
+                Some(V::I32(1))
+            }
+            "eglSwapBuffers" => {
+                #[cfg(target_os = "macos")]
+                if let Some((px, w, h)) = crate::native::glctx::read_rgba() {
+                    *SWAP_FRAME.lock().unwrap() = Some((px, w as u32, h as u32));
+                }
+                Some(V::I32(1))
+            }
+            "eglGetCurrentContext" => obj(vm, "Ljavax/microedition/khronos/egl/EGLContext;"),
+            "eglGetCurrentDisplay" => obj(vm, "Ljavax/microedition/khronos/egl/EGLDisplay;"),
+            "eglGetCurrentSurface" => obj(vm, "Ljavax/microedition/khronos/egl/EGLSurface;"),
+            "eglGetConfigAttrib" => {
+                // eglGetConfigAttrib(disp, cfg, attrib, value[]) — write a
+                // sane value so the chooser's RGBA/depth checks pass.
+                let attrib = args.get(3).map(|v| i32v(*v)).unwrap_or(0);
+                let val = match attrib {
+                    0x3020 => 32,     // EGL_BUFFER_SIZE
+                    0x3021 => 8,      // EGL_ALPHA_SIZE
+                    0x3022 => 8,      // EGL_BLUE_SIZE
+                    0x3023 => 8,      // EGL_GREEN_SIZE
+                    0x3024 => 8,      // EGL_RED_SIZE
+                    0x3025 => 24,     // EGL_DEPTH_SIZE
+                    0x3026 => 8,      // EGL_STENCIL_SIZE
+                    0x3027 => 0x3038, // EGL_CONFIG_CAVEAT -> EGL_NONE
+                    0x3029 => 0,      // EGL_LEVEL
+                    0x302d => 1,      // EGL_NATIVE_RENDERABLE
+                    0x3031 => 0,      // EGL_SAMPLES
+                    0x3032 => 0,      // EGL_SAMPLE_BUFFERS
+                    0x3033 => 0x5,    // EGL_SURFACE_TYPE: WINDOW|PBUFFER
+                    0x303b => 0,      // EGL_MIN_SWAP_INTERVAL
+                    0x303c => 1,      // EGL_MAX_SWAP_INTERVAL
+                    0x303d => 0,      // EGL_LUMINANCE_SIZE
+                    0x303e => 0,      // EGL_ALPHA_MASK_SIZE
+                    0x303f => 0x308e, // EGL_COLOR_BUFFER_TYPE -> RGB_BUFFER
+                    0x3040 => 4,      // EGL_RENDERABLE_TYPE -> OPENGL_ES2
+                    0x3042 => 4,      // EGL_CONFORMANT
+                    _ => 8,
+                };
+                put_ints(vm, 4, &[val]);
+                Some(V::I32(1))
+            }
+            "eglGetError" => Some(V::I32(0x3000)), // EGL_SUCCESS
+            "eglGetProcAddress" => Some(V::I32(0)),
+            "eglQuerySurface" | "eglQueryContext" | "eglQueryDisplay" => {
+                put_ints(vm, 4, &[0]);
+                Some(V::I32(1))
+            }
+            _ => Some(V::I32(1)),
+        }));
+    }
     if !name.starts_with("gl") {
         return Ok(None);
     }

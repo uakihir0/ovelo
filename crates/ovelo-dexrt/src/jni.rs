@@ -324,6 +324,20 @@ pub(crate) fn call_native(
     }
     without_vm_lock(|| {
         crate::native::with_guest_tls_at("jni_call", || unsafe {
+            // Publish our thread's mach port so the watchdog can sample
+            // this thread's pc at high rate while guest code runs.
+            #[cfg(target_os = "macos")]
+            {
+                extern "C" {
+                    fn mach_thread_self() -> u32;
+                }
+                crate::native::excport::JNI_ACT_PORT
+                    .store(mach_thread_self(), std::sync::atomic::Ordering::Release);
+                crate::native::excport::JNI_ACT_TCB.store(
+                    crate::native::guest_tcb() as usize,
+                    std::sync::atomic::Ordering::Release,
+                );
+            }
             ovelo_jni_call(
                 fnptr,
                 iargs.as_ptr(),
@@ -331,7 +345,9 @@ pub(crate) fn call_native(
                 out.as_mut_ptr(),
                 sargs.as_ptr(),
                 sargs.len() as u64,
-            )
+            );
+            #[cfg(target_os = "macos")]
+            crate::native::excport::JNI_ACT_PORT.store(0, std::sync::atomic::Ordering::Release);
         });
     });
     if ncall {

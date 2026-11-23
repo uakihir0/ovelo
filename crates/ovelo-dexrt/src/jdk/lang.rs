@@ -33,7 +33,9 @@ pub(crate) fn call(
         classloader_call(vm, name, args)
     } else if class == "Ljava/lang/Package;" {
         package_call(vm, name, sig, args)
-    } else if desc_is_a(class, "Ljava/lang/Thread;") {
+    } else if desc_is_a(class, "Ljava/lang/Thread;")
+        || vm.assignable_desc(class, "Ljava/lang/Thread;")
+    {
         thread_call(vm, name, sig, args)?
     } else if class.ends_with("ThreadLocal;") {
         threadlocal_call(vm, name, args)
@@ -2118,6 +2120,22 @@ fn thread_call(vm: &mut Vm, name: &str, _sig: &str, args: &[V]) -> Rt<Option<Opt
                     // budget — a `while (running)` game loop parks on
                     // every Thread.sleep and must never hit the worker
                     // repark cap.
+                    let rcls = super::class_of(vm, V::Ref(r));
+                    eprintln!("[thread] start {rcls} runnable=0x{r:x}");
+                    // GLSurfaceView$GLThread waits on surface state inside
+                    // its own manager — set it directly since the real
+                    // SurfaceHolder.Callback chain never fires here.
+                    if rcls.contains("GLSurfaceView$GLThread") {
+                        for (m, a) in [
+                            ("surfaceCreated", vec![]),
+                            ("onWindowResize", vec![V::I32(720), V::I32(1280)]),
+                            ("setRenderMode", vec![V::I32(1)]),
+                            ("requestRender", vec![]),
+                        ] {
+                            let r_ = vm.call_virtual(r, m, &a);
+                            eprintln!("[thread] {m} -> {r_:?}");
+                        }
+                    }
                     vm.thread_runnables.insert(r);
                     vm.enqueue_runnable(r, false);
                 }
