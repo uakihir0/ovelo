@@ -843,6 +843,14 @@ impl GuestUi {
         // the last good ops until a frame lands.
         let ops = (ow > 0 && oh > 0).then(|| vm.guest_draw_ops(h, ow, oh));
         let mut g = rc.borrow_mut();
+        // The widget kind is chosen once, but `is_group` can arrive
+        // late: ViewPager2 builds its page container FrameLayout
+        // empty and adds the page inside onMeasure/populate, so a
+        // view materialized as Plain before children existed must be
+        // rebuilt as a Group or its kids stay dropped forever.
+        if info.is_group && !matches!(&*g, GuestView::Group(_)) {
+            *g = make_dex_view(vm, &info, &fonts);
+        }
         // `g` borrows the view object while `self.materialize_dex`
         // recurses into children — different cells, no aliasing.
         update_dex_view(&mut g, &info);
