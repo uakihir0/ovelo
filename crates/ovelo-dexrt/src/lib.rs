@@ -1939,24 +1939,31 @@ impl Vm {
                     let due = self.sleep_until.remove(&r).unwrap_or(now);
                     let unparkable = self.park_waiters.remove(&r);
                     if unparkable && self.deadline_woke.remove(&r) {
-                        // The wake was this runnable's OWN deadline,
-                        // not an unpark — a kotlinx surplus worker past
-                        // its keep-alive would retire here, but our
-                        // re-run-from-top model can't reach its
-                        // termination check. After a couple of
-                        // deadline-only cycles, retire it out of the
-                        // delayed set: `unpark`/fresh `enqueue_runnable`
-                        // still revive it via `parked_runnables`.
-                        let n = self.deadline_park_cycles.entry(r).or_insert(0);
-                        *n += 1;
-                        if *n >= 2 {
-                            if dbg {
-                                eprintln!("[drain] h={r} park -> retired(deadline)");
+                        if due.saturating_sub(now) >= 1_000 {
+                            // The wake was this runnable's OWN deadline,
+                            // not an unpark — a kotlinx surplus worker
+                            // past its keep-alive would retire here, but
+                            // our re-run-from-top model can't reach its
+                            // termination check. After a couple of
+                            // deadline-only cycles, retire it out of the
+                            // delayed set: `unpark`/fresh
+                            // `enqueue_runnable` still revive it via
+                            // `parked_runnables`.
+                            let n = self.deadline_park_cycles.entry(r).or_insert(0);
+                            *n += 1;
+                            if *n >= 2 {
+                                if dbg {
+                                    eprintln!("[drain] h={r} park -> retired(deadline)");
+                                }
+                                self.deadline_park_cycles.remove(&r);
+                                self.reparked.remove(&r);
+                                self.parked_runnables.insert(r, on_main);
+                                continue;
                             }
+                        } else {
+                            // A short re-park is an active timer loop,
+                            // not an idle keep-alive — don't count it.
                             self.deadline_park_cycles.remove(&r);
-                            self.reparked.remove(&r);
-                            self.parked_runnables.insert(r, on_main);
-                            continue;
                         }
                     }
                     if unparkable {
@@ -1974,16 +1981,20 @@ impl Vm {
                     let due = self.sleep_until.remove(&r).unwrap_or(now);
                     let unparkable = self.park_waiters.remove(&r);
                     if unparkable && self.deadline_woke.remove(&r) {
-                        let n = self.deadline_park_cycles.entry(r).or_insert(0);
-                        *n += 1;
-                        if *n >= 2 {
-                            if dbg {
-                                eprintln!("[drain] h={r} park -> retired(deadline)");
+                        if due.saturating_sub(now) >= 1_000 {
+                            let n = self.deadline_park_cycles.entry(r).or_insert(0);
+                            *n += 1;
+                            if *n >= 2 {
+                                if dbg {
+                                    eprintln!("[drain] h={r} park -> retired(deadline)");
+                                }
+                                self.deadline_park_cycles.remove(&r);
+                                self.reparked.remove(&r);
+                                self.parked_runnables.insert(r, on_main);
+                                continue;
                             }
+                        } else {
                             self.deadline_park_cycles.remove(&r);
-                            self.reparked.remove(&r);
-                            self.parked_runnables.insert(r, on_main);
-                            continue;
                         }
                     }
                     if unparkable {
