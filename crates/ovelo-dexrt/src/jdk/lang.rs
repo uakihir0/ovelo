@@ -531,6 +531,16 @@ fn strbuf(vm: &mut Vm, name: &str, sig: &str, args: &[V]) -> Rt<Option<Option<V>
                     },
                     _ => String::new(),
                 },
+                "Ljava/lang/CharSequence;" if p.len() == 3 => {
+                    // `append(CharSequence, start, end)` appends the
+                    // char-range view — kotlin's replace/split builders
+                    // rely on it (appending the whole input instead
+                    // duplicated the source into the output).
+                    let t = sv(vm, args[1]).unwrap_or_default();
+                    let lo = i32v(args[2]).max(0) as usize;
+                    let hi = i32v(args[3]).max(0) as usize;
+                    t.chars().skip(lo).take(hi.saturating_sub(lo)).collect()
+                }
                 _ => v_to_s(vm, args[1]),
             };
             if let Some(Obj::Host {
