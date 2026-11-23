@@ -678,8 +678,12 @@ pub(crate) fn list_snapshot(vm: &Vm, h: u32) -> Option<Vec<V>> {
                     // `head`-offset ring (kotlin ArrayDeque) may wrap:
                     // read it mod capacity.
                     if ring && !data.is_empty() {
-                        let n = size.unwrap_or(data.len());
                         let len = data.len();
+                        // Capacity bounds a ring's element count — a
+                        // guest-claimed `size` beyond it would
+                        // duplicate elements and can exhaust host
+                        // memory building the snapshot.
+                        let n = size.unwrap_or(len).min(len);
                         return Some((0..n).map(|i| data[(off + i) % len]).collect::<Vec<_>>());
                     }
                     Some(
@@ -770,8 +774,9 @@ fn guest_list_backing(vm: &Vm, h: u32, depth: u8) -> Option<(u32, usize, Option<
         if let Some(len) = len {
             let off = off_field.min(len);
             // On a wrapped ring the window folds mod `len` — clamp by
-            // the logical size itself, not the tail of the array.
-            let size = size_field.map(|n| if ring { n } else { n.min(len - off) });
+            // the logical size itself (bounded by capacity), not the
+            // tail of the array.
+            let size = size_field.map(|n| if ring { n.min(len) } else { n.min(len - off) });
             return Some((x, off, size, ring));
         }
     }
