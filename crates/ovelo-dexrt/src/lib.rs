@@ -2985,14 +2985,37 @@ impl Vm {
             });
         }
         if let Ok((class, name, sig)) = self.method_sig(midx) {
-            if let Some(&g) = self.methods_by_sig.get(&(class, name, sig)) {
-                if let Some(&(c, em)) = self.defined.get(&g) {
-                    return Ok(Loc {
-                        class_idx: c,
-                        midx: g,
-                        em,
-                    });
+            // Static/direct refs may name a subclass of the actual
+            // declarer — ART resolves them walking the superclass
+            // chain (`V3/g.b` declared on `V3/i` etc.), so do the
+            // same on a direct-table miss.
+            let mut cur = Some(class);
+            for _ in 0..64 {
+                let Some(desc) = cur else { break };
+                if let Some(&g) =
+                    self.methods_by_sig
+                        .get(&(desc.clone(), name.clone(), sig.clone()))
+                {
+                    if let Some(&(c, em)) = self.defined.get(&g) {
+                        return Ok(Loc {
+                            class_idx: c,
+                            midx: g,
+                            em,
+                        });
+                    }
                 }
+                let Some(&(di, def_i)) = self.defs.get(&desc) else {
+                    break;
+                };
+                let d = &self.dexes[di];
+                let def = &d.class_defs()[def_i];
+                if def.superclass_idx == u32::MAX {
+                    break;
+                }
+                cur = d
+                    .type_descriptor(def.superclass_idx)
+                    .ok()
+                    .map(|s| s.to_string());
             }
         }
         Err(E::Vm(err("dexrt.invoke.unresolved")))
