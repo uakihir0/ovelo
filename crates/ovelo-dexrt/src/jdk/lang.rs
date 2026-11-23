@@ -546,8 +546,7 @@ fn strbuf(vm: &mut Vm, name: &str, sig: &str, args: &[V]) -> Rt<Option<Option<V>
                             };
                             // char[] is UTF-16 — decode code units so
                             // surrogate pairs survive.
-                            let units: Vec<u16> =
-                                slice.iter().map(|v| i32v(*v) as u16).collect();
+                            let units: Vec<u16> = slice.iter().map(|v| i32v(*v) as u16).collect();
                             String::from_utf16_lossy(&units)
                         }
                         _ => String::new(),

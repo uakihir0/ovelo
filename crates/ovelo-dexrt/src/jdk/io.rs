@@ -458,10 +458,7 @@ fn writer_text(vm: &mut Vm, v: V, lo_v: Option<V>, hi_v: Option<V>, len_mode: bo
         _ => {
             let t = v_to_s(vm, v);
             let n = t.chars().count();
-            let lo = lo_v
-                .map(|v| i64v(v).max(0) as usize)
-                .unwrap_or(0)
-                .min(n);
+            let lo = lo_v.map(|v| i64v(v).max(0) as usize).unwrap_or(0).min(n);
             let hi = if len_mode {
                 hi_v.map(|v| lo + i64v(v).max(0) as usize)
             } else {
