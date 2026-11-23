@@ -319,7 +319,19 @@ fn print_call(vm: &mut Vm, name: &str, _sig: &str, args: &[V]) -> Option<Option<
             } else {
                 String::new()
             };
-            if name == "println" {
+            if let Some(w) = wrapped_writer(vm, h_of(args[0])) {
+                let mut t = t;
+                if name == "println" {
+                    t.push('\n');
+                }
+                if let Some(Obj::Host {
+                    state: HostState::StrBuf(b),
+                    ..
+                }) = vm.heap.get_mut(w)
+                {
+                    b.push_str(&t);
+                }
+            } else if name == "println" {
                 eprintln!("{t}");
             } else {
                 eprint!("{t}");
@@ -340,16 +352,65 @@ fn print_call(vm: &mut Vm, name: &str, _sig: &str, args: &[V]) -> Option<Option<
             eprint!("{}", simple_format(vm, &fmt, &flat));
             Some(Some(args[0]))
         }
-        "write" | "flush" | "close" | "checkError" | "append" => {
-            if name == "checkError" {
-                Some(Some(V::I32(0)))
-            } else if name == "append" {
+        "write" | "append" => {
+            // PrintWriter(Writer) forwards — the wrapped writer is under
+            // P_DATA so prints land in its buffer.
+            if let Some(t) = args.get(1) {
+                if let Some(w) = wrapped_writer(vm, h_of(args[0])) {
+                    let t = v_to_s(vm, *t);
+                    if let Some(Obj::Host {
+                        state: HostState::StrBuf(b),
+                        ..
+                    }) = vm.heap.get_mut(w)
+                    {
+                        b.push_str(&t);
+                    }
+                }
+            }
+            if name == "append" {
                 Some(Some(args[0]))
             } else {
                 Some(None)
             }
         }
+        "flush" | "close" | "checkError" => {
+            if name == "checkError" {
+                Some(Some(V::I32(0)))
+            } else {
+                Some(None)
+            }
+        }
+        "<init>" => {
+            if let Some(&V::Ref(w)) = args.get(1) {
+                pseudo_set(vm, h_of(args[0]), P_DATA, V::Ref(w));
+            }
+            Some(None)
+        }
         _ => None,
+    }
+}
+
+/// Follow the P_DATA chain of wrapper writers (PrintWriter,
+/// BufferedWriter, OutputStreamWriter) to the innermost target.
+fn wrapped_writer(vm: &mut Vm, this: u32) -> Option<u32> {
+    let mut h = this;
+    for _ in 0..4 {
+        match pseudo_get(vm, h, P_DATA) {
+            Some(V::Ref(n)) if n != h => h = n,
+            _ => break,
+        }
+    }
+    if h != this {
+        Some(h)
+    } else {
+        None
+    }
+}
+
+fn h_of(v: V) -> u32 {
+    match v {
+        V::Ref(h) => h,
+        _ => 0,
     }
 }
 
@@ -695,12 +756,21 @@ fn stream_call(vm: &mut Vm, name: &str, args: &[V]) -> Rt<Option<Option<V>>> {
         }
         return Ok(Some(None));
     }
+    // `<init>(Writer/OutputStream)` wrappers record the wrapped sink so
+    // writes can be forwarded into the innermost buffer.
+    if name == "<init>" {
+        if let Some(&V::Ref(w)) = args.get(1) {
+            pseudo_set(vm, this, P_DATA, V::Ref(w));
+        }
+        return Ok(Some(None));
+    }
     // StringWriter/CharArrayWriter accumulate into a StrBuf — writes
     // append text and toString()/getBuffer() hand it back. A bare
     // `toString` that returned the identity string poisoned resource
     // strings in tasks.org (Okio.Utf8 getString via StringWriter).
+    let wthis = wrapped_writer(vm, this).unwrap_or(this);
     let is_strbuf = matches!(
-        vm.heap.get(this),
+        vm.heap.get(wthis),
         Some(Obj::Host {
             state: HostState::StrBuf(_),
             ..
@@ -740,7 +810,7 @@ fn stream_call(vm: &mut Vm, name: &str, args: &[V]) -> Rt<Option<Option<V>>> {
                 if let Some(Obj::Host {
                     state: HostState::StrBuf(b),
                     ..
-                }) = vm.heap.get_mut(this)
+                }) = vm.heap.get_mut(wthis)
                 {
                     b.push_str(&t);
                 }
@@ -759,14 +829,14 @@ fn stream_call(vm: &mut Vm, name: &str, args: &[V]) -> Rt<Option<Option<V>>> {
                 if let Some(Obj::Host {
                     state: HostState::StrBuf(b),
                     ..
-                }) = vm.heap.get_mut(this)
+                }) = vm.heap.get_mut(wthis)
                 {
                     b.push_str(&t);
                 }
                 return Ok(Some(Some(args[0])));
             }
             "toString" | "getBuffer" | "toCharArray" => {
-                let t = match vm.heap.get(this) {
+                let t = match vm.heap.get(wthis) {
                     Some(Obj::Host {
                         state: HostState::StrBuf(b),
                         ..
