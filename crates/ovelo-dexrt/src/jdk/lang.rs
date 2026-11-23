@@ -485,6 +485,28 @@ fn strbuf(vm: &mut Vm, name: &str, sig: &str, args: &[V]) -> Rt<Option<Option<V>
     let V::Ref(h) = args.first().copied().unwrap_or(V::Ref(0)) else {
         return Ok(None);
     };
+    // `StringWriter.getBuffer()` hands out a StringBuffer view that
+    // delegates through P_DATA to the writer's shared buffer — follow
+    // the chain so view operations hit the real storage.
+    let h = {
+        let mut cur = h;
+        for _ in 0..4 {
+            if matches!(
+                vm.heap.get(cur),
+                Some(Obj::Host {
+                    state: HostState::StrBuf(_),
+                    ..
+                })
+            ) {
+                break;
+            }
+            match pseudo_get(vm, cur, P_DATA) {
+                Some(V::Ref(n)) if n != cur => cur = n,
+                _ => break,
+            }
+        }
+        cur
+    };
     Ok(match name {
         "<init>" => {
             // StringBuilder(String|CharSequence|int capacity).
@@ -522,10 +544,11 @@ fn strbuf(vm: &mut Vm, name: &str, sig: &str, args: &[V]) -> Rt<Option<Option<V>
                             } else {
                                 data
                             };
-                            slice
-                                .iter()
-                                .filter_map(|v| char::from_u32(i32v(*v) as u32))
-                                .collect()
+                            // char[] is UTF-16 — decode code units so
+                            // surrogate pairs survive.
+                            let units: Vec<u16> =
+                                slice.iter().map(|v| i32v(*v) as u16).collect();
+                            String::from_utf16_lossy(&units)
                         }
                         _ => String::new(),
                     },
