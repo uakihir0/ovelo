@@ -686,7 +686,10 @@ fn jar_headers(b: &[u8]) -> Vec<(String, String)> {
             continue;
         }
         if let Some((k, v)) = line.split_once(": ") {
-            out.push((k.to_string(), v.to_string()));
+            // JAR header names are case-insensitive (Attributes.Name
+            // compares uppercase) — normalize so lookups match
+            // "sha1-Digest" and "SHA1-Digest" alike.
+            out.push((k.to_ascii_uppercase(), v.to_string()));
         }
     }
     out
@@ -763,6 +766,12 @@ fn verify_v1_signer(
         .collect();
     if cert_ders.is_empty() {
         return Err(sig_err("sig.v1.cert"));
+    }
+    // Real signers embed 1–3 certs. Each candidate costs an X.509 parse
+    // plus an RSA verify — cap the scan so a hostile block with a huge
+    // cert set can't spin install.
+    if cert_ders.len() > 16 {
+        return Err(sig_err("sig.v1.certs.many"));
     }
 
     // --- SignerInfo: version, sid, digestAlg, [0] attrs?, sigAlg, signature ---
@@ -910,7 +919,7 @@ fn verify_v1_signer(
         .unwrap_or_default();
     let whole_digests: Vec<(String, Vec<u8>)> = main
         .iter()
-        .filter(|(k, _)| k.ends_with("-Digest-Manifest"))
+        .filter(|(k, _)| k.ends_with("-DIGEST-MANIFEST"))
         .map(|(k, v)| Ok((k.clone(), b64(v)?)))
         .collect::<Result<Vec<_>>>()?;
     let mut manifest_ok = false;
@@ -936,14 +945,14 @@ fn verify_v1_signer(
             let hdrs = jar_headers(&sf[*s..*e]);
             let Some(name) = hdrs
                 .iter()
-                .find(|(k, _)| k == "Name")
+                .find(|(k, _)| k == "NAME")
                 .map(|(_, v)| v.clone())
             else {
                 continue;
             };
             let Some(digest) = hdrs
                 .iter()
-                .find(|(k, _)| k.ends_with("-Digest"))
+                .find(|(k, _)| k.ends_with("-DIGEST"))
                 .map(|(k, v)| (k.clone(), v.clone()))
             else {
                 continue;
@@ -952,7 +961,7 @@ fn verify_v1_signer(
             let mf_sec = mf_sections.iter().find(|(s, e)| {
                 jar_headers(&manifest[*s..*e])
                     .iter()
-                    .any(|(k, v)| k == "Name" && *v == name)
+                    .any(|(k, v)| k == "NAME" && *v == name)
             });
             let Some(&(ms, me)) = mf_sec else {
                 return Err(sig_err("sig.v1.section.missing"));
@@ -984,16 +993,16 @@ fn verify_v1_signer(
         let sf_names: std::collections::HashSet<String> = sf_sections
             .iter()
             .flat_map(|(s, e)| jar_headers(&sf[*s..*e]))
-            .filter(|(k, _)| k == "Name")
+            .filter(|(k, _)| k == "NAME")
             .map(|(_, v)| v)
             .collect();
         for (s, e) in &mf_sections {
             let has_name = jar_headers(&manifest[*s..*e])
                 .iter()
-                .any(|(k, v)| k == "Name" && sf_names.contains(v));
+                .any(|(k, v)| k == "NAME" && sf_names.contains(v));
             let is_main = !jar_headers(&manifest[*s..*e])
                 .iter()
-                .any(|(k, _)| k == "Name");
+                .any(|(k, _)| k == "NAME");
             if !is_main && !has_name {
                 return Err(sig_err("sig.v1.section.uncovered"));
             }
@@ -1006,7 +1015,7 @@ fn verify_v1_signer(
         let hdrs = jar_headers(&manifest[s..e]);
         let Some(name) = hdrs
             .iter()
-            .find(|(k, _)| k == "Name")
+            .find(|(k, _)| k == "NAME")
             .map(|(_, v)| v.clone())
         else {
             continue;
@@ -1015,7 +1024,7 @@ fn verify_v1_signer(
         let Some(entry) = entry else {
             return Err(sig_err("sig.v1.entry.missing"));
         };
-        for (k, v) in hdrs.iter().filter(|(k, _)| k.ends_with("-Digest")) {
+        for (k, v) in hdrs.iter().filter(|(k, _)| k.ends_with("-DIGEST")) {
             let want = b64(v)?;
             let data = read_entry(bytes, entry)?;
             let Some(got) = digest_for_name(k, &data) else {
@@ -1040,7 +1049,7 @@ fn verify_v1_signer(
     let listed: std::collections::HashSet<String> = jar_sections(manifest)
         .iter()
         .flat_map(|(s, e)| jar_headers(&manifest[*s..*e]))
-        .filter(|(k, _)| k == "Name")
+        .filter(|(k, _)| k == "NAME")
         .map(|(_, v)| v)
         .collect();
     for en in entries {
