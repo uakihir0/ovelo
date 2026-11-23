@@ -772,6 +772,62 @@ fn guest_list_backing(vm: &Vm, h: u32, depth: u8) -> Option<(u32, usize, Option<
             _ => None,
         };
         if let Some(len) = len {
+            let mut off_field = off_field;
+            let mut size_field = size_field;
+            let mut ring = ring;
+            if size_field.is_none() && off_field == 0 && !ring {
+                // R8-obfuscated container: window ints carry no names.
+                // With exactly two candidates, score each (off, size)
+                // assignment by how many null slots its window reads —
+                // a live ring/queue window is dense, the stale prefix
+                // isn't. `modCount` keeps its real name even under R8.
+                let ints: Vec<usize> = fields
+                    .iter()
+                    .filter_map(|(g, v)| match v {
+                        V::I32(n)
+                            if *n >= 0
+                                && vm.dbg_field_name(*g).rsplit('.').next() != Some("modCount") =>
+                        {
+                            Some(*n as usize)
+                        }
+                        _ => None,
+                    })
+                    .collect();
+                if ints.len() == 2 {
+                    let nulls = |off: usize, n: usize| -> usize {
+                        let n = n.min(len);
+                        match vm.heap.get(x) {
+                            Some(Obj::Host {
+                                state: HostState::List(l),
+                                ..
+                            }) => (0..n)
+                                .filter(|&i| {
+                                    matches!(
+                                        l.get((off + i) % len.max(1)),
+                                        Some(V::Ref(0)) | Some(V::I32(0)) | None
+                                    )
+                                })
+                                .count(),
+                            Some(Obj::Array { data, .. }) => (0..n)
+                                .filter(|&i| {
+                                    matches!(
+                                        data.get((off + i) % len.max(1)),
+                                        Some(V::Ref(0)) | Some(V::I32(0)) | None
+                                    )
+                                })
+                                .count(),
+                            _ => len,
+                        }
+                    };
+                    let (a, b) = (ints[0], ints[1]);
+                    if nulls(a.min(len), b) <= nulls(b.min(len), a) {
+                        (off_field, size_field) = (a, Some(b));
+                    } else {
+                        (off_field, size_field) = (b, Some(a));
+                    }
+                    ring = off_field + size_field.unwrap_or(0) > len;
+                }
+            }
             let off = off_field.min(len);
             // On a wrapped ring the window folds mod `len` — clamp by
             // the logical size itself (bounded by capacity), not the
