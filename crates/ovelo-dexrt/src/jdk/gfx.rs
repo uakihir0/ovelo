@@ -21,6 +21,7 @@ const PK_CH: u32 = 0xFFFD_FF11;
 /// composites pixels into it instead of only recording ops (Glide's
 /// transform path draws into a pooled Bitmap this way).
 const PK_TARGET: u32 = 0xFFFD_FF12;
+const PK_SAVECNT: u32 = 0xFFFD_FF13;
 
 fn flt(v: V) -> f32 {
     f64v(v) as f32
@@ -123,15 +124,41 @@ fn canvas_call(vm: &mut Vm, name: &str, sig: &str, args: &[V]) -> Rt<Option<Opti
         }))),
         "save" | "saveLayer" | "saveLayerAlpha" => {
             rec(vm, this, CanvasOp::Save);
-            Some(Some(V::I32(1)))
+            if let V::Ref(h) = this {
+                let n = i32v(pseudo_get(vm, h, PK_SAVECNT).unwrap_or(V::I32(0))) + 1;
+                pseudo_set(vm, h, PK_SAVECNT, V::I32(n));
+                Some(Some(V::I32(n)))
+            } else {
+                Some(Some(V::I32(1)))
+            }
         }
-        "saveCount" => Some(Some(V::I32(1))),
+        "saveCount" => Some(Some(V::I32(match this {
+            V::Ref(h) => i32v(pseudo_get(vm, h, PK_SAVECNT).unwrap_or(V::I32(0))),
+            _ => 0,
+        }))),
         "restore" => {
             rec(vm, this, CanvasOp::Restore);
+            if let V::Ref(h) = this {
+                let n = i32v(pseudo_get(vm, h, PK_SAVECNT).unwrap_or(V::I32(0)));
+                pseudo_set(vm, h, PK_SAVECNT, V::I32((n - 1).max(0)));
+            }
             Some(None)
         }
+        // restoreToCount pops every save above `count` — recording a
+        // single Restore would leave guest saves on the replay stack,
+        // and the host's own bracket restore would then pop a guest
+        // save instead, leaking the view's translate into its siblings.
         "restoreToCount" => {
-            rec(vm, this, CanvasOp::Restore);
+            let want = i32v(args.first().copied().unwrap_or(V::I32(0))).max(0);
+            if let V::Ref(h) = this {
+                let have = i32v(pseudo_get(vm, h, PK_SAVECNT).unwrap_or(V::I32(0)));
+                for _ in want..have {
+                    rec(vm, this, CanvasOp::Restore);
+                }
+                pseudo_set(vm, h, PK_SAVECNT, V::I32(want.min(have)));
+            } else {
+                rec(vm, this, CanvasOp::Restore);
+            }
             Some(None)
         }
         "translate" => {
