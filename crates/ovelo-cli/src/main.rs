@@ -1188,6 +1188,44 @@ fn run_activity_cbs(vm: &mut ovelo_dexrt::Vm, this: u32, callbacks: &[String]) {
                 }
             );
         }
+        dispatch_alc(vm, this, cb);
+    }
+}
+
+/// AOSP `Activity.performX` fans each lifecycle stage out to the
+/// Application's registered `ActivityLifecycleCallbacks` (pre, mid and
+/// post variants — impls override whichever they need; unresolved
+/// names just skip). androidx `ReportFragment` registers one to drive
+/// `ComponentActivity.mLifecycleRegistry` — without these calls the
+/// registry stays INITIALIZED and Compose's `WrappedComposition` never
+/// sees ON_RESUME, so `setContent` never runs.
+fn dispatch_alc(vm: &mut ovelo_dexrt::Vm, this: u32, stage: &str) {
+    use ovelo_dexrt::V;
+    let (stem, bundle) = match stage {
+        "onCreate" => ("Created", true),
+        "onStart" => ("Started", false),
+        "onResume" => ("Resumed", false),
+        "onPause" => ("Paused", false),
+        "onStop" => ("Stopped", false),
+        "onSaveInstanceState" => ("SaveInstanceState", true),
+        "onDestroy" => ("Destroyed", false),
+        _ => return,
+    };
+    let names = [
+        format!("onActivityPre{stem}"),
+        format!("onActivity{stem}"),
+        format!("onActivityPost{stem}"),
+    ];
+    for cb in vm.activity_callbacks() {
+        for name in &names {
+            let mut args = vec![V::Ref(this)];
+            if bundle {
+                args.push(V::Ref(0));
+            }
+            vm.call_virtual(cb, name, &args)
+                .inspect_err(|e| println!("activity lifecycle {name} crashed: {e}"))
+                .ok();
+        }
     }
 }
 

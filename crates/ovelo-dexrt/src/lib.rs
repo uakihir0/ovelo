@@ -324,6 +324,19 @@ pub struct Vm {
     /// deadlocks on self-rescheduling executors). Drained at the
     /// outermost `call_virtual` boundary.
     pub pending_runnables: std::collections::VecDeque<(u32, bool)>,
+    /// `Choreographer.postFrameCallback*` — `(callback handle, due_ms)`.
+    /// Drained once per `drain_runnables` pass (= once per frame tick)
+    /// as `doFrame(J)V`; the Compose Recomposer's frame clock and
+    /// `View.postOnAnimation` both schedule through it.
+    pub(crate) frame_callbacks: Vec<(u32, u64)>,
+    /// The one `Choreographer.getInstance()` handle — identity matters
+    /// (dex code compares instances).
+    pub(crate) choreographer_h: u32,
+    /// `Application.ActivityLifecycleCallbacks` handles registered via
+    /// `registerActivityLifecycleCallbacks` — application-global in
+    /// AOSP. androidx ReportFragment relies on these to drive
+    /// `ComponentActivity.mLifecycleRegistry` through its states.
+    pub(crate) activity_callbacks: Vec<u32>,
     /// Time-gated posts (`Handler.postDelayed`/`sendMessageDelayed`) —
     /// `(handle, on_main, due_ms)`. Promoted into `pending_runnables` by
     /// `drain_runnables` once due; without this a self-rescheduling
@@ -527,6 +540,9 @@ impl Vm {
             total_steps: 0,
             pending_activity: None,
             pending_runnables: std::collections::VecDeque::new(),
+            frame_callbacks: Vec::new(),
+            choreographer_h: 0,
+            activity_callbacks: Vec::new(),
             delayed_runnables: Vec::new(),
             thread_runnables: std::collections::HashSet::new(),
             cur_runnable: 0,
@@ -1586,7 +1602,25 @@ impl Vm {
     /// the frame loop drains continuously then (game threads sleep in
     /// `delayed_runnables` between ticks) instead of on the idle cadence.
     pub fn has_queued_runnables(&self) -> bool {
-        !self.pending_runnables.is_empty() || !self.delayed_runnables.is_empty()
+        !self.pending_runnables.is_empty()
+            || !self.delayed_runnables.is_empty()
+            || !self.frame_callbacks.is_empty()
+    }
+
+    /// Registered `Application.ActivityLifecycleCallbacks` handles — the
+    /// runner dispatches `onActivity{Pre,Post}*` to them around each
+    /// activity lifecycle stage (ReportFragment needs the Post/Pre
+    /// variants to advance `ComponentActivity.mLifecycleRegistry`).
+    pub fn activity_callbacks(&self) -> Vec<u32> {
+        self.activity_callbacks.clone()
+    }
+
+    /// `View.removeCallbacks`/`Handler.removeCallbacks`/`Choreographer.remove*` —
+    /// drop a queued runnable without running it.
+    pub(crate) fn remove_runnable(&mut self, r: u32) {
+        self.pending_runnables.retain(|(h, _)| *h != r);
+        self.delayed_runnables.retain(|(h, _, _)| *h != r);
+        self.frame_callbacks.retain(|(h, _)| *h != r);
     }
 
     /// `enqueue_runnable` with a millisecond delay — the runnable sits
@@ -1734,8 +1768,22 @@ impl Vm {
         for h in std::mem::take(&mut self.pending_destroy) {
             let _ = self.call_virtual(h, "onDestroy", &[]);
         }
-        let mut ran = 0usize;
+        // Choreographer frame callbacks — `drain_runnables` runs once
+        // per frame tick, so a due callback fires on the next pass; one
+        // that reposts itself lands in `frame_callbacks` again (the
+        // Recomposer's loop works exactly that way).
+        let frame_nanos = V::I64(jdk::now_ms() * 1_000_000);
+        let (due_cbs, pending_cbs): (Vec<_>, Vec<_>) =
+            self.frame_callbacks.drain(..).partition(|(_, t)| *t <= now);
+        self.frame_callbacks = pending_cbs;
         let dbg = std::env::var_os("OVELO_DRAINDBG").is_some();
+        for (cb, _) in due_cbs {
+            match self.call_virtual(cb, "doFrame", &[frame_nanos]) {
+                Err(e) if dbg => eprintln!("[drain] doFrame h{cb} err={e:?}"),
+                _ => {}
+            }
+        }
+        let mut ran = 0usize;
         for _ in 0..max {
             let Some((r, on_main)) = self.pending_runnables.pop_front() else {
                 break;

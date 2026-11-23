@@ -579,12 +579,12 @@ fn list_call(vm: &mut Vm, name: &str, sig: &str, args: &[V]) -> Rt<Option<Option
                 }
             }
         }
-        "element" | "getFirst" | "getLast" => {
+        "element" | "getFirst" | "getLast" | "first" | "last" => {
             let l = match list_ref(vm, h) {
                 Some(l) => l,
                 None => return Ok(None),
             };
-            let v = if name == "getLast" {
+            let v = if matches!(name, "getLast" | "last") {
                 l.last()
             } else {
                 l.first()

@@ -15,6 +15,7 @@ const VIEWGROUP: &str = "Landroid/view/ViewGroup;";
 const FRAMELAYOUT: &str = "Landroid/widget/FrameLayout;";
 const WINDOW: &str = "Landroid/view/Window;";
 const INFLATER: &str = "Landroid/view/LayoutInflater;";
+const CHOR: &str = "Landroid/view/Choreographer;";
 
 // Pseudo keys for view-tree state (see mod.rs for the other P_* slots).
 const P_VIEW_ID: u32 = u32::MAX - 7;
@@ -716,6 +717,7 @@ pub(crate) fn is_viewish(vm: &Vm, class: &str, args: &[V]) -> bool {
             | "Landroid/view/WindowManager;"
             | "Landroid/view/WindowMetrics;"
             | "Landroid/view/WindowInsets;"
+            | "Landroid/view/Choreographer;"
             | "Landroid/graphics/Insets;"
     ) || class.ends_with("LayoutParams;")
         || desc_is_a(class, VIEW)
@@ -807,6 +809,64 @@ pub(crate) fn call(
             }
             Some(None)
         }
+        // ---------- Choreographer ----------
+        // The Recomposer's frame clock (MonotonicFrameClock on the main
+        // dispatcher) and `View.postOnAnimation` ride postFrameCallback —
+        // stubbing it left the first composition permanently unscheduled.
+        "getInstance" if class == CHOR => Some(Some(choreographer(vm))),
+        "postFrameCallback" | "postFrameCallbackDelayed" | "postVsyncCallback" if class == CHOR => {
+            // (FrameCallback [, long delayMillis])
+            let delay = if name == "postFrameCallback" {
+                0
+            } else {
+                args.get(2).map(|v| i64v(*v)).unwrap_or(0)
+            };
+            if let Some(V::Ref(cb)) = args.get(1).copied() {
+                if cb != 0 {
+                    vm.frame_callbacks
+                        .push((cb, (now_ms() + delay.max(0)) as u64));
+                }
+            }
+            Some(None)
+        }
+        "postCallback" | "postCallbackDelayed" | "postCallbackDelayedInternal" if class == CHOR => {
+            // (int callbackType, Runnable action, Object token [, long delay])
+            let delay = if args.len() > 4 { i64v(args[4]) } else { 0 };
+            if let Some(V::Ref(r)) = args.get(2).copied() {
+                if r != 0 {
+                    if delay > 0 {
+                        vm.enqueue_runnable_delayed(r, true, delay);
+                    } else {
+                        vm.enqueue_runnable(r, true);
+                    }
+                }
+            }
+            Some(None)
+        }
+        "removeFrameCallback" | "removeCallbacks" if class == CHOR => {
+            for v in [args.get(1), args.get(2)].into_iter().flatten() {
+                if let V::Ref(r) = v {
+                    if *r != 0 {
+                        vm.remove_runnable(*r);
+                    }
+                }
+            }
+            Some(None)
+        }
+        "getFrameTime"
+        | "getLastFrameTimeNanos"
+        | "getFrameTimeNanos"
+        | "getFrameDeadlineNanos"
+            if class == CHOR =>
+        {
+            let t = if name == "getFrameTime" {
+                now_ms()
+            } else {
+                now_ms() * 1_000_000
+            };
+            Some(Some(V::I64(t)))
+        }
+        "isNewPostCallbackOnMainThread" if class == CHOR => Some(Some(V::I32(1))),
         // AOSP `MarginLayoutParams.resolveLayoutDirection` — the
         // ConstraintLayout dex override resolves the start/end anchors
         // into its resolved* fields and invoke-supers here for the
@@ -1658,10 +1718,33 @@ pub(crate) fn call(
             HostState::Empty,
         ))),
         "getHandler" => Some(Some(host(vm, "Landroid/os/Handler;", HostState::Empty))),
-        "post" | "postDelayed" | "postOnAnimation" | "postOnAnimationDelayed" => {
+        "post" | "postOnAnimation" => {
+            // AttachInfo.mRunQueue work runs on the next traversal —
+            // our drain pass is the same tick; Compose's OwnerSnapshot
+            // and AndroidComposeView's invalidation dispatcher post
+            // here (dropping the runnable = silent blank).
+            if let Some(V::Ref(r)) = args.get(1).copied() {
+                if r != 0 {
+                    vm.enqueue_runnable(r, true);
+                }
+            }
             Some(Some(V::I32(1)))
         }
-        "removeCallbacks" => Some(Some(V::I32(1))),
+        "postDelayed" | "postOnAnimationDelayed" => {
+            if let Some(V::Ref(r)) = args.get(1).copied() {
+                if r != 0 {
+                    let d = args.get(2).map(|v| i64v(*v)).unwrap_or(0);
+                    vm.enqueue_runnable_delayed(r, true, d);
+                }
+            }
+            Some(Some(V::I32(1)))
+        }
+        "removeCallbacks" => {
+            if let Some(V::Ref(r)) = args.get(1).copied() {
+                vm.remove_runnable(r);
+            }
+            Some(Some(V::I32(1)))
+        }
         "animate" => Some(Some(host(
             vm,
             "Landroid/view/ViewPropertyAnimator;",
@@ -2360,6 +2443,16 @@ pub(crate) fn inflater(vm: &mut Vm, ctx: Option<V>) -> V {
         pseudo_set(vm, h, P_CONTEXT, c);
     }
     V::Ref(h)
+}
+
+/// The one `Choreographer.getInstance()` — dex code compares it by
+/// identity (`AndroidUiDispatcher` hangs the frame clock off the
+/// exact object it fetched).
+fn choreographer(vm: &mut Vm) -> V {
+    if vm.choreographer_h == 0 {
+        vm.choreographer_h = vm.alloc_host(CHOR, HostState::Empty);
+    }
+    V::Ref(vm.choreographer_h)
 }
 
 fn inflate_call(vm: &mut Vm, args: &[V]) -> V {
@@ -4926,10 +5019,20 @@ pub(crate) fn attach_at(
     if let V::Ref(ch) = child {
         pseudo_set(vm, ch, P_PARENT, V::Ref(parent));
         // AOSP ViewGroup.addView → child.dispatchAttachedToWindow when
-        // the parent is already attached — carry the flag down so
-        // `isAttachedToWindow` is right before the callback lands.
+        // the parent is already attached — set the flag first (AttachInfo
+        // is installed before the callback), then deliver the callback.
+        // AndroidComposeView.onAttachedToWindow is where the Compose
+        // root LayoutNode gets its Owner; skipping it leaves
+        // DepthSortedSet.remove crashing on unattached nodes.
         if pint(vm, parent, P_ATTACHED) == 1 {
             pseudo_set(vm, ch, P_ATTACHED, V::I32(1));
+            let r = vm.call_virtual(ch, "onAttachedToWindow", &[]);
+            if std::env::var_os("OVELO_VIEWDBG").is_some() {
+                match r {
+                    Ok(_) => eprintln!("[viewdbg] onAttachedToWindow h{ch} ok"),
+                    Err(e) => eprintln!("[viewdbg] onAttachedToWindow h{ch} err {e}"),
+                }
+            }
         }
         // AOSP addViewInner checkLayoutParams → generateLayoutParams
         // first: ConstraintLayout's onViewAdded reads getLayoutParams()

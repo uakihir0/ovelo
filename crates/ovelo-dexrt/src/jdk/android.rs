@@ -2377,6 +2377,20 @@ fn context_call(
             }
             Some(None)
         }
+        "registerActivityLifecycleCallbacks" => {
+            // AOSP keeps these on the Application; our runner dispatches
+            // to every registered callback around each lifecycle stage.
+            if let Some(V::Ref(cb)) = args.get(1).copied() {
+                vm.activity_callbacks.push(cb);
+            }
+            Some(None)
+        }
+        "unregisterActivityLifecycleCallbacks" => {
+            if let Some(V::Ref(cb)) = args.get(1).copied() {
+                vm.activity_callbacks.retain(|h| *h != cb);
+            }
+            Some(None)
+        }
         "setIntent"
         | "requestWindowFeature"
         | "setTitle"
@@ -2386,8 +2400,6 @@ fn context_call(
         | "setRequestedOrientation"
         | "setTaskDescription"
         | "setVolumeControlStream"
-        | "registerActivityLifecycleCallbacks"
-        | "unregisterActivityLifecycleCallbacks"
         | "invalidateOptionsMenu"
         | "supportRequestWindowFeature"
         | "onWindowFocusChanged"
@@ -3706,9 +3718,12 @@ fn res_misc(vm: &mut Vm, class: &str, name: &str, args: &[V]) -> Rt<Option<Optio
             | "getGrammaticalGender",
         ) => match name {
             "getLocales" => Some(Some(host(vm, "Landroid/os/LocaleList;", HostState::Empty))),
+            // AOSP updateFrom returns the diff bitmask (int), not void —
+            // a void result here breaks the dex call site.
             _ if name.starts_with("is")
                 || name == "getLayoutDirection"
                 || name == "diff"
+                || name == "updateFrom"
                 || name == "getGrammaticalGender" =>
             {
                 Some(Some(V::I32(0)))

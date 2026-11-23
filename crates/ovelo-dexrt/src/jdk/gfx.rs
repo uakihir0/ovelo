@@ -893,7 +893,16 @@ pub(crate) fn guest_draw_ops(vm: &mut Vm, view: u32, w: i32, h: i32) -> Vec<Canv
         .ok()
         .flatten()
         .is_some();
-    if !has {
+    // `dispatchDraw` overrides matter too: `AndroidComposeView` keeps
+    // `onDraw` empty and draws the whole LayoutNode tree from
+    // `dispatchDraw` (its children are dex LayoutNodes, not host
+    // views, so the host walk can't reach them).
+    let has_dd = vm
+        .find_method_on_chain_sig(ci, "dispatchDraw", &["Landroid/graphics/Canvas;"])
+        .ok()
+        .flatten()
+        .is_some();
+    if !has && !has_dd {
         return Vec::new();
     }
     let V::Ref(canvas) = host(
@@ -905,12 +914,27 @@ pub(crate) fn guest_draw_ops(vm: &mut Vm, view: u32, w: i32, h: i32) -> Vec<Canv
     };
     pseudo_set(vm, canvas, PK_CW, V::I32(w));
     pseudo_set(vm, canvas, PK_CH, V::I32(h));
-    let r = vm.call_virtual_sig(
-        view,
-        "onDraw",
-        &["Landroid/graphics/Canvas;"],
-        &[V::Ref(canvas)],
-    );
+    let mut err = false;
+    if has {
+        let r = vm.call_virtual_sig(
+            view,
+            "onDraw",
+            &["Landroid/graphics/Canvas;"],
+            &[V::Ref(canvas)],
+        );
+        err = r.is_err();
+    }
+    if has_dd {
+        // dispatchDraw runs after onDraw, matching View.draw order.
+        let r2 = vm.call_virtual_sig(
+            view,
+            "dispatchDraw",
+            &["Landroid/graphics/Canvas;"],
+            &[V::Ref(canvas)],
+        );
+        err = err || r2.is_err();
+    }
+    let r: Result<(), ()> = if err { Err(()) } else { Ok(()) };
     let n = match vm.heap.get(canvas) {
         Some(Obj::Host {
             state: HostState::CanvasOps(ops),
