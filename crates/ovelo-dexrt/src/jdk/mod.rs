@@ -644,7 +644,7 @@ pub(crate) fn list_snapshot(vm: &Vm, h: u32) -> Option<Vec<V>> {
         }) => Some(l.clone()),
         Some(Obj::Array { data, .. }) => Some(data.clone()),
         Some(Obj::Instance { .. }) => {
-            let (x, off, size) = guest_list_backing(vm, h, 8)?;
+            let (x, off, size, ring) = guest_list_backing(vm, h, 8)?;
             if std::env::var("OVELO_ITERDBG").is_ok() {
                 let fs = match vm.heap.get(h) {
                     Some(Obj::Instance { fields, .. }) => fields
@@ -674,7 +674,14 @@ pub(crate) fn list_snapshot(vm: &Vm, h: u32) -> Option<Vec<V>> {
                     // `elementData` capacity can exceed the collection's
                     // logical size — the tail is unused null slots, not
                     // elements — and a SubList window sits partway in.
-                    // Apply the (offset, size) window when found.
+                    // Apply the (offset, size) window when found. A
+                    // `head`-offset ring (kotlin ArrayDeque) may wrap:
+                    // read it mod capacity.
+                    if ring && !data.is_empty() {
+                        let n = size.unwrap_or(data.len());
+                        let len = data.len();
+                        return Some((0..n).map(|i| data[(off + i) % len]).collect::<Vec<_>>());
+                    }
                     Some(
                         data.iter()
                             .skip(off)
@@ -691,13 +698,15 @@ pub(crate) fn list_snapshot(vm: &Vm, h: u32) -> Option<Vec<V>> {
 }
 
 /// The `HostState::List` or `Obj::Array` a guest Collection
-/// implementation delegates to, as `(store, offset, size)` — a `SubList`
-/// narrows its parent's window (`offset`/`fromIndex` and `size`/`_size`
-/// int fields), composed through each delegation level. Verified
-/// `instanceof Collection` so arbitrary guest objects holding collection
-/// fields are not misread; direct backing fields are preferred over
-/// nested delegates, and the depth budget ends reference cycles.
-fn guest_list_backing(vm: &Vm, h: u32, depth: u8) -> Option<(u32, usize, Option<usize>)> {
+/// implementation delegates to, as `(store, offset, size, ring)` — a
+/// `SubList` narrows its parent's window (`offset`/`fromIndex` and
+/// `size`/`_size` int fields), a `head` offset marks a ring buffer
+/// (kotlin ArrayDeque) whose window may wrap mod capacity, and both
+/// compose through each delegation level. Verified `instanceof
+/// Collection` so arbitrary guest objects holding collection fields
+/// are not misread; direct backing fields are preferred over nested
+/// delegates, and the depth budget ends reference cycles.
+fn guest_list_backing(vm: &Vm, h: u32, depth: u8) -> Option<(u32, usize, Option<usize>, bool)> {
     if depth == 0 || !vm.is_guest_collection(h) {
         return None;
     }
@@ -711,7 +720,7 @@ fn guest_list_backing(vm: &Vm, h: u32, depth: u8) -> Option<(u32, usize, Option<
                 ..
             }) | Some(Obj::Array { .. })
         ) {
-            return Some((bh, 0, None));
+            return Some((bh, 0, None, false));
         }
     }
     let Some(Obj::Instance { fields, .. }) = vm.heap.get(h) else {
@@ -722,6 +731,7 @@ fn guest_list_backing(vm: &Vm, h: u32, depth: u8) -> Option<(u32, usize, Option<
     // and, for sublists, the start index (`offset`, `fromIndex`).
     let mut size_field = None;
     let mut off_field = 0usize;
+    let mut ring = false;
     for (g, v) in fields.iter() {
         let V::I32(n) = v else { continue };
         if *n < 0 {
@@ -729,10 +739,15 @@ fn guest_list_backing(vm: &Vm, h: u32, depth: u8) -> Option<(u32, usize, Option<
         }
         match vm.dbg_field_name(*g).rsplit('.').next().unwrap_or_default() {
             "size" | "length" | "_size" => size_field = Some(*n as usize),
-            // `head` too: kotlin ArrayDeque is a ring — elements live
-            // at [head, head+size), so an un-offset snapshot reads the
-            // stale null slots at index 0 (navigation backQueue).
-            "offset" | "fromIndex" | "head" => off_field = *n as usize,
+            "offset" | "fromIndex" => off_field = *n as usize,
+            // kotlin ArrayDeque is a ring — elements live at
+            // [head, head+size) mod capacity, so an un-offset snapshot
+            // reads the stale null slots at index 0 (navigation
+            // backQueue), and a wrapped ring needs rotation.
+            "head" => {
+                off_field = *n as usize;
+                ring = true;
+            }
             _ => {}
         }
     }
@@ -754,13 +769,17 @@ fn guest_list_backing(vm: &Vm, h: u32, depth: u8) -> Option<(u32, usize, Option<
         };
         if let Some(len) = len {
             let off = off_field.min(len);
-            let size = size_field.map(|n| n.min(len - off));
-            return Some((x, off, size));
+            // On a wrapped ring the window folds mod `len` — clamp by
+            // the logical size itself, not the tail of the array.
+            let size = size_field.map(|n| if ring { n } else { n.min(len - off) });
+            return Some((x, off, size, ring));
         }
     }
     for &x in &cands {
         if let Some(Obj::Instance { .. }) = vm.heap.get(x) {
-            if let Some((y, inner_off, inner_size)) = guest_list_backing(vm, x, depth - 1) {
+            if let Some((y, inner_off, inner_size, inner_ring)) =
+                guest_list_backing(vm, x, depth - 1)
+            {
                 // Compose windows: this level's `off` sits inside the
                 // delegate window, and its `size` is clipped to the
                 // delegate's remaining span.
@@ -770,7 +789,7 @@ fn guest_list_backing(vm: &Vm, h: u32, depth: u8) -> Option<(u32, usize, Option<
                     (Some(s), None) => Some(s),
                     (None, b) => b,
                 };
-                return Some((y, inner_off.saturating_add(off_field), size));
+                return Some((y, inner_off.saturating_add(off_field), size, inner_ring));
             }
         }
     }
@@ -834,7 +853,7 @@ fn backing_handle(vm: &mut Vm, h: u32, map: bool) -> Option<u32> {
         return Some(bh);
     }
     if !map {
-        if let Some((x, off, size)) = guest_list_backing(vm, h, 8) {
+        if let Some((x, off, size, ring)) = guest_list_backing(vm, h, 8) {
             match vm.heap.get(x) {
                 Some(Obj::Host {
                     state: HostState::List(_),
@@ -844,14 +863,21 @@ fn backing_handle(vm: &mut Vm, h: u32, map: bool) -> Option<u32> {
                 // growable store so add/remove keep working. The copy
                 // keeps only the guest's logical window: `elementData`
                 // capacity beyond `size` holds unused null slots, and a
-                // SubList's `offset` skips its parent's head.
+                // SubList's `offset` skips its parent's head. A `head`
+                // ring may wrap — rotate mod capacity.
                 Some(Obj::Array { data, .. }) => {
-                    let data: Vec<V> = data
-                        .iter()
-                        .skip(off)
-                        .take(size.unwrap_or(usize::MAX))
-                        .cloned()
-                        .collect();
+                    let data: Vec<V> = if ring && !data.is_empty() {
+                        let len = data.len();
+                        (0..size.unwrap_or(len))
+                            .map(|i| data[(off + i) % len])
+                            .collect()
+                    } else {
+                        data.iter()
+                            .skip(off)
+                            .take(size.unwrap_or(usize::MAX))
+                            .cloned()
+                            .collect()
+                    };
                     let bh = vm.alloc_host("Ljava/util/ArrayList;", HostState::List(data));
                     pseudo_set(vm, h, key, V::Ref(bh));
                     return Some(bh);
