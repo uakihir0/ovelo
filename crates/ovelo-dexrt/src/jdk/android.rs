@@ -202,6 +202,10 @@ pub(crate) fn call(
         || class.ends_with("Activity;")
         || class.ends_with("Application;")
         || class.ends_with("Service;")
+        // Dex-defined Context subclasses (custom Application/Service
+        // classes like `PFSudoku extends MultiDexApplication`) — walk
+        // the dex hierarchy to the framework Context.
+        || vm.assignable_desc(class, "Landroid/content/Context;")
     {
         context_call(vm, class, name, sig, args)?
     } else if class == "Landroid/content/pm/PackageManager;" || class.ends_with("PackageManager;") {

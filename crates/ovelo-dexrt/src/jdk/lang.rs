@@ -2303,6 +2303,21 @@ fn enum_call(vm: &mut Vm, class: &str, name: &str, args: &[V]) -> Rt<Option<Opti
                 _ => 0,
             };
             let d = ord(args[0]) - ord(args[1]);
+            if std::env::var_os("OVELO_ENUMDBG").is_some() {
+                let nm = |v: V| match v {
+                    V::Ref(h) => pseudo_get(vm, h, P_DATA)
+                        .and_then(|s| sv(vm, s))
+                        .unwrap_or_else(|| "?".into()),
+                    _ => "nonref".into(),
+                };
+                eprintln!(
+                    "[enumdbg] compareTo {}({}) vs {}({}) -> {d}",
+                    nm(args[0]),
+                    ord(args[0]),
+                    nm(args[1]),
+                    ord(args[1])
+                );
+            }
             Some(Some(V::I32(d.signum() as i32)))
         }
         "getDeclaringClass" => Some(Some(class_obj(vm, "Ljava/lang/Enum;".into()))),

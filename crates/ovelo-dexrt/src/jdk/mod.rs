@@ -1180,9 +1180,15 @@ fn universal(vm: &mut Vm, class: &str, name: &str, sig: &str, args: &[V]) -> Rt<
             }
             Some(None)
         }
-        "compareTo" if args.len() == 2 && !desc_is_a(class, "Ljava/lang/Enum;") => {
+        "compareTo"
+            if args.len() == 2
+                && !desc_is_a(class, "Ljava/lang/Enum;")
+                && !vm.assignable_desc(class, "Ljava/lang/Enum;") =>
+        {
             // Generic compareTo: boxed numbers and strings only;
-            // enums compare by ordinal in `enum_call`.
+            // enums compare by ordinal in `enum_call`. Dex-defined
+            // enums (e.g. androidx `Lifecycle$State`) don't appear in
+            // `host_supers`, so `desc_is_a` alone would steal them.
             let c = collect::natural_cmp(vm, args[0], args[1]);
             Some(Some(V::I32(c)))
         }
