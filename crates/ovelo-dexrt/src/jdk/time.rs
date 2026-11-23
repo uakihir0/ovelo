@@ -1008,11 +1008,17 @@ fn localdatetime_call(vm: &mut Vm, name: &str, args: &[V]) -> Rt<Option<Option<V
                 "Ljava/time/LocalDateTime;",
                 HostState::Millis(now_ms()),
             ))),
-            "ofInstant" => Some(Some(host(
-                vm,
-                "Ljava/time/LocalDateTime;",
-                HostState::Millis(millis_of(vm, *args.first().unwrap_or(&V::I64(0)))),
-            ))),
+            "ofInstant" => {
+                // ofInstant(Instant, ZoneId) — apply the zone offset like
+                // LocalDate.ofInstant so both agree near midnight.
+                let ms = millis_of(vm, *args.first().unwrap_or(&V::I64(0)))
+                    + zone_off_ms(vm, args.get(1).copied().unwrap_or(V::I64(0)));
+                Some(Some(host(
+                    vm,
+                    "Ljava/time/LocalDateTime;",
+                    HostState::Millis(ms),
+                )))
+            }
             "of" => {
                 let ms = days_from_civil(
                     i64v(args.first().copied().unwrap_or(V::I32(1970))),
