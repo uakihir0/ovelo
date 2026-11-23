@@ -64,6 +64,8 @@ extern "C" {
     #[cfg(target_os = "macos")]
     fn write(fd: i32, buf: *const c_void, n: usize) -> isize;
     #[cfg(target_os = "macos")]
+    fn sigaltstack(ss: *const SigStack, old: *mut SigStack) -> i32;
+    #[cfg(target_os = "macos")]
     fn dladdr(addr: *const c_void, info: *mut DlInfo) -> i32;
     #[cfg(target_os = "macos")]
     fn malloc_create_zone(start_size: usize, flags: u32) -> *mut c_void;
@@ -85,6 +87,39 @@ extern "C" {
     fn malloc_default_zone() -> *mut c_void;
     #[cfg(target_os = "macos")]
     fn free(ptr: *mut c_void);
+    #[cfg(target_os = "macos")]
+    fn mach_task_self() -> u32;
+    #[cfg(target_os = "macos")]
+    fn mach_vm_read_overwrite(
+        task: u32,
+        addr: u64,
+        size: u64,
+        data: u64,
+        out_size: *mut u64,
+    ) -> i32;
+}
+
+/// Read `size` bytes of OUR address space via Mach — safe inside the
+/// signal handler where the faulting address may itself be unmapped
+/// (an instruction abort on a wild branch has pc == unmapped, so a
+/// plain deref faults inside the handler: nested fault during signal
+/// delivery is the kernel's "unrecoverable exception" -> SIGKILL).
+#[cfg(target_os = "macos")]
+unsafe fn safe_read_u32(addr: usize) -> Option<u32> {
+    let mut out = 0u32;
+    let mut n = 0u64;
+    let kr = mach_vm_read_overwrite(
+        mach_task_self(),
+        addr as u64,
+        4,
+        &mut out as *mut u32 as u64,
+        &mut n,
+    );
+    if kr == 0 && n == 4 {
+        Some(out)
+    } else {
+        None
+    }
 }
 
 #[cfg(target_os = "macos")]
@@ -93,6 +128,13 @@ struct Sigaction {
     sa_sigaction: usize,
     sa_mask: u32,
     sa_flags: i32,
+}
+#[cfg(target_os = "macos")]
+#[repr(C)]
+struct SigStack {
+    ss_sp: *mut c_void,
+    ss_size: usize,
+    ss_flags: i32,
 }
 #[cfg(target_os = "macos")]
 #[repr(C)]
@@ -860,8 +902,10 @@ pub fn install_crash_dump() {
                     .lock()
                     .map(|v| v.iter().any(|(b, s)| pc >= *b && pc < b + s))
                     .unwrap_or(false);
-                let insn = *(pc as *const u32);
-                if heal_tls_fault(si, insn, mc as *mut u8) {
+                // pc may be unmapped (instruction abort on a wild
+                // branch): read through Mach, never dereference.
+                let insn = safe_read_u32(pc).unwrap_or(0);
+                if insn != 0 && heal_tls_fault(si, insn, mc as *mut u8) {
                     return;
                 }
                 // Classify the fault victim: which malloc zone (if any)
@@ -1099,13 +1143,38 @@ pub fn install_crash_dump() {
             }
         }
         if std::env::var_os("OVELO_NOSEGV").is_none() {
+            // SA_ONSTACK + a private alternate stack: a guest that
+            // corrupts its own SP still gets the handler delivered —
+            // without it the kernel can't push the frame and kills the
+            // process with an "unrecoverable exception" (SIGKILL, no
+            // trace). Map it once per process; each thread would
+            // ideally get its own but the main thread covers the dex
+            // dispatch path and .so-spawned pthreads rarely fault on
+            // a broken stack.
+            let stk = mmap(
+                std::ptr::null_mut(),
+                128 * 1024,
+                3,      // PROT_READ|PROT_WRITE
+                0x1002, // MAP_PRIVATE|MAP_ANON
+                -1,
+                0,
+            );
+            if !stk.is_null() && stk as isize != -1 {
+                let ss = SigStack {
+                    ss_sp: stk,
+                    ss_size: 128 * 1024,
+                    ss_flags: 0,
+                };
+                sigaltstack(&ss, std::ptr::null_mut());
+            }
             let sa = Sigaction {
                 sa_sigaction: on_segv as *const () as usize,
                 sa_mask: 0,
-                sa_flags: 0x40, // SA_SIGINFO
+                sa_flags: 0x40 | 0x1, // SA_SIGINFO | SA_ONSTACK
             };
             sigaction(11, &sa, std::ptr::null_mut());
             sigaction(10, &sa, std::ptr::null_mut()); // SIGBUS — writes to non-writable guest pages
+            sigaction(4, &sa, std::ptr::null_mut()); // SIGILL — bad guest insn
         }
         let _ = dladdr as *const (); // keep decl referenced
     }
@@ -3356,8 +3425,11 @@ extern "C" fn sh_mutex_trylock(m: usize) -> usize {
             } else if *owner == t && *ty == 1 {
                 *count += 1;
                 0
-            } else if *owner == t && *ty == 2 {
-                bsync::EDEADLK as usize
+            } else if *owner == t {
+                // POSIX/Bionic: trylock on an already-owned mutex
+                // reports EBUSY even for ERRORCHECK — EDEADLK is a
+                // blocking-lock result only.
+                bsync::EBUSY as usize
             } else {
                 bsync::EBUSY as usize
             }
@@ -3781,6 +3853,16 @@ extern "C" fn sh_exit(code: i32) -> ! {
     unsafe { exit(code) }
 }
 
+/// `_exit`/`_Exit` bypass atexit handlers and stdio flushing — they
+/// must not become regular `exit`.
+#[cfg(target_os = "macos")]
+extern "C" fn sh_underscore_exit(code: i32) -> ! {
+    let mut lr = 0usize;
+    unsafe { core::arch::asm!("mov {}, x30", out(reg) lr) };
+    eprintln!("[_exit] code={code} caller={:#x?}", so_off(lr));
+    unsafe { _exit(code) }
+}
+
 #[cfg(target_os = "macos")]
 extern "C" fn sh_abort() -> ! {
     let mut lr = 0usize;
@@ -3808,6 +3890,39 @@ extern "C" fn sh_kill(pid: i32, sig: i32) -> i32 {
 }
 
 #[cfg(target_os = "macos")]
+extern "C" fn sh_killpg(pgrp: i32, sig: i32) -> i32 {
+    let mut lr = 0usize;
+    unsafe { core::arch::asm!("mov {}, x30", out(reg) lr) };
+    eprintln!("[killpg] pgrp={pgrp} sig={sig} caller={:#x?}", so_off(lr));
+    unsafe { killpg(pgrp, sig) }
+}
+
+#[cfg(target_os = "macos")]
+extern "C" fn sh_tgkill(pid: i32, tid: i32, sig: i32) -> i32 {
+    let mut lr = 0usize;
+    unsafe { core::arch::asm!("mov {}, x30", out(reg) lr) };
+    eprintln!(
+        "[tgkill] pid={pid} tid={tid} sig={sig} caller={:#x?}",
+        so_off(lr)
+    );
+    // Darwin has no tgkill; pthread_kill needs a thread handle, which
+    // the guest's Linux tid can't give us — fall back to kill() on
+    // the process when the caller targets a foreign thread.
+    unsafe { kill(pid, sig) }
+}
+
+#[cfg(target_os = "macos")]
+extern "C" fn sh_pthread_kill(thread: usize, sig: i32) -> i32 {
+    let mut lr = 0usize;
+    unsafe { core::arch::asm!("mov {}, x30", out(reg) lr) };
+    eprintln!(
+        "[pthread_kill] thread={thread:#x} sig={sig} caller={:#x?}",
+        so_off(lr)
+    );
+    unsafe { pthread_kill(thread, sig) }
+}
+
+#[cfg(target_os = "macos")]
 extern "C" fn sh_raise(sig: i32) -> i32 {
     let mut lr = 0usize;
     unsafe { core::arch::asm!("mov {}, x30", out(reg) lr) };
@@ -3818,6 +3933,8 @@ extern "C" fn sh_raise(sig: i32) -> i32 {
 #[cfg(target_os = "macos")]
 unsafe extern "C" {
     fn kill(pid: i32, sig: i32) -> i32;
+    fn killpg(pgrp: i32, sig: i32) -> i32;
+    fn pthread_kill(thread: usize, sig: i32) -> i32;
     fn raise(sig: i32) -> i32;
 }
 
@@ -4073,13 +4190,21 @@ fn builtin_shim(name: &str) -> Option<usize> {
         "__android_log_print" | "__android_log_vprint" => sh_log_print as *const () as usize,
         "__android_log_write" => sh_log_write as *const () as usize,
         #[cfg(target_os = "macos")]
-        "exit" | "_exit" | "_Exit" => sh_exit as *const () as usize,
+        "exit" | "exit_group" => sh_exit as *const () as usize,
+        #[cfg(target_os = "macos")]
+        "_exit" | "_Exit" => sh_underscore_exit as *const () as usize,
         #[cfg(target_os = "macos")]
         "abort" => sh_abort as *const () as usize,
         #[cfg(target_os = "macos")]
-        "kill" | "killpg" | "tgkill" => sh_kill as *const () as usize,
+        "kill" => sh_kill as *const () as usize,
         #[cfg(target_os = "macos")]
-        "raise" | "pthread_kill" => sh_raise as *const () as usize,
+        "killpg" => sh_killpg as *const () as usize,
+        #[cfg(target_os = "macos")]
+        "tgkill" => sh_tgkill as *const () as usize,
+        #[cfg(target_os = "macos")]
+        "pthread_kill" => sh_pthread_kill as *const () as usize,
+        #[cfg(target_os = "macos")]
+        "raise" => sh_raise as *const () as usize,
         #[cfg(target_os = "macos")]
         "__emutls_get_address" => sh_emutls_addr as *const () as usize,
         _ => return None,

@@ -315,6 +315,13 @@ pub(crate) fn call_native(
             eprintln!("[envcall] {name}({iargs:p})");
         }
     }
+    let ncall = std::env::var_os("OVELO_NCALL").is_some();
+    if ncall {
+        eprintln!(
+            "[ncall] -> {fnptr:#x} off={:#x?}",
+            crate::native::so_off(fnptr)
+        );
+    }
     without_vm_lock(|| {
         crate::native::with_guest_tls_at("jni_call", || unsafe {
             ovelo_jni_call(
@@ -327,6 +334,9 @@ pub(crate) fn call_native(
             )
         });
     });
+    if ncall {
+        eprintln!("[ncall] <- {fnptr:#x} ok");
+    }
     (out[0], out[1])
 }
 
