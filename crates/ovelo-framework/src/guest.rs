@@ -382,7 +382,10 @@ fn update_dex_view(g: &mut GuestView, info: &ovelo_dexrt::DexViewInfo) {
         }
     }
     if let GuestView::Group(gr) = g {
-        gr.clip_children = info.clip_children;
+        if gr.clip_children != info.clip_children {
+            gr.clip_children = info.clip_children;
+            gr.invalidate();
+        }
     }
     if let Some(tv) = g.text_mut() {
         if let Some(t) = &info.text {
