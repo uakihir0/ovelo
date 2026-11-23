@@ -1975,6 +1975,10 @@ pub(crate) fn bundled_call(vm: &mut Vm, name: &str, args: &[V]) -> Rt<Option<Opt
                 }
                 if let Some(s) = vm.bundled_stmts.get_mut(&(h as u64)) {
                     s.params.resize(s.params.len().max(idx), SV::Null);
+                    // Batch use: the caller binds params for row N+1 over
+                    // the same statement — a resize without the store
+                    // leaves row N's value at this index.
+                    s.params[idx - 1] = SV::Null;
                 }
                 None
             }
