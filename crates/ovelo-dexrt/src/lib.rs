@@ -223,7 +223,7 @@ pub struct Vm {
     pub clock_views: Vec<u32>,
     /// Installed-APK resource index for `LayoutInflater.inflate` — `None`
     /// degrades inflation to bare placeholder views.
-    pub apk_res: Option<res::ApkResources>,
+    pub apk_res: Option<Box<res::ApkResources>>,
     /// Guest SQLite connections by database name
     /// (`android.database.sqlite` — see `jdk::db`).
     pub(crate) dbs: HashMap<String, std::rc::Rc<std::cell::RefCell<jdk::db::Db>>>,

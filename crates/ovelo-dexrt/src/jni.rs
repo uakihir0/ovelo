@@ -2049,7 +2049,7 @@ pub(crate) fn load_native_lib(vm: &mut Vm, arg: &str, absolute: bool) {
     let libs = {
         let res = vm.apk_res.as_ref();
         if let Some(r) = res {
-            crate::native::set_apk_reader(r as *const _ as usize);
+            crate::native::set_apk_reader(&**r as *const _ as usize);
         }
         let mut lookup = |soname: &str| -> Option<Vec<u8>> {
             res.and_then(|r| r.read(&format!("lib/arm64-v8a/{soname}")))

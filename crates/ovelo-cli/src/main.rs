@@ -1453,7 +1453,7 @@ fn run_app(store: &InstallStore, package: &str) -> Result<(), OveloError> {
                         let _ = std::fs::write(p, wav_tone(*freq));
                     }
                 }
-                v.apk_res = ovelo_dexrt::res::ApkResources::open(bytes.clone());
+                v.apk_res = ovelo_dexrt::res::ApkResources::open(bytes.clone()).map(Box::new);
                 v.theme_id = info
                     .manifest
                     .activity_themes

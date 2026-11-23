@@ -800,13 +800,25 @@ unsafe fn heal_tls_fault(si: usize, insn: u32, mc: *mut u8) -> bool {
     if tcb == 0 {
         return false;
     }
+    // The value the thread expects depends on whose code faulted:
+    // guest `.so`/thunk code runs on the guest TCB, while a host lib
+    // entered through a thunk runs on the host TPIDR stashed in the
+    // TCB slot — Darwin's boundary rewrite clobbers either one.
+    let restore = if code_mapped(pc) {
+        tcb
+    } else {
+        unsafe { *(tcb as *const usize).add(SLOT_HOST_TPIDR) }
+    };
+    if restore == 0 {
+        return false;
+    }
     unsafe {
-        *(mc.add(16 + rn * 8) as *mut usize) = tcb;
+        *(mc.add(16 + rn * 8) as *mut usize) = restore;
         for (rb, off) in spills.iter().take(nspill) {
             // mc+248 = saved fp (x29), mc+264 = saved sp.
             let slot = *(mc.add(if *rb == 31 { 264 } else { 248 }) as *const usize)
                 .wrapping_add(*off) as *mut usize;
-            *slot = tcb;
+            *slot = restore;
         }
         let s = b"[segv-heal]\n";
         write(2, s.as_ptr() as *const c_void, s.len());
@@ -2576,8 +2588,11 @@ static SL_OBJS: std::sync::LazyLock<Mutex<HashMap<usize, SlObj>>> =
 fn sl_vtable(entries: &[usize]) -> usize {
     unsafe {
         let p = malloc_zone_calloc(guest_zone(), entries.len(), 8) as *mut usize;
+        // Guests call vtable slots directly (no PLT), so each entry
+        // needs the TPIDR swap thunk itself or host code runs under
+        // the guest TCB.
         for (i, &e) in entries.iter().enumerate() {
-            *p.add(i) = e;
+            *p.add(i) = host_thunk(e);
         }
         p as usize
     }
@@ -2876,6 +2891,8 @@ extern "C" fn sh_sl_create_player(
     let p = sl_alloc_obj(&[
         ("SL_IID_PLAY", sl_play_vt()),
         ("SL_IID_ANDROIDSIMPLEBUFFERQUEUE", bq_slot_vt),
+        // Godot asks for the standard (non-Android) BQ interface id.
+        ("SL_IID_BUFFERQUEUE", bq_slot_vt),
         ("SL_IID_VOLUME", sl_volume_vt()),
         ("SL_IID_ANDROIDCONFIGURATION", sl_aconfig_vt()),
         ("SL_IID_EFFECTSEND", sl_effectsend_vt()),
@@ -3186,6 +3203,564 @@ extern "C" fn sh_setname(_t: usize, _name: usize) -> usize {
     0
 }
 
+// ----------------------------------------------------------------
+// Bionic pthread synchronization: Bionic's pthread_mutex_t is a
+// 40-byte inline object and Darwin's pthread_mutex_* rejects the
+// foreign layout (EINVAL -> libc++ "failed to acquire mutex" aborts).
+// Mutex / condvar / rwlock state lives here keyed by guest address;
+// a single global lock + condvar drives every wait (correct if
+// thundering-herd-y).
+// ----------------------------------------------------------------
+#[cfg(target_os = "macos")]
+mod bsync {
+    use std::collections::HashMap;
+    use std::sync::{Condvar, LazyLock, Mutex};
+
+    pub enum Obj {
+        Mutex {
+            ty: u32,
+            owner: u64,
+            count: u32,
+        },
+        Cond,
+        Rw {
+            readers: u32,
+            wr_owner: u64,
+            wr_count: u32,
+            wait_w: u32,
+        },
+    }
+
+    pub static SYNC: LazyLock<(Mutex<HashMap<usize, Obj>>, Condvar)> =
+        LazyLock::new(|| (Mutex::new(HashMap::new()), Condvar::new()));
+
+    pub const EPERM: i32 = 1;
+    pub const EBUSY: i32 = 16;
+    pub const EINVAL: i32 = 22;
+    pub const EDEADLK: i32 = 35;
+    pub const ETIMEDOUT: i32 = 110;
+
+    pub fn tid() -> u64 {
+        unsafe { super::mach_thread_id() }
+    }
+}
+#[cfg(target_os = "macos")]
+use bsync::Obj as Bobj;
+
+#[cfg(target_os = "macos")]
+extern "C" fn sh_mutexattr_init(a: usize) -> usize {
+    unsafe { *(a as *mut u32) = 0 };
+    0
+}
+#[cfg(target_os = "macos")]
+extern "C" fn sh_mutexattr_settype(a: usize, ty: u32) -> usize {
+    unsafe { *(a as *mut u32) = ty };
+    0
+}
+#[cfg(target_os = "macos")]
+extern "C" fn sh_mutexattr_gettype(a: usize, out: usize) -> usize {
+    unsafe { *(out as *mut u32) = *(a as *const u32) };
+    0
+}
+#[cfg(target_os = "macos")]
+extern "C" fn sh_attr_noop() -> usize {
+    0
+}
+
+/// `pthread_mutex_init(m, attr)` — attr is Bionic's 4-byte attr
+/// object (`{int type}`); NULL means default.
+#[cfg(target_os = "macos")]
+extern "C" fn sh_mutex_init(m: usize, attr: usize) -> usize {
+    unsafe { std::ptr::write_bytes(m as *mut u8, 0, 40) };
+    let ty = if attr == 0 {
+        0
+    } else {
+        unsafe { *(attr as *const u32) & 3 }
+    };
+    bsync::SYNC.0.lock().unwrap().insert(
+        m,
+        Bobj::Mutex {
+            ty,
+            owner: 0,
+            count: 0,
+        },
+    );
+    0
+}
+
+#[cfg(target_os = "macos")]
+extern "C" fn sh_mutex_destroy(m: usize) -> usize {
+    bsync::SYNC.0.lock().unwrap().remove(&m);
+    0
+}
+
+#[cfg(target_os = "macos")]
+extern "C" fn sh_mutex_lock(m: usize) -> usize {
+    let (map, cv) = &*bsync::SYNC;
+    let mut g = map.lock().unwrap();
+    let t = bsync::tid();
+    loop {
+        match g.get_mut(&m) {
+            Some(Bobj::Mutex { ty, owner, count }) => {
+                if *owner == 0 {
+                    *owner = t;
+                    *count = 1;
+                    return 0;
+                }
+                if *owner == t {
+                    // Bionic: NORMAL=0 RECURSIVE=1 ERRORCHECK=2.
+                    if *ty == 1 {
+                        *count += 1;
+                        return 0;
+                    }
+                    if *ty == 2 {
+                        return bsync::EDEADLK as usize;
+                    }
+                    // NORMAL self-lock: wait forever (real deadlock).
+                }
+                g = cv.wait(g).unwrap();
+            }
+            // An object that was never inited acts like a zeroed
+            // NORMAL mutex (Bionic zero-init semantics).
+            None => {
+                g.insert(
+                    m,
+                    Bobj::Mutex {
+                        ty: 0,
+                        owner: t,
+                        count: 1,
+                    },
+                );
+                return 0;
+            }
+            Some(_) => return bsync::EINVAL as usize,
+        }
+    }
+}
+
+#[cfg(target_os = "macos")]
+extern "C" fn sh_mutex_trylock(m: usize) -> usize {
+    let (map, _) = &*bsync::SYNC;
+    let mut g = map.lock().unwrap();
+    let t = bsync::tid();
+    match g.get_mut(&m) {
+        Some(Bobj::Mutex { ty, owner, count }) => {
+            if *owner == 0 {
+                *owner = t;
+                *count = 1;
+                0
+            } else if *owner == t && *ty == 1 {
+                *count += 1;
+                0
+            } else if *owner == t && *ty == 2 {
+                bsync::EDEADLK as usize
+            } else {
+                bsync::EBUSY as usize
+            }
+        }
+        None => {
+            g.insert(
+                m,
+                Bobj::Mutex {
+                    ty: 0,
+                    owner: t,
+                    count: 1,
+                },
+            );
+            0
+        }
+        Some(_) => bsync::EINVAL as usize,
+    }
+}
+
+#[cfg(target_os = "macos")]
+extern "C" fn sh_mutex_unlock(m: usize) -> usize {
+    let (map, cv) = &*bsync::SYNC;
+    let mut g = map.lock().unwrap();
+    let t = bsync::tid();
+    match g.get_mut(&m) {
+        Some(Bobj::Mutex { ty, owner, count }) => {
+            if *owner != t {
+                return bsync::EPERM as usize;
+            }
+            let _ = ty;
+            *count -= 1;
+            if *count == 0 {
+                *owner = 0;
+                cv.notify_all();
+            }
+            0
+        }
+        _ => bsync::EINVAL as usize,
+    }
+}
+
+#[cfg(target_os = "macos")]
+extern "C" fn sh_cond_init(c: usize, _attr: usize) -> usize {
+    unsafe { std::ptr::write_bytes(c as *mut u8, 0, 40) };
+    bsync::SYNC.0.lock().unwrap().insert(c, Bobj::Cond);
+    0
+}
+
+#[cfg(target_os = "macos")]
+extern "C" fn sh_cond_destroy(c: usize) -> usize {
+    bsync::SYNC.0.lock().unwrap().remove(&c);
+    0
+}
+
+/// Shared cond-wait core: drop the mutex (preserving a recursive
+/// count), wait on the global cv, then reacquire. `deadline` is an
+/// absolute mach time in nanoseconds; None = untimed.
+#[cfg(target_os = "macos")]
+fn bcond_wait(c: usize, m: usize, deadline_ns: Option<u64>) -> i32 {
+    let (map, cv) = &*bsync::SYNC;
+    let t = bsync::tid();
+    let mut g = map.lock().unwrap();
+    // Release the mutex, saving recursive depth.
+    let mut saved = 0u32;
+    match g.get_mut(&m) {
+        Some(Bobj::Mutex { owner, count, .. }) => {
+            if *owner != t {
+                return bsync::EPERM;
+            }
+            saved = *count;
+            *owner = 0;
+            *count = 0;
+        }
+        Some(_) => return bsync::EINVAL,
+        None => {}
+    }
+    cv.notify_all();
+    if !matches!(g.get(&c), Some(Bobj::Cond)) {
+        g.insert(c, Bobj::Cond);
+    }
+    let mut timed_out = false;
+    if let Some(dl) = deadline_ns {
+        let dur = dl.saturating_sub(unsafe { mach_absolute_time_ns() });
+        let (_g2, to) = cv
+            .wait_timeout(g, std::time::Duration::from_nanos(dur))
+            .unwrap();
+        g = _g2;
+        timed_out = to.timed_out();
+    } else {
+        g = cv.wait(g).unwrap();
+    }
+    // Reacquire the mutex (blocking).
+    loop {
+        match g.get_mut(&m) {
+            Some(Bobj::Mutex { owner, count, .. }) => {
+                if *owner == 0 {
+                    *owner = t;
+                    *count = if saved == 0 { 1 } else { saved };
+                    break;
+                }
+                g = cv.wait(g).unwrap();
+            }
+            Some(_) => return bsync::EINVAL,
+            None => {
+                g.insert(
+                    m,
+                    Bobj::Mutex {
+                        ty: 0,
+                        owner: t,
+                        count: saved.max(1),
+                    },
+                );
+                break;
+            }
+        }
+    }
+    if timed_out {
+        bsync::ETIMEDOUT
+    } else {
+        0
+    }
+}
+
+/// Current monotonic time in nanoseconds for pthread timeouts
+/// (CLOCK_REALTIME abstime comes in as epoch ns — guests pass
+/// timespecs in either clock; treat as monotonic-ish by comparing
+/// against system uptime).
+#[cfg(target_os = "macos")]
+unsafe fn mach_absolute_time_ns() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_nanos() as u64)
+        .unwrap_or(0)
+}
+
+#[cfg(target_os = "macos")]
+extern "C" fn sh_cond_wait(c: usize, m: usize) -> usize {
+    bcond_wait(c, m, None) as usize
+}
+
+#[cfg(target_os = "macos")]
+extern "C" fn sh_cond_timedwait(c: usize, m: usize, ts: usize) -> usize {
+    let dl = if ts == 0 {
+        None
+    } else {
+        let (sec, nsec) = unsafe { (*(ts as *const i64), *(ts as *const i64).add(1)) };
+        Some(
+            (sec as u64)
+                .saturating_mul(1_000_000_000)
+                .saturating_add(nsec as u64),
+        )
+    };
+    bcond_wait(c, m, dl) as usize
+}
+
+#[cfg(target_os = "macos")]
+extern "C" fn sh_cond_signal(c: usize) -> usize {
+    let (map, cv) = &*bsync::SYNC;
+    let _g = map.lock().unwrap();
+    cv.notify_one();
+    let _ = c;
+    0
+}
+
+#[cfg(target_os = "macos")]
+extern "C" fn sh_cond_broadcast(c: usize) -> usize {
+    let (map, cv) = &*bsync::SYNC;
+    let _g = map.lock().unwrap();
+    cv.notify_all();
+    let _ = c;
+    0
+}
+
+#[cfg(target_os = "macos")]
+extern "C" fn sh_rwlock_init(r: usize, _attr: usize) -> usize {
+    unsafe { std::ptr::write_bytes(r as *mut u8, 0, 200) };
+    bsync::SYNC.0.lock().unwrap().insert(
+        r,
+        Bobj::Rw {
+            readers: 0,
+            wr_owner: 0,
+            wr_count: 0,
+            wait_w: 0,
+        },
+    );
+    0
+}
+
+#[cfg(target_os = "macos")]
+extern "C" fn sh_rwlock_destroy(r: usize) -> usize {
+    bsync::SYNC.0.lock().unwrap().remove(&r);
+    0
+}
+
+#[cfg(target_os = "macos")]
+extern "C" fn sh_rwlock_rdlock(r: usize) -> usize {
+    let (map, cv) = &*bsync::SYNC;
+    let mut g = map.lock().unwrap();
+    loop {
+        match g.get_mut(&r) {
+            Some(Bobj::Rw {
+                readers,
+                wr_owner,
+                wait_w,
+                ..
+            }) => {
+                if *wr_owner == 0 && *wait_w == 0 {
+                    *readers += 1;
+                    return 0;
+                }
+                g = cv.wait(g).unwrap();
+            }
+            Some(_) => return bsync::EINVAL as usize,
+            None => {
+                g.insert(
+                    r,
+                    Bobj::Rw {
+                        readers: 1,
+                        wr_owner: 0,
+                        wr_count: 0,
+                        wait_w: 0,
+                    },
+                );
+                return 0;
+            }
+        }
+    }
+}
+
+#[cfg(target_os = "macos")]
+extern "C" fn sh_rwlock_tryrdlock(r: usize) -> usize {
+    let (map, _) = &*bsync::SYNC;
+    let mut g = map.lock().unwrap();
+    match g.get_mut(&r) {
+        Some(Bobj::Rw {
+            readers,
+            wr_owner,
+            wait_w,
+            ..
+        }) => {
+            if *wr_owner == 0 && *wait_w == 0 {
+                *readers += 1;
+                0
+            } else {
+                bsync::EBUSY as usize
+            }
+        }
+        Some(_) => bsync::EINVAL as usize,
+        None => {
+            g.insert(
+                r,
+                Bobj::Rw {
+                    readers: 1,
+                    wr_owner: 0,
+                    wr_count: 0,
+                    wait_w: 0,
+                },
+            );
+            0
+        }
+    }
+}
+
+#[cfg(target_os = "macos")]
+extern "C" fn sh_rwlock_wrlock(r: usize) -> usize {
+    let (map, cv) = &*bsync::SYNC;
+    let mut g = map.lock().unwrap();
+    let t = bsync::tid();
+    if g.get(&r).is_none() {
+        g.insert(
+            r,
+            Bobj::Rw {
+                readers: 0,
+                wr_owner: t,
+                wr_count: 1,
+                wait_w: 0,
+            },
+        );
+        return 0;
+    }
+    // Recursion: Bionic rwlocks are not recursive; wait like others.
+    loop {
+        match g.get_mut(&r) {
+            Some(Bobj::Rw {
+                readers,
+                wr_owner,
+                wr_count,
+                wait_w,
+            }) => {
+                if *wr_owner == t {
+                    *wr_count += 1;
+                    return 0;
+                }
+                if *wr_owner == 0 && *readers == 0 {
+                    *wr_owner = t;
+                    *wr_count = 1;
+                    return 0;
+                }
+                *wait_w += 1;
+                g = cv.wait(g).unwrap();
+                if let Some(Bobj::Rw { wait_w, .. }) = g.get_mut(&r) {
+                    *wait_w = wait_w.saturating_sub(1);
+                }
+            }
+            Some(_) => return bsync::EINVAL as usize,
+            None => return bsync::EINVAL as usize,
+        }
+    }
+}
+
+#[cfg(target_os = "macos")]
+extern "C" fn sh_rwlock_trywrlock(r: usize) -> usize {
+    let (map, _) = &*bsync::SYNC;
+    let mut g = map.lock().unwrap();
+    let t = bsync::tid();
+    match g.get_mut(&r) {
+        Some(Bobj::Rw {
+            readers,
+            wr_owner,
+            wr_count,
+            ..
+        }) => {
+            if *wr_owner == t {
+                *wr_count += 1;
+                0
+            } else if *wr_owner == 0 && *readers == 0 {
+                *wr_owner = t;
+                *wr_count = 1;
+                0
+            } else {
+                bsync::EBUSY as usize
+            }
+        }
+        Some(_) => bsync::EINVAL as usize,
+        None => {
+            g.insert(
+                r,
+                Bobj::Rw {
+                    readers: 0,
+                    wr_owner: t,
+                    wr_count: 1,
+                    wait_w: 0,
+                },
+            );
+            0
+        }
+    }
+}
+
+#[cfg(target_os = "macos")]
+extern "C" fn sh_rwlock_unlock(r: usize) -> usize {
+    let (map, cv) = &*bsync::SYNC;
+    let mut g = map.lock().unwrap();
+    let t = bsync::tid();
+    match g.get_mut(&r) {
+        Some(Bobj::Rw {
+            readers,
+            wr_owner,
+            wr_count,
+            ..
+        }) => {
+            if *wr_owner == t {
+                *wr_count -= 1;
+                if *wr_count == 0 {
+                    *wr_owner = 0;
+                    cv.notify_all();
+                }
+                0
+            } else if *wr_owner == 0 && *readers > 0 {
+                *readers -= 1;
+                if *readers == 0 {
+                    cv.notify_all();
+                }
+                0
+            } else {
+                bsync::EPERM as usize
+            }
+        }
+        _ => bsync::EINVAL as usize,
+    }
+}
+
+/// Diagnostic wrapper for `vfprintf(FILE*,fmt,ap)`: log the args and
+/// the guest caller (lr -> .so offset), then let the real call run —
+/// libSystem varargs can't be forwarded portably, so this only logs.
+#[cfg(target_os = "macos")]
+extern "C" fn sh_vfprintf(fp: usize, fmt: usize, _ap: usize) -> usize {
+    let mut lr = 0usize;
+    unsafe { core::arch::asm!("mov {}, x30", out(reg) lr) };
+    let off = so_off(lr);
+    let f = crate::jni::cstr_ro(fmt as u64);
+    let shown = if f.len() > 80 { &f[..80] } else { &f };
+    eprintln!("[vf] fp={fp:#x} caller={off:#x?} fmt={shown:?}");
+    0
+}
+
+#[cfg(target_os = "macos")]
+extern "C" fn sh_fprintf(fp: usize, fmt: usize, _a3: usize, _a4: usize) -> usize {
+    let mut lr = 0usize;
+    unsafe { core::arch::asm!("mov {}, x30", out(reg) lr) };
+    let off = so_off(lr);
+    let f = crate::jni::cstr_ro(fmt as u64);
+    let shown = if f.len() > 80 { &f[..80] } else { &f };
+    eprintln!("[fprintf] fp={fp:#x} caller={off:#x?} fmt={shown:?}");
+    0
+}
+
 /// `__emutls_get_address(struct __emutls_control*)` — Bionic's emulated
 /// TLS for `__thread` in libs built without native TLS. One guest-zone
 /// cell per (control, thread), lazily allocated + initialized.
@@ -3368,6 +3943,66 @@ fn builtin_shim(name: &str) -> Option<usize> {
         "__FD_SET_chk" => sh_fd_set_chk as *const () as usize,
         #[cfg(target_os = "macos")]
         "pthread_gettid_np" => sh_gettid as *const () as usize,
+        // Bionic pthread sync objects have a different layout than
+        // Darwin's — keyed guest-side implementation, not host calls.
+        #[cfg(target_os = "macos")]
+        "pthread_mutex_init" => sh_mutex_init as *const () as usize,
+        #[cfg(target_os = "macos")]
+        "pthread_mutex_destroy" => sh_mutex_destroy as *const () as usize,
+        #[cfg(target_os = "macos")]
+        "pthread_mutex_lock" => sh_mutex_lock as *const () as usize,
+        #[cfg(target_os = "macos")]
+        "pthread_mutex_trylock" => sh_mutex_trylock as *const () as usize,
+        #[cfg(target_os = "macos")]
+        "pthread_mutex_unlock" => sh_mutex_unlock as *const () as usize,
+        #[cfg(target_os = "macos")]
+        "pthread_mutexattr_init" => sh_mutexattr_init as *const () as usize,
+        #[cfg(target_os = "macos")]
+        "pthread_mutexattr_destroy" => sh_attr_noop as *const () as usize,
+        #[cfg(target_os = "macos")]
+        "pthread_mutexattr_settype" => sh_mutexattr_settype as *const () as usize,
+        #[cfg(target_os = "macos")]
+        "pthread_mutexattr_gettype" => sh_mutexattr_gettype as *const () as usize,
+        #[cfg(target_os = "macos")]
+        "pthread_mutexattr_setpshared" => sh_attr_noop as *const () as usize,
+        #[cfg(target_os = "macos")]
+        "pthread_cond_init" => sh_cond_init as *const () as usize,
+        #[cfg(target_os = "macos")]
+        "pthread_cond_destroy" => sh_cond_destroy as *const () as usize,
+        #[cfg(target_os = "macos")]
+        "pthread_cond_wait" => sh_cond_wait as *const () as usize,
+        #[cfg(target_os = "macos")]
+        "pthread_cond_timedwait" => sh_cond_timedwait as *const () as usize,
+        #[cfg(target_os = "macos")]
+        "pthread_cond_signal" => sh_cond_signal as *const () as usize,
+        #[cfg(target_os = "macos")]
+        "pthread_cond_broadcast" => sh_cond_broadcast as *const () as usize,
+        #[cfg(target_os = "macos")]
+        "pthread_condattr_init" => sh_mutexattr_init as *const () as usize,
+        #[cfg(target_os = "macos")]
+        "pthread_condattr_destroy" => sh_attr_noop as *const () as usize,
+        #[cfg(target_os = "macos")]
+        "pthread_rwlock_init" => sh_rwlock_init as *const () as usize,
+        #[cfg(target_os = "macos")]
+        "pthread_rwlock_destroy" => sh_rwlock_destroy as *const () as usize,
+        #[cfg(target_os = "macos")]
+        "pthread_rwlock_rdlock" => sh_rwlock_rdlock as *const () as usize,
+        #[cfg(target_os = "macos")]
+        "pthread_rwlock_tryrdlock" => sh_rwlock_tryrdlock as *const () as usize,
+        #[cfg(target_os = "macos")]
+        "pthread_rwlock_wrlock" => sh_rwlock_wrlock as *const () as usize,
+        #[cfg(target_os = "macos")]
+        "pthread_rwlock_trywrlock" => sh_rwlock_trywrlock as *const () as usize,
+        #[cfg(target_os = "macos")]
+        "pthread_rwlock_unlock" => sh_rwlock_unlock as *const () as usize,
+        #[cfg(target_os = "macos")]
+        "pthread_rwlockattr_init" => sh_mutexattr_init as *const () as usize,
+        #[cfg(target_os = "macos")]
+        "pthread_rwlockattr_destroy" => sh_attr_noop as *const () as usize,
+        #[cfg(target_os = "macos")]
+        "vfprintf" => sh_vfprintf as *const () as usize,
+        #[cfg(target_os = "macos")]
+        "fprintf" => sh_fprintf as *const () as usize,
         #[cfg(target_os = "macos")]
         "pthread_setname_np" => sh_setname as *const () as usize,
         "dl_iterate_phdr" => sh_dl_iterate_phdr as *const () as usize,
