@@ -1577,10 +1577,21 @@ fn collections_static(vm: &mut Vm, name: &str, args: &[V]) -> Option<Option<V>> 
         }
         "disjoint" => Some(Some(V::I32(0))),
         "addAll" => {
+            // Collections.addAll(c, T... elements): the vararg arrives
+            // as a single T[] arg — push its elements, not the array
+            // itself, or `getAppDatabase`-style loops later field-read
+            // the array and crash.
             if let V::Ref(h) = args[0] {
                 for v in &args[1..] {
+                    let items: Vec<V> = match v {
+                        V::Ref(ah) => match vm.heap.get(*ah) {
+                            Some(Obj::Array { data, .. }) => data.clone(),
+                            _ => vec![*v],
+                        },
+                        _ => vec![*v],
+                    };
                     if let Some(l) = list_mut(vm, h) {
-                        l.push(*v);
+                        l.extend(items);
                     }
                 }
             }
