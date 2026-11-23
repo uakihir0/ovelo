@@ -208,6 +208,12 @@ pub struct Vm {
     /// Root of the tree that owns each activity's content frame —
     /// appcompat's real decor when it built one dex-side.
     pub(crate) decor_roots: HashMap<u32, u32>,
+    /// The frame `setContentView` attaches into, per window owner —
+    /// the frame that last wore `android.R.id.content`. AppCompat's
+    /// ensureSubDecor calls `frameworkFrame.setId(NO_ID)` before it
+    /// moves its own ContentFrameLayout in, so an id-search can't be
+    /// trusted to find the attachment point afterwards.
+    pub(crate) content_frames: HashMap<u32, u32>,
     /// Attached `TextClock` views that tick — refreshed once per
     /// `drain_runnables` pass (AOSP ticks them per postDelayed).
     pub clock_views: Vec<u32>,
@@ -497,6 +503,7 @@ impl Vm {
             cur_activity: 0,
             content_views: HashMap::new(),
             decor_roots: HashMap::new(),
+            content_frames: HashMap::new(),
             clock_views: Vec::new(),
             apk_res: None,
             dbs: HashMap::new(),
@@ -1407,6 +1414,11 @@ impl Vm {
     /// object's class doesn't declare it — the platform base class
     /// (not in this DEX) provides the default.
     pub fn call_virtual(&mut self, this: u32, name: &str, args: &[V]) -> Result<Option<V>> {
+        if name == "onAttachedToWindow" {
+            jdk::pseudo_set(self, this, jdk::view::P_ATTACHED, V::I32(1));
+        } else if name == "onDetachedFromWindow" {
+            jdk::pseudo_set(self, this, jdk::view::P_ATTACHED, V::I32(0));
+        }
         let ci = self
             .heap
             .class_of(this)
@@ -1505,6 +1517,20 @@ impl Vm {
     /// re-entry) but makes runBlock-style callers redo work — hence
     /// the generous cap.
     pub(crate) fn park_drain(&mut self) -> std::result::Result<(), E> {
+        // Promote delayed tasks that came due — a parked scheduler
+        // worker requeued with `due=now` sits in `delayed_runnables`,
+        // and an unbounded park (runBlocking on the main thread) must
+        // run it rather than unwinding as if nothing were queued.
+        let now = jdk::now_ms() as u64;
+        let mut i = 0;
+        while i < self.delayed_runnables.len() {
+            if self.delayed_runnables[i].2 <= now {
+                let (r, on_main, _) = self.delayed_runnables.swap_remove(i);
+                self.pending_runnables.push_back((r, on_main));
+            } else {
+                i += 1;
+            }
+        }
         // Nothing queued anywhere: an inline drain can't complete the
         // wait, so yield by unwinding — the drain loop requeues the
         // runnable (queue-scanning workers rescan on re-entry).

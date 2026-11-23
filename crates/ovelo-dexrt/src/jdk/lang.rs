@@ -1551,7 +1551,8 @@ fn class_call(vm: &mut Vm, name: &str, _sig: &str, args: &[V]) -> Rt<Option<Opti
             )
             .unwrap_or_default();
             let got = class_of(vm, args[1]);
-            Some(Some(V::I32(desc_is_a(&got, &want) as i32)))
+            let ok = desc_is_a(&got, &want) || vm.assignable_desc(&got, &want);
+            Some(Some(V::I32(ok as i32)))
         }
         "isAssignableFrom" => {
             let a = class_desc_of(
@@ -1570,7 +1571,11 @@ fn class_call(vm: &mut Vm, name: &str, _sig: &str, args: &[V]) -> Rt<Option<Opti
                 },
             )
             .unwrap_or_default();
-            Some(Some(V::I32(desc_is_a(&b, &a) as i32)))
+            // desc_is_a only knows host classes — dex-to-dex
+            // subclassing (e.g. a generated protobuf class extending
+            // GeneratedMessageLite) needs assignable_desc's dex walk.
+            let ok = desc_is_a(&b, &a) || vm.assignable_desc(&b, &a);
+            Some(Some(V::I32(ok as i32)))
         }
         "getSuperclass" => {
             // `s()` returns None for `Obj::Class` mirrors — resolve the
@@ -1908,36 +1913,7 @@ fn thread_call(vm: &mut Vm, name: &str, _sig: &str, args: &[V]) -> Rt<Option<Opt
             "Ljava/lang/Thread$State;",
             HostState::StrBuf("RUNNABLE".into()),
         ))),
-        "getStackTrace" => {
-            // Real frames — kotlin's Intrinsics.checkNotNullParameter
-            // walks this array to sanitize its NPE, so an empty array
-            // turns every guest NPE into an aget AIOOBE.
-            let frames: Vec<V> = vm
-                .describe_stack()
-                .into_iter()
-                .rev()
-                .map(|d| {
-                    // "Lpkg/Cls;.name(sig)ret" -> (pkg.Cls, name)
-                    let (cn, mn) = d
-                        .strip_prefix('L')
-                        .and_then(|r| r.split_once(";."))
-                        .map(|(c, r)| {
-                            (
-                                c.replace('/', "."),
-                                r.split('(').next().unwrap_or("").to_string(),
-                            )
-                        })
-                        .unwrap_or((d.clone(), String::new()));
-                    let v = host(vm, "Ljava/lang/StackTraceElement;", HostState::StrBuf(cn));
-                    if let V::Ref(h) = v {
-                        let m = jstr(vm, &mn);
-                        pseudo_set(vm, h, P_COMPONENT, m);
-                    }
-                    v
-                })
-                .collect();
-            Some(Some(arr(vm, "Ljava/lang/StackTraceElement;", frames)))
-        }
+        "getStackTrace" => Some(Some(stack_frames(vm))),
         "getAllStackTraces" => Some(Some(arr(vm, "Ljava/lang/StackTraceElement;", vec![]))),
         "getContextClassLoader" => {
             Some(Some(host(vm, "Ljava/lang/ClassLoader;", HostState::Empty)))
@@ -2144,6 +2120,37 @@ fn threadlocal_call(vm: &mut Vm, name: &str, args: &[V]) -> Option<Option<V>> {
 // ---------------------------------------------------------------------
 // Throwable / Enum / StackTraceElement
 
+/// The current guest call stack as a `StackTraceElement[]` —
+/// declaring class in the element's StrBuf, method name in
+/// P_COMPONENT (the slots `<init>`/`getStackTrace` fill).
+fn stack_frames(vm: &mut Vm) -> V {
+    let frames: Vec<V> = vm
+        .describe_stack()
+        .into_iter()
+        .rev()
+        .map(|d| {
+            // "Lpkg/Cls;.name(sig)ret" -> (pkg.Cls, name)
+            let (cn, mn) = d
+                .strip_prefix('L')
+                .and_then(|r| r.split_once(";."))
+                .map(|(c, r)| {
+                    (
+                        c.replace('/', "."),
+                        r.split('(').next().unwrap_or("").to_string(),
+                    )
+                })
+                .unwrap_or((d.clone(), String::new()));
+            let v = host(vm, "Ljava/lang/StackTraceElement;", HostState::StrBuf(cn));
+            if let V::Ref(h) = v {
+                let m = jstr(vm, &mn);
+                pseudo_set(vm, h, P_COMPONENT, m);
+            }
+            v
+        })
+        .collect();
+    arr(vm, "Ljava/lang/StackTraceElement;", frames)
+}
+
 fn throwable_call(vm: &mut Vm, name: &str, _sig: &str, args: &[V]) -> Rt<Option<Option<V>>> {
     let V::Ref(h) = args.first().copied().unwrap_or(V::Ref(0)) else {
         return Ok(None);
@@ -2188,9 +2195,10 @@ fn throwable_call(vm: &mut Vm, name: &str, _sig: &str, args: &[V]) -> Rt<Option<
             Some(Some(args[0]))
         }
         "fillInStackTrace" => Some(Some(args[0])),
-        "getStackTrace" | "getOurStackTrace" => {
-            Some(Some(arr(vm, "Ljava/lang/StackTraceElement;", vec![])))
-        }
+        // Real frames — Timber's getTag and kotlin's
+        // checkNotNullParameter both index this array; an empty
+        // array turns those into first{} crashes / aget AIOOBEs.
+        "getStackTrace" | "getOurStackTrace" => Some(Some(stack_frames(vm))),
         "setStackTrace" | "addSuppressed" => Some(None),
         "getSuppressed" => Some(Some(arr(vm, THROWABLE, vec![]))),
         "printStackTrace" => {

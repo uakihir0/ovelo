@@ -21,6 +21,11 @@ const P_VIEW_ID: u32 = u32::MAX - 7;
 const P_CHILDREN: u32 = u32::MAX - 8;
 const P_PARENT: u32 = u32::MAX - 9;
 const P_TAG: u32 = u32::MAX - 10;
+/// Set while the view is attached to a window — `isAttachedToWindow`
+/// must report false before `onAttachedToWindow` actually fires
+/// (AbstractComposeView defers `ensureCompositionCreated` until it
+/// does; a hardcoded true composes a parentless view).
+pub(crate) const P_ATTACHED: u32 = u32::MAX - 48;
 /// Live `setText`/`setHint` argument — read by `dex_view` before the
 /// inflated `android:text` attribute. `pub`: the guest bridge's setter
 /// overrides write it for dex-inflated (non-GuestView) receivers.
@@ -1478,14 +1483,28 @@ pub(crate) fn call(
             }
             Some(Some(V::Ref(cur)))
         }
-        "getTag" => Some(Some(
-            match args.get(1) {
+        "getTag" => {
+            let v = match args.get(1) {
                 Some(&key) => pseudo_get(vm, this, tag_key(i32v(key))),
                 None => pseudo_get(vm, this, P_TAG),
             }
-            .unwrap_or(V::Ref(0)),
-        )),
+            .unwrap_or(V::Ref(0));
+            if std::env::var_os("OVELO_VIEWDBG").is_some() {
+                eprintln!(
+                    "[viewdbg] getTag h{this} key={:?} -> {v:?}",
+                    args.get(1).map(|k| i32v(*k))
+                );
+            }
+            Some(Some(v))
+        }
         "setTag" => {
+            if std::env::var_os("OVELO_VIEWDBG").is_some() {
+                eprintln!(
+                    "[viewdbg] setTag h{this} key={:?} v={:?}",
+                    args.get(1).map(|k| i32v(*k)),
+                    args.get(2)
+                );
+            }
             match args.len() {
                 n if n >= 3 => {
                     pseudo_set(vm, this, tag_key(i32v(args[1])), args[2]);
@@ -1606,7 +1625,6 @@ pub(crate) fn call(
             Some(None)
         }
         "isShown"
-        | "isAttachedToWindow"
         | "hasWindowFocus"
         | "isEnabled"
         | "isClickable"
@@ -1615,6 +1633,7 @@ pub(crate) fn call(
         | "isFocusableOnScreen"
         | "hasFocusable"
         | "isImportantForAccessibility" => Some(Some(V::I32(1))),
+        "isAttachedToWindow" => Some(Some(V::I32(pint(vm, this, P_ATTACHED)))),
         "isSelected"
         | "isActivated"
         | "isPressed"
@@ -4906,6 +4925,12 @@ pub(crate) fn attach_at(
     }
     if let V::Ref(ch) = child {
         pseudo_set(vm, ch, P_PARENT, V::Ref(parent));
+        // AOSP ViewGroup.addView → child.dispatchAttachedToWindow when
+        // the parent is already attached — carry the flag down so
+        // `isAttachedToWindow` is right before the callback lands.
+        if pint(vm, parent, P_ATTACHED) == 1 {
+            pseudo_set(vm, ch, P_ATTACHED, V::I32(1));
+        }
         // AOSP addViewInner checkLayoutParams → generateLayoutParams
         // first: ConstraintLayout's onViewAdded reads getLayoutParams()
         // and mints the child widget from the LP, so the LP must exist
@@ -4984,6 +5009,7 @@ pub(crate) fn attach_at(
                 Some(V::Ref(a)) => a,
                 _ => vm.cur_activity,
             };
+            vm.content_frames.insert(owner, parent);
             vm.content_views.insert(owner, ch);
             vm.decor_roots.insert(owner, top);
         }
@@ -5125,8 +5151,17 @@ pub(crate) fn decor_of(vm: &mut Vm, window: u32) -> Option<u32> {
     pseudo_set(vm, cf, P_IS_VIEW, V::I32(1));
     pseudo_set(vm, cf, P_IS_GROUP, V::I32(1));
     pseudo_set(vm, cf, P_VIEW_ID, V::I32(ANDROID_ID_CONTENT));
+    // The decor exists only in service of a live window — mark both
+    // frames attached so children added before any onAttachedToWindow
+    // dispatch still report `isAttachedToWindow` correctly.
+    pseudo_set(vm, d, P_ATTACHED, V::I32(1));
+    pseudo_set(vm, cf, P_ATTACHED, V::I32(1));
     attach(vm, d, V::Ref(cf));
+    vm.content_frames.insert(owner, cf);
     pseudo_set(vm, window, P_DECOR, V::Ref(d));
+    if std::env::var_os("OVELO_VIEWDBG").is_some() {
+        eprintln!("[viewdbg] decor_of window=h{window} owner=h{owner} -> d=h{d} cf=h{cf}");
+    }
     Some(d)
 }
 
@@ -5137,6 +5172,16 @@ pub(crate) const ANDROID_ID_CONTENT: i32 = 0x0102_0002;
 /// `ensureSubDecor` rebinds app content into).
 pub(crate) fn content_frame_of(vm: &mut Vm, window: u32) -> Option<u32> {
     let d = decor_of(vm, window)?;
+    // Prefer the frame we already handed out: ensureSubDecor strips
+    // `android.R.id.content` off the framework frame before moving its
+    // own ContentFrameLayout in, and the id-search then misses.
+    let owner = match pseudo_get(vm, window, P_TARGET) {
+        Some(V::Ref(a)) => a,
+        _ => vm.cur_activity,
+    };
+    if let Some(&cf) = vm.content_frames.get(&owner) {
+        return Some(cf);
+    }
     find_in_tree(vm, d, ANDROID_ID_CONTENT)
 }
 

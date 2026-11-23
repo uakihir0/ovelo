@@ -489,6 +489,37 @@ fn jtime_call(vm: &mut Vm, class: &str, name: &str, args: &[V]) -> Rt<Option<Opt
         ("Ljava/time/Duration;", "toNanos") => {
             Some(Some(V::I64(millis_of(vm, args[0]) * 1_000_000)))
         }
+        ("Ljava/time/Month;", "getValue") => Some(Some(V::I32(month_of(vm, args[0])))),
+        ("Ljava/time/Month;", "of") => Some(Some(month_obj(
+            vm,
+            i64v(args.get(1).copied().unwrap_or(V::I32(1))),
+        ))),
+        ("Ljava/time/Month;", "values") => {
+            let vals = (1..=12).map(|m| month_obj(vm, m)).collect();
+            Some(Some(arr(vm, "Ljava/time/Month;", vals)))
+        }
+        ("Ljava/time/Month;", "valueOf") => {
+            let n = sv(vm, args.get(1).copied().unwrap_or(V::Ref(0))).unwrap_or_default();
+            let i = MONTH_NAMES.iter().position(|m| *m == n).unwrap_or(0) as i64;
+            Some(Some(month_obj(vm, i + 1)))
+        }
+        ("Ljava/time/DayOfWeek;", "getValue") => Some(Some(V::I32(day_of_week_of(vm, args[0])))),
+        ("Ljava/time/DayOfWeek;", "of") => Some(Some(day_of_week_obj(
+            vm,
+            i64v(args.get(1).copied().unwrap_or(V::I32(1))),
+        ))),
+        ("Ljava/time/DayOfWeek;", "values") => {
+            let vals = (1..=7).map(|d| day_of_week_obj(vm, d)).collect();
+            Some(Some(arr(vm, "Ljava/time/DayOfWeek;", vals)))
+        }
+        ("Ljava/time/DayOfWeek;", "valueOf") => {
+            let n = sv(vm, args.get(1).copied().unwrap_or(V::Ref(0))).unwrap_or_default();
+            let i = DAY_NAMES.iter().position(|d| *d == n).unwrap_or(0) as i64;
+            Some(Some(day_of_week_obj(vm, i + 1)))
+        }
+        ("Ljava/time/LocalDate;", _) => localdate_call(vm, name, args)?,
+        ("Ljava/time/LocalTime;", _) => localtime_call(vm, name, args)?,
+        ("Ljava/time/LocalDateTime;", _) => localdatetime_call(vm, name, args)?,
         (_, "now") if class.contains("ZoneId") || class.contains("ZoneOffset") => {
             Some(Some(host(vm, class, HostState::StrBuf("UTC".into()))))
         }
@@ -500,6 +531,407 @@ fn jtime_call(vm: &mut Vm, class: &str, name: &str, args: &[V]) -> Rt<Option<Opt
                 Some(Some(host(vm, class, HostState::Empty)))
             }
         }
+        _ => None,
+    })
+}
+
+// java.time enum-like value objects (Month / DayOfWeek are real enums;
+// minted as host objects carrying name + ordinal like dex enums).
+
+const MONTH_NAMES: [&str; 12] = [
+    "JANUARY",
+    "FEBRUARY",
+    "MARCH",
+    "APRIL",
+    "MAY",
+    "JUNE",
+    "JULY",
+    "AUGUST",
+    "SEPTEMBER",
+    "OCTOBER",
+    "NOVEMBER",
+    "DECEMBER",
+];
+const DAY_NAMES: [&str; 7] = [
+    "MONDAY",
+    "TUESDAY",
+    "WEDNESDAY",
+    "THURSDAY",
+    "FRIDAY",
+    "SATURDAY",
+    "SUNDAY",
+];
+
+/// Mint a java.time enum constant: StrBuf name + P_FLAGS ordinal —
+/// the slots Enum.name()/ordinal()/compareTo read.
+fn jtime_enum(vm: &mut Vm, desc: &str, name: &str, ordinal: i32) -> V {
+    let v = host(vm, desc, HostState::StrBuf(name.into()));
+    if let V::Ref(h) = v {
+        let nm = jstr(vm, name);
+        pseudo_set(vm, h, P_DATA, nm);
+        pseudo_set(vm, h, P_FLAGS, V::I32(ordinal));
+    }
+    v
+}
+
+fn month_obj(vm: &mut Vm, m1_12: i64) -> V {
+    let m = ((m1_12 - 1).rem_euclid(12)) as usize;
+    jtime_enum(vm, "Ljava/time/Month;", MONTH_NAMES[m], m as i32)
+}
+
+fn day_of_week_obj(vm: &mut Vm, v1_7: i64) -> V {
+    let d = ((v1_7 - 1).rem_euclid(7)) as usize;
+    jtime_enum(vm, "Ljava/time/DayOfWeek;", DAY_NAMES[d], d as i32)
+}
+
+fn month_of(vm: &Vm, v: V) -> i32 {
+    match v {
+        V::Ref(h) => i32v(pseudo_get(vm, h, P_FLAGS).unwrap_or(V::I32(0))) + 1,
+        _ => i32v(v),
+    }
+}
+
+fn day_of_week_of(vm: &Vm, v: V) -> i32 {
+    match v {
+        V::Ref(h) => i32v(pseudo_get(vm, h, P_FLAGS).unwrap_or(V::I32(0))) + 1,
+        _ => i32v(v),
+    }
+}
+
+/// Days since epoch of an epoch-millis LocalDate/LocalDateTime.
+fn ldate_days(ms: i64) -> i64 {
+    ms.div_euclid(86_400_000)
+}
+
+/// Days in a month (1-based) for a year.
+fn dim(y: i64, m: i64) -> i64 {
+    let leap = y % 4 == 0 && (y % 100 != 0 || y % 400 == 0);
+    [
+        31,
+        if leap { 29 } else { 28 },
+        31,
+        30,
+        31,
+        30,
+        31,
+        31,
+        30,
+        31,
+        30,
+        31,
+    ][(m - 1).clamp(0, 11) as usize]
+}
+
+fn localdate_call(vm: &mut Vm, name: &str, args: &[V]) -> Rt<Option<Option<V>>> {
+    let ms = millis_of(vm, args[0]);
+    let (y, mo, d, ..) = ms_fields(ms);
+    Ok(match name {
+        "now" | "ofInstant" => Some(Some(host(
+            vm,
+            "Ljava/time/LocalDate;",
+            HostState::Millis(ldate_days(now_ms()) * 86_400_000),
+        ))),
+        "of" => {
+            // of(year, month|Month, day) — month may be the enum.
+            let mv = match args.get(2) {
+                Some(V::Ref(h)) => month_of(vm, V::Ref(*h)) as i64,
+                _ => i64v(args.get(2).copied().unwrap_or(V::I32(1))),
+            };
+            let ms = days_from_civil(
+                i64v(args.get(1).copied().unwrap_or(V::I32(1970))),
+                mv,
+                i64v(args.get(3).copied().unwrap_or(V::I32(1))),
+            ) * 86_400_000;
+            Some(Some(host(
+                vm,
+                "Ljava/time/LocalDate;",
+                HostState::Millis(ms),
+            )))
+        }
+        "ofEpochDay" => Some(Some(host(
+            vm,
+            "Ljava/time/LocalDate;",
+            HostState::Millis(i64v(args.get(1).copied().unwrap_or(V::I64(0))) * 86_400_000),
+        ))),
+        "ofYearDay" => {
+            let y = i64v(args.get(1).copied().unwrap_or(V::I32(1970)));
+            let doy = i64v(args.get(2).copied().unwrap_or(V::I32(1)));
+            Some(Some(host(
+                vm,
+                "Ljava/time/LocalDate;",
+                HostState::Millis((days_from_civil(y, 1, 1) + doy - 1) * 86_400_000),
+            )))
+        }
+        "parse" => {
+            let t = sv(vm, args.get(1).copied().unwrap_or(V::Ref(0))).unwrap_or_default();
+            Some(Some(host(
+                vm,
+                "Ljava/time/LocalDate;",
+                HostState::Millis(ldate_days(parse_date(&t)) * 86_400_000),
+            )))
+        }
+        "getYear" => Some(Some(V::I32(y as i32))),
+        "getMonth" => Some(Some(month_obj(vm, mo))),
+        "getMonthValue" => Some(Some(V::I32(mo as i32))),
+        "getDayOfMonth" => Some(Some(V::I32(d as i32))),
+        "getDayOfYear" => Some(Some(V::I32(
+            (ldate_days(ms) - days_from_civil(y, 1, 1) + 1) as i32,
+        ))),
+        "getDayOfWeek" => {
+            // epoch day = Thursday (value 4): dow = ((days + 3) mod 7) + 1
+            let dow = ((ldate_days(ms) + 3).rem_euclid(7)) + 1;
+            Some(Some(day_of_week_obj(vm, dow)))
+        }
+        "toEpochDay" => Some(Some(V::I64(ldate_days(ms)))),
+        "isLeapYear" => Some(Some(V::I32(
+            (y % 4 == 0 && (y % 100 != 0 || y % 400 == 0)) as i32,
+        ))),
+        "lengthOfYear" => Some(Some(V::I32(
+            if y % 4 == 0 && (y % 100 != 0 || y % 400 == 0) {
+                366
+            } else {
+                365
+            },
+        ))),
+        "lengthOfMonth" => Some(Some(V::I32(dim(y, mo) as i32))),
+        "plusDays" | "minusDays" => {
+            let s = if name.starts_with("plus") { 1 } else { -1 };
+            Some(Some(host(
+                vm,
+                "Ljava/time/LocalDate;",
+                HostState::Millis(
+                    ms + s * i64v(args.get(1).copied().unwrap_or(V::I64(0))) * 86_400_000,
+                ),
+            )))
+        }
+        "plusWeeks" | "minusWeeks" => {
+            let s = if name.starts_with("plus") { 1 } else { -1 };
+            Some(Some(host(
+                vm,
+                "Ljava/time/LocalDate;",
+                HostState::Millis(
+                    ms + s * i64v(args.get(1).copied().unwrap_or(V::I64(0))) * 7 * 86_400_000,
+                ),
+            )))
+        }
+        "plusMonths" | "minusMonths" => {
+            let s = if name.starts_with("plus") { 1 } else { -1 };
+            let n = s * i64v(args.get(1).copied().unwrap_or(V::I64(0)));
+            let total = (y * 12 + mo - 1) + n;
+            let (ny, nm0) = (total.div_euclid(12), total.rem_euclid(12));
+            Some(Some(host(
+                vm,
+                "Ljava/time/LocalDate;",
+                HostState::Millis(
+                    days_from_civil(ny, nm0 + 1, d.min(dim(ny, nm0 + 1))) * 86_400_000,
+                ),
+            )))
+        }
+        "plusYears" | "minusYears" => {
+            let s = if name.starts_with("plus") { 1 } else { -1 };
+            let ny = y + s * i64v(args.get(1).copied().unwrap_or(V::I64(0)));
+            Some(Some(host(
+                vm,
+                "Ljava/time/LocalDate;",
+                HostState::Millis(days_from_civil(ny, mo, d.min(dim(ny, mo))) * 86_400_000),
+            )))
+        }
+        "isBefore" => Some(Some(V::I32((ms < millis_of(vm, args[1])) as i32))),
+        "isAfter" => Some(Some(V::I32((ms > millis_of(vm, args[1])) as i32))),
+        "isEqual" | "equals" => Some(Some(V::I32((ms == millis_of(vm, args[1])) as i32))),
+        "compareTo" => Some(Some(V::I32(ms.cmp(&millis_of(vm, args[1])) as i32))),
+        "hashCode" => {
+            // java.time.LocalDate.hashCode: (y & -2048) ^ (y<<11)+(mo<<6)+d
+            Some(Some(V::I32(
+                ((y & -2048) ^ ((y << 11) + (mo << 6) + d)) as i32,
+            )))
+        }
+        "atTime" | "atStartOfDay" => Some(Some(host(
+            vm,
+            "Ljava/time/LocalDateTime;",
+            HostState::Millis(ms),
+        ))),
+        "toString" => Some(Some(jstr(vm, &format!("{y:04}-{mo:02}-{d:02}")))),
+        _ => None,
+    })
+}
+
+fn localtime_call(vm: &mut Vm, name: &str, args: &[V]) -> Rt<Option<Option<V>>> {
+    // Stored as ms-of-day.
+    let ms = millis_of(vm, args[0]);
+    Ok(match name {
+        "now" => Some(Some(host(
+            vm,
+            "Ljava/time/LocalTime;",
+            HostState::Millis(now_ms().rem_euclid(86_400_000)),
+        ))),
+        "of" | "ofSecondOfDay" | "ofNanoOfDay" => {
+            let ms = match name {
+                "of" => {
+                    i64v(args.get(1).copied().unwrap_or(V::I32(0))) * 3_600_000
+                        + i64v(args.get(2).copied().unwrap_or(V::I32(0))) * 60_000
+                        + i64v(args.get(3).copied().unwrap_or(V::I32(0))) * 1000
+                        + i64v(args.get(4).copied().unwrap_or(V::I32(0))) / 1_000_000
+                }
+                "ofSecondOfDay" => i64v(args.get(1).copied().unwrap_or(V::I64(0))) * 1000,
+                _ => i64v(args.get(1).copied().unwrap_or(V::I64(0))) / 1_000_000,
+            };
+            Some(Some(host(
+                vm,
+                "Ljava/time/LocalTime;",
+                HostState::Millis(ms),
+            )))
+        }
+        "parse" => {
+            let t = sv(vm, args.get(1).copied().unwrap_or(V::Ref(0))).unwrap_or_default();
+            let mut tp = t.split(':');
+            let ms = tp.next().and_then(|x| x.parse::<i64>().ok()).unwrap_or(0) * 3_600_000
+                + tp.next().and_then(|x| x.parse::<i64>().ok()).unwrap_or(0) * 60_000
+                + tp.next()
+                    .and_then(|x| x.split('.').next().and_then(|v| v.parse::<i64>().ok()))
+                    .unwrap_or(0)
+                    * 1000;
+            Some(Some(host(
+                vm,
+                "Ljava/time/LocalTime;",
+                HostState::Millis(ms),
+            )))
+        }
+        "getHour" => Some(Some(V::I32((ms / 3_600_000) as i32))),
+        "getMinute" => Some(Some(V::I32(((ms / 60_000) % 60) as i32))),
+        "getSecond" => Some(Some(V::I32(((ms / 1000) % 60) as i32))),
+        "getNano" => Some(Some(V::I32(((ms % 1000) * 1_000_000) as i32))),
+        "toSecondOfDay" => Some(Some(V::I32((ms / 1000) as i32))),
+        "toNanoOfDay" => Some(Some(V::I64(ms * 1_000_000))),
+        "toString" => {
+            let (h, mi, s) = (ms / 3_600_000, (ms / 60_000) % 60, (ms / 1000) % 60);
+            Some(Some(jstr(
+                vm,
+                &if s == 0 {
+                    format!("{h:02}:{mi:02}")
+                } else {
+                    format!("{h:02}:{mi:02}:{s:02}")
+                },
+            )))
+        }
+        _ => None,
+    })
+}
+
+fn localdatetime_call(vm: &mut Vm, name: &str, args: &[V]) -> Rt<Option<Option<V>>> {
+    let ms = millis_of(vm, args[0]);
+    let (y, mo, d, h, mi, s, n) = ms_fields(ms);
+    Ok(match name {
+        "now" => Some(Some(host(
+            vm,
+            "Ljava/time/LocalDateTime;",
+            HostState::Millis(now_ms()),
+        ))),
+        "of" => {
+            let ms = days_from_civil(
+                i64v(args.get(1).copied().unwrap_or(V::I32(1970))),
+                match args.get(2) {
+                    Some(V::Ref(h)) => month_of(vm, V::Ref(*h)) as i64,
+                    _ => i64v(args.get(2).copied().unwrap_or(V::I32(1))),
+                },
+                i64v(args.get(3).copied().unwrap_or(V::I32(1))),
+            ) * 86_400_000
+                + i64v(args.get(4).copied().unwrap_or(V::I32(0))) * 3_600_000
+                + i64v(args.get(5).copied().unwrap_or(V::I32(0))) * 60_000
+                + i64v(args.get(6).copied().unwrap_or(V::I32(0))) * 1000
+                + i64v(args.get(7).copied().unwrap_or(V::I32(0))) / 1_000_000;
+            Some(Some(host(
+                vm,
+                "Ljava/time/LocalDateTime;",
+                HostState::Millis(ms),
+            )))
+        }
+        "parse" => {
+            let t = sv(vm, args.get(1).copied().unwrap_or(V::Ref(0))).unwrap_or_default();
+            Some(Some(host(
+                vm,
+                "Ljava/time/LocalDateTime;",
+                HostState::Millis(parse_date(&t)),
+            )))
+        }
+        "ofInstant" => Some(Some(host(
+            vm,
+            "Ljava/time/LocalDateTime;",
+            HostState::Millis(millis_of(vm, args[1])),
+        ))),
+        "getYear" => Some(Some(V::I32(y as i32))),
+        "getMonth" => Some(Some(month_obj(vm, mo))),
+        "getMonthValue" => Some(Some(V::I32(mo as i32))),
+        "getDayOfMonth" => Some(Some(V::I32(d as i32))),
+        "getDayOfYear" => Some(Some(V::I32(
+            (ldate_days(ms) - days_from_civil(y, 1, 1) + 1) as i32,
+        ))),
+        "getDayOfWeek" => {
+            let dow = ((ldate_days(ms) + 3).rem_euclid(7)) + 1;
+            Some(Some(day_of_week_obj(vm, dow)))
+        }
+        "getHour" => Some(Some(V::I32(h as i32))),
+        "getMinute" => Some(Some(V::I32(mi as i32))),
+        "getSecond" => Some(Some(V::I32(s as i32))),
+        "getNano" => Some(Some(V::I32((n * 1_000_000) as i32))),
+        "toLocalDate" => Some(Some(host(
+            vm,
+            "Ljava/time/LocalDate;",
+            HostState::Millis(ldate_days(ms) * 86_400_000),
+        ))),
+        "toLocalTime" => Some(Some(host(
+            vm,
+            "Ljava/time/LocalTime;",
+            HostState::Millis(ms.rem_euclid(86_400_000)),
+        ))),
+        "toEpochSecond" | "toEpochMilli" => {
+            // Optional ZoneOffset arg — Millis host carries offset ms.
+            let off_ms = args
+                .get(1)
+                .and_then(|v| match v {
+                    V::Ref(h) => match vm.heap.get(*h) {
+                        Some(Obj::Host {
+                            state: HostState::Millis(o),
+                            ..
+                        }) => Some(*o),
+                        _ => None,
+                    },
+                    _ => None,
+                })
+                .unwrap_or(0);
+            let e = ms - off_ms;
+            Some(Some(if name == "toEpochSecond" {
+                V::I64(e / 1000)
+            } else {
+                V::I64(e)
+            }))
+        }
+        "isBefore" => Some(Some(V::I32((ms < millis_of(vm, args[1])) as i32))),
+        "isAfter" => Some(Some(V::I32((ms > millis_of(vm, args[1])) as i32))),
+        "equals" => Some(Some(V::I32((ms == millis_of(vm, args[1])) as i32))),
+        "compareTo" => Some(Some(V::I32(ms.cmp(&millis_of(vm, args[1])) as i32))),
+        "plusDays" | "minusDays" | "plusHours" | "minusHours" | "plusMinutes" | "minusMinutes"
+        | "plusSeconds" | "minusSeconds" => {
+            let unit = if name.contains("Days") {
+                86_400_000
+            } else if name.contains("Hours") {
+                3_600_000
+            } else if name.contains("Minutes") {
+                60_000
+            } else {
+                1000
+            };
+            let s = if name.starts_with("plus") { 1 } else { -1 };
+            Some(Some(host(
+                vm,
+                "Ljava/time/LocalDateTime;",
+                HostState::Millis(ms + s * i64v(args.get(1).copied().unwrap_or(V::I64(0))) * unit),
+            )))
+        }
+        "toString" => Some(Some(jstr(
+            vm,
+            &format!("{y:04}-{mo:02}-{d:02}T{h:02}:{mi:02}:{s:02}"),
+        ))),
         _ => None,
     })
 }

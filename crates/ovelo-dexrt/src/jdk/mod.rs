@@ -562,6 +562,9 @@ pub fn pseudo_get(vm: &Vm, h: u32, key: impl Into<u64>) -> Option<V> {
 /// Write a pseudo field (`P_*` key) on a host/instance object.
 pub fn pseudo_set(vm: &mut Vm, h: u32, key: impl Into<u64>, v: V) {
     let key = key.into();
+    if key == u32::MAX as u64 - 7 && std::env::var_os("OVELO_VIEWDBG").is_some() {
+        eprintln!("[viewdbg] P_VIEW_ID h{h} <- {v:?}");
+    }
     if let Some(f) = fields_mut(vm, h) {
         // Re-writing the same value (deterministic layout passes do this
         // every pass) must not dirty the tree — the render/layout
@@ -1247,6 +1250,39 @@ pub(crate) fn sfield(vm: &mut Vm, owner: &str, name: &str, ftype: &str) -> Optio
         ("Ljava/lang/Float;", "BYTES") => V::I32(4),
         ("Ljava/lang/Math;", "PI") => V::F64(std::f64::consts::PI),
         ("Ljava/lang/Math;", "E") => V::F64(std::f64::consts::E),
+        // java.time range constants — kotlinx-datetime reads
+        // `LocalDate.MIN/MAX.toEpochDay()` into its own bounds fields;
+        // missing them silently clamps every date arithmetic result.
+        ("Ljava/time/LocalDate;", "MIN") => {
+            return Some(host(
+                vm,
+                owner,
+                HostState::Millis(-365_961_662 * 86_400_000),
+            ));
+        }
+        ("Ljava/time/LocalDate;", "MAX") => {
+            return Some(host(vm, owner, HostState::Millis(365_241_723 * 86_400_000)));
+        }
+        ("Ljava/time/LocalDateTime;", "MIN") => {
+            return Some(host(
+                vm,
+                owner,
+                HostState::Millis(-365_961_662 * 86_400_000),
+            ));
+        }
+        ("Ljava/time/LocalDateTime;", "MAX") => {
+            return Some(host(
+                vm,
+                owner,
+                HostState::Millis(365_241_723 * 86_400_000 + 86_399_999),
+            ));
+        }
+        ("Ljava/time/LocalTime;", "MIN") => {
+            return Some(host(vm, owner, HostState::Millis(0)));
+        }
+        ("Ljava/time/LocalTime;", "MAX") => {
+            return Some(host(vm, owner, HostState::Millis(86_399_999)));
+        }
         ("Ljava/io/File;", "separator") => {
             return Some(jstr(vm, "/"));
         }
@@ -2317,9 +2353,13 @@ pub(crate) fn host_supers(d: &str) -> &'static [&'static str] {
         | "Ljava/time/MonthDay;"
         | "Ljava/time/ZoneId;"
         | "Ljava/time/ZoneOffset;"
-        | "Ljava/time/DayOfWeek;"
-        | "Ljava/time/Month;"
         | "Ljava/time/format/DateTimeFormatter;" => &[OBJ],
+        "Ljava/time/DayOfWeek;" | "Ljava/time/Month;" => &[
+            "Ljava/lang/Enum;",
+            "Ljava/lang/Comparable;",
+            "Ljava/io/Serializable;",
+            OBJ,
+        ],
         // ----- regex
         "Ljava/util/regex/Pattern;" => &["Ljava/io/Serializable;", OBJ],
         "Ljava/util/regex/Matcher;" => &["Ljava/util/regex/MatchResult;", OBJ],

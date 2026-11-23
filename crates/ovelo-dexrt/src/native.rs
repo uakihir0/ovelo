@@ -2153,6 +2153,61 @@ extern "C" fn sh_pvalloc(size: usize) -> *mut c_void {
     unsafe { malloc_zone_memalign(guest_zone(), PAGE, size.div_ceil(PAGE) * PAGE) }
 }
 
+/// Linux `mremap` — no Darwin equivalent; always behaves like
+/// MREMAP_MAYMOVE: fresh zone buffer, copy the live prefix, free old.
+/// Callers that mmap'd the old range get a heap block back — our own
+/// `free`/`realloc` shims handle it, and guest `munmap` is a stub below.
+#[cfg(target_os = "macos")]
+extern "C" fn sh_mremap(
+    old: *mut c_void,
+    old_size: usize,
+    new_size: usize,
+    _flags: i32,
+) -> *mut c_void {
+    let np = unsafe { malloc_zone_malloc(guest_zone(), new_size.max(1)) };
+    if np.is_null() {
+        return usize::MAX as *mut c_void; // MAP_FAILED
+    }
+    if !old.is_null() {
+        unsafe { std::ptr::copy_nonoverlapping(old, np, old_size.min(new_size)) };
+        sh_free(old);
+    }
+    np
+}
+
+/// Guest `mmap`/`munmap` for code paths that treat the result as a
+/// plain buffer (sqlite's shm/remap). `mmap` hands out a zone block —
+/// no file mapping; `munmap` frees it.
+#[cfg(target_os = "macos")]
+extern "C" fn sh_guest_mmap(
+    _addr: *mut c_void,
+    len: usize,
+    _prot: i32,
+    _flags: i32,
+    fd: i32,
+    _off: i64,
+) -> *mut c_void {
+    if fd >= 0 {
+        // File-backed mappings are not emulated — shared-memory
+        // consumers (sqlite WAL) fall back to heap when we fail.
+        return usize::MAX as *mut c_void;
+    }
+    let p = unsafe { malloc_zone_calloc(guest_zone(), 1, len.max(1)) };
+    if p.is_null() {
+        usize::MAX as *mut c_void
+    } else {
+        p
+    }
+}
+
+#[cfg(target_os = "macos")]
+extern "C" fn sh_guest_munmap(addr: *mut c_void, _len: usize) -> i32 {
+    if !addr.is_null() && addr as usize != usize::MAX {
+        sh_free(addr);
+    }
+    0
+}
+
 #[cfg(target_os = "macos")]
 extern "C" fn sh_posix_memalign(out: *mut *mut c_void, align: usize, size: usize) -> i32 {
     if out.is_null() || align < 8 || !align.is_power_of_two() {
@@ -2427,6 +2482,12 @@ fn builtin_shim(name: &str) -> Option<usize> {
         "valloc" => sh_valloc as *const () as usize,
         #[cfg(target_os = "macos")]
         "pvalloc" => sh_pvalloc as *const () as usize,
+        #[cfg(target_os = "macos")]
+        "mremap" => sh_mremap as *const () as usize,
+        #[cfg(target_os = "macos")]
+        "mmap" => sh_guest_mmap as *const () as usize,
+        #[cfg(target_os = "macos")]
+        "munmap" => sh_guest_munmap as *const () as usize,
         #[cfg(target_os = "macos")]
         "posix_memalign" => sh_posix_memalign as *const () as usize,
         #[cfg(target_os = "macos")]
