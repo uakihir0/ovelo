@@ -1540,8 +1540,18 @@ fn class_call(vm: &mut Vm, name: &str, _sig: &str, args: &[V]) -> Rt<Option<Opti
             )
             .unwrap_or_else(|| class_of(vm, args[0]));
             let base = dotted(&d);
-            let short = base.rsplit(['.', '$']).next().unwrap_or(&base).to_string();
-            Some(Some(jstr(vm, &short)))
+            // Member name per InnerClasses: the part after the last
+            // `$` — but when that last `$` is itself preceded by `$`
+            // (`Foo$$serializer`), the member's declared name keeps
+            // the leading `$`. kotlinx.serialization's fallback scans
+            // getDeclaredClasses for simpleName == "$serializer".
+            let after_pkg = base.rsplit('.').next().unwrap_or(&base);
+            let short = match after_pkg.rfind('$') {
+                Some(i) if i > 0 && after_pkg.as_bytes()[i - 1] == b'$' => &after_pkg[i - 1..],
+                Some(i) => &after_pkg[i + 1..],
+                None => after_pkg,
+            };
+            Some(Some(jstr(vm, short)))
         }
         "getPackageName" | "getPackage" => {
             let d = class_desc_of(
