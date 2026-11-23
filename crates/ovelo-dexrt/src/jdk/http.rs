@@ -660,16 +660,44 @@ fn coil_enqueue(vm: &mut Vm, a: &[V]) -> Result<Option<V>> {
 /// WebP) into a `BitmapDrawable` handed to the view.
 pub(crate) fn drain_coil(vm: &mut Vm) {
     let jobs = std::mem::take(&mut vm.coil_jobs);
+    if httpdbg() && !jobs.is_empty() {
+        eprintln!("[http] coil drain n={}", jobs.len());
+    }
     for (ticket, view) in jobs {
         let Some(res) = take_result(ticket) else {
             vm.coil_jobs.push((ticket, view));
             continue;
         };
-        let Ok(resp) = res else { continue };
+        let Ok(resp) = res else {
+            if httpdbg() {
+                eprintln!("[http] coil ticket={ticket} fetch err");
+            }
+            continue;
+        };
         if resp.code != 200 || resp.body.is_empty() {
+            if httpdbg() {
+                eprintln!(
+                    "[http] coil ticket={ticket} code={} bytes={}",
+                    resp.code,
+                    resp.body.len()
+                );
+            }
             continue;
         }
         let Ok(img) = image::load_from_memory(&resp.body) else {
+            if httpdbg() {
+                let enc = resp
+                    .headers
+                    .iter()
+                    .find(|(k, _)| k.eq_ignore_ascii_case("content-encoding"))
+                    .map(|(_, v)| v.clone())
+                    .unwrap_or_default();
+                eprintln!(
+                    "[http] coil ticket={ticket} decode fail {}B enc={enc} magic={:?}",
+                    resp.body.len(),
+                    &resp.body[..resp.body.len().min(12)]
+                );
+            }
             continue;
         };
         let rgba = img.to_rgba8();
@@ -689,10 +717,10 @@ pub(crate) fn drain_coil(vm: &mut Vm) {
         );
         if let V::Ref(dh) = d {
             super::pseudo_set(vm, dh, P_BITMAP_SLOT, V::Ref(bmp));
+            let r = vm.call_virtual(view, "setImageDrawable", &[V::Ref(dh)]);
             if httpdbg() {
-                eprintln!("[http] coil delivered ticket={ticket} -> view={view}");
+                eprintln!("[http] coil delivered ticket={ticket} view={view} r={r:?}");
             }
-            let _ = vm.call_virtual(view, "setImageDrawable", &[V::Ref(dh)]);
         }
     }
 }

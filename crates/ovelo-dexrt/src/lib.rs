@@ -1635,6 +1635,11 @@ impl Vm {
         // by its view-tree parent; once detached and unreferenced it is
         // collected and drain_runnables prunes the stale handle.
         roots.extend(self.db_handles.values().copied());
+        // Stopped services and coil delivery targets must survive until
+        // the drain runs their onDestroy / attaches the drawable —
+        // collecting either first silently drops the delivery.
+        roots.extend(self.pending_destroy.iter().copied());
+        roots.extend(self.coil_jobs.iter().map(|(_, v)| *v));
         // obj_db/throw_sites/unsafe_offsets are NOT rooted: entries whose
         // owner object is dead are pruned after the sweep instead, so the
         // registries can't grow forever or keep stale values alive.
@@ -1678,14 +1683,6 @@ impl Vm {
             return 0;
         }
         native::check_all_zones("drain");
-        // Host-side async deliveries that run before guest work:
-        // finished coil image fetches become drawables, and services
-        // that stopped since the last pass get their onDestroy here —
-        // not inline inside their own callback.
-        jdk::http::drain_coil(self);
-        for h in std::mem::take(&mut self.pending_destroy) {
-            let _ = self.call_virtual(h, "onDestroy", &[]);
-        }
         let now = jdk::now_ms() as u64;
         let (due, later): (Vec<_>, Vec<_>) = self
             .delayed_runnables
@@ -1696,6 +1693,16 @@ impl Vm {
             self.pending_runnables.push_back((r, on_main));
         }
         self.draining = true;
+        // Host-side async deliveries before guest work: finished coil
+        // image fetches become drawables, and services that stopped
+        // since the last pass get their onDestroy here — not inline
+        // inside their own callback. Runs AFTER the draining flag is
+        // set so a nested drain from a delivered callback early-returns
+        // instead of running an unbounded inner pass.
+        jdk::http::drain_coil(self);
+        for h in std::mem::take(&mut self.pending_destroy) {
+            let _ = self.call_virtual(h, "onDestroy", &[]);
+        }
         let mut ran = 0usize;
         let dbg = std::env::var_os("OVELO_DRAINDBG").is_some();
         for _ in 0..max {
