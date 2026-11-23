@@ -500,8 +500,13 @@ fn jtime_call(vm: &mut Vm, class: &str, name: &str, args: &[V]) -> Rt<Option<Opt
         }
         ("Ljava/time/Month;", "valueOf") => {
             let n = sv(vm, args.first().copied().unwrap_or(V::Ref(0))).unwrap_or_default();
-            let i = MONTH_NAMES.iter().position(|m| *m == n).unwrap_or(0) as i64;
-            Some(Some(month_obj(vm, i + 1)))
+            let Some(i) = MONTH_NAMES.iter().position(|m| *m == n) else {
+                return Err(vm.throw_builtin(
+                    "Ljava/lang/IllegalArgumentException;",
+                    &format!("No enum constant java.time.Month.{n}"),
+                ));
+            };
+            Some(Some(month_obj(vm, i as i64 + 1)))
         }
         ("Ljava/time/Month;", "plus" | "minus") => {
             let s = if name == "plus" { 1 } else { -1 };
@@ -521,8 +526,13 @@ fn jtime_call(vm: &mut Vm, class: &str, name: &str, args: &[V]) -> Rt<Option<Opt
         }
         ("Ljava/time/DayOfWeek;", "valueOf") => {
             let n = sv(vm, args.first().copied().unwrap_or(V::Ref(0))).unwrap_or_default();
-            let i = DAY_NAMES.iter().position(|d| *d == n).unwrap_or(0) as i64;
-            Some(Some(day_of_week_obj(vm, i + 1)))
+            let Some(i) = DAY_NAMES.iter().position(|d| *d == n) else {
+                return Err(vm.throw_builtin(
+                    "Ljava/lang/IllegalArgumentException;",
+                    &format!("No enum constant java.time.DayOfWeek.{n}"),
+                ));
+            };
+            Some(Some(day_of_week_obj(vm, i as i64 + 1)))
         }
         ("Ljava/time/DayOfWeek;", "plus" | "minus") => {
             let s = if name == "plus" { 1 } else { -1 };
@@ -574,6 +584,11 @@ fn jtime_call(vm: &mut Vm, class: &str, name: &str, args: &[V]) -> Rt<Option<Opt
         ("Ljava/time/LocalDate;", _) => localdate_call(vm, name, args)?,
         ("Ljava/time/LocalTime;", _) => localtime_call(vm, name, args)?,
         ("Ljava/time/LocalDateTime;", _) => localdatetime_call(vm, name, args)?,
+        ("Ljava/time/ZoneOffset;", "ofTotalSeconds") => Some(Some(host(
+            vm,
+            class,
+            HostState::Millis(i64v(args.first().copied().unwrap_or(V::I64(0))) * 1000),
+        ))),
         (_, "now") if class.contains("ZoneId") || class.contains("ZoneOffset") => {
             Some(Some(host(vm, class, HostState::StrBuf("UTC".into()))))
         }
@@ -676,6 +691,22 @@ fn ldate_days(ms: i64) -> i64 {
     ms.div_euclid(86_400_000)
 }
 
+/// Zone offset in ms carried by a ZoneId/ZoneOffset host object —
+/// offsets minted as `Millis` (ofTotalSeconds); named zones are UTC
+/// in this runtime so everything else reads as 0.
+fn zone_off_ms(vm: &Vm, v: V) -> i64 {
+    match v {
+        V::Ref(h) => match vm.heap.get(h) {
+            Some(Obj::Host {
+                state: HostState::Millis(o),
+                ..
+            }) => *o,
+            _ => 0,
+        },
+        _ => 0,
+    }
+}
+
 /// Days in a month (1-based) for a year.
 fn dim(y: i64, m: i64) -> i64 {
     let leap = y % 4 == 0 && (y % 100 != 0 || y % 400 == 0);
@@ -707,13 +738,17 @@ fn localdate_call(vm: &mut Vm, name: &str, args: &[V]) -> Rt<Option<Option<V>>> 
                 "Ljava/time/LocalDate;",
                 HostState::Millis(ldate_days(now_ms()) * 86_400_000),
             ))),
-            "ofInstant" => Some(Some(host(
-                vm,
-                "Ljava/time/LocalDate;",
-                HostState::Millis(
-                    ldate_days(millis_of(vm, *args.first().unwrap_or(&V::I64(0)))) * 86_400_000,
-                ),
-            ))),
+            "ofInstant" => {
+                // ofInstant(Instant, ZoneId) — apply the zone offset so
+                // dates near midnight land on the right day.
+                let ms = millis_of(vm, *args.first().unwrap_or(&V::I64(0)))
+                    + zone_off_ms(vm, args.get(1).copied().unwrap_or(V::I64(0)));
+                Some(Some(host(
+                    vm,
+                    "Ljava/time/LocalDate;",
+                    HostState::Millis(ldate_days(ms) * 86_400_000),
+                )))
+            }
             "of" => {
                 // of(year, month|Month, day) — month may be the enum.
                 let mv = match args.get(1) {
