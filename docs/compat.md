@@ -23,7 +23,7 @@ Legend:
 | Fossify Gallery | `org.fossify.gallery` | 🟡 | **Renders real data**: grid cell shows the actual "Pictures" folder with item count and a real decoded PNG thumbnail (Glide fetch→decode→transform→draw chain works) |
 | Fossify Music Player | `org.fossify.musicplayer` | 🟡 | **Renders real data**: MediaStore scan → Room DB (tracks/albums/artists tables populated) → tab bar + track list bound with real `Lfu4` rows ("All 3" tab) |
 | Fossify Voice Recorder | `org.fossify.voicerecorder` | 🟡 | Recorder page renders; SAF walk (`DocumentFile`/`DocumentsContract`) lists real recordings — list rows materialize on the Player tab |
-| Fossify Calendar | `org.fossify.calendar` | 🟡 | **Renders real data**: month grid draws 7-column day cells with real locale strings, today marker, month name |
+| Fossify Calendar | `org.fossify.calendar` | 🟢 | **Renders real data**: clean month grid — November title, Sun–Sat headers, day cells with today circled, next-month days greyed; lifecycle crash-free after obfuscated-ring list fix |
 | Fossify Clock | `org.fossify.clock` | 🟢 | **Renders real data**: clock page shows live time + date, tab bar (Clock/Alarm/Stopwatch/Timer); alarm list RecyclerViews are legitimately empty |
 | Fossify Messages | `org.fossify.messages` | 🟡 | Lifecycle completes to correct end state: "No stored conversations" empty state + FAB render (DB is empty) |
 | Fossify Paint | `org.fossify.paint` | 🟡 | Full lifecycle; toolbar + canvas render, brush strokes register (stroke position offset from touch point) |
