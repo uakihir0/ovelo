@@ -22,6 +22,9 @@ const P_VIEW_ID: u32 = u32::MAX - 7;
 const P_CHILDREN: u32 = u32::MAX - 8;
 const P_PARENT: u32 = u32::MAX - 9;
 const P_TAG: u32 = u32::MAX - 10;
+/// Bumped by `invalidate`/`postInvalidate` — the value is never read;
+/// the write exists to move `view_gen` so draw-only changes repaint.
+const P_INVALID_SEQ: u32 = u32::MAX - 49;
 /// Set while the view is attached to a window — `isAttachedToWindow`
 /// must report false before `onAttachedToWindow` actually fires
 /// (AbstractComposeView defers `ensureCompositionCreated` until it
@@ -2008,9 +2011,16 @@ pub(crate) fn call(
             Some(None)
         }
         "willNotDraw" => Some(Some(V::I32(0))),
-        "invalidate"
-        | "postInvalidate"
-        | "requestFocus"
+        "invalidate" | "postInvalidate" => {
+            // A draw-only change touches no layout/text field, but the
+            // host only re-records draw ops when `view_gen` moved —
+            // a dedicated sequence slot flips on every invalidate so
+            // the next traversal re-runs guest_draw_ops for this tree.
+            let n = pint(vm, this, P_INVALID_SEQ);
+            pseudo_set(vm, this, P_INVALID_SEQ, V::I32(n.wrapping_add(1)));
+            Some(None)
+        }
+        "requestFocus"
         | "clearFocus"
         | "setAlpha"
         | "setBackgroundColor"
