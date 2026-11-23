@@ -653,7 +653,9 @@ impl Vm {
         // throws NoClassDefFoundError (minSdk gating for post-release
         // platform APIs). On a real device the platform class wins, so
         // shadow the dex def the same way: treat it as not defined.
-        if desc.starts_with("Landroid/") {
+        // `android.support.*` is bundled library code (legacy support
+        // lib ships inside the app, not the platform) — never shadow it.
+        if desc.starts_with("Landroid/") && !desc.starts_with("Landroid/support/") {
             return None;
         }
         let &(di, i) = self.defs.get(&desc)?;
