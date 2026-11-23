@@ -4870,6 +4870,17 @@ impl Vm {
             0x44..=0x4a => {
                 let (h, i) = (Self::refv(r(1)?)?, Self::i32v(r(2)?)?);
                 let v = self.aget(h, i)?;
+                if std::env::var_os("OVELO_ARRDBG").is_some() {
+                    if let V::Ref(vh) = v {
+                        if let Some(Obj::Array { elem, data }) = self.heap.get(vh) {
+                            eprintln!(
+                                "[arrdbg] aget h{h}[{i}] -> array h{vh} elem={elem} len={} in {}",
+                                data.len(),
+                                self.describe_method(fr.loc.midx)
+                            );
+                        }
+                    }
+                }
                 set!(regs[0], v);
             }
             0x4b..=0x51 => {
@@ -4918,14 +4929,11 @@ impl Vm {
                                     Some(Obj::Array { elem, data }) => format!(
                                         "elem={elem} len={} e0={:?}",
                                         data.len(),
-                                        data.first()
-                                            .and_then(|v| match v {
-                                                V::Ref(eh) => self
-                                                    .heap
-                                                    .get(*eh)
-                                                    .map(std::mem::discriminant),
-                                                _ => None,
-                                            })
+                                        data.first().and_then(|v| match v {
+                                            V::Ref(eh) =>
+                                                self.heap.get(*eh).map(std::mem::discriminant),
+                                            _ => None,
+                                        })
                                     ),
                                     _ => "-".into(),
                                 }
