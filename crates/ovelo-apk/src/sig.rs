@@ -584,10 +584,51 @@ const OID_SIGNED_DATA: &[u8] = &[0x2a, 0x86, 0x48, 0x86, 0xf7, 0x0d, 0x01, 0x07,
 const OID_SHA1: &[u8] = &[0x2b, 0x0e, 0x03, 0x02, 0x1a];
 const OID_SHA256: &[u8] = &[0x60, 0x86, 0x48, 0x01, 0x65, 0x03, 0x04, 0x02, 0x01];
 const OID_SHA512: &[u8] = &[0x60, 0x86, 0x48, 0x01, 0x65, 0x03, 0x04, 0x02, 0x03];
+const OID_SHA384: &[u8] = &[0x60, 0x86, 0x48, 0x01, 0x65, 0x03, 0x04, 0x02, 0x02];
 const OID_RSA: &[u8] = &[0x2a, 0x86, 0x48, 0x86, 0xf7, 0x0d, 0x01, 0x01, 0x01];
 const OID_RSA_SHA1: &[u8] = &[0x2a, 0x86, 0x48, 0x86, 0xf7, 0x0d, 0x01, 0x01, 0x05];
 const OID_RSA_SHA256: &[u8] = &[0x2a, 0x86, 0x48, 0x86, 0xf7, 0x0d, 0x01, 0x01, 0x0b];
+const OID_RSA_SHA384: &[u8] = &[0x2a, 0x86, 0x48, 0x86, 0xf7, 0x0d, 0x01, 0x01, 0x0c];
 const OID_RSA_SHA512: &[u8] = &[0x2a, 0x86, 0x48, 0x86, 0xf7, 0x0d, 0x01, 0x01, 0x0d];
+const OID_MESSAGE_DIGEST: &[u8] = &[0x2a, 0x86, 0x48, 0x86, 0xf7, 0x0d, 0x01, 0x09, 0x04];
+
+fn sha384(b: &[u8]) -> Vec<u8> {
+    use sha2::Digest;
+    sha2::Sha384::digest(b).to_vec()
+}
+
+/// Hash `data` with the digest named by `oid` (SHA-1/256/384/512).
+fn digest_for_oid(oid: &[u8], data: &[u8]) -> Option<Vec<u8>> {
+    if oid == OID_SHA256 {
+        Some(sha256(data))
+    } else if oid == OID_SHA384 {
+        Some(sha384(data))
+    } else if oid == OID_SHA512 {
+        Some(sha512(data))
+    } else if oid == OID_SHA1 {
+        use sha1::Sha1;
+        Some(Sha1::digest(data).to_vec())
+    } else {
+        None
+    }
+}
+
+/// Hash `data` with the digest named by a manifest header
+/// ("SHA-256-Digest", "SHA1-Digest-Manifest", …).
+fn digest_for_name(k: &str, data: &[u8]) -> Option<Vec<u8>> {
+    if k.starts_with("SHA-256") {
+        Some(sha256(data))
+    } else if k.starts_with("SHA-384") {
+        Some(sha384(data))
+    } else if k.starts_with("SHA-512") {
+        Some(sha512(data))
+    } else if k.starts_with("SHA1") || k.starts_with("SHA-1") {
+        use sha1::Sha1;
+        Some(Sha1::digest(data).to_vec())
+    } else {
+        None
+    }
+}
 
 /// Split a manifest/.SF body into raw sections, each ending at (and
 /// including) the blank line that terminates it. A blank line is two
@@ -713,15 +754,16 @@ fn verify_v1_signer(
         .find(|x| x.0 == 0x31)
         .ok_or_else(|| sig_err("sig.v1.signerinfo.missing"))?;
     let cert_ctx = certs_ctx.ok_or_else(|| sig_err("sig.v1.certs.missing"))?;
-    // First cert inside the [0] certificates context.
-    let (ct, _cs0, ce0) = der_tlv(&block, cert_ctx.2)?;
-    if ct != 0x30 {
+    // Every certificate inside the [0] context — when a chain is present
+    // the signer's leaf may not be first, so verification tries each.
+    let cert_ders: Vec<(usize, usize)> = der_children(&block, cert_ctx.2, cert_ctx.3)?
+        .iter()
+        .filter(|x| x.0 == 0x30)
+        .map(|x| (x.1, x.3))
+        .collect();
+    if cert_ders.is_empty() {
         return Err(sig_err("sig.v1.cert"));
     }
-    let cert_der = &block[cert_ctx.2..ce0];
-    let (_, parsed) = x509_parser::prelude::X509Certificate::from_der(cert_der)
-        .map_err(|_| sig_err("sig.v1.cert.malformed"))?;
-    let spki = parsed.tbs_certificate.subject_pki.raw;
 
     // --- SignerInfo: version, sid, digestAlg, [0] attrs?, sigAlg, signature ---
     let si_children = der_children(&block, signer_infos_set.2, signer_infos_set.3)?;
@@ -733,15 +775,21 @@ fn verify_v1_signer(
         return Err(sig_err("sig.v1.signerinfo"));
     }
     let fields = der_children(&block, sis, sie)?;
-    if fields.len() < 4 {
+    // version, sid, digestAlgorithm, signatureAlgorithm and the signature
+    // value are all mandatory — a truncated SignerInfo is an error, not a
+    // panic.
+    if fields.len() < 5 {
         return Err(sig_err("sig.v1.signerinfo"));
     }
     let digest_oid = der_oid(&block, fields[2].2, fields[2].3)?;
-    let (signed_attrs, sig_alg_i, sig_i) = if fields.len() >= 6 && fields[3].0 == 0xa0 {
+    let (signed_attrs, sig_alg_i, sig_i) = if fields[3].0 == 0xa0 {
         (Some(&fields[3]), 4usize, 5usize)
     } else {
         (None, 3usize, 4usize)
     };
+    if fields.len() <= sig_i {
+        return Err(sig_err("sig.v1.signerinfo"));
+    }
     let sig_alg_oid = der_oid(&block, fields[sig_alg_i].2, fields[sig_alg_i].3)?;
     let signature = {
         let (t, ss, se) = der_tlv(&block, fields[sig_i].1)?;
@@ -761,10 +809,41 @@ fn verify_v1_signer(
         }
         None => sf.clone(),
     };
+    // With signedAttrs the signature alone proves nothing about the .SF:
+    // PKCS#7 requires a messageDigest attribute carrying the content
+    // digest — verify it covers the .SF bytes actually on disk, or an
+    // attacker could swap the .SF and keep the signature valid.
+    if let Some(f) = signed_attrs {
+        let mut want: Option<Vec<u8>> = None;
+        for a in der_children(&block, f.2, f.3)? {
+            if a.0 != 0x30 {
+                continue;
+            }
+            let parts = der_children(&block, a.2, a.3)?;
+            let Some(&(0x06, _ts, os, oe)) = parts.first() else {
+                continue;
+            };
+            if block[os..oe] != *OID_MESSAGE_DIGEST {
+                continue;
+            }
+            let Some(&(0x31, _ts, vs, ve)) = parts.get(1) else {
+                continue;
+            };
+            if let Some(&(0x04, _ts, cs, ce)) = der_children(&block, vs, ve)?.first() {
+                want = Some(block[cs..ce].to_vec());
+            }
+        }
+        let Some(want) = want else {
+            return Err(sig_err("sig.v1.md.missing"));
+        };
+        let got = digest_for_oid(&digest_oid, &sf).ok_or_else(|| sig_err("sig.v1.digest_alg"))?;
+        if got != want {
+            return Err(sig_err("sig.v1.md.mismatch"));
+        }
+    }
     use rsa::pkcs8::DecodePublicKey;
-    let key = rsa::RsaPublicKey::from_public_key_der(spki).map_err(|_| sig_err("sig.v1.key"))?;
     // Digest alg inside SignerInfo and the signature alg must agree.
-    let dig_ok = digest_oid == OID_SHA256 || digest_oid == OID_SHA1 || digest_oid == OID_SHA512;
+    let dig_ok = [OID_SHA256, OID_SHA384, OID_SHA1, OID_SHA512].contains(&digest_oid.as_slice());
     if !dig_ok {
         return Err(sig_err("sig.v1.digest_alg"));
     }
@@ -772,31 +851,56 @@ fn verify_v1_signer(
     // digestAlgorithm, per PKCS#1) or the explicit hashWithRSA OID.
     let rsa_ok = sig_alg_oid == OID_RSA
         || (sig_alg_oid == OID_RSA_SHA256 && digest_oid == OID_SHA256)
+        || (sig_alg_oid == OID_RSA_SHA384 && digest_oid == OID_SHA384)
         || (sig_alg_oid == OID_RSA_SHA1 && digest_oid == OID_SHA1)
         || (sig_alg_oid == OID_RSA_SHA512 && digest_oid == OID_SHA512);
     if !rsa_ok {
         return Err(sig_err("sig.v1.alg.unsupported"));
     }
-    let verified = if digest_oid == OID_SHA256 {
-        key.verify(rsa::Pkcs1v15Sign::new::<Sha256>(), &sha256(&msg), signature)
+    let verify_with = |spki: &[u8]| -> bool {
+        let Ok(key) = rsa::RsaPublicKey::from_public_key_der(spki) else {
+            return false;
+        };
+        if digest_oid == OID_SHA256 {
+            key.verify(rsa::Pkcs1v15Sign::new::<Sha256>(), &sha256(&msg), signature)
+                .is_ok()
+        } else if digest_oid == OID_SHA384 {
+            key.verify(
+                rsa::Pkcs1v15Sign::new::<sha2::Sha384>(),
+                &sha384(&msg),
+                signature,
+            )
             .is_ok()
-    } else if digest_oid == OID_SHA1 {
-        use sha1::Sha1;
-        key.verify(
-            rsa::Pkcs1v15Sign::new::<Sha1>(),
-            &Sha1::digest(&msg),
-            signature,
-        )
-        .is_ok()
-    } else if digest_oid == OID_SHA512 {
-        key.verify(rsa::Pkcs1v15Sign::new::<Sha512>(), &sha512(&msg), signature)
+        } else if digest_oid == OID_SHA1 {
+            use sha1::Sha1;
+            key.verify(
+                rsa::Pkcs1v15Sign::new::<Sha1>(),
+                &Sha1::digest(&msg),
+                signature,
+            )
             .is_ok()
-    } else {
-        return Err(sig_err("sig.v1.digest_alg"));
+        } else {
+            digest_oid == OID_SHA512
+                && key
+                    .verify(rsa::Pkcs1v15Sign::new::<Sha512>(), &sha512(&msg), signature)
+                    .is_ok()
+        }
     };
-    if !verified {
-        return Err(sig_err("sig.v1.verify.failed"));
-    }
+    // Try every certificate in the block — the signer's leaf may sit
+    // behind CA certs when a chain is embedded.
+    let cert_i = cert_ders
+        .iter()
+        .enumerate()
+        .find_map(|(i, &(cs, ce))| {
+            let (_, parsed) =
+                x509_parser::prelude::X509Certificate::from_der(&block[cs..ce]).ok()?;
+            verify_with(parsed.tbs_certificate.subject_pki.raw).then_some(i)
+        })
+        .ok_or_else(|| sig_err("sig.v1.verify.failed"))?;
+    let (cert_cs, cert_ce) = cert_ders[cert_i];
+    let cert_der = &block[cert_cs..cert_ce];
+    let (_, parsed) = x509_parser::prelude::X509Certificate::from_der(cert_der)
+        .map_err(|_| sig_err("sig.v1.cert.malformed"))?;
 
     // --- .SF → MANIFEST.MF digest chain ---
     let sf_sections = jar_sections(&sf);
@@ -811,14 +915,7 @@ fn verify_v1_signer(
         .collect::<Result<Vec<_>>>()?;
     let mut manifest_ok = false;
     for (k, want) in &whole_digests {
-        let got = if k.starts_with("SHA-256") {
-            sha256(manifest)
-        } else if k.starts_with("SHA-512") {
-            sha512(manifest)
-        } else if k.starts_with("SHA1") || k.starts_with("SHA-1") {
-            use sha1::Sha1;
-            Sha1::digest(manifest).to_vec()
-        } else {
+        let Some(got) = digest_for_name(k, manifest) else {
             continue;
         };
         if &got == want {
@@ -870,17 +967,9 @@ fn verify_v1_signer(
                 }
                 &manifest[ms..e2]
             };
-            let ok = [span_full, span_trim].iter().any(|sp| {
-                let g = if digest.0.starts_with("SHA-256") {
-                    sha256(sp)
-                } else if digest.0.starts_with("SHA-512") {
-                    sha512(sp)
-                } else {
-                    use sha1::Sha1;
-                    Sha1::digest(sp).to_vec()
-                };
-                g == want
-            });
+            let ok = [span_full, span_trim]
+                .iter()
+                .any(|sp| digest_for_name(&digest.0, sp).is_some_and(|g| g == want));
             if !ok {
                 return Err(sig_err("sig.v1.section.mismatch"));
             }
@@ -888,6 +977,26 @@ fn verify_v1_signer(
         }
         if checked == 0 {
             return Err(sig_err("sig.v1.sf.nothing"));
+        }
+        // Coverage runs both ways: every manifest section must also be
+        // authenticated by an .SF section, or entries added to the
+        // manifest after signing would slip through unsigned.
+        let sf_names: std::collections::HashSet<String> = sf_sections
+            .iter()
+            .flat_map(|(s, e)| jar_headers(&sf[*s..*e]))
+            .filter(|(k, _)| k == "Name")
+            .map(|(_, v)| v)
+            .collect();
+        for (s, e) in &mf_sections {
+            let has_name = jar_headers(&manifest[*s..*e])
+                .iter()
+                .any(|(k, v)| k == "Name" && sf_names.contains(v));
+            let is_main = !jar_headers(&manifest[*s..*e])
+                .iter()
+                .any(|(k, _)| k == "Name");
+            if !is_main && !has_name {
+                return Err(sig_err("sig.v1.section.uncovered"));
+            }
         }
     }
 
@@ -909,13 +1018,8 @@ fn verify_v1_signer(
         for (k, v) in hdrs.iter().filter(|(k, _)| k.ends_with("-Digest")) {
             let want = b64(v)?;
             let data = read_entry(bytes, entry)?;
-            let got = if k.starts_with("SHA-256") {
-                sha256(&data)
-            } else if k.starts_with("SHA-512") {
-                sha512(&data)
-            } else {
-                use sha1::Sha1;
-                Sha1::digest(&data).to_vec()
+            let Some(got) = digest_for_name(k, &data) else {
+                continue;
             };
             if got != want {
                 return Err(sig_err("sig.v1.entry.mismatch"));
@@ -987,6 +1091,21 @@ pub fn verify_v1(bytes: &[u8]) -> Result<Vec<SignerInfo>> {
         .collect();
     if sf_entries.is_empty() {
         return Err(sig_err("sig.v1.sf.missing"));
+    }
+    // An .SF whose main section declares `X-Android-APK-Signed: 2` was
+    // produced alongside a v2 signing block. Reaching v1 verification
+    // means that block was stripped — reject the downgrade.
+    for sf_e in &sf_entries {
+        let sf = read_entry(bytes, sf_e)?;
+        if let Some(&(s, e)) = jar_sections(&sf).first() {
+            for (k, v) in jar_headers(&sf[s..e]) {
+                if k.eq_ignore_ascii_case("X-Android-APK-Signed")
+                    && v.split(',').any(|t| t.trim() == "2")
+                {
+                    return Err(sig_err("sig.v1.downgrade"));
+                }
+            }
+        }
     }
     let mut infos = Vec::new();
     for sf_e in sf_entries {

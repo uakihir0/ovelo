@@ -36,6 +36,8 @@ Legend:
 | Tiny Weather Forecast Germany | `de.kaffeemitkoffein.tinyweatherforecastgermany` | 🟡 | `WelcomeActivity` renders to the window (first real APK first frame) |
 | NewPipe | `org.schabi.newpipe` | 🟢 | **Renders real data**: kiosk "Live" tab lists actual Innertube-fetched videos with titles/channels and real image thumbnails (host-bridged Coil3 `enqueue` → HTTP → WebP decode → `setImageDrawable`). Feed tab empty is expected without subscriptions |
 | F-Droid | `org.fdroid.fdroid` | 🟡 | Multi-dex + Hilt init runs without crashing; UI is Compose — no render path yet |
+| 2048 (AndStatus) | `org.andstatus.game2048` | 🟡 | Lifecycle completes (KorGE engine); GLSurfaceView opens but GLES2 pipeline is not implemented — blank window |
+| Snakes (drugi) | `red.drugi.snakes` | 🟡 | Lifecycle completes (Godot engine); host `Lifecycle` throwable on onCreate, blank GL window |
 
 ## Famous apps — assessment
 
@@ -60,7 +62,8 @@ by how much new work they imply.
 | Engine | Status | What's missing |
 |--------|--------|----------------|
 | libGDX | 🟡 | View-layer menu renders (Bouncy verified); GLES surface wiring (ANativeWindow → EGL) exists as object model, no live GL context yet |
-| Godot | ❌ | Same + native engine `.so` needs real JNI |
+| KorGE | 🟡 | Lifecycle completes (AndStatus 2048); needs GLES2 shaders/context |
+| Godot | 🟡 | Lifecycle completes (drugi snakes); needs GLES2 + engine `.so` JNI |
 | Unity | ❌ | Same + native engine `.so` needs real JNI |
 
 ## Methodology

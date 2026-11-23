@@ -3052,6 +3052,9 @@ pub(crate) fn host_supers(d: &str) -> &'static [&'static str] {
         | "Lorg/json/JSONTokener;"
         | "Lorg/json/JSONStringer;"
         | "Lorg/json/JSONObject$Null;" => &[OBJ],
+        // ----- android.window
+        "Landroid/window/OnBackAnimationCallback;" => &["Landroid/window/OnBackInvokedCallback;"],
+        "Landroid/window/OnBackInvokedCallback;" => &[OBJ],
         // ----- misc
         "Ldalvik/system/DexClassLoader;"
         | "Ldalvik/system/PathClassLoader;"
