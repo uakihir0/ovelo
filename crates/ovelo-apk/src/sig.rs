@@ -517,6 +517,484 @@ pub fn verify_v2(bytes: &[u8]) -> Result<Vec<SignerInfo>> {
     Ok(infos)
 }
 
+// ---- v1 (JAR) signature verification ----
+//
+// Chain of trust: the PKCS#7 block (META-INF/*.RSA) signs the .SF file,
+// .SF digests cover MANIFEST.MF sections, and per-entry digests in the
+// manifest cover each archive member.
+
+/// DER TLV reader — returns (tag, content_start, tlv_end).
+fn der_tlv(b: &[u8], pos: usize) -> Result<(u8, usize, usize)> {
+    if pos + 2 > b.len() {
+        return Err(sig_err("sig.v1.der.truncated"));
+    }
+    let tag = b[pos];
+    if tag & 0x1f == 0x1f {
+        // Multi-byte tags never appear in PKCS#7/X.509 — refuse.
+        return Err(sig_err("sig.v1.der.tag"));
+    }
+    let mut p = pos + 1;
+    let len0 = b[p] as usize;
+    p += 1;
+    let len = if len0 & 0x80 == 0 {
+        len0
+    } else {
+        let n = len0 & 0x7f;
+        if n == 0 || n > 4 || p + n > b.len() {
+            return Err(sig_err("sig.v1.der.len"));
+        }
+        let mut l = 0usize;
+        for i in 0..n {
+            l = (l << 8) | b[p + i] as usize;
+        }
+        p += n;
+        l
+    };
+    let end = p
+        .checked_add(len)
+        .filter(|e| *e <= b.len())
+        .ok_or_else(|| sig_err("sig.v1.der.bounds"))?;
+    Ok((tag, p, end))
+}
+
+/// Child elements of a constructed DER value: (tag, tlv_start, content_start, tlv_end).
+fn der_children(b: &[u8], start: usize, end: usize) -> Result<Vec<(u8, usize, usize, usize)>> {
+    let mut out = Vec::new();
+    let mut pos = start;
+    while pos < end {
+        let (tag, cs, te) = der_tlv(b, pos)?;
+        out.push((tag, pos, cs, te));
+        pos = te;
+    }
+    Ok(out)
+}
+
+/// OID bytes of an AlgorithmIdentifier/ContentInfo OID element.
+fn der_oid(b: &[u8], start: usize, end: usize) -> Result<Vec<u8>> {
+    let kids = der_children(b, start, end)?;
+    for (tag, _ts, cs, te) in &kids {
+        if *tag == 0x06 {
+            return Ok(b[*cs..*te].to_vec());
+        }
+    }
+    Err(sig_err("sig.v1.oid.missing"))
+}
+
+const OID_SIGNED_DATA: &[u8] = &[0x2a, 0x86, 0x48, 0x86, 0xf7, 0x0d, 0x01, 0x07, 0x02];
+const OID_SHA1: &[u8] = &[0x2b, 0x0e, 0x03, 0x02, 0x1a];
+const OID_SHA256: &[u8] = &[0x60, 0x86, 0x48, 0x01, 0x65, 0x03, 0x04, 0x02, 0x01];
+const OID_SHA512: &[u8] = &[0x60, 0x86, 0x48, 0x01, 0x65, 0x03, 0x04, 0x02, 0x03];
+const OID_RSA: &[u8] = &[0x2a, 0x86, 0x48, 0x86, 0xf7, 0x0d, 0x01, 0x01, 0x01];
+const OID_RSA_SHA1: &[u8] = &[0x2a, 0x86, 0x48, 0x86, 0xf7, 0x0d, 0x01, 0x01, 0x05];
+const OID_RSA_SHA256: &[u8] = &[0x2a, 0x86, 0x48, 0x86, 0xf7, 0x0d, 0x01, 0x01, 0x0b];
+const OID_RSA_SHA512: &[u8] = &[0x2a, 0x86, 0x48, 0x86, 0xf7, 0x0d, 0x01, 0x01, 0x0d];
+
+/// Split a manifest/.SF body into raw sections, each ending at (and
+/// including) the blank line that terminates it. A blank line is two
+/// consecutive line terminators (\r\n | \n | \r).
+fn jar_sections(b: &[u8]) -> Vec<(usize, usize)> {
+    let term = |b: &[u8], i: usize| -> usize {
+        if i + 1 < b.len() && b[i] == b'\r' && b[i + 1] == b'\n' {
+            2
+        } else if i < b.len() && (b[i] == b'\n' || b[i] == b'\r') {
+            1
+        } else {
+            0
+        }
+    };
+    let mut out = Vec::new();
+    let mut start = 0usize;
+    let mut i = 0usize;
+    while i < b.len() {
+        let t1 = term(b, i);
+        if t1 == 0 {
+            i += 1;
+            continue;
+        }
+        let j = i + t1;
+        let t2 = term(b, j);
+        if t2 > 0 {
+            let end = j + t2;
+            out.push((start, end));
+            start = end;
+            i = end;
+        } else {
+            i = j;
+        }
+    }
+    if start < b.len() {
+        out.push((start, b.len()));
+    }
+    out
+}
+
+/// Parse `Key: value` headers (with continuation lines starting ' ') of one
+/// manifest-style section.
+fn jar_headers(b: &[u8]) -> Vec<(String, String)> {
+    let mut out: Vec<(String, String)> = Vec::new();
+    for line in b.split(|&c| c == b'\n') {
+        let line = std::str::from_utf8(line).unwrap_or("");
+        let line = line.strip_suffix('\r').unwrap_or(line);
+        if line.is_empty() {
+            continue;
+        }
+        if let Some(cont) = line.strip_prefix(' ') {
+            if let Some((_, v)) = out.last_mut() {
+                v.push_str(cont);
+            }
+            continue;
+        }
+        if let Some((k, v)) = line.split_once(": ") {
+            out.push((k.to_string(), v.to_string()));
+        }
+    }
+    out
+}
+
+fn b64(s: &str) -> Result<Vec<u8>> {
+    use base64::Engine;
+    base64::engine::general_purpose::STANDARD
+        .decode(s.trim())
+        .map_err(|_| sig_err("sig.v1.b64"))
+}
+
+/// Verify one JAR signer: PKCS#7 block signs `sf`, .SF digests cover
+/// `manifest`, manifest digests cover every non-META-INF member.
+fn verify_v1_signer(
+    bytes: &[u8],
+    entries: &[crate::zip::CentralEntry],
+    manifest: &[u8],
+    sf_e: &crate::zip::CentralEntry,
+) -> Result<SignerInfo> {
+    use crate::zip::read_entry;
+    let sf = read_entry(bytes, sf_e)?;
+    let stem = &sf_e.name[..sf_e.name.len().saturating_sub(3)];
+    let block_e = entries
+        .iter()
+        .find(|e| {
+            let n = e.name.to_ascii_uppercase();
+            let stem_up = stem.to_ascii_uppercase();
+            n == format!("{stem_up}.RSA")
+                || n == format!("{stem_up}.DSA")
+                || n == format!("{stem_up}.EC")
+        })
+        .ok_or_else(|| sig_err("sig.v1.block.missing"))?;
+    let block = read_entry(bytes, block_e)?;
+
+    // --- PKCS#7: ContentInfo → [0] → SignedData ---
+    let (t, cs, ce) = der_tlv(&block, 0)?;
+    if t != 0x30 {
+        return Err(sig_err("sig.v1.pkcs7"));
+    }
+    let outer = der_children(&block, cs, ce)?;
+    // ContentInfo's first child is the content-type OID itself.
+    let oid = match outer.first() {
+        Some(&(0x06, _ts, os, oe)) => block[os..oe].to_vec(),
+        _ => return Err(sig_err("sig.v1.oid.missing")),
+    };
+    if oid != OID_SIGNED_DATA {
+        return Err(sig_err("sig.v1.not_signed_data"));
+    }
+    let sd = outer
+        .iter()
+        .find(|x| x.0 == 0xa0)
+        .ok_or_else(|| sig_err("sig.v1.content.missing"))?;
+    let (t, sds, sde) = der_tlv(&block, sd.2)?;
+    if t != 0x30 {
+        return Err(sig_err("sig.v1.pkcs7"));
+    }
+    let sd_children = der_children(&block, sds, sde)?;
+    let certs_ctx = sd_children.iter().find(|x| x.0 == 0xa0);
+    // Two SETs appear in SignedData — digestAlgorithms first, signerInfos
+    // last. Take the final one.
+    let signer_infos_set = sd_children
+        .iter()
+        .rev()
+        .find(|x| x.0 == 0x31)
+        .ok_or_else(|| sig_err("sig.v1.signerinfo.missing"))?;
+    let cert_ctx = certs_ctx.ok_or_else(|| sig_err("sig.v1.certs.missing"))?;
+    // First cert inside the [0] certificates context.
+    let (ct, _cs0, ce0) = der_tlv(&block, cert_ctx.2)?;
+    if ct != 0x30 {
+        return Err(sig_err("sig.v1.cert"));
+    }
+    let cert_der = &block[cert_ctx.2..ce0];
+    let (_, parsed) = x509_parser::prelude::X509Certificate::from_der(cert_der)
+        .map_err(|_| sig_err("sig.v1.cert.malformed"))?;
+    let spki = parsed.tbs_certificate.subject_pki.raw;
+
+    // --- SignerInfo: version, sid, digestAlg, [0] attrs?, sigAlg, signature ---
+    let si_children = der_children(&block, signer_infos_set.2, signer_infos_set.3)?;
+    let (t, sis, sie) = si_children
+        .first()
+        .map(|x| der_tlv(&block, x.1))
+        .ok_or_else(|| sig_err("sig.v1.signerinfo"))??;
+    if t != 0x30 {
+        return Err(sig_err("sig.v1.signerinfo"));
+    }
+    let fields = der_children(&block, sis, sie)?;
+    if fields.len() < 4 {
+        return Err(sig_err("sig.v1.signerinfo"));
+    }
+    let digest_oid = der_oid(&block, fields[2].2, fields[2].3)?;
+    let (signed_attrs, sig_alg_i, sig_i) = if fields.len() >= 6 && fields[3].0 == 0xa0 {
+        (Some(&fields[3]), 4usize, 5usize)
+    } else {
+        (None, 3usize, 4usize)
+    };
+    let sig_alg_oid = der_oid(&block, fields[sig_alg_i].2, fields[sig_alg_i].3)?;
+    let signature = {
+        let (t, ss, se) = der_tlv(&block, fields[sig_i].1)?;
+        if t != 0x04 {
+            return Err(sig_err("sig.v1.signature"));
+        }
+        &block[ss..se]
+    };
+
+    // Signed message: with signedAttrs the signature covers the DER SET OF
+    // attributes (tag swapped 0xa0 → 0x31); otherwise the raw .SF bytes.
+    let msg: Vec<u8> = match signed_attrs {
+        Some(f) => {
+            let mut m = block[f.1..f.3].to_vec();
+            m[0] = 0x31;
+            m
+        }
+        None => sf.clone(),
+    };
+    use rsa::pkcs8::DecodePublicKey;
+    let key = rsa::RsaPublicKey::from_public_key_der(spki).map_err(|_| sig_err("sig.v1.key"))?;
+    // Digest alg inside SignerInfo and the signature alg must agree.
+    let dig_ok = digest_oid == OID_SHA256 || digest_oid == OID_SHA1 || digest_oid == OID_SHA512;
+    if !dig_ok {
+        return Err(sig_err("sig.v1.digest_alg"));
+    }
+    // signatureAlgorithm is either rsaEncryption (digest picked from
+    // digestAlgorithm, per PKCS#1) or the explicit hashWithRSA OID.
+    let rsa_ok = sig_alg_oid == OID_RSA
+        || (sig_alg_oid == OID_RSA_SHA256 && digest_oid == OID_SHA256)
+        || (sig_alg_oid == OID_RSA_SHA1 && digest_oid == OID_SHA1)
+        || (sig_alg_oid == OID_RSA_SHA512 && digest_oid == OID_SHA512);
+    if !rsa_ok {
+        return Err(sig_err("sig.v1.alg.unsupported"));
+    }
+    let verified = if digest_oid == OID_SHA256 {
+        key.verify(rsa::Pkcs1v15Sign::new::<Sha256>(), &sha256(&msg), signature)
+            .is_ok()
+    } else if digest_oid == OID_SHA1 {
+        use sha1::Sha1;
+        key.verify(
+            rsa::Pkcs1v15Sign::new::<Sha1>(),
+            &Sha1::digest(&msg),
+            signature,
+        )
+        .is_ok()
+    } else if digest_oid == OID_SHA512 {
+        key.verify(rsa::Pkcs1v15Sign::new::<Sha512>(), &sha512(&msg), signature)
+            .is_ok()
+    } else {
+        return Err(sig_err("sig.v1.digest_alg"));
+    };
+    if !verified {
+        return Err(sig_err("sig.v1.verify.failed"));
+    }
+
+    // --- .SF → MANIFEST.MF digest chain ---
+    let sf_sections = jar_sections(&sf);
+    let main = sf_sections
+        .first()
+        .map(|(s, e)| jar_headers(&sf[*s..*e]))
+        .unwrap_or_default();
+    let whole_digests: Vec<(String, Vec<u8>)> = main
+        .iter()
+        .filter(|(k, _)| k.ends_with("-Digest-Manifest"))
+        .map(|(k, v)| Ok((k.clone(), b64(v)?)))
+        .collect::<Result<Vec<_>>>()?;
+    let mut manifest_ok = false;
+    for (k, want) in &whole_digests {
+        let got = if k.starts_with("SHA-256") {
+            sha256(manifest)
+        } else if k.starts_with("SHA-512") {
+            sha512(manifest)
+        } else if k.starts_with("SHA1") || k.starts_with("SHA-1") {
+            use sha1::Sha1;
+            Sha1::digest(manifest).to_vec()
+        } else {
+            continue;
+        };
+        if &got == want {
+            manifest_ok = true;
+            break;
+        }
+    }
+    if !manifest_ok && !whole_digests.is_empty() {
+        return Err(sig_err("sig.v1.manifest.mismatch"));
+    }
+    if whole_digests.is_empty() {
+        // Per-section digests: each `Name: <sec>` maps to the manifest
+        // section whose `Name:` header matches; the digested bytes are the
+        // manifest section verbatim (blank line included).
+        let mf_sections = jar_sections(manifest);
+        let mut checked = 0usize;
+        for (s, e) in &sf_sections {
+            let hdrs = jar_headers(&sf[*s..*e]);
+            let Some(name) = hdrs
+                .iter()
+                .find(|(k, _)| k == "Name")
+                .map(|(_, v)| v.clone())
+            else {
+                continue;
+            };
+            let Some(digest) = hdrs
+                .iter()
+                .find(|(k, _)| k.ends_with("-Digest"))
+                .map(|(k, v)| (k.clone(), v.clone()))
+            else {
+                continue;
+            };
+            let want = b64(&digest.1)?;
+            let mf_sec = mf_sections.iter().find(|(s, e)| {
+                jar_headers(&manifest[*s..*e])
+                    .iter()
+                    .any(|(k, v)| k == "Name" && *v == name)
+            });
+            let Some(&(ms, me)) = mf_sec else {
+                return Err(sig_err("sig.v1.section.missing"));
+            };
+            // JAR signers differ on whether the terminating blank line is
+            // inside the digested span — accept either byte range.
+            let span_full = &manifest[ms..me];
+            let span_trim = {
+                let mut e2 = me;
+                while e2 > ms && (manifest[e2 - 1] == b'\n' || manifest[e2 - 1] == b'\r') {
+                    e2 -= 1;
+                }
+                &manifest[ms..e2]
+            };
+            let ok = [span_full, span_trim].iter().any(|sp| {
+                let g = if digest.0.starts_with("SHA-256") {
+                    sha256(sp)
+                } else if digest.0.starts_with("SHA-512") {
+                    sha512(sp)
+                } else {
+                    use sha1::Sha1;
+                    Sha1::digest(sp).to_vec()
+                };
+                g == want
+            });
+            if !ok {
+                return Err(sig_err("sig.v1.section.mismatch"));
+            }
+            checked += 1;
+        }
+        if checked == 0 {
+            return Err(sig_err("sig.v1.sf.nothing"));
+        }
+    }
+
+    // --- Manifest per-entry digests → zip members ---
+    let mut files_checked = 0usize;
+    for (s, e) in jar_sections(manifest) {
+        let hdrs = jar_headers(&manifest[s..e]);
+        let Some(name) = hdrs
+            .iter()
+            .find(|(k, _)| k == "Name")
+            .map(|(_, v)| v.clone())
+        else {
+            continue;
+        };
+        let entry = entries.iter().find(|en| en.name == name);
+        let Some(entry) = entry else {
+            return Err(sig_err("sig.v1.entry.missing"));
+        };
+        for (k, v) in hdrs.iter().filter(|(k, _)| k.ends_with("-Digest")) {
+            let want = b64(v)?;
+            let data = read_entry(bytes, entry)?;
+            let got = if k.starts_with("SHA-256") {
+                sha256(&data)
+            } else if k.starts_with("SHA-512") {
+                sha512(&data)
+            } else {
+                use sha1::Sha1;
+                Sha1::digest(&data).to_vec()
+            };
+            if got != want {
+                return Err(sig_err("sig.v1.entry.mismatch"));
+            }
+            files_checked += 1;
+        }
+    }
+    // Every non-signature member must appear in the manifest.
+    let is_sig_meta = |n: &str| {
+        let u = n.to_ascii_uppercase();
+        u == "META-INF/MANIFEST.MF"
+            || (u.starts_with("META-INF/")
+                && (u.ends_with(".SF")
+                    || u.ends_with(".RSA")
+                    || u.ends_with(".DSA")
+                    || u.ends_with(".EC")))
+    };
+    let listed: std::collections::HashSet<String> = jar_sections(manifest)
+        .iter()
+        .flat_map(|(s, e)| jar_headers(&manifest[*s..*e]))
+        .filter(|(k, _)| k == "Name")
+        .map(|(_, v)| v)
+        .collect();
+    for en in entries {
+        if en.name.ends_with('/') || is_sig_meta(&en.name) {
+            continue;
+        }
+        if !listed.contains(&en.name) {
+            return Err(sig_err("sig.v1.entry.unlisted"));
+        }
+    }
+    if files_checked == 0 {
+        return Err(sig_err("sig.v1.manifest.nodigests"));
+    }
+
+    let subject = parsed
+        .tbs_certificate
+        .subject
+        .iter_common_name()
+        .next()
+        .and_then(|cn| cn.as_str().ok().map(|s| s.to_string()))
+        .unwrap_or_else(|| parsed.tbs_certificate.subject.to_string());
+    Ok(SignerInfo {
+        cert_sha256: sha256(cert_der)
+            .iter()
+            .map(|b| format!("{b:02x}"))
+            .collect(),
+        sig_alg: 0,
+        subject,
+    })
+}
+
+/// Verify an APK carrying only a v1 (JAR) signature — the fallback when no
+/// v2 signing block exists. Errors are `PkgSignature`.
+pub fn verify_v1(bytes: &[u8]) -> Result<Vec<SignerInfo>> {
+    use crate::zip::{parse_central_directory, read_entry, CentralEntry, ZipLimits};
+    let (_cd, entries) = parse_central_directory(bytes, &ZipLimits::default())?;
+    let is_meta = |e: &&CentralEntry| e.name.to_ascii_uppercase().starts_with("META-INF/");
+    let manifest_e = entries
+        .iter()
+        .find(|e| e.name.eq_ignore_ascii_case("META-INF/MANIFEST.MF"))
+        .ok_or_else(|| sig_err("sig.v1.manifest.missing"))?;
+    let manifest = read_entry(bytes, manifest_e)?;
+    let sf_entries: Vec<&CentralEntry> = entries
+        .iter()
+        .filter(|e| {
+            is_meta(e) && e.name.to_ascii_uppercase().ends_with(".SF") && !e.name.ends_with('/')
+        })
+        .collect();
+    if sf_entries.is_empty() {
+        return Err(sig_err("sig.v1.sf.missing"));
+    }
+    let mut infos = Vec::new();
+    for sf_e in sf_entries {
+        infos.push(verify_v1_signer(bytes, &entries, &manifest, sf_e)?);
+    }
+    Ok(infos)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

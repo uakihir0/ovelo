@@ -30,6 +30,7 @@ Legend:
 | Fossify Contacts | `org.fossify.contacts` | 🟡 | SplashActivity → MainActivity transition works; tab bar (Contacts/Favorites/Groups) + contact grid render — needs `invoke-static` superclass-chain resolution |
 | Fossify Documents | `org.fossify.documents` | 🟡 | Lifecycle completes; UI is Compose (`ViewTreeLifecycleOwner`) — no render path yet |
 | Fossify Home (launcher) | `org.fossify.home` | 🟢 | Renders correct end state: "No items found." empty grid on a clean install |
+| BMI Calculator | `com.github.characterdog.bmicalculator` | 🟡 | Lifecycle completes and the form renders (title/Weight/kg labels); v1-JAR-signed APK accepted by new `verify_v1` chain; layout rough |
 | Bouncy (pinball, libGDX) | `com.dozingcatsoftware.bouncy` | 🟡 | **Playable**: menu → table select → live pinball table with bumpers rendering; box2d `.so` physics runs via JNI. TLS self-heal in the segv handler patches kernel-rewritten TPIDR_EL0 per access (Darwin rewrites it at signal/exception boundaries). Text labels and ball rendering still rough |
 | Open Sudoku | `org.moire.opensudoku` | 🟢 | **Renders real data**: full 9×9 board drawn with given digits, pencil-mark notes and cell coloring; custom `View.onDraw` path works end to end |
 | Tiny Weather Forecast Germany | `de.kaffeemitkoffein.tinyweatherforecastgermany` | 🟡 | `WelcomeActivity` renders to the window (first real APK first frame) |

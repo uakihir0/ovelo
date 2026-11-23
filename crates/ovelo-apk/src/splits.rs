@@ -296,7 +296,10 @@ pub fn install_split_set(
 ) -> Result<InstallRecord> {
     let mut members_in = Vec::with_capacity(inputs.len());
     for (name, bytes) in inputs {
-        let signers = crate::sig::verify_v2(bytes)?;
+        let signers = crate::sig::verify_v2(bytes).or_else(|e| match e.cause() {
+            c if c == "sig.block.missing" || c == "sig.v2.absent" => crate::sig::verify_v1(bytes),
+            _ => Err(e),
+        })?;
         let mut hashes: Vec<&str> = signers.iter().map(|s| s.cert_sha256.as_str()).collect();
         hashes.sort_unstable();
         let signer = hashes.join("+");

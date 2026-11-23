@@ -15,7 +15,7 @@ pub mod zip;
 pub use arsc::{parse_arsc, ResourcePackage};
 pub use install::{AppId, InstallRecord, InstallStore, StoredSplit};
 pub use manifest::{parse_manifest, Element, ManifestInfo, Value};
-pub use sig::{has_v2_signature, has_v3_signature, verify_v2, SignerInfo};
+pub use sig::{has_v2_signature, has_v3_signature, verify_v1, verify_v2, SignerInfo};
 pub use splits::{
     install_split_set, resolve_splits, split_kind, validate_split_set, DeviceProfile, SplitInput,
     SplitKind, SplitMember,
@@ -102,10 +102,16 @@ pub fn inspect_apk(bytes: &[u8]) -> Result<ApkInfo> {
 
 /// Verify signature, then commit into `store` (§03 steps 3–5).
 ///
-/// Requires a v2 signature block; updates to the same package must carry the
-/// same signer fingerprint.
+/// v2 block verified when present, v1 (JAR) chain otherwise; updates to the
+/// same package must carry the same signer fingerprint.
 pub fn install_apk(store: &InstallStore, bytes: &[u8]) -> Result<InstallRecord> {
-    let signers = verify_v2(bytes)?;
+    // v2 block verified when present; otherwise fall back to the v1
+    // (JAR) signature chain — older F-Droid and side-loaded APKs carry
+    // only that.
+    let signers = verify_v2(bytes).or_else(|e| match e.cause() {
+        c if c == "sig.block.missing" || c == "sig.v2.absent" => verify_v1(bytes),
+        _ => Err(e),
+    })?;
     // Canonical fingerprint covers *every* signer: an update signed by a
     // strict subset of the original signer set must not pass `commit`.
     let mut hashes: Vec<&str> = signers.iter().map(|s| s.cert_sha256.as_str()).collect();
