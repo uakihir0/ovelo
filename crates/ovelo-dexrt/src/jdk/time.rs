@@ -618,7 +618,7 @@ fn jtime_call(vm: &mut Vm, class: &str, name: &str, args: &[V]) -> Rt<Option<Opt
                     a / 3600,
                     (a % 3600) / 60
                 );
-                if a % 60 != 0 {
+                if !a.is_multiple_of(60) {
                     format!("{base}:{:02}", a % 60)
                 } else {
                     base
