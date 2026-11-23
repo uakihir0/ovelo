@@ -28,6 +28,8 @@ Legend:
 | Fossify Messages | `org.fossify.messages` | 🟡 | Lifecycle completes to correct end state: "No stored conversations" empty state + FAB render (DB is empty) |
 | Fossify Paint | `org.fossify.paint` | 🟡 | Full lifecycle; toolbar + canvas render, brush strokes register (stroke position offset from touch point) |
 | Fossify Contacts | `org.fossify.contacts` | 🟡 | SplashActivity → MainActivity transition works; tab bar (Contacts/Favorites/Groups) + contact grid render — needs `invoke-static` superclass-chain resolution |
+| Fossify Documents | `org.fossify.documents` | 🟡 | Lifecycle completes; UI is Compose (`ViewTreeLifecycleOwner`) — no render path yet |
+| Fossify Home (launcher) | `org.fossify.home` | 🟢 | Renders correct end state: "No items found." empty grid on a clean install |
 | Bouncy (pinball, libGDX) | `com.dozingcatsoftware.bouncy` | 🟡 | **Playable**: menu → table select → live pinball table with bumpers rendering; box2d `.so` physics runs via JNI. TLS self-heal in the segv handler patches kernel-rewritten TPIDR_EL0 per access (Darwin rewrites it at signal/exception boundaries). Text labels and ball rendering still rough |
 | Open Sudoku | `org.moire.opensudoku` | 🟢 | **Renders real data**: full 9×9 board drawn with given digits, pencil-mark notes and cell coloring; custom `View.onDraw` path works end to end |
 | Tiny Weather Forecast Germany | `de.kaffeemitkoffein.tinyweatherforecastgermany` | 🟡 | `WelcomeActivity` renders to the window (first real APK first frame) |
