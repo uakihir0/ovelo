@@ -52,6 +52,7 @@ extern "C" {
     #[cfg(not(target_os = "macos"))]
     fn __errno_location() -> *mut i32;
     fn lseek(fd: i32, off: i64, whence: i32) -> i64;
+    fn read(fd: i32, buf: *mut c_void, n: usize) -> isize;
     #[cfg(target_os = "macos")]
     fn sys_icache_invalidate(start: *mut c_void, len: usize);
     #[cfg(target_os = "macos")]
@@ -1506,6 +1507,14 @@ extern "C" fn sh_memset_chk(d: *mut c_void, c: i32, n: usize, dlen: usize) -> *m
     }
     unsafe { memset(d, c, n) }
 }
+// `__read_chk(fd, buf, count, buf_size)` — real read when the request
+// fits the caller's declared buffer size.
+extern "C" fn sh_read_chk(fd: i32, buf: *mut c_void, n: usize, dlen: usize) -> isize {
+    if n > dlen {
+        sh_chk_fail();
+    }
+    unsafe { read(fd, buf, n) }
+}
 
 // dl_iterate_phdr: libunwind-style users (glide-webp's crash handler,
 // exception tables) walk the loaded objects' program headers. The shim
@@ -2532,6 +2541,7 @@ fn builtin_shim(name: &str) -> Option<usize> {
         "lseek64" => lseek as *const () as usize,
         "__memcpy_chk" => sh_memcpy_chk as *const () as usize,
         "__memset_chk" => sh_memset_chk as *const () as usize,
+        "__read_chk" => sh_read_chk as *const () as usize,
         "dl_iterate_phdr" => sh_dl_iterate_phdr as *const () as usize,
         "android_set_abort_message" => sh_set_abort_message as *const () as usize,
         "AndroidBitmap_getInfo" => sh_ab_get_info as *const () as usize,
