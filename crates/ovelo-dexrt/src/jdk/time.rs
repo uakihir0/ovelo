@@ -592,11 +592,40 @@ fn jtime_call(vm: &mut Vm, class: &str, name: &str, args: &[V]) -> Rt<Option<Opt
         ("Ljava/time/LocalDate;", _) => localdate_call(vm, name, args)?,
         ("Ljava/time/LocalTime;", _) => localtime_call(vm, name, args)?,
         ("Ljava/time/LocalDateTime;", _) => localdatetime_call(vm, name, args)?,
-        ("Ljava/time/ZoneOffset;", "ofTotalSeconds") => Some(Some(host(
-            vm,
-            class,
-            HostState::Millis(i64v(args.first().copied().unwrap_or(V::I64(0))) * 1000),
-        ))),
+        ("Ljava/time/ZoneOffset;", "ofTotalSeconds") => {
+            // JDK bounds the fixed offset to ±18h — out-of-range input
+            // throws DateTimeException rather than minting a fake zone.
+            let sec = i64v(args.first().copied().unwrap_or(V::I64(0)));
+            if sec.abs() > 18 * 3600 {
+                return Err(vm.throw_builtin(
+                    "Ljava/time/DateTimeException;",
+                    "Zone offset not in valid range: -18:00 to +18:00",
+                ));
+            }
+            Some(Some(host(vm, class, HostState::Millis(sec * 1000))))
+        }
+        // ISO-8601 offset id: Z, or ±HH:MM[:SS]. Apps persist this via
+        // getId() — the generic arm would render it as a date string.
+        ("Ljava/time/ZoneOffset;", "getId" | "toString") => {
+            let sec = millis_of(vm, args[0]) / 1000;
+            let s = if sec == 0 {
+                "Z".to_string()
+            } else {
+                let a = sec.unsigned_abs();
+                let base = format!(
+                    "{}{:02}:{:02}",
+                    if sec < 0 { "-" } else { "+" },
+                    a / 3600,
+                    (a % 3600) / 60
+                );
+                if a % 60 != 0 {
+                    format!("{base}:{:02}", a % 60)
+                } else {
+                    base
+                }
+            };
+            Some(Some(jstr(vm, &s)))
+        }
         (_, "now") if class.contains("ZoneId") || class.contains("ZoneOffset") => {
             Some(Some(host(vm, class, HostState::StrBuf("UTC".into()))))
         }
@@ -604,6 +633,19 @@ fn jtime_call(vm: &mut Vm, class: &str, name: &str, args: &[V]) -> Rt<Option<Opt
             if name == "toString" {
                 let ms = millis_of(vm, args[0]);
                 Some(Some(jstr(vm, &date_to_string(ms))))
+            } else if name == "getId" {
+                // ZoneId.getId returns the id text; named zones minted
+                // with StrBuf hand it back, others get a fresh host.
+                match args.first() {
+                    Some(V::Ref(h)) => match vm.heap.get(*h) {
+                        Some(Obj::Host {
+                            state: HostState::StrBuf(s),
+                            ..
+                        }) => Some(Some(jstr(vm, &s.clone()))),
+                        _ => Some(Some(host(vm, class, HostState::Empty))),
+                    },
+                    _ => Some(Some(host(vm, class, HostState::Empty))),
+                }
             } else {
                 Some(Some(host(vm, class, HostState::Empty)))
             }
