@@ -29,6 +29,8 @@ extern "C" {
     fn mprotect(addr: *mut c_void, len: usize, prot: i32) -> i32;
     fn munmap(addr: *mut c_void, len: usize) -> i32;
     fn dlsym(handle: *mut c_void, symbol: *const i8) -> *mut c_void;
+    #[cfg(target_os = "macos")]
+    fn dlopen(path: *const i8, mode: i32) -> *mut c_void;
     fn strlen(s: *const i8) -> usize;
     fn memcpy(d: *mut c_void, s: *const c_void, n: usize) -> *mut c_void;
     fn memset(d: *mut c_void, c: i32, n: usize) -> *mut c_void;
@@ -437,7 +439,9 @@ mod thunk {
     //   add  sp, sp, #192
     //   ret
     const SLOT: usize = 160;
-    const PAGE: usize = 0x10000;
+    // One thunk per resolved import — big .so trees (godot+libc++)
+    // need tens of thousands.
+    const PAGE: usize = 0x400000;
 
     /// Varargs-call spill stub: JNIEnv `Call*Method`/`NewObject` varargs
     /// entries receive args in x3-x7, d0-d7 and the caller stack. This
@@ -1210,9 +1214,29 @@ fn host_dlsym(name: &str) -> Option<usize> {
     // dlsym prepends the Mach-O '_' itself — pass the ELF name verbatim
     // (`_Znwm` resolves to `__Znwm`, `malloc` to `_malloc`).
     let c = CString::new(name).ok()?;
+    if name.starts_with("gl") {
+        ensure_gl_framework();
+    }
     let p = unsafe { dlsym(RTLD_DEFAULT, c.as_ptr()) };
     (!p.is_null()).then_some(p as usize)
 }
+
+/// Most GLES3 entry points exist with the same signature in macOS's
+/// OpenGL 4.1 driver. Loading the framework globally once lets the
+/// generic `host_dlsym` path satisfy `gl*` imports with real code.
+#[cfg(target_os = "macos")]
+fn ensure_gl_framework() {
+    static ONCE: OnceLock<()> = OnceLock::new();
+    ONCE.get_or_init(|| unsafe {
+        dlopen(
+            c"/System/Library/Frameworks/OpenGL.framework/OpenGL".as_ptr(),
+            2 | 8, // RTLD_NOW | RTLD_GLOBAL
+        );
+    });
+}
+
+#[cfg(not(target_os = "macos"))]
+fn ensure_gl_framework() {}
 
 /// Bionic/libc++-abi imports libSystem doesn't export under these
 /// names. Addresses are filled per-process where they need storage.
@@ -2376,6 +2400,13 @@ fn data_shim(name: &str) -> Option<usize> {
         "__cxa_terminate_handler" | "__cxa_unexpected_handler" | "__cxa_new_handler" => {
             Some(cxa_handler_cell(name))
         }
+        // Bionic `__sF` — array of 3 FILE* cells (stdin/out/err).
+        #[cfg(target_os = "macos")]
+        "__sF" => Some(sf_cells()),
+        // OpenSL interface IDs are `const SLInterfaceID` pointer
+        // variables (wilhelm/libOpenSLES.so exports).
+        #[cfg(target_os = "macos")]
+        _ if name.starts_with("SL_IID_") => sl_iid_guid(name).map(|g| sl_iid_cell(name, g)),
         _ => None,
     }
 }
@@ -2444,6 +2475,758 @@ fn ctype_table() -> usize {
 #[cfg(not(target_os = "macos"))]
 fn ctype_table() -> usize {
     0
+}
+
+// ---- OpenSL ES: IID data symbols + a minimal silent object model ----
+// Godot's libgodot_android.so links libOpenSLES at load time. The
+// exported `SL_IID_*` symbols are `const SLInterfaceID` pointer
+// variables — the guest reads a cell to get the GUID's address, so
+// each export is an 8-byte cell pointing at the 16-byte GUID.
+//
+// Objects are arrays of vtable pointers: obj[0] is &ObjectItf so
+// `(*obj)->Realize` works; GetInterface returns &obj[i] (a pointer to
+// the slot holding that interface's vtable). obj[-1] stores the state
+// key into SL_OBJS, which owns everything the C layout can't express.
+
+#[cfg(target_os = "macos")]
+const SL_NODE: [u8; 6] = [0x00, 0x02, 0xa5, 0xd5, 0xc5, 0x1b];
+
+#[cfg(target_os = "macos")]
+fn iid_bytes(lo: u32, mid: u16, hi: u16, cs: u16, node: [u8; 6]) -> [u8; 16] {
+    let mut b = [0u8; 16];
+    b[0..4].copy_from_slice(&lo.to_le_bytes());
+    b[4..6].copy_from_slice(&mid.to_le_bytes());
+    b[6..8].copy_from_slice(&hi.to_le_bytes());
+    b[8..10].copy_from_slice(&cs.to_le_bytes());
+    b[10..16].copy_from_slice(&node);
+    b
+}
+
+#[cfg(target_os = "macos")]
+fn sl_iid_guid(name: &str) -> Option<[u8; 16]> {
+    Some(match name {
+        "SL_IID_OBJECT" => iid_bytes(0x7921638f, 0xddd4, 0x11db, 0xa0e0, SL_NODE),
+        "SL_IID_ENGINE" => iid_bytes(0x8d97c260, 0xddd4, 0x11db, 0x958f, SL_NODE),
+        "SL_IID_PLAY" => iid_bytes(0xef0bd9c0, 0xddd7, 0x11db, 0xbf49, SL_NODE),
+        "SL_IID_RECORD" => iid_bytes(0xc5657aa0, 0xdddb, 0x11db, 0x82f7, SL_NODE),
+        "SL_IID_SEEK" => iid_bytes(0xd43135a0, 0xdddc, 0x11db, 0xb62b, SL_NODE),
+        "SL_IID_BUFFERQUEUE" => iid_bytes(0x2bc99cc0, 0xddd4, 0x11db, 0x8d99, SL_NODE),
+        "SL_IID_EFFECTSEND" => iid_bytes(0x56e7d200, 0xddd4, 0x11db, 0xaefb, SL_NODE),
+        "SL_IID_VOLUME" => iid_bytes(0xda9ee320, 0xddd4, 0x11db, 0x82f2, SL_NODE),
+        "SL_IID_ENVIRONMENTALREVERB" => iid_bytes(
+            0xc2e5d5f0,
+            0x94bd,
+            0x4763,
+            0x9cac,
+            [0x4e, 0x23, 0x4d, 0x06, 0x83, 0x9e],
+        ),
+        "SL_IID_ANDROIDCONFIGURATION" => iid_bytes(0x89f6a7e0, 0xbeac, 0x11df, 0x8b5c, SL_NODE),
+        "SL_IID_ANDROIDSIMPLEBUFFERQUEUE" => iid_bytes(0x198e4940, 0xc5d7, 0x11df, 0xa2a6, SL_NODE),
+        _ => return None,
+    })
+}
+
+#[cfg(target_os = "macos")]
+fn sl_iid_cell(name: &str, guid: [u8; 16]) -> usize {
+    static C: std::sync::LazyLock<Mutex<HashMap<String, usize>>> =
+        std::sync::LazyLock::new(|| Mutex::new(HashMap::new()));
+    let mut m = C.lock().unwrap();
+    if let Some(&a) = m.get(name) {
+        return a;
+    }
+    let a = unsafe {
+        let p = malloc_zone_calloc(guest_zone(), 24, 1) as *mut u64;
+        *p = (p as usize + 8) as u64; // cell -> GUID
+        core::ptr::copy_nonoverlapping(guid.as_ptr(), (p as usize + 8) as *mut u8, 16);
+        p as usize
+    };
+    m.insert(name.to_string(), a);
+    a
+}
+
+#[cfg(target_os = "macos")]
+const SL_RESULT_SUCCESS: usize = 0;
+#[cfg(target_os = "macos")]
+const SL_RESULT_FEATURE_UNSUPPORTED: usize = 0x11;
+#[cfg(target_os = "macos")]
+const SL_OBJECT_REALIZED: u32 = 3;
+#[cfg(target_os = "macos")]
+const SL_PLAYSTATE_STOPPED: u32 = 1;
+#[cfg(target_os = "macos")]
+const SL_PLAYSTATE_PLAYING: u32 = 3;
+
+#[cfg(target_os = "macos")]
+struct SlObj {
+    realized: bool,
+    play_state: u32,
+    ifaces: Vec<([u8; 16], usize)>, // (guid, &obj[slot])
+    bq_itf: usize,                  // the buffer-queue interface pointer
+    bq_cb: usize,
+    bq_ctx: usize,
+    bq_count: u32,
+    bq_index: u32,
+    destroyed: bool,
+}
+
+#[cfg(target_os = "macos")]
+static SL_OBJS: std::sync::LazyLock<Mutex<HashMap<usize, SlObj>>> =
+    std::sync::LazyLock::new(|| Mutex::new(HashMap::new()));
+
+#[cfg(target_os = "macos")]
+fn sl_vtable(entries: &[usize]) -> usize {
+    unsafe {
+        let p = malloc_zone_calloc(guest_zone(), entries.len(), 8) as *mut usize;
+        for (i, &e) in entries.iter().enumerate() {
+            *p.add(i) = e;
+        }
+        p as usize
+    }
+}
+
+#[cfg(target_os = "macos")]
+fn sl_obj_vt() -> usize {
+    static V: OnceLock<usize> = OnceLock::new();
+    *V.get_or_init(|| {
+        sl_vtable(&[
+            sh_sl_obj_realize as *const () as usize,
+            sh_sl_obj_realize as *const () as usize, // Resume
+            sh_sl_obj_get_state as *const () as usize,
+            sh_sl_obj_get_iface as *const () as usize,
+            sh_sl_ok2 as *const () as usize,  // RegisterCallback
+            sh_sl_void as *const () as usize, // AbortAsyncOperation
+            sh_sl_obj_destroy as *const () as usize,
+            sh_sl_ok2 as *const () as usize, // SetPriority
+            sh_sl_ok2 as *const () as usize, // GetPriority
+            sh_sl_ok2 as *const () as usize, // SetLossOfControlInterfaces
+        ])
+    })
+}
+
+#[cfg(target_os = "macos")]
+fn sl_engine_vt() -> usize {
+    static V: OnceLock<usize> = OnceLock::new();
+    *V.get_or_init(|| {
+        sl_vtable(&[
+            sh_sl_unsupported as *const () as usize, // CreateLEDDevice
+            sh_sl_unsupported as *const () as usize, // CreateVibraDevice
+            sh_sl_create_player as *const () as usize,
+            sh_sl_create_recorder as *const () as usize,
+            sh_sl_unsupported as *const () as usize, // CreateMidiPlayer
+            sh_sl_unsupported as *const () as usize, // CreateListener
+            sh_sl_unsupported as *const () as usize, // Create3DGroup
+            sh_sl_create_mix as *const () as usize,
+            sh_sl_unsupported as *const () as usize, // CreateMetadataExtractor
+            sh_sl_unsupported as *const () as usize, // CreateExtensionObject
+            sh_sl_unsupported as *const () as usize, // QueryNumSupportedInterfaces
+            sh_sl_unsupported as *const () as usize, // QuerySupportedInterfaces
+            sh_sl_unsupported as *const () as usize, // QueryNumSupportedExtensions
+            sh_sl_unsupported as *const () as usize, // QuerySupportedExtension
+        ])
+    })
+}
+
+#[cfg(target_os = "macos")]
+fn sl_play_vt() -> usize {
+    static V: OnceLock<usize> = OnceLock::new();
+    *V.get_or_init(|| {
+        sl_vtable(&[
+            sh_sl_set_play_state as *const () as usize,
+            sh_sl_get_play_state as *const () as usize,
+            sh_sl_get_duration as *const () as usize,
+            sh_sl_get_position as *const () as usize,
+            sh_sl_ok2 as *const () as usize, // RegisterCallback
+            sh_sl_ok2 as *const () as usize, // SetCallbackEventsMask
+            sh_sl_ok2 as *const () as usize, // GetCallbackEventsMask
+            sh_sl_ok2 as *const () as usize, // SetMarkerPosition
+            sh_sl_ok2 as *const () as usize, // ClearMarkerPosition
+            sh_sl_ok2 as *const () as usize, // GetMarkerPosition
+            sh_sl_ok2 as *const () as usize, // SetPositionUpdatePeriod
+            sh_sl_ok2 as *const () as usize, // GetPositionUpdatePeriod
+        ])
+    })
+}
+
+#[cfg(target_os = "macos")]
+fn sl_bq_vt() -> usize {
+    static V: OnceLock<usize> = OnceLock::new();
+    *V.get_or_init(|| {
+        sl_vtable(&[
+            sh_sl_bq_enqueue as *const () as usize,
+            sh_sl_bq_clear as *const () as usize,
+            sh_sl_bq_get_state as *const () as usize,
+            sh_sl_bq_register_cb as *const () as usize,
+        ])
+    })
+}
+
+#[cfg(target_os = "macos")]
+fn sl_volume_vt() -> usize {
+    static V: OnceLock<usize> = OnceLock::new();
+    *V.get_or_init(|| {
+        sl_vtable(&[
+            sh_sl_ok2 as *const () as usize,      // SetVolumeLevel
+            sh_sl_zero_out as *const () as usize, // GetVolumeLevel
+            sh_sl_zero_out as *const () as usize, // GetMaxVolumeLevel
+            sh_sl_ok2 as *const () as usize,      // SetMute
+            sh_sl_zero_out as *const () as usize, // GetMute
+            sh_sl_ok2 as *const () as usize,      // EnableStereoPosition
+            sh_sl_zero_out as *const () as usize, // IsEnabledStereoPosition
+            sh_sl_ok2 as *const () as usize,      // SetStereoPosition
+            sh_sl_zero_out as *const () as usize, // GetStereoPosition
+        ])
+    })
+}
+
+#[cfg(target_os = "macos")]
+fn sl_aconfig_vt() -> usize {
+    static V: OnceLock<usize> = OnceLock::new();
+    *V.get_or_init(|| {
+        sl_vtable(&[
+            sh_sl_ok2 as *const () as usize,         // SetConfiguration
+            sh_sl_unsupported as *const () as usize, // GetConfiguration
+            sh_sl_unsupported as *const () as usize, // AcquireJavaProxy
+            sh_sl_unsupported as *const () as usize, // ReleaseJavaProxy
+            sh_sl_unsupported as *const () as usize, // AcquireJavaVm
+            sh_sl_unsupported as *const () as usize, // ReleaseJavaVm
+            sh_sl_unsupported as *const () as usize, // AcquireBuildInfo
+            sh_sl_unsupported as *const () as usize, // ReleaseBuildInfo
+        ])
+    })
+}
+
+#[cfg(target_os = "macos")]
+fn sl_effectsend_vt() -> usize {
+    static V: OnceLock<usize> = OnceLock::new();
+    *V.get_or_init(|| {
+        sl_vtable(&[
+            sh_sl_ok2 as *const () as usize,      // EnableEffectSend
+            sh_sl_zero_out as *const () as usize, // IsEnabledEffectSend
+            sh_sl_ok2 as *const () as usize,      // SetDirectLevel
+            sh_sl_zero_out as *const () as usize, // GetDirectLevel
+        ])
+    })
+}
+
+/// Allocate a guest object: [state_key, &OBJ_VT, iface vtable ptrs...];
+/// returns &base[1] so (*obj) is the ObjectItf vtable.
+#[cfg(target_os = "macos")]
+fn sl_alloc_obj(iface_vts: &[(&str, usize)]) -> usize {
+    let n = iface_vts.len();
+    let base = unsafe { malloc_zone_calloc(guest_zone(), n + 2, 8) } as *mut usize;
+    let obj = unsafe { base.add(1) };
+    unsafe {
+        *base = obj as usize; // state key, mirrored by sl_obj()
+        *obj = sl_obj_vt();
+        for (i, &(_, vt)) in iface_vts.iter().enumerate() {
+            *obj.add(1 + i) = vt;
+        }
+    }
+    let mut ifaces = Vec::with_capacity(n);
+    for (i, &(name, _)) in iface_vts.iter().enumerate() {
+        if let Some(g) = sl_iid_guid(name) {
+            ifaces.push((g, unsafe { obj.add(1 + i) } as usize));
+        }
+    }
+    SL_OBJS.lock().unwrap().insert(
+        obj as usize,
+        SlObj {
+            realized: false,
+            play_state: SL_PLAYSTATE_STOPPED,
+            ifaces,
+            bq_itf: 0,
+            bq_cb: 0,
+            bq_ctx: 0,
+            bq_count: 0,
+            bq_index: 0,
+            destroyed: false,
+        },
+    );
+    obj as usize
+}
+
+/// Map an interface pointer (`&obj[i]`, or the object itself for
+/// ObjectItf calls) back to its SlObj entry — the state key sits at
+/// obj[-1] where `obj` is base+1.
+#[cfg(target_os = "macos")]
+fn sl_obj_key(iface_self: usize) -> usize {
+    // iface_self points into the slot array; the object base is
+    // somewhere below it. The slot at base+0 holds the object
+    // address itself, so walk back until *(p-1) == base.
+    unsafe {
+        let mut p = iface_self as *const usize;
+        for _ in 0..8 {
+            if *p.sub(1) == p as usize {
+                return p as usize;
+            }
+            p = p.sub(1);
+        }
+        0
+    }
+}
+
+#[cfg(target_os = "macos")]
+extern "C" fn sh_sl_ok2(_a: usize, _b: usize, _c: usize, _d: usize) -> usize {
+    SL_RESULT_SUCCESS
+}
+
+#[cfg(target_os = "macos")]
+extern "C" fn sh_sl_unsupported() -> usize {
+    SL_RESULT_FEATURE_UNSUPPORTED
+}
+
+#[cfg(target_os = "macos")]
+extern "C" fn sh_sl_void() {}
+
+#[cfg(target_os = "macos")]
+extern "C" fn sh_sl_zero_out(_s: usize, out: usize) -> usize {
+    unsafe { *(out as *mut u64) = 0 };
+    SL_RESULT_SUCCESS
+}
+
+#[cfg(target_os = "macos")]
+extern "C" fn sh_sl_obj_realize(self_: usize, _async: usize) -> usize {
+    let k = sl_obj_key(self_);
+    if let Some(o) = SL_OBJS.lock().unwrap().get_mut(&k) {
+        o.realized = true;
+        return SL_RESULT_SUCCESS;
+    }
+    SL_RESULT_FEATURE_UNSUPPORTED
+}
+
+#[cfg(target_os = "macos")]
+extern "C" fn sh_sl_obj_get_state(self_: usize, out: usize) -> usize {
+    let k = sl_obj_key(self_);
+    let st = SL_OBJS
+        .lock()
+        .unwrap()
+        .get(&k)
+        .map(|o| if o.realized { SL_OBJECT_REALIZED } else { 1 })
+        .unwrap_or(1);
+    unsafe { *(out as *mut u32) = st };
+    SL_RESULT_SUCCESS
+}
+
+#[cfg(target_os = "macos")]
+extern "C" fn sh_sl_obj_get_iface(self_: usize, iid: usize, out: usize) -> usize {
+    let k = sl_obj_key(self_);
+    let guid = unsafe { *(iid as *const [u8; 16]) };
+    let m = SL_OBJS.lock().unwrap();
+    if let Some(o) = m.get(&k) {
+        // SL_IID_OBJECT asks for the object itself.
+        if guid == sl_iid_guid("SL_IID_OBJECT").unwrap() {
+            unsafe { *(out as *mut usize) = k };
+            return SL_RESULT_SUCCESS;
+        }
+        for &(g, slot) in &o.ifaces {
+            if g == guid {
+                unsafe { *(out as *mut usize) = slot };
+                return SL_RESULT_SUCCESS;
+            }
+        }
+    }
+    SL_RESULT_FEATURE_UNSUPPORTED
+}
+
+#[cfg(target_os = "macos")]
+extern "C" fn sh_sl_obj_destroy(self_: usize) {
+    let k = sl_obj_key(self_);
+    if let Some(o) = SL_OBJS.lock().unwrap().get_mut(&k) {
+        o.destroyed = true;
+    }
+}
+
+#[cfg(target_os = "macos")]
+extern "C" fn sh_sl_create_engine(
+    out: usize,
+    _n_opts: usize,
+    _opts: usize,
+    _n_if: usize,
+    _iids: usize,
+    _req: usize,
+) -> usize {
+    let e = sl_alloc_obj(&[("SL_IID_ENGINE", sl_engine_vt())]);
+    unsafe { *(out as *mut usize) = e };
+    SL_RESULT_SUCCESS
+}
+
+#[cfg(target_os = "macos")]
+extern "C" fn sh_sl_create_mix(
+    _eng: usize,
+    out: usize,
+    _n_if: usize,
+    _iids: usize,
+    _req: usize,
+) -> usize {
+    let m = sl_alloc_obj(&[]);
+    unsafe { *(out as *mut usize) = m };
+    SL_RESULT_SUCCESS
+}
+
+#[cfg(target_os = "macos")]
+extern "C" fn sh_sl_create_player(
+    _eng: usize,
+    out: usize,
+    _src: usize,
+    _snk: usize,
+    _n_if: usize,
+    _iids: usize,
+    _req: usize,
+) -> usize {
+    let bq_slot_vt = sl_bq_vt();
+    let p = sl_alloc_obj(&[
+        ("SL_IID_PLAY", sl_play_vt()),
+        ("SL_IID_ANDROIDSIMPLEBUFFERQUEUE", bq_slot_vt),
+        ("SL_IID_VOLUME", sl_volume_vt()),
+        ("SL_IID_ANDROIDCONFIGURATION", sl_aconfig_vt()),
+        ("SL_IID_EFFECTSEND", sl_effectsend_vt()),
+    ]);
+    if let Some(o) = SL_OBJS.lock().unwrap().get_mut(&p) {
+        o.bq_itf = o
+            .ifaces
+            .iter()
+            .find(|(g, _)| *g == sl_iid_guid("SL_IID_ANDROIDSIMPLEBUFFERQUEUE").unwrap())
+            .map(|(_, s)| *s)
+            .unwrap_or(0);
+    }
+    unsafe { *(out as *mut usize) = p };
+    SL_RESULT_SUCCESS
+}
+
+#[cfg(target_os = "macos")]
+extern "C" fn sh_sl_create_recorder(
+    _eng: usize,
+    out: usize,
+    _src: usize,
+    _snk: usize,
+    _n_if: usize,
+    _iids: usize,
+    _req: usize,
+) -> usize {
+    let r = sl_alloc_obj(&[("SL_IID_RECORD", sl_bq_vt())]);
+    unsafe { *(out as *mut usize) = r };
+    SL_RESULT_SUCCESS
+}
+
+#[cfg(target_os = "macos")]
+extern "C" fn sh_sl_set_play_state(self_: usize, state: u32) -> usize {
+    let k = sl_obj_key(self_);
+    if let Some(o) = SL_OBJS.lock().unwrap().get_mut(&k) {
+        o.play_state = state;
+    }
+    SL_RESULT_SUCCESS
+}
+
+#[cfg(target_os = "macos")]
+extern "C" fn sh_sl_get_play_state(self_: usize, out: usize) -> usize {
+    let k = sl_obj_key(self_);
+    let s = SL_OBJS
+        .lock()
+        .unwrap()
+        .get(&k)
+        .map(|o| o.play_state)
+        .unwrap_or(SL_PLAYSTATE_STOPPED);
+    unsafe { *(out as *mut u32) = s };
+    SL_RESULT_SUCCESS
+}
+
+#[cfg(target_os = "macos")]
+extern "C" fn sh_sl_get_duration(_s: usize, out: usize) -> usize {
+    unsafe { *(out as *mut u32) = 0xFFFF_FFFF }; // SL_TIME_UNKNOWN
+    SL_RESULT_SUCCESS
+}
+
+#[cfg(target_os = "macos")]
+extern "C" fn sh_sl_get_position(self_: usize, out: usize) -> usize {
+    let k = sl_obj_key(self_);
+    let pos = SL_OBJS
+        .lock()
+        .unwrap()
+        .get(&k)
+        .map(|o| o.bq_index as u64 * 8)
+        .unwrap_or(0);
+    unsafe { *(out as *mut u64) = pos };
+    SL_RESULT_SUCCESS
+}
+
+#[cfg(target_os = "macos")]
+extern "C" fn sh_sl_bq_enqueue(self_: usize, _buf: usize, _size: u32) -> usize {
+    let k = sl_obj_key(self_);
+    if let Some(o) = SL_OBJS.lock().unwrap().get_mut(&k) {
+        o.bq_count = o.bq_count.saturating_add(1);
+    }
+    SL_RESULT_SUCCESS
+}
+
+#[cfg(target_os = "macos")]
+extern "C" fn sh_sl_bq_clear(self_: usize) -> usize {
+    let k = sl_obj_key(self_);
+    if let Some(o) = SL_OBJS.lock().unwrap().get_mut(&k) {
+        o.bq_count = 0;
+    }
+    SL_RESULT_SUCCESS
+}
+
+#[cfg(target_os = "macos")]
+extern "C" fn sh_sl_bq_get_state(self_: usize, out: usize) -> usize {
+    let k = sl_obj_key(self_);
+    let (c, i) = SL_OBJS
+        .lock()
+        .unwrap()
+        .get(&k)
+        .map(|o| (o.bq_count, o.bq_index))
+        .unwrap_or((0, 0));
+    unsafe {
+        *(out as *mut u32) = c;
+        *(out as *mut u32).add(1) = i;
+    }
+    SL_RESULT_SUCCESS
+}
+
+#[cfg(target_os = "macos")]
+extern "C" fn sh_sl_bq_register_cb(self_: usize, cb: usize, ctx: usize) -> usize {
+    let k = sl_obj_key(self_);
+    if let Some(o) = SL_OBJS.lock().unwrap().get_mut(&k) {
+        o.bq_cb = cb;
+        o.bq_ctx = ctx;
+    }
+    sl_start_pump();
+    SL_RESULT_SUCCESS
+}
+
+/// Silent sink: while a player is PLAYING, consume one queued buffer
+/// per tick and fire the registered callback, which is where Godot
+/// mixes and re-enqueues audio.
+#[cfg(target_os = "macos")]
+fn sl_start_pump() {
+    static ONCE: OnceLock<()> = OnceLock::new();
+    ONCE.get_or_init(|| {
+        std::thread::spawn(|| loop {
+            std::thread::sleep(std::time::Duration::from_millis(10));
+            let calls: Vec<(usize, usize, usize)> = {
+                let mut m = SL_OBJS.lock().unwrap();
+                m.values_mut()
+                    .filter(|o| {
+                        !o.destroyed
+                            && o.play_state == SL_PLAYSTATE_PLAYING
+                            && o.bq_cb != 0
+                            && o.bq_count > 0
+                    })
+                    .map(|o| {
+                        o.bq_count -= 1;
+                        o.bq_index = o.bq_index.wrapping_add(1);
+                        (o.bq_cb, o.bq_itf, o.bq_ctx)
+                    })
+                    .collect()
+            };
+            for (cb, itf, ctx) in calls {
+                let f: extern "C" fn(usize, usize) = unsafe { std::mem::transmute(cb) };
+                with_guest_tls_at("sl_pump", || f(itf, ctx));
+            }
+        });
+    });
+}
+
+// ---- NDK miscellany: AAsset, ANativeWindow, cxa-abi helpers ----
+
+/// Raw pointer to the running app's ApkResources — set when a native
+/// library loads for it. The Vm owns it and outlives loaded code.
+static APK_RES_PTR: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
+pub(crate) fn set_apk_reader(p: usize) {
+    APK_RES_PTR.store(p, std::sync::atomic::Ordering::Release);
+}
+
+fn apk_read(path: &str) -> Option<Vec<u8>> {
+    let p =
+        APK_RES_PTR.load(std::sync::atomic::Ordering::Acquire) as *const crate::res::ApkResources;
+    if p.is_null() {
+        return None;
+    }
+    unsafe { (*p).read(path) }
+}
+
+#[cfg(target_os = "macos")]
+type AssetMap = Mutex<HashMap<usize, (Vec<u8>, usize)>>;
+static AASSETS: std::sync::LazyLock<AssetMap> =
+    std::sync::LazyLock::new(|| Mutex::new(HashMap::new()));
+
+#[cfg(target_os = "macos")]
+extern "C" fn sh_asset_mgr_from_java(_env: usize, _mgr: usize) -> usize {
+    1
+}
+
+#[cfg(target_os = "macos")]
+extern "C" fn sh_asset_open(_mgr: usize, name: usize, _mode: i32) -> usize {
+    let n = crate::jni::cstr_ro(name as u64);
+    let data = apk_read(&n)
+        .or_else(|| apk_read(&format!("assets/{n}")))
+        .or_else(|| apk_read(&format!("assets/{}", n.trim_start_matches('/'))));
+    let Some(data) = data else { return 0 };
+    let mut m = AASSETS.lock().unwrap();
+    let token = m.keys().max().unwrap_or(&0) + 1;
+    m.insert(token, (data, 0));
+    token
+}
+
+#[cfg(target_os = "macos")]
+extern "C" fn sh_asset_read(asset: usize, buf: usize, count: usize) -> isize {
+    let mut m = AASSETS.lock().unwrap();
+    let Some((data, off)) = m.get_mut(&asset) else {
+        return -1;
+    };
+    let n = count.min(data.len().saturating_sub(*off));
+    unsafe { std::ptr::copy_nonoverlapping(data.as_ptr().add(*off), buf as *mut u8, n) };
+    *off += n;
+    n as isize
+}
+
+#[cfg(target_os = "macos")]
+extern "C" fn sh_asset_len(asset: usize) -> i64 {
+    AASSETS
+        .lock()
+        .unwrap()
+        .get(&asset)
+        .map(|(d, _)| d.len() as i64)
+        .unwrap_or(-1)
+}
+
+#[cfg(target_os = "macos")]
+extern "C" fn sh_asset_seek(asset: usize, offset: i64, whence: i32) -> i64 {
+    let mut m = AASSETS.lock().unwrap();
+    let Some((data, off)) = m.get_mut(&asset) else {
+        return -1;
+    };
+    let new = match whence {
+        0 => offset,                     // SEEK_SET
+        1 => *off as i64 + offset,       // SEEK_CUR
+        2 => data.len() as i64 + offset, // SEEK_END
+        _ => -1,
+    };
+    if new < 0 || new > data.len() as i64 {
+        return -1;
+    }
+    *off = new as usize;
+    new
+}
+
+#[cfg(target_os = "macos")]
+extern "C" fn sh_asset_close(asset: usize) {
+    AASSETS.lock().unwrap().remove(&asset);
+}
+
+#[cfg(target_os = "macos")]
+extern "C" fn sh_native_window_from_surface(_env: usize, _surf: usize) -> usize {
+    // A token — guests only test it for null before handing it to EGL.
+    1
+}
+
+#[cfg(target_os = "macos")]
+extern "C" fn sh_egl_current(_d: usize) -> usize {
+    0
+}
+
+#[cfg(target_os = "macos")]
+extern "C" fn sh_egl_get_proc(name: usize) -> usize {
+    let n = crate::jni::cstr_ro(name as u64);
+    builtin_shim(&n).or_else(|| host_dlsym(&n)).unwrap_or(0)
+}
+
+#[cfg(target_os = "macos")]
+extern "C" fn sh_void_n(_a: usize, _b: usize, _c: usize, _d: usize) {}
+
+#[cfg(target_os = "macos")]
+extern "C" fn sh_cxa_guard_acquire(g: usize) -> usize {
+    (unsafe { *(g as *const u8) } == 0) as usize
+}
+
+#[cfg(target_os = "macos")]
+extern "C" fn sh_cxa_guard_release(g: usize) {
+    unsafe { *(g as *mut u8) = 1 };
+}
+
+#[cfg(target_os = "macos")]
+extern "C" fn sh_cxa_thread_atexit(_f: usize, _a: usize, _d: usize) -> usize {
+    0
+}
+
+/// `__dynamic_cast(src, src_type, dst_type, src2dst_offset)` — return
+/// the source pointer, right for the identity/upcast cases Godot uses.
+#[cfg(target_os = "macos")]
+extern "C" fn sh_dynamic_cast(src: usize, _a: usize, _b: usize, _c: usize) -> usize {
+    src
+}
+
+/// Bionic `__sF` — guests declare `extern FILE* __sF[]` and index it
+/// for stdin/stdout/stderr. Three cells holding the real Darwin FILEs.
+#[cfg(target_os = "macos")]
+fn sf_cells() -> usize {
+    static A: OnceLock<usize> = OnceLock::new();
+    *A.get_or_init(|| unsafe {
+        let p = malloc_zone_calloc(guest_zone(), 3, 8) as *mut usize;
+        for (i, n) in ["__stdinp", "__stdoutp", "__stderrp"].iter().enumerate() {
+            if let Some(a) = host_dlsym(n) {
+                *p.add(i) = *(a as *const usize);
+            }
+        }
+        p as usize
+    })
+}
+
+/// `__FD_SET_chk(fd, set, set_size)` — FORTIFY-bound-checked FD_SET.
+#[cfg(target_os = "macos")]
+extern "C" fn sh_fd_set_chk(fd: i32, set: usize, _set_size: usize) {
+    if !(0..1024).contains(&fd) {
+        sh_chk_fail();
+    }
+    unsafe { *(set as *mut u64).add(fd as usize / 64) |= 1u64 << (fd as usize % 64) };
+}
+
+#[cfg(target_os = "macos")]
+extern "C" fn sh_setname(_t: usize, _name: usize) -> usize {
+    0
+}
+
+/// `__emutls_get_address(struct __emutls_control*)` — Bionic's emulated
+/// TLS for `__thread` in libs built without native TLS. One guest-zone
+/// cell per (control, thread), lazily allocated + initialized.
+#[cfg(target_os = "macos")]
+extern "C" fn sh_emutls_addr(ctrl: usize) -> usize {
+    static EMU: std::sync::LazyLock<Mutex<HashMap<(usize, u64), usize>>> =
+        std::sync::LazyLock::new(|| Mutex::new(HashMap::new()));
+    let tid = unsafe { mach_thread_id() };
+    let key = (ctrl, tid);
+    let mut m = EMU.lock().unwrap();
+    if let Some(&a) = m.get(&key) {
+        return a;
+    }
+    let (size, init) = unsafe { (*(ctrl as *const usize), *(ctrl as *const usize).add(3)) };
+    let a = unsafe { malloc_zone_calloc(guest_zone(), size.max(1), 1) } as usize;
+    if init != 0 {
+        unsafe {
+            std::ptr::copy_nonoverlapping(init as *const u8, a as *mut u8, size.min(1 << 20))
+        };
+    }
+    m.insert(key, a);
+    a
+}
+
+/// glClearDepthf/glDepthRangef — ES names for the desktop-GL doubles.
+#[cfg(target_os = "macos")]
+extern "C" fn sh_gl_clear_depthf(d: f32) {
+    ensure_gl_framework();
+    type F = unsafe extern "C" fn(f64);
+    if let Some(p) = host_dlsym("glClearDepth") {
+        unsafe { std::mem::transmute::<usize, F>(p)(d as f64) };
+    }
+}
+
+#[cfg(target_os = "macos")]
+extern "C" fn sh_gl_depth_rangef(n: f32, f: f32) {
+    ensure_gl_framework();
+    type F = unsafe extern "C" fn(f64, f64);
+    if let Some(p) = host_dlsym("glDepthRanged") {
+        unsafe { std::mem::transmute::<usize, F>(p)(n as f64, f as f64) };
+    }
 }
 
 fn builtin_shim(name: &str) -> Option<usize> {
@@ -2542,6 +3325,51 @@ fn builtin_shim(name: &str) -> Option<usize> {
         "__memcpy_chk" => sh_memcpy_chk as *const () as usize,
         "__memset_chk" => sh_memset_chk as *const () as usize,
         "__read_chk" => sh_read_chk as *const () as usize,
+        #[cfg(target_os = "macos")]
+        "slCreateEngine" => sh_sl_create_engine as *const () as usize,
+        #[cfg(target_os = "macos")]
+        "AAssetManager_fromJava" => sh_asset_mgr_from_java as *const () as usize,
+        #[cfg(target_os = "macos")]
+        "AAssetManager_open" => sh_asset_open as *const () as usize,
+        #[cfg(target_os = "macos")]
+        "AAsset_read" => sh_asset_read as *const () as usize,
+        #[cfg(target_os = "macos")]
+        "AAsset_getLength" | "AAsset_getLength64" => sh_asset_len as *const () as usize,
+        #[cfg(target_os = "macos")]
+        "AAsset_seek" | "AAsset_seek64" => sh_asset_seek as *const () as usize,
+        #[cfg(target_os = "macos")]
+        "AAsset_close" => sh_asset_close as *const () as usize,
+        #[cfg(target_os = "macos")]
+        "ANativeWindow_fromSurface" => sh_native_window_from_surface as *const () as usize,
+        #[cfg(target_os = "macos")]
+        "eglGetCurrentContext" | "eglGetCurrentDisplay" | "eglGetCurrentSurface" => {
+            sh_egl_current as *const () as usize
+        }
+        #[cfg(target_os = "macos")]
+        "eglGetProcAddress" => sh_egl_get_proc as *const () as usize,
+        #[cfg(target_os = "macos")]
+        "glClearDepthf" => sh_gl_clear_depthf as *const () as usize,
+        #[cfg(target_os = "macos")]
+        "glDepthRangef" => sh_gl_depth_rangef as *const () as usize,
+        #[cfg(target_os = "macos")]
+        "ZSTD_trace_compress_begin"
+        | "ZSTD_trace_compress_end"
+        | "ZSTD_trace_decompress_begin"
+        | "ZSTD_trace_decompress_end" => sh_void_n as *const () as usize,
+        #[cfg(target_os = "macos")]
+        "__cxa_guard_acquire" => sh_cxa_guard_acquire as *const () as usize,
+        #[cfg(target_os = "macos")]
+        "__cxa_guard_release" => sh_cxa_guard_release as *const () as usize,
+        #[cfg(target_os = "macos")]
+        "__cxa_thread_atexit" => sh_cxa_thread_atexit as *const () as usize,
+        #[cfg(target_os = "macos")]
+        "__dynamic_cast" => sh_dynamic_cast as *const () as usize,
+        #[cfg(target_os = "macos")]
+        "__FD_SET_chk" => sh_fd_set_chk as *const () as usize,
+        #[cfg(target_os = "macos")]
+        "pthread_gettid_np" => sh_gettid as *const () as usize,
+        #[cfg(target_os = "macos")]
+        "pthread_setname_np" => sh_setname as *const () as usize,
         "dl_iterate_phdr" => sh_dl_iterate_phdr as *const () as usize,
         "android_set_abort_message" => sh_set_abort_message as *const () as usize,
         "AndroidBitmap_getInfo" => sh_ab_get_info as *const () as usize,
@@ -2549,7 +3377,8 @@ fn builtin_shim(name: &str) -> Option<usize> {
         "AndroidBitmap_unlockPixels" => sh_ab_unlock_pixels as *const () as usize,
         "__android_log_print" | "__android_log_vprint" => sh_log_print as *const () as usize,
         "__android_log_write" => sh_log_write as *const () as usize,
-        "__emutls_get_address" => 0, // TLS unimplemented — signal caller
+        #[cfg(target_os = "macos")]
+        "__emutls_get_address" => sh_emutls_addr as *const () as usize,
         _ => return None,
     })
     .filter(|&a| a != 0)
@@ -2793,6 +3622,7 @@ struct MappedLib {
     lo: u64,
     d: Dyn,
     segs: Vec<(usize, usize, u32)>,
+    relro: Option<(u64, u64)>,
     exports: HashMap<String, usize>,
     /// Raw program-header bytes (for `dl_iterate_phdr`) + count.
     phdrs: Vec<u8>,
@@ -2819,6 +3649,7 @@ fn map_so(elf: &[u8]) -> Result<MappedLib> {
     let mut lo = u64::MAX;
     let mut hi = 0u64;
     let mut dyn_off = 0usize;
+    let mut relro: Option<(u64, u64)> = None;
     for i in 0..phnum {
         let p = phoff + i * phentsize;
         if p + 56 > elf.len() {
@@ -2831,6 +3662,12 @@ fn map_so(elf: &[u8]) -> Result<MappedLib> {
                 hi = hi.max(va + rd64(elf, p + 40));
             }
             PT_DYNAMIC => dyn_off = rd64(elf, p + 8) as usize,
+            // PT_GNU_RELRO: region mprotect'd read-only after
+            // relocation on Android too — honoring it also splits the
+            // RWX boundary page macOS would reject.
+            0x6474_e552 => {
+                relro = Some((rd64(elf, p + 16), rd64(elf, p + 40)));
+            }
             _ => {}
         }
     }
@@ -3003,6 +3840,7 @@ fn map_so(elf: &[u8]) -> Result<MappedLib> {
         lo,
         d,
         segs,
+        relro,
         exports,
         phdrs,
         phnum,
@@ -3023,6 +3861,7 @@ fn finish_so(m: MappedLib, name: &str) -> Result<(NativeLib, Vec<usize>)> {
     let lo = m.lo;
     let d = &m.d;
     let segs = &m.segs;
+    let relro = m.relro;
     let exports = &m.exports;
     let map_end = map as usize + span;
     // A raw guest-vaddr-derived pointer is legal only inside the
@@ -3175,23 +4014,52 @@ fn finish_so(m: MappedLib, name: &str) -> Result<(NativeLib, Vec<usize>)> {
             *p |= prot;
         }
     }
+    // PT_GNU_RELRO: pages fully inside the region lose WRITE (the
+    // boundary page where an RX tail meets the RW RELRO head then
+    // reads R|X instead of the RWX macOS refuses to grant).
+    if let Some((rva, rlen)) = relro {
+        let rlo = (rva - lo) as usize;
+        let rhi = (rva - lo + rlen) as usize;
+        for (i, p) in page_prot.iter_mut().enumerate() {
+            let plo = i * PAGE;
+            let phi = plo + PAGE;
+            if plo >= rlo && phi <= rhi {
+                *p &= !PROT_WRITE;
+            }
+        }
+    }
     let mut start = 0;
     while start < n_pages {
         let mut end = start + 1;
         while end < n_pages && page_prot[end] == page_prot[start] {
             end += 1;
         }
-        if page_prot[start] != 0
-            && unsafe {
-                mprotect(
-                    (map as usize + start * PAGE) as *mut c_void,
-                    (end - start) * PAGE,
-                    page_prot[start],
-                )
-            } != 0
-        {
-            let e = std::io::Error::last_os_error();
-            return Err(errd("elf.mprotect", format!("{e}")));
+        if page_prot[start] != 0 {
+            let addr = (map as usize + start * PAGE) as *mut c_void;
+            let len = (end - start) * PAGE;
+            // macOS never grants RWX on non-JIT anonymous maps. Where
+            // a 16 KiB OS page merges an RX tail with an RW head, the
+            // writable bytes are the data tail already relocated
+            // above — drop WRITE and keep the page executable.
+            let prot = if page_prot[start] & (PROT_EXEC | PROT_WRITE) == PROT_EXEC | PROT_WRITE {
+                page_prot[start] & !PROT_WRITE
+            } else {
+                page_prot[start]
+            };
+            if unsafe { mprotect(addr, len, prot) } != 0 {
+                let e = std::io::Error::last_os_error();
+                return Err(errd(
+                    "elf.mprotect",
+                    format!(
+                        "{name}: off={:#x} len={:#x} prot={:#x} map={:#x} span={:#x}: {e}",
+                        start * PAGE,
+                        (end - start) * PAGE,
+                        page_prot[start],
+                        map as usize,
+                        span
+                    ),
+                ));
+            }
         }
         start = end;
     }

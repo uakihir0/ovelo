@@ -677,7 +677,7 @@ extern "C" fn ret1() -> u64 {
     1
 }
 
-fn cstr_ro(p: u64) -> String {
+pub(crate) fn cstr_ro(p: u64) -> String {
     if p == 0 {
         return String::new();
     }
@@ -2048,6 +2048,9 @@ pub(crate) fn load_native_lib(vm: &mut Vm, arg: &str, absolute: bool) {
     // global scope when the dependent relocates.
     let libs = {
         let res = vm.apk_res.as_ref();
+        if let Some(r) = res {
+            crate::native::set_apk_reader(r as *const _ as usize);
+        }
         let mut lookup = |soname: &str| -> Option<Vec<u8>> {
             res.and_then(|r| r.read(&format!("lib/arm64-v8a/{soname}")))
         };
