@@ -1211,7 +1211,13 @@ fn universal(vm: &mut Vm, class: &str, name: &str, sig: &str, args: &[V]) -> Rt<
         // kotlinx MainCoroutineDispatcher.getImmediate() returns the
         // dispatcher itself.
         "getImmediate" => Some(Some(args[0])),
-        "notify" | "notifyAll" | "finalize" => Some(None),
+        "notify" | "notifyAll" => {
+            // A notify can cut a wait(ms) short — promote sleepers
+            // the same way LockSupport.unpark promotes parked ones.
+            vm.wake_parked();
+            Some(None)
+        }
+        "finalize" => Some(None),
         "wait" => {
             // A worker thread's `wait()` can't really suspend — yield
             // with ovelo.park so the drain lets other runnables (the
@@ -1228,6 +1234,7 @@ fn universal(vm: &mut Vm, class: &str, name: &str, sig: &str, args: &[V]) -> Rt<
                 let due = (now_ms().saturating_add(ms)).max(0) as u64;
                 if vm.cur_runnable != 0 {
                     vm.sleep_until.insert(vm.cur_runnable, due);
+                    vm.park_waiters.insert(vm.cur_runnable);
                 }
                 return Err(crate::E::Vm(crate::err("ovelo.park")));
             }

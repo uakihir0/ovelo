@@ -287,9 +287,26 @@ pub(crate) fn call(
             "isDone" | "isCancelled" => Some(Some(V::I32(1))),
             "cancel" => Some(Some(V::I32(1))),
             "park" | "parkNanos" | "parkUntil" => {
-                // LockSupport.park* — run queued work inline so the
-                // waiter sees its completion (see `park_drain`); past
-                // the nesting cap it falls back to unwind+requeue.
+                // LockSupport.park* — a timed park records its wake
+                // deadline so an idling thread (kotlinx scheduler
+                // worker, ~60s keep-alive) sleeps in `delayed_runnables`
+                // instead of busy-cycling the drain; `due=now` requeues
+                // were the tasks.org 100%-CPU spin. parkNanos(0)/park
+                // keep the inline drain: queued work may complete the
+                // wait, and past the nesting cap it unwinds+requeues.
+                let due_ms = match name {
+                    "parkNanos" => match args.last().copied() {
+                        Some(v) => now_ms().saturating_add(i64v(v).max(0) / 1_000_000),
+                        None => now_ms(),
+                    },
+                    "parkUntil" => args.last().copied().map(i64v).unwrap_or_default(),
+                    _ => 0,
+                };
+                if due_ms > now_ms() && vm.cur_runnable != 0 {
+                    vm.sleep_until.insert(vm.cur_runnable, due_ms.max(0) as u64);
+                    vm.park_waiters.insert(vm.cur_runnable);
+                    return Err(crate::E::Vm(crate::err("ovelo.park")));
+                }
                 vm.park_drain()?;
                 Some(None)
             }

@@ -354,6 +354,13 @@ pub struct Vm {
     /// wake at (`Thread.sleep` in worker context writes; the drain
     /// reads when requeueing into `delayed_runnables`).
     pub(crate) sleep_until: HashMap<u32, u64>,
+    /// Runnables whose `sleep_until` deadline came from
+    /// `LockSupport.park*`/`Object.wait(ms)` — interruptible waits an
+    /// `unpark`/`notify` may cut short, unlike `Thread.sleep`.
+    pub(crate) park_waiters: std::collections::HashSet<u32>,
+    /// Handles currently sitting in `delayed_runnables` whose deadline
+    /// is interruptible — `wake_parked` promotes these early.
+    pub(crate) unparkable_delayed: std::collections::HashSet<u32>,
     /// Runnables whose re-run after a long `Thread.sleep` park must
     /// skip the first sleep call: `run()` re-executes from the top,
     /// so without the flag a one-shot task that sleeps mid-body
@@ -556,6 +563,8 @@ impl Vm {
             park_spins: 0,
             repark_counts: HashMap::new(),
             parked_runnables: HashMap::new(),
+            park_waiters: std::collections::HashSet::new(),
+            unparkable_delayed: std::collections::HashSet::new(),
             media_ids: HashMap::new(),
             next_media_id: 0,
             natives: Vec::new(),
@@ -1649,6 +1658,7 @@ impl Vm {
     pub(crate) fn remove_runnable(&mut self, r: u32) {
         self.pending_runnables.retain(|(h, _)| *h != r);
         self.delayed_runnables.retain(|(h, _, _)| *h != r);
+        self.unparkable_delayed.remove(&r);
         self.frame_callbacks.retain(|(h, _)| *h != r);
     }
 
@@ -1664,12 +1674,27 @@ impl Vm {
 
     /// Re-arm runnables that parked out of the live queue — called
     /// from `enqueue_runnable` (fresh work may feed a dropped worker's
-    /// internal queue) and `LockSupport.unpark`.
+    /// internal queue) and `LockSupport.unpark`. Delayed sleepers
+    /// whose deadline came from `LockSupport.park*` (not `Thread.sleep`)
+    /// are also promoted early — a permit cuts the wait short.
     pub(crate) fn wake_parked(&mut self) {
         for (r, on_main) in self.parked_runnables.drain() {
             self.repark_counts.remove(&r);
             self.reparked.remove(&r);
             self.pending_runnables.push_back((r, on_main));
+        }
+        let mut i = 0;
+        while i < self.delayed_runnables.len() {
+            let (r, on_main, _) = self.delayed_runnables[i];
+            if self.unparkable_delayed.contains(&r) {
+                self.delayed_runnables.swap_remove(i);
+                self.unparkable_delayed.remove(&r);
+                self.repark_counts.remove(&r);
+                self.reparked.remove(&r);
+                self.pending_runnables.push_back((r, on_main));
+            } else {
+                i += 1;
+            }
         }
     }
 
@@ -1709,6 +1734,8 @@ impl Vm {
         roots.extend(self.sleep_until.keys().copied());
         roots.extend(self.reparked.iter().copied());
         roots.extend(self.repark_counts.keys().copied());
+        roots.extend(self.park_waiters.iter().copied());
+        roots.extend(self.unparkable_delayed.iter().copied());
         roots.extend(self.vto_listeners.keys().copied());
         roots.extend(self.vto_listeners.values().flatten().copied());
         roots.extend(self.vto_predraw.keys().copied());
@@ -1843,19 +1870,40 @@ impl Vm {
                 }
             }
             match &out {
-                Err(e) if e.cause() == "ovelo.park" && self.thread_runnables.contains(&r) => {
+                Err(e)
+                    if e.cause() == "ovelo.park"
+                        && self.thread_runnables.contains(&r)
+                        && self.sleep_until.contains_key(&r) =>
+                {
+                    if dbg {
+                        eprintln!("[drain] h={r} park -> delayed(thread)");
+                    }
                     // A `Thread` runnable that parked on Thread.sleep
                     // waits out its requested deadline, then re-runs —
                     // no repark budget: a game loop legitimately parks
-                    // once per frame forever.
+                    // once per frame forever. A thread parked WITHOUT a
+                    // recorded deadline (LockSupport.park*/unpark pairs,
+                    // e.g. a kotlinx scheduler worker idling) falls
+                    // through to the counted repark path instead —
+                    // `unwrap_or(now)` here requeued it instantly and
+                    // spun the drain.
                     let due = self.sleep_until.remove(&r).unwrap_or(now);
+                    if self.park_waiters.remove(&r) {
+                        self.unparkable_delayed.insert(r);
+                    }
                     self.delayed_runnables.push((r, on_main, due));
                 }
                 Err(e) if e.cause() == "ovelo.park" && self.sleep_until.contains_key(&r) => {
+                    if dbg {
+                        eprintln!("[drain] h={r} park -> delayed(sleep)");
+                    }
                     // A non-thread runnable parked with a recorded
                     // deadline (e.g. RealCall.execute polling a host
                     // fetch) waits it out rather than burning reparks.
                     let due = self.sleep_until.remove(&r).unwrap_or(now);
+                    if self.park_waiters.remove(&r) {
+                        self.unparkable_delayed.insert(r);
+                    }
                     self.delayed_runnables.push((r, on_main, due));
                 }
                 Err(e) if e.cause() == "ovelo.park" => {
@@ -1870,9 +1918,15 @@ impl Vm {
                     let n = self.repark_counts.entry(r).or_insert(0);
                     *n += 1;
                     if *n <= 64 {
+                        if dbg {
+                            eprintln!("[drain] h={r} park -> requeue #{n}");
+                        }
                         self.reparked.insert(r);
                         self.pending_runnables.push_back((r, on_main));
                     } else {
+                        if dbg {
+                            eprintln!("[drain] h={r} park -> parked out");
+                        }
                         self.reparked.remove(&r);
                         // Parked out of the live queue — not gone: a
                         // later `enqueue_runnable`/`unpark` re-arms it
@@ -1890,6 +1944,8 @@ impl Vm {
                     // captured references.
                     self.thread_runnables.remove(&r);
                     self.sleep_until.remove(&r);
+                    self.park_waiters.remove(&r);
+                    self.unparkable_delayed.remove(&r);
                     self.slept_once.remove(&r);
                 }
             }
