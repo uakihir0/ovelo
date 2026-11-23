@@ -361,6 +361,17 @@ pub struct Vm {
     /// Handles currently sitting in `delayed_runnables` whose deadline
     /// is interruptible — `wake_parked` promotes these early.
     pub(crate) unparkable_delayed: std::collections::HashSet<u32>,
+    /// Runnables whose latest promotion out of `delayed_runnables` was
+    /// their own deadline expiring — not an `unpark`. An interruptible
+    /// parker that re-parks straight after a deadline wake ticks
+    /// `deadline_park_cycles` (a kotlinx surplus worker re-parks here
+    /// when its keep-alive check should have retired it).
+    pub(crate) deadline_woke: std::collections::HashSet<u32>,
+    /// Consecutive deadline-expiry wake→re-park cycles per runnable —
+    /// at the cap the runnable is retired into `parked_runnables`
+    /// (still revivable by `unpark`/`enqueue_runnable`), approximating
+    /// coroutine surplus-worker retirement.
+    pub(crate) deadline_park_cycles: HashMap<u32, u32>,
     /// Runnables whose re-run after a long `Thread.sleep` park must
     /// skip the first sleep call: `run()` re-executes from the top,
     /// so without the flag a one-shot task that sleeps mid-body
@@ -565,6 +576,8 @@ impl Vm {
             parked_runnables: HashMap::new(),
             park_waiters: std::collections::HashSet::new(),
             unparkable_delayed: std::collections::HashSet::new(),
+            deadline_woke: std::collections::HashSet::new(),
+            deadline_park_cycles: HashMap::new(),
             media_ids: HashMap::new(),
             next_media_id: 0,
             natives: Vec::new(),
@@ -1574,14 +1587,39 @@ impl Vm {
         while i < self.delayed_runnables.len() {
             if self.delayed_runnables[i].2 <= now {
                 let (r, on_main, _) = self.delayed_runnables.swap_remove(i);
+                self.unparkable_delayed.remove(&r);
+                self.deadline_woke.insert(r);
                 self.pending_runnables.push_back((r, on_main));
             } else {
                 i += 1;
             }
         }
-        // Nothing queued anywhere: an inline drain can't complete the
-        // wait, so yield by unwinding — the drain loop requeues the
-        // runnable (queue-scanning workers rescan on re-entry).
+        // Nothing queued right now: a delayed task may still complete
+        // the wait — a `runBlocking` parked inside a dex callback
+        // (Hilt `SwitchingProvider.get` building the theme on the main
+        // thread) unwinds fatally if we give up while its completion
+        // sits in `delayed_runnables`. Wait out a short slice to the
+        // soonest deadline, promote, then only unwind when still dry.
+        if self.pending_runnables.is_empty() && self.park_depth < 8 {
+            if let Some(due) = self.delayed_runnables.iter().map(|(_, _, t)| *t).min() {
+                let now2 = jdk::now_ms() as u64;
+                if due > now2 {
+                    std::thread::sleep(std::time::Duration::from_millis((due - now2).min(50)));
+                }
+                let now3 = jdk::now_ms() as u64;
+                let mut i = 0;
+                while i < self.delayed_runnables.len() {
+                    if self.delayed_runnables[i].2 <= now3 {
+                        let (r, on_main, _) = self.delayed_runnables.swap_remove(i);
+                        self.unparkable_delayed.remove(&r);
+                        self.deadline_woke.insert(r);
+                        self.pending_runnables.push_back((r, on_main));
+                    } else {
+                        i += 1;
+                    }
+                }
+            }
+        }
         if self.pending_runnables.is_empty() || self.park_depth >= 8 {
             return Err(E::Vm(err("ovelo.park")));
         }
@@ -1659,6 +1697,8 @@ impl Vm {
         self.pending_runnables.retain(|(h, _)| *h != r);
         self.delayed_runnables.retain(|(h, _, _)| *h != r);
         self.unparkable_delayed.remove(&r);
+        self.deadline_woke.remove(&r);
+        self.deadline_park_cycles.remove(&r);
         self.frame_callbacks.retain(|(h, _)| *h != r);
     }
 
@@ -1681,6 +1721,8 @@ impl Vm {
         for (r, on_main) in self.parked_runnables.drain() {
             self.repark_counts.remove(&r);
             self.reparked.remove(&r);
+            self.deadline_woke.remove(&r);
+            self.deadline_park_cycles.remove(&r);
             self.pending_runnables.push_back((r, on_main));
         }
         let mut i = 0;
@@ -1689,6 +1731,9 @@ impl Vm {
             if self.unparkable_delayed.contains(&r) {
                 self.delayed_runnables.swap_remove(i);
                 self.unparkable_delayed.remove(&r);
+                // An unpark-driven promotion — not a deadline expiry.
+                self.deadline_woke.remove(&r);
+                self.deadline_park_cycles.remove(&r);
                 self.repark_counts.remove(&r);
                 self.reparked.remove(&r);
                 self.pending_runnables.push_back((r, on_main));
@@ -1736,6 +1781,8 @@ impl Vm {
         roots.extend(self.repark_counts.keys().copied());
         roots.extend(self.park_waiters.iter().copied());
         roots.extend(self.unparkable_delayed.iter().copied());
+        roots.extend(self.deadline_woke.iter().copied());
+        roots.extend(self.deadline_park_cycles.keys().copied());
         roots.extend(self.vto_listeners.keys().copied());
         roots.extend(self.vto_listeners.values().flatten().copied());
         roots.extend(self.vto_predraw.keys().copied());
@@ -1818,6 +1865,8 @@ impl Vm {
             .partition(|(_, _, t)| *t <= now);
         self.delayed_runnables = later;
         for (r, on_main, _) in due {
+            self.unparkable_delayed.remove(&r);
+            self.deadline_woke.insert(r);
             self.pending_runnables.push_back((r, on_main));
         }
         self.draining = true;
@@ -1888,7 +1937,29 @@ impl Vm {
                     // `unwrap_or(now)` here requeued it instantly and
                     // spun the drain.
                     let due = self.sleep_until.remove(&r).unwrap_or(now);
-                    if self.park_waiters.remove(&r) {
+                    let unparkable = self.park_waiters.remove(&r);
+                    if unparkable && self.deadline_woke.remove(&r) {
+                        // The wake was this runnable's OWN deadline,
+                        // not an unpark — a kotlinx surplus worker past
+                        // its keep-alive would retire here, but our
+                        // re-run-from-top model can't reach its
+                        // termination check. After a couple of
+                        // deadline-only cycles, retire it out of the
+                        // delayed set: `unpark`/fresh `enqueue_runnable`
+                        // still revive it via `parked_runnables`.
+                        let n = self.deadline_park_cycles.entry(r).or_insert(0);
+                        *n += 1;
+                        if *n >= 2 {
+                            if dbg {
+                                eprintln!("[drain] h={r} park -> retired(deadline)");
+                            }
+                            self.deadline_park_cycles.remove(&r);
+                            self.reparked.remove(&r);
+                            self.parked_runnables.insert(r, on_main);
+                            continue;
+                        }
+                    }
+                    if unparkable {
                         self.unparkable_delayed.insert(r);
                     }
                     self.delayed_runnables.push((r, on_main, due));
@@ -1901,7 +1972,21 @@ impl Vm {
                     // deadline (e.g. RealCall.execute polling a host
                     // fetch) waits it out rather than burning reparks.
                     let due = self.sleep_until.remove(&r).unwrap_or(now);
-                    if self.park_waiters.remove(&r) {
+                    let unparkable = self.park_waiters.remove(&r);
+                    if unparkable && self.deadline_woke.remove(&r) {
+                        let n = self.deadline_park_cycles.entry(r).or_insert(0);
+                        *n += 1;
+                        if *n >= 2 {
+                            if dbg {
+                                eprintln!("[drain] h={r} park -> retired(deadline)");
+                            }
+                            self.deadline_park_cycles.remove(&r);
+                            self.reparked.remove(&r);
+                            self.parked_runnables.insert(r, on_main);
+                            continue;
+                        }
+                    }
+                    if unparkable {
                         self.unparkable_delayed.insert(r);
                     }
                     self.delayed_runnables.push((r, on_main, due));
@@ -1946,6 +2031,8 @@ impl Vm {
                     self.sleep_until.remove(&r);
                     self.park_waiters.remove(&r);
                     self.unparkable_delayed.remove(&r);
+                    self.deadline_woke.remove(&r);
+                    self.deadline_park_cycles.remove(&r);
                     self.slept_once.remove(&r);
                 }
             }
