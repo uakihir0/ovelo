@@ -724,9 +724,7 @@ fn register_compat_shims(
                 // cache answers — never a second create().
                 if provider_ran2.get() {
                     if let Some(V::Ref(ai)) = a.first().copied() {
-                        if let Ok(r) =
-                            vm.call_virtual_direct(ai, "initializeComponent", &a[1..])
-                        {
+                        if let Ok(r) = vm.call_virtual_direct(ai, "initializeComponent", &a[1..]) {
                             return Ok(r);
                         }
                     }
@@ -783,10 +781,9 @@ fn register_compat_shims(
             // Provider ran: return the guest's own singleton — its
             // mDiscovered/mInitialized carry the discovered state.
             if provider_ran.get() {
-                if let Some(V::Ref(h)) = vm.get_static_named(
-                    "Landroidx/startup/AppInitializer;",
-                    "sInstance",
-                ) {
+                if let Some(V::Ref(h)) =
+                    vm.get_static_named("Landroidx/startup/AppInitializer;", "sInstance")
+                {
                     if h != 0 {
                         return Ok(Some(V::Ref(h)));
                     }
@@ -907,8 +904,7 @@ fn register_compat_shims(
         let V::Ref(ih) = v? else {
             return None;
         };
-        let V::Ref(ch) = ovelo_dexrt::pseudo_get(vm, ih, ovelo_dexrt::P_COMPONENT)?
-        else {
+        let V::Ref(ch) = ovelo_dexrt::pseudo_get(vm, ih, ovelo_dexrt::P_COMPONENT)? else {
             return None;
         };
         if let Some(t) = vm.heap.str_val(ch).map(|t| t.to_string()) {
@@ -945,12 +941,7 @@ fn register_compat_shims(
         }
         info
     }
-    fn mint_ri(
-        vm: &mut ovelo_dexrt::Vm,
-        info_desc: &str,
-        name: &str,
-        pkg: &str,
-    ) -> ovelo_dexrt::V {
+    fn mint_ri(vm: &mut ovelo_dexrt::Vm, info_desc: &str, name: &str, pkg: &str) -> ovelo_dexrt::V {
         let info = mint_info(vm, info_desc, name, pkg);
         let ri = V::Ref(vm.heap.alloc(Obj::Host {
             class_idx: u64::MAX,
@@ -995,14 +986,14 @@ fn register_compat_shims(
                 let want = intent_class(vm, a.get(1).copied());
                 let infos: Vec<V> = names
                     .iter()
-                    .filter(|n| {
-                        want.as_deref()
-                            .is_none_or(|c| n.ends_with(c) || *n == c)
-                    })
+                    .filter(|n| want.as_deref().is_none_or(|c| n.ends_with(c) || *n == c))
                     .map(|n| mint_ri(vm, info_desc, n, &pkg))
                     .collect();
                 if std::env::var_os("PMDEBUG").is_some() {
-                    eprintln!("[pmdbg] {meth} want={want:?} names={names:?} -> {} infos", infos.len());
+                    eprintln!(
+                        "[pmdbg] {meth} want={want:?} names={names:?} -> {} infos",
+                        infos.len()
+                    );
                 }
                 Ok(Some(V::Ref(vm.heap.alloc(Obj::Host {
                     class_idx: u64::MAX,
@@ -1035,10 +1026,7 @@ fn register_compat_shims(
                 let want = intent_class(vm, a.get(1).copied());
                 let hit = names
                     .iter()
-                    .find(|n| {
-                        want.as_deref()
-                            .is_none_or(|c| n.ends_with(c) || *n == c)
-                    })
+                    .find(|n| want.as_deref().is_none_or(|c| n.ends_with(c) || *n == c))
                     .map(|n| mint_ri(vm, info_desc, n, &pkg))
                     .unwrap_or(V::Ref(0));
                 if std::env::var_os("PMDEBUG").is_some() {
@@ -1087,10 +1075,7 @@ fn register_compat_shims(
                 };
                 let hit = names
                     .iter()
-                    .find(|n| {
-                        want.as_deref()
-                            .is_none_or(|c| n.ends_with(c) || *n == c)
-                    })
+                    .find(|n| want.as_deref().is_none_or(|c| n.ends_with(c) || *n == c))
                     .map(|n| mint_info(vm, info_desc, n, &pkg))
                     .unwrap_or_else(|| {
                         // Undeclared component — keep the builtin's
@@ -1394,7 +1379,10 @@ fn run_app(store: &InstallStore, package: &str) -> Result<(), OveloError> {
                 }
                 for (f, body) in [
                     ("readme.md", "ovelo guest storage\n".as_bytes().to_vec()),
-                    ("Documents/notes.txt", "hello from ovelo\n".as_bytes().to_vec()),
+                    (
+                        "Documents/notes.txt",
+                        "hello from ovelo\n".as_bytes().to_vec(),
+                    ),
                     (
                         "Pictures/sunset.png",
                         include_bytes!("../assets/seed-sunset.png").to_vec(),
@@ -1552,7 +1540,10 @@ fn run_app(store: &InstallStore, package: &str) -> Result<(), OveloError> {
     // Debug hook: OVELO_AUTOSTART_SERVICE=<descriptor> instantiates the
     // service and runs onCreate+onStartCommand once the window is up —
     // exercises the service path without a UI trigger.
-    if let Some(desc) = std::env::var("OVELO_AUTOSTART_SERVICE").ok().filter(|d| !d.is_empty()) {
+    if let Some(desc) = std::env::var("OVELO_AUTOSTART_SERVICE")
+        .ok()
+        .filter(|d| !d.is_empty())
+    {
         if let Some((vm, _)) = &mut guest {
             let intent = {
                 let ih = vm.heap.alloc(ovelo_dexrt::Obj::Host {
@@ -1760,9 +1751,7 @@ fn run_app(store: &InstallStore, package: &str) -> Result<(), OveloError> {
                         let u = ui2.borrow();
                         (u.root.w, u.root.h)
                     };
-                    ovelo_framework::drive_dex_layout_pass(
-                        vm, *this, dex_frame, win_w, win_h,
-                    );
+                    ovelo_framework::drive_dex_layout_pass(vm, *this, dex_frame, win_w, win_h);
                 }
             }
             ui2.borrow_mut().refresh_dex_tree(vm, *this);

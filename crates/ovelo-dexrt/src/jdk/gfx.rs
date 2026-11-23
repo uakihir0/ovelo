@@ -160,7 +160,13 @@ fn canvas_call(vm: &mut Vm, name: &str, sig: &str, args: &[V]) -> Rt<Option<Opti
             Some(Some(V::I32(1)))
         }
         "drawColor" | "drawRGB" | "drawARGB" => {
-            rec(vm, this, CanvasOp::Color { argb: i32v(arg(args, 1)) });
+            rec(
+                vm,
+                this,
+                CanvasOp::Color {
+                    argb: i32v(arg(args, 1)),
+                },
+            );
             Some(None)
         }
         "drawPaint" => {
@@ -180,7 +186,17 @@ fn canvas_call(vm: &mut Vm, name: &str, sig: &str, args: &[V]) -> Rt<Option<Opti
                     flt(arg(args, 4)),
                 )
             };
-            rec(vm, this, CanvasOp::Rect { l, t, r, b, paint: p });
+            rec(
+                vm,
+                this,
+                CanvasOp::Rect {
+                    l,
+                    t,
+                    r,
+                    b,
+                    paint: p,
+                },
+            );
             Some(None)
         }
         "drawRoundRect" => {
@@ -200,7 +216,15 @@ fn canvas_call(vm: &mut Vm, name: &str, sig: &str, args: &[V]) -> Rt<Option<Opti
             rec(
                 vm,
                 this,
-                CanvasOp::RoundRect { l, t, r, b, rx, ry, paint: p },
+                CanvasOp::RoundRect {
+                    l,
+                    t,
+                    r,
+                    b,
+                    rx,
+                    ry,
+                    paint: p,
+                },
             );
             Some(None)
         }
@@ -216,7 +240,17 @@ fn canvas_call(vm: &mut Vm, name: &str, sig: &str, args: &[V]) -> Rt<Option<Opti
                     flt(arg(args, 4)),
                 )
             };
-            rec(vm, this, CanvasOp::Oval { l, t, r, b, paint: p });
+            rec(
+                vm,
+                this,
+                CanvasOp::Oval {
+                    l,
+                    t,
+                    r,
+                    b,
+                    paint: p,
+                },
+            );
             Some(None)
         }
         "drawCircle" => {
@@ -316,10 +350,7 @@ fn canvas_call(vm: &mut Vm, name: &str, sig: &str, args: &[V]) -> Rt<Option<Opti
             let text = if bounded && !is_char_arr {
                 let st = i32v(arg(args, 2)).max(0) as usize;
                 let en = i32v(arg(args, 3)).max(0) as usize;
-                full.chars()
-                    .skip(st)
-                    .take(en.saturating_sub(st))
-                    .collect()
+                full.chars().skip(st).take(en.saturating_sub(st)).collect()
             } else {
                 full
             };
@@ -341,12 +372,7 @@ fn canvas_call(vm: &mut Vm, name: &str, sig: &str, args: &[V]) -> Rt<Option<Opti
             let (src_w, src_h, rgba) = match arg(args, 1) {
                 V::Ref(bh) => match vm.heap.get(bh) {
                     Some(Obj::Host {
-                        state:
-                            HostState::Bitmap {
-                                w,
-                                h,
-                                rgba,
-                            },
+                        state: HostState::Bitmap { w, h, rgba },
                         ..
                     }) => (*w, *h, rgba.clone()),
                     _ => (0, 0, std::rc::Rc::new(Vec::new())),
@@ -456,8 +482,7 @@ fn bitmap_blit(
             } else {
                 let ia = 255 - a;
                 for c in 0..3 {
-                    out[di + c] =
-                        ((src[si + c] as u32 * a + out[di + c] as u32 * ia) / 255) as u8;
+                    out[di + c] = ((src[si + c] as u32 * a + out[di + c] as u32 * ia) / 255) as u8;
                 }
                 out[di + 3] = (a + (out[di + 3] as u32 * ia) / 255) as u8;
             }
@@ -562,17 +587,11 @@ fn paint_call(vm: &mut Vm, name: &str, _sig: &str, args: &[V]) -> Rt<Option<Opti
             pseudo_get(vm, h, PK_COLOR).unwrap_or(V::I32(0xFF00_0000u32 as i32)),
         )),
         "getAlpha" => Some(Some(V::I32(
-            (i32v(pseudo_get(vm, h, PK_COLOR).unwrap_or(V::I32(
-                0xFF00_0000u32 as i32,
-            ))) >> 24)
+            (i32v(pseudo_get(vm, h, PK_COLOR).unwrap_or(V::I32(0xFF00_0000u32 as i32))) >> 24)
                 & 0xFF,
         ))),
-        "getTextSize" => Some(Some(
-            pseudo_get(vm, h, PK_TSIZE).unwrap_or(V::F32(12.0)),
-        )),
-        "getStrokeWidth" => Some(Some(
-            pseudo_get(vm, h, PK_SW).unwrap_or(V::F32(1.0)),
-        )),
+        "getTextSize" => Some(Some(pseudo_get(vm, h, PK_TSIZE).unwrap_or(V::F32(12.0)))),
+        "getStrokeWidth" => Some(Some(pseudo_get(vm, h, PK_SW).unwrap_or(V::F32(1.0)))),
         "getTextAlign" => {
             let n = match pseudo_get(vm, h, PK_ALIGN) {
                 Some(V::I32(1)) => "CENTER",
@@ -659,38 +678,26 @@ fn paint_call(vm: &mut Vm, name: &str, _sig: &str, args: &[V]) -> Rt<Option<Opti
             let w = measure_text(&text, size) as i32;
             if let V::Ref(rh) = arg(args, args.len() - 1) {
                 if rh != 0 {
-                    android::rect_write(
-                        vm,
-                        rh,
-                        0,
-                        (-0.8 * size) as i32,
-                        w,
-                        (0.25 * size) as i32,
-                    );
+                    android::rect_write(vm, rh, 0, (-0.8 * size) as i32, w, (0.25 * size) as i32);
                 }
             }
             Some(None)
         }
-        "descent" => Some(Some(V::F32(
-            match pseudo_get(vm, h, PK_TSIZE) {
-                Some(V::F32(f)) => f * 0.25,
-                _ => 3.0,
-            },
-        ))),
-        "ascent" => Some(Some(V::F32(
-            match pseudo_get(vm, h, PK_TSIZE) {
-                Some(V::F32(f)) => f * -0.8,
-                _ => -9.6,
-            },
-        ))),
+        "descent" => Some(Some(V::F32(match pseudo_get(vm, h, PK_TSIZE) {
+            Some(V::F32(f)) => f * 0.25,
+            _ => 3.0,
+        }))),
+        "ascent" => Some(Some(V::F32(match pseudo_get(vm, h, PK_TSIZE) {
+            Some(V::F32(f)) => f * -0.8,
+            _ => -9.6,
+        }))),
         "getFontMetrics" | "getFontMetricsInt" => {
             let size = match pseudo_get(vm, h, PK_TSIZE) {
                 Some(V::F32(f)) => f,
                 Some(v) => f64v(v) as f32,
                 None => 12.0,
             };
-            let (top, asc, des, bot) =
-                (size * -0.95, size * -0.8, size * 0.25, size * 0.35);
+            let (top, asc, des, bot) = (size * -0.95, size * -0.8, size * 0.25, size * 0.35);
             let desc = if name == "getFontMetrics" {
                 "Landroid/graphics/Paint$FontMetrics;"
             } else {
@@ -708,12 +715,10 @@ fn paint_call(vm: &mut Vm, name: &str, _sig: &str, args: &[V]) -> Rt<Option<Opti
             };
             let fh = match (fh, name, has_arg) {
                 (Some(fh), _, _) => Some(fh),
-                (None, "getFontMetrics", false) => {
-                    match host(vm, desc, HostState::Empty) {
-                        V::Ref(fh) => Some(fh),
-                        _ => None,
-                    }
-                }
+                (None, "getFontMetrics", false) => match host(vm, desc, HostState::Empty) {
+                    V::Ref(fh) => Some(fh),
+                    _ => None,
+                },
                 _ => None,
             };
             if let Some(fh) = fh {
@@ -726,8 +731,8 @@ fn paint_call(vm: &mut Vm, name: &str, _sig: &str, args: &[V]) -> Rt<Option<Opti
                 ] {
                     if let Some(g) = vm.field_index_of(desc, n) {
                         let g = vm.canon_field(g);
-                        if let Some(Obj::Instance { fields, .. }
-                        | Obj::Host { fields, .. }) = vm.heap.get_mut(fh)
+                        if let Some(Obj::Instance { fields, .. } | Obj::Host { fields, .. }) =
+                            vm.heap.get_mut(fh)
                         {
                             fields.insert(
                                 g,
@@ -761,14 +766,36 @@ fn paint_call(vm: &mut Vm, name: &str, _sig: &str, args: &[V]) -> Rt<Option<Opti
         }
         // Mutators we accept but don't model: typeface, AA, filters,
         // effects, flags, spacing, skew, cap/join, hinting, variants.
-        "setAntiAlias" | "setSubpixelText" | "setLinearText" | "setDither"
-        | "setFilterBitmap" | "setUnderlineText" | "setStrikeThruText"
-        | "setTypeface" | "setTextSkewX" | "setTextScaleX" | "setLetterSpacing"
-        | "setStrokeCap" | "setStrokeJoin" | "setStrokeMiter" | "setMaskFilter"
-        | "setPathEffect" | "setShader" | "setColorFilter" | "setXfermode"
-        | "setShadowLayer" | "setFlags" | "setHinting" | "setElegantTextHeight"
-        | "setFontFeatureSettings" | "setFontVariationSettings" | "clearShadowLayer"
-        | "set" | "reset" | "setLocales" | "setTextLocale" => Some(None),
+        "setAntiAlias"
+        | "setSubpixelText"
+        | "setLinearText"
+        | "setDither"
+        | "setFilterBitmap"
+        | "setUnderlineText"
+        | "setStrikeThruText"
+        | "setTypeface"
+        | "setTextSkewX"
+        | "setTextScaleX"
+        | "setLetterSpacing"
+        | "setStrokeCap"
+        | "setStrokeJoin"
+        | "setStrokeMiter"
+        | "setMaskFilter"
+        | "setPathEffect"
+        | "setShader"
+        | "setColorFilter"
+        | "setXfermode"
+        | "setShadowLayer"
+        | "setFlags"
+        | "setHinting"
+        | "setElegantTextHeight"
+        | "setFontFeatureSettings"
+        | "setFontVariationSettings"
+        | "clearShadowLayer"
+        | "set"
+        | "reset"
+        | "setLocales"
+        | "setTextLocale" => Some(None),
         _ => None,
     })
 }
@@ -814,9 +841,7 @@ pub(crate) fn call(
 ) -> Rt<Option<Option<V>>> {
     match class {
         "Landroid/graphics/Canvas;" => canvas_call(vm, name, sig, args),
-        "Landroid/graphics/Paint;" | "Landroid/text/TextPaint;" => {
-            paint_call(vm, name, sig, args)
-        }
+        "Landroid/graphics/Paint;" | "Landroid/text/TextPaint;" => paint_call(vm, name, sig, args),
         _ => Ok(None),
     }
 }
@@ -844,8 +869,11 @@ pub(crate) fn guest_draw_ops(vm: &mut Vm, view: u32, w: i32, h: i32) -> Vec<Canv
     if !has {
         return Vec::new();
     }
-    let V::Ref(canvas) = host(vm, "Landroid/graphics/Canvas;", HostState::CanvasOps(Vec::new()))
-    else {
+    let V::Ref(canvas) = host(
+        vm,
+        "Landroid/graphics/Canvas;",
+        HostState::CanvasOps(Vec::new()),
+    ) else {
         return Vec::new();
     };
     pseudo_set(vm, canvas, PK_CW, V::I32(w));
@@ -865,7 +893,10 @@ pub(crate) fn guest_draw_ops(vm: &mut Vm, view: u32, w: i32, h: i32) -> Vec<Canv
     };
     if std::env::var_os("OVELO_DRAWDBG").is_some() {
         let d = crate::jdk::class_of(vm, V::Ref(view));
-        eprintln!("[drawdbg] onDraw h{view} {d} {w}x{h} -> {n} ops err={:?}", r.is_err());
+        eprintln!(
+            "[drawdbg] onDraw h{view} {d} {w}x{h} -> {n} ops err={:?}",
+            r.is_err()
+        );
         if std::env::var_os("OVELO_DRAWDBG_DUMP").is_some() {
             if let Some(Obj::Host {
                 state: HostState::CanvasOps(ops),

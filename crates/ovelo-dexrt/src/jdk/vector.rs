@@ -53,7 +53,11 @@ pub(crate) fn drawable_bitmap(vm: &Vm, res_id: u32) -> Option<(u32, u32, Rc<Vec<
 pub(crate) fn drawable_for_res(vm: &mut Vm, res_id: u32) -> V {
     match drawable_bitmap(vm, res_id) {
         Some((w, h, rgba)) => {
-            let d = host(vm, "Landroid/graphics/drawable/BitmapDrawable;", HostState::Empty);
+            let d = host(
+                vm,
+                "Landroid/graphics/drawable/BitmapDrawable;",
+                HostState::Empty,
+            );
             if let V::Ref(dh) = d {
                 let bmp = vm.alloc_host(
                     "Landroid/graphics/Bitmap;",
@@ -73,7 +77,11 @@ pub(crate) fn drawable_for_res(vm: &mut Vm, res_id: u32) -> V {
                 .and_then(|r| r.type_name(res_id))
                 .is_some_and(|t| t == "color");
             if is_color {
-                let d = host(vm, "Landroid/graphics/drawable/ColorDrawable;", HostState::Empty);
+                let d = host(
+                    vm,
+                    "Landroid/graphics/drawable/ColorDrawable;",
+                    HostState::Empty,
+                );
                 if let (V::Ref(dh), Some(argb)) = (d, resolve_ref_color(vm, res_id)) {
                     pseudo_set(vm, dh, P_DRAW_COLOR, V::I32(argb as i32));
                 }
@@ -366,12 +374,7 @@ fn parse_color(s: &str) -> Option<u32> {
             0xff00_0000 | ((r * 0x11) << 16) | ((g * 0x11) << 8) | (b * 0x11)
         }
         4 => {
-            let (a, r, g, b) = (
-                (v >> 12) & 0xf,
-                (v >> 8) & 0xf,
-                (v >> 4) & 0xf,
-                v & 0xf,
-            );
+            let (a, r, g, b) = ((v >> 12) & 0xf, (v >> 8) & 0xf, (v >> 4) & 0xf, v & 0xf);
             ((a * 0x11) << 24) | ((r * 0x11) << 16) | ((g * 0x11) << 8) | (b * 0x11)
         }
         6 => 0xff00_0000 | v,
@@ -553,7 +556,11 @@ fn parse_path(d: &str) -> Vec<Sub> {
             b'S' => {
                 let (c, d1) = (n!(), n!());
                 let (e, f) = (n!(), n!());
-                let p1 = if pc { (2.0 * x - cx, 2.0 * y - cy) } else { (x, y) };
+                let p1 = if pc {
+                    (2.0 * x - cx, 2.0 * y - cy)
+                } else {
+                    (x, y)
+                };
                 let (p2, p3) = if rel {
                     ((x + c, y + d1), (x + e, y + f))
                 } else {
@@ -568,7 +575,11 @@ fn parse_path(d: &str) -> Vec<Sub> {
             b'Q' => {
                 let (a, b1) = (n!(), n!());
                 let (c, d1) = (n!(), n!());
-                let (p1, p2) = if rel { ((x + a, y + b1), (x + c, y + d1)) } else { ((a, b1), (c, d1)) };
+                let (p1, p2) = if rel {
+                    ((x + a, y + b1), (x + c, y + d1))
+                } else {
+                    ((a, b1), (c, d1))
+                };
                 flatten_quad(&mut cur, (x, y), p1, p2);
                 (qx, qy) = p1;
                 (x, y) = p2;
@@ -577,7 +588,11 @@ fn parse_path(d: &str) -> Vec<Sub> {
             }
             b'T' => {
                 let (c, d1) = (n!(), n!());
-                let p1 = if pq { (2.0 * x - qx, 2.0 * y - qy) } else { (x, y) };
+                let p1 = if pq {
+                    (2.0 * x - qx, 2.0 * y - qy)
+                } else {
+                    (x, y)
+                };
                 let p2 = if rel { (x + c, y + d1) } else { (c, d1) };
                 flatten_quad(&mut cur, (x, y), p1, p2);
                 (qx, qy) = p1;
@@ -621,8 +636,10 @@ fn flatten_cubic(
     for i in 1..=N {
         let t = i as f32 / N as f32;
         let u = 1.0 - t;
-        let x = u * u * u * p0.0 + 3.0 * u * u * t * p1.0 + 3.0 * u * t * t * p2.0 + t * t * t * p3.0;
-        let y = u * u * u * p0.1 + 3.0 * u * u * t * p1.1 + 3.0 * u * t * t * p2.1 + t * t * t * p3.1;
+        let x =
+            u * u * u * p0.0 + 3.0 * u * u * t * p1.0 + 3.0 * u * t * t * p2.0 + t * t * t * p3.0;
+        let y =
+            u * u * u * p0.1 + 3.0 * u * u * t * p1.1 + 3.0 * u * t * t * p2.1 + t * t * t * p3.1;
         out.push((x, y));
     }
 }

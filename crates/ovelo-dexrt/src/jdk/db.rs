@@ -388,12 +388,11 @@ pub(crate) fn media_cursor(vm: &mut Vm, uri: &str, projection: &[String]) -> V {
     let mut bucket_audio: std::collections::BTreeMap<String, i64> =
         std::collections::BTreeMap::new();
     for f in files.iter().filter(|f| f.2 == 2) {
-        let rel = f
-            .0
-            .strip_prefix(&vm.external_root)
-            .ok()
-            .map(|r| r.to_string_lossy().replace('\\', "/"))
-            .unwrap_or_default();
+        let rel =
+            f.0.strip_prefix(&vm.external_root)
+                .ok()
+                .map(|r| r.to_string_lossy().replace('\\', "/"))
+                .unwrap_or_default();
         let dir = rel
             .rsplit_once('/')
             .map(|(d, _)| format!("{d}/"))
@@ -402,145 +401,148 @@ pub(crate) fn media_cursor(vm: &mut Vm, uri: &str, projection: &[String]) -> V {
     }
     let audio_albums = bucket_audio.len() as i64;
     for (p, mime, mtype) in files {
-            // A scoped volume (images/video/audio) filters by media
-            // type; "file"/"media" volumes accept everything.
-            let wanted = if images {
-                mtype == 1
-            } else if video {
-                mtype == 3
-            } else if audio {
-                mtype == 2
-            } else {
-                true
-            };
-            if !wanted {
-                continue;
-            }
-            let rel = p
-                .strip_prefix(&vm.external_root)
-                .ok()
-                .map(|r| r.to_string_lossy().replace('\\', "/"))
-                .unwrap_or_default();
-            let name = p
-                .file_name()
-                .map(|n| n.to_string_lossy().to_string())
-                .unwrap_or_default();
-            let title = p
-                .file_stem()
-                .map(|n| n.to_string_lossy().to_string())
-                .unwrap_or_default();
-            let bucket = p
-                .parent()
-                .and_then(|x| x.file_name())
-                .map(|n| n.to_string_lossy().to_string())
-                .unwrap_or_default();
-            // Full parent path relative to the storage root, with a
-            // trailing slash — nested folders keep their ancestors
-            // (DCIM/Camera/ → "DCIM/Camera/", root files → "").
-            let rel_dir = rel
-                .rsplit_once('/')
-                .map(|(d, _)| format!("{d}/"))
-                .unwrap_or_default();
-            let meta = std::fs::metadata(&p).ok();
-            let size = meta.as_ref().map(|m| m.len() as i64).unwrap_or(0);
-            let mtime = meta
-                .and_then(|m| m.modified().ok())
-                .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
-                .map(|d| d.as_secs() as i64)
-                .unwrap_or(0);
-            let (w, h) = img_dims(&p);
-            let dur = if mtype == 2 {
-                audio_duration_ms(&p, size)
+        // A scoped volume (images/video/audio) filters by media
+        // type; "file"/"media" volumes accept everything.
+        let wanted = if images {
+            mtype == 1
+        } else if video {
+            mtype == 3
+        } else if audio {
+            mtype == 2
+        } else {
+            true
+        };
+        if !wanted {
+            continue;
+        }
+        let rel = p
+            .strip_prefix(&vm.external_root)
+            .ok()
+            .map(|r| r.to_string_lossy().replace('\\', "/"))
+            .unwrap_or_default();
+        let name = p
+            .file_name()
+            .map(|n| n.to_string_lossy().to_string())
+            .unwrap_or_default();
+        let title = p
+            .file_stem()
+            .map(|n| n.to_string_lossy().to_string())
+            .unwrap_or_default();
+        let bucket = p
+            .parent()
+            .and_then(|x| x.file_name())
+            .map(|n| n.to_string_lossy().to_string())
+            .unwrap_or_default();
+        // Full parent path relative to the storage root, with a
+        // trailing slash — nested folders keep their ancestors
+        // (DCIM/Camera/ → "DCIM/Camera/", root files → "").
+        let rel_dir = rel
+            .rsplit_once('/')
+            .map(|(d, _)| format!("{d}/"))
+            .unwrap_or_default();
+        let meta = std::fs::metadata(&p).ok();
+        let size = meta.as_ref().map(|m| m.len() as i64).unwrap_or(0);
+        let mtime = meta
+            .and_then(|m| m.modified().ok())
+            .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+            .map(|d| d.as_secs() as i64)
+            .unwrap_or(0);
+        let (w, h) = img_dims(&p);
+        let dur = if mtype == 2 {
+            audio_duration_ms(&p, size)
+        } else {
+            0
+        };
+        let data = format!("/storage/emulated/0/{rel}");
+        // `_id` persists per path for the runtime's life — like a
+        // real MediaStore rowid, adding/removing other files never
+        // reshuffles it. `bucket_id` follows MediaStore's
+        // parent-path hashCode (AOSP collides there too).
+        let row_id = if let Some(&id) = vm.media_ids.get(&data) {
+            id
+        } else {
+            vm.next_media_id += 1;
+            vm.media_ids.insert(data.clone(), vm.next_media_id);
+            vm.next_media_id
+        };
+        let bucket_id = java_hash(&rel_dir.to_lowercase()) as i64;
+        // Scoped aggregate URIs key `_id` by their own entity:
+        // `audio/albums` rows must expose `album_id` as `_id` —
+        // apps join `track.album_id == album._id` (and likewise
+        // artists/genres); a media rowid would fail that join.
+        // `…/{id}/members` lists tracks — those rows keep their own
+        // media rowid or playback URIs break.
+        let album_id = java_hash(&rel_dir.to_lowercase()) as i64;
+        let artist_id = 1i64;
+        let genre_id = 0i64;
+        let scoped_id = if uri.contains("/members") {
+            row_id
+        } else if uri.contains("/albums") {
+            album_id
+        } else if uri.contains("/artists") {
+            artist_id
+        } else if uri.contains("/genres") {
+            genre_id
+        } else {
+            row_id
+        };
+        rows.push(vec![
+            V::I64(scoped_id),
+            jstr(vm, &data),
+            jstr(vm, &name),
+            jstr(vm, &title),
+            V::I64(size),
+            V::I64(mtime),
+            V::I64(mtime),
+            V::I64(mtime * 1000),
+            jstr(vm, mime),
+            V::I64(mtype),
+            V::I64(bucket_id),
+            jstr(vm, &bucket),
+            jstr(vm, &rel_dir),
+            V::I64(w),
+            V::I64(h),
+            V::I64(0),
+            V::I64(dur),
+            V::I64(0),
+            jstr(vm, "external"),
+            // The parent folder doubles as the album name (like a
+            // Music/<Album>/<Track>.mp3 library layout); artist is
+            // left at the conventional unknown-artist label.
+            jstr(vm, "<unknown>"),
+            jstr(vm, &bucket),
+            V::I64(java_hash(&rel_dir.to_lowercase()) as i64),
+            V::I64(1),
+            // `track` = disc*1000 + number (MediaStore encoding);
+            // apps filter `track > 0` — 0 drops the row entirely.
+            V::I64(if mtype == 2 { 1001 } else { 0 }),
+            V::I64(0),
+            V::I64(0),
+            jstr(vm, "<unknown>"),
+            V::Ref(0),
+            V::I64((mtype == 2) as i64),
+            V::I64(0),
+            V::I64(0),
+            V::I64(0),
+            V::I64(0),
+            V::I64(0),
+            V::I64(if mtype == 2 { audio_total } else { 0 }),
+            V::I64(if mtype == 2 { audio_albums } else { 0 }),
+            V::I64(if mtype == 2 {
+                *bucket_audio.get(&rel_dir).unwrap_or(&0)
             } else {
                 0
-            };
-            let data = format!("/storage/emulated/0/{rel}");
-            // `_id` persists per path for the runtime's life — like a
-            // real MediaStore rowid, adding/removing other files never
-            // reshuffles it. `bucket_id` follows MediaStore's
-            // parent-path hashCode (AOSP collides there too).
-            let row_id = if let Some(&id) = vm.media_ids.get(&data) {
-                id
-            } else {
-                vm.next_media_id += 1;
-                vm.media_ids.insert(data.clone(), vm.next_media_id);
-                vm.next_media_id
-            };
-            let bucket_id = java_hash(&rel_dir.to_lowercase()) as i64;
-            // Scoped aggregate URIs key `_id` by their own entity:
-            // `audio/albums` rows must expose `album_id` as `_id` —
-            // apps join `track.album_id == album._id` (and likewise
-            // artists/genres); a media rowid would fail that join.
-            // `…/{id}/members` lists tracks — those rows keep their own
-            // media rowid or playback URIs break.
-            let album_id = java_hash(&rel_dir.to_lowercase()) as i64;
-            let artist_id = 1i64;
-            let genre_id = 0i64;
-            let scoped_id = if uri.contains("/members") {
-                row_id
-            } else if uri.contains("/albums") {
-                album_id
-            } else if uri.contains("/artists") {
-                artist_id
-            } else if uri.contains("/genres") {
-                genre_id
-            } else {
-                row_id
-            };
-            rows.push(vec![
-                V::I64(scoped_id),
-                jstr(vm, &data),
-                jstr(vm, &name),
-                jstr(vm, &title),
-                V::I64(size),
-                V::I64(mtime),
-                V::I64(mtime),
-                V::I64(mtime * 1000),
-                jstr(vm, mime),
-                V::I64(mtype),
-                V::I64(bucket_id),
-                jstr(vm, &bucket),
-                jstr(vm, &rel_dir),
-                V::I64(w),
-                V::I64(h),
-                V::I64(0),
-                V::I64(dur),
-                V::I64(0),
-                jstr(vm, "external"),
-                // The parent folder doubles as the album name (like a
-                // Music/<Album>/<Track>.mp3 library layout); artist is
-                // left at the conventional unknown-artist label.
-                jstr(vm, "<unknown>"),
-                jstr(vm, &bucket),
-                V::I64(java_hash(&rel_dir.to_lowercase()) as i64),
-                V::I64(1),
-                // `track` = disc*1000 + number (MediaStore encoding);
-                // apps filter `track > 0` — 0 drops the row entirely.
-                V::I64(if mtype == 2 { 1001 } else { 0 }),
-                V::I64(0),
-                V::I64(0),
-                jstr(vm, "<unknown>"),
-                V::Ref(0),
-                V::I64((mtype == 2) as i64),
-                V::I64(0),
-                V::I64(0),
-                V::I64(0),
-                V::I64(0),
-                V::I64(0),
-                V::I64(if mtype == 2 { audio_total } else { 0 }),
-                V::I64(if mtype == 2 { audio_albums } else { 0 }),
-                V::I64(if mtype == 2 {
-                    *bucket_audio.get(&rel_dir).unwrap_or(&0)
-                } else {
-                    0
-                }),
-                V::I64(0),
-                jstr(vm, "<unknown>"),
-                V::I64(0),
-            ]);
+            }),
+            V::I64(0),
+            jstr(vm, "<unknown>"),
+            V::I64(0),
+        ]);
     }
     if std::env::var_os("OVELO_DRAINDBG").is_some() {
-        eprintln!("[media_cursor] {uri} rows={} projection={projection:?}", rows.len());
+        eprintln!(
+            "[media_cursor] {uri} rows={} projection={projection:?}",
+            rows.len()
+        );
     }
     // Honor the projection: the cursor's column set is exactly the
     // requested names, in the requested order — positional reads must
@@ -716,10 +718,7 @@ pub(crate) fn saf_cursor(vm: &mut Vm, uri: &str, projection: &[String]) -> V {
             _ => "application/octet-stream",
         }
     };
-    let vol = doc_id
-        .split_once(':')
-        .map(|(v, _)| v)
-        .unwrap_or("primary");
+    let vol = doc_id.split_once(':').map(|(v, _)| v).unwrap_or("primary");
     let push_row = |vm: &mut Vm, rows: &mut Vec<Vec<V>>, p: &std::path::Path, id: String| {
         let meta = std::fs::metadata(p).ok();
         let size = meta.as_ref().map(|m| m.len() as i64).unwrap_or(0);
@@ -768,7 +767,10 @@ pub(crate) fn saf_cursor(vm: &mut Vm, uri: &str, projection: &[String]) -> V {
         push_row(vm, &mut rows, &base, doc_id.clone());
     }
     if std::env::var_os("OVELO_DRAINDBG").is_some() {
-        eprintln!("[saf_cursor] {uri} rows={} projection={projection:?}", rows.len());
+        eprintln!(
+            "[saf_cursor] {uri} rows={} projection={projection:?}",
+            rows.len()
+        );
     }
     let (cols, rows) = if projection.is_empty() || projection.iter().any(|c| c == "*") {
         (COLS.iter().map(|c| c.to_string()).collect(), rows)
@@ -825,9 +827,8 @@ fn audio_duration_ms(p: &std::path::Path, size: i64) -> i64 {
                     let tag = &b[i..i + 4];
                     let len = u32::from_le_bytes(b[i + 4..i + 8].try_into().unwrap()) as usize;
                     if tag == b"fmt " && i + 8 + len <= b.len() && len >= 16 {
-                        rate = u32::from_le_bytes(
-                            b[i + 8 + 8..i + 8 + 12].try_into().unwrap(),
-                        ) as u64;
+                        rate =
+                            u32::from_le_bytes(b[i + 8 + 8..i + 8 + 12].try_into().unwrap()) as u64;
                     } else if tag == b"data" {
                         data = len as u64;
                     }
@@ -1008,10 +1009,7 @@ pub(crate) fn db_call(vm: &mut Vm, name: &str, args: &[V]) -> Rt<Option<Option<V
         _ => 0,
     };
     if std::env::var_os("OVELO_DBDBG").is_some() {
-        let sql = args
-            .get(1)
-            .and_then(|v| sv(vm, *v))
-            .unwrap_or_default();
+        let sql = args.get(1).and_then(|v| sv(vm, *v)).unwrap_or_default();
         let sql: String = sql.chars().take(80).collect();
         eprintln!("[db] {name}(h={h}) {sql}");
     }
@@ -1582,7 +1580,10 @@ fn cursor_call(vm: &mut Vm, name: &str, args: &[V]) -> Rt<Option<Option<V>>> {
     let col_arg = i32v(*args.get(1).unwrap_or(&V::I32(0)));
     let dbg = std::env::var_os("OVELO_CURDBG").is_some();
     if dbg && matches!(name, "getCount") {
-        eprintln!("[cur] h={h} getCount -> {n_rows} cols={:?}", cur_cols(vm, h));
+        eprintln!(
+            "[cur] h={h} getCount -> {n_rows} cols={:?}",
+            cur_cols(vm, h)
+        );
     }
     Ok(match name {
         "getCount" => Some(Some(V::I32(n_rows))),
@@ -1640,9 +1641,7 @@ fn cursor_call(vm: &mut Vm, name: &str, args: &[V]) -> Rt<Option<Option<V>>> {
         // after-last. Returning false there makes guest loops like
         // `while (!isAfterLast()) { moveToNext() }` spin forever and
         // blow the interpreter's instruction budget.
-        "isBeforeFirst" => Some(Some(V::I32(
-            (n_rows == 0 || cur_pos(vm, h) < 0) as i32,
-        ))),
+        "isBeforeFirst" => Some(Some(V::I32((n_rows == 0 || cur_pos(vm, h) < 0) as i32))),
         "isAfterLast" => Some(Some(V::I32(
             (n_rows == 0 || cur_pos(vm, h) >= n_rows) as i32,
         ))),
@@ -1681,7 +1680,11 @@ fn cursor_call(vm: &mut Vm, name: &str, args: &[V]) -> Rt<Option<Option<V>>> {
                 eprintln!(
                     "[cur] h={h} getString pos={} col={col_arg} -> {}",
                     cur_pos(vm, h),
-                    sv(vm, v).unwrap_or_else(|| format!("{v:?}")).chars().take(60).collect::<String>()
+                    sv(vm, v)
+                        .unwrap_or_else(|| format!("{v:?}"))
+                        .chars()
+                        .take(60)
+                        .collect::<String>()
                 );
             }
             Some(Some(match v {
@@ -1773,12 +1776,19 @@ impl BundledStmt {
                 self.rows.push(row);
             }
             if std::env::var_os("OVELO_DBDBG").is_some() {
-                eprintln!("[bundled] query -> {} rows: {:?}", self.rows.len(), self.rows.first());
+                eprintln!(
+                    "[bundled] query -> {} rows: {:?}",
+                    self.rows.len(),
+                    self.rows.first()
+                );
             }
         } else {
             let r = st.execute(params_from_iter(self.params.clone()))?;
             if std::env::var_os("OVELO_DBDBG").is_some() {
-                eprintln!("[bundled] exec -> {r} rows rowid={}", d.conn.last_insert_rowid());
+                eprintln!(
+                    "[bundled] exec -> {r} rows rowid={}",
+                    d.conn.last_insert_rowid()
+                );
             }
             self.cols = Vec::new();
             self.rows = Vec::new();
@@ -1789,7 +1799,9 @@ impl BundledStmt {
     }
 
     fn cur_row(&self) -> Option<&[SV]> {
-        self.cur.and_then(|i| self.rows.get(i)).map(|r| r.as_slice())
+        self.cur
+            .and_then(|i| self.rows.get(i))
+            .map(|r| r.as_slice())
     }
 
     fn cell(&self, col: i64) -> SV {
@@ -1847,10 +1859,7 @@ pub(crate) fn bundled_call(vm: &mut Vm, name: &str, args: &[V]) -> Rt<Option<Opt
         Ok(match name {
             "nativeThreadSafeMode" => Some(V::I32(1)),
             "nativeOpen" => {
-                let p = args
-                    .first()
-                    .and_then(|v| sv(vm, *v))
-                    .unwrap_or_default();
+                let p = args.first().and_then(|v| sv(vm, *v)).unwrap_or_default();
                 let dbname = if p.contains(":memory:") {
                     ":memory:".to_string()
                 } else {
@@ -1881,20 +1890,14 @@ pub(crate) fn bundled_call(vm: &mut Vm, name: &str, args: &[V]) -> Rt<Option<Opt
             "nativeLoadExtension" => None,
             "nativePrepare" => {
                 let d = bconn(vm, i64v(args[0]))?;
-                let sql = args
-                    .get(1)
-                    .and_then(|v| sv(vm, *v))
-                    .unwrap_or_default();
+                let sql = args.get(1).and_then(|v| sv(vm, *v)).unwrap_or_default();
                 if std::env::var_os("OVELO_DBDBG").is_some() {
                     let t: String = sql.chars().take(100).collect();
                     eprintln!("[bundled] prepare: {t}");
                 }
                 // Compile now: the real JNI surfaces syntax errors here,
                 // not at first step.
-                d.borrow()
-                    .conn
-                    .prepare(&sql)
-                    .map_err(|e| sql_err(vm, e))?;
+                d.borrow().conn.prepare(&sql).map_err(|e| sql_err(vm, e))?;
                 let h = next_bundled_h(vm);
                 vm.bundled_stmts.insert(
                     h as u64,
@@ -1939,7 +1942,14 @@ pub(crate) fn bundled_call(vm: &mut Vm, name: &str, args: &[V]) -> Rt<Option<Opt
                     return Err(sql_err(vm, e));
                 }
                 if std::env::var_os("OVELO_DBDBG").is_some() {
-                    eprintln!("[bundled] step h={h} -> {has} (rows={}, cur={:?})", vm.bundled_stmts.get(&(h as u64)).map(|s| s.rows.len()).unwrap_or(0), vm.bundled_stmts.get(&(h as u64)).and_then(|s| s.cur));
+                    eprintln!(
+                        "[bundled] step h={h} -> {has} (rows={}, cur={:?})",
+                        vm.bundled_stmts
+                            .get(&(h as u64))
+                            .map(|s| s.rows.len())
+                            .unwrap_or(0),
+                        vm.bundled_stmts.get(&(h as u64)).and_then(|s| s.cur)
+                    );
                 }
                 Some(V::I32(has as i32))
             }
@@ -2102,9 +2112,7 @@ pub(crate) fn bundled_call(vm: &mut Vm, name: &str, args: &[V]) -> Rt<Option<Opt
                     .map(|s| s.cell(col))
                     .unwrap_or(SV::Null);
                 Some(match v {
-                    SV::Blob(b) => {
-                        arr(vm, "B", b.iter().map(|&x| V::I32(x as i32)).collect())
-                    }
+                    SV::Blob(b) => arr(vm, "B", b.iter().map(|&x| V::I32(x as i32)).collect()),
                     _ => V::Ref(0),
                 })
             }

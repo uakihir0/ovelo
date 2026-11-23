@@ -128,9 +128,11 @@ fn is_iter(class: &str) -> bool {
 /// not the call site's declared type (guests declare `Collection`).
 fn is_set_obj(vm: &Vm, v: V) -> bool {
     match v {
-        V::Ref(h) if h != 0 => desc_is_a(&class_of(vm, v), "Ljava/util/Set;")
-            || desc_is_a(&class_of(vm, v), "Landroid/util/ArraySet;")
-            || class_of(vm, v).contains("$Set;"),
+        V::Ref(h) if h != 0 => {
+            desc_is_a(&class_of(vm, v), "Ljava/util/Set;")
+                || desc_is_a(&class_of(vm, v), "Landroid/util/ArraySet;")
+                || class_of(vm, v).contains("$Set;")
+        }
         _ => false,
     }
 }
@@ -218,8 +220,8 @@ pub(crate) fn call(
                 let d = i64v(args.get(1).copied().unwrap_or(V::I64(0)));
                 Some(Some(V::I64(timeunit_convert(dst, src, d))))
             }
-            "toNanos" | "toMicros" | "toMillis" | "toSeconds" | "toMinutes"
-            | "toHours" | "toDays" => {
+            "toNanos" | "toMicros" | "toMillis" | "toSeconds" | "toMinutes" | "toHours"
+            | "toDays" => {
                 let dst = match name {
                     "toNanos" => 0,
                     "toMicros" => 1,
@@ -438,8 +440,7 @@ fn list_call(vm: &mut Vm, name: &str, sig: &str, args: &[V]) -> Rt<Option<Option
             let src: Vec<V> = if is_set {
                 src.into_iter()
                     .filter(|v| {
-                        !list_ref(vm, h)
-                            .is_some_and(|l| l.iter().any(|e| value_eq(vm, *e, *v)))
+                        !list_ref(vm, h).is_some_and(|l| l.iter().any(|e| value_eq(vm, *e, *v)))
                     })
                     .collect()
             } else {
@@ -790,8 +791,14 @@ fn map_call(vm: &mut Vm, name: &str, sig: &str, args: &[V]) -> Rt<Option<Option<
     Ok(match name {
         "put" => {
             if std::env::var_os("OVELO_MAPDBG").is_some() {
-                let ks = s(vm, match args[1] { V::Ref(h2) => h2, _ => 0 })
-                    .unwrap_or_else(|| format!("{:?}", args[1]));
+                let ks = s(
+                    vm,
+                    match args[1] {
+                        V::Ref(h2) => h2,
+                        _ => 0,
+                    },
+                )
+                .unwrap_or_else(|| format!("{:?}", args[1]));
                 let caller = vm
                     .stack
                     .last()
@@ -856,10 +863,13 @@ fn map_call(vm: &mut Vm, name: &str, sig: &str, args: &[V]) -> Rt<Option<Option<
         }
         "get" | "getOrDefault" | "remove" | "removeObject" => {
             if std::env::var_os("OVELO_MAPDBG").is_some() {
-                let ks = s(vm, match args[1] {
-                    V::Ref(h2) => h2,
-                    _ => 0,
-                })
+                let ks = s(
+                    vm,
+                    match args[1] {
+                        V::Ref(h2) => h2,
+                        _ => 0,
+                    },
+                )
                 .unwrap_or_else(|| format!("{:?}", args[1]));
                 let hit = map_get(vm, h, args[1]).is_some();
                 let caller = vm
@@ -1083,16 +1093,18 @@ fn map_call(vm: &mut Vm, name: &str, sig: &str, args: &[V]) -> Rt<Option<Option<
         | "lastEntry" => {
             let pairs = map_pairs(vm, h);
             let nm = nav_name(name, nav_desc(vm, h));
-            Some(Some(
-                match nav_pick(vm, &pairs, nm, args.get(1).copied()) {
-                    Some((k, v)) => entry_of(vm, k, v),
-                    None => V::Ref(0),
-                },
-            ))
+            Some(Some(match nav_pick(vm, &pairs, nm, args.get(1).copied()) {
+                Some((k, v)) => entry_of(vm, k, v),
+                None => V::Ref(0),
+            }))
         }
         "pollFirstEntry" | "pollLastEntry" => {
             let pairs = map_pairs(vm, h);
-            let op = if name == "pollFirstEntry" { "first" } else { "last" };
+            let op = if name == "pollFirstEntry" {
+                "first"
+            } else {
+                "last"
+            };
             let op = nav_name(op, nav_desc(vm, h));
             match nav_pick(vm, &pairs, op, None) {
                 Some((k, v)) => {
@@ -1144,25 +1156,14 @@ fn map_call(vm: &mut Vm, name: &str, sig: &str, args: &[V]) -> Rt<Option<Option<
                     args.get(1).copied(),
                     args.get(2).map(|v| i32v(*v) != 0).unwrap_or(true),
                 ),
-                (_, false) => (
-                    args.get(1).copied(),
-                    true,
-                    args.get(2).copied(),
-                    false,
-                ),
-                (_, true) => (
-                    args.get(2).copied(),
-                    true,
-                    args.get(1).copied(),
-                    false,
-                ),
+                (_, false) => (args.get(1).copied(), true, args.get(2).copied(), false),
+                (_, true) => (args.get(2).copied(), true, args.get(1).copied(), false),
             };
             let mut out = Vec::new();
             for &(k, v) in &pairs {
                 let lo_ok = lo.is_none_or(|p| {
                     let c = key_cmp(vm, k, p);
-                    c == std::cmp::Ordering::Greater
-                        || (lo_incl && c == std::cmp::Ordering::Equal)
+                    c == std::cmp::Ordering::Greater || (lo_incl && c == std::cmp::Ordering::Equal)
                 });
                 let hi_ok = hi.is_none_or(|p| {
                     let c = key_cmp(vm, k, p);
@@ -1184,7 +1185,11 @@ fn map_call(vm: &mut Vm, name: &str, sig: &str, args: &[V]) -> Rt<Option<Option<
             if (name == "descendingKeySet") != nav_desc(vm, h) {
                 keys.reverse();
             }
-            Some(Some(host(vm, "Ljava/util/NavigableSet;", HostState::List(keys))))
+            Some(Some(host(
+                vm,
+                "Ljava/util/NavigableSet;",
+                HostState::List(keys),
+            )))
         }
         "descendingMap" => {
             let mut pairs = map_pairs(vm, h);
@@ -2158,7 +2163,11 @@ fn atomic_call(vm: &mut Vm, class: &str, name: &str, args: &[V]) -> Option<Optio
             // where the guest just stored an object. Coerce to the
             // class's natural width so `AtomicLong.get` (J) never
             // surfaces an I32 to a move-result-wide.
-            slot_put(vm, h, width_coerce(class, args.get(1).copied().unwrap_or(V::I32(0))));
+            slot_put(
+                vm,
+                h,
+                width_coerce(class, args.get(1).copied().unwrap_or(V::I32(0))),
+            );
             None
         }
         "get" | "getOpaque" | "getAcquire" | "getPlain" => {

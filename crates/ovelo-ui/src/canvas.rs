@@ -138,13 +138,11 @@ impl<'a> Canvas<'a> {
                 if dx * dx + dy * dy > 1.0 {
                     continue;
                 }
-                let in_inner = irx > 0.0
-                    && iry > 0.0
-                    && {
-                        let ix = (x as f32 + 0.5 - cx) / irx;
-                        let iy = (y as f32 + 0.5 - cy) / iry;
-                        ix * ix + iy * iy <= 1.0
-                    };
+                let in_inner = irx > 0.0 && iry > 0.0 && {
+                    let ix = (x as f32 + 0.5 - cx) / irx;
+                    let iy = (y as f32 + 0.5 - cy) / iry;
+                    ix * ix + iy * iy <= 1.0
+                };
                 if !in_inner {
                     self.surf.blend_pixel(x, y, p.color, 255);
                 }

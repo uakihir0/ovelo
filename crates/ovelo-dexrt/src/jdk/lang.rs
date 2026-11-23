@@ -83,10 +83,8 @@ pub(crate) fn call(
                 match cached {
                     Some(v) => Some(Some(v)),
                     _ => {
-                        let r = vm.alloc_host(
-                            "Ljava/lang/ref/Reference;",
-                            HostState::Slot(V::Ref(0)),
-                        );
+                        let r =
+                            vm.alloc_host("Ljava/lang/ref/Reference;", HostState::Slot(V::Ref(0)));
                         Some(Some(V::Ref(r)))
                     }
                 }
@@ -740,10 +738,7 @@ fn boxed_call(
                     Some(t) if class != "Ljava/lang/Character;" => {
                         let t = t.trim();
                         match class {
-                            "Ljava/lang/Long;" => t
-                                .parse::<i64>()
-                                .map(V::I64)
-                                .unwrap_or(V::I64(0)),
+                            "Ljava/lang/Long;" => t.parse::<i64>().map(V::I64).unwrap_or(V::I64(0)),
                             "Ljava/lang/Double;" => {
                                 t.parse::<f64>().map(V::F64).unwrap_or(V::F64(0.0))
                             }
@@ -1384,8 +1379,9 @@ fn system_call(vm: &mut Vm, name: &str, _sig: &str, args: &[V]) -> Rt<Option<Opt
                 "java.runtime.name" => "Android Runtime",
                 "java.vm.name" => "Dalvik",
                 "java.vm.version" => "2.1.0",
-                "java.vm.vendor" | "java.specification.vendor"
-                | "java.vm.specification.vendor" => "The Android Project",
+                "java.vm.vendor" | "java.specification.vendor" | "java.vm.specification.vendor" => {
+                    "The Android Project"
+                }
                 "java.io.tmpdir" => "/data/local/ovelo/tmp",
                 "file.encoding"
                 | "sun.jnu.encoding"
@@ -1407,8 +1403,8 @@ fn system_call(vm: &mut Vm, name: &str, _sig: &str, args: &[V]) -> Rt<Option<Opt
             crate::jni::load_native_lib(vm, &arg, name == "load");
             Some(None)
         }
-        "gc" | "runFinalization" | "exit" | "halt" | "setIn"
-        | "setOut" | "setErr" | "setProperties" | "setSecurityManager" => Some(None),
+        "gc" | "runFinalization" | "exit" | "halt" | "setIn" | "setOut" | "setErr"
+        | "setProperties" | "setSecurityManager" => Some(None),
         "mapLibraryName" => {
             let n = sv(vm, args[0]).unwrap_or_default();
             Some(Some(jstr(vm, &format!("lib{n}.so"))))
@@ -1598,9 +1594,7 @@ fn class_call(vm: &mut Vm, name: &str, _sig: &str, args: &[V]) -> Rt<Option<Opti
                 .or_else(|| vm.super_desc(&d));
             match sup {
                 Some(sup) => Some(Some(class_obj(vm, sup))),
-                None if !d.is_empty() && d != OBJ => {
-                    Some(Some(class_obj(vm, OBJ.into())))
-                }
+                None if !d.is_empty() && d != OBJ => Some(Some(class_obj(vm, OBJ.into()))),
                 None => Some(Some(V::Ref(0))),
             }
         }
@@ -1626,10 +1620,8 @@ fn class_call(vm: &mut Vm, name: &str, _sig: &str, args: &[V]) -> Rt<Option<Opti
                     let raw = V::Ref(vm.class_handle(&sup));
                     let obj = V::Ref(vm.class_handle(OBJ));
                     let args_arr = arr(vm, OBJ, vec![obj]);
-                    let h = vm.alloc_host(
-                        "Ljava/lang/reflect/ParameterizedType;",
-                        HostState::Empty,
-                    );
+                    let h =
+                        vm.alloc_host("Ljava/lang/reflect/ParameterizedType;", HostState::Empty);
                     pseudo_set(vm, h, P_TARGET, raw);
                     pseudo_set(vm, h, P_DATA, args_arr);
                     Some(Some(V::Ref(h)))
@@ -2241,7 +2233,9 @@ pub(crate) fn enum_value_list(vm: &mut Vm, class: &str) -> Vec<V> {
             if d.type_descriptor(cd.class_idx).ok().as_deref() != Some(class) {
                 continue;
             }
-            let Ok(data) = d.class_data_rc(cd) else { continue };
+            let Ok(data) = d.class_data_rc(cd) else {
+                continue;
+            };
             for ef in &data.static_fields {
                 let is_const = d
                     .field(ef.field_idx)
@@ -2459,9 +2453,7 @@ fn reflect_call(
         } else {
             None
         }),
-        "isAccessible" | "canAccess" | "isDefault" | "isEnumConstant" => {
-            Some(Some(V::I32(1)))
-        }
+        "isAccessible" | "canAccess" | "isDefault" | "isEnumConstant" => Some(Some(V::I32(1))),
         "isSynthetic" | "isBridge" | "isVarArgs" => {
             let f = pseudo_get(vm, h, P_FLAGS)
                 .map(|v| match v {
@@ -2656,16 +2648,12 @@ fn reflect_call(
                 // component may itself be an array (`int[].class` →
                 // `int[][]`) or a primitive (`int.class` → `int[]`).
                 let comp = match args.first() {
-                    Some(V::Ref(h)) => {
-                        class_desc_of(vm, *h).unwrap_or_else(|| OBJ.to_string())
-                    }
+                    Some(V::Ref(h)) => class_desc_of(vm, *h).unwrap_or_else(|| OBJ.to_string()),
                     _ => OBJ.to_string(),
                 };
                 let dims: Vec<i32> = match args.get(1) {
                     Some(V::Ref(dh)) => match vm.heap.get(*dh) {
-                        Some(Obj::Array { data, .. }) => {
-                            data.iter().map(|v| i32v(*v)).collect()
-                        }
+                        Some(Obj::Array { data, .. }) => data.iter().map(|v| i32v(*v)).collect(),
                         _ => vec![0],
                     },
                     Some(v) => vec![i32v(*v)],
@@ -3015,8 +3003,7 @@ fn unsafe_call(vm: &mut Vm, name: &str, args: &[V]) -> Rt<Option<Option<V>>> {
             // call so the guest's own deadline check eventually trips.
             let time = i64v(args.get(2).copied().unwrap_or(V::I64(0)));
             if time > 0 {
-                let absolute =
-                    i64v(args.get(1).copied().unwrap_or(V::I32(0))) != 0;
+                let absolute = i64v(args.get(1).copied().unwrap_or(V::I32(0))) != 0;
                 let remain_ms = if absolute {
                     time.saturating_sub(now_ms())
                 } else {
@@ -3045,9 +3032,7 @@ fn unsafe_call(vm: &mut Vm, name: &str, args: &[V]) -> Rt<Option<Option<V>>> {
                         .map(|(_, _, t)| t.saturating_sub(now))
                         .min()
                         .unwrap_or(u64::MAX);
-                    let ms = (remain_ms.max(0) as u64)
-                        .min(until_due)
-                        .clamp(1, 64);
+                    let ms = (remain_ms.max(0) as u64).min(until_due).clamp(1, 64);
                     std::thread::sleep(std::time::Duration::from_millis(ms));
                 }
                 return Ok(Some(None));
@@ -3064,9 +3049,7 @@ fn unsafe_call(vm: &mut Vm, name: &str, args: &[V]) -> Rt<Option<Option<V>>> {
             vm.wake_parked();
             None
         }
-        "loadFence" | "storeFence" | "fullFence" | "monitorEnter" | "monitorExit" => {
-            None
-        }
+        "loadFence" | "storeFence" | "fullFence" | "monitorEnter" | "monitorExit" => None,
         _ => return Ok(None),
     };
     Ok(Some(v))
@@ -3086,7 +3069,9 @@ fn new_array_dims(vm: &mut Vm, comp: &str, dims: &[i32]) -> V {
     let data = if dims.len() <= 1 {
         vec![V::default_for(&elem); n]
     } else {
-        (0..n).map(|_| new_array_dims(vm, comp, &dims[1..])).collect()
+        (0..n)
+            .map(|_| new_array_dims(vm, comp, &dims[1..]))
+            .collect()
     };
     arr(vm, &elem, data)
 }

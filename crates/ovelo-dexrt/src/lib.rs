@@ -17,8 +17,8 @@ mod value;
 
 pub use aot::Aot;
 pub use jdk::view::{fire_global_layout, DexViewInfo, P_TCOLOR, P_TEXT, P_TSIZE};
-pub use value::{CanvasOp, PaintState};
 pub use jdk::{pseudo_get, pseudo_set, P_COMPONENT, P_DATA, P_META, P_TARGET};
+pub use value::{CanvasOp, PaintState};
 pub use value::{Heap, HostState, Obj, V};
 
 use aot::{AotFn, TRAP_DIV_ZERO, TRAP_REM_ZERO};
@@ -900,9 +900,7 @@ impl Vm {
         let ret = d.type_descriptor(p.return_type_idx)?;
         sig.push_str(&ret);
         let out = (class, name, sig);
-        self.method_sig_cache
-            .borrow_mut()
-            .insert(midx, out.clone());
+        self.method_sig_cache.borrow_mut().insert(midx, out.clone());
         Ok(out)
     }
 
@@ -1636,12 +1634,15 @@ impl Vm {
         self.unsafe_offsets
             .retain(|(h, _), _| self.heap.get(*h).is_some());
         self.obj_db.retain(|h, _| self.heap.get(*h).is_some());
-        self.throw_sites
-            .retain(|h, _| self.heap.get(*h).is_some());
+        self.throw_sites.retain(|h, _| self.heap.get(*h).is_some());
         // Next collection when the heap grows another ~50%.
         self.gc_mark = (self.heap.len() * 3 / 2).max(65_536);
         if std::env::var_os("OVELO_MEMDBG").is_some() {
-            eprintln!("[gc] freed {freed} slots={} mark={}", self.heap.len(), self.gc_mark);
+            eprintln!(
+                "[gc] freed {freed} slots={} mark={}",
+                self.heap.len(),
+                self.gc_mark
+            );
         }
         freed
     }
@@ -1654,8 +1655,10 @@ impl Vm {
         }
         native::check_all_zones("drain");
         let now = jdk::now_ms() as u64;
-        let (due, later): (Vec<_>, Vec<_>) =
-            self.delayed_runnables.drain(..).partition(|(_, _, t)| *t <= now);
+        let (due, later): (Vec<_>, Vec<_>) = self
+            .delayed_runnables
+            .drain(..)
+            .partition(|(_, _, t)| *t <= now);
         self.delayed_runnables = later;
         for (r, on_main, _) in due {
             self.pending_runnables.push_back((r, on_main));
@@ -1686,9 +1689,7 @@ impl Vm {
                 }
             }
             match &out {
-                Err(e) if e.cause() == "ovelo.park"
-                    && self.thread_runnables.contains(&r) =>
-                {
+                Err(e) if e.cause() == "ovelo.park" && self.thread_runnables.contains(&r) => {
                     // A `Thread` runnable that parked on Thread.sleep
                     // waits out its requested deadline, then re-runs —
                     // no repark budget: a game loop legitimately parks
@@ -1696,9 +1697,7 @@ impl Vm {
                     let due = self.sleep_until.remove(&r).unwrap_or(now);
                     self.delayed_runnables.push((r, on_main, due));
                 }
-                Err(e) if e.cause() == "ovelo.park"
-                    && self.sleep_until.contains_key(&r) =>
-                {
+                Err(e) if e.cause() == "ovelo.park" && self.sleep_until.contains_key(&r) => {
                     // A non-thread runnable parked with a recorded
                     // deadline (e.g. RealCall.execute polling a host
                     // fetch) waits it out rather than burning reparks.
@@ -1826,12 +1825,12 @@ impl Vm {
         };
         if std::env::var_os("OVELO_VIEWDBG").is_some() {
             let d = self.type_desc_of(ci).unwrap_or_else(|_| "?".into());
-            eprintln!("[viewdbg] hdv h{h} ci={ci} desc={d} {name} -> {:?}", self.find_method_on_chain_sig(ci, name, params));
+            eprintln!(
+                "[viewdbg] hdv h{h} ci={ci} desc={d} {name} -> {:?}",
+                self.find_method_on_chain_sig(ci, name, params)
+            );
         }
-        matches!(
-            self.find_method_on_chain_sig(ci, name, params),
-            Ok(Some(_))
-        )
+        matches!(self.find_method_on_chain_sig(ci, name, params), Ok(Some(_)))
     }
 
     /// The options `Menu` attached to an Activity — the runner hands it
@@ -1958,9 +1957,7 @@ impl Vm {
             .map(|(class, name, sig)| format!("{class}.{name}{sig}"))
             .unwrap_or_else(|_| format!("method@{midx}"))
             .into();
-        self.method_desc_cache
-            .borrow_mut()
-            .insert(midx, s.clone());
+        self.method_desc_cache.borrow_mut().insert(midx, s.clone());
         s
     }
 
@@ -2065,7 +2062,11 @@ impl Vm {
             let mut slots = 0usize;
             for t in d.proto_params(p)? {
                 let ty = d.type_descriptor(t as u32)?;
-                slots += if ty.starts_with('J') || ty.starts_with('D') { 2 } else { 1 };
+                slots += if ty.starts_with('J') || ty.starts_with('D') {
+                    2
+                } else {
+                    1
+                };
             }
             if slots == nslots {
                 return Ok(Some(gx(di, m.method_idx)));
@@ -2973,12 +2974,7 @@ impl Vm {
         out.ok_or_else(|| E::Vm(err("dexrt.invoke.unresolved")))
     }
 
-    fn resolve_virtual_uncached(
-        &self,
-        midx: GIdx,
-        start_class: GIdx,
-        fallback: bool,
-    ) -> Rt<Loc> {
+    fn resolve_virtual_uncached(&self, midx: GIdx, start_class: GIdx, fallback: bool) -> Rt<Loc> {
         let Ok((_, name, sig)) = self.method_sig(midx) else {
             return Err(E::Vm(err("dexrt.invoke.unresolved")));
         };
@@ -3110,7 +3106,10 @@ impl Vm {
         if std::env::var_os("OVELO_VIEWDBG").is_some()
             && self.describe_method(midx).contains("setText")
         {
-            eprintln!("[viewdbg] call_builtin {} args={args:?}", self.describe_method(midx));
+            eprintln!(
+                "[viewdbg] call_builtin {} args={args:?}",
+                self.describe_method(midx)
+            );
         }
         let args = self.compact_args(midx, args, has_receiver);
         let args = args.as_slice();
@@ -3149,8 +3148,7 @@ impl Vm {
             ("Ljava/lang/String;", "length") => {
                 if let V::Ref(h) = args.first().copied().unwrap_or(V::Ref(0)) {
                     if let Some(s) = self.heap.str_val(h).map(|x| x.to_string()).or_else(|| {
-                        jdk::pseudo_get(self, h, jdk::P_DATA)
-                            .and_then(|v| jdk::sv(self, v))
+                        jdk::pseudo_get(self, h, jdk::P_DATA).and_then(|v| jdk::sv(self, v))
                     }) {
                         return Ok(Some(V::I32(s.chars().count() as i32)));
                     }
@@ -3340,12 +3338,7 @@ impl Vm {
     /// ROOT method only — compat shims delegate to the real dex body
     /// through this once the genuine path is known to work (nested
     /// invokes inside the dex body still honor host overrides).
-    pub fn call_virtual_direct(
-        &mut self,
-        this: u32,
-        name: &str,
-        args: &[V],
-    ) -> Result<Option<V>> {
+    pub fn call_virtual_direct(&mut self, this: u32, name: &str, args: &[V]) -> Result<Option<V>> {
         let ci = self
             .heap
             .class_of(this)
@@ -3420,9 +3413,7 @@ impl Vm {
         };
         let as_i64 = as_f64 as i64;
         Ok(Some(match name.as_str() {
-            "intValue" | "shortValue" | "byteValue" | "charValue" => {
-                V::I32(as_i64 as i32)
-            }
+            "intValue" | "shortValue" | "byteValue" | "charValue" => V::I32(as_i64 as i32),
             "longValue" => V::I64(as_i64),
             "floatValue" => V::F32(as_f64 as f32),
             "doubleValue" => V::F64(as_f64),
@@ -3474,11 +3465,11 @@ impl Vm {
     /// numbers satisfy Number/Object and the matching box class.
     fn scalar_is_instance(&mut self, v: V, ty: GIdx) -> bool {
         let want = self.type_desc_of(ty).unwrap_or_default();
-        let num = matches!(v, V::I32(_) | V::I64(_) | V::F32(_) | V::F64(_))
-            && !Self::scalar_is_zero(v);
+        let num =
+            matches!(v, V::I32(_) | V::I64(_) | V::F32(_) | V::F64(_)) && !Self::scalar_is_zero(v);
         let int_kind = matches!(v, V::I32(_) | V::I64(_));
-        let hit = num
-            && matches!(
+        let hit =
+            num && matches!(
                 want.as_str(),
                 "Ljava/lang/Object;"
                     | "Ljava/lang/Number;"
@@ -3490,8 +3481,7 @@ impl Vm {
                     | "Ljava/lang/Float;"
                     | "Ljava/io/Serializable;"
                     | "Ljava/lang/Comparable;"
-            )
-            && (want != "Ljava/lang/Double;" && want != "Ljava/lang/Float;" || !int_kind);
+            ) && (want != "Ljava/lang/Double;" && want != "Ljava/lang/Float;" || !int_kind);
         if std::env::var_os("OVELO_TRACE_INSTOF").is_some() {
             eprintln!("[instof] scalar {:?} vs {} -> {}", v, want, hit);
         }
@@ -3518,8 +3508,18 @@ impl Vm {
             if let Some(d) = self.dex_of(midx) {
                 if let Ok(m) = d.method(gl(midx)) {
                     if let Ok(n) = d.string(m.name_idx) {
-                        if matches!(n.as_str(), "measure" | "measureChild" | "measureChildWithMargins" | "onMeasureChild") {
-                            eprintln!("[viewdbg] invoke {} recv={:?}", self.describe_method(midx), args.first());
+                        if matches!(
+                            n.as_str(),
+                            "measure"
+                                | "measureChild"
+                                | "measureChildWithMargins"
+                                | "onMeasureChild"
+                        ) {
+                            eprintln!(
+                                "[viewdbg] invoke {} recv={:?}",
+                                self.describe_method(midx),
+                                args.first()
+                            );
                         }
                     }
                 }
@@ -3661,7 +3661,12 @@ impl Vm {
 
     /// JNI-facing wrappers — the `jni` module sits outside `Vm` but
     /// needs the same interpreter surface the opcodes use.
-    pub(crate) fn invoke_pub(&mut self, midx: GIdx, args: Vec<V>, kind: InvokeKind) -> Rt<Option<V>> {
+    pub(crate) fn invoke_pub(
+        &mut self,
+        midx: GIdx,
+        args: Vec<V>,
+        kind: InvokeKind,
+    ) -> Rt<Option<V>> {
         self.invoke(midx, args, kind)
     }
 
@@ -3717,21 +3722,16 @@ impl Vm {
                 // descriptor can't resolve on a dex chain, but the
                 // builtin surface can still answer it — same fallback
                 // `call_virtual_sig` uses.
-                if let Some(r) = jdk::call(self, owner, name, "", &args)
-                    .map_err(|e| match e {
-                        E::Vm(v) => v,
-                        E::Throw(h) => {
-                            let d = self.describe_throw(h);
-                            errd("dexrt.exception.uncaught", d)
-                        }
-                    })?
-                {
+                if let Some(r) = jdk::call(self, owner, name, "", &args).map_err(|e| match e {
+                    E::Vm(v) => v,
+                    E::Throw(h) => {
+                        let d = self.describe_throw(h);
+                        errd("dexrt.exception.uncaught", d)
+                    }
+                })? {
                     return Ok(r);
                 }
-                Err(errd(
-                    "dexrt.invoke.unresolved",
-                    format!("{owner}.{name}"),
-                ))
+                Err(errd("dexrt.invoke.unresolved", format!("{owner}.{name}")))
             }
         }
     }
@@ -3775,10 +3775,9 @@ impl Vm {
                 });
                 Some(V::Ref(h))
             }
-            EV::Annotation {
-                type_idx,
-                elements,
-            } => self.annotation_mirror(cg, *type_idx, elements),
+            EV::Annotation { type_idx, elements } => {
+                self.annotation_mirror(cg, *type_idx, elements)
+            }
             _ => None,
         }
     }
@@ -3894,12 +3893,7 @@ impl Vm {
                 continue;
             }
             for (ni, ev) in &it.elements {
-                if self
-                    .dex_of(cg)
-                    .and_then(|d| d.string(*ni).ok())
-                    .as_deref()
-                    == Some(name)
-                {
+                if self.dex_of(cg).and_then(|d| d.string(*ni).ok()).as_deref() == Some(name) {
                     return self.encoded_to_v(cg, ev);
                 }
             }
@@ -4044,7 +4038,8 @@ impl Vm {
         let v = if self.def_of(owner).is_none() {
             self.builtin_sfield(f).or_else(|| self.field_default(f))
         } else {
-            self.encoded_static(owner, f).or_else(|| self.field_default(f))
+            self.encoded_static(owner, f)
+                .or_else(|| self.field_default(f))
         }?;
         if matches!(v, V::Ref(h) if h != 0) {
             self.classes.entry(owner).or_default().statics.insert(f, v);
@@ -4100,9 +4095,7 @@ impl Vm {
                         continue;
                     }
                     if let Some(want) = want_ty {
-                        if d.type_descriptor(fi.type_idx as u32).ok().as_deref()
-                            == Some(want)
-                        {
+                        if d.type_descriptor(fi.type_idx as u32).ok().as_deref() == Some(want) {
                             return Some(gx(gd(cg), f.field_idx));
                         }
                     }
@@ -4640,10 +4633,7 @@ impl Vm {
                 let desc = self.dexes[di]
                     .type_descriptor(ins.idx.unwrap_or(0))
                     .map_err(E::Vm)?;
-                let elem = desc
-                    .strip_prefix('[')
-                    .unwrap_or(&desc)
-                    .to_string();
+                let elem = desc.strip_prefix('[').unwrap_or(&desc).to_string();
                 let h = self.heap.alloc(Obj::Array {
                     data: vec![V::default_for(&elem); len as usize],
                     elem,
@@ -4656,10 +4646,7 @@ impl Vm {
                 let desc = self.dexes[di]
                     .type_descriptor(ins.idx.unwrap_or(0))
                     .map_err(E::Vm)?;
-                let elem = desc
-                    .strip_prefix('[')
-                    .unwrap_or(&desc)
-                    .to_string();
+                let elem = desc.strip_prefix('[').unwrap_or(&desc).to_string();
                 let arg_regs: Vec<usize> = if ins.opcode == 0x25 {
                     // {vCCCC..+AA}: `regs`=[range start], `lit`=reg count
                     let (first, n) = (regs[0] as usize, ins.lit.unwrap_or(0) as usize);
@@ -5031,7 +5018,10 @@ impl Vm {
                                     s.push_str(&format!("[{}]", els.join(",")));
                                 }
                                 if let Some(Obj::Str(t)) = self.heap.get(*h) {
-                                    s.push_str(&format!("=\"{}\"", t.chars().take(80).collect::<String>()));
+                                    s.push_str(&format!(
+                                        "=\"{}\"",
+                                        t.chars().take(80).collect::<String>()
+                                    ));
                                 }
                                 if let Some(Obj::Class { type_idx }) = self.heap.get(*h) {
                                     if let Ok(d) = self.type_desc_of(*type_idx) {
@@ -5050,7 +5040,8 @@ impl Vm {
                 if let Some(p) = self.trace_call.as_deref() {
                     let callee = self.describe_method(midx);
                     let caller = self.describe_method(fr.loc.midx);
-                    if p.split(',').any(|one| !one.is_empty() && callee.contains(one))
+                    if p.split(',')
+                        .any(|one| !one.is_empty() && callee.contains(one))
                         && self
                             .trace_from
                             .as_deref()
@@ -5092,7 +5083,10 @@ impl Vm {
                         let thisfmt = match this_arg {
                             Some(V::Ref(h)) => match self.heap.get(h) {
                                 Some(Obj::Str(t)) => {
-                                    format!("h{h}:String=\"{}\"", t.chars().take(80).collect::<String>())
+                                    format!(
+                                        "h{h}:String=\"{}\"",
+                                        t.chars().take(80).collect::<String>()
+                                    )
                                 }
                                 _ => format!("{:?}", this_arg.unwrap()),
                             },
@@ -5101,7 +5095,10 @@ impl Vm {
                         let resfmt = match res {
                             Some(V::Ref(h)) if h != 0 => match self.heap.get(h) {
                                 Some(Obj::Str(t)) => {
-                                    format!("Some(h{h}:String=\"{}\")", t.chars().take(80).collect::<String>())
+                                    format!(
+                                        "Some(h{h}:String=\"{}\")",
+                                        t.chars().take(80).collect::<String>()
+                                    )
                                 }
                                 _ => format!("{res:?}"),
                             },

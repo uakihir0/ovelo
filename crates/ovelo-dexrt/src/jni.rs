@@ -556,29 +556,64 @@ pub(crate) fn init_tables() {
 
         let mut names = std::collections::HashMap::new();
         for (i, n) in [
-            (4, "GetVersion"), (6, "FindClass"), (13, "Throw"), (14, "ThrowNew"),
-            (15, "ExceptionOccurred"), (16, "ExceptionDescribe"), (17, "ExceptionClear"),
-            (20, "PopLocalFrame"), (21, "NewLocalRef"), (24, "IsSameObject"),
-            (25, "NewGlobalRef"), (27, "AllocObject"), (31, "GetObjectClass"),
-            (32, "IsInstanceOf"), (33, "GetMethodID"), (36, "CallObjectMethodA"),
-            (39, "CallBooleanMethodA"), (42, "CallByteMethodA"), (45, "CallCharMethodA"),
-            (48, "CallShortMethodA"), (51, "CallIntMethodA"), (54, "CallLongMethodA"),
-            (57, "CallFloatMethodA"), (60, "CallDoubleMethodA"), (63, "CallVoidMethodA"),
-            (94, "GetFieldID"), (95, "GetObjectField"), (100, "GetIntField"),
-            (104, "SetObjectField"), (113, "GetStaticMethodID"),
-            (116, "CallStaticObjectMethodA"), (143, "CallStaticVoidMethodA"),
-            (144, "GetStaticFieldID"), (145, "GetStaticObjectField"),
-            (154, "SetStaticObjectField"), (163, "NewString"), (164, "GetStringLength"),
-            (167, "NewStringUTF"), (168, "GetStringUTFLength"),
-            (169, "GetStringUTFChars"), (170, "ReleaseStringUTFChars"),
-            (171, "GetArrayLength"), (172, "NewObjectArray"),
-            (173, "GetObjectArrayElement"), (174, "SetObjectArrayElement"),
-            (184, "GetByteArrayElements"), (187, "GetIntArrayElements"),
-            (192, "ReleaseByteArrayElements"), (195, "ReleaseIntArrayElements"),
-            (200, "GetByteArrayRegion"), (203, "GetIntArrayRegion"),
-            (208, "SetByteArrayRegion"), (211, "SetIntArrayRegion"),
-            (215, "RegisterNatives"), (219, "GetJavaVM"), (228, "ExceptionCheck"),
-            (229, "NewDirectByteBuffer"), (230, "GetDirectBufferAddress"),
+            (4, "GetVersion"),
+            (6, "FindClass"),
+            (13, "Throw"),
+            (14, "ThrowNew"),
+            (15, "ExceptionOccurred"),
+            (16, "ExceptionDescribe"),
+            (17, "ExceptionClear"),
+            (20, "PopLocalFrame"),
+            (21, "NewLocalRef"),
+            (24, "IsSameObject"),
+            (25, "NewGlobalRef"),
+            (27, "AllocObject"),
+            (31, "GetObjectClass"),
+            (32, "IsInstanceOf"),
+            (33, "GetMethodID"),
+            (36, "CallObjectMethodA"),
+            (39, "CallBooleanMethodA"),
+            (42, "CallByteMethodA"),
+            (45, "CallCharMethodA"),
+            (48, "CallShortMethodA"),
+            (51, "CallIntMethodA"),
+            (54, "CallLongMethodA"),
+            (57, "CallFloatMethodA"),
+            (60, "CallDoubleMethodA"),
+            (63, "CallVoidMethodA"),
+            (94, "GetFieldID"),
+            (95, "GetObjectField"),
+            (100, "GetIntField"),
+            (104, "SetObjectField"),
+            (113, "GetStaticMethodID"),
+            (116, "CallStaticObjectMethodA"),
+            (143, "CallStaticVoidMethodA"),
+            (144, "GetStaticFieldID"),
+            (145, "GetStaticObjectField"),
+            (154, "SetStaticObjectField"),
+            (163, "NewString"),
+            (164, "GetStringLength"),
+            (167, "NewStringUTF"),
+            (168, "GetStringUTFLength"),
+            (169, "GetStringUTFChars"),
+            (170, "ReleaseStringUTFChars"),
+            (171, "GetArrayLength"),
+            (172, "NewObjectArray"),
+            (173, "GetObjectArrayElement"),
+            (174, "SetObjectArrayElement"),
+            (184, "GetByteArrayElements"),
+            (187, "GetIntArrayElements"),
+            (192, "ReleaseByteArrayElements"),
+            (195, "ReleaseIntArrayElements"),
+            (200, "GetByteArrayRegion"),
+            (203, "GetIntArrayRegion"),
+            (208, "SetByteArrayRegion"),
+            (211, "SetIntArrayRegion"),
+            (215, "RegisterNatives"),
+            (219, "GetJavaVM"),
+            (228, "ExceptionCheck"),
+            (229, "NewDirectByteBuffer"),
+            (230, "GetDirectBufferAddress"),
             (231, "GetDirectBufferCapacity"),
         ] {
             let p = JNI_TABLE[i] as usize;
@@ -762,16 +797,16 @@ fn call_obj_direct(obj: u64, mid: u64, args: &[V]) -> Option<V> {
     let mut a = Vec::with_capacity(args.len() + 1);
     a.push(V::Ref(obj as u32));
     a.extend_from_slice(args);
-    v.invoke_pub(g, a, crate::InvokeKind::Direct)
-        .ok()
-        .flatten()
+    v.invoke_pub(g, a, crate::InvokeKind::Direct).ok().flatten()
 }
 
 /// Method-id registration: name+sig on `clazz` (a jclass handle) → id.
 fn find_method_id(clazz: u64, name_p: u64, sig_p: u64) -> u64 {
     let name = cstr_ro(name_p);
     let sig = cstr_ro(sig_p);
-    if std::env::var("OVELO_JNIDBG").is_ok() { eprintln!("[jni] GetMethodID {name}{sig} clazz={clazz:#x}"); }
+    if std::env::var("OVELO_JNIDBG").is_ok() {
+        eprintln!("[jni] GetMethodID {name}{sig} clazz={clazz:#x}");
+    }
     let params = split_params(&sig);
     let pref: Vec<&str> = params.iter().map(String::as_str).collect();
     let mut v = vm();
@@ -796,7 +831,9 @@ fn find_method_id(clazz: u64, name_p: u64, sig_p: u64) -> u64 {
 fn find_field_id(clazz: u64, name_p: u64, sig_p: u64, is_static: bool) -> u64 {
     let name = cstr_ro(name_p);
     let sig = cstr_ro(sig_p);
-    if std::env::var("OVELO_JNIDBG").is_ok() { eprintln!("[jni] GetFieldID {name} clazz={clazz:#x}"); }
+    if std::env::var("OVELO_JNIDBG").is_ok() {
+        eprintln!("[jni] GetFieldID {name} clazz={clazz:#x}");
+    }
     let mut v = vm();
     let Some(ci) = (match clazz {
         h if h != 0 => v.class_for_jclass(h as u32),
@@ -823,16 +860,24 @@ extern "C" fn find_class(_e: u64, name_p: u64) -> u64 {
     env_enter("find_class");
     let name = cstr_ro(name_p);
     let dbg = std::env::var("OVELO_JNIDBG").is_ok();
-    if dbg { eprintln!("[jni] FindClass {name}"); }
+    if dbg {
+        eprintln!("[jni] FindClass {name}");
+    }
     let desc = format!("L{};", name.replace('.', "/"));
     let mut v = vm();
-    if dbg { eprintln!("[jni]   type_index_of.."); }
+    if dbg {
+        eprintln!("[jni]   type_index_of..");
+    }
     let ci = v.type_index_of(&desc);
-    if dbg { eprintln!("[jni]   ci={ci:?} -> mirror.."); }
+    if dbg {
+        eprintln!("[jni]   ci={ci:?} -> mirror..");
+    }
     match ci {
         Some(ci) => {
             let h = v.class_mirror(ci) as u64;
-            if dbg { eprintln!("[jni]   mirror={h:#x}"); }
+            if dbg {
+                eprintln!("[jni]   mirror={h:#x}");
+            }
             h
         }
         None => {
@@ -865,7 +910,10 @@ extern "C" fn exception_occurred(_e: u64) -> u64 {
 }
 extern "C" fn exception_describe(_e: u64) -> u64 {
     env_enter("exception_describe");
-    eprintln!("[jni] ExceptionDescribe: pending={:#x}", vm().jni_pending_exc);
+    eprintln!(
+        "[jni] ExceptionDescribe: pending={:#x}",
+        vm().jni_pending_exc
+    );
     0
 }
 extern "C" fn exception_clear(_e: u64) -> u64 {
@@ -939,7 +987,12 @@ fn jargs(params: &[String], jvalues: u64) -> Vec<V> {
     params
         .iter()
         .enumerate()
-        .map(|(i, d)| jval(unsafe { ((jvalues + 8 * i as u64) as *const u64).read() }, d))
+        .map(|(i, d)| {
+            jval(
+                unsafe { ((jvalues + 8 * i as u64) as *const u64).read() },
+                d,
+            )
+        })
         .collect()
 }
 
@@ -1262,7 +1315,9 @@ extern "C" fn is_assignable_from(_e: u64, sub: u64, sup: u64) -> u64 {
 }
 
 fn field_get_v(obj: u64, id: u64) -> V {
-    let Some(g) = fid_of(id) else { return V::I32(0) };
+    let Some(g) = fid_of(id) else {
+        return V::I32(0);
+    };
     let v = vm();
     let f = v.canon_field(g);
     match v.heap.get(obj as u32) {
@@ -1283,7 +1338,9 @@ fn field_set_v(obj: u64, id: u64, val: u64) {
     }
 }
 fn static_get_v(_clazz: u64, id: u64) -> V {
-    let Some(g) = fid_of(id) else { return V::I32(0) };
+    let Some(g) = fid_of(id) else {
+        return V::I32(0);
+    };
     vm().sget_pub(g).unwrap_or(V::I32(0))
 }
 fn static_set_v(_clazz: u64, id: u64, val: u64) {
@@ -1465,10 +1522,7 @@ fn mutf8_unit(out: &mut Vec<u8>, u: u16) {
     match u {
         0 => out.extend_from_slice(&[0xC0, 0x80]),
         1..=0x7F => out.push(u as u8),
-        0x80..=0x7FF => out.extend_from_slice(&[
-            0xC0 | (u >> 6) as u8,
-            0x80 | (u & 0x3F) as u8,
-        ]),
+        0x80..=0x7FF => out.extend_from_slice(&[0xC0 | (u >> 6) as u8, 0x80 | (u & 0x3F) as u8]),
         _ => out.extend_from_slice(&[
             0xE0 | (u >> 12) as u8,
             0x80 | ((u >> 6) & 0x3F) as u8,
@@ -1490,7 +1544,10 @@ extern "C" fn get_string_utf_region(_e: u64, s: u64, start: u64, len: u64, buf: 
         mutf8_unit(&mut out, u);
     }
     if !crate::native::guest_dst_ok(buf as usize, out.len()) {
-        eprintln!("[guestptr] get_string_utf_region: write {buf:#x}+{} not guest/stack/image", out.len());
+        eprintln!(
+            "[guestptr] get_string_utf_region: write {buf:#x}+{} not guest/stack/image",
+            out.len()
+        );
         return;
     }
     unsafe {
@@ -1603,11 +1660,7 @@ fn get_elems(a: u64, _copy: u64) -> u64 {
         // the malloc'd block.
         unsafe {
             let bytes = elem_bits(*v, sz).to_le_bytes();
-            std::ptr::copy_nonoverlapping(
-                bytes.as_ptr(),
-                (buf + (i * sz) as u64) as *mut u8,
-                sz,
-            );
+            std::ptr::copy_nonoverlapping(bytes.as_ptr(), (buf + (i * sz) as u64) as *mut u8, sz);
         }
     }
     buf
@@ -1668,7 +1721,10 @@ fn libc_free(p: usize) {
     if let Some(n) = n {
         let m = unsafe { ((p + n) as *const u64).read_unaligned() };
         if m != 0xdead_beef_cafe_f00d {
-            eprintln!("[bufdbg] canary dead at {p:#x}+{n} on free; last env {}", last_env_get());
+            eprintln!(
+                "[bufdbg] canary dead at {p:#x}+{n} on free; last env {}",
+                last_env_get()
+            );
         }
     }
     crate::native::guest_free(p)
@@ -1686,7 +1742,10 @@ fn check_buf_canaries(name: &'static str) {
         for (&p, &n) in b.iter() {
             let m = unsafe { ((p + n) as *const u64).read_unaligned() };
             if m != 0xdead_beef_cafe_f00d {
-                eprintln!("[bufdbg] overrun: buf {p:#x}+{n} bad on entry to {name}; previous env {}", last_env_get());
+                eprintln!(
+                    "[bufdbg] overrun: buf {p:#x}+{n} bad on entry to {name}; previous env {}",
+                    last_env_get()
+                );
             }
         }
     }
@@ -1749,11 +1808,7 @@ fn get_region(a: u64, start: u64, len: u64, out: u64) {
         // stride spills into the caller's buffer past the last element.
         unsafe {
             let bytes = elem_bits(v, sz).to_le_bytes();
-            std::ptr::copy_nonoverlapping(
-                bytes.as_ptr(),
-                (out + (i * sz) as u64) as *mut u8,
-                sz,
-            );
+            std::ptr::copy_nonoverlapping(bytes.as_ptr(), (out + (i * sz) as u64) as *mut u8, sz);
         }
     }
 }
@@ -1815,7 +1870,9 @@ sr!(set_double_array_region);
 
 extern "C" fn register_natives(_e: u64, clazz: u64, methods: u64, n: u64) -> u64 {
     env_enter("register_natives");
-    if std::env::var("OVELO_JNIDBG").is_ok() { eprintln!("[jni] RegisterNatives clazz={clazz:#x} n={n}"); }
+    if std::env::var("OVELO_JNIDBG").is_ok() {
+        eprintln!("[jni] RegisterNatives clazz={clazz:#x} n={n}");
+    }
     let mut v = vm();
     let desc = v
         .class_for_jclass(clazz as u32)
@@ -1836,7 +1893,8 @@ extern "C" fn register_natives(_e: u64, clazz: u64, methods: u64, n: u64) -> u64
         };
         let name = cstr_ro(name_p);
         let sig = cstr_ro(sig_p);
-        lib.registered.insert((desc.clone(), name, sig), fn_p as usize);
+        lib.registered
+            .insert((desc.clone(), name, sig), fn_p as usize);
     }
     0
 }
@@ -1872,7 +1930,9 @@ extern "C" fn new_direct_byte_buffer(_e: u64, addr: u64, cap: u64) -> u64 {
         eprintln!("[guestptr] new_direct_byte_buffer: {addr:#x}+{cap} not guest/stack/image");
     }
     let mut v = vm();
-    let ci = v.type_index_of("Ljava/nio/ByteBuffer;").unwrap_or(crate::GX_NONE);
+    let ci = v
+        .type_index_of("Ljava/nio/ByteBuffer;")
+        .unwrap_or(crate::GX_NONE);
     let mut fields = std::collections::HashMap::new();
     fields.insert(jdk::P_DATA as u64, V::I64(addr as i64));
     fields.insert(jdk::P_FLAGS as u64, V::I64(cap as i64));
@@ -1926,7 +1986,10 @@ pub(crate) fn native_addr(vm: &Vm, class: &str, name: &str, sig: &str) -> Option
         if let Some(&a) = lib.exports.get(&short).or_else(|| lib.exports.get(&long)) {
             return Some(a);
         }
-        if let Some(&a) = lib.registered.get(&(class.to_string(), name.to_string(), sig.to_string())) {
+        if let Some(&a) =
+            lib.registered
+                .get(&(class.to_string(), name.to_string(), sig.to_string()))
+        {
             return Some(a);
         }
     }
@@ -2052,7 +2115,11 @@ pub(crate) fn dispatch_native(
     };
     let mut ii = 2usize;
     let mut fi = 0usize;
-    let params = if is_static { args } else { &args[1.min(args.len())..] };
+    let params = if is_static {
+        args
+    } else {
+        &args[1.min(args.len())..]
+    };
     for v in params {
         match v {
             V::F32(f) => {

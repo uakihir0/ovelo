@@ -9,8 +9,8 @@ mod android;
 mod collect;
 pub(crate) mod db;
 pub(crate) mod gfx;
-pub(crate) mod http;
 pub(crate) mod gl;
+pub(crate) mod http;
 mod io;
 mod lang;
 mod rx;
@@ -828,13 +828,15 @@ pub(crate) fn map_pairs_of(vm: &Vm, h: u32) -> Vec<(V, V)> {
             state: HostState::Map(m),
             ..
         }) => m.clone(),
-        Some(Obj::Instance { .. }) => match guest_map_backing(vm, h, 8).and_then(|bh| vm.heap.get(bh)) {
-            Some(Obj::Host {
-                state: HostState::Map(m),
-                ..
-            }) => m.clone(),
-            _ => Vec::new(),
-        },
+        Some(Obj::Instance { .. }) => {
+            match guest_map_backing(vm, h, 8).and_then(|bh| vm.heap.get(bh)) {
+                Some(Obj::Host {
+                    state: HostState::Map(m),
+                    ..
+                }) => m.clone(),
+                _ => Vec::new(),
+            }
+        }
         _ => Vec::new(),
     }
 }
@@ -868,7 +870,10 @@ pub(crate) fn map_get(vm: &Vm, h: u32, k: V) -> Option<V> {
                     v => format!("{v:?}"),
                 };
                 if kd.contains("humbnail") || kd.contains("Renderer") {
-                    eprintln!("[mapdbg] get h{h} {kd} -> {hit:?} ({})", hit.map(|v| class_of(vm, v)).unwrap_or_else(|| "-".into()));
+                    eprintln!(
+                        "[mapdbg] get h{h} {kd} -> {hit:?} ({})",
+                        hit.map(|v| class_of(vm, v)).unwrap_or_else(|| "-".into())
+                    );
                 }
             }
             hit
@@ -1311,18 +1316,10 @@ pub(crate) fn sfield(vm: &mut Vm, owner: &str, name: &str, ftype: &str) -> Optio
             return Some(host(vm, "Ljava/io/InputStream;", HostState::Empty))
         }
         ("Ljava/nio/ByteOrder;", "BIG_ENDIAN") => {
-            return Some(host(
-                vm,
-                "Ljava/nio/ByteOrder;",
-                HostState::Slot(V::I32(0)),
-            ))
+            return Some(host(vm, "Ljava/nio/ByteOrder;", HostState::Slot(V::I32(0))))
         }
         ("Ljava/nio/ByteOrder;", "LITTLE_ENDIAN") => {
-            return Some(host(
-                vm,
-                "Ljava/nio/ByteOrder;",
-                HostState::Slot(V::I32(1)),
-            ))
+            return Some(host(vm, "Ljava/nio/ByteOrder;", HostState::Slot(V::I32(1))))
         }
         ("Ljava/lang/Void;", "TYPE") => return Some(class_obj(vm, "V".into())),
         ("Ljava/lang/String;", "CASE_INSENSITIVE_ORDER") => {
@@ -1584,23 +1581,15 @@ pub(crate) fn sfield(vm: &mut Vm, owner: &str, name: &str, ftype: &str) -> Optio
                 "Telephony$Mms$Outbox" => "content://mms/outbox",
                 "Telephony$Threads" => "content://mms-sms/conversations",
                 "Telephony$MmsSms" => "content://mms-sms",
-                "Telephony$MmsSms$PendingMessages" => {
-                    "content://mms-sms/pending"
-                }
-                "Telephony$CanonicalAddresses" => {
-                    "content://mms-sms/canonical-addresses"
-                }
+                "Telephony$MmsSms$PendingMessages" => "content://mms-sms/pending",
+                "Telephony$CanonicalAddresses" => "content://mms-sms/canonical-addresses",
                 "Telephony$CarrierMessages" => "content://carrier_information",
                 "BlockedNumberContract$BlockedNumbers" => {
                     "content://com.android.blockednumber/blocked"
                 }
                 "CallLog$Calls" => "content://call_log/calls",
-                "ContactsContract$Contacts" => {
-                    "content://com.android.contacts/contacts"
-                }
-                "ContactsContract$RawContacts" => {
-                    "content://com.android.contacts/raw_contacts"
-                }
+                "ContactsContract$Contacts" => "content://com.android.contacts/contacts",
+                "ContactsContract$RawContacts" => "content://com.android.contacts/raw_contacts",
                 "ContactsContract$Data" => "content://com.android.contacts/data",
                 "ContactsContract$CommonDataKinds$Phone" => {
                     "content://com.android.contacts/data/phones"
@@ -1614,38 +1603,20 @@ pub(crate) fn sfield(vm: &mut Vm, owner: &str, name: &str, ftype: &str) -> Optio
                 "ContactsContract$CommonDataKinds$Photo" => {
                     "content://com.android.contacts/data/photos"
                 }
-                "ContactsContract$Groups" => {
-                    "content://com.android.contacts/groups"
-                }
-                "ContactsContract$PhoneLookup" => {
-                    "content://com.android.contacts/phone_lookup"
-                }
-                "CalendarContract$Events" => {
-                    "content://com.android.calendar/events"
-                }
-                "CalendarContract$Calendars" => {
-                    "content://com.android.calendar/calendars"
-                }
-                "CalendarContract$Instances" => {
-                    "content://com.android.calendar/instances/when"
-                }
-                "CalendarContract$Reminders" => {
-                    "content://com.android.calendar/reminders"
-                }
-                "CalendarContract$Attendees" => {
-                    "content://com.android.calendar/attendees"
-                }
+                "ContactsContract$Groups" => "content://com.android.contacts/groups",
+                "ContactsContract$PhoneLookup" => "content://com.android.contacts/phone_lookup",
+                "CalendarContract$Events" => "content://com.android.calendar/events",
+                "CalendarContract$Calendars" => "content://com.android.calendar/calendars",
+                "CalendarContract$Instances" => "content://com.android.calendar/instances/when",
+                "CalendarContract$Reminders" => "content://com.android.calendar/reminders",
+                "CalendarContract$Attendees" => "content://com.android.calendar/attendees",
                 "UserDictionary$Words" => "content://user_dictionary/words",
-                "VoicemailContract$Voicemails" => {
-                    "content://com.android.voicemail/voicemails"
-                }
+                "VoicemailContract$Voicemails" => "content://com.android.voicemail/voicemails",
                 "Settings$System" => "content://settings/system",
                 "Settings$Secure" => "content://settings/secure",
                 "Settings$Global" => "content://settings/global",
                 "DocumentsContract$Document" => "content://com.android.externalstorage.documents",
-                "DocumentsContract$Root" => {
-                    "content://com.android.externalstorage.documents/root"
-                }
+                "DocumentsContract$Root" => "content://com.android.externalstorage.documents/root",
                 _ => "",
             };
             // Fallback for unmapped contracts: a deterministic URI built
@@ -1654,10 +1625,7 @@ pub(crate) fn sfield(vm: &mut Vm, owner: &str, name: &str, ftype: &str) -> Optio
             let uri = if uri.is_empty() {
                 format!(
                     "content://com.android.{}",
-                    body.split('$')
-                        .collect::<Vec<_>>()
-                        .join("/")
-                        .to_lowercase()
+                    body.split('$').collect::<Vec<_>>().join("/").to_lowercase()
                 )
             } else {
                 uri.to_string()
@@ -1811,9 +1779,7 @@ pub(crate) fn ifield(vm: &Vm, h: u32, owner: &str, name: &str) -> Option<V> {
         ("Landroid/os/Message;", "arg2") => {
             Some(pseudo_get(vm, h, P_MSG_ARG2).unwrap_or(V::I32(0)))
         }
-        ("Landroid/os/Message;", "obj") => {
-            Some(pseudo_get(vm, h, P_MSG_OBJ).unwrap_or(V::Ref(0)))
-        }
+        ("Landroid/os/Message;", "obj") => Some(pseudo_get(vm, h, P_MSG_OBJ).unwrap_or(V::Ref(0))),
         ("Landroid/graphics/Point;", "x" | "y")
         | ("Landroid/graphics/RectF;", "left" | "top" | "right" | "bottom")
         | ("Landroid/graphics/PointF;", "x" | "y") => Some(V::I32(0)),
@@ -1975,14 +1941,10 @@ pub(crate) fn host_supers(d: &str) -> &'static [&'static str] {
             OBJ,
         ],
         "Ljava/util/Collections$EmptyIterator;" => &[OBJ, "Ljava/util/Iterator;"],
-        "Ljava/util/Collections$EmptyListIterator;" => &[
-            OBJ,
-            "Ljava/util/ListIterator;",
-            "Ljava/util/Iterator;",
-        ],
-        "Ljava/util/Collections$EmptyEnumeration;" => {
-            &[OBJ, "Ljava/util/Enumeration;"]
+        "Ljava/util/Collections$EmptyListIterator;" => {
+            &[OBJ, "Ljava/util/ListIterator;", "Ljava/util/Iterator;"]
         }
+        "Ljava/util/Collections$EmptyEnumeration;" => &[OBJ, "Ljava/util/Enumeration;"],
         "Ljava/util/Collections$SingletonList;" => &[
             "Ljava/util/AbstractList;",
             "Ljava/util/AbstractCollection;",
@@ -2063,11 +2025,9 @@ pub(crate) fn host_supers(d: &str) -> &'static [&'static str] {
             "Ljava/lang/Iterable;",
             OBJ,
         ],
-        "Ljava/util/Collections$SynchronizedMap;" => &[
-            OBJ,
-            "Ljava/util/Map;",
-            "Ljava/io/Serializable;",
-        ],
+        "Ljava/util/Collections$SynchronizedMap;" => {
+            &[OBJ, "Ljava/util/Map;", "Ljava/io/Serializable;"]
+        }
         "Ljava/util/Collections$CheckedCollection;" => &[
             OBJ,
             "Ljava/util/Collection;",
@@ -2597,7 +2557,9 @@ pub(crate) fn host_supers(d: &str) -> &'static [&'static str] {
         "Landroid/widget/FrameLayout;"
         | "Landroid/widget/RelativeLayout;"
         | "Landroid/widget/AbsoluteLayout;"
-        | "Landroid/widget/GridLayout;" => &["Landroid/view/ViewGroup;", "Landroid/view/View;", OBJ],
+        | "Landroid/widget/GridLayout;" => {
+            &["Landroid/view/ViewGroup;", "Landroid/view/View;", OBJ]
+        }
         // AOSP: TableLayout extends LinearLayout (always vertical),
         // TableRow extends LinearLayout (always horizontal).
         "Landroid/widget/TableLayout;" | "Landroid/widget/TableRow;" => &[
@@ -2667,13 +2629,11 @@ pub(crate) fn host_supers(d: &str) -> &'static [&'static str] {
         // widgets (MyTextClock) extend them and must check-cast to View.
         "Landroid/widget/TextClock;"
         | "Landroid/widget/Chronometer;"
-        | "Landroid/widget/DigitalClock;" => &["Landroid/widget/TextView;", "Landroid/view/View;", OBJ],
+        | "Landroid/widget/DigitalClock;" => {
+            &["Landroid/widget/TextView;", "Landroid/view/View;", OBJ]
+        }
         "Landroid/widget/Space;" => &["Landroid/view/View;", OBJ],
-        "Landroid/widget/VideoView;" => &[
-            "Landroid/view/SurfaceView;",
-            "Landroid/view/View;",
-            OBJ,
-        ],
+        "Landroid/widget/VideoView;" => &["Landroid/view/SurfaceView;", "Landroid/view/View;", OBJ],
         "Landroid/widget/Toast;" => &[OBJ],
         "Landroid/view/ViewStub;" | "Landroid/view/SurfaceView;" | "Landroid/view/TextureView;" => {
             &["Landroid/view/View;", OBJ]

@@ -197,7 +197,10 @@ impl Drawable for AbsView {
     }
     fn layout(&mut self, left: i32, top: i32) {
         if std::env::var_os("OVELO_POSDBG").is_some() {
-            eprintln!("[posdbg] AbsView layout left={left} top={top} rect={:?}", self.rect);
+            eprintln!(
+                "[posdbg] AbsView layout left={left} top={top} rect={:?}",
+                self.rect
+            );
         }
         self.inner.layout(left, top);
     }
@@ -716,10 +719,7 @@ impl GuestUi {
         };
         // Tree unchanged since the mounted materialize — skip the
         // per-node info build (the per-frame dominant cost).
-        if self.dex_root == root
-            && self.dex_mounted.is_some()
-            && self.dex_gen_seen == vm.view_gen
-        {
+        if self.dex_root == root && self.dex_mounted.is_some() && self.dex_gen_seen == vm.view_gen {
             // A bound GLSurfaceView.Renderer draws every frame in
             // continuous mode — its output isn't triggered by
             // view-tree changes, so pump it even when we skip the
@@ -891,7 +891,11 @@ impl GuestUi {
             }
             gr.children = kids;
         } else if !info.children.is_empty() && viewdbg() {
-            eprintln!("[viewdbg] KIDS DROPPED h{h} {} kids={} not-a-group", info.desc, info.children.len());
+            eprintln!(
+                "[viewdbg] KIDS DROPPED h{h} {} kids={} not-a-group",
+                info.desc,
+                info.children.len()
+            );
         }
         if info.listener != 0 {
             let listener = info.listener;
@@ -1022,8 +1026,7 @@ pub fn drive_dex_layout_pass(vm: &mut Vm, activity: u32, frame: u32, win_w: i32,
         // reports a dex parent (the `android.R.id.content` frame the
         // decor wraps it in), so `!parent_is_dex` alone would skip
         // every node and no frame would ever be set.
-        let parent_is_dex =
-            depth != 0 && info.parent != 0 && vm.is_dex_view(info.parent);
+        let parent_is_dex = depth != 0 && info.parent != 0 && vm.is_dex_view(info.parent);
         // Drive subtree roots regardless of group-ness: a leaf custom
         // view at the XML root has no dex parent to measure/layout it,
         // so without this its frame stays unset and `onDraw` ops never

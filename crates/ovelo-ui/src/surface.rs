@@ -302,9 +302,7 @@ impl Surface {
         src_h: usize,
         src: &[u8],
     ) {
-        if dw == 0 || dh == 0 || src_w == 0 || src_h == 0
-            || src.len() != src_w * src_h * 4
-        {
+        if dw == 0 || dh == 0 || src_w == 0 || src_h == 0 || src.len() != src_w * src_h * 4 {
             return;
         }
         let clip = *self.clips.last().unwrap();

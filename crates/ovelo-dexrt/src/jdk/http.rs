@@ -16,7 +16,7 @@ use std::time::{Duration, Instant};
 
 use super::*;
 use crate::value::{Obj, V};
-use crate::{errd, E, InvokeKind, GX_NONE};
+use crate::{errd, InvokeKind, E, GX_NONE};
 use ovelo_error::Result;
 
 /// Ticket pseudo field — set on the RealCall while a fetch is in
@@ -73,17 +73,18 @@ fn do_fetch(spec: HttpSpec) -> std::result::Result<HttpResp, String> {
             req = req.header(k.as_str(), v.as_str());
         }
     }
-    let mut resp = if spec.body.is_empty()
-        && !matches!(spec.method.as_str(), "POST" | "PUT" | "PATCH")
-    {
-        let req = req.body(ureq::SendBody::none()).map_err(|e| e.to_string())?;
-        a.run(req).map_err(|e| e.to_string())?
-    } else {
-        // An empty body vec still forces Content-Length: 0 — the write
-        // methods expect it.
-        let req = req.body(spec.body.clone()).map_err(|e| e.to_string())?;
-        a.run(req).map_err(|e| e.to_string())?
-    };
+    let mut resp =
+        if spec.body.is_empty() && !matches!(spec.method.as_str(), "POST" | "PUT" | "PATCH") {
+            let req = req
+                .body(ureq::SendBody::none())
+                .map_err(|e| e.to_string())?;
+            a.run(req).map_err(|e| e.to_string())?
+        } else {
+            // An empty body vec still forces Content-Length: 0 — the write
+            // methods expect it.
+            let req = req.body(spec.body.clone()).map_err(|e| e.to_string())?;
+            a.run(req).map_err(|e| e.to_string())?
+        };
     let code = resp.status().as_u16();
     let message = resp
         .status()
@@ -100,10 +101,7 @@ fn do_fetch(spec: HttpSpec) -> std::result::Result<HttpResp, String> {
             )
         })
         .collect();
-    let body = resp
-        .body_mut()
-        .read_to_vec()
-        .map_err(|e| e.to_string())?;
+    let body = resp.body_mut().read_to_vec().map_err(|e| e.to_string())?;
     Ok(HttpResp {
         code,
         message,
@@ -270,15 +268,12 @@ fn request_spec(vm: &mut Vm, call_h: u32) -> Result<HttpSpec> {
         }
         None => String::new(),
     };
-    let method =
-        member_str(vm, req, "method").unwrap_or_else(|| "GET".into());
+    let method = member_str(vm, req, "method").unwrap_or_else(|| "GET".into());
     let mut headers = Vec::new();
-    if let Some(hh) = member_ref(vm, req, "headers", Some("Lokhttp3/Headers;"))
-    {
+    if let Some(hh) = member_ref(vm, req, "headers", Some("Lokhttp3/Headers;")) {
         // OkHttp 5: flat `namesAndValues` String[] field, name/value pairs.
         // OkHttp 4: `size()`/`name(i)`/`value(i)` methods.
-        let pairs = match field_v(vm, hh, "namesAndValues", Some("[Ljava/lang/String;"))
-        {
+        let pairs = match field_v(vm, hh, "namesAndValues", Some("[Ljava/lang/String;")) {
             Some(V::Ref(arr)) => match vm.heap.get(arr) {
                 Some(Obj::Array { data, .. }) => data
                     .iter()
@@ -334,7 +329,10 @@ fn request_spec(vm: &mut Vm, call_h: u32) -> Result<HttpSpec> {
             // OkHttp keeps an explicit Content-Type header over the
             // body's own media type — don't append a second one.
             if let Some(ct) = ct {
-                if !headers.iter().any(|(k, _)| k.eq_ignore_ascii_case("content-type")) {
+                if !headers
+                    .iter()
+                    .any(|(k, _)| k.eq_ignore_ascii_case("content-type"))
+                {
                     headers.push(("Content-Type".into(), ct));
                 }
             }
@@ -428,7 +426,13 @@ fn response_body(vm: &mut Vm, content_type: &str, bytes: &[u8]) -> Result<u32> {
     } else {
         {
             let s = jstr(vm, content_type);
-            static_sig(vm, "Lokhttp3/MediaType;", "get", &["Ljava/lang/String;"], vec![s])?
+            static_sig(
+                vm,
+                "Lokhttp3/MediaType;",
+                "get",
+                &["Ljava/lang/String;"],
+                vec![s],
+            )?
         }
         .unwrap_or(V::Ref(0))
     };
@@ -441,7 +445,10 @@ fn response_body(vm: &mut Vm, content_type: &str, bytes: &[u8]) -> Result<u32> {
     )? {
         return Ok(h);
     }
-    if vm.type_index_of("Lokhttp3/internal/http/RealResponseBody;").is_none() {
+    if vm
+        .type_index_of("Lokhttp3/internal/http/RealResponseBody;")
+        .is_none()
+    {
         return Ok(0);
     }
     let buf = vm.instantiate("Lokio/Buffer;")?;
@@ -646,8 +653,7 @@ pub(crate) fn install(vm: &mut Vm) {
         "toCanonicalHost",
         "(Ljava/lang/String;)Ljava/lang/String;",
         std::rc::Rc::new(std::cell::RefCell::new(|vm: &mut Vm, a: &[V]| {
-            let t = sv(vm, a.first().copied().unwrap_or(V::Ref(0)))
-                .unwrap_or_default();
+            let t = sv(vm, a.first().copied().unwrap_or(V::Ref(0))).unwrap_or_default();
             Ok(Some(jstr(vm, &t.to_lowercase())))
         })),
     );

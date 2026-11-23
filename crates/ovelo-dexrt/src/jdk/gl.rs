@@ -224,9 +224,7 @@ fn byte_at(vm: &Vm, buf: u32, off: usize) -> u8 {
             state: HostState::Slot(V::Ref(b)),
             ..
         }) => match vm.heap.get(*b) {
-            Some(Obj::Array { data, .. }) => {
-                data.get(off).map(|v| i32v(*v) as u8).unwrap_or(0)
-            }
+            Some(Obj::Array { data, .. }) => data.get(off).map(|v| i32v(*v) as u8).unwrap_or(0),
             _ => 0,
         },
         _ => 0,
@@ -260,12 +258,10 @@ fn bbuf_pos(vm: &Vm, buf: u32) -> usize {
     // Typed views store element-indexed positions — GL paths read raw
     // bytes, so convert via the element width; a view's content starts
     // at P_BBUF_BASE (the parent position when the view was made).
-    let esz = i32v(pseudo_get(vm, buf, super::P_BBUF_ESZ).unwrap_or(V::I32(1))).clamp(1, 8)
-        as usize;
-    let base = i32v(pseudo_get(vm, buf, super::P_BBUF_BASE).unwrap_or(V::I32(0))).max(0)
-        as usize;
-    base + i32v(pseudo_get(vm, buf, super::P_BBUF_POS).unwrap_or(V::I32(0))).max(0) as usize
-        * esz
+    let esz =
+        i32v(pseudo_get(vm, buf, super::P_BBUF_ESZ).unwrap_or(V::I32(1))).clamp(1, 8) as usize;
+    let base = i32v(pseudo_get(vm, buf, super::P_BBUF_BASE).unwrap_or(V::I32(0))).max(0) as usize;
+    base + i32v(pseudo_get(vm, buf, super::P_BBUF_POS).unwrap_or(V::I32(0))).max(0) as usize * esz
 }
 
 fn bbuf_le(vm: &Vm, buf: u32) -> bool {
@@ -394,7 +390,11 @@ fn record(vm: &Vm, gl: u32, mode: i32, first: i32, count: i32) {
                 None => st.color,
             });
         }
-        st.prims.push(Prim { mode, verts, colors });
+        st.prims.push(Prim {
+            mode,
+            verts,
+            colors,
+        });
     });
 }
 
@@ -413,7 +413,11 @@ fn record_el(vm: &Vm, gl: u32, mode: i32, count: i32, ty: i32, buf: u32) {
                 None => st.color,
             });
         }
-        st.prims.push(Prim { mode, verts, colors });
+        st.prims.push(Prim {
+            mode,
+            verts,
+            colors,
+        });
     });
 }
 
@@ -735,10 +739,22 @@ pub(crate) fn call(
         }
         "glTranslatef" | "glTranslatex" => {
             let m = [
-                1.0, 0.0, 0.0, 0.0, //
-                0.0, 1.0, 0.0, 0.0, //
-                0.0, 0.0, 1.0, 0.0, //
-                fv(1), fv(2), fv(3), 1.0,
+                1.0,
+                0.0,
+                0.0,
+                0.0, //
+                0.0,
+                1.0,
+                0.0,
+                0.0, //
+                0.0,
+                0.0,
+                1.0,
+                0.0, //
+                fv(1),
+                fv(2),
+                fv(3),
+                1.0,
             ];
             state(h, |s| match s.mode {
                 GL_PROJECTION => s.proj = mul(&s.proj, &m),
@@ -938,8 +954,9 @@ fn farr(vm: &Vm, v: &V, off: &V, n: usize) -> Vec<f32> {
                 let le = bbuf_le(vm, *h);
                 (0..n)
                     .map(|k| {
-                        let b: Vec<u8> =
-                            (0..4).map(|j| byte_at(vm, *h, pos + o * 4 + k * 4 + j)).collect();
+                        let b: Vec<u8> = (0..4)
+                            .map(|j| byte_at(vm, *h, pos + o * 4 + k * 4 + j))
+                            .collect();
                         let a: [u8; 4] = b.try_into().unwrap_or([0; 4]);
                         if le {
                             f32::from_le_bytes(a)
@@ -1067,16 +1084,42 @@ fn record20(vm: &Vm, st: &mut GlState, mode: i32, idxs: &[i32]) {
                     a.name, a.size, a.ty, a.normalized, a.stride, a.off, a.buf, a.enabled
                 );
             }
-            eprintln!("[gldbg] vbos={:?} unames={:?}", st.vbos.keys().map(|k| (*k, st.vbos[k].len())).collect::<Vec<_>>(), st.uni_names);
-            if let Some(pa) = st.attribs.values().find(|a| a.enabled && a.name == "position").cloned() {
+            eprintln!(
+                "[gldbg] vbos={:?} unames={:?}",
+                st.vbos
+                    .keys()
+                    .map(|k| (*k, st.vbos[k].len()))
+                    .collect::<Vec<_>>(),
+                st.uni_names
+            );
+            if let Some(pa) = st
+                .attribs
+                .values()
+                .find(|a| a.enabled && a.name == "position")
+                .cloned()
+            {
                 for i in 0..4usize {
-                    eprintln!("[gldbg] v{i} pos={:?} col={:?}", attr_at(vm, st, &pa, i), st.attribs.values().find(|a| a.enabled && a.name.contains("olor")).cloned().map(|a| attr_at(vm, st, &a, i)));
+                    eprintln!(
+                        "[gldbg] v{i} pos={:?} col={:?}",
+                        attr_at(vm, st, &pa, i),
+                        st.attribs
+                            .values()
+                            .find(|a| a.enabled && a.name.contains("olor"))
+                            .cloned()
+                            .map(|a| attr_at(vm, st, &a, i))
+                    );
                 }
-                eprintln!("[gldbg] idxs0={:?} mvp={:?}", &idxs[..idxs.len().min(8)], mvp_uniform(st).map(|m| m[..4].to_vec()));
+                eprintln!(
+                    "[gldbg] idxs0={:?} mvp={:?}",
+                    &idxs[..idxs.len().min(8)],
+                    mvp_uniform(st).map(|m| m[..4].to_vec())
+                );
             }
         }
     }
-    let Some(pos_a) = find("position") else { return };
+    let Some(pos_a) = find("position") else {
+        return;
+    };
     let col_a = st
         .attribs
         .values()
@@ -1136,7 +1179,11 @@ fn record20(vm: &Vm, st: &mut GlState, mode: i32, idxs: &[i32]) {
         colors.push(col);
     }
     if mode >= 0 {
-        st.prims.push(Prim { mode, verts, colors });
+        st.prims.push(Prim {
+            mode,
+            verts,
+            colors,
+        });
     }
 }
 
@@ -1231,8 +1278,7 @@ pub(crate) fn call_static(
                     eprintln!(
                         "[gldbg] bufferData size={size} obj={:?}",
                         vm.heap.get(h).map(|o| match o {
-                            Obj::Host { desc, state, .. } =>
-                                format!("Host {desc} {state:?}"),
+                            Obj::Host { desc, state, .. } => format!("Host {desc} {state:?}"),
                             Obj::Instance { .. } => "Instance".into(),
                             Obj::Array { elem, .. } => format!("Array[{elem}]"),
                             _ => "other".into(),
@@ -1339,8 +1385,8 @@ pub(crate) fn call_static(
                                     let at = off + k * w;
                                     let mut v = 0u64;
                                     for j in 0..w {
-                                        v |= (d.get(at + j).copied().unwrap_or(0) as u64)
-                                            << (8 * j);
+                                        v |=
+                                            (d.get(at + j).copied().unwrap_or(0) as u64) << (8 * j);
                                     }
                                     v as i32
                                 })
@@ -1418,7 +1464,8 @@ fn matrix_call(vm: &mut Vm, name: &str, args: &[V]) -> Option<Option<V>> {
                 f32v(args.get(6)?),
                 f32v(args.get(7)?),
             );
-            farr_write(vm, 
+            farr_write(
+                vm,
                 args.first()?,
                 args.get(1)?,
                 &[
@@ -1477,21 +1524,9 @@ fn matrix_call(vm: &mut Vm, name: &str, args: &[V]) -> Option<Option<V>> {
             farr_write(vm, args.first()?, args.get(1)?, &m);
         }
         "setLookAtM" => {
-            let (ex, ey, ez) = (
-                f32v(args.get(2)?),
-                f32v(args.get(3)?),
-                f32v(args.get(4)?),
-            );
-            let (cx, cy, cz) = (
-                f32v(args.get(5)?),
-                f32v(args.get(6)?),
-                f32v(args.get(7)?),
-            );
-            let (ux, uy, uz) = (
-                f32v(args.get(8)?),
-                f32v(args.get(9)?),
-                f32v(args.get(10)?),
-            );
+            let (ex, ey, ez) = (f32v(args.get(2)?), f32v(args.get(3)?), f32v(args.get(4)?));
+            let (cx, cy, cz) = (f32v(args.get(5)?), f32v(args.get(6)?), f32v(args.get(7)?));
+            let (ux, uy, uz) = (f32v(args.get(8)?), f32v(args.get(9)?), f32v(args.get(10)?));
             let mut f = [cx - ex, cy - ey, cz - ez];
             let fl = (f[0] * f[0] + f[1] * f[1] + f[2] * f[2]).sqrt();
             if fl > 0.0 {
@@ -1570,7 +1605,8 @@ fn matrix_call(vm: &mut Vm, name: &str, args: &[V]) -> Option<Option<V>> {
         "multiplyMV" => {
             let m = mat16(vm, args.get(2)?, args.get(3)?);
             let vin = farr(vm, args.get(4)?, args.get(5)?, 4);
-            farr_write(vm, 
+            farr_write(
+                vm,
                 args.first()?,
                 args.get(1)?,
                 &apply(&m, [vin[0], vin[1], vin[2], vin[3]]),
@@ -1578,11 +1614,7 @@ fn matrix_call(vm: &mut Vm, name: &str, args: &[V]) -> Option<Option<V>> {
         }
         "translateM" | "scaleM" => {
             let m = mat16(vm, args.first()?, args.get(1)?);
-            let (x, y, z) = (
-                f32v(args.get(2)?),
-                f32v(args.get(3)?),
-                f32v(args.get(4)?),
-            );
+            let (x, y, z) = (f32v(args.get(2)?), f32v(args.get(3)?), f32v(args.get(4)?));
             let t = if name == "translateM" {
                 [
                     1.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0, x, y, z, 1.0,

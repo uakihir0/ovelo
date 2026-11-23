@@ -13,7 +13,9 @@ fn main() {
         let buf = read_entry(&bytes, e).unwrap();
         let Ok(d) = DexFile::parse(buf) else { continue };
         for fidx in 0..d.field_ids_len() {
-            let Ok(f) = d.field(fidx as u32) else { continue };
+            let Ok(f) = d.field(fidx as u32) else {
+                continue;
+            };
             let Ok(owner) = d.type_descriptor(f.class_idx as u32) else {
                 continue;
             };

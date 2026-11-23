@@ -106,7 +106,8 @@ impl TtfFont {
     /// between faces — a `.ttc` registered per-face otherwise carries
     /// one full copy of the collection each.
     fn from_arc(bytes: std::sync::Arc<Vec<u8>>, index: u32) -> Result<Self> {
-        let face = ttf_parser::Face::parse(&bytes[..], index).map_err(|e| err("ui.font.parse", e))?;
+        let face =
+            ttf_parser::Face::parse(&bytes[..], index).map_err(|e| err("ui.font.parse", e))?;
         if face.is_variable() {
             // Variable fonts need instance pinning for deterministic layout;
             // reject until pinning is implemented.

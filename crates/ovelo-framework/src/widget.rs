@@ -288,7 +288,10 @@ impl Drawable for TextView {
             false,
         );
         if std::env::var_os("OVELO_POSDBG").is_some() && !self.text.is_empty() {
-            eprintln!("[posdbg] text {:?} at {},{} size {}", self.text, self.view.left, self.view.top, self.text_size);
+            eprintln!(
+                "[posdbg] text {:?} at {},{} size {}",
+                self.text, self.view.left, self.view.top, self.text_size
+            );
         }
         let lh = t.ascent + t.descent;
         // Vertical gravity: 0x10 center, 0x50 bottom, else top.
@@ -489,7 +492,13 @@ fn replay_guest_ops(c: &mut Canvas, ops: &[ovelo_dexrt::CanvasOp]) {
                 *argb as u8,
                 (argb >> 24) as u8,
             )),
-            O::Rect { l, t, r, b, paint: p } => {
+            O::Rect {
+                l,
+                t,
+                r,
+                b,
+                paint: p,
+            } => {
                 let r = Rect::new(*l as i32, *t as i32, (*r - *l) as i32, (*b - *t) as i32);
                 stroke_or_fill(c, r, p, 0);
             }
@@ -505,7 +514,13 @@ fn replay_guest_ops(c: &mut Canvas, ops: &[ovelo_dexrt::CanvasOp]) {
                 let r = Rect::new(*l as i32, *t as i32, (*r - *l) as i32, (*b - *t) as i32);
                 stroke_or_fill(c, r, p, rx.max(*ry) as i32);
             }
-            O::Oval { l, t, r, b, paint: p } => {
+            O::Oval {
+                l,
+                t,
+                r,
+                b,
+                paint: p,
+            } => {
                 let r = Rect::new(*l as i32, *t as i32, (*r - *l) as i32, (*b - *t) as i32);
                 if p.style == 1 {
                     // STROKE — a real ring, not a rect outline.
@@ -564,7 +579,12 @@ fn replay_guest_ops(c: &mut Canvas, ops: &[ovelo_dexrt::CanvasOp]) {
                     paint(p),
                 );
             }
-            O::Text { text, x, y, paint: p } => {
+            O::Text {
+                text,
+                x,
+                y,
+                paint: p,
+            } => {
                 let mut px = *x;
                 if p.align == 1 {
                     px -= c.measure(text, p.text_size.max(1.0)) / 2.0;

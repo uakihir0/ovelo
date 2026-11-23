@@ -38,13 +38,13 @@ pub(crate) fn call(
     } else if class == "Landroid/provider/DocumentsContract;" {
         // SAF URI builders only mint content:// strings — like Uri.parse.
         match name {
-            "buildTreeDocumentUri" | "buildDocumentUri"
-            | "buildDocumentUriUsingTree" | "buildChildDocumentsUri"
+            "buildTreeDocumentUri"
+            | "buildDocumentUri"
+            | "buildDocumentUriUsingTree"
+            | "buildChildDocumentsUri"
             | "buildChildDocumentsUriUsingTree" => {
-                let a0 = sv(vm, args.first().copied().unwrap_or(V::Ref(0)))
-                    .unwrap_or_default();
-                let id = sv(vm, args.get(1).copied().unwrap_or(V::Ref(0)))
-                    .unwrap_or_default();
+                let a0 = sv(vm, args.first().copied().unwrap_or(V::Ref(0))).unwrap_or_default();
+                let id = sv(vm, args.get(1).copied().unwrap_or(V::Ref(0))).unwrap_or_default();
                 // DocIds are percent-encoded into the URI segment
                 // (`primary:Music/Recordings` → `primary%3AMusic%2FRecordings`)
                 // so embedded `/` never forges a `/document/` or
@@ -63,8 +63,11 @@ pub(crate) fn call(
                 } else if name.starts_with("buildChild") {
                     format!("content://{a0}/document/{id}/children")
                 } else {
-                    let seg =
-                        if name == "buildTreeDocumentUri" { "tree" } else { "document" };
+                    let seg = if name == "buildTreeDocumentUri" {
+                        "tree"
+                    } else {
+                        "document"
+                    };
                     format!("content://{a0}/{seg}/{id}")
                 };
                 Some(Some(host(vm, "Landroid/net/Uri;", HostState::StrBuf(s))))
@@ -74,8 +77,7 @@ pub(crate) fn call(
                 // document id is the whole remainder after the LAST
                 // `/document/`; the tree id is the remainder after the
                 // LAST `/tree/` up to the next `/document/` segment.
-                let u = sv(vm, args.first().copied().unwrap_or(V::Ref(0)))
-                    .unwrap_or_default();
+                let u = sv(vm, args.first().copied().unwrap_or(V::Ref(0))).unwrap_or_default();
                 let id = if name == "getTreeDocumentId" {
                     u.rfind("/tree/")
                         .map(|off| {
@@ -86,17 +88,18 @@ pub(crate) fn call(
                 } else {
                     ["/document/", "/tree/"]
                         .iter()
-                        .find_map(|pat| {
-                            u.rfind(pat).map(|off| &u[off + pat.len()..])
-                        })
+                        .find_map(|pat| u.rfind(pat).map(|off| &u[off + pat.len()..]))
                         .unwrap_or_default()
                 };
                 let id = db::pct_dec(id);
-                Some(Some(if u.is_empty() { V::Ref(0) } else { jstr(vm, &id) }))
+                Some(Some(if u.is_empty() {
+                    V::Ref(0)
+                } else {
+                    jstr(vm, &id)
+                }))
             }
             "isTreeUri" | "isDocumentUri" => {
-                let u = sv(vm, args.first().copied().unwrap_or(V::Ref(0)))
-                    .unwrap_or_default();
+                let u = sv(vm, args.first().copied().unwrap_or(V::Ref(0))).unwrap_or_default();
                 let yes = if name == "isTreeUri" {
                     u.contains("/tree/")
                 } else {
@@ -228,14 +231,17 @@ pub(crate) fn call(
                 } else if uri.contains("externalstorage.documents") {
                     Some(Some(db::saf_cursor(vm, &uri, &projection)))
                 } else {
-                    Some(Some(host(vm, "Landroid/database/Cursor;", HostState::Empty)))
+                    Some(Some(host(
+                        vm,
+                        "Landroid/database/Cursor;",
+                        HostState::Empty,
+                    )))
                 }
             }
             "openFileDescriptor" | "openAssetFileDescriptor" | "openTypedAssetFileDescriptor" => {
                 // Glide's local-uri fetcher reads the pixels through a
                 // parcelled descriptor — hand it the file's real bytes.
-                let uri = sv(vm, args.get(1).copied().unwrap_or(V::Ref(0)))
-                    .unwrap_or_default();
+                let uri = sv(vm, args.get(1).copied().unwrap_or(V::Ref(0))).unwrap_or_default();
                 let bytes = media_uri_path(vm, &uri)
                     .and_then(|p| std::fs::read(io::fspath(vm, &p)).ok())
                     .unwrap_or_default();
@@ -255,11 +261,9 @@ pub(crate) fn call(
                 }
             }
             // SAF permission list: no persisted grants — guests iterate it.
-            "getPersistedUriPermissions" => Some(Some(host(
-                vm,
-                "Ljava/util/List;",
-                HostState::List(vec![]),
-            ))),
+            "getPersistedUriPermissions" => {
+                Some(Some(host(vm, "Ljava/util/List;", HostState::List(vec![]))))
+            }
             "insert"
             | "call"
             | "openFile"
@@ -278,8 +282,7 @@ pub(crate) fn call(
                 Some(Some(arr(vm, "Landroid/content/SyncAdapterType;", vec![])))
             }
             "openInputStream" => {
-                let uri = sv(vm, args.get(1).copied().unwrap_or(V::Ref(0)))
-                    .unwrap_or_default();
+                let uri = sv(vm, args.get(1).copied().unwrap_or(V::Ref(0))).unwrap_or_default();
                 let bytes = media_uri_path(vm, &uri)
                     .and_then(|p| std::fs::read(io::fspath(vm, &p)).ok())
                     .unwrap_or_default();
@@ -290,14 +293,12 @@ pub(crate) fn call(
                 )))
             }
             "openOutputStream" => {
-                let uri = sv(vm, args.get(1).copied().unwrap_or(V::Ref(0)))
-                    .unwrap_or_default();
+                let uri = sv(vm, args.get(1).copied().unwrap_or(V::Ref(0))).unwrap_or_default();
                 // SAF documents resolve to real files under
                 // external_root so `canWrite()` documents actually
                 // persist bytes. mode: "w" truncate (default),
                 // "wa" append, "rw"/"rwt" read+write.
-                let mode = sv(vm, args.get(2).copied().unwrap_or(V::Ref(0)))
-                    .unwrap_or_default();
+                let mode = sv(vm, args.get(2).copied().unwrap_or(V::Ref(0))).unwrap_or_default();
                 if uri.contains("externalstorage.documents") {
                     let (_id, rel) = db::saf_doc_rel(&uri);
                     let path = vm.external_root.join(&rel);
@@ -315,11 +316,7 @@ pub(crate) fn call(
                         .open(&path)
                         .ok();
                     return Ok(Some(match f {
-                        Some(f) => Some(host(
-                            vm,
-                            "Ljava/io/FileOutputStream;",
-                            HostState::File(f),
-                        )),
+                        Some(f) => Some(host(vm, "Ljava/io/FileOutputStream;", HostState::File(f))),
                         None => Some(V::Ref(0)),
                     }));
                 }
@@ -417,13 +414,7 @@ pub(crate) fn call(
                 if let V::Ref(mh) = m {
                     let refs: Vec<u32> = args
                         .iter()
-                        .filter_map(|a| {
-                            if let V::Ref(h) = a {
-                                Some(*h)
-                            } else {
-                                None
-                            }
-                        })
+                        .filter_map(|a| if let V::Ref(h) = a { Some(*h) } else { None })
                         .collect();
                     if let Some(&t) = refs.first() {
                         pseudo_set(vm, mh, P_MSG_TARGET, V::Ref(t));
@@ -463,15 +454,11 @@ pub(crate) fn call(
                 Some(Some(V::I32(1)))
             }
             "getTarget" => Some(Some(match args.first() {
-                Some(&V::Ref(mh)) => {
-                    pseudo_get(vm, mh, P_MSG_TARGET).unwrap_or(V::Ref(0))
-                }
+                Some(&V::Ref(mh)) => pseudo_get(vm, mh, P_MSG_TARGET).unwrap_or(V::Ref(0)),
                 _ => V::Ref(0),
             })),
             "getCallback" => Some(Some(match args.first() {
-                Some(&V::Ref(mh)) => {
-                    pseudo_get(vm, mh, P_MSG_CALLBACK).unwrap_or(V::Ref(0))
-                }
+                Some(&V::Ref(mh)) => pseudo_get(vm, mh, P_MSG_CALLBACK).unwrap_or(V::Ref(0)),
                 _ => V::Ref(0),
             })),
             "obj" | "getObj" => Some(Some(match args.first() {
@@ -484,12 +471,13 @@ pub(crate) fn call(
                 }
                 Some(None)
             }
-            "recycle" | "send" | "sendMessage" | "sendMessageDelayed"
-            | "sendEmptyMessage" => Some(if name.starts_with("send") {
-                Some(V::I32(1))
-            } else {
-                None
-            }),
+            "recycle" | "send" | "sendMessage" | "sendMessageDelayed" | "sendEmptyMessage" => {
+                Some(if name.starts_with("send") {
+                    Some(V::I32(1))
+                } else {
+                    None
+                })
+            }
             "getData" | "peekData" | "getMessenger" => Some(Some(V::Ref(0))),
             "getWhen" | "getSendingUid" => Some(Some(V::I64(0))),
             "setData" | "copyFrom" => Some(None),
@@ -557,9 +545,9 @@ pub(crate) fn call(
                     Some(None)
                 }
             }
-            "allowThreadDiskWrites" | "allowThreadDiskReads" | "getThreadPolicy" => Some(
-                Some(host(vm, "Landroid/os/StrictMode$ThreadPolicy;", HostState::Empty)),
-            ),
+            "allowThreadDiskWrites" | "allowThreadDiskReads" | "getThreadPolicy" => Some(Some(
+                host(vm, "Landroid/os/StrictMode$ThreadPolicy;", HostState::Empty),
+            )),
             "getVmPolicy" | "build" => Some(Some(host(
                 vm,
                 "Landroid/os/StrictMode$VmPolicy;",
@@ -777,10 +765,7 @@ pub(crate) fn call(
                     Some(tail) => match tail.parse::<i64>() {
                         Ok(id) => Some(Some(V::I64(id))),
                         Err(_) => {
-                            return Err(vm.throw_builtin(
-                                "Ljava/lang/NumberFormatException;",
-                                tail,
-                            ));
+                            return Err(vm.throw_builtin("Ljava/lang/NumberFormatException;", tail));
                         }
                     },
                 }
@@ -903,11 +888,9 @@ pub(crate) fn call(
         // the default SMS handler.
         match name {
             "isRoleAvailable" | "isRoleHeld" => Some(Some(V::I32(1))),
-            "createRequestRoleIntent" => Some(Some(host(
-                vm,
-                "Landroid/content/Intent;",
-                HostState::Empty,
-            ))),
+            "createRequestRoleIntent" => {
+                Some(Some(host(vm, "Landroid/content/Intent;", HostState::Empty)))
+            }
             _ => None,
         }
     } else if class == "Landroid/view/View$MeasureSpec;" {
@@ -1735,9 +1718,7 @@ fn component_call(vm: &mut Vm, name: &str, args: &[V]) -> Rt<Option<Option<V>>> 
     // Stored separately by <init>/unflattenFromString so the
     // accessors answer real pieces: P_COMPONENT = package,
     // P_DATA = class.
-    let part = |key: u32| -> Option<String> {
-        pseudo_get(vm, this, key).and_then(|v| sv(vm, v))
-    };
+    let part = |key: u32| -> Option<String> { pseudo_get(vm, this, key).and_then(|v| sv(vm, v)) };
     Ok(match name {
         "<init>" => {
             let rest = &args[1.min(args.len())..];
@@ -1747,9 +1728,9 @@ fn component_call(vm: &mut Vm, name: &str, args: &[V]) -> Rt<Option<Option<V>>> 
                     Some(vm.guest_package.clone().unwrap_or_default()),
                     class_desc_of(vm, *ch).map(|d| dotted(&d)),
                 ),
-                [V::Ref(p), V::Ref(c)] => (s(vm, *p).or_else(|| {
-                    vm.guest_package.clone()
-                }), s(vm, *c)),
+                [V::Ref(p), V::Ref(c)] => {
+                    (s(vm, *p).or_else(|| vm.guest_package.clone()), s(vm, *c))
+                }
                 [V::Ref(p), V::Ref(c), ..] => (s(vm, *p), s(vm, *c)),
                 _ => (None, None),
             };
@@ -1763,9 +1744,7 @@ fn component_call(vm: &mut Vm, name: &str, args: &[V]) -> Rt<Option<Option<V>>> 
             }
             Some(None)
         }
-        "getPackageName" => {
-            Some(Some(jstr(vm, &part(P_COMPONENT).unwrap_or_default())))
-        }
+        "getPackageName" => Some(Some(jstr(vm, &part(P_COMPONENT).unwrap_or_default()))),
         "getClassName" => Some(Some(jstr(vm, &part(P_DATA).unwrap_or_default()))),
         "getShortClassName" => {
             let c = part(P_DATA).unwrap_or_default();
@@ -1809,9 +1788,9 @@ fn component_call(vm: &mut Vm, name: &str, args: &[V]) -> Rt<Option<Option<V>>> 
                 (Some(p), Some(c)) => format!("{p}/{c}"),
                 _ => s(vm, this).unwrap_or_default(),
             };
-            let h = flat.bytes().fold(0i32, |a, b| {
-                a.wrapping_mul(31).wrapping_add(b as i32)
-            });
+            let h = flat
+                .bytes()
+                .fold(0i32, |a, b| a.wrapping_mul(31).wrapping_add(b as i32));
             Some(Some(V::I32(h)))
         }
         "describeContents" | "writeToParcel" | "clone" => {
@@ -2195,11 +2174,7 @@ fn context_call(
                         h
                     }
                 };
-                let _ = vm.call_virtual(
-                    sh,
-                    "onStartCommand",
-                    &[V::Ref(ih), V::I32(0), V::I32(1)],
-                );
+                let _ = vm.call_virtual(sh, "onStartCommand", &[V::Ref(ih), V::I32(0), V::I32(1)]);
                 Some(sh)
             })();
             Some(Some(if svc.is_some() { component } else { V::Ref(0) }))
@@ -2996,7 +2971,9 @@ fn resources_call(vm: &mut Vm, name: &str, args: &[V]) -> Rt<Option<Option<V>>> 
             // text visible instead of alpha-0 invisible.
             let mut data = 0xFF00_0000u32;
             for _ in 0..8 {
-                let Some(res) = vm.apk_res.as_ref() else { break };
+                let Some(res) = vm.apk_res.as_ref() else {
+                    break;
+                };
                 let Some(ev) = res.entry_value(id) else { break };
                 match ev.data_type {
                     0x01 => {
@@ -3348,22 +3325,19 @@ fn res_misc(vm: &mut Vm, class: &str, name: &str, args: &[V]) -> Rt<Option<Optio
                     // arsc type ids are 1-based, so a literal whose
                     // type byte is 0 (e.g. color 0x7f00_0000) is a
                     // value, not a reference.
-                    V::I32(id)
-                        if (id as u32) >> 24 == 0x7f && (id as u32) >> 16 & 0xff != 0 =>
-                    {
+                    V::I32(id) if (id as u32) >> 24 == 0x7f && (id as u32) >> 16 & 0xff != 0 => {
                         // `?attr/x` entries arrive as the attr's res id;
                         // the theme bind rewrites them to the real
                         // resource/value (AOSP resolveAttributeReference).
-                        let (rid, entry) =
-                            match view::resolve_ta_id(vm, id as u32) {
-                                Some((r, ev)) => (r, Some(ev)),
-                                None => (
-                                    id as u32,
-                                    vm.apk_res
-                                        .as_ref()
-                                        .and_then(|r| r.entry_value(id as u32).cloned()),
-                                ),
-                            };
+                        let (rid, entry) = match view::resolve_ta_id(vm, id as u32) {
+                            Some((r, ev)) => (r, Some(ev)),
+                            None => (
+                                id as u32,
+                                vm.apk_res
+                                    .as_ref()
+                                    .and_then(|r| r.entry_value(id as u32).cloned()),
+                            ),
+                        };
                         if name == "getResourceId" {
                             V::I32(rid as i32)
                         } else {
@@ -3447,12 +3421,8 @@ fn res_misc(vm: &mut Vm, class: &str, name: &str, args: &[V]) -> Rt<Option<Optio
             // vectors/bitmaps into a BitmapDrawable callers can draw.
             // `TintTypedArray` delegates to the wrapped TypedArray and
             // lands here too.
-            let d = match ta_index(vm, args)
-                .and_then(|(h, i)| view::ta_lookup(vm, h, i))
-            {
-                Some(V::I32(res)) if res > 0 => {
-                    super::vector::drawable_for_res(vm, res as u32)
-                }
+            let d = match ta_index(vm, args).and_then(|(h, i)| view::ta_lookup(vm, h, i)) {
+                Some(V::I32(res)) if res > 0 => super::vector::drawable_for_res(vm, res as u32),
                 _ => V::Ref(0),
             };
             Some(Some(d))
@@ -3572,8 +3542,7 @@ fn res_misc(vm: &mut Vm, class: &str, name: &str, args: &[V]) -> Rt<Option<Optio
                 return Ok(Some(Some(arr(vm, STRING, vec![]))));
             }
             // Asset reads serve real bytes out of the APK's assets/ dir.
-            let fname = sv(vm, args.get(1).copied().unwrap_or(V::I32(0)))
-                .unwrap_or_default();
+            let fname = sv(vm, args.get(1).copied().unwrap_or(V::I32(0))).unwrap_or_default();
             let bytes = vm.apk_res.as_ref().and_then(|r| {
                 r.read(&format!("assets/{fname}"))
                     .or_else(|| r.read(&fname))
@@ -3836,8 +3805,7 @@ fn graphics_call(vm: &mut Vm, class: &str, name: &str, args: &[V]) -> Rt<Option<
     // generic set*/draw* stubs below would silently eat every call.
     if matches!(
         class,
-        "Landroid/graphics/Canvas;" | "Landroid/graphics/Paint;"
-            | "Landroid/text/TextPaint;"
+        "Landroid/graphics/Canvas;" | "Landroid/graphics/Paint;" | "Landroid/text/TextPaint;"
     ) {
         return Ok(None);
     }
@@ -4052,7 +4020,9 @@ fn graphics_call(vm: &mut Vm, class: &str, name: &str, args: &[V]) -> Rt<Option<
             if std::env::var_os("OVELO_DRAWDBG").is_some() {
                 eprintln!(
                     "[drawdbg] {c}.draw px={} canvas_arg={:?}",
-                    px.as_ref().map(|(w, h, _)| format!("{w}x{h}")).unwrap_or_else(|| "-".into()),
+                    px.as_ref()
+                        .map(|(w, h, _)| format!("{w}x{h}"))
+                        .unwrap_or_else(|| "-".into()),
                     args.get(1)
                 );
             }
@@ -4060,11 +4030,10 @@ fn graphics_call(vm: &mut Vm, class: &str, name: &str, args: &[V]) -> Rt<Option<
             if px.is_none() {
                 if let (V::Ref(dh), Some(V::I32(argb))) = (
                     args.first().copied().unwrap_or(V::I32(0)),
-                    args.first()
-                        .and_then(|a| match a {
-                            V::Ref(h) => pseudo_get(vm, *h, P_DRAW_COLOR),
-                            _ => None,
-                        }),
+                    args.first().and_then(|a| match a {
+                        V::Ref(h) => pseudo_get(vm, *h, P_DRAW_COLOR),
+                        _ => None,
+                    }),
                 ) {
                     let (l, t, r, b) = rect_edges(vm, bounds_h(vm, dh).unwrap_or(0));
                     if r > l && b > t {
@@ -4206,12 +4175,12 @@ fn graphics_call(vm: &mut Vm, class: &str, name: &str, args: &[V]) -> Rt<Option<
             }
             Some(None)
         }
-        ("Landroid/graphics/drawable/BitmapDrawable;", "getBitmap") => Some(Some(
-            match args.first() {
+        ("Landroid/graphics/drawable/BitmapDrawable;", "getBitmap") => {
+            Some(Some(match args.first() {
                 Some(V::Ref(h)) => pseudo_get(vm, *h, P_BITMAP_SLOT).unwrap_or(V::Ref(0)),
                 _ => V::Ref(0),
-            },
-        )),
+            }))
+        }
         ("Landroid/graphics/BitmapFactory;", "decodeFile") => {
             let path = sv(vm, args[0]).unwrap_or_default();
             let bytes = std::fs::read(io::fspath(vm, &path)).unwrap_or_default();
@@ -4220,17 +4189,16 @@ fn graphics_call(vm: &mut Vm, class: &str, name: &str, args: &[V]) -> Rt<Option<
         ("Landroid/graphics/BitmapFactory;", "decodeByteArray") => {
             let data = match args.first().copied() {
                 Some(V::Ref(h)) => match vm.heap.get(h) {
-                    Some(Obj::Array { data, .. }) => data
-                        .iter()
-                        .map(|v| i32v(*v) as u8)
-                        .collect::<Vec<u8>>(),
+                    Some(Obj::Array { data, .. }) => {
+                        data.iter().map(|v| i32v(*v) as u8).collect::<Vec<u8>>()
+                    }
                     _ => vec![],
                 },
                 _ => vec![],
             };
             let off = i32v(args.get(1).copied().unwrap_or(V::I32(0))).max(0) as usize;
-            let len = i32v(args.get(2).copied().unwrap_or(V::I32(data.len() as i32)))
-                .max(0) as usize;
+            let len =
+                i32v(args.get(2).copied().unwrap_or(V::I32(data.len() as i32))).max(0) as usize;
             let bytes = &data[off.min(data.len())..(off + len).min(data.len())];
             Some(bitmap_decode_opts(vm, bytes, args))
         }
@@ -4251,8 +4219,7 @@ fn graphics_call(vm: &mut Vm, class: &str, name: &str, args: &[V]) -> Rt<Option<
         ("Landroid/graphics/BitmapFactory;", "decodeResource") => {
             // (Resources, resId): vector drawables rasterize too, then
             // fall back to the packaged file's PNG/JPEG decode.
-            let res_id = i32v(*args.get(1).unwrap_or(args.first().unwrap_or(&V::I32(0))))
-                as u32;
+            let res_id = i32v(*args.get(1).unwrap_or(args.first().unwrap_or(&V::I32(0)))) as u32;
             Some(match super::vector::drawable_bitmap(vm, res_id) {
                 Some((w, h, rgba)) => Some(V::Ref(vm.alloc_host(
                     "Landroid/graphics/Bitmap;",
@@ -4268,9 +4235,11 @@ fn graphics_call(vm: &mut Vm, class: &str, name: &str, args: &[V]) -> Rt<Option<
                 }
             })
         }
-        ("Landroid/graphics/Bitmap;", "getWidth" | "getHeight" | "getByteCount"
-        | "getRowBytes" | "hasAlpha" | "isRecycled" | "getDensity"
-        | "getGenerationId") => {
+        (
+            "Landroid/graphics/Bitmap;",
+            "getWidth" | "getHeight" | "getByteCount" | "getRowBytes" | "hasAlpha" | "isRecycled"
+            | "getDensity" | "getGenerationId",
+        ) => {
             let (w, h) = bitmap_dims(vm, args[0]);
             Some(Some(match name {
                 "getWidth" => V::I32(w as i32),
@@ -4487,9 +4456,7 @@ fn gravity_apply(
         _ => (ct + y_adj, ct + y_adj + h),
     };
     if std::env::var_os("OVELO_VIEWDBG").is_some() {
-        eprintln!(
-            "[viewdbg] gravity apply h{oh} c=({cl},{ct},{cr},{cb}) -> ({l},{t},{r},{b})"
-        );
+        eprintln!("[viewdbg] gravity apply h{oh} c=({cl},{ct},{cr},{cb}) -> ({l},{t},{r},{b})");
     }
     rect_write(vm, oh, l, t, r, b);
 }

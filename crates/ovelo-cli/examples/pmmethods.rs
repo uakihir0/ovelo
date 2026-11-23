@@ -13,7 +13,9 @@ fn main() {
         let buf = read_entry(&bytes, e).unwrap();
         let Ok(d) = DexFile::parse(buf) else { continue };
         for midx in 0..d.method_ids_len() {
-            let Ok(m) = d.method(midx as u32) else { continue };
+            let Ok(m) = d.method(midx as u32) else {
+                continue;
+            };
             let Ok(owner) = d.type_descriptor(m.class_idx as u32) else {
                 continue;
             };
@@ -21,10 +23,10 @@ fn main() {
                 continue;
             }
             let name = d.string(m.name_idx).unwrap_or_default();
-            let Ok(proto) = d.proto(m.proto_idx as u32) else { continue };
-            let ret = d
-                .type_descriptor(proto.return_type_idx)
-                .unwrap_or_default();
+            let Ok(proto) = d.proto(m.proto_idx as u32) else {
+                continue;
+            };
+            let ret = d.type_descriptor(proto.return_type_idx).unwrap_or_default();
             let mut sig = String::from("(");
             if let Ok(params) = d.proto_params(proto) {
                 for t in params {

@@ -241,7 +241,9 @@ impl<'a> Parser<'a> {
                         None => return Err("bad \\u escape".into()),
                     }
                 }
-                char::from_u32(v).map(Ast::Char).ok_or_else(|| "bad \\u".into())
+                char::from_u32(v)
+                    .map(Ast::Char)
+                    .ok_or_else(|| "bad \\u".into())
             }
             Some('x') => {
                 let mut v = 0u32;
@@ -273,7 +275,9 @@ impl<'a> Parser<'a> {
                 if n == 0 {
                     return Err("bad \\x escape".into());
                 }
-                char::from_u32(v).map(Ast::Char).ok_or_else(|| "bad \\x".into())
+                char::from_u32(v)
+                    .map(Ast::Char)
+                    .ok_or_else(|| "bad \\x".into())
             }
             Some('Q') => {
                 // \Q...\E literal run
@@ -596,7 +600,16 @@ impl Rx {
                     _ => false,
                 };
                 if ok {
-                    self.add(&mut nlist, &mut seen_n, pc + 1, sp + 1, &saves, lo, hi, text);
+                    self.add(
+                        &mut nlist,
+                        &mut seen_n,
+                        pc + 1,
+                        sp + 1,
+                        &saves,
+                        lo,
+                        hi,
+                        text,
+                    );
                 }
             }
             std::mem::swap(&mut clist, &mut nlist);
@@ -635,7 +648,12 @@ impl Rx {
     }
 
     /// `Matcher.matches()`: entire `lo..hi` region must match.
-    pub(crate) fn matches(&self, text: &[char], lo: usize, hi: usize) -> Option<Vec<Option<usize>>> {
+    pub(crate) fn matches(
+        &self,
+        text: &[char],
+        lo: usize,
+        hi: usize,
+    ) -> Option<Vec<Option<usize>>> {
         self.run(text, lo, lo, hi, true, true)
     }
 }
@@ -695,9 +713,12 @@ mod tests {
     }
     #[test]
     fn okhttp_media_type() {
-        let ts = Rx::compile("([a-zA-Z0-9-!#$%&'*+.^_`{|}~]+)/([a-zA-Z0-9-!#$%&'*+.^_`{|}~]+)").unwrap();
+        let ts =
+            Rx::compile("([a-zA-Z0-9-!#$%&'*+.^_`{|}~]+)/([a-zA-Z0-9-!#$%&'*+.^_`{|}~]+)").unwrap();
         let s = t("application/json; charset=utf-8");
-        let m = ts.looking_at(&s, 0, 0, s.len()).expect("TYPE_SUBTYPE match");
+        let m = ts
+            .looking_at(&s, 0, 0, s.len())
+            .expect("TYPE_SUBTYPE match");
         assert_eq!(m[0], Some(0));
         assert_eq!(m[1], Some(16));
         assert_eq!(m[2], Some(0));
@@ -728,10 +749,18 @@ mod tests {
             vec!["a".to_string(), "b.c".to_string()]
         );
         // limit = 0 drops trailing empty strings.
-        assert_eq!(regex_split(",", "a,b,,", 0), vec!["a".to_string(), "b".to_string()]);
+        assert_eq!(
+            regex_split(",", "a,b,,", 0),
+            vec!["a".to_string(), "b".to_string()]
+        );
         assert_eq!(
             regex_split(",", "a,b,,", -1),
-            vec!["a".to_string(), "b".to_string(), "".to_string(), "".to_string()]
+            vec![
+                "a".to_string(),
+                "b".to_string(),
+                "".to_string(),
+                "".to_string()
+            ]
         );
         // Zero-width pattern still terminates (Java yields a leading
         // empty element for "" matching at position 0).
@@ -752,4 +781,3 @@ mod tests {
         assert!(rx.matches(&t("12345"), 0, 5).is_none());
     }
 }
-

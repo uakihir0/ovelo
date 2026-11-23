@@ -10,9 +10,9 @@
 
 use std::collections::{HashMap, HashSet};
 use std::ffi::{c_void, CString};
-use std::sync::{Arc, LazyLock, Mutex};
 #[cfg(target_os = "macos")]
 use std::sync::OnceLock;
+use std::sync::{Arc, LazyLock, Mutex};
 
 use ovelo_error::{ErrorCategory, OveloError, Phase, Result};
 
@@ -24,14 +24,8 @@ fn errd(cause: &str, detail: impl std::fmt::Display) -> OveloError {
 }
 
 extern "C" {
-    fn mmap(
-        addr: *mut c_void,
-        len: usize,
-        prot: i32,
-        flags: i32,
-        fd: i32,
-        off: i64,
-    ) -> *mut c_void;
+    fn mmap(addr: *mut c_void, len: usize, prot: i32, flags: i32, fd: i32, off: i64)
+        -> *mut c_void;
     fn mprotect(addr: *mut c_void, len: usize, prot: i32) -> i32;
     fn munmap(addr: *mut c_void, len: usize) -> i32;
     fn dlsym(handle: *mut c_void, symbol: *const i8) -> *mut c_void;
@@ -139,10 +133,11 @@ fn code_mapped(addr: usize) -> bool {
 
 /// Image-relative offset of `addr` when it lies inside a loaded `.so`.
 pub(crate) fn so_off(addr: usize) -> Option<usize> {
-    LOADED_RANGES
-        .lock()
-        .ok()
-        .and_then(|v| v.iter().find(|(b, s)| addr >= *b && addr < b + s).map(|(b, _)| addr - *b))
+    LOADED_RANGES.lock().ok().and_then(|v| {
+        v.iter()
+            .find(|(b, s)| addr >= *b && addr < b + s)
+            .map(|(b, _)| addr - *b)
+    })
 }
 
 /// Fake Bionic TCB. Guest `.so`s read Bionic TLS slots off TPIDR_EL0 —
@@ -196,7 +191,10 @@ fn guest_tcb() -> *mut u64 {
     // before tid so a torn read never pairs a tid with a stale tcb.
     for i in (0..TCB_LIST.len()).step_by(2) {
         if TCB_LIST[i + 1].load(std::sync::atomic::Ordering::Acquire) == 0 {
-            TCB_LIST[i].store(tcb.as_ptr() as usize as u64, std::sync::atomic::Ordering::Release);
+            TCB_LIST[i].store(
+                tcb.as_ptr() as usize as u64,
+                std::sync::atomic::Ordering::Release,
+            );
             TCB_LIST[i + 1].store(tid, std::sync::atomic::Ordering::Release);
             break;
         }
@@ -206,7 +204,8 @@ fn guest_tcb() -> *mut u64 {
 
 /// (tcb, tid) pairs appended at TCB creation; never removed.
 #[cfg(target_arch = "aarch64")]
-static TCB_LIST: [std::sync::atomic::AtomicU64; 256] = [const { std::sync::atomic::AtomicU64::new(0) }; 256];
+static TCB_LIST: [std::sync::atomic::AtomicU64; 256] =
+    [const { std::sync::atomic::AtomicU64::new(0) }; 256];
 
 /// TCB for `tid`, scannable from the async-signal handler.
 #[cfg(target_arch = "aarch64")]
@@ -302,7 +301,11 @@ pub(crate) fn with_guest_tls_at<R>(site: &'static str, f: impl FnOnce() -> R) ->
         let mut now: usize;
         core::arch::asm!("mrs {}, tpidr_el0", out(reg) now);
         if now != tcb as usize {
-            eprintln!("[tls] {site} window ended tid={} TPIDR={now:#x} (expected {:#x})", mach_thread_id(), tcb as usize);
+            eprintln!(
+                "[tls] {site} window ended tid={} TPIDR={now:#x} (expected {:#x})",
+                mach_thread_id(),
+                tcb as usize
+            );
         }
         core::arch::asm!("msr tpidr_el0, {}", in(reg) old);
         TLS_TRACE[9].store(old as u64, std::sync::atomic::Ordering::Relaxed);
@@ -337,7 +340,10 @@ extern "C" fn sh_pthread_create(
     }
     extern "C" fn tramp(p: *mut c_void) -> *mut c_void {
         let (entry, arg) = unsafe { *Box::from_raw(p as *mut (usize, usize)) };
-        eprintln!("[tls] guest pthread start entry={entry:#x} tid={}", unsafe { mach_thread_id() });
+        eprintln!(
+            "[tls] guest pthread start entry={entry:#x} tid={}",
+            unsafe { mach_thread_id() }
+        );
         unsafe {
             // Per-thread guest TCB; env thunks on this thread swap to
             // whatever TPIDR the thread started with (host garbage).
@@ -476,19 +482,25 @@ mod thunk {
             let w = at as *mut u32;
             let ins: [u32; 20] = [
                 0xD102_83FF, // sub sp, sp, #160
-                0xA900_07E0, 0xA901_0FE2, 0xA902_17E4, 0xA903_1FE6, // stp x pairs
-                0x6D04_07E0, 0x6D05_0FE2, 0x6D06_17E4, 0x6D07_1FE6, // stp d pairs
-                0xA908_7BFD, // stp x29,x30,[sp,#128]
-                0x9100_03E0, // mov x0, sp
-                0x9102_83E1, // add x1, sp, #160
+                0xA900_07E0,
+                0xA901_0FE2,
+                0xA902_17E4,
+                0xA903_1FE6, // stp x pairs
+                0x6D04_07E0,
+                0x6D05_0FE2,
+                0x6D06_17E4,
+                0x6D07_1FE6,                        // stp d pairs
+                0xA908_7BFD,                        // stp x29,x30,[sp,#128]
+                0x9100_03E0,                        // mov x0, sp
+                0x9102_83E1,                        // add x1, sp, #160
                 0xD280_0002 | ((kind as u32) << 5), // movz x2, #kind
-                0x5800_00D0, // ldr x16, +24 (lit at insn 15+... below)
-                0xD63F_0200, // blr x16
-                0x9E67_0000, // fmov d0, x0
-                0xA948_7BFD, // ldp x29,x30,[sp,#128]
-                0x9102_83FF, // add sp, sp, #160
-                0xD65F_03C0, // ret
-                0x0000_0000, // literal slot written below (as u32 pair)
+                0x5800_00D0,                        // ldr x16, +24 (lit at insn 15+... below)
+                0xD63F_0200,                        // blr x16
+                0x9E67_0000,                        // fmov d0, x0
+                0xA948_7BFD,                        // ldp x29,x30,[sp,#128]
+                0x9102_83FF,                        // add sp, sp, #160
+                0xD65F_03C0,                        // ret
+                0x0000_0000,                        // literal slot written below (as u32 pair)
             ];
             for (i, ins) in ins.iter().enumerate() {
                 w.add(i).write_volatile(*ins);
@@ -507,8 +519,7 @@ mod thunk {
             return t;
         }
         let t = emit_slow(target);
-        MEMO
-            .lock()
+        MEMO.lock()
             .unwrap()
             .get_or_insert_with(HashMap::new)
             .insert(target, t);
@@ -770,7 +781,9 @@ unsafe fn heal_tls_fault(si: usize, insn: u32, mc: *mut u8) -> bool {
             }
             continue;
         }
-        if ((b >> 25) & 0x7) == 0x2 || (b & 0xFF00_0000) == 0xD600_0000 || clobbers_gpr(b, rn as u32)
+        if ((b >> 25) & 0x7) == 0x2
+            || (b & 0xFF00_0000) == 0xD600_0000
+            || clobbers_gpr(b, rn as u32)
         {
             break;
         }
@@ -869,7 +882,16 @@ pub fn install_crash_dump() {
                     n += 1;
                 }
                 // Zone tag, image flag, then extra registers.
-                for c in [b'z', b'=', zt, b' ', b'i', b'=', if si_img { b'1' } else { b'0' }, b' '] {
+                for c in [
+                    b'z',
+                    b'=',
+                    zt,
+                    b' ',
+                    b'i',
+                    b'=',
+                    if si_img { b'1' } else { b'0' },
+                    b' ',
+                ] {
                     msg[n] = c;
                     n += 1;
                 }
@@ -891,7 +913,10 @@ pub fn install_crash_dump() {
                     })
                     .unwrap_or(None);
                 if let Some(off) = pc_so {
-                    for c in b"pc=[so]" { msg[n] = *c; n += 1; }
+                    for c in b"pc=[so]" {
+                        msg[n] = *c;
+                        n += 1;
+                    }
                     for i in (0..16).rev() {
                         msg[n] = b"0123456789abcdef"[(off >> (i * 4)) & 0xf];
                         n += 1;
@@ -904,14 +929,29 @@ pub fn install_crash_dump() {
                         let off = pc - di.dli_fbase as usize;
                         let mut p = di.dli_fname;
                         let mut end = p;
-                        while *end != 0 { end = end.add(1) }
+                        while *end != 0 {
+                            end = end.add(1)
+                        }
                         let mut last = p;
-                        while p != end { if *p == b'/' as i8 { last = p.add(1) } p = p.add(1) }
-                        for c in b"pc=<" { msg[n] = *c; n += 1; }
+                        while p != end {
+                            if *p == b'/' as i8 {
+                                last = p.add(1)
+                            }
+                            p = p.add(1)
+                        }
+                        for c in b"pc=<" {
+                            msg[n] = *c;
+                            n += 1;
+                        }
                         let l = (end as usize - last as usize).min(40);
-                        std::ptr::copy_nonoverlapping(last as *const u8, msg.as_mut_ptr().add(n), l);
+                        std::ptr::copy_nonoverlapping(
+                            last as *const u8,
+                            msg.as_mut_ptr().add(n),
+                            l,
+                        );
                         n += l;
-                        msg[n] = b'+'; n += 1;
+                        msg[n] = b'+';
+                        n += 1;
                         for i in (0..8).rev() {
                             msg[n] = b"0123456789abcdef"[(off >> (i * 4)) & 0xf];
                             n += 1;
@@ -961,14 +1001,27 @@ pub fn install_crash_dump() {
                         let off = lr - di.dli_fbase as usize;
                         let mut p = di.dli_fname;
                         let mut end = p;
-                        while *end != 0 { end = end.add(1) }
+                        while *end != 0 {
+                            end = end.add(1)
+                        }
                         let mut last = p;
-                        while p != end { if *p == b'/' as i8 { last = p.add(1) } p = p.add(1) }
-                        msg[n] = b'<'; n += 1;
+                        while p != end {
+                            if *p == b'/' as i8 {
+                                last = p.add(1)
+                            }
+                            p = p.add(1)
+                        }
+                        msg[n] = b'<';
+                        n += 1;
                         let l = (end as usize - last as usize).min(40);
-                        std::ptr::copy_nonoverlapping(last as *const u8, msg.as_mut_ptr().add(n), l);
+                        std::ptr::copy_nonoverlapping(
+                            last as *const u8,
+                            msg.as_mut_ptr().add(n),
+                            l,
+                        );
                         n += l;
-                        msg[n] = b'+'; n += 1;
+                        msg[n] = b'+';
+                        n += 1;
                         for i in (0..8).rev() {
                             msg[n] = b"0123456789abcdef"[(off >> (i * 4)) & 0xf];
                             n += 1;
@@ -992,18 +1045,27 @@ pub fn install_crash_dump() {
                 {
                     let mut tp: usize;
                     core::arch::asm!("mrs {}, tpidr_el0", out(reg) tp);
-                    for c in b"tp=" { msg[n] = *c; n += 1; }
+                    for c in b"tp=" {
+                        msg[n] = *c;
+                        n += 1;
+                    }
                     for i in (0..16).rev() {
                         msg[n] = b"0123456789abcdef"[(tp >> (i * 4)) & 0xf];
                         n += 1;
                     }
-                    for c in b" tid=" { msg[n] = *c; n += 1; }
+                    for c in b" tid=" {
+                        msg[n] = *c;
+                        n += 1;
+                    }
                     let tid = mach_thread_id() as usize;
                     for i in (0..16).rev() {
                         msg[n] = b"0123456789abcdef"[(tid >> (i * 4)) & 0xf];
                         n += 1;
                     }
-                    for c in b" win=" { msg[n] = *c; n += 1; }
+                    for c in b" win=" {
+                        msg[n] = *c;
+                        n += 1;
+                    }
                     for cell in TLS_TRACE.iter() {
                         let v = cell.load(std::sync::atomic::Ordering::Relaxed) as usize;
                         for j in (0..16).rev() {
@@ -1162,11 +1224,7 @@ extern "C" fn sh_stack_chk_fail() -> ! {
     std::process::abort()
 }
 extern "C" fn sh_cxa_finalize(_p: *mut c_void) {}
-extern "C" fn sh_cxa_atexit(
-    _f: *mut c_void,
-    _a: *mut c_void,
-    _d: *mut c_void,
-) -> i32 {
+extern "C" fn sh_cxa_atexit(_f: *mut c_void, _a: *mut c_void, _d: *mut c_void) -> i32 {
     0
 }
 extern "C" fn sh_sincosf(x: f32, s: *mut f32, c: *mut f32) {
@@ -1269,12 +1327,7 @@ extern "C" fn sh_errno() -> *mut i32 {
         }
     }
 }
-extern "C" fn sh_assert2(
-    file: *const i8,
-    line: i32,
-    func: *const i8,
-    msg: *const i8,
-) -> ! {
+extern "C" fn sh_assert2(file: *const i8, line: i32, func: *const i8, msg: *const i8) -> ! {
     let (f, g, m) = unsafe {
         (
             std::ffi::CStr::from_ptr(file).to_string_lossy(),
@@ -1349,21 +1402,21 @@ extern "C" fn sh_getaffinity(_pid: i32, size: usize, mask: *mut u8) -> i32 {
 #[cfg(target_os = "macos")]
 fn guest_oflags(flags: i32) -> i32 {
     const MAP: &[(i32, i32)] = &[
-        (0x00040, 0x00200),    // O_CREAT
-        (0x00080, 0x00800),    // O_EXCL
-        (0x00100, 0x20000),    // O_NOCTTY
-        (0x00200, 0x00400),    // O_TRUNC
-        (0x00400, 0x00008),    // O_APPEND
-        (0x00800, 0x00004),    // O_NONBLOCK
-        (0x01000, 0x400000),   // O_DSYNC
-        (0x10000, 0x100000),   // O_DIRECTORY
-        (0x20000, 0x00100),    // O_NOFOLLOW
-        (0x80000, 0x1000000),  // O_CLOEXEC
-        (0x101000, 0x00080),   // O_SYNC (Bionic's value includes DSYNC)
-        (0x200000, 0x00000),   // O_PATH — no Darwin equivalent
-        (0x04000, 0x00000),    // O_DIRECT — drop (Darwin uses fcntl)
-        (0x08000, 0x00000),    // O_LARGEFILE — implicit on 64-bit
-        (0x40000, 0x00000),    // O_NOATIME — no Darwin equivalent
+        (0x00040, 0x00200),   // O_CREAT
+        (0x00080, 0x00800),   // O_EXCL
+        (0x00100, 0x20000),   // O_NOCTTY
+        (0x00200, 0x00400),   // O_TRUNC
+        (0x00400, 0x00008),   // O_APPEND
+        (0x00800, 0x00004),   // O_NONBLOCK
+        (0x01000, 0x400000),  // O_DSYNC
+        (0x10000, 0x100000),  // O_DIRECTORY
+        (0x20000, 0x00100),   // O_NOFOLLOW
+        (0x80000, 0x1000000), // O_CLOEXEC
+        (0x101000, 0x00080),  // O_SYNC (Bionic's value includes DSYNC)
+        (0x200000, 0x00000),  // O_PATH — no Darwin equivalent
+        (0x04000, 0x00000),   // O_DIRECT — drop (Darwin uses fcntl)
+        (0x08000, 0x00000),   // O_LARGEFILE — implicit on 64-bit
+        (0x40000, 0x00000),   // O_NOATIME — no Darwin equivalent
     ];
     let mut out = flags & 0x3;
     for &(b, d) in MAP {
@@ -1431,7 +1484,12 @@ extern "C" fn sh_strncpy(d: *mut c_void, s: *const c_void, n: usize) -> *mut c_v
     }
     unsafe { strncpy(d as *mut i8, s as *const i8, n) as *mut c_void }
 }
-extern "C" fn sh_memcpy_chk(d: *mut c_void, s: *const c_void, n: usize, dlen: usize) -> *mut c_void {
+extern "C" fn sh_memcpy_chk(
+    d: *mut c_void,
+    s: *const c_void,
+    n: usize,
+    dlen: usize,
+) -> *mut c_void {
     if n > dlen {
         sh_chk_fail();
     }
@@ -1482,10 +1540,23 @@ type PhdrCb = unsafe extern "C" fn(*mut c_void, usize, *mut c_void) -> i32;
 fn is_data_sym(name: &str) -> bool {
     matches!(
         name,
-        "optarg" | "opterr" | "optind" | "optopt" | "optreset"
-            | "environ" | "__progname" | "sys_nerr" | "sys_errlist"
-            | "timezone" | "daylight" | "altzone" | "tzname"
-            | "signgam" | "stdin" | "stdout" | "stderr"
+        "optarg"
+            | "opterr"
+            | "optind"
+            | "optopt"
+            | "optreset"
+            | "environ"
+            | "__progname"
+            | "sys_nerr"
+            | "sys_errlist"
+            | "timezone"
+            | "daylight"
+            | "altzone"
+            | "tzname"
+            | "signgam"
+            | "stdin"
+            | "stdout"
+            | "stderr"
     )
 }
 
@@ -1533,8 +1604,10 @@ extern "C" fn sh_set_abort_message(s: *const i8) {
         return;
     }
     unsafe {
-        eprintln!("[native] abort-msg: {}",
-            std::ffi::CStr::from_ptr(s).to_string_lossy());
+        eprintln!(
+            "[native] abort-msg: {}",
+            std::ffi::CStr::from_ptr(s).to_string_lossy()
+        );
     }
 }
 // NDK jnigraphics — glide-webp decodes into Android Bitmap objects.
@@ -1763,8 +1836,7 @@ pub(crate) fn check_all_zones(tag: &str) {
             eprintln!("[zonecheck] {tag}: get_all_zones failed");
             return;
         }
-        let rz = crate::RUST_ZONE.load(std::sync::atomic::Ordering::Relaxed)
-            as *mut c_void;
+        let rz = crate::RUST_ZONE.load(std::sync::atomic::Ordering::Relaxed) as *mut c_void;
         let dz = malloc_default_zone();
         let gz = guest_zone();
         for i in 0..n as usize {
@@ -1799,7 +1871,11 @@ pub(crate) fn check_all_zones(_tag: &str) {}
 /// zone functions with a `[so]` frame naming the culprit.
 #[cfg(target_os = "macos")]
 pub(crate) fn guest_malloc(size: usize) -> usize {
-    let extra = if std::env::var_os("OVELO_FREEDBG").is_some() { 16 } else { 0 };
+    let extra = if std::env::var_os("OVELO_FREEDBG").is_some() {
+        16
+    } else {
+        0
+    };
     let p = unsafe { malloc_zone_malloc(guest_zone(), size.max(1) + extra) as usize };
     dbg_alloc(p, size.max(1));
     p
@@ -1843,9 +1919,8 @@ pub(crate) fn guest_free(p: usize) {
 }
 
 #[cfg(target_os = "macos")]
-static LIVE_ALLOCS: std::sync::LazyLock<
-    std::sync::Mutex<std::collections::HashMap<usize, usize>>,
-> = std::sync::LazyLock::new(|| std::sync::Mutex::new(std::collections::HashMap::new()));
+static LIVE_ALLOCS: std::sync::LazyLock<std::sync::Mutex<std::collections::HashMap<usize, usize>>> =
+    std::sync::LazyLock::new(|| std::sync::Mutex::new(std::collections::HashMap::new()));
 /// ptr -> poisoned region length. Under OVELO_FREEDBG frees are
 /// quarantined: the block is poisoned and STAYS allocated, so a
 /// use-after-free write lands in memory malloc no longer manages and
@@ -1963,7 +2038,11 @@ fn dbg_free(p: usize, who: &'static str) -> bool {
 
 #[cfg(target_os = "macos")]
 extern "C" fn sh_malloc(size: usize) -> *mut c_void {
-    let extra = if std::env::var_os("OVELO_FREEDBG").is_some() { 16 } else { 0 };
+    let extra = if std::env::var_os("OVELO_FREEDBG").is_some() {
+        16
+    } else {
+        0
+    };
     let p = unsafe { malloc_zone_malloc(guest_zone(), size.max(1) + extra) };
     dbg_alloc(p as usize, size.max(1));
     p
@@ -1996,8 +2075,15 @@ extern "C" fn sh_free(ptr: *mut c_void) {
 
 #[cfg(target_os = "macos")]
 extern "C" fn sh_calloc(n: usize, size: usize) -> *mut c_void {
-    let extra = if std::env::var_os("OVELO_FREEDBG").is_some() { 16 } else { 0 };
-    let Some(total) = n.max(1).checked_mul(size.max(1)).and_then(|t| t.checked_add(extra))
+    let extra = if std::env::var_os("OVELO_FREEDBG").is_some() {
+        16
+    } else {
+        0
+    };
+    let Some(total) = n
+        .max(1)
+        .checked_mul(size.max(1))
+        .and_then(|t| t.checked_add(extra))
     else {
         return std::ptr::null_mut(); // overflow — calloc must fail, not wrap
     };
@@ -2042,7 +2128,11 @@ extern "C" fn sh_realloc(ptr: *mut c_void, size: usize) -> *mut c_void {
 
 #[cfg(target_os = "macos")]
 extern "C" fn sh_memalign(align: usize, size: usize) -> *mut c_void {
-    let extra = if std::env::var_os("OVELO_FREEDBG").is_some() { 16 } else { 0 };
+    let extra = if std::env::var_os("OVELO_FREEDBG").is_some() {
+        16
+    } else {
+        0
+    };
     let p = unsafe { malloc_zone_memalign(guest_zone(), align.max(16), size + extra) };
     dbg_alloc(p as usize, size);
     p
@@ -2088,7 +2178,11 @@ extern "C" fn sh_strdup(s: *const i8) -> *mut i8 {
     }
     unsafe {
         let n = strlen(s) + 1;
-        let extra = if std::env::var_os("OVELO_FREEDBG").is_some() { 16 } else { 0 };
+        let extra = if std::env::var_os("OVELO_FREEDBG").is_some() {
+            16
+        } else {
+            0
+        };
         let p = malloc_zone_malloc(guest_zone(), n + extra) as *mut i8;
         if !p.is_null() {
             memcpy(p.cast(), s.cast(), n);
@@ -2110,7 +2204,11 @@ extern "C" fn sh_strndup(s: *const i8, n: usize) -> *mut i8 {
         while len < n && *s.add(len) != 0 {
             len += 1;
         }
-        let extra = if std::env::var_os("OVELO_FREEDBG").is_some() { 16 } else { 0 };
+        let extra = if std::env::var_os("OVELO_FREEDBG").is_some() {
+            16
+        } else {
+            0
+        };
         let p = malloc_zone_malloc(guest_zone(), len + 1 + extra) as *mut i8;
         if !p.is_null() {
             memcpy(p.cast(), s.cast(), len);
@@ -2126,7 +2224,11 @@ extern "C" fn sh_guest_new(size: usize) -> *mut c_void {
     // operator new must not return null — spin until it succeeds is
     // what libc++ does under -fno-exceptions; for us a null means the
     // guest heap is genuinely exhausted, so abort loudly instead.
-    let extra = if std::env::var_os("OVELO_FREEDBG").is_some() { 16 } else { 0 };
+    let extra = if std::env::var_os("OVELO_FREEDBG").is_some() {
+        16
+    } else {
+        0
+    };
     let p = unsafe { malloc_zone_malloc(guest_zone(), size.max(1) + extra) };
     if p.is_null() {
         eprintln!("[shim] guest operator new({size}) failed");
@@ -2138,9 +2240,12 @@ extern "C" fn sh_guest_new(size: usize) -> *mut c_void {
 
 #[cfg(target_os = "macos")]
 extern "C" fn sh_guest_new_aligned(size: usize, align: usize) -> *mut c_void {
-    let extra = if std::env::var_os("OVELO_FREEDBG").is_some() { 16 } else { 0 };
-    let p =
-        unsafe { malloc_zone_memalign(guest_zone(), align.max(16), size.max(1) + extra) };
+    let extra = if std::env::var_os("OVELO_FREEDBG").is_some() {
+        16
+    } else {
+        0
+    };
+    let p = unsafe { malloc_zone_memalign(guest_zone(), align.max(16), size.max(1) + extra) };
     if p.is_null() {
         eprintln!("[shim] guest aligned operator new({size},{align}) failed");
         std::process::abort();
@@ -2152,7 +2257,11 @@ extern "C" fn sh_guest_new_aligned(size: usize, align: usize) -> *mut c_void {
 /// nothrow new variants must return null on failure, never abort.
 #[cfg(target_os = "macos")]
 extern "C" fn sh_guest_new_nothrow(size: usize) -> *mut c_void {
-    let extra = if std::env::var_os("OVELO_FREEDBG").is_some() { 16 } else { 0 };
+    let extra = if std::env::var_os("OVELO_FREEDBG").is_some() {
+        16
+    } else {
+        0
+    };
     let p = unsafe { malloc_zone_malloc(guest_zone(), size.max(1) + extra) };
     dbg_alloc(p as usize, size.max(1));
     p
@@ -2160,9 +2269,12 @@ extern "C" fn sh_guest_new_nothrow(size: usize) -> *mut c_void {
 
 #[cfg(target_os = "macos")]
 extern "C" fn sh_guest_new_aligned_nothrow(size: usize, align: usize) -> *mut c_void {
-    let extra = if std::env::var_os("OVELO_FREEDBG").is_some() { 16 } else { 0 };
-    let p =
-        unsafe { malloc_zone_memalign(guest_zone(), align.max(16), size.max(1) + extra) };
+    let extra = if std::env::var_os("OVELO_FREEDBG").is_some() {
+        16
+    } else {
+        0
+    };
+    let p = unsafe { malloc_zone_memalign(guest_zone(), align.max(16), size.max(1) + extra) };
     dbg_alloc(p as usize, size.max(1));
     p
 }
@@ -2277,9 +2389,7 @@ fn builtin_shim(name: &str) -> Option<usize> {
         #[cfg(target_os = "macos")]
         "_Znwm" | "_Znam" => sh_guest_new as *const () as usize,
         #[cfg(target_os = "macos")]
-        "_ZnwmRKSt9nothrow_t" | "_ZnamRKSt9nothrow_t" => {
-            sh_guest_new_nothrow as *const () as usize
-        }
+        "_ZnwmRKSt9nothrow_t" | "_ZnamRKSt9nothrow_t" => sh_guest_new_nothrow as *const () as usize,
         #[cfg(target_os = "macos")]
         "_ZnwmSt11align_val_t" | "_ZnamSt11align_val_t" => {
             sh_guest_new_aligned as *const () as usize
@@ -2289,12 +2399,19 @@ fn builtin_shim(name: &str) -> Option<usize> {
             sh_guest_new_aligned_nothrow as *const () as usize
         }
         #[cfg(target_os = "macos")]
-        "free" | "_ZdlPv" | "_ZdaPv" | "_ZdlPvm" | "_ZdaPvm" | "_ZdlPvRKSt9nothrow_t"
-        | "_ZdaPvRKSt9nothrow_t" | "_ZdlPvSt11align_val_t" | "_ZdaPvSt11align_val_t"
-        | "_ZdlPvmSt11align_val_t" | "_ZdaPvmSt11align_val_t"
-        | "_ZdlPvSt11align_val_tRKSt9nothrow_t" | "_ZdaPvSt11align_val_tRKSt9nothrow_t" => {
-            sh_guest_delete as *const () as usize
-        }
+        "free"
+        | "_ZdlPv"
+        | "_ZdaPv"
+        | "_ZdlPvm"
+        | "_ZdaPvm"
+        | "_ZdlPvRKSt9nothrow_t"
+        | "_ZdaPvRKSt9nothrow_t"
+        | "_ZdlPvSt11align_val_t"
+        | "_ZdaPvSt11align_val_t"
+        | "_ZdlPvmSt11align_val_t"
+        | "_ZdaPvmSt11align_val_t"
+        | "_ZdlPvSt11align_val_tRKSt9nothrow_t"
+        | "_ZdaPvSt11align_val_tRKSt9nothrow_t" => sh_guest_delete as *const () as usize,
         #[cfg(target_os = "macos")]
         "calloc" => sh_calloc as *const () as usize,
         #[cfg(target_os = "macos")]
@@ -2553,7 +2670,10 @@ fn load_tree_into(
             let dep = soname.rsplit('/').next().unwrap_or(&soname).to_string();
             // A bundled bionic would collide with the host/shim libc —
             // its symbols resolve via builtin_shim/host_dlsym anyway.
-            if matches!(dep.as_str(), "libc.so" | "libm.so" | "libdl.so" | "libstdc++.so") {
+            if matches!(
+                dep.as_str(),
+                "libc.so" | "libm.so" | "libdl.so" | "libstdc++.so"
+            ) {
                 continue;
             }
             if LOADED_SONAMES.lock().unwrap().contains(&dep) {
@@ -2783,7 +2903,8 @@ fn map_so(elf: &[u8]) -> Result<MappedLib> {
         cstr_at(bias, d.strtab, name_off)
     };
     let sym_shndx = |i: usize| -> u16 { unsafe { ((d.symtab + i * 24 + 6) as *const u16).read() } };
-    let sym_value = |i: usize| -> usize { unsafe { ((d.symtab + i * 24 + 8) as *const u64).read() as usize } };
+    let sym_value =
+        |i: usize| -> usize { unsafe { ((d.symtab + i * 24 + 8) as *const u64).read() as usize } };
     // Export map (defined GLOBAL/WEAK/DEFAULT symbols).
     let mut exports: HashMap<String, usize> = HashMap::new();
     for i in 0..sym_count {
@@ -2835,7 +2956,8 @@ fn finish_so(m: MappedLib, name: &str) -> Result<(NativeLib, Vec<usize>)> {
         let name_off = unsafe { (so as *const u32).read() };
         cstr_at(bias, d.strtab, name_off)
     };
-    let sym_bind = |i: usize| -> u8 { (unsafe { ((d.symtab + i * 24 + 4) as *const u8).read() }) >> 4 };
+    let sym_bind =
+        |i: usize| -> u8 { (unsafe { ((d.symtab + i * 24 + 4) as *const u8).read() }) >> 4 };
 
     // Import resolution: own exports → shim table → host dlsym.
     let resolve = |i: usize, exports: &HashMap<String, usize>| -> Result<usize> {
@@ -2873,11 +2995,7 @@ fn finish_so(m: MappedLib, name: &str) -> Result<(NativeLib, Vec<usize>)> {
                 // Data symbols must stay raw addresses — wrapping them in
                 // a code thunk would have the guest read machine code
                 // where the variable's value belongs.
-                return Ok(if is_data_sym(&name) {
-                    a
-                } else {
-                    host_thunk(a)
-                });
+                return Ok(if is_data_sym(&name) { a } else { host_thunk(a) });
             }
         }
         // Weak undefined symbols resolve to 0 (legal — the callee checks).
@@ -2887,7 +3005,12 @@ fn finish_so(m: MappedLib, name: &str) -> Result<(NativeLib, Vec<usize>)> {
         Err(errd("elf.unresolved", name.to_string()))
     };
 
-    let apply = |_d: &Dyn, table: usize, bytes: usize, entsize: usize, exports: &HashMap<String, usize>| -> Result<()> {
+    let apply = |_d: &Dyn,
+                 table: usize,
+                 bytes: usize,
+                 entsize: usize,
+                 exports: &HashMap<String, usize>|
+     -> Result<()> {
         let n = bytes / entsize;
         for k in 0..n {
             let r = table + k * entsize;
@@ -2909,9 +3032,7 @@ fn finish_so(m: MappedLib, name: &str) -> Result<(NativeLib, Vec<usize>)> {
                 return Err(errd("elf.reloc", format!("target oob {r_off:#x}")));
             }
             match rtype {
-                R_AARCH64_RELATIVE => unsafe {
-                    loc.write((bias as i64 + r_add) as u64)
-                },
+                R_AARCH64_RELATIVE => unsafe { loc.write((bias as i64 + r_add) as u64) },
                 R_AARCH64_ABS64 | R_AARCH64_GLOB_DAT | R_AARCH64_JUMP_SLOT => {
                     let s = resolve(sym_i, exports)? as i64;
                     unsafe { loc.write((s + r_add) as u64) };
@@ -2930,7 +3051,12 @@ fn finish_so(m: MappedLib, name: &str) -> Result<(NativeLib, Vec<usize>)> {
     let n_rel = d.android_relsz / 8;
     for k in 0..n_rel {
         let r = d.android_rel + k * 8;
-        let (r_off, r_info) = unsafe { ((r as *const u64).read() as usize, ((r as *const u64).add(1)).read()) };
+        let (r_off, r_info) = unsafe {
+            (
+                (r as *const u64).read() as usize,
+                ((r as *const u64).add(1)).read(),
+            )
+        };
         let rtype = (r_info & 0xffff_ffff) as u32;
         let loc = (bias + r_off) as *mut u64;
         if !in_img(loc as usize, 8) {
@@ -3089,7 +3215,8 @@ fn gnu_sym_count(gh: usize) -> usize {
             if si == 0 {
                 continue;
             }
-            let mut chain = (gh + 16 + bloom_size * 8 + nbuckets * 4 + (si - symoffset) * 4) as *const u32;
+            let mut chain =
+                (gh + 16 + bloom_size * 8 + nbuckets * 4 + (si - symoffset) * 4) as *const u32;
             loop {
                 let h = chain.read();
                 si += 1;

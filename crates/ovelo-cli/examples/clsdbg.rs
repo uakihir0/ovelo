@@ -25,7 +25,10 @@ fn main() {
                 .unwrap_or_else(|_| "?".into());
             println!("{owner} extends {sup}");
             for t in dex.type_list(cd.interfaces_off).unwrap_or_default() {
-                println!("  impl {}", dex.type_descriptor(t as u32).unwrap_or_default());
+                println!(
+                    "  impl {}",
+                    dex.type_descriptor(t as u32).unwrap_or_default()
+                );
             }
         }
     }

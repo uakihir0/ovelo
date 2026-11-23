@@ -1096,10 +1096,7 @@ fn read_encoded_value_at(r: &mut R, depth: usize) -> Result<EncodedValue> {
         }
         0x1d => {
             let (type_idx, elements) = read_encoded_annotation(r, depth)?;
-            EncodedValue::Annotation {
-                type_idx,
-                elements,
-            }
+            EncodedValue::Annotation { type_idx, elements }
         }
         0x1e => EncodedValue::Null,
         0x1f => EncodedValue::Bool(arg != 0),
@@ -1108,10 +1105,7 @@ fn read_encoded_value_at(r: &mut R, depth: usize) -> Result<EncodedValue> {
 }
 
 /// `encoded_annotation`: type_idx + size × (name_idx, encoded_value).
-fn read_encoded_annotation(
-    r: &mut R,
-    depth: usize,
-) -> Result<(u32, Vec<(u32, EncodedValue)>)> {
+fn read_encoded_annotation(r: &mut R, depth: usize) -> Result<(u32, Vec<(u32, EncodedValue)>)> {
     let type_idx = r.uleb128()?;
     let n = r.uleb128()? as usize;
     if n > 1 << 16 {

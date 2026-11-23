@@ -62,10 +62,7 @@ pub(crate) fn call(
             let arg = args.get(1).copied().unwrap_or(V::Ref(0));
             let mut bytes: Vec<u8> = match arg {
                 V::Ref(h) => match vm.heap.get(h) {
-                    Some(Obj::Array { data, .. }) => data
-                        .iter()
-                        .map(|v| i32v(*v) as u8)
-                        .collect(),
+                    Some(Obj::Array { data, .. }) => data.iter().map(|v| i32v(*v) as u8).collect(),
                     _ => Vec::new(),
                 },
                 _ => Vec::new(),
@@ -73,11 +70,7 @@ pub(crate) fn call(
             if args.len() > 3 {
                 let off = i64v(args[2]).max(0) as usize;
                 let len = i64v(args[3]).max(0) as usize;
-                bytes = bytes
-                    .into_iter()
-                    .skip(off)
-                    .take(len)
-                    .collect();
+                bytes = bytes.into_iter().skip(off).take(len).collect();
             }
             if let Some(V::Ref(this)) = args.first() {
                 if let Some(Obj::Host { state, .. }) = vm.heap.get_mut(*this) {
@@ -117,9 +110,9 @@ pub(crate) fn call(
                 } else if class == "Ljava/io/CharArrayReader;" {
                     match arg {
                         V::Ref(h) => match vm.heap.get(h) {
-                            Some(Obj::Array { data, .. }) => Some(
-                                data.iter().map(|v| i32v(*v) as u16).collect(),
-                            ),
+                            Some(Obj::Array { data, .. }) => {
+                                Some(data.iter().map(|v| i32v(*v) as u16).collect())
+                            }
                             _ => Some(Vec::new()),
                         },
                         _ => Some(Vec::new()),
@@ -383,10 +376,7 @@ fn stream_call(vm: &mut Vm, name: &str, args: &[V]) -> Rt<Option<Option<V>>> {
                 match args.get(1) {
                     Some(&V::Ref(bh)) => {
                         if let Some(Obj::Array { data: src, .. }) = vm.heap.get(bh) {
-                            let off = args
-                                .get(2)
-                                .map(|v| i64v(*v).max(0) as usize)
-                                .unwrap_or(0);
+                            let off = args.get(2).map(|v| i64v(*v).max(0) as usize).unwrap_or(0);
                             let want = args
                                 .get(3)
                                 .map(|v| i64v(*v).max(0) as usize)
@@ -419,8 +409,7 @@ fn stream_call(vm: &mut Vm, name: &str, args: &[V]) -> Rt<Option<Option<V>>> {
                     }) => d.clone(),
                     _ => std::rc::Rc::new(Vec::new()),
                 };
-                let out: Vec<V> =
-                    bytes.iter().map(|b| V::I32(*b as i8 as i32)).collect();
+                let out: Vec<V> = bytes.iter().map(|b| V::I32(*b as i8 as i32)).collect();
                 return Ok(Some(Some(arr(vm, "B", out))));
             }
             "size" => {
@@ -564,11 +553,7 @@ fn stream_call(vm: &mut Vm, name: &str, args: &[V]) -> Rt<Option<Option<V>>> {
                 return Ok(Some(Some(V::I32(n as i32))));
             }
             "available" | "ready" => {
-                return Ok(Some(Some(V::I32(if *pos < data.len() {
-                    1
-                } else {
-                    0
-                }))));
+                return Ok(Some(Some(V::I32(if *pos < data.len() { 1 } else { 0 }))));
             }
             "skip" => {
                 let n = i64v(args.get(1).copied().unwrap_or(V::I64(0))).max(0) as usize;
@@ -678,10 +663,7 @@ fn stream_call(vm: &mut Vm, name: &str, args: &[V]) -> Rt<Option<Option<V>>> {
                     _ => 0,
                 };
                 let (off, len) = if args.len() > 3 {
-                    (
-                        i64v(args[2]).max(0) as usize,
-                        i64v(args[3]).max(0) as usize,
-                    )
+                    (i64v(args[2]).max(0) as usize, i64v(args[3]).max(0) as usize)
                 } else {
                     (0, usize::MAX)
                 };
@@ -1040,8 +1022,7 @@ pub(crate) fn literal_match(pat: &str, text: &str) -> bool {
                         false
                     }
                     '?' => {
-                        (!t.is_empty() && class_ok(spec, t[0]) && m(rest, &t[1..]))
-                            || m(rest, t)
+                        (!t.is_empty() && class_ok(spec, t[0]) && m(rest, &t[1..])) || m(rest, t)
                     }
                     _ => !t.is_empty() && class_ok(spec, t[0]) && m(rest, &t[1..]),
                 };
@@ -1258,7 +1239,12 @@ fn matcher_call(vm: &mut Vm, name: &str, args: &[V]) -> Rt<Option<Option<V>>> {
             let out = match rx_spans(vm, h) {
                 Some(sp) if 2 * i + 1 < sp.len() && sp[2 * i] >= 0 => {
                     let (a, b) = (sp[2 * i] as usize, sp[2 * i + 1] as usize);
-                    jstr(vm, &chars[a.min(chars.len())..b.min(chars.len())].iter().collect::<String>())
+                    jstr(
+                        vm,
+                        &chars[a.min(chars.len())..b.min(chars.len())]
+                            .iter()
+                            .collect::<String>(),
+                    )
                 }
                 _ => V::Ref(0),
             };
@@ -1309,9 +1295,7 @@ fn matcher_call(vm: &mut Vm, name: &str, args: &[V]) -> Rt<Option<Option<V>>> {
             }
             Some(Some(args[0]))
         }
-        "useAnchoringBounds" | "useTransparentBounds" | "appendReplacement" => {
-            Some(Some(args[0]))
-        }
+        "useAnchoringBounds" | "useTransparentBounds" | "appendReplacement" => Some(Some(args[0])),
         "appendTail" => Some(Some(args[1])),
         "pattern" => Some(Some(args[0])),
         "requireEnd" | "hasAnchoringBounds" | "hasTransparentBounds" => Some(Some(V::I32(0))),
@@ -1356,7 +1340,11 @@ pub(crate) fn rx_replace(rx: &Rx, t: &[char], rep: &str, first_only: bool) -> St
                     // Longest valid group number wins ($12 → g12 else g1 + '2').
                     let mut k = j;
                     loop {
-                        let g: usize = rep_chars[i + 1..k].iter().collect::<String>().parse().unwrap_or(usize::MAX);
+                        let g: usize = rep_chars[i + 1..k]
+                            .iter()
+                            .collect::<String>()
+                            .parse()
+                            .unwrap_or(usize::MAX);
                         if 2 * g + 1 < m.len() || k <= i + 2 {
                             if 2 * g + 1 < m.len() {
                                 if let (Some(a), Some(b)) = (m[2 * g], m[2 * g + 1]) {
@@ -2015,12 +2003,12 @@ fn url_call(vm: &mut Vm, name: &str, args: &[V]) -> Rt<Option<Option<V>>> {
             let (spec, base) = if args.len() >= 3 {
                 (sv(vm, args[2]).unwrap_or_default(), t.clone())
             } else {
-                (sv(vm, args.get(1).copied().unwrap_or(V::Ref(0)))
-                    .unwrap_or_default(), String::new())
+                (
+                    sv(vm, args.get(1).copied().unwrap_or(V::Ref(0))).unwrap_or_default(),
+                    String::new(),
+                )
             };
-            let resolved = if spec.contains("://") || spec.starts_with('/')
-                || base.is_empty()
-            {
+            let resolved = if spec.contains("://") || spec.starts_with('/') || base.is_empty() {
                 spec
             } else {
                 let trim = match base.find(['?', '#']) {
@@ -2039,9 +2027,11 @@ fn url_call(vm: &mut Vm, name: &str, args: &[V]) -> Rt<Option<Option<V>>> {
             }
             Some(None)
         }
-        "openConnection" | "openStream" | "getContent" => {
-            Some(Some(host(vm, "Ljava/net/URLConnection;", HostState::StrBuf(t))))
-        }
+        "openConnection" | "openStream" | "getContent" => Some(Some(host(
+            vm,
+            "Ljava/net/URLConnection;",
+            HostState::StrBuf(t),
+        ))),
         "toURI" => Some(Some(host(vm, "Ljava/net/URI;", HostState::StrBuf(t)))),
         "toURL" => Some(Some(host(vm, "Ljava/net/URL;", HostState::StrBuf(t)))),
         "getProtocol" => {
@@ -2120,9 +2110,11 @@ fn url_call(vm: &mut Vm, name: &str, args: &[V]) -> Rt<Option<Option<V>>> {
             .unwrap_or_default();
             Some(Some(V::I32((t == other) as i32)))
         }
-        "hashCode" => Some(Some(V::I32(t.bytes().fold(0i32, |a, b| {
-            a.wrapping_mul(31).wrapping_add(b as i32)
-        })))),
+        "hashCode" => {
+            Some(Some(V::I32(t.bytes().fold(0i32, |a, b| {
+                a.wrapping_mul(31).wrapping_add(b as i32)
+            }))))
+        }
         _ => None,
     })
 }
@@ -2184,20 +2176,17 @@ fn nio_call(vm: &mut Vm, class: &str, name: &str, args: &[V]) -> Option<Option<V
             _ => None,
         }
     };
-    let bpos = |vm: &Vm| i32v(pseudo_get(vm, this, P_BBUF_POS).unwrap_or(V::I32(0))).max(0) as usize;
-    let little =
-        |vm: &Vm| i32v(pseudo_get(vm, this, P_BBUF_ORD).unwrap_or(V::I32(0))) != 0;
+    let bpos =
+        |vm: &Vm| i32v(pseudo_get(vm, this, P_BBUF_POS).unwrap_or(V::I32(0))).max(0) as usize;
+    let little = |vm: &Vm| i32v(pseudo_get(vm, this, P_BBUF_ORD).unwrap_or(V::I32(0))) != 0;
     // Typed views (`asIntBuffer`…) keep the same byte backing but
     // address it in elements of `esz` bytes.
-    let esz = |vm: &Vm| {
-        i32v(pseudo_get(vm, this, P_BBUF_ESZ).unwrap_or(V::I32(1)))
-            .clamp(1, 8) as usize
-    };
+    let esz =
+        |vm: &Vm| i32v(pseudo_get(vm, this, P_BBUF_ESZ).unwrap_or(V::I32(1))).clamp(1, 8) as usize;
     // A typed view's content starts at the parent's byte position when
     // it was created — `read_at`/`put` index `base + pos`.
-    let base = |vm: &Vm| {
-        i32v(pseudo_get(vm, this, P_BBUF_BASE).unwrap_or(V::I32(0))).max(0) as usize
-    };
+    let base =
+        |vm: &Vm| i32v(pseudo_get(vm, this, P_BBUF_BASE).unwrap_or(V::I32(0))).max(0) as usize;
     // Read `n` bytes at `pos`; None when out of bounds.
     let read_at = |vm: &Vm, pos: usize, n: usize| -> Option<Vec<u8>> {
         let pos = base(vm) + pos;
@@ -2207,12 +2196,7 @@ fn nio_call(vm: &mut Vm, class: &str, name: &str, args: &[V]) -> Option<Option<V
                 if pos + n > data.len() {
                     None
                 } else {
-                    Some(
-                        data[pos..pos + n]
-                            .iter()
-                            .map(|v| i32v(*v) as u8)
-                            .collect(),
-                    )
+                    Some(data[pos..pos + n].iter().map(|v| i32v(*v) as u8).collect())
                 }
             }
             _ => None,
@@ -2231,7 +2215,11 @@ fn nio_call(vm: &mut Vm, class: &str, name: &str, args: &[V]) -> Option<Option<V
                 c if c.contains("CharBuffer") => ("Ljava/nio/CharBuffer;", 2),
                 _ => ("Ljava/nio/ByteBuffer;", 1),
             };
-            let n = i32v(*args.get(if args.len() > 1 { 1 } else { 0 }).unwrap_or(&V::I32(0)));
+            let n = i32v(
+                *args
+                    .get(if args.len() > 1 { 1 } else { 0 })
+                    .unwrap_or(&V::I32(0)),
+            );
             let buf = vm.heap.alloc(Obj::Array {
                 elem: "B".into(),
                 data: vec![V::I32(0); (n.max(0) as usize) * w],
@@ -2242,8 +2230,8 @@ fn nio_call(vm: &mut Vm, class: &str, name: &str, args: &[V]) -> Option<Option<V
             }
             Some(Some(v))
         }
-        "asIntBuffer" | "asFloatBuffer" | "asLongBuffer" | "asDoubleBuffer"
-        | "asShortBuffer" | "asCharBuffer" => {
+        "asIntBuffer" | "asFloatBuffer" | "asLongBuffer" | "asDoubleBuffer" | "asShortBuffer"
+        | "asCharBuffer" => {
             // Typed view over the same byte backing; positions/capacity
             // are element-indexed via P_BBUF_ESZ.
             let (desc, w) = match name {
@@ -2361,9 +2349,7 @@ fn nio_call(vm: &mut Vm, class: &str, name: &str, args: &[V]) -> Option<Option<V
             "Ljava/nio/ByteOrder;",
             HostState::Slot(V::I32(1)),
         ))),
-        "mark" | "compact" | "slice" | "duplicate" | "asReadOnlyBuffer" => {
-            Some(Some(args[0]))
-        }
+        "mark" | "compact" | "slice" | "duplicate" | "asReadOnlyBuffer" => Some(Some(args[0])),
         "putInt" | "putLong" | "putShort" | "putDouble" | "putFloat" | "putChar" | "putByte"
         | "put" => {
             let (pos0, es) = (bpos(vm), esz(vm));
@@ -2457,10 +2443,9 @@ fn nio_call(vm: &mut Vm, class: &str, name: &str, args: &[V]) -> Option<Option<V
                         // put(byte[]) / put(srcBuffer) / put(byte).
                         let bytes: Vec<u8> = match args.get(1).copied() {
                             Some(V::Ref(sh)) => match vm.heap.get(sh) {
-                                Some(Obj::Array { data, .. }) => data
-                                    .iter()
-                                    .flat_map(|v| elem_bytes(vm, *v))
-                                    .collect(),
+                                Some(Obj::Array { data, .. }) => {
+                                    data.iter().flat_map(|v| elem_bytes(vm, *v)).collect()
+                                }
                                 _ => {
                                     // Another ByteBuffer: drain its
                                     // remaining bytes and move its cursor.
@@ -2480,21 +2465,18 @@ fn nio_call(vm: &mut Vm, class: &str, name: &str, args: &[V]) -> Option<Option<V
                                     let mut v = Vec::new();
                                     if let Some(sb) = src_backing {
                                         let ses = i32v(
-                                            pseudo_get(vm, sh, P_BBUF_ESZ)
-                                                .unwrap_or(V::I32(1)),
+                                            pseudo_get(vm, sh, P_BBUF_ESZ).unwrap_or(V::I32(1)),
                                         )
                                         .clamp(1, 8)
                                             as usize;
                                         let sp = i32v(
-                                            pseudo_get(vm, sh, P_BBUF_POS)
-                                                .unwrap_or(V::I32(0)),
+                                            pseudo_get(vm, sh, P_BBUF_POS).unwrap_or(V::I32(0)),
                                         )
                                         .max(0)
                                             as usize
                                             * ses;
                                         let sb_off = i32v(
-                                            pseudo_get(vm, sh, P_BBUF_BASE)
-                                                .unwrap_or(V::I32(0)),
+                                            pseudo_get(vm, sh, P_BBUF_BASE).unwrap_or(V::I32(0)),
                                         )
                                         .max(0)
                                             as usize;
@@ -2529,12 +2511,7 @@ fn nio_call(vm: &mut Vm, class: &str, name: &str, args: &[V]) -> Option<Option<V
                                 }
                             }
                         }
-                        pseudo_set(
-                            vm,
-                            this,
-                            P_BBUF_POS,
-                            V::I32((pos0 + len / es) as i32),
-                        );
+                        pseudo_set(vm, this, P_BBUF_POS, V::I32((pos0 + len / es) as i32));
                     }
                 }
                 _ => {
@@ -2560,9 +2537,7 @@ fn nio_call(vm: &mut Vm, class: &str, name: &str, args: &[V]) -> Option<Option<V
                             "putLong" => i64v(v2).to_be_bytes().to_vec(),
                             "putDouble" => f64v(v2).to_be_bytes().to_vec(),
                             "putFloat" => (f64v(v2) as f32).to_be_bytes().to_vec(),
-                            "putShort" | "putChar" => {
-                                (i32v(v2) as u16).to_be_bytes().to_vec()
-                            }
+                            "putShort" | "putChar" => (i32v(v2) as u16).to_be_bytes().to_vec(),
                             _ => vec![i32v(v2) as u8],
                         }
                     } else {
@@ -2570,12 +2545,7 @@ fn nio_call(vm: &mut Vm, class: &str, name: &str, args: &[V]) -> Option<Option<V
                     };
                     put(vm, pos, &bytes);
                     if adv > 0 {
-                        pseudo_set(
-                            vm,
-                            this,
-                            P_BBUF_POS,
-                            V::I32((pos0 + adv) as i32),
-                        );
+                        pseudo_set(vm, this, P_BBUF_POS, V::I32((pos0 + adv) as i32));
                     }
                 }
             }
@@ -2609,16 +2579,12 @@ fn nio_call(vm: &mut Vm, class: &str, name: &str, args: &[V]) -> Option<Option<V
                     vm.heap.get(this),
                     Some(Obj::Host { desc, .. }) if desc.contains("Float")
                 );
-                if let Some(bytes) =
-                    read_at(vm, pos, len.min(usize::MAX / 8).saturating_mul(es))
-                {
+                if let Some(bytes) = read_at(vm, pos, len.min(usize::MAX / 8).saturating_mul(es)) {
                     let n = bytes.len();
                     let le = little(vm);
                     if let V::Ref(dh) = dst {
                         if let Some(Obj::Array { data, .. }) = vm.heap.get_mut(dh) {
-                            for (i, slot) in
-                                data.iter_mut().enumerate().skip(off).take(len)
-                            {
+                            for (i, slot) in data.iter_mut().enumerate().skip(off).take(len) {
                                 let at = (i - off) * es;
                                 let mut e = vec![0u8; es];
                                 if let Some(src) = bytes.get(at..at + es) {
@@ -2667,50 +2633,37 @@ fn nio_call(vm: &mut Vm, class: &str, name: &str, args: &[V]) -> Option<Option<V
                 bytes.reverse();
             }
             if args.len() == 1 {
-                pseudo_set(
-                    vm,
-                    this,
-                    P_BBUF_POS,
-                    V::I32((pos / es + size / es) as i32),
-                );
+                pseudo_set(vm, this, P_BBUF_POS, V::I32((pos / es + size / es) as i32));
             }
             let v = match name {
                 "get" if es > 1 => match (es, is_float) {
-                    (8, true) => V::F64(f64::from_be_bytes(
-                        bytes[..8].try_into().unwrap_or([0; 8]),
-                    )),
-                    (8, false) => V::I64(i64::from_be_bytes(
-                        bytes[..8].try_into().unwrap_or([0; 8]),
-                    )),
-                    (4, true) => V::F32(f32::from_be_bytes(
-                        bytes[..4].try_into().unwrap_or([0; 4]),
-                    )),
-                    (4, false) => V::I32(i32::from_be_bytes(
-                        bytes[..4].try_into().unwrap_or([0; 4]),
-                    )),
+                    (8, true) => {
+                        V::F64(f64::from_be_bytes(bytes[..8].try_into().unwrap_or([0; 8])))
+                    }
+                    (8, false) => {
+                        V::I64(i64::from_be_bytes(bytes[..8].try_into().unwrap_or([0; 8])))
+                    }
+                    (4, true) => {
+                        V::F32(f32::from_be_bytes(bytes[..4].try_into().unwrap_or([0; 4])))
+                    }
+                    (4, false) => {
+                        V::I32(i32::from_be_bytes(bytes[..4].try_into().unwrap_or([0; 4])))
+                    }
                     (2, _) => {
                         V::I32(i16::from_be_bytes(bytes[..2].try_into().unwrap_or([0; 2])) as i32)
                     }
                     _ => V::I32(bytes[0] as i8 as i32),
                 },
-                "getInt" => V::I32(i32::from_be_bytes(
-                    bytes[..4].try_into().unwrap_or([0; 4]),
-                )),
-                "getLong" => V::I64(i64::from_be_bytes(
-                    bytes[..8].try_into().unwrap_or([0; 8]),
-                )),
-                "getDouble" => V::F64(f64::from_be_bytes(
-                    bytes[..8].try_into().unwrap_or([0; 8]),
-                )),
-                "getFloat" => V::F32(f32::from_be_bytes(
-                    bytes[..4].try_into().unwrap_or([0; 4]),
-                )),
-                "getShort" => V::I32(i16::from_be_bytes(
-                    bytes[..2].try_into().unwrap_or([0; 2]),
-                ) as i32),
-                "getChar" => V::I32(u16::from_be_bytes(
-                    bytes[..2].try_into().unwrap_or([0; 2]),
-                ) as i32),
+                "getInt" => V::I32(i32::from_be_bytes(bytes[..4].try_into().unwrap_or([0; 4]))),
+                "getLong" => V::I64(i64::from_be_bytes(bytes[..8].try_into().unwrap_or([0; 8]))),
+                "getDouble" => V::F64(f64::from_be_bytes(bytes[..8].try_into().unwrap_or([0; 8]))),
+                "getFloat" => V::F32(f32::from_be_bytes(bytes[..4].try_into().unwrap_or([0; 4]))),
+                "getShort" => {
+                    V::I32(i16::from_be_bytes(bytes[..2].try_into().unwrap_or([0; 2])) as i32)
+                }
+                "getChar" => {
+                    V::I32(u16::from_be_bytes(bytes[..2].try_into().unwrap_or([0; 2])) as i32)
+                }
                 _ => V::I32(bytes[0] as i8 as i32),
             };
             Some(Some(v))
@@ -2934,8 +2887,7 @@ fn stream_arg_path(vm: &Vm, v: V) -> Option<String> {
     let raw = match vm.heap.get(h) {
         Some(Obj::Str(s)) => s.clone(),
         Some(Obj::Host {
-            state:
-                HostState::Path(s) | HostState::StrBuf(s) | HostState::Regex(s),
+            state: HostState::Path(s) | HostState::StrBuf(s) | HostState::Regex(s),
             ..
         }) => s.clone(),
         _ => return None,
