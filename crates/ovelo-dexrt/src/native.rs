@@ -1033,10 +1033,16 @@ unsafe fn heal_tls_fault(si: usize, insn: u32, mc: *mut u8) -> bool {
     unsafe {
         *(mc.add(16 + rn * 8) as *mut usize) = restore;
         for (rb, off) in spills.iter().take(nspill) {
-            // mc+248 = saved fp (x29), mc+264 = saved sp.
-            let slot = *(mc.add(if *rb == 31 { 264 } else { 248 }) as *const usize)
-                .wrapping_add(*off) as *mut usize;
-            *slot = restore;
+            // mc+248 = saved fp (x29), mc+264 = saved sp. A zeroed or
+            // smashed saved base makes `slot` wild — writing `restore`
+            // through it faults inside the handler (nested segv → mach
+            // exception loop → thread suspended). Only patch a slot
+            // that is still writable.
+            let base = *(mc.add(if *rb == 31 { 264 } else { 248 }) as *const usize);
+            let slot = base.wrapping_add(*off) as *mut usize;
+            if base != 0 && mem_writable(slot as *const c_void, 8) {
+                *slot = restore;
+            }
         }
         // Durable fix: restore the thread's real TPIDR too — patching
         // only this register leaves TPIDR smashed, so every later TLS
