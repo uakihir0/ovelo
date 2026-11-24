@@ -1373,7 +1373,90 @@ pub(crate) fn call(
 /// the view's laid-out frame; returns the recorded ops (empty when the
 /// class doesn't override `onDraw` or the call fails — a framework
 /// `View.onDraw` is a no-op anyway).
+/// OVELO_NODEDUMP: recursively walk the dex LayoutNode tree hanging
+/// off an AndroidComposeView (`root` → `_unfoldedChildren` vectors)
+/// so we can see what composition actually emitted.
+fn node_tree_dump(vm: &mut Vm, node: u32, depth: usize) {
+    if depth > 12 || node == 0 {
+        return;
+    }
+    let cls = super::class_of(vm, V::Ref(node));
+    // `_unfoldedChildren` is null while folded — `get_children$ui()`
+    // is the accessor the layout code itself uses.
+    let kids = vm
+        .call_virtual_sig(node, "get_children$ui", &[], &[])
+        .ok()
+        .flatten();
+    if depth == 0 {
+        eprintln!("[nodedump] root kids={kids:?}");
+    }
+    let (n, arr) = match kids {
+        Some(V::Ref(mv)) => {
+            let sz = match vm.get_object_field(
+                mv,
+                "Landroidx/compose/runtime/collection/MutableVector;",
+                "size",
+            ) {
+                Some(V::I32(s)) => s,
+                _ => -1,
+            };
+            let a = match vm.get_object_field(
+                mv,
+                "Landroidx/compose/runtime/collection/MutableVector;",
+                "content",
+            ) {
+                Some(V::Ref(a)) => a,
+                _ => 0,
+            };
+            (sz, a)
+        }
+        _ => (-1, 0),
+    };
+    eprintln!(
+        "[nodedump] {:indent$}h{node} {cls} children={n}",
+        "",
+        indent = depth * 2
+    );
+    let kids_vec: Vec<u32> = match vm.heap.get(arr) {
+        Some(Obj::Array { data, .. }) => data
+            .iter()
+            .take(n.max(0) as usize)
+            .filter_map(|v| match v {
+                V::Ref(k) => Some(*k),
+                _ => None,
+            })
+            .collect(),
+        _ => Vec::new(),
+    };
+    for k in kids_vec {
+        node_tree_dump(vm, k, depth + 1);
+    }
+}
+
+/// OVELO_NODEDUMP entry point — call from the pump path even when the
+/// view measured 0×0 (that is exactly the failure this debugs).
+pub(crate) fn dump_node_tree(vm: &mut Vm, view: u32) {
+    if crate::dbg_flag("OVELO_NODEDUMP") {
+        if let Some(V::Ref(root)) = vm.get_object_field(
+            view,
+            "Landroidx/compose/ui/platform/AndroidComposeView;",
+            "root",
+        ) {
+            node_tree_dump(vm, root, 0);
+        }
+    }
+}
+
 pub(crate) fn guest_draw_ops(vm: &mut Vm, view: u32, w: i32, h: i32) -> Vec<CanvasOp> {
+    if crate::dbg_flag("OVELO_NODEDUMP") {
+        if let Some(V::Ref(root)) = vm.get_object_field(
+            view,
+            "Landroidx/compose/ui/platform/AndroidComposeView;",
+            "root",
+        ) {
+            node_tree_dump(vm, root, 0);
+        }
+    }
     // GLSurfaceView subclasses draw through a Renderer, not onDraw —
     // drive the GL10 path and flatten its recorded primitives.
     if pseudo_get(vm, view, super::gl::P_GLES_RENDERER).is_some() {

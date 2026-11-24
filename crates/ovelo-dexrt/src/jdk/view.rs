@@ -932,6 +932,9 @@ pub(crate) fn call(
             };
             if let Some(V::Ref(cb)) = args.get(1).copied() {
                 if cb != 0 {
+                    if crate::dbg_flag("OVELO_DRAINDBG") {
+                        eprintln!("[drain] push framecb h{cb} delay={delay}");
+                    }
                     vm.frame_callbacks
                         .push((cb, (now_ms() + delay.max(0)) as u64));
                 }

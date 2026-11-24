@@ -1741,7 +1741,18 @@ impl Vm {
             }
             return Err(errd("dexrt.bad_this", name.to_string()));
         };
-        let Some(midx) = self.find_method_on_chain(ci, name, args.len())? else {
+        // J/D params occupy two dex registers; arity must match
+        // `find_method_by_name`'s slot count or a wide-arg dex override
+        // (`Choreographer$FrameCallback.doFrame(J)V`) silently misses
+        // and the builtin fallback no-ops.
+        let nslots: usize = args
+            .iter()
+            .map(|v| match v {
+                V::I64(_) | V::F64(_) => 2,
+                _ => 1,
+            })
+            .sum();
+        let Some(midx) = self.find_method_on_chain(ci, name, nslots)? else {
             // No dex override — a framework method (`View.layout`,
             // `View.measure`, …). Route it through the builtin
             // dispatcher so host arms still apply when the caller is
@@ -1803,10 +1814,14 @@ impl Vm {
             .heap
             .class_of(this)
             .ok_or_else(|| E::Vm(errd("dexrt.bad_this", name.to_string())))?;
-        let Some(midx) = self
-            .find_method_on_chain(ci, name, args.len())
-            .map_err(E::Vm)?
-        else {
+        let nslots: usize = args
+            .iter()
+            .map(|v| match v {
+                V::I64(_) | V::F64(_) => 2,
+                _ => 1,
+            })
+            .sum();
+        let Some(midx) = self.find_method_on_chain(ci, name, nslots).map_err(E::Vm)? else {
             if crate::dbg_flag("OVELO_VIEWDBG") && matches!(name, "onMeasure" | "onLayout") {
                 let d = self.type_desc_of(ci).unwrap_or_default();
                 eprintln!("[viewdbg] onChain miss {name} ci_desc={d}");
@@ -2184,9 +2199,17 @@ impl Vm {
             self.frame_callbacks.drain(..).partition(|(_, t)| *t <= now);
         self.frame_callbacks = pending_cbs;
         let dbg = crate::dbg_flag("OVELO_DRAINDBG");
+        if dbg && !due_cbs.is_empty() {
+            eprintln!(
+                "[drain] framecb due={} pending={}",
+                due_cbs.len(),
+                self.frame_callbacks.len()
+            );
+        }
         for (cb, _) in due_cbs {
             match self.call_virtual(cb, "doFrame", &[frame_nanos]) {
                 Err(e) if dbg => eprintln!("[drain] doFrame h{cb} err={e:?}"),
+                Ok(v) if dbg => eprintln!("[drain] doFrame h{cb} ok={v:?}"),
                 _ => {}
             }
         }
@@ -2482,6 +2505,11 @@ impl Vm {
     /// no class in the chain overrides `onDraw` or the call fails.
     pub fn guest_draw_ops(&mut self, view: u32, w: i32, h: i32) -> Vec<crate::value::CanvasOp> {
         jdk::gfx::guest_draw_ops(self, view, w, h)
+    }
+
+    /// Log the dex LayoutNode tree under `view` (OVELO_NODEDUMP).
+    pub fn dump_node_tree(&mut self, view: u32) {
+        jdk::gfx::dump_node_tree(self, view)
     }
 
     /// Whether `view` has a bound `GLSurfaceView.Renderer` — such views
