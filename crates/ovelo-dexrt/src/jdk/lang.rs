@@ -2605,19 +2605,31 @@ fn enum_call(vm: &mut Vm, class: &str, name: &str, args: &[V]) -> Rt<Option<Opti
         "valueOf" => {
             // Both `Enum.valueOf(Class,String)` (2 args) and the
             // compiler-generated `EnumType.valueOf(String)` (1 arg)
-            // land here — the name is always the LAST argument.
+            // land here — the name is always the LAST argument, and
+            // for the 2-arg form the enum type comes from the Class
+            // mirror arg, not the invoke owner (`Ljava/lang/Enum;`) —
+            // minting a base-Enum object fails the caller's
+            // check-cast to the concrete type.
             let n = args.last().and_then(|v| sv(vm, *v)).unwrap_or_default();
+            let cls = args
+                .first()
+                .and_then(|v| match v {
+                    V::Ref(h) => vm.class_descriptor_of(*h),
+                    _ => None,
+                })
+                .filter(|d| d != "Ljava/lang/Enum;")
+                .unwrap_or_else(|| class.to_string());
             // Resolve through values() so platform enums return a
             // constant with its real ordinal (Kotlin `when` tables
             // index by it).
-            let hit = enum_value_list(vm, class).into_iter().find(|v| {
+            let hit = enum_value_list(vm, &cls).into_iter().find(|v| {
                 matches!(v, V::Ref(h)
                     if pseudo_get(vm, *h, P_DATA)
                         .and_then(|s| sv(vm, s))
                         .as_deref() == Some(n.as_str()))
             });
             Some(Some(hit.unwrap_or_else(|| {
-                host(vm, "Ljava/lang/Enum;", HostState::StrBuf(n))
+                host(vm, &cls, HostState::StrBuf(n))
             })))
         }
         "values" => {
