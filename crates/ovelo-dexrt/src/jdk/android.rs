@@ -1972,11 +1972,7 @@ fn context_call(
         }
         "getApplicationContext" | "getApplication" => Some(Some(app_object(vm))),
         "getBaseContext" => Some(Some(args[0])),
-        "getApplicationInfo" | "getActivityInfo" => Some(Some(host(
-            vm,
-            "Landroid/content/pm/ApplicationInfo;",
-            HostState::Empty,
-        ))),
+        "getApplicationInfo" | "getActivityInfo" => Some(Some(app_info(vm))),
         "getContentResolver" => Some(Some(host(
             vm,
             "Landroid/content/ContentResolver;",
@@ -2765,11 +2761,7 @@ fn pm_call(vm: &mut Vm, name: &str, args: &[V]) -> Rt<Option<Option<V>>> {
             }
             Some(Some(V::Ref(h)))
         }
-        "getApplicationInfo" => Some(Some(host(
-            vm,
-            "Landroid/content/pm/ApplicationInfo;",
-            HostState::Empty,
-        ))),
+        "getApplicationInfo" => Some(Some(app_info(vm))),
         "getActivityInfo"
         | "getServiceInfo"
         | "getReceiverInfo"
@@ -4597,6 +4589,24 @@ fn gravity_apply(
         eprintln!("[viewdbg] gravity apply h{oh} c=({cl},{ct},{cr},{cb}) -> ({l},{t},{r},{b})");
     }
     rect_write(vm, oh, l, t, r, b);
+}
+
+/// `ApplicationInfo` with the path fields populated — guests read
+/// `dataDir`/`sourceDir`/`nativeLibraryDir` directly (Korgw seeds its
+/// VFS root from `dataDir`) and null paths poison downstream caches.
+fn app_info(vm: &mut Vm) -> V {
+    let h = match host(vm, "Landroid/content/pm/ApplicationInfo;", HostState::Empty) {
+        V::Ref(h) => h,
+        _ => unreachable!(),
+    };
+    let pkg = vm.guest_package.clone().unwrap_or_else(|| "app".into());
+    let data = jstr(vm, &format!("/data/data/{pkg}"));
+    let src = jstr(vm, &format!("/data/app/{pkg}/base.apk"));
+    let libs = jstr(vm, &format!("/data/app/{pkg}/lib/arm64"));
+    pseudo_set(vm, h, P_DATA, data);
+    pseudo_set(vm, h, P_META, src);
+    pseudo_set(vm, h, P_FLAGS, libs);
+    V::Ref(h)
 }
 
 /// `SharedPreferences` host object interned per file name — Android

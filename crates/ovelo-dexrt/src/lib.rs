@@ -52,7 +52,18 @@ fn void_resolved(o: Option<V>) -> Option<V> {
     o.or(Some(V::Ref(0)))
 }
 
-/// `(params)ret` descriptor for a proto index local to `d`.
+/// `(w, h)` of the view owning a SurfaceHolder — its laid-out frame,
+/// (0,0) when the view has no frame yet, the window default when the
+/// holder has no owning view.
+fn surface_holder_size(vm: &Vm, holder: u32) -> (i32, i32) {
+    let Some(V::Ref(vh)) = jdk::pseudo_get(vm, holder, jdk::P_TARGET) else {
+        return (720, 1280);
+    };
+    vm.dex_view(vh)
+        .and_then(|i| i.frame.map(|(l, t, r, b)| (r - l, b - t)))
+        .unwrap_or((0, 0))
+}
+
 fn proto_sig(d: &DexFile, pidx: u32) -> Result<String> {
     let p = d.proto(pidx)?;
     let mut sig = String::from("(");
@@ -343,11 +354,19 @@ pub struct Vm {
     /// handler floods every drain tick regardless of its delay.
     pub(crate) delayed_runnables: Vec<(u32, bool, u64)>,
     /// `SurfaceHolder.addCallback` deliveries queued for the next
-    /// drain tick: `(holder handle, callback handle, w, h)`. Android
-    /// only fires surfaceCreated/surfaceChanged once a real surface
-    /// exists — calling them inline during `init()` hits views whose
-    /// GL thread field is not assigned yet (Godot NPE'd exactly so).
-    pub(crate) pending_surface: Vec<(u32, u32, i32, i32)>,
+    /// drain tick: `(holder, callback, retries)`. Android only fires
+    /// surfaceCreated/surfaceChanged once a real surface exists —
+    /// calling them inline during `init()` hits views whose GL thread
+    /// field is not assigned yet (Godot NPE'd exactly so). The size is
+    /// resolved from the owning view's frame at delivery, not when
+    /// `addCallback` runs (the view may not be laid out yet).
+    pub(crate) pending_surface: Vec<(u32, u32, u32)>,
+    /// Registered `(holder, callback)` pairs kept for redispatching
+    /// `surfaceChanged` when the owning view's frame later changes
+    /// (e.g. it was 0x0 when `addCallback` ran).
+    pub(crate) surface_cbs: Vec<(u32, u32)>,
+    /// Last `(w, h)` reported to each holder via `surfaceChanged`.
+    pub(crate) surface_sizes: HashMap<u32, (i32, i32)>,
     /// Runnables spawned by `Thread.start` — long-lived loops that
     /// legitimately park/reschedule forever (game loops like bouncy's
     /// FieldDriver), unlike executor workers which the repark budget
@@ -575,6 +594,8 @@ impl Vm {
             activity_callbacks: Vec::new(),
             delayed_runnables: Vec::new(),
             pending_surface: Vec::new(),
+            surface_cbs: Vec::new(),
+            surface_sizes: HashMap::new(),
             thread_runnables: std::collections::HashSet::new(),
             cur_runnable: 0,
             sleep_until: HashMap::new(),
@@ -865,6 +886,11 @@ impl Vm {
     /// Runtime class descriptor for any heap object handle (debug use).
     pub fn dbg_class_of(&self, h: u32) -> String {
         jdk::class_of(self, V::Ref(h))
+    }
+
+    /// Debug: a view's recorded P_PARENT handle (0 when none).
+    pub fn dbg_view_parent(&self, h: u32) -> u32 {
+        jdk::view::view_parent(self, h)
     }
 
     /// Debug: the `Class.field` name for a canonical global field index.
@@ -1913,14 +1939,44 @@ impl Vm {
         // set so a nested drain from a delivered callback early-returns
         // instead of running an unbounded inner pass.
         jdk::http::drain_coil(self);
-        for (holder, cb, sw, sh) in std::mem::take(&mut self.pending_surface) {
+        for (holder, cb, tries) in std::mem::take(&mut self.pending_surface) {
+            let (mut sw, mut sh) = surface_holder_size(self, holder);
+            if sw <= 0 || sh <= 0 {
+                if tries < 240 {
+                    // Not laid out yet — retry next tick so the guest
+                    // never builds a projection over a 0x0 surface.
+                    self.pending_surface.push((holder, cb, tries + 1));
+                    continue;
+                }
+                // View never laid out (hidden SurfaceView etc.) —
+                // report the window default rather than 0x0.
+                (sw, sh) = (720, 1280);
+            }
             let wh = V::Ref(holder);
+            if std::env::var_os("OVELO_DRAWDBG").is_some() {
+                eprintln!("[gldbg] surfaceCreated+Changed h{holder} cb{cb} {sw}x{sh}");
+            }
             let _ = self.call_virtual(cb, "surfaceCreated", &[wh]);
             let _ = self.call_virtual(
                 cb,
                 "surfaceChanged",
                 &[wh, V::I32(0), V::I32(sw), V::I32(sh)],
             );
+            self.surface_sizes.insert(holder, (sw, sh));
+        }
+        // Redispatch `surfaceChanged` on registered holders whose owning
+        // view's size changed (first layout, rotation, ...).
+        for (holder, cb) in std::mem::take(&mut self.surface_cbs) {
+            let (sw, sh) = surface_holder_size(self, holder);
+            if sw > 0 && sh > 0 && self.surface_sizes.get(&holder) != Some(&(sw, sh)) {
+                self.surface_sizes.insert(holder, (sw, sh));
+                let _ = self.call_virtual(
+                    cb,
+                    "surfaceChanged",
+                    &[V::Ref(holder), V::I32(0), V::I32(sw), V::I32(sh)],
+                );
+            }
+            self.surface_cbs.push((holder, cb));
         }
         for h in std::mem::take(&mut self.pending_destroy) {
             let _ = self.call_virtual(h, "onDestroy", &[]);
@@ -2135,9 +2191,44 @@ impl Vm {
         jdk::view::set_content_view(self, activity, V::Ref(content));
     }
 
+    /// `attach_at` for the guest bridge: registered `addView` overloads
+    /// intercept the invoke, so the dex-side bookkeeping (parent, attach
+    /// mark, `onViewAdded`) must run from the bridge itself.
+    pub fn view_tree_attach_at(
+        &mut self,
+        parent: u32,
+        child: u32,
+        idx: Option<usize>,
+        lp: Option<V>,
+    ) {
+        if parent != 0 && child != 0 {
+            jdk::view::attach_at(self, parent, V::Ref(child), idx, true, lp);
+        }
+    }
+
+    /// `detach` for the guest bridge: registered `removeView`/`detach`
+    /// overloads intercept the invoke, so the dex-side bookkeeping must
+    /// run from the bridge itself (`notify` mirrors AOSP's
+    /// removeView-vs-detachViewFromParent split).
+    pub fn view_tree_detach(&mut self, parent: u32, child: u32, notify: bool) {
+        if parent != 0 && child != 0 {
+            jdk::view::detach(self, parent, V::Ref(child), notify);
+        }
+    }
+
     /// The handle `activity` last set as its content view, if any.
     pub fn activity_content(&self, activity: u32) -> Option<u32> {
         jdk::view::activity_content(self, activity)
+    }
+
+    /// Push a host-computed frame onto a dex view object — the host
+    /// layout engine positions bridged views without running the dex
+    /// `layout()` call, so `getWidth()`/`getHeight()` would read 0
+    /// (Korge's GL view NaN'd its ortho matrix exactly so).
+    pub fn view_set_frame(&mut self, h: u32, l: i32, t: i32, r: i32, b: i32) {
+        if h != 0 {
+            jdk::view::frame_set(self, h, l, t, r, b);
+        }
     }
 
     /// `(width, height)` a dex LayoutParams object requests —
@@ -4019,7 +4110,11 @@ impl Vm {
                         }
                         return Err(self.throw_builtin(
                             "Ljava/lang/NullPointerException;",
-                            &format!("null receiver calling {}", self.describe_method(midx)),
+                            &format!(
+                                "null receiver calling {} arg={:?}",
+                                self.describe_method(midx),
+                                v
+                            ),
                         ));
                     }
                     None => {
@@ -5655,6 +5750,23 @@ impl Vm {
                     .statics
                     .get(&f)
                     .copied();
+                if std::env::var_os("OVELO_SGETDBG").is_some()
+                    && !matches!(stored, Some(V::Ref(h)) if h != 0)
+                {
+                    let fd = self.dexes[di].field(fl).map_err(E::Vm)?;
+                    let cname = self.dexes[di]
+                        .type_descriptor(fd.class_idx as u32)
+                        .unwrap_or_default();
+                    let fname = self.dexes[di].string(fd.name_idx).unwrap_or_default();
+                    let keys: Vec<GIdx> = self
+                        .classes
+                        .get(&owner)
+                        .map(|c| c.statics.keys().copied().collect())
+                        .unwrap_or_default();
+                    eprintln!(
+                        "[sgetdbg] miss {cname}.{fname} fl={fl} f={f:?} owner={owner:?} stored={stored:?} keys={keys:?}"
+                    );
+                }
                 let v = match stored {
                     Some(v) => v,
                     // A static on a host-provided class (Build.VERSION,

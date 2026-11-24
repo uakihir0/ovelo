@@ -169,6 +169,9 @@ impl Drawable for SharedView {
     fn lp(&self) -> (Length, Length) {
         self.0.borrow().lp()
     }
+    fn as_any(&mut self) -> Option<&mut dyn std::any::Any> {
+        Some(self)
+    }
 }
 
 /// Wraps a materialized child whose dex `layout`/`setFrame` assigned a
@@ -231,6 +234,23 @@ impl Drawable for AbsView {
     fn dispatch_touch(&mut self, down: bool, x: i32, y: i32) -> bool {
         self.inner.dispatch_touch(down, x, y)
     }
+    fn as_any(&mut self) -> Option<&mut dyn std::any::Any> {
+        Some(self)
+    }
+}
+
+/// Same-Rc check for a boxed child vs a dex handle's bound view —
+/// matches `SharedView` and `AbsView`-wrapped SharedViews; used by the
+/// removeView bridge and addView dedupe.
+fn child_matches(b: &mut Box<dyn Drawable>, cv: &Rc<RefCell<GuestView>>) -> bool {
+    let Some(a) = b.as_any() else { return false };
+    if let Some(sv) = a.downcast_ref::<SharedView>() {
+        return Rc::ptr_eq(&sv.0, cv);
+    }
+    if let Some(av) = a.downcast_ref::<AbsView>() {
+        return Rc::ptr_eq(&av.inner.0, cv);
+    }
+    false
 }
 
 /// Host-side state for guest UI: the view-object map plus the
@@ -523,88 +543,159 @@ impl GuestUi {
             });
         }
 
-        // ---- ViewGroup.addView -------------------------------------------
+        // ---- ViewGroup.addView / removeView -------------------------------
         for cls in ["Landroid/view/ViewGroup;", "Landroid/widget/LinearLayout;"] {
-            Self::on(
-                ui,
-                vm,
-                cls,
-                "addView",
+            for sig in [
                 "(Landroid/view/View;)V",
-                |ui, vm, a| {
+                "(Landroid/view/View;I)V",
+                "(Landroid/view/View;ILandroid/view/ViewGroup$LayoutParams;)V",
+                "(Landroid/view/View;Landroid/view/ViewGroup$LayoutParams;)V",
+            ] {
+                Self::on(ui, vm, cls, "addView", sig, |ui, vm, a| {
                     let this = ref_arg(a, 0)?;
                     let child = ref_arg(a, 1)?;
-                    if std::env::var_os("OVELO_VIEWDBG").is_some() {
-                        eprintln!(
-                            "[viewdbg] bridge addView this={this} child={child} \
-                             child_in_views={} parent_in_views={}",
-                            ui.views.contains_key(&child),
-                            ui.views.contains_key(&this)
-                        );
-                    }
-                    // Dex-inflated views (real Instances or view-tree stubs)
-                    // aren't GuestViews — attach them in the VM's view tree
-                    // instead of failing.
-                    let Some(cv) = ui.views.get(&child).cloned() else {
-                        vm.view_tree_add(this, child);
+                    // Overloads differ after the child arg: LayoutParams is
+                    // the last Ref; the index is the first non-negative I32
+                    // (the dex arm parses them the same way).
+                    let lp = a[2.min(a.len())..]
+                        .iter()
+                        .rev()
+                        .find(|x| matches!(x, V::Ref(h) if *h != 0))
+                        .copied();
+                    let idx = a[2.min(a.len())..]
+                        .iter()
+                        .find(|x| matches!(x, V::I32(i) if *i >= 0))
+                        .map(|x| match x {
+                            V::I32(i) => *i as usize,
+                            _ => 0,
+                        });
+                    // Dex-side bookkeeping first: registered overloads
+                    // intercept the invoke, so `attach_at` never runs
+                    // unless the bridge does it — parent/attach mark,
+                    // LP resolution and onViewAdded all live there.
+                    vm.view_tree_attach_at(this, child, idx, lp);
+                    // Bridged parents adopt dex-view-tree children too —
+                    // materialize them so e.g. ViewPager2's empty
+                    // FrameLayout still hosts inflated content.
+                    let Some(cv) = ui
+                        .views
+                        .get(&child)
+                        .cloned()
+                        .or_else(|| ui.materialize_dex(vm, child))
+                    else {
                         return Ok(None);
                     };
-                    match ui.views.get(&this).cloned() {
-                        Some(rc) => {
-                            let mut g = rc.borrow_mut();
-                            match &mut *g {
-                                GuestView::Group(gr) => {
-                                    // addView(v, lp) hands the LP here —
-                                    // apply its dims so the child isn't
-                                    // measured at its 0×0 desired size.
-                                    if let Some(V::Ref(lp)) = a.get(2).copied() {
-                                        let (w, h) = vm.layout_params_dims(lp);
-                                        if std::env::var_os("OVELO_VIEWDBG").is_some() {
-                                            eprintln!(
-                                                "[viewdbg] bridge addView lp w={w:?} h={h:?}"
-                                            );
-                                        }
-                                        let mut c = cv.borrow_mut();
-                                        let v = c.view_mut();
-                                        if let Some(w) = w {
-                                            v.lp_w = Length::from_aosp(w);
-                                        }
-                                        if let Some(h) = h {
-                                            v.lp_h = Length::from_aosp(h);
-                                        }
-                                        drop(c);
-                                    }
-                                    gr.children.push(Box::new(SharedView(cv)));
-                                    if std::env::var_os("OVELO_VIEWDBG").is_some() {
-                                        eprintln!(
-                                            "[viewdbg] bridge addView pushed; children={}",
-                                            gr.children.len()
-                                        );
-                                    }
-                                    gr.view.invalidate();
-                                    Ok(None)
-                                }
-                                _ => {
-                                    if std::env::var_os("OVELO_VIEWDBG").is_some() {
-                                        eprintln!(
-                                            "[viewdbg] bridge addView non-group kind={:?} class={}",
-                                            std::mem::discriminant(&*g),
-                                            vm.dbg_class_of(this)
-                                        );
-                                    }
-                                    drop(g);
-                                    vm.view_tree_add(this, child);
-                                    Ok(None)
-                                }
-                            }
+                    let Some(rc) = ui.views.get(&this).cloned() else {
+                        return Ok(None);
+                    };
+                    let mut g = rc.borrow_mut();
+                    let GuestView::Group(gr) = &mut *g else {
+                        return Ok(None);
+                    };
+                    if let Some(V::Ref(lp)) = lp {
+                        let (w, h) = vm.layout_params_dims(lp);
+                        let mut c = cv.borrow_mut();
+                        let v = c.view_mut();
+                        if let Some(w) = w {
+                            v.lp_w = Length::from_aosp(w);
                         }
-                        None => {
-                            vm.view_tree_add(this, child);
-                            Ok(None)
+                        if let Some(h) = h {
+                            v.lp_h = Length::from_aosp(h);
                         }
+                        drop(c);
                     }
-                },
-            );
+                    // Dedupe a re-added child (move, not duplicate) — the
+                    // dex side does the same in attach_at.
+                    if let Some(old) = gr.children.iter_mut().position(|b| child_matches(b, &cv)) {
+                        gr.children.remove(old);
+                    }
+                    let boxed: Box<dyn Drawable> = match vm.dex_view(child).and_then(|i| i.frame) {
+                        Some((l, t, r, b)) => Box::new(AbsView {
+                            inner: SharedView(cv),
+                            rect: (l, t, r, b),
+                        }),
+                        None => Box::new(SharedView(cv)),
+                    };
+                    match idx {
+                        Some(i) if i <= gr.children.len() => gr.children.insert(i, boxed),
+                        _ => gr.children.push(boxed),
+                    }
+                    gr.view.invalidate();
+                    Ok(None)
+                });
+            }
+            for (name, notify, sigs) in [
+                ("removeView", true, vec!["(Landroid/view/View;)V", "(I)V"]),
+                ("removeViewInLayout", true, vec!["(Landroid/view/View;)V"]),
+                ("removeViewAt", true, vec!["(I)V"]),
+                (
+                    "detachViewFromParent",
+                    false,
+                    vec!["(Landroid/view/View;)V", "(I)V"],
+                ),
+            ] {
+                for sig in sigs {
+                    Self::on(ui, vm, cls, name, sig, move |ui, vm, a| {
+                        let this = ref_arg(a, 0)?;
+                        // Child by ref arg, else by index into the dex
+                        // child list (it still reflects the pre-remove
+                        // state — the dex bookkeeping runs below).
+                        let child = match ref_arg(a, 1) {
+                            Ok(c) => Some(c),
+                            Err(_) => match a.get(1).copied() {
+                                Some(V::I32(i)) if i >= 0 => vm
+                                    .dex_view(this)
+                                    .and_then(|i0| i0.children.get(i as usize).copied()),
+                                _ => None,
+                            },
+                        };
+                        let Some(child) = child else {
+                            return Ok(None);
+                        };
+                        // Dex bookkeeping: registered overloads intercept
+                        // the invoke, so the bridge must run detach.
+                        vm.view_tree_detach(this, child, notify);
+                        let Some(cv) = ui
+                            .views
+                            .get(&child)
+                            .cloned()
+                            .or_else(|| ui.dex_views.get(&child).cloned())
+                        else {
+                            return Ok(None);
+                        };
+                        let Some(rc) = ui.views.get(&this).cloned() else {
+                            return Ok(None);
+                        };
+                        let mut g = rc.borrow_mut();
+                        let GuestView::Group(gr) = &mut *g else {
+                            return Ok(None);
+                        };
+                        if let Some(i) = gr.children.iter_mut().position(|b| child_matches(b, &cv))
+                        {
+                            gr.children.remove(i);
+                            gr.view.invalidate();
+                        }
+                        Ok(None)
+                    });
+                }
+            }
+            Self::on(ui, vm, cls, "removeAllViews", "()V", |ui, vm, a| {
+                let this = ref_arg(a, 0)?;
+                for c in vm
+                    .dex_view(this)
+                    .map(|i| i.children.clone())
+                    .unwrap_or_default()
+                {
+                    vm.view_tree_detach(this, c, true);
+                }
+                if let Some(rc) = ui.views.get(&this).cloned() {
+                    if let GuestView::Group(gr) = &mut *rc.borrow_mut() {
+                        gr.children.clear();
+                        gr.view.invalidate();
+                    }
+                }
+                Ok(None)
+            });
         }
 
         // ---- Activity.setContentView -------------------------------------
@@ -616,14 +707,14 @@ impl GuestUi {
             "(Landroid/view/View;)V",
             |ui, vm, a| {
                 let v = ref_arg(a, 1)?;
-                match ui.views.get(&v).cloned() {
-                    Some(cv) => {
-                        ui.guest_content_set = true;
-                        ui.root.set_content_view(Box::new(SharedView(cv)));
-                    }
-                    None => {
-                        vm.view_set_content(ref_arg(a, 0)?, v);
-                    }
+                let activity = ref_arg(a, 0)?;
+                // Dex-side bookkeeping (attach, content-frame registration)
+                // runs for bridged views too — the GL attach gate and the
+                // dex view tree both need it.
+                vm.view_set_content(activity, v);
+                if let Some(cv) = ui.views.get(&v).cloned() {
+                    ui.guest_content_set = true;
+                    ui.root.set_content_view(Box::new(SharedView(cv)));
                 }
                 Ok(None)
             },
@@ -832,6 +923,20 @@ impl GuestUi {
     /// view-tree generation changes. Covers both the materialized dex
     /// tree (`dex_views`) and bridged `new` views (`views`).
     fn pump_gl_frames(&mut self, vm: &mut Vm) {
+        // Push host-computed bounds back onto the dex view objects:
+        // `getWidth()`/`getHeight()` read the dex-side frame, which the
+        // host layout engine never ran `layout()` to set (Korge's GL
+        // view builds its ortho matrix from these — 0x0 NaNs it).
+        for (&h, rc) in self.views.iter() {
+            let (l, t, s) = {
+                let mut g = rc.borrow_mut();
+                let v = g.view_mut();
+                (v.left, v.top, v.measured)
+            };
+            if s.w > 0 && s.h > 0 {
+                vm.view_set_frame(h, l, t, l + s.w, t + s.h);
+            }
+        }
         if std::env::var_os("OVELO_DRAWDBG").is_some() {
             eprintln!(
                 "[gldbg] pump views={:?} dex_views={:?}",
@@ -842,8 +947,11 @@ impl GuestUi {
         for (&h, rc) in self.views.iter().chain(self.dex_views.iter()) {
             if std::env::var_os("OVELO_DRAWDBG").is_some() {
                 eprintln!(
-                    "[gldbg] cand h={h} gl={} measured={:?}",
+                    "[gldbg] cand h={h} gl={} att={} cls={} parent={:?} measured={:?}",
                     vm.has_gl_renderer(h),
+                    vm.view_is_attached(h),
+                    vm.dbg_class_of(h),
+                    vm.dbg_view_parent(h),
                     rc.borrow_mut().view_mut().measured
                 );
             }
@@ -861,8 +969,15 @@ impl GuestUi {
                 };
                 (r - l, b - t)
             } else {
-                // Bridged view: laid out by the host tree — use its
-                // measured size (0 before the first traversal).
+                // Bridged view: must still be attached to the dex tree —
+                // a removed SurfaceView (e.g. after a second
+                // setContentView) must stop pumping its renderer, or it
+                // keeps drawing over the new content view.
+                if !vm.view_is_attached(h) {
+                    continue;
+                }
+                // Laid out by the host tree — use its measured size
+                // (0 before the first traversal).
                 let s = rc.borrow_mut().view_mut().measured;
                 (s.w, s.h)
             };

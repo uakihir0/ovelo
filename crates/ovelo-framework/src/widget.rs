@@ -44,6 +44,12 @@ pub trait Drawable {
         let _ = (down, x, y);
         false
     }
+    /// Downcast hook — the guest bridge needs the concrete wrapper
+    /// (`SharedView`/`AbsView`) to match a child box to its dex handle
+    /// for positional insert/remove.
+    fn as_any(&mut self) -> Option<&mut dyn std::any::Any> {
+        None
+    }
 }
 
 /// Whether `(x,y)` is inside the view's laid-out rect.

@@ -1978,6 +1978,17 @@ pub(crate) fn ifield(vm: &Vm, h: u32, owner: &str, name: &str) -> Option<V> {
         ("Landroid/content/pm/ApplicationInfo;", "targetSdkVersion") => Some(V::I32(35)),
         ("Landroid/content/pm/ApplicationInfo;", "minSdkVersion") => Some(V::I32(21)),
         ("Landroid/content/pm/ApplicationInfo;", "flags") => Some(V::I32(0)),
+        // Path fields populated by `app_info` at creation.
+        ("Landroid/content/pm/ApplicationInfo;", "dataDir") => {
+            Some(pseudo_get(vm, h, P_DATA).unwrap_or(V::Ref(0)))
+        }
+        ("Landroid/content/pm/ApplicationInfo;", "sourceDir")
+        | ("Landroid/content/pm/ApplicationInfo;", "publicSourceDir") => {
+            Some(pseudo_get(vm, h, P_META).unwrap_or(V::Ref(0)))
+        }
+        ("Landroid/content/pm/ApplicationInfo;", "nativeLibraryDir") => {
+            Some(pseudo_get(vm, h, P_FLAGS).unwrap_or(V::Ref(0)))
+        }
         // Manifest-backed component infos the CLI mints for
         // resolveService/queryIntentServices & friends — ResolveInfo
         // links its *Info in P_TARGET; *Info carries name/packageName

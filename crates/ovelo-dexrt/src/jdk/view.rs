@@ -415,7 +415,7 @@ fn pint(vm: &Vm, h: u32, key: u32) -> i32 {
 
 /// Store a view frame; returns whether it changed (View.setFrame's
 /// contract and `layout`'s `changed` argument).
-fn frame_set(vm: &mut Vm, h: u32, l: i32, t: i32, r: i32, b: i32) -> bool {
+pub(crate) fn frame_set(vm: &mut Vm, h: u32, l: i32, t: i32, r: i32, b: i32) -> bool {
     let changed = pint(vm, h, P_LEFT) != l
         || pint(vm, h, P_TOP) != t
         || pint(vm, h, P_RIGHT) != r
@@ -1384,15 +1384,22 @@ pub(crate) fn call(
                 // `addView(View)` sig only — every overload ends in
                 // `addViewInner(child)` with the child at args[1], so
                 // fall back to it when the exact proto isn't bridged.
-                let host = vm
-                    .named_host(class, name, sig)
-                    .or_else(|| vm.named_host(class, name, "(Landroid/view/View;)V"));
+                let host = if matches!(name, "addView" | "addViewInLayout") {
+                    vm.named_host(class, name, sig)
+                        .or_else(|| vm.named_host(class, name, "(Landroid/view/View;)V"))
+                } else {
+                    // attachViewToParent* are transient (RecyclerView
+                    // scrap): dex bookkeeping only, no host bridge.
+                    None
+                };
+                let mut host_ran = false;
                 if let Some(f) = host {
                     if std::env::var_os("OVELO_VIEWDBG").is_some() {
                         eprintln!("[viewdbg] addView host-arm h{this} (ref {class})");
                     }
                     if let Ok(mut g) = f.try_borrow_mut() {
                         let _ = g(vm, args);
+                        host_ran = true;
                     }
                 } else if std::env::var_os("OVELO_VIEWDBG").is_some() {
                     eprintln!("[viewdbg] addView host-miss h{this} (ref {class}) sig={sig}");
@@ -1407,7 +1414,12 @@ pub(crate) fn call(
                     .rev()
                     .find(|a| matches!(a, V::Ref(h) if *h != 0))
                     .copied();
-                attach_at(vm, this, child, idx, notify, lp);
+                // A host bridge that ran already did the attach
+                // bookkeeping itself — attaching again would fire
+                // onViewAdded twice.
+                if !host_ran {
+                    attach_at(vm, this, child, idx, notify, lp);
+                }
             }
             Some(match ret(sig) {
                 "V" => None,
@@ -1415,7 +1427,22 @@ pub(crate) fn call(
             })
         }
         "removeView" | "removeViewInLayout" => {
-            detach(vm, this, args.get(1).copied().unwrap_or(V::Ref(0)), true);
+            // Mirror addView: a bridged group gets its host-side child
+            // removed by the registered arm (which also detaches); the
+            // fallback covers overloads the bridge didn't register.
+            let host = vm
+                .named_host(class, name, sig)
+                .or_else(|| vm.named_host(class, name, "(Landroid/view/View;)V"));
+            let mut ran = false;
+            if let Some(f) = host {
+                if let Ok(mut g) = f.try_borrow_mut() {
+                    let _ = g(vm, args);
+                    ran = true;
+                }
+            }
+            if !ran {
+                detach(vm, this, args.get(1).copied().unwrap_or(V::Ref(0)), true);
+            }
             Some(None)
         }
         "removeViewAt" => {
@@ -1487,25 +1514,18 @@ pub(crate) fn call(
                 if let Some(V::Ref(cb)) = args.get(1).copied() {
                     if cb != 0 {
                         pseudo_set(vm, this, P_HOLDER_CBS, V::Ref(cb));
-                        // Size from the owning view's frame — GL threads
-                        // (GLSurfaceView.guardedRun) hold `wait()` until
-                        // surfaceChanged reports a non-zero w/h.
-                        let (sw, sh) = pseudo_get(vm, this, crate::jdk::P_TARGET)
-                            .and_then(|v| {
-                                if let V::Ref(vh) = v {
-                                    vm.dex_view(vh).and_then(|i| i.frame)
-                                } else {
-                                    None
-                                }
-                            })
-                            .map(|(l, t, r, b)| (r - l, b - t))
-                            .unwrap_or((720, 1280));
                         // Defer to the next drain tick: Android only
                         // fires these once a real surface exists, and
                         // Godot's `init()` runs this before its
                         // `glThread` field is assigned — inline calls
-                        // NPE on the null receiver.
-                        vm.pending_surface.push((this, cb, sw, sh));
+                        // NPE on the null receiver. The size is resolved
+                        // at delivery, not here: the view is often still
+                        // unlaid-out when the callback registers (Korge
+                        // saw 0x0 and NaN'd its ortho matrix).
+                        vm.pending_surface.push((this, cb, 0));
+                        if !vm.surface_cbs.iter().any(|&(_, c)| c == cb) {
+                            vm.surface_cbs.push((this, cb));
+                        }
                     }
                 }
             }
@@ -5156,6 +5176,13 @@ pub(crate) fn attach_at(
     }
     if let V::Ref(ch) = child {
         pseudo_set(vm, ch, P_PARENT, V::Ref(parent));
+        if std::env::var_os("OVELO_VIEWDBG").is_some() {
+            eprintln!(
+                "[viewdbg] attach_at h{ch} <- h{parent} parent_att={} cls={}",
+                pint(vm, parent, P_ATTACHED),
+                vm.dbg_class_of(ch)
+            );
+        }
         // AOSP ViewGroup.addView → child.dispatchAttachedToWindow when
         // the parent is already attached — set the flag first (AttachInfo
         // is installed before the callback), then deliver the callback.
@@ -5163,14 +5190,7 @@ pub(crate) fn attach_at(
         // root LayoutNode gets its Owner; skipping it leaves
         // DepthSortedSet.remove crashing on unattached nodes.
         if pint(vm, parent, P_ATTACHED) == 1 {
-            pseudo_set(vm, ch, P_ATTACHED, V::I32(1));
-            let r = vm.call_virtual(ch, "onAttachedToWindow", &[]);
-            if std::env::var_os("OVELO_VIEWDBG").is_some() {
-                match r {
-                    Ok(_) => eprintln!("[viewdbg] onAttachedToWindow h{ch} ok"),
-                    Err(e) => eprintln!("[viewdbg] onAttachedToWindow h{ch} err {e}"),
-                }
-            }
+            mark_attached(vm, ch, 0);
         }
         // AOSP addViewInner checkLayoutParams → generateLayoutParams
         // first: ConstraintLayout's onViewAdded reads getLayoutParams()
@@ -5260,7 +5280,7 @@ pub(crate) fn attach_at(
 /// `notify` fires `onViewRemoved` — real `removeView*` paths only;
 /// the ChildHelper's transient `detachViewFromParent` never notifies
 /// (the child is coming right back).
-fn detach(vm: &mut Vm, parent: u32, child: V, notify: bool) {
+pub(crate) fn detach(vm: &mut Vm, parent: u32, child: V, notify: bool) {
     let Some(a) = children_arr(vm, parent) else {
         return;
     };
@@ -5277,10 +5297,54 @@ fn detach(vm: &mut Vm, parent: u32, child: V, notify: bool) {
             // Mirror onViewAdded: dex parents unregister the child here
             // (ConstraintLayout drops it from mChildrenById; adapters
             // recycle through detach and stale registrations would keep
-            // dead views in subsequent passes).
+            // dead views in subsequent passes). A real remove also ends
+            // the child's attach — `view_is_attached` must stop being
+            // true or e.g. the GL pump keeps driving an orphaned
+            // SurfaceView after setContentView replaces the tree.
             if notify {
+                clear_attached(vm, ch, 0);
                 let _ = vm.call_virtual_rt(parent, "onViewRemoved", &[V::Ref(ch)]);
             }
+        }
+    }
+}
+
+/// `dispatchAttachedToWindow` bookkeeping: set the attach mark and
+/// deliver `onAttachedToWindow` on the view and every still-unattached
+/// descendant (depth-bounded like `find_in_tree_at`). Needed when a
+/// view was added before its parent attached — the parent's later
+/// attach must reach the existing subtree, not just future children.
+fn mark_attached(vm: &mut Vm, h: u32, depth: u32) {
+    if h == 0 || depth > 128 {
+        return;
+    }
+    if pint(vm, h, P_ATTACHED) != 1 {
+        pseudo_set(vm, h, P_ATTACHED, V::I32(1));
+        let r = vm.call_virtual(h, "onAttachedToWindow", &[]);
+        if std::env::var_os("OVELO_VIEWDBG").is_some() {
+            match r {
+                Ok(_) => eprintln!("[viewdbg] onAttachedToWindow h{h} ok"),
+                Err(e) => eprintln!("[viewdbg] onAttachedToWindow h{h} err {e}"),
+            }
+        }
+    }
+    for c in children(vm, h) {
+        if let V::Ref(ch) = c {
+            mark_attached(vm, ch, depth + 1);
+        }
+    }
+}
+
+/// `dispatchDetachedFromWindow` bookkeeping: clear the attach mark on
+/// the view and its subtree (depth-bounded like `find_in_tree_at`).
+fn clear_attached(vm: &mut Vm, h: u32, depth: u32) {
+    if h == 0 || depth > 128 {
+        return;
+    }
+    pseudo_set(vm, h, P_ATTACHED, V::I32(0));
+    for c in children(vm, h) {
+        if let V::Ref(ch) = c {
+            clear_attached(vm, ch, depth + 1);
         }
     }
 }
@@ -5311,6 +5375,14 @@ fn find_in_tree_at(vm: &Vm, root: u32, id: i32, depth: u32) -> Option<u32> {
 
 fn is_marked(vm: &Vm, h: u32) -> bool {
     h != 0 && pseudo_get(vm, h, P_IS_VIEW).is_some()
+}
+
+/// The view's recorded parent handle (0 when none).
+pub(crate) fn view_parent(vm: &Vm, h: u32) -> u32 {
+    match pseudo_get(vm, h, P_PARENT) {
+        Some(V::Ref(p)) => p,
+        _ => 0,
+    }
 }
 
 fn stub_ctx(vm: &mut Vm) -> V {
@@ -5397,6 +5469,10 @@ pub(crate) fn decor_of(vm: &mut Vm, window: u32) -> Option<u32> {
     // dispatch still report `isAttachedToWindow` correctly.
     pseudo_set(vm, d, P_ATTACHED, V::I32(1));
     pseudo_set(vm, cf, P_ATTACHED, V::I32(1));
+    // Children added before the decor attached (an early
+    // setContentView) get their attach callbacks now — AOSP's
+    // dispatchAttachedToWindow reaches the whole existing subtree.
+    mark_attached(vm, cf, 0);
     attach(vm, d, V::Ref(cf));
     vm.content_frames.insert(owner, cf);
     pseudo_set(vm, window, P_DECOR, V::Ref(d));
@@ -5800,6 +5876,14 @@ pub(crate) fn set_content_view(vm: &mut Vm, activity: u32, content: V) {
     pseudo_set(vm, activity, P_CONTENT, cv);
     if let Some(w) = window_of(vm, activity) {
         if let Some(cf) = content_frame_of(vm, w) {
+            // A second setContentView replaces the content view — the
+            // old tree must leave the frame or it keeps drawing (and
+            // e.g. keeps pumping an orphaned GLSurfaceView renderer).
+            for c in children(vm, cf) {
+                if matches!(c, V::Ref(h) if h != 0) {
+                    detach(vm, cf, c, true);
+                }
+            }
             attach(vm, cf, cv);
         }
     }

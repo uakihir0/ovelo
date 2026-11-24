@@ -2158,10 +2158,13 @@ fn thread_call(vm: &mut Vm, name: &str, _sig: &str, args: &[V]) -> Rt<Option<Opt
                     _ => 0,
                 }
                 .max(0);
-                // Short sleeps just block: execution continues after
-                // the call, which parking can't express — a re-run
-                // from the top would repeat the whole runnable.
-                if ms <= 500 {
+                // A spawned Thread's run() IS the loop — restart it at
+                // the top and re-enter: parking yields the drain slice
+                // so frame-scheduler loops (`while { work; sleep(1) }`)
+                // don't captive the worker inside one drain call.
+                // Executor workers instead keep a short real sleep —
+                // parking there re-runs the whole queued task.
+                if ms <= 500 && !vm.thread_runnables.contains(&vm.cur_runnable) {
                     std::thread::sleep(std::time::Duration::from_millis(ms as u64));
                     return Ok(Some(None));
                 }

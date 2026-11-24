@@ -440,7 +440,8 @@ fn list_call(vm: &mut Vm, name: &str, sig: &str, args: &[V]) -> Rt<Option<Option
             // on `add` reporting "already present" via false.
             let is_set = is_set_obj(vm, args[0]);
             let dup = is_set
-                && list_ref(vm, h).is_some_and(|l| l.iter().any(|e| value_eq(vm, *e, args[1])));
+                && list_snapshot(vm, h)
+                    .is_some_and(|l| l.iter().any(|e| value_eq(vm, *e, args[1])));
             let l = match list_mut(vm, h) {
                 Some(l) => l,
                 None => return Ok(None),
@@ -530,7 +531,12 @@ fn list_call(vm: &mut Vm, name: &str, sig: &str, args: &[V]) -> Rt<Option<Option
                 };
                 Some(Some(if i < l.len() { l.remove(i) } else { V::Ref(0) }))
             } else {
-                let items: Vec<V> = list_ref(vm, h).map(|l| l.to_vec()).unwrap_or_default();
+                // Guest-backed collections mutate themselves — without
+                // a host store this arm cannot remove, so defer to dex.
+                if list_mut(vm, h).is_none() {
+                    return Ok(None);
+                }
+                let items: Vec<V> = list_snapshot(vm, h).unwrap_or_default();
                 let mut pos = None;
                 for (i, e) in items.iter().enumerate() {
                     if elem_eq(vm, *e, args[1])? {
@@ -550,6 +556,10 @@ fn list_call(vm: &mut Vm, name: &str, sig: &str, args: &[V]) -> Rt<Option<Option
             }
         }
         "removeAll" | "removeIf" | "retainAll" => {
+            // Guest-backed collections mutate themselves.
+            if list_mut(vm, h).is_none() {
+                return Ok(None);
+            }
             if name == "removeIf" {
                 Some(Some(V::I32(0))) // predicate not run — keep contents
             } else {
@@ -564,7 +574,7 @@ fn list_call(vm: &mut Vm, name: &str, sig: &str, args: &[V]) -> Rt<Option<Option
                     },
                     _ => vec![],
                 };
-                let cur: Vec<V> = list_ref(vm, h).cloned().unwrap_or_default();
+                let cur: Vec<V> = list_snapshot(vm, h).unwrap_or_default();
                 let keep: Vec<bool> = cur
                     .iter()
                     .map(|e| {
@@ -587,7 +597,7 @@ fn list_call(vm: &mut Vm, name: &str, sig: &str, args: &[V]) -> Rt<Option<Option
             }
         }
         "get" => {
-            let l = match list_ref(vm, h) {
+            let l = match list_snapshot(vm, h) {
                 Some(l) => l,
                 None => return Ok(None),
             };
@@ -607,7 +617,7 @@ fn list_call(vm: &mut Vm, name: &str, sig: &str, args: &[V]) -> Rt<Option<Option
             }
         }
         "element" | "getFirst" | "getLast" | "first" | "last" => {
-            let l = match list_ref(vm, h) {
+            let l = match list_snapshot(vm, h) {
                 Some(l) => l,
                 None => return Ok(None),
             };
@@ -624,7 +634,7 @@ fn list_call(vm: &mut Vm, name: &str, sig: &str, args: &[V]) -> Rt<Option<Option
             }
         }
         "peek" | "peekFirst" | "peekLast" => {
-            let l = match list_ref(vm, h) {
+            let l = match list_snapshot(vm, h) {
                 Some(l) => l,
                 None => return Ok(None),
             };
@@ -635,6 +645,10 @@ fn list_call(vm: &mut Vm, name: &str, sig: &str, args: &[V]) -> Rt<Option<Option
             Some(Some(v))
         }
         "set" => {
+            // Guest-backed collections mutate themselves.
+            if list_mut(vm, h).is_none() {
+                return Ok(None);
+            }
             let n = list_ref(vm, h).map(|l| l.len()).unwrap_or(0);
             let i = i32v(args[1]) as usize;
             if i >= n {
@@ -650,21 +664,25 @@ fn list_call(vm: &mut Vm, name: &str, sig: &str, args: &[V]) -> Rt<Option<Option
             Some(Some(std::mem::replace(&mut l[i], args[2])))
         }
         "size" => {
-            let n = list_ref(vm, h).map(|l| l.len()).unwrap_or(0);
+            let n = list_snapshot(vm, h).map(|l| l.len()).unwrap_or(0);
             Some(Some(V::I32(n as i32)))
         }
         "isEmpty" => {
-            let e = list_ref(vm, h).map(|l| l.is_empty()).unwrap_or(true);
+            let e = list_snapshot(vm, h).map(|l| l.is_empty()).unwrap_or(true);
             Some(Some(V::I32(e as i32)))
         }
         "clear" => {
+            // Guest-backed collections mutate themselves.
+            if list_mut(vm, h).is_none() {
+                return Ok(None);
+            }
             if let Some(l) = list_mut(vm, h) {
                 l.clear();
             }
             Some(None)
         }
         "contains" => {
-            let items: Vec<V> = list_ref(vm, h).map(|l| l.to_vec()).unwrap_or_default();
+            let items: Vec<V> = list_snapshot(vm, h).unwrap_or_default();
             let mut c = false;
             for e in &items {
                 if elem_eq(vm, *e, args[1])? {
@@ -703,8 +721,8 @@ fn list_call(vm: &mut Vm, name: &str, sig: &str, args: &[V]) -> Rt<Option<Option
         }
         "containsAll" | "equals" => Some(Some(V::I32(1))),
         "indexOf" | "lastIndexOf" => {
-            let items: Vec<V> = match list_ref(vm, h) {
-                Some(l) => l.to_vec(),
+            let items: Vec<V> = match list_snapshot(vm, h) {
+                Some(l) => l,
                 None => return Ok(None),
             };
             let mut i = None;
@@ -777,10 +795,7 @@ fn list_call(vm: &mut Vm, name: &str, sig: &str, args: &[V]) -> Rt<Option<Option
             )))
         }
         "toArray" => {
-            let items: Vec<V> = match list_ref(vm, h) {
-                Some(l) => l.clone(),
-                None => vec![],
-            };
+            let items: Vec<V> = list_snapshot(vm, h).unwrap_or_default();
             let elem = match args.get(1) {
                 Some(V::Ref(ah)) => match vm.heap.get(*ah) {
                     Some(Obj::Array { elem, .. }) => elem.clone(),
@@ -792,15 +807,12 @@ fn list_call(vm: &mut Vm, name: &str, sig: &str, args: &[V]) -> Rt<Option<Option
         }
         "subList" => {
             let (a, b) = (i32v(args[1]) as usize, i32v(args[2]) as usize);
-            let items: Vec<V> = match list_ref(vm, h) {
-                Some(l) => l
-                    .iter()
-                    .skip(a)
-                    .take(b.saturating_sub(a))
-                    .copied()
-                    .collect(),
-                None => vec![],
-            };
+            let items: Vec<V> = list_snapshot(vm, h)
+                .unwrap_or_default()
+                .into_iter()
+                .skip(a)
+                .take(b.saturating_sub(a))
+                .collect();
             Some(Some(host(vm, "Ljava/util/List;", HostState::List(items))))
         }
         "forEach" | "replaceAll" | "sort" | "stream" | "parallelStream" => {
@@ -817,7 +829,9 @@ fn list_call(vm: &mut Vm, name: &str, sig: &str, args: &[V]) -> Rt<Option<Option
             }
         }
         "hashCode" => {
-            let hc = list_ref(vm, h).map(|l| l.len() as i32 * 31).unwrap_or(1);
+            let hc = list_snapshot(vm, h)
+                .map(|l| l.len() as i32 * 31)
+                .unwrap_or(1);
             Some(Some(V::I32(hc)))
         }
         _ => None,
