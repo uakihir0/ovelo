@@ -2087,7 +2087,8 @@ fn thread_call(vm: &mut Vm, name: &str, _sig: &str, args: &[V]) -> Rt<Option<Opt
                 Some(V::Ref(h)) => {
                     let t = pseudo_get(vm, *h, P_TARGET).unwrap_or(V::Ref(*h));
                     pseudo_get(vm, *h, P_STARTED).is_some()
-                        && matches!(t, V::Ref(r) if vm.thread_runnables.contains(&r))
+                        && matches!(t, V::Ref(r) if vm.thread_runnables.contains(&r)
+                            && vm.runnable_thread.get(&r) == Some(h))
                 }
                 _ => false,
             };
@@ -2154,6 +2155,7 @@ fn thread_call(vm: &mut Vm, name: &str, _sig: &str, args: &[V]) -> Rt<Option<Opt
                 pseudo_set(vm, h, P_STARTED, V::I32(1));
                 let t = pseudo_get(vm, h, P_TARGET).unwrap_or(V::Ref(h));
                 if let V::Ref(r) = t {
+                    vm.runnable_thread.insert(r, h);
                     // Thread-spawned runnables get an unbounded park
                     // budget — a `while (running)` game loop parks on
                     // every Thread.sleep and must never hit the worker
@@ -2221,10 +2223,44 @@ fn thread_call(vm: &mut Vm, name: &str, _sig: &str, args: &[V]) -> Rt<Option<Opt
             }
             Some(None)
         }
+        "join" => {
+            // Wait for the target thread's runnable to finish by
+            // draining the queue inline — a no-op return leaves a
+            // `while (t.isAlive()) t.join()` poll spinning forever on
+            // this thread while the worker can never run. Park-yield
+            // instead would re-run the caller's run() from the top, so
+            // drain inline with a wall-clock bound (join's millis arg,
+            // capped) and give up quietly when the queue dries.
+            let h = match args.first() {
+                Some(V::Ref(h)) => *h,
+                _ => return Ok(Some(None)),
+            };
+            let t = pseudo_get(vm, h, P_TARGET).unwrap_or(V::Ref(h));
+            let alive = |vm: &Vm| {
+                matches!(t, V::Ref(r) if vm.thread_runnables.contains(&r)
+                    && vm.runnable_thread.get(&r) == Some(&h))
+            };
+            let m_raw: i64 = match args.get(1).copied().unwrap_or(V::I64(0)) {
+                V::I64(m) => m,
+                V::I32(m) => m as i64,
+                _ => 0,
+            };
+            let cap_ms = if m_raw > 0 {
+                (m_raw as u64).min(2_000)
+            } else {
+                2_000
+            };
+            let until = super::now_ms() as u64 + cap_ms;
+            while alive(vm) && (super::now_ms() as u64) < until {
+                if vm.park_drain().is_err() {
+                    break;
+                }
+            }
+            Some(None)
+        }
         "setPriority"
         | "setDaemon"
         | "interrupt"
-        | "join"
         | "yield"
         | "setUncaughtExceptionHandler"
         | "setDefaultUncaughtExceptionHandler"

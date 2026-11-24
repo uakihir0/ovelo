@@ -456,6 +456,9 @@ pub struct Vm {
     /// FieldDriver), unlike executor workers which the repark budget
     /// exists to stop. Keyed by runnable handle.
     pub(crate) thread_runnables: std::collections::HashSet<u32>,
+    /// Runnable handle → the Thread that `start()`ed it, so isAlive
+    /// distinguishes which Thread a shared Runnable runs on.
+    pub(crate) runnable_thread: std::collections::HashMap<u32, u32>,
     /// The runnable `run_on_worker` is executing right now — lets
     /// `Thread.sleep(ms)` record a wake deadline against it.
     pub(crate) cur_runnable: u32,
@@ -793,6 +796,7 @@ impl Vm {
             in_host_retry: false,
             surface_sizes: HashMap::new(),
             thread_runnables: std::collections::HashSet::new(),
+            runnable_thread: std::collections::HashMap::new(),
             cur_runnable: 0,
             sleep_until: HashMap::new(),
             slept_once: std::collections::HashSet::new(),
@@ -2417,6 +2421,7 @@ impl Vm {
                     // done — drop it so GC can reclaim it and its
                     // captured references.
                     self.thread_runnables.remove(&r);
+                    self.runnable_thread.remove(&r);
                     self.sleep_until.remove(&r);
                     self.park_waiters.remove(&r);
                     self.unparkable_delayed.remove(&r);
@@ -3336,6 +3341,13 @@ impl Vm {
             | "Ljava/util/concurrent/CompletionException;"
             | "Ljava/util/concurrent/CancellationException;"
             | "Ljava/lang/reflect/MalformedParametersException;" => &[
+                "Ljava/lang/RuntimeException;",
+                "Ljava/lang/Exception;",
+                "Ljava/lang/Throwable;",
+                "Ljava/lang/Object;",
+            ],
+            "Ljava/lang/IllegalThreadStateException;" => &[
+                "Ljava/lang/IllegalArgumentException;",
                 "Ljava/lang/RuntimeException;",
                 "Ljava/lang/Exception;",
                 "Ljava/lang/Throwable;",
