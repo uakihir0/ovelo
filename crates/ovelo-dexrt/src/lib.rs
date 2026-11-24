@@ -504,6 +504,11 @@ pub struct Vm {
     /// kills one (and its task is lost). Cleared whenever fresh work
     /// is enqueued — it may target those workers' internal queues.
     reparked: std::collections::HashSet<u32>,
+    /// Array handles whose fill-loop peephole scan found a non-uniform
+    /// range — re-scanning every loop iteration is O(n²), so a failed
+    /// handle is remembered and the check skipped from then on. A handle
+    /// that later becomes uniform just loses a skip (perf only).
+    fill_bad: std::collections::HashSet<u32>,
     /// Consecutive `park_drain` calls that drained only re-parked
     /// workers — bounded so mutual waiters yield to the outer drain
     /// (which re-runs them with a fresh budget) instead of spinning
@@ -796,6 +801,7 @@ impl Vm {
             draining: false,
             park_depth: 0,
             reparked: std::collections::HashSet::new(),
+            fill_bad: std::collections::HashSet::new(),
             park_spins: 0,
             repark_counts: HashMap::new(),
             parked_runnables: HashMap::new(),
@@ -6219,6 +6225,13 @@ impl Vm {
                             && inc.lit == Some(1)
                             && go.opcode == 0x28
                             && go.target == Some(ins.offset)
+                            // The const target must not alias the
+                            // counter, bound or array register — an
+                            // aliased store would also change what the
+                            // loop compares or writes through.
+                            && cst.regs.first() != ins.regs.first()
+                            && cst.regs.first() != ins.regs.get(1)
+                            && cst.regs.first() != ap.regs.get(1)
                         {
                             Some((cst.regs[0] as usize, ap.regs[1] as usize, lit as i32))
                         } else {
@@ -6229,20 +6242,23 @@ impl Vm {
                     };
                     if let Some((z, arr_reg, c)) = fill {
                         let (i0, n) = (Self::i32v(va)?, Self::i32v(vb)?);
-                        if let Some(Obj::Array { data, .. }) =
-                            self.heap.get(Self::refv(Self::reg(fr, arr_reg)?)?)
+                        let ah = Self::refv(Self::reg(fr, arr_reg)?)?;
+                        let probed = !self.fill_bad.contains(&ah);
+                        if let Some(Obj::Array { data, .. }) = self.heap.get(ah).filter(|_| probed)
                         {
                             // The loop is a no-op iff every slot it
-                            // would touch already reads as the
-                            // stored constant — Ref(0) is the same
-                            // null an aput-object of I32(0) writes.
+                            // would touch already holds the canonical
+                            // value the store would leave — for
+                            // aput-object that is Ref(0) (aput
+                            // canonicalizes I32(0) → Ref(0) on object
+                            // arrays), so a skipped range is bit-equal
+                            // to a looped one, including under
+                            // Arrays.equals.
+                            let stored = if c == 0 { V::Ref(0) } else { V::I32(c) };
                             let uniform = i0 >= 0
                                 && n >= 0
                                 && n as usize <= data.len()
-                                && data[i0 as usize..n as usize].iter().all(|v| {
-                                    matches!(v, V::I32(x) if *x == c)
-                                        || (c == 0 && matches!(v, V::Ref(0)))
-                                });
+                                && data[i0 as usize..n as usize].iter().all(|v| *v == stored);
                             if uniform {
                                 Self::set(fr, ins.regs[0] as usize, V::I32(n));
                                 Self::set(fr, z, V::I32(c));
@@ -6250,6 +6266,11 @@ impl Vm {
                                     ins.target.ok_or_else(|| E::Vm(err("dexrt.branch")))? as usize,
                                 ));
                             }
+                            // Non-uniform: the real loop runs — and a
+                            // rescan on every head hit would be O(n²),
+                            // so the failed handle is remembered and
+                            // later hits go straight to interpretation.
+                            self.fill_bad.insert(ah);
                         }
                     }
                 }
@@ -6835,13 +6856,23 @@ impl Vm {
     fn aput(&mut self, h: u32, i: i32, v: V) -> Rt<()> {
         self.null_check(h, "aput")?;
         match self.heap.get_mut(h) {
-            Some(Obj::Array { data, .. }) => {
+            Some(Obj::Array { elem, data }) => {
                 if i < 0 || i as usize >= data.len() {
                     let d = format!("aput idx {i} len {}", data.len());
                     return Err(
                         self.throw_builtin("Ljava/lang/ArrayIndexOutOfBoundsException;", &d)
                     );
                 }
+                // A `const/4 0` null written through aput-object must
+                // read back as a reference — canonicalize to Ref(0) so a
+                // stored null compares equal to the new-array default
+                // (Arrays.equals, if-eq, Object[] of fresh nulls).
+                let v =
+                    if matches!(v, V::I32(0)) && (elem.starts_with('L') || elem.starts_with('[')) {
+                        V::Ref(0)
+                    } else {
+                        v
+                    };
                 data[i as usize] = v;
                 Ok(())
             }
