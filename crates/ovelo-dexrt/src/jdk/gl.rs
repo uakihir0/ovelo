@@ -1243,15 +1243,19 @@ fn farr(vm: &Vm, v: &V, off: &V, n: usize) -> Vec<f32> {
 fn buf_bytes(vm: &Vm, buf: &V, size: usize) -> Vec<u8> {
     let V::Ref(h) = buf else { return vec![0; size] };
     if let Some(arr) = elem_arr(vm, *h) {
-        // Typed view (IntBuffer/FloatBuffer): one element per 4-byte
-        // word stored little-endian — matches how the buffer was
-        // populated from guest ints/floats.
+        // Typed view (IntBuffer/FloatBuffer/ShortBuffer): elements are
+        // stored as values, serialized at the view's element width and
+        // declared order.
         if let Some(Obj::Array { data, .. }) = vm.heap.get(arr) {
             let pos = bbuf_pos(vm, *h);
+            let esz = i32v(pseudo_get(vm, *h, super::P_BBUF_ESZ).unwrap_or(V::I32(4))).clamp(1, 8)
+                as usize;
+            let le = bbuf_le(vm, *h);
             let mut out = Vec::with_capacity(size);
-            for i in 0..size / 4 {
+            for i in 0..size / esz {
                 let v = i32v(data.get(pos + i).copied().unwrap_or(V::I32(0)));
-                out.extend_from_slice(&v.to_le_bytes());
+                let b = if le { v.to_le_bytes() } else { v.to_be_bytes() };
+                out.extend_from_slice(&b[4 - esz..]);
             }
             out.resize(size, 0);
             return out;
