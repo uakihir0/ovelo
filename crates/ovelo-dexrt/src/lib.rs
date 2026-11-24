@@ -3700,13 +3700,19 @@ impl Vm {
             if *owner != GX_NONE && (*owner == owner_ref || self.assignable(owner_ref, *owner)) {
                 return Ok(Some(f.clone()));
             }
-            // Platform-class registrations carry no dex type: compare
-            // descriptors — `type_desc_of`/`assignable_desc` are cached.
-            if *owner == GX_NONE {
-                if let Ok(site) = self.type_desc_of(owner_ref) {
-                    if self.assignable_desc(&site, desc) {
-                        return Ok(Some(f.clone()));
-                    }
+            // Descriptor fallback covers every GX_NONE mix (platform
+            // classes have no dex type on one or both sides).
+            // `<init>` is non-virtual: only the exact declared class
+            // may match — `new EditText` reaching the inherited `View`
+            // ctor bridge builds the wrong GuestView kind (the dex
+            // EditText's setText then hits a type error).
+            if let Ok(site) = self.type_desc_of(owner_ref) {
+                if if name == "<init>" {
+                    site == *desc
+                } else {
+                    self.assignable_desc(&site, desc)
+                } {
+                    return Ok(Some(f.clone()));
                 }
             }
         }
@@ -3719,6 +3725,19 @@ impl Vm {
     /// would otherwise swallow a bridged call (`ViewGroup.addView`).
     pub(crate) fn named_host(&self, class: &str, name: &str, sig: &str) -> Option<HostCall> {
         let owner_ref = self.type_index_of(class).unwrap_or(GX_NONE);
+        if crate::dbg_flag("OVELO_VIEWDBG") {
+            let key = (name.to_string(), sig.to_string());
+            let es: Vec<String> = self
+                .hosts_named
+                .get(&key)
+                .into_iter()
+                .flatten()
+                .map(|(o, d, _)| format!("o{o}={d}"))
+                .collect();
+            eprintln!(
+                "[viewdbg] named_host {class}.{name}{sig} owner_ref={owner_ref} entries={es:?}"
+            );
+        }
         for (owner, desc, f) in self
             .hosts_named
             .get(&(name.to_string(), sig.to_string()))
@@ -3731,11 +3750,16 @@ impl Vm {
             {
                 return Some(f.clone());
             }
-            // A call site naming the platform class itself (or any
-            // ancestor in its descriptor) still reaches the bridge —
-            // `ViewGroup.addView` invoked via a `ViewGroup`-typed ref
-            // has owner_ref == GX_NONE and must not early-exit.
-            if *owner == GX_NONE && self.assignable_desc(class, desc) {
+            // Descriptor ancestry covers platform classes on either
+            // side — `ViewGroup.addView` invoked via a `ViewGroup`-typed
+            // ref must not miss the bridge (fossify documents white
+            // frame was exactly this: 4-arg addView host-miss).
+            // `<init>` is non-virtual: exact declared class only.
+            if if name == "<init>" {
+                class == desc
+            } else {
+                self.assignable_desc(class, desc)
+            } {
                 return Some(f.clone());
             }
         }

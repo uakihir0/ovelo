@@ -553,14 +553,53 @@ impl GuestUi {
         }
 
         // ---- ViewGroup.addView / removeView -------------------------------
+        // `addViewInLayout` shares the bridge: AOSP semantics differ
+        // only in skipping measure/layout, which our tree re-runs each
+        // pump anyway. Apps inflate children through it directly
+        // (fossify documents' ViewPager did) — an unregistered call
+        // attached children parent_att=0 and they never drew.
         for cls in ["Landroid/view/ViewGroup;", "Landroid/widget/LinearLayout;"] {
-            for sig in [
-                "(Landroid/view/View;)V",
-                "(Landroid/view/View;I)V",
-                "(Landroid/view/View;ILandroid/view/ViewGroup$LayoutParams;)V",
-                "(Landroid/view/View;Landroid/view/ViewGroup$LayoutParams;)V",
+            for (name, sig) in [
+                ("addView", "(Landroid/view/View;)V"),
+                ("addView", "(Landroid/view/View;I)V"),
+                (
+                    "addView",
+                    "(Landroid/view/View;ILandroid/view/ViewGroup$LayoutParams;)V",
+                ),
+                (
+                    "addView",
+                    "(Landroid/view/View;Landroid/view/ViewGroup$LayoutParams;)V",
+                ),
+                (
+                    "addView",
+                    "(Landroid/view/View;ILandroid/view/ViewGroup$LayoutParams;Z)V",
+                ),
+                ("addViewInLayout", "(Landroid/view/View;)V"),
+                ("addViewInLayout", "(Landroid/view/View;I)V"),
+                (
+                    "addViewInLayout",
+                    "(Landroid/view/View;ILandroid/view/ViewGroup$LayoutParams;)V",
+                ),
+                (
+                    "addViewInLayout",
+                    "(Landroid/view/View;Landroid/view/ViewGroup$LayoutParams;)V",
+                ),
+                (
+                    "addViewInLayout",
+                    "(Landroid/view/View;ILandroid/view/ViewGroup$LayoutParams;Z)V",
+                ),
+                // Some androidx/internal helpers declare the boolean
+                // overload with a boolean return.
+                (
+                    "addView",
+                    "(Landroid/view/View;ILandroid/view/ViewGroup$LayoutParams;Z)Z",
+                ),
+                (
+                    "addViewInLayout",
+                    "(Landroid/view/View;ILandroid/view/ViewGroup$LayoutParams;Z)Z",
+                ),
             ] {
-                Self::on_rc(ui, vm, cls, "addView", sig, |ui, vm, a| {
+                Self::on_rc(ui, vm, cls, name, sig, |ui, vm, a| {
                     let this = ref_arg(a, 0)?;
                     let child = ref_arg(a, 1)?;
                     // Overloads differ after the child arg: LayoutParams is
