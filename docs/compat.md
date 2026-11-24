@@ -42,6 +42,8 @@ Legend:
 | Aegis Authenticator | `com.beemdevelopment.aegis` | 🟢 | Intro wizard renders real content (Welcome slide + logo + import prompt); ViewPager2 page containers materialize. Layout rough (overlapping header) |
 | Markor | `net.gsantner.markor` | 🟢 | **Renders real UI**: Documents file list with real entries + dates, preview pane, FAB, bottom nav (Files/To-Do/QuickNote/LinkBox/More) |
 | Tasks.org | `org.tasks` | 🟡 | Sign-in screen renders (Add account / Continue without sync / Import backup) — layout placement rough |
+| Neumorphic Calculator | `com.neumorphic.calculator` | ⛔ | Flutter app — the entire UI runs in `libflutter.so`'s Dart VM, outside the dex runtime's scope |
+| AntennaPod | `de.danoeh.antennapod` | 🟡 | Lifecycle completes and window opens; conscrypt JNI registers 288 natives via `libconscrypt_jni.so`; WorkManager + UserPreferences run — splash→main transition pending, window blank |
 
 ## Famous apps — assessment
 
