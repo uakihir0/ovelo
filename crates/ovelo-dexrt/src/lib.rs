@@ -6184,6 +6184,75 @@ impl Vm {
                         }
                     }
                 };
+                if !t && op == 0x35 {
+                    // Canonical constant-fill counted loop:
+                    //   if-ge i, n, EXIT
+                    //   const z, C
+                    //   aput-object z, arr, i
+                    //   add-int/lit8 i, i, +1
+                    //   goto HEAD
+                    // `new-array` already default-fills its data, so
+                    // re-storing the same constant is a pure no-op —
+                    // but Compose's SlotWriter.insertSlots emits this
+                    // shape over arrays grown to ~2M slots, burning
+                    // the whole instruction budget one element per
+                    // step. When the write range already holds the
+                    // constant, finish the loop in one step.
+                    let pat = |o: usize| fr.table.get(o);
+                    // Pull every operand out as a value first so the
+                    // `fr.table` borrow ends before `Self::set(fr,…)`.
+                    let fill = if let (Some(cst), Some(ap), Some(inc), Some(go)) =
+                        (pat(pos + 1), pat(pos + 2), pat(pos + 3), pat(pos + 4))
+                    {
+                        let lit = match cst.opcode {
+                            0x12..=0x14 => cst.lit.unwrap_or(0),
+                            0x15 => cst.lit.unwrap_or(0) << 16,
+                            _ => i64::MAX,
+                        };
+                        if lit != i64::MAX
+                            && ap.opcode == 0x4d
+                            && ap.regs.first() == cst.regs.first()
+                            && ap.regs.get(2) == ins.regs.first()
+                            && inc.opcode == 0xd8
+                            && inc.regs.first() == ins.regs.first()
+                            && inc.regs.get(1) == ins.regs.first()
+                            && inc.lit == Some(1)
+                            && go.opcode == 0x28
+                            && go.target == Some(ins.offset)
+                        {
+                            Some((cst.regs[0] as usize, ap.regs[1] as usize, lit as i32))
+                        } else {
+                            None
+                        }
+                    } else {
+                        None
+                    };
+                    if let Some((z, arr_reg, c)) = fill {
+                        let (i0, n) = (Self::i32v(va)?, Self::i32v(vb)?);
+                        if let Some(Obj::Array { data, .. }) =
+                            self.heap.get(Self::refv(Self::reg(fr, arr_reg)?)?)
+                        {
+                            // The loop is a no-op iff every slot it
+                            // would touch already reads as the
+                            // stored constant — Ref(0) is the same
+                            // null an aput-object of I32(0) writes.
+                            let uniform = i0 >= 0
+                                && n >= 0
+                                && n as usize <= data.len()
+                                && data[i0 as usize..n as usize].iter().all(|v| {
+                                    matches!(v, V::I32(x) if *x == c)
+                                        || (c == 0 && matches!(v, V::Ref(0)))
+                                });
+                            if uniform {
+                                Self::set(fr, ins.regs[0] as usize, V::I32(n));
+                                Self::set(fr, z, V::I32(c));
+                                return Ok(Out::Next(
+                                    ins.target.ok_or_else(|| E::Vm(err("dexrt.branch")))? as usize,
+                                ));
+                            }
+                        }
+                    }
+                }
                 if t {
                     return Ok(Out::Next(
                         ins.target.ok_or_else(|| E::Vm(err("dexrt.branch")))? as usize,
