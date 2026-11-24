@@ -641,7 +641,7 @@ impl GuestUi {
                 ),
             ] {
                 for sig in sigs {
-                    Self::on(ui, vm, cls, name, sig, move |ui, vm, a| {
+                    Self::on_rc(ui, vm, cls, name, sig, move |ui, vm, a| {
                         let this = ref_arg(a, 0)?;
                         // Child by ref arg, else by index into the dex
                         // child list (it still reflects the pre-remove
@@ -659,8 +659,11 @@ impl GuestUi {
                             return Ok(None);
                         };
                         // Dex bookkeeping: registered overloads intercept
-                        // the invoke, so the bridge must run detach.
+                        // the invoke, so the bridge must run detach —
+                        // outside the ui borrow since onViewRemoved is
+                        // guest code re-entering bridged methods.
                         vm.view_tree_detach(this, child, notify);
+                        let ui = ui.borrow();
                         let Some(cv) = ui
                             .views
                             .get(&child)
@@ -685,7 +688,7 @@ impl GuestUi {
                     });
                 }
             }
-            Self::on(ui, vm, cls, "removeAllViews", "()V", |ui, vm, a| {
+            Self::on_rc(ui, vm, cls, "removeAllViews", "()V", |ui, vm, a| {
                 let this = ref_arg(a, 0)?;
                 for c in vm
                     .dex_view(this)
@@ -694,7 +697,7 @@ impl GuestUi {
                 {
                     vm.view_tree_detach(this, c, true);
                 }
-                if let Some(rc) = ui.views.get(&this).cloned() {
+                if let Some(rc) = ui.borrow().views.get(&this).cloned() {
                     if let GuestView::Group(gr) = &mut *rc.borrow_mut() {
                         gr.children.clear();
                         gr.view.invalidate();
@@ -705,7 +708,7 @@ impl GuestUi {
         }
 
         // ---- Activity.setContentView -------------------------------------
-        Self::on(
+        Self::on_rc(
             ui,
             vm,
             "Landroid/app/Activity;",
@@ -716,8 +719,10 @@ impl GuestUi {
                 let activity = ref_arg(a, 0)?;
                 // Dex-side bookkeeping (attach, content-frame registration)
                 // runs for bridged views too — the GL attach gate and the
-                // dex view tree both need it.
+                // dex view tree both need it. Outside the ui borrow:
+                // inflation and onViewAdded are guest code.
                 vm.view_set_content(activity, v);
+                let mut ui = ui.borrow_mut();
                 if let Some(cv) = ui.views.get(&v).cloned() {
                     ui.guest_content_set = true;
                     ui.root.set_content_view(Box::new(SharedView(cv)));
@@ -1168,6 +1173,32 @@ impl GuestUi {
                     Ok(None)
                 },
             )) as HostCall,
+        );
+    }
+
+    /// `on` variant for handlers that dispatch guest code (attach and
+    /// detach bookkeeping invokes dex listeners like `onViewAdded`,
+    /// `setContentView` can inflate): the closure gets the `Rc` and
+    /// borrows only around view mutation, so guest code re-entering a
+    /// bridged method can't double-borrow the `GuestUi` RefCell.
+    fn on_rc(
+        ui: &Rc<RefCell<Self>>,
+        vm: &mut Vm,
+        class: &str,
+        name: &str,
+        proto: &str,
+        mut f: impl FnMut(&Rc<RefCell<Self>>, &mut Vm, &[V]) -> Result<Option<V>> + 'static,
+    ) {
+        let ui2 = ui.clone();
+        let class2 = class.to_string();
+        let name2 = name.to_string();
+        let _ = vm.register_host(
+            class,
+            name,
+            proto,
+            Rc::new(RefCell::new(move |vm2: &mut Vm, a: &[V]| {
+                f(&ui2, vm2, a).map_err(|e| e.with_detail(format!("{class2}.{name2}")))
+            })) as HostCall,
         );
     }
 
