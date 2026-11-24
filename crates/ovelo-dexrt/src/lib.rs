@@ -142,6 +142,9 @@ struct Loc {
 /// `dexrt.host.reentrant` error there instead of panicking on the
 /// RefCell's second mutable borrow.
 pub type HostCall = std::rc::Rc<std::cell::RefCell<dyn FnMut(&mut Vm, &[V]) -> Result<Option<V>>>>;
+/// One `(name,sig)`-registered host impl: owner GIdx (or `GX_NONE`
+/// for platform classes), its class descriptor, and the call itself.
+type NamedHost = (GIdx, String, HostCall);
 
 /// DEX interpreter over one or more [`DexFile`]s (multi-dex apps).
 pub struct Vm {
@@ -167,7 +170,10 @@ pub struct Vm {
     /// method through a subclass descriptor. Only a reference whose
     /// class is the owner or a subclass of it may resolve — see
     /// `host_named`.
-    hosts_named: HashMap<(String, String), Vec<(GIdx, HostCall)>>,
+    /// `(GIdx owner or GX_NONE, registered class desc, impl)` — the
+    /// desc survives platform-class registrations whose owner has no
+    /// dex type index, and matches call sites by `assignable_desc`.
+    hosts_named: HashMap<(String, String), Vec<NamedHost>>,
     /// AOT-compiled method bodies (`None` until `enable_aot`).
     aot: Option<Aot>,
     /// Package name of the guest app, set by the launcher so
@@ -1165,7 +1171,7 @@ impl Vm {
         self.hosts_named
             .entry((name.to_string(), proto_desc.to_string()))
             .or_default()
-            .push((owner, f));
+            .push((owner, class_desc.to_string(), f));
         Ok(found)
     }
 
@@ -3690,9 +3696,18 @@ impl Vm {
         // `Activity.setContentView` is bridged) would steal the call.
         let key = (name.to_string(), sig);
         let owner_ref = gx(gd(midx), mid.class_idx as u32);
-        for (owner, f) in self.hosts_named.get(&key).into_iter().flatten() {
-            if *owner == owner_ref || self.assignable(owner_ref, *owner) {
+        for (owner, desc, f) in self.hosts_named.get(&key).into_iter().flatten() {
+            if *owner != GX_NONE && (*owner == owner_ref || self.assignable(owner_ref, *owner)) {
                 return Ok(Some(f.clone()));
+            }
+            // Platform-class registrations carry no dex type: compare
+            // descriptors — `type_desc_of`/`assignable_desc` are cached.
+            if *owner == GX_NONE {
+                if let Ok(site) = self.type_desc_of(owner_ref) {
+                    if self.assignable_desc(&site, desc) {
+                        return Ok(Some(f.clone()));
+                    }
+                }
             }
         }
         Ok(None)
@@ -3704,16 +3719,23 @@ impl Vm {
     /// would otherwise swallow a bridged call (`ViewGroup.addView`).
     pub(crate) fn named_host(&self, class: &str, name: &str, sig: &str) -> Option<HostCall> {
         let owner_ref = self.type_index_of(class).unwrap_or(GX_NONE);
-        if owner_ref == GX_NONE {
-            return None;
-        }
-        for (owner, f) in self
+        for (owner, desc, f) in self
             .hosts_named
             .get(&(name.to_string(), sig.to_string()))
             .into_iter()
             .flatten()
         {
-            if *owner == owner_ref || self.assignable(owner_ref, *owner) {
+            if *owner != GX_NONE
+                && owner_ref != GX_NONE
+                && (*owner == owner_ref || self.assignable(owner_ref, *owner))
+            {
+                return Some(f.clone());
+            }
+            // A call site naming the platform class itself (or any
+            // ancestor in its descriptor) still reaches the bridge —
+            // `ViewGroup.addView` invoked via a `ViewGroup`-typed ref
+            // has owner_ref == GX_NONE and must not early-exit.
+            if *owner == GX_NONE && self.assignable_desc(class, desc) {
                 return Some(f.clone());
             }
         }
