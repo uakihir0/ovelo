@@ -597,52 +597,50 @@ fn list_call(vm: &mut Vm, name: &str, sig: &str, args: &[V]) -> Rt<Option<Option
             }
         }
         "get" => {
-            let l = match list_snapshot(vm, h) {
-                Some(l) => l,
-                None => return Ok(None),
-            };
+            if list_len(vm, h).is_none() {
+                return Ok(None);
+            }
             let i = i32v(args[1]) as usize;
-            match l.get(i) {
+            match list_get(vm, h, i) {
                 // Java throws, it does not return null — guests catch
                 // IndexOutOfBoundsException where a null would NPE
                 // later (NewPipe Tab.getTabName on the default tab
                 // list).
-                Some(v) => Some(Some(*v)),
+                Some(v) => Some(Some(v)),
                 None => {
                     return Err(vm.throw_builtin(
                         "Ljava/lang/IndexOutOfBoundsException;",
-                        &format!("List.get({i}) on size {}", l.len()),
+                        &format!("List.get({i}) on size {}", list_len(vm, h).unwrap_or(0)),
                     ));
                 }
             }
         }
         "element" | "getFirst" | "getLast" | "first" | "last" => {
-            let l = match list_snapshot(vm, h) {
-                Some(l) => l,
-                None => return Ok(None),
-            };
-            let v = if matches!(name, "getLast" | "last") {
-                l.last()
+            if list_len(vm, h).is_none() {
+                return Ok(None);
+            }
+            let i = if matches!(name, "getLast" | "last") {
+                list_len(vm, h).unwrap_or(0).wrapping_sub(1)
             } else {
-                l.first()
+                0
             };
-            match v {
-                Some(v) => Some(Some(*v)),
+            match list_get(vm, h, i) {
+                Some(v) => Some(Some(v)),
                 None => {
                     return Err(vm.throw_builtin("Ljava/util/NoSuchElementException;", name));
                 }
             }
         }
         "peek" | "peekFirst" | "peekLast" => {
-            let l = match list_snapshot(vm, h) {
-                Some(l) => l,
-                None => return Ok(None),
+            if list_len(vm, h).is_none() {
+                return Ok(None);
+            }
+            let i = if name == "peekLast" {
+                list_len(vm, h).unwrap_or(0).wrapping_sub(1)
+            } else {
+                0
             };
-            let v = match name {
-                "peekLast" => l.last().copied().unwrap_or(V::Ref(0)),
-                _ => l.first().copied().unwrap_or(V::Ref(0)),
-            };
-            Some(Some(v))
+            Some(Some(list_get(vm, h, i).unwrap_or(V::Ref(0))))
         }
         "set" => {
             // Guest-backed collections mutate themselves.
@@ -664,11 +662,11 @@ fn list_call(vm: &mut Vm, name: &str, sig: &str, args: &[V]) -> Rt<Option<Option
             Some(Some(std::mem::replace(&mut l[i], args[2])))
         }
         "size" => {
-            let n = list_snapshot(vm, h).map(|l| l.len()).unwrap_or(0);
+            let n = list_len(vm, h).unwrap_or(0);
             Some(Some(V::I32(n as i32)))
         }
         "isEmpty" => {
-            let e = list_snapshot(vm, h).map(|l| l.is_empty()).unwrap_or(true);
+            let e = list_len(vm, h).unwrap_or(0) == 0;
             Some(Some(V::I32(e as i32)))
         }
         "clear" => {

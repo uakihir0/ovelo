@@ -701,6 +701,78 @@ pub(crate) fn list_snapshot(vm: &Vm, h: u32) -> Option<Vec<V>> {
     }
 }
 
+/// One element of any List-typed value, sharing `list_snapshot`'s
+/// backing resolution without cloning — `get`/bounds-checked reads
+/// stay O(1) instead of O(n) per call (indexed scans were O(n²)).
+pub(crate) fn list_get(vm: &Vm, h: u32, i: usize) -> Option<V> {
+    match vm.heap.get(h) {
+        Some(Obj::Host {
+            state: HostState::List(l),
+            ..
+        }) => l.get(i).copied(),
+        Some(Obj::Array { data, .. }) => data.get(i).copied(),
+        Some(Obj::Instance { .. }) => {
+            let (x, off, size, ring) = guest_list_backing(vm, h, 8)?;
+            match vm.heap.get(x) {
+                Some(Obj::Host {
+                    state: HostState::List(l),
+                    ..
+                }) => {
+                    if let Some(s) = size {
+                        if i >= s {
+                            return None;
+                        }
+                    }
+                    l.get(off + i).copied()
+                }
+                Some(Obj::Array { data, .. }) => {
+                    if ring {
+                        let len = data.len();
+                        if len == 0 || i >= size.unwrap_or(len).min(len) {
+                            return None;
+                        }
+                        data.get((off + i) % len).copied()
+                    } else {
+                        if let Some(s) = size {
+                            if i >= s {
+                                return None;
+                            }
+                        }
+                        data.get(off + i).copied()
+                    }
+                }
+                _ => None,
+            }
+        }
+        _ => None,
+    }
+}
+
+/// Logical element count of any List-typed value, without cloning.
+pub(crate) fn list_len(vm: &Vm, h: u32) -> Option<usize> {
+    match vm.heap.get(h) {
+        Some(Obj::Host {
+            state: HostState::List(l),
+            ..
+        }) => Some(l.len()),
+        Some(Obj::Array { data, .. }) => Some(data.len()),
+        Some(Obj::Instance { .. }) => {
+            let (x, off, size, ring) = guest_list_backing(vm, h, 8)?;
+            let cap = match vm.heap.get(x) {
+                Some(Obj::Host {
+                    state: HostState::List(l),
+                    ..
+                }) => l.len(),
+                Some(Obj::Array { data, .. }) => data.len(),
+                _ => return None,
+            };
+            let n = size.unwrap_or_else(|| cap.saturating_sub(off));
+            Some(if ring { n.min(cap) } else { n })
+        }
+        _ => None,
+    }
+}
+
 /// The `HostState::List` or `Obj::Array` a guest Collection
 /// implementation delegates to, as `(store, offset, size, ring)` — a
 /// `SubList` narrows its parent's window (`offset`/`fromIndex` and
