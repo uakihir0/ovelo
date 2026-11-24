@@ -2245,21 +2245,49 @@ fn package_call(vm: &mut Vm, name: &str, sig: &str, args: &[V]) -> Option<Option
     }
 }
 
+/// The guest thread `Thread.currentThread()` would return now —
+/// key for a ThreadLocal's value table.
+fn tls_thread(vm: &Vm) -> u32 {
+    if vm.cur_thread != 0 {
+        vm.cur_thread
+    } else {
+        vm.main_thread_h
+    }
+}
+
+/// The per-thread value table of a ThreadLocal — a `HostState::Map`
+/// keyed by thread handle, minted on first access.
+fn tls_map(vm: &mut Vm, h: u32) -> Option<u32> {
+    if let Some(V::Ref(m)) = pseudo_get(vm, h, P_TLS) {
+        return Some(m);
+    }
+    let m = vm.alloc_host("Ljava/util/HashMap;", HostState::Map(Vec::new()));
+    pseudo_set(vm, h, P_TLS, V::Ref(m));
+    Some(m)
+}
+
 fn threadlocal_call(vm: &mut Vm, name: &str, args: &[V]) -> Option<Option<V>> {
     match name {
         "get" => {
             let V::Ref(h) = args[0] else {
                 return Some(Some(V::Ref(0)));
             };
-            let cur = slot_of(vm, h)
-                .or_else(|| pseudo_get(vm, h, P_TARGET))
-                .unwrap_or(V::Ref(0));
-            if !matches!(cur, V::Ref(0) | V::I32(0)) {
-                return Some(Some(cur));
+            // Values are per calling thread — Room's
+            // `suspendingTransactionId` set on the transaction
+            // executor must read unset everywhere else.
+            let th = tls_thread(vm);
+            let Some(m) = tls_map(vm, h) else {
+                return Some(Some(V::Ref(0)));
+            };
+            if let Some(v) = map_get(vm, m, V::Ref(th)) {
+                if crate::dbg_flag("OVELO_TLSDBG") {
+                    eprintln!("[tls] get h{h} th{th} -> {v:?}");
+                }
+                return Some(Some(v));
             }
-            // First access: `initialValue` is virtual so a dex-defined
-            // subclass (desugared ThreadLocalRandom's `u`) supplies it;
-            // `withInitial` locals call their stored supplier instead.
+            // First access on this thread: `initialValue` is virtual so
+            // a dex-defined subclass (desugared ThreadLocalRandom's `u`)
+            // supplies it; `withInitial` locals call their supplier.
             let init = match pseudo_get(vm, h, P_DATA) {
                 Some(V::Ref(sup)) if sup != 0 => vm
                     .call_virtual(sup, "get", &[])
@@ -2272,30 +2300,24 @@ fn threadlocal_call(vm: &mut Vm, name: &str, args: &[V]) -> Option<Option<V>> {
                     .flatten()
                     .unwrap_or(V::Ref(0)),
             };
-            if let Some(Obj::Host {
-                state: HostState::Slot(s),
-                ..
-            }) = vm.heap.get_mut(h)
-            {
-                *s = init;
-            } else {
-                // Dex-defined ThreadLocal subclass: cache on a pseudo field
-                // so repeated get() returns the same value.
-                pseudo_set(vm, h, P_TARGET, init);
-            }
+            map_put(vm, m, V::Ref(th), init);
             Some(Some(init))
         }
         "set" | "remove" => {
             if let V::Ref(h) = args[0] {
-                let v = if name == "set" { args[1] } else { V::Ref(0) };
-                if let Some(Obj::Host {
-                    state: HostState::Slot(s),
-                    ..
-                }) = vm.heap.get_mut(h)
-                {
-                    *s = v;
-                } else {
-                    pseudo_set(vm, h, P_TARGET, v);
+                let th = tls_thread(vm);
+                if let Some(m) = tls_map(vm, h) {
+                    if name == "set" {
+                        if crate::dbg_flag("OVELO_TLSDBG") {
+                            eprintln!("[tls] set h{h} th{th} = {:?}", args[1]);
+                        }
+                        map_put(vm, m, V::Ref(th), args[1]);
+                    } else {
+                        if crate::dbg_flag("OVELO_TLSDBG") {
+                            eprintln!("[tls] remove h{h} th{th}");
+                        }
+                        map_remove(vm, m, V::Ref(th));
+                    }
                 }
             }
             Some(None)

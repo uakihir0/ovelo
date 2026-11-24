@@ -576,6 +576,7 @@ fn stream_call(vm: &mut Vm, name: &str, args: &[V]) -> Rt<Option<Option<V>>> {
     }
     // Byte-backed streams (raw resources, assets): real reads.
     if let Some(Obj::Host {
+        desc: stream_desc,
         state: HostState::Bytes(data, pos),
         ..
     }) = vm.heap.get_mut(this)
@@ -608,6 +609,17 @@ fn stream_call(vm: &mut Vm, name: &str, args: &[V]) -> Rt<Option<Option<V>>> {
                 let n = want.min(avail);
                 let chunk: Vec<u8> = data[*pos..*pos + n].to_vec();
                 *pos += n;
+                if crate::dbg_flag("OVELO_STREAMDBG") {
+                    eprintln!(
+                        "[sdbg] read {stream_desc}#{this} pos-{} n={} want={} off={} args={:?} head={:?}",
+                        *pos,
+                        n,
+                        want,
+                        off,
+                        args,
+                        chunk.iter().take(24).collect::<Vec<_>>()
+                    );
+                }
                 if let Some(Obj::Array { data: dst, .. }) = vm.heap.get_mut(buf) {
                     for (i, b) in chunk.iter().enumerate() {
                         if let Some(slot) = dst.get_mut(off + i) {
@@ -2363,22 +2375,27 @@ fn charset_name(vm: &Vm, h: u32) -> String {
 /// Remaining bytes of a `ByteBuffer`-like host buffer (Slot-backed
 /// array at base+position), with the position the bytes start at.
 fn bb_bytes(vm: &Vm, h: u32) -> (Vec<u8>, usize) {
-    let (back, base, pos) = match vm.heap.get(h) {
+    let (back, base, pos, lim, es) = match vm.heap.get(h) {
         Some(Obj::Host {
             state: HostState::Slot(V::Ref(b)),
             ..
         }) => {
             let base = i32v(pseudo_get(vm, h, P_BBUF_BASE).unwrap_or(V::I32(0))).max(0) as usize;
             let pos = i32v(pseudo_get(vm, h, P_BBUF_POS).unwrap_or(V::I32(0))).max(0) as usize;
-            (*b, base, pos)
+            let es = i32v(pseudo_get(vm, h, P_BBUF_ESZ).unwrap_or(V::I32(1))).clamp(1, 8) as usize;
+            let lim = pseudo_get(vm, h, P_BBUF_LIM)
+                .map(|v| i32v(v).max(0) as usize)
+                .unwrap_or(usize::MAX);
+            (*b, base, pos, lim, es)
         }
-        Some(Obj::Array { .. }) => (h, 0, 0),
+        Some(Obj::Array { .. }) => (h, 0, 0, usize::MAX, 1),
         _ => return (Vec::new(), 0),
     };
     match vm.heap.get(back) {
         Some(Obj::Array { data, .. }) => (
             data.iter()
-                .skip(base + pos)
+                .skip(base + pos * es)
+                .take(lim.saturating_sub(pos) * es)
                 .map(|v| i32v(*v) as u8)
                 .collect(),
             pos,
@@ -2390,7 +2407,7 @@ fn bb_bytes(vm: &Vm, h: u32) -> (Vec<u8>, usize) {
 /// Remaining chars of a `CharBuffer`-like host (Slot-backed `C` array
 /// at base+position). Other buffer kinds return None.
 fn charbuf_string(vm: &Vm, h: u32) -> Option<String> {
-    let (back, base, pos) = match vm.heap.get(h) {
+    let (back, base, pos, lim) = match vm.heap.get(h) {
         Some(Obj::Host {
             state: HostState::Slot(V::Ref(b)),
             ..
@@ -2398,14 +2415,18 @@ fn charbuf_string(vm: &Vm, h: u32) -> Option<String> {
             *b,
             i32v(pseudo_get(vm, h, P_BBUF_BASE).unwrap_or(V::I32(0))).max(0) as usize,
             i32v(pseudo_get(vm, h, P_BBUF_POS).unwrap_or(V::I32(0))).max(0) as usize,
+            pseudo_get(vm, h, P_BBUF_LIM)
+                .map(|v| i32v(v).max(0) as usize)
+                .unwrap_or(usize::MAX),
         ),
-        Some(Obj::Array { .. }) => (h, 0, 0),
+        Some(Obj::Array { .. }) => (h, 0, 0, usize::MAX),
         _ => return None,
     };
     match vm.heap.get(back) {
         Some(Obj::Array { data, .. }) => Some(
             data.iter()
                 .skip(base + pos)
+                .take(lim.saturating_sub(pos))
                 .map(|v| char::from_u32(i32v(*v) as u32).unwrap_or('\u{FFFD}'))
                 .collect(),
         ),
@@ -2471,8 +2492,11 @@ fn charset_decode(vm: &mut Vm, args: &[V]) -> V {
                     i32v(pseudo_get(vm, out_h, P_BBUF_BASE).unwrap_or(V::I32(0))).max(0) as usize;
                 let pos =
                     i32v(pseudo_get(vm, out_h, P_BBUF_POS).unwrap_or(V::I32(0))).max(0) as usize;
+                let lim = pseudo_get(vm, out_h, P_BBUF_LIM)
+                    .map(|v| i32v(v).max(0) as usize)
+                    .unwrap_or(usize::MAX);
                 let cap = match vm.heap.get(*b) {
-                    Some(Obj::Array { data, .. }) => data.len().saturating_sub(base + pos),
+                    Some(Obj::Array { data, .. }) => lim.min(data.len()).saturating_sub(base + pos),
                     _ => 0,
                 };
                 (*b, base, pos, cap)
@@ -2715,13 +2739,33 @@ fn nio_call(vm: &mut Vm, class: &str, name: &str, args: &[V]) -> Option<Option<V
     // it was created — `read_at`/`put` index `base + pos`.
     let base =
         |vm: &Vm| i32v(pseudo_get(vm, this, P_BBUF_BASE).unwrap_or(V::I32(0))).max(0) as usize;
-    // Read `n` bytes at `pos`; None when out of bounds.
+    // Capacity in element units.
+    let blim_capacity = |vm: &Vm| -> usize {
+        backing(vm)
+            .and_then(|b| match vm.heap.get(b) {
+                Some(Obj::Array { data, .. }) => Some(data.len()),
+                _ => None,
+            })
+            .unwrap_or(0)
+            .saturating_sub(base(vm))
+            / esz(vm)
+    };
+    // Limit in element units — absent means capacity.
+    let blim = |vm: &Vm| -> usize {
+        match pseudo_get(vm, this, P_BBUF_LIM) {
+            Some(v) => i32v(v).max(0) as usize,
+            None => blim_capacity(vm),
+        }
+    };
+    // Read `n` bytes at `pos`; None when out of bounds. `pos` is a byte
+    // offset; the limit bounds it (elements → bytes via `esz`).
     let read_at = |vm: &Vm, pos: usize, n: usize| -> Option<Vec<u8>> {
         let pos = base(vm) + pos;
+        let lim_bytes = base(vm) + blim(vm) * esz(vm);
         let b = backing(vm)?;
         match vm.heap.get(b) {
             Some(Obj::Array { data, .. }) => {
-                if pos + n > data.len() {
+                if pos + n > data.len() || pos + n > lim_bytes {
                     None
                 } else {
                     Some(data[pos..pos + n].iter().map(|v| i32v(*v) as u8).collect())
@@ -2804,6 +2848,13 @@ fn nio_call(vm: &mut Vm, class: &str, name: &str, args: &[V]) -> Option<Option<V
                 pseudo_set(vm, h, P_BBUF_RAW, V::I32(1));
                 if args.len() > 2 {
                     pseudo_set(vm, h, P_BBUF_POS, V::I32(i32v(args[1])));
+                    // wrap(arr, off, len): limit = off + len.
+                    pseudo_set(
+                        vm,
+                        h,
+                        P_BBUF_LIM,
+                        V::I32(i32v(args[1]) + i32v(args.get(2).copied().unwrap_or(V::I32(0)))),
+                    );
                 }
             }
             Some(Some(v))
@@ -2845,14 +2896,15 @@ fn nio_call(vm: &mut Vm, class: &str, name: &str, args: &[V]) -> Option<Option<V
             }) => *v,
             _ => V::Ref(0),
         })),
-        "hasArray" | "hasRemaining" => Some(Some(V::I32(1))),
+        "hasArray" => Some(Some(V::I32(1))),
+        "hasRemaining" => Some(Some(V::I32((blim(vm) > bpos(vm)) as i32))),
         // Every buffer we mint is array-backed but behaves direct —
         // guests pool-vs-copy on this (Korge picks a shared pool when
         // a buffer reports non-direct, splitting read/write sites).
         "isDirect" => Some(Some(V::I32(1))),
         "isReadOnly" => Some(Some(V::I32(0))),
         "arrayOffset" => Some(Some(V::I32(0))),
-        "capacity" | "limit" => {
+        "capacity" => {
             let n = backing(vm)
                 .and_then(|b| match vm.heap.get(b) {
                     Some(Obj::Array { data, .. }) => Some(data.len()),
@@ -2861,23 +2913,17 @@ fn nio_call(vm: &mut Vm, class: &str, name: &str, args: &[V]) -> Option<Option<V
                 .unwrap_or(0)
                 .saturating_sub(base(vm))
                 / esz(vm);
+            Some(Some(V::I32(n as i32)))
+        }
+        "limit" => {
             if args.len() > 1 {
+                pseudo_set(vm, this, P_BBUF_LIM, args[1]);
                 Some(Some(args[0]))
             } else {
-                Some(Some(V::I32(n as i32)))
+                Some(Some(V::I32(blim(vm) as i32)))
             }
         }
-        "remaining" => {
-            let n = backing(vm)
-                .and_then(|b| match vm.heap.get(b) {
-                    Some(Obj::Array { data, .. }) => Some(data.len()),
-                    _ => None,
-                })
-                .unwrap_or(0)
-                .saturating_sub(base(vm))
-                / esz(vm);
-            Some(Some(V::I32(n.saturating_sub(bpos(vm)) as i32)))
-        }
+        "remaining" => Some(Some(V::I32(blim(vm).saturating_sub(bpos(vm)) as i32))),
         "position" => {
             if args.len() > 1 {
                 pseudo_set(vm, this, P_BBUF_POS, args[1]);
@@ -2886,8 +2932,28 @@ fn nio_call(vm: &mut Vm, class: &str, name: &str, args: &[V]) -> Option<Option<V
                 Some(Some(V::I32(bpos(vm) as i32)))
             }
         }
-        "flip" | "clear" | "rewind" | "reset" => {
+        "flip" => {
+            // limit = position, position = 0 — the written region
+            // becomes the readable one.
+            let pos = bpos(vm) as i32;
+            pseudo_set(vm, this, P_BBUF_LIM, V::I32(pos));
             pseudo_set(vm, this, P_BBUF_POS, V::I32(0));
+            Some(Some(args[0]))
+        }
+        "clear" => {
+            // position = 0, limit = capacity.
+            pseudo_set(vm, this, P_BBUF_POS, V::I32(0));
+            pseudo_set(vm, this, P_BBUF_LIM, V::I32(blim_capacity(vm) as i32));
+            Some(Some(args[0]))
+        }
+        "rewind" => {
+            pseudo_set(vm, this, P_BBUF_POS, V::I32(0));
+            Some(Some(args[0]))
+        }
+        "reset" => {
+            // position = mark (0 when none was taken).
+            let m = i32v(pseudo_get(vm, this, P_BBUF_MARK).unwrap_or(V::I32(0)));
+            pseudo_set(vm, this, P_BBUF_POS, V::I32(m.max(0)));
             Some(Some(args[0]))
         }
         "nativeOrder" => {
@@ -2903,7 +2969,82 @@ fn nio_call(vm: &mut Vm, class: &str, name: &str, args: &[V]) -> Option<Option<V
             };
             Some(Some(v))
         }
-        "mark" | "compact" | "slice" | "duplicate" | "asReadOnlyBuffer" => Some(Some(args[0])),
+        "mark" => {
+            pseudo_set(vm, this, P_BBUF_MARK, V::I32(bpos(vm) as i32));
+            Some(Some(args[0]))
+        }
+        "compact" => {
+            // Move the unread region [pos, limit) to the front, then
+            // position = remaining, limit = capacity — the caller reads
+            // into the tail and `flip`s back to read mode.
+            let es = esz(vm);
+            let (pos, lim) = (bpos(vm), blim(vm));
+            let cap = blim_capacity(vm);
+            if let Some(bh) = backing(vm).filter(|_| lim > pos) {
+                let bb = base(vm);
+                if let Some(Obj::Array { data, .. }) = vm.heap.get_mut(bh) {
+                    for i in 0..(lim - pos) * es {
+                        let src = data.get(bb + pos * es + i).copied().unwrap_or(V::I32(0));
+                        if let Some(slot) = data.get_mut(bb + i) {
+                            *slot = src;
+                        }
+                    }
+                }
+            }
+            pseudo_set(vm, this, P_BBUF_POS, V::I32((lim - pos) as i32));
+            pseudo_set(vm, this, P_BBUF_LIM, V::I32(cap as i32));
+            Some(Some(args[0]))
+        }
+        "slice" | "duplicate" | "asReadOnlyBuffer" => {
+            // A view buffer is a NEW object sharing the same backing:
+            // its own position/limit must not alias the parent's.
+            // `slice` re-bases to the parent's current position;
+            // `duplicate`/`asReadOnlyBuffer` copy position/limit as-is.
+            // (ByteBuffer order matters little — our element model
+            // reads via esz/ord flags, which carry over.)
+            let desc = match vm.heap.get(this) {
+                Some(Obj::Host { desc, .. }) => desc.clone(),
+                _ => "Ljava/nio/ByteBuffer;".to_string(),
+            };
+            let (pos, lim, cap) = (bpos(vm), blim(vm), blim_capacity(vm));
+            let es = esz(vm);
+            let base_new = if name == "slice" {
+                base(vm) + pos * es
+            } else {
+                base(vm)
+            };
+            let b = backing(vm).map(V::Ref).unwrap_or(V::I32(0));
+            let v = host(vm, &desc, HostState::Slot(b));
+            if let V::Ref(h) = v {
+                if base_new != 0 {
+                    pseudo_set(vm, h, P_BBUF_BASE, V::I32(base_new as i32));
+                }
+                if es != 1 {
+                    pseudo_set(vm, h, P_BBUF_ESZ, V::I32(es as i32));
+                }
+                if let Some(o) = pseudo_get(vm, this, P_BBUF_ORD) {
+                    pseudo_set(vm, h, P_BBUF_ORD, o);
+                }
+                if pseudo_get(vm, this, P_BBUF_RAW).is_some() {
+                    pseudo_set(vm, h, P_BBUF_RAW, V::I32(1));
+                }
+                if name == "slice" {
+                    // slice: position 0, limit = parent's remaining.
+                    pseudo_set(vm, h, P_BBUF_POS, V::I32(0));
+                    pseudo_set(vm, h, P_BBUF_LIM, V::I32(lim.saturating_sub(pos) as i32));
+                } else {
+                    // duplicate: same position/limit, same window.
+                    pseudo_set(vm, h, P_BBUF_POS, V::I32(pos as i32));
+                    pseudo_set(
+                        vm,
+                        h,
+                        P_BBUF_LIM,
+                        V::I32(if lim == cap { cap } else { lim } as i32),
+                    );
+                }
+            }
+            Some(Some(v))
+        }
         "putInt" | "putLong" | "putShort" | "putDouble" | "putFloat" | "putChar" | "putByte"
         | "put" => {
             let (pos0, es) = (bpos(vm), esz(vm));

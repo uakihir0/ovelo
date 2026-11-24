@@ -81,6 +81,12 @@ pub(crate) const P_BBUF_BASE: u64 = 0xFFFD_FF00;
 /// source's order — native little-endian — not Java's BE default that
 /// applies to buffers filled through typed `put*` calls.
 pub(crate) const P_BBUF_RAW: u64 = 0xFFFD_FF01;
+/// Buffer limit in element units — `flip` stores the old position here
+/// so `remaining`/`hasRemaining`/`decode` stop at the written content
+/// instead of reporting full capacity.
+pub(crate) const P_BBUF_LIM: u64 = 0xFFFD_FF02;
+/// `mark()`'s saved position for `reset()`.
+pub(crate) const P_BBUF_MARK: u64 = 0xFFFD_FF03;
 /// `Message` routing: target `Handler`, payload `obj`, `callback`
 /// `Runnable` — and a `Handler`'s own `Handler.Callback` — so
 /// `obtainMessage(...).sendToTarget()`/`sendMessage` actually deliver
@@ -115,6 +121,12 @@ pub(crate) const P_MAP_BACKING: u64 = 0xFFFD_FEF2;
 /// its ApplicationInfo. Separate from `P_META`: that slot is also the
 /// ProviderInfo `metaData` Bundle, so one key can't carry both.
 pub const P_APPINFO: u64 = 0xFFFD_FEF3;
+/// A `ThreadLocal`'s per-thread value table — a `HostState::Map` host
+/// keyed by `V::Ref(thread)`, minted on first access. One slot per
+/// ThreadLocal object would leak values across threads (Room's
+/// `suspendingTransactionId` must read unset on every thread that
+/// isn't the transaction executor).
+pub(crate) const P_TLS: u64 = 0xFFFD_FEF4;
 
 pub(crate) fn now_ms() -> i64 {
     std::time::SystemTime::now()
@@ -184,10 +196,14 @@ fn s_d(vm: &Vm, h: u32, depth: u8) -> Option<String> {
         }) if desc.contains("CharBuffer") => {
             let base = i32v(pseudo_get(vm, h, P_BBUF_BASE).unwrap_or(V::I32(0))).max(0) as usize;
             let pos = i32v(pseudo_get(vm, h, P_BBUF_POS).unwrap_or(V::I32(0))).max(0) as usize;
+            let lim = pseudo_get(vm, h, P_BBUF_LIM)
+                .map(|v| i32v(v).max(0) as usize)
+                .unwrap_or(usize::MAX);
             match vm.heap.get(*b) {
                 Some(Obj::Array { data, .. }) => Some(
                     data.iter()
                         .skip(base + pos)
+                        .take(lim.saturating_sub(pos))
                         .map(|v| char::from_u32(i32v(*v) as u32).unwrap_or('\u{FFFD}'))
                         .collect(),
                 ),
@@ -542,6 +558,46 @@ pub(crate) fn value_eq(vm: &Vm, a: V, b: V) -> bool {
                                 | "Ljava/lang/Double;"
                         )
                         && value_eq(vm, *a, *b)
+                }
+                // `new String(x)` mirrors its text under P_DATA on a
+                // Host object instead of carrying an interned `Str`
+                // payload — `Map.get(key)` / `equals` against interned
+                // strings must compare that mirrored content, or
+                // every name-table lookup built from `new String` keys
+                // misses (kotlinx serial-name indices).
+                (Some(Obj::Str(p)), Some(Obj::Host { desc, fields, .. }))
+                | (Some(Obj::Host { desc, fields, .. }), Some(Obj::Str(p)))
+                    if desc == "Ljava/lang/String;" =>
+                {
+                    match fields.get(&(P_DATA as u64)) {
+                        Some(&V::Ref(rh)) => match vm.heap.get(rh) {
+                            Some(Obj::Str(q)) => p == q,
+                            _ => false,
+                        },
+                        _ => false,
+                    }
+                }
+                (
+                    Some(Obj::Host {
+                        desc: da,
+                        fields: fa,
+                        ..
+                    }),
+                    Some(Obj::Host {
+                        desc: db,
+                        fields: fb,
+                        ..
+                    }),
+                ) if da == "Ljava/lang/String;" && db == "Ljava/lang/String;" => {
+                    match (fa.get(&(P_DATA as u64)), fb.get(&(P_DATA as u64))) {
+                        (Some(&V::Ref(ra)), Some(&V::Ref(rb))) => {
+                            match (vm.heap.get(ra), vm.heap.get(rb)) {
+                                (Some(Obj::Str(pa)), Some(Obj::Str(pb))) => pa == pb,
+                                _ => false,
+                            }
+                        }
+                        _ => false,
+                    }
                 }
                 _ => false,
             }

@@ -24,6 +24,8 @@ pub(crate) const P_CUR_POS: u32 = u32::MAX - 32;
 pub(crate) const P_SQL: u32 = u32::MAX - 33;
 pub(crate) const P_DBNAME: u32 = u32::MAX - 34;
 pub(crate) const P_DBVER: u32 = u32::MAX - 35;
+/// Marker: this helper's `onOpen` already ran for the current open.
+pub(crate) const P_DBOPENED: u32 = u32::MAX - 36;
 
 /// One open SQLite database (connection + transaction state).
 pub(crate) struct Db {
@@ -180,6 +182,36 @@ fn commit_or_rollback(conn: &mut rusqlite::Connection, ok: bool) -> rusqlite::Re
             Err(e)
         }
         r => r,
+    }
+}
+
+/// Mirror transaction depth when a guest drives BEGIN/COMMIT/ROLLBACK
+/// as raw SQL. Room's bundled androidx.sqlite driver wraps them in
+/// `TransactionSQLiteStatement`s that reach us through `execSQL` /
+/// `SQLiteStatement.execute` — not `beginTransaction` — and
+/// `RoomDatabase.inTransaction` would read an empty stack and let
+/// `assertNotSuspendingTransaction` throw inside `withTransaction`.
+fn track_tx_sql(d: &mut Db, sql: &str) {
+    let mut it = sql.split_whitespace();
+    let verb = it.next().unwrap_or_default();
+    if verb.eq_ignore_ascii_case("begin") {
+        d.tx_stack.push(false);
+    } else if verb.eq_ignore_ascii_case("commit")
+        || verb.eq_ignore_ascii_case("end")
+        || verb.eq_ignore_ascii_case("release")
+    {
+        d.tx_stack.pop();
+        if d.tx_stack.is_empty() {
+            d.tx_failed = false;
+        }
+    } else if verb.eq_ignore_ascii_case("rollback") {
+        // Both `ROLLBACK` and `ROLLBACK TO SAVEPOINT` unwind a level.
+        d.tx_stack.pop();
+        if d.tx_stack.is_empty() {
+            d.tx_failed = false;
+        }
+    } else if verb.eq_ignore_ascii_case("savepoint") {
+        d.tx_stack.push(false);
     }
 }
 
@@ -1052,6 +1084,15 @@ fn sqlite_call(vm: &mut Vm, name: &str, args: &[V]) -> Rt<Option<Option<V>>> {
         "getWritableDatabase" | "getReadableDatabase" => {
             let n = db_name_of(vm, this).unwrap_or_else(|| "ovelo".into());
             let out = db_obj(vm, &n)?;
+            // AOSP open sequence: onConfigure runs first on a fresh
+            // open (Room's SupportOpenHelperCallback enables foreign
+            // keys there), then the version check below, then onOpen.
+            // The handle is cached afterwards — once per helper, not
+            // once per getWritableDatabase call.
+            let first_open = pseudo_get(vm, this, P_DBOPENED).map(i32v).unwrap_or(0) == 0;
+            if first_open {
+                vm.call_virtual_rt(this, "onConfigure", &[out])?;
+            }
             // AOSP migrates on open: when the stored user_version
             // differs from the helper's schema version the matching
             // guest callback runs before the db is handed out.
@@ -1134,6 +1175,14 @@ fn sqlite_call(vm: &mut Vm, name: &str, args: &[V]) -> Rt<Option<Option<V>>> {
                     }
                 }
             }
+            // Room's RoomConnectionManager installs an onOpen callback
+            // that records its supportDatabase wrapper here — skipping
+            // it leaves isSupportDatabaseOpen() false and Room's
+            // assertNotSuspendingTransaction fires mid-transaction.
+            if first_open {
+                pseudo_set(vm, this, P_DBOPENED, V::I32(1));
+                vm.call_virtual_rt(this, "onOpen", &[out])?;
+            }
             Some(Some(out))
         }
         "beginTransaction"
@@ -1215,6 +1264,7 @@ fn sqlite_call(vm: &mut Vm, name: &str, args: &[V]) -> Rt<Option<Option<V>>> {
                     .execute_batch(&sql)
                     .map_err(|e| sql_err(vm, e))?;
             }
+            track_tx_sql(&mut db.borrow_mut(), &sql);
             Some(None)
         }
         "rawQuery" | "rawQueryWithFactory" => {
@@ -1383,6 +1433,8 @@ fn sqlite_call(vm: &mut Vm, name: &str, args: &[V]) -> Rt<Option<Option<V>>> {
             if let Some(n) = db_name_of(vm, this) {
                 vm.dbs.remove(&safe_name(&n));
             }
+            // A re-open must run the configure/open callbacks again.
+            pseudo_set(vm, this, P_DBOPENED, V::I32(0));
             Some(None)
         }
         "getVersion" => {
@@ -1485,6 +1537,7 @@ fn stmt_call(vm: &mut Vm, name: &str, args: &[V]) -> Rt<Option<Option<V>>> {
                 .conn
                 .execute(&sql, params_from_iter(params))
                 .map_err(|e| sql_err(vm, e))?;
+            track_tx_sql(&mut db.borrow_mut(), &sql);
             Some(None)
         }
         "executeInsert" => {

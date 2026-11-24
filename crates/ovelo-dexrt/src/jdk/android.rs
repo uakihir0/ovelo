@@ -3153,7 +3153,16 @@ fn pm_call(vm: &mut Vm, name: &str, args: &[V]) -> Rt<Option<Option<V>>> {
             | "getModuleInfo"
             | "getInstallSourceInfo"
             | "getPackageInstaller" => {
-                if name == "getApplicationLabel" {
+                if name == "getPackageInstaller" {
+                    // A real handle — install managers take
+                    // `installer.getClass()`/`createSession` on it and
+                    // an NPE here kills Hilt singleton construction.
+                    Some(Some(host(
+                        vm,
+                        "Landroid/content/pm/PackageInstaller;",
+                        HostState::Empty,
+                    )))
+                } else if name == "getApplicationLabel" {
                     Some(Some(jstr(vm, "app")))
                 } else {
                     Some(Some(V::Ref(0)))
@@ -3927,13 +3936,18 @@ fn res_misc(vm: &mut Vm, class: &str, name: &str, args: &[V]) -> Rt<Option<Optio
             }
             // Asset reads serve real bytes out of the APK's assets/ dir.
             let fname = sv(vm, args.get(1).copied().unwrap_or(V::I32(0))).unwrap_or_default();
-            if crate::dbg_flag("OVELO_ASSETDBG") {
-                eprintln!("[asset] {name} '{fname}'");
-            }
             let bytes = vm.apk_res.as_ref().and_then(|r| {
                 r.read(&format!("assets/{fname}"))
                     .or_else(|| r.read(&fname))
             });
+            if crate::dbg_flag("OVELO_ASSETDBG") {
+                match &bytes {
+                    Some(b) => {
+                        eprintln!("[asset] {name} '{fname}' -> {} bytes h-alloc-next", b.len())
+                    }
+                    None => eprintln!("[asset] {name} '{fname}' -> MISSING (FileNotFound)"),
+                }
+            }
             let Some(b) = bytes else {
                 // AOSP throws FileNotFoundException for a missing
                 // asset — callers probe locale variants this way and
@@ -3946,6 +3960,9 @@ fn res_misc(vm: &mut Vm, class: &str, name: &str, args: &[V]) -> Rt<Option<Optio
                     "Ljava/io/ByteArrayInputStream;",
                     HostState::Bytes(std::rc::Rc::new(b), 0),
                 );
+                if crate::dbg_flag("OVELO_ASSETDBG") {
+                    eprintln!("[asset] {name} '{fname}' -> stream #{h}");
+                }
                 V::Ref(h)
             }))
         }
