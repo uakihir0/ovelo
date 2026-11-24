@@ -1412,8 +1412,23 @@ fn node_tree_dump(vm: &mut Vm, node: u32, depth: usize) {
         }
         _ => (-1, 0),
     };
+    let (mut mw, mut mh) = (None, None);
+    if let Some(V::Ref(coord)) = vm
+        .call_virtual_sig(node, "getOuterCoordinator", &[], &[])
+        .ok()
+        .flatten()
+    {
+        mw = vm
+            .call_virtual_sig(coord, "getMeasuredWidth", &[], &[])
+            .ok()
+            .flatten();
+        mh = vm
+            .call_virtual_sig(coord, "getMeasuredHeight", &[], &[])
+            .ok()
+            .flatten();
+    }
     eprintln!(
-        "[nodedump] {:indent$}h{node} {cls} children={n}",
+        "[nodedump] {:indent$}h{node} {cls} children={n} measured={mw:?}x{mh:?}",
         "",
         indent = depth * 2
     );

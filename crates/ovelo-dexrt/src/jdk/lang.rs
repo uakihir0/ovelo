@@ -42,6 +42,7 @@ pub(crate) fn call(
     } else if desc_is_a(class, THROWABLE) {
         throwable_call(vm, name, sig, args)?
     } else if class == "Ljava/lang/Enum;"
+        || platform_enum_consts(class).is_some()
         || (!class.starts_with("Ljava/time/") && vm.assignable_desc(class, "Ljava/lang/Enum;"))
     {
         // java.time's enums carry the Enum super but have dedicated
@@ -2456,7 +2457,79 @@ pub(crate) fn enum_value_list(vm: &mut Vm, class: &str) -> Vec<V> {
             }
         }
     }
+    if vals.is_empty() {
+        // Platform enums (android.graphics.* etc.) have no dex class
+        // def — mint their constants so Kotlin $WhenMappings clinits
+        // and `values().length` don't die on an empty array.
+        if let Some(names) = platform_enum_consts(class) {
+            for (i, n) in names.iter().enumerate() {
+                let h = host(vm, class, HostState::Empty);
+                if let V::Ref(hh) = h {
+                    let ns = jstr(vm, n);
+                    pseudo_set(vm, hh, P_DATA, ns);
+                    pseudo_set(vm, hh, P_FLAGS, V::I32(i as i32));
+                }
+                vals.push(h);
+            }
+        }
+    }
     vals
+}
+
+/// Declaration-order constants of Android platform enums we mirror.
+fn platform_enum_consts(class: &str) -> Option<&'static [&'static str]> {
+    Some(match class {
+        "Landroid/graphics/Paint$Cap;" => &["BUTT", "ROUND", "SQUARE"],
+        "Landroid/graphics/Paint$Style;" => &["FILL", "STROKE", "FILL_AND_STROKE"],
+        "Landroid/graphics/Paint$Join;" => &["MITER", "ROUND", "BEVEL"],
+        "Landroid/graphics/Paint$Align;" => &["LEFT", "CENTER", "RIGHT"],
+        "Landroid/graphics/PorterDuff$Mode;" => &[
+            "CLEAR", "SRC", "DST", "SRC_OVER", "DST_OVER", "SRC_IN", "DST_IN", "SRC_OUT",
+            "DST_OUT", "SRC_ATOP", "DST_ATOP", "XOR", "DARKEN", "LIGHTEN", "MULTIPLY", "SCREEN",
+            "ADD", "OVERLAY",
+        ],
+        "Landroid/graphics/BlendMode;" => &[
+            "CLEAR",
+            "SRC",
+            "DST",
+            "SRC_OVER",
+            "DST_OVER",
+            "SRC_IN",
+            "DST_IN",
+            "SRC_OUT",
+            "DST_OUT",
+            "SRC_ATOP",
+            "DST_ATOP",
+            "XOR",
+            "PLUS",
+            "MODULATE",
+            "SCREEN",
+            "OVERLAY",
+            "DARKEN",
+            "LIGHTEN",
+            "COLOR_DODGE",
+            "COLOR_BURN",
+            "HARD_LIGHT",
+            "SOFT_LIGHT",
+            "DIFFERENCE",
+            "EXCLUSION",
+            "MULTIPLY",
+            "HUE",
+            "SATURATION",
+            "COLOR",
+            "LUMINOSITY",
+        ],
+        "Landroid/graphics/Path$Direction;" => &["CW", "CCW"],
+        "Landroid/graphics/Region$Op;" => &[
+            "DIFFERENCE",
+            "INTERSECT",
+            "UNION",
+            "XOR",
+            "REVERSE_DIFFERENCE",
+            "REPLACE",
+        ],
+        _ => return None,
+    })
 }
 
 /// An enum constant's `ordinal()` as stored by `Enum.<init>`.

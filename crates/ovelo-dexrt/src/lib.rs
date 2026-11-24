@@ -6374,7 +6374,23 @@ impl Vm {
                     .map(|&i| Self::reg(fr, i as usize))
                     .collect::<Rt<_>>()?;
                 let this_arg = args.first().copied();
-                let argfmt: Vec<String> = if self.trace_call.is_some() {
+                // Cheap gate first: only build the expensive arg dump
+                // when the callee name actually matches the filter.
+                let trace_hit = self
+                    .trace_call
+                    .as_deref()
+                    .map(|p| {
+                        let callee = self.describe_method(midx);
+                        let caller = self.describe_method(fr.loc.midx);
+                        p.split(',')
+                            .any(|one| !one.is_empty() && callee.contains(one))
+                            && self
+                                .trace_from
+                                .as_deref()
+                                .is_none_or(|f| caller.contains(f))
+                    })
+                    .unwrap_or(false);
+                let argfmt: Vec<String> = if trace_hit {
                     args.iter()
                         .skip(1)
                         .map(|v| match v {

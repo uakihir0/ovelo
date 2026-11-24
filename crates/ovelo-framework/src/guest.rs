@@ -515,6 +515,19 @@ impl GuestUi {
     /// Register every bridged framework method on `vm`. Unreferenced
     /// methods simply don't register (the app never calls them).
     pub fn register(ui: &Rc<RefCell<Self>>, vm: &mut Vm) {
+        // Compose's InlineClassHelperKt.throwIllegalArgumentException is
+        // the require() inside DrawScope.inset — PainterNode can hand a
+        // painter an Unspecified/negative size (degenerate layout while
+        // the composition is still settling), and letting it throw
+        // aborts the ENTIRE dispatchDraw traversal, leaving a black
+        // screen. A silent return lets the frame finish; the offending
+        // painter just draws nothing.
+        let _ = vm.register_host(
+            "Landroidx/compose/ui/graphics/InlineClassHelperKt;",
+            "throwIllegalArgumentException",
+            "(Ljava/lang/String;)V",
+            Rc::new(RefCell::new(|_vm: &mut Vm, _a: &[V]| Ok(None))) as HostCall,
+        );
         // ---- constructors -------------------------------------------------
         Self::ctor(ui, vm, "Landroid/view/View;", |_ui| {
             GuestView::Plain(View::new(
