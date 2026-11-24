@@ -5,6 +5,7 @@
 //! Vector Pinball table — without a GPU or EGL context).
 
 use std::collections::HashMap;
+use std::sync::Arc;
 use std::sync::Mutex;
 
 use super::{host, i32v, pseudo_get, pseudo_set};
@@ -70,10 +71,13 @@ struct Prim {
     tex: Option<TexVerts>,
 }
 
+/// Per-vertex sampled texture (shared snapshot at draw-record time)
+/// plus UV coords.
+type TexVerts = (Vec<Option<Arc<TexImg>>>, Vec<(f32, f32)>);
+
 /// A decoded `glTexImage2D` texture: straight RGBA8 rows in upload
 /// order (row 0 = GL v = 0, matching the guest's UV convention).
-type TexVerts = (Vec<i32>, Vec<(f32, f32)>);
-
+#[derive(Clone)]
 struct TexImg {
     w: usize,
     h: usize,
@@ -137,7 +141,11 @@ struct GlState {
     /// Texture unit -> bound texture id (`glBindTexture`).
     tex_bound: HashMap<i32, i32>,
     /// Texture id -> decoded pixels (`glTexImage2D`/`glTexSubImage2D`).
-    textures: HashMap<i32, TexImg>,
+    /// Shared with the prims that sampled it so mid-frame updates and
+    /// deletes cannot rewrite already-recorded draws.
+    textures: HashMap<i32, Arc<TexImg>>,
+    /// GL_UNPACK_ALIGNMENT (default 4).
+    unpack_align: i32,
 }
 
 impl GlState {
@@ -170,6 +178,7 @@ impl GlState {
             tex_unit: 0,
             tex_bound: HashMap::new(),
             textures: HashMap::new(),
+            unpack_align: 4,
         }
     }
 }
@@ -490,13 +499,16 @@ fn record_el(vm: &Vm, gl: u32, mode: i32, count: i32, ty: i32, buf: u32) {
 /// two triangles over exactly four axis-aligned corners, all sampling
 /// the same texture. Extracts the UV rect from the texture and emits
 /// a tinted `CanvasOp::Bitmap`; returns None to fall back to fills.
-fn tex_quad_op(st: &GlState, p: &Prim, i: usize) -> Option<CanvasOp> {
+fn tex_quad_op(_st: &GlState, p: &Prim, i: usize) -> Option<CanvasOp> {
     let (tex_ids, uvs) = p.tex.as_ref()?;
     if i + 5 >= p.verts.len() {
         return None;
     }
-    let tex = tex_ids[i];
-    if tex == 0 || tex_ids[i..i + 6].iter().any(|&t| t != tex) {
+    let tex = tex_ids[i].clone()?;
+    if tex_ids[i..i + 6]
+        .iter()
+        .any(|t| !matches!(t.as_ref(), Some(r) if Arc::ptr_eq(r, &tex)))
+    {
         return None;
     }
     let vs = &p.verts[i..i + 6];
@@ -510,7 +522,7 @@ fn tex_quad_op(st: &GlState, p: &Prim, i: usize) -> Option<CanvasOp> {
     if xs.len() != 2 || ys.len() != 2 {
         return None;
     }
-    let t = st.textures.get(&tex)?;
+    let t = &*tex;
     if t.w == 0 || t.h == 0 || t.rgba.is_empty() {
         return None;
     }
@@ -1394,17 +1406,24 @@ fn buf_bytes(vm: &Vm, buf: &V, size: usize) -> Vec<u8> {
 
 /// Decode `glTexImage2D`/`glTexSubImage2D` source pixels to straight
 /// RGBA8. Null `pixels` yields a zeroed buffer (sized-only alloc).
-fn tex_pixels(vm: &Vm, src: &V, w: usize, h: usize, fmt: i32, ty: i32) -> Vec<u8> {
+fn tex_pixels(vm: &Vm, src: &V, w: usize, h: usize, fmt: i32, ty: i32, align: i32) -> Vec<u8> {
     let npix = w.saturating_mul(h);
     if npix == 0 {
         return Vec::new();
     }
+    let align = align.clamp(1, 8) as usize;
     let ch = match fmt {
         0x1908 => 4,          // GL_RGBA
         0x1907 => 3,          // GL_RGB
         0x190A => 2,          // GL_LUMINANCE_ALPHA
         0x1906 | 0x1909 => 1, // GL_ALPHA | GL_LUMINANCE
         _ => 4,
+    };
+    // Rows are padded up to GL_UNPACK_ALIGNMENT bytes in the source.
+    let row_bytes = |bpp: usize| w * bpp;
+    let stride = |bpp: usize| {
+        let rb = row_bytes(bpp);
+        rb + (align - rb % align) % align
     };
     let expand = |r: u32, g: u32, b: u32, a: u32, o: &mut Vec<u8>| {
         o.extend_from_slice(&[r as u8, g as u8, b as u8, a as u8]);
@@ -1413,9 +1432,11 @@ fn tex_pixels(vm: &Vm, src: &V, w: usize, h: usize, fmt: i32, ty: i32) -> Vec<u8
     match ty {
         0x1401 => {
             // GL_UNSIGNED_BYTE
-            let b = buf_bytes(vm, src, npix * ch);
+            let st = stride(ch);
+            let b = buf_bytes(vm, src, st * h);
             for p in 0..npix {
-                let s = p * ch;
+                let (y, x) = (p / w.max(1), p % w.max(1));
+                let s = y * st + x * ch;
                 if s + ch > b.len() {
                     break;
                 }
@@ -1438,9 +1459,11 @@ fn tex_pixels(vm: &Vm, src: &V, w: usize, h: usize, fmt: i32, ty: i32) -> Vec<u8
         // Packed u16 formats — byte order follows the buffer order.
         0x8363 | 0x8033 | 0x8034 => {
             let le = upload_le(vm, src);
-            let b = buf_bytes(vm, src, npix * 2);
+            let st = stride(2);
+            let b = buf_bytes(vm, src, st * h);
             for p in 0..npix {
-                let s = p * 2;
+                let (y, x) = (p / w.max(1), p % w.max(1));
+                let s = y * st + x * 2;
                 if s + 2 > b.len() {
                     break;
                 }
@@ -1493,9 +1516,9 @@ fn tex_id_at(
     tidx_a: &Option<Attrib>,
     samplers: &[(i32, String)],
     i: usize,
-) -> i32 {
+) -> Option<Arc<TexImg>> {
     if !uv_ok || samplers.is_empty() {
-        return 0;
+        return None;
     }
     let ti = tidx_a
         .as_ref()
@@ -1510,14 +1533,17 @@ fn tex_id_at(
         } else {
             None
         });
-    let Some(loc) = loc else { return 0 };
+    let loc = loc?;
     let unit = st
         .uniforms
         .get(&loc)
         .and_then(|v| v.first())
         .copied()
         .unwrap_or(0.0) as i32;
-    st.tex_bound.get(&unit).copied().unwrap_or(0)
+    st.tex_bound
+        .get(&unit)
+        .and_then(|id| st.textures.get(id))
+        .cloned()
 }
 
 fn attr_at(vm: &Vm, st: &GlState, a: &Attrib, i: usize) -> [f32; 4] {
@@ -2349,15 +2375,24 @@ pub(crate) fn call_static(
             state(GL20, |s| s.tex_unit = i(0).saturating_sub(0x84C0));
             None
         }
+        "glPixelStorei" => {
+            // GL_UNPACK_ALIGNMENT
+            if i(0) == 0x0CF5 {
+                state(GL20, |s| s.unpack_align = i(1).clamp(1, 8));
+            }
+            None
+        }
         "glBindTexture" => {
             let id = i(1);
             state(GL20, |s| {
                 s.tex_bound.insert(s.tex_unit, id);
                 if id > 0 {
-                    s.textures.entry(id).or_insert(TexImg {
-                        w: 0,
-                        h: 0,
-                        rgba: Vec::new(),
+                    s.textures.entry(id).or_insert_with(|| {
+                        Arc::new(TexImg {
+                            w: 0,
+                            h: 0,
+                            rgba: Vec::new(),
+                        })
                     });
                 }
             });
@@ -2393,7 +2428,8 @@ pub(crate) fn call_static(
             //  type, pixels)
             let (w, h) = (i(3).max(0) as usize, i(4).max(0) as usize);
             let src = args.get(8).copied().unwrap_or(V::I32(0));
-            let rgba = tex_pixels(vm, &src, w, h, i(6), i(7));
+            let align = state(GL20, |s| s.unpack_align);
+            let rgba = tex_pixels(vm, &src, w, h, i(6), i(7), align);
             if std::env::var_os("OVELO_GLDBG").is_some() {
                 let desc = match &src {
                     V::Ref(h) => match vm.heap.get(*h) {
@@ -2444,7 +2480,7 @@ pub(crate) fn call_static(
             state(GL20, |s| {
                 let id = s.tex_bound.get(&s.tex_unit).copied().unwrap_or(0);
                 if id > 0 {
-                    s.textures.insert(id, TexImg { w, h, rgba });
+                    s.textures.insert(id, Arc::new(TexImg { w, h, rgba }));
                 }
             });
             None
@@ -2454,10 +2490,11 @@ pub(crate) fn call_static(
             let (xo, yo) = (i(2).max(0) as usize, i(3).max(0) as usize);
             let (w, h) = (i(4).max(0) as usize, i(5).max(0) as usize);
             let src = args.get(8).copied().unwrap_or(V::I32(0));
-            let rgba = tex_pixels(vm, &src, w, h, i(6), i(7));
+            let align = state(GL20, |s| s.unpack_align);
+            let rgba = tex_pixels(vm, &src, w, h, i(6), i(7), align);
             state(GL20, |s| {
                 let id = s.tex_bound.get(&s.tex_unit).copied().unwrap_or(0);
-                if let Some(t) = s.textures.get_mut(&id) {
+                if let Some(t) = s.textures.get_mut(&id).map(Arc::make_mut) {
                     for y in 0..h.min(t.h.saturating_sub(yo)) {
                         for x in 0..w.min(t.w.saturating_sub(xo)) {
                             let d = ((yo + y) * t.w + (xo + x)) * 4;
