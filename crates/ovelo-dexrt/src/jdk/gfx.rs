@@ -909,8 +909,17 @@ fn paint_call(vm: &mut Vm, name: &str, _sig: &str, args: &[V]) -> Rt<Option<Opti
         }
         "getTypeface" => Some(Some(V::Ref(0))),
         "getStrokeMiter" => Some(Some(V::F32(1.0))),
-        "getShader" | "getColorFilter" | "getMaskFilter" | "getPathEffect" | "getXfermode"
-        | "getTextLocale" | "getTextLocales" => Some(Some(V::Ref(0))),
+        "getShader" | "getColorFilter" | "getMaskFilter" | "getPathEffect" | "getXfermode" => {
+            Some(Some(V::Ref(0)))
+        }
+        // Compose's word-boundary selection calls `getTextLocale()` —
+        // a null locale throws inside `BreakIterator`/`SelectionSegment`.
+        "getTextLocale" => Some(Some(host(
+            vm,
+            "Ljava/util/Locale;",
+            HostState::StrBuf("en-US".into()),
+        ))),
+        "getTextLocales" => Some(Some(host(vm, "Landroid/os/LocaleList;", HostState::Empty))),
         _ => None,
     })
 }

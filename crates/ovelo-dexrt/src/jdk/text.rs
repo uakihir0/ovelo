@@ -31,7 +31,7 @@ pub(crate) fn call(
     vm: &mut Vm,
     class: &str,
     name: &str,
-    _sig: &str,
+    sig: &str,
     args: &[V],
 ) -> Rt<Option<Option<V>>> {
     match class {
@@ -40,7 +40,7 @@ pub(crate) fn call(
             Ok(builder_call(vm, name, args))
         }
         "Landroid/text/Layout;" | "Landroid/text/StaticLayout;" | "Landroid/text/BoringLayout;" => {
-            Ok(boring_call(vm, class, name, args))
+            Ok(boring_call(vm, class, name, sig, args))
         }
         "Landroid/text/BoringLayout$Metrics;" => Ok(metrics_call(vm, name, args)),
         "Landroid/text/SpannableString;"
@@ -135,7 +135,20 @@ fn spannable_call(vm: &mut Vm, name: &str, args: &[V]) -> Option<Option<V>> {
         }
         "toString" => Some(Some(jstr(vm, &cs_text(vm, this)))),
         "setSpan" | "removeSpan" => Some(None),
-        "getSpans" => Some(Some(arr(vm, "Ljava/lang/Object;", vec![]))),
+        "getSpans" => {
+            // `getSpans(int, int, Class<T>)` — the array must be typed
+            // `T[]`: an `Object[]` fails checkcast to `CharacterStyle[]`
+            // and aborts Compose's styled-text measurement.
+            let desc = args
+                .get(3)
+                .and_then(|v| match v {
+                    V::Ref(h) => class_desc_of(vm, *h),
+                    _ => None,
+                })
+                .filter(|d| d.starts_with('L') || d.starts_with('['))
+                .unwrap_or_else(|| "Ljava/lang/Object;".to_string());
+            Some(Some(arr(vm, &desc, vec![])))
+        }
         "getSpanStart" | "getSpanEnd" | "getSpanFlags" | "nextSpanTransition" => {
             Some(Some(V::I32(-1)))
         }
@@ -260,7 +273,7 @@ fn line_starts(lines: &[(String, f32)]) -> Vec<i64> {
         .collect()
 }
 
-fn boring_call(vm: &mut Vm, class: &str, name: &str, args: &[V]) -> Option<Option<V>> {
+fn boring_call(vm: &mut Vm, class: &str, name: &str, sig: &str, args: &[V]) -> Option<Option<V>> {
     // BoringLayout statics + constructor carry the real text/width —
     // everything else is the shared Layout model below.
     if class == "Landroid/text/BoringLayout;" {
@@ -319,13 +332,13 @@ fn boring_call(vm: &mut Vm, class: &str, name: &str, args: &[V]) -> Option<Optio
                 return Some(None);
             }
             "isFallbackLineSpacingEnabled" => return Some(Some(V::I32(1))),
-            _ => return layout_call(vm, class, name, args),
+            _ => return layout_call(vm, class, name, sig, args),
         }
     }
-    layout_call(vm, class, name, args)
+    layout_call(vm, class, name, sig, args)
 }
 
-fn layout_call(vm: &mut Vm, _class: &str, name: &str, args: &[V]) -> Option<Option<V>> {
+fn layout_call(vm: &mut Vm, _class: &str, name: &str, sig: &str, args: &[V]) -> Option<Option<V>> {
     let Some(&V::Ref(this)) = args.first() else {
         return Some(None);
     };
@@ -410,11 +423,28 @@ fn layout_call(vm: &mut Vm, _class: &str, name: &str, args: &[V]) -> Option<Opti
         "getSpacingMultiplier" => V::F32(1.0),
         "getEllipsizedWidth" => V::I32(width as i32),
         "getDesiredWidth" => {
-            let w = layout_lines(vm, this)
-                .iter()
-                .map(|l| l.1)
-                .fold(0f32, f32::max);
-            V::F32(w)
+            if sig.starts_with("(Ljava/lang/CharSequence;") {
+                // Static `Layout.getDesiredWidth(CharSequence, TextPaint)`
+                // — args[0] is the text, not a layout. Measuring the
+                // pseudo state of a CharSequence yielded width 0 and
+                // wrap-content text never sized itself.
+                let t = cs_arg(vm, args.first().copied().unwrap_or(V::Ref(0)));
+                let sz = args
+                    .get(1)
+                    .and_then(|v| match v {
+                        V::Ref(h) => pseudo_get(vm, *h, gfx::PK_TSIZE),
+                        _ => None,
+                    })
+                    .map(f64v)
+                    .unwrap_or(12.0) as f32;
+                V::F32(gfx::measure_text(&t, sz))
+            } else {
+                let w = layout_lines(vm, this)
+                    .iter()
+                    .map(|l| l.1)
+                    .fold(0f32, f32::max);
+                V::F32(w)
+            }
         }
         "getIncludePadding" => V::I32(1),
         "draw" => {
