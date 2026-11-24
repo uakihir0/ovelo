@@ -1459,11 +1459,6 @@ pub(crate) fn call(
                 if let Some(V::Ref(cb)) = args.get(1).copied() {
                     if cb != 0 {
                         pseudo_set(vm, this, P_HOLDER_CBS, V::Ref(cb));
-                        // The host window already exists — the surface
-                        // is live the moment the view has a holder, so
-                        // deliver created+changed immediately (Godot
-                        // starts its render threads off these).
-                        let wh = host(vm, "Landroid/view/SurfaceHolder;", HostState::Empty);
                         // Size from the owning view's frame — GL threads
                         // (GLSurfaceView.guardedRun) hold `wait()` until
                         // surfaceChanged reports a non-zero w/h.
@@ -1477,13 +1472,12 @@ pub(crate) fn call(
                             })
                             .map(|(l, t, r, b)| (r - l, b - t))
                             .unwrap_or((720, 1280));
-                        let r1 = vm.call_virtual(cb, "surfaceCreated", &[wh]);
-                        let r2 = vm.call_virtual(
-                            cb,
-                            "surfaceChanged",
-                            &[wh, V::I32(0), V::I32(sw), V::I32(sh)],
-                        );
-                        eprintln!("[holder] addCallback {sw}x{sh} created={r1:?} changed={r2:?}");
+                        // Defer to the next drain tick: Android only
+                        // fires these once a real surface exists, and
+                        // Godot's `init()` runs this before its
+                        // `glThread` field is assigned — inline calls
+                        // NPE on the null receiver.
+                        vm.pending_surface.push((this, cb, sw, sh));
                     }
                 }
             }

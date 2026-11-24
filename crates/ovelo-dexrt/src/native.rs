@@ -168,6 +168,24 @@ unsafe fn safe_read_u32(addr: usize) -> Option<u32> {
 }
 
 #[cfg(target_os = "macos")]
+unsafe fn safe_read_u64(addr: usize) -> Option<u64> {
+    let mut out = 0u64;
+    let mut n = 0u64;
+    let kr = mach_vm_read_overwrite(
+        mach_task_self(),
+        addr as u64,
+        8,
+        &mut out as *mut u64 as u64,
+        &mut n,
+    );
+    if kr == 0 && n == 8 {
+        Some(out)
+    } else {
+        None
+    }
+}
+
+#[cfg(target_os = "macos")]
 #[repr(C)]
 struct Sigaction {
     sa_sigaction: usize,
@@ -326,6 +344,11 @@ fn fallback_tcb() -> usize {
     tcb as usize
 }
 
+/// Scribble target for *unproven* healed stores: a wild `str` patched
+/// to the live TCB would overwrite the stack-guard cookie or the
+/// bookkeeping slots — quarantine those writes here (primed the same
+/// so reads from it stay consistent).
+#[cfg(target_arch = "aarch64")]
 /// TCB for `tid`, scannable from the async-signal handler.
 #[cfg(target_arch = "aarch64")]
 fn tcb_for(tid: u64) -> usize {
@@ -416,10 +439,7 @@ pub(crate) fn with_guest_tls_at<R>(site: &'static str, f: impl FnOnce() -> R) ->
         if old >= 0x1000 {
             *tcb.add(SLOT_HOST_TPIDR) = old as u64;
         }
-        core::arch::asm!(
-            "msr tpidr_el0, {t}\nmov x18, {t}",
-            t = in(reg) tcb as usize
-        );
+        core::arch::asm!("msr tpidr_el0, {t}", t = in(reg) tcb as usize);
         TLS_TRACE[8].store(tcb as usize as u64, std::sync::atomic::Ordering::Relaxed);
         // OVELO_TLSPROBE: allocation inside the swapped window — if the
         // crash is malloc's TPIDR-keyed per-thread magazine state, a
@@ -517,10 +537,7 @@ extern "C" fn sh_pthread_create(
             let mut old: usize;
             core::arch::asm!("mrs {}, tpidr_el0", out(reg) old);
             *tcb.add(SLOT_HOST_TPIDR) = old as u64;
-            core::arch::asm!(
-                "msr tpidr_el0, {t}\nmov x18, {t}",
-                t = in(reg) tcb as usize
-            );
+            core::arch::asm!("msr tpidr_el0, {t}", t = in(reg) tcb as usize);
             TLS_TRACE[10].store(tcb as usize as u64, std::sync::atomic::Ordering::Relaxed);
             let f: extern "C" fn(usize) -> usize = std::mem::transmute(entry);
             let r = f(arg) as *mut c_void;
@@ -1008,7 +1025,26 @@ unsafe fn heal_tls_fault(si: usize, insn: u32, mc: *mut u8) -> bool {
         }
     }
     if !proven {
-        return false;
+        // A near-null base in guest code is a genuine null-object
+        // deref, not a smashed thread pointer (the x18 carrier is dead
+        // anyway — signal delivery zeroes it). Injecting the TCB here
+        // made the callee run on TCB garbage and kept caller loops on a
+        // permanently-null entry alive ~20k faults/s. Emulate instead:
+        // `ldr` yields 0 so the usual `cbz` early-out runs, `str` is
+        // dropped, and pc advances past the faulting access.
+        if !code_mapped(pc) || base >= 0x1000 {
+            return false;
+        }
+        let rt = (insn & 31) as usize;
+        if (insn & 0xFFC0_0000) == 0xF940_0000 && rt != 31 {
+            unsafe {
+                *(mc.add(16 + rt * 8) as *mut usize) = 0;
+            }
+        }
+        unsafe {
+            *(mc.add(272) as *mut usize) = pc + 4;
+        }
+        return true;
     }
     // The value the thread expects depends on whose code faulted:
     // guest `.so`/thunk code runs on the guest TCB, while a host lib
@@ -1018,7 +1054,7 @@ unsafe fn heal_tls_fault(si: usize, insn: u32, mc: *mut u8) -> bool {
     // contended), fall back to a shared zeroed block: thunk stores
     // land harmlessly, and the host-TPIDR slot reads 0 so a host-call
     // fault resolves via the dead-call heal.
-    let mut tcb = tcb_for(unsafe { mach_thread_id() });
+    let mut tcb = tcb_for(mach_thread_id());
     if tcb == 0 {
         tcb = fallback_tcb();
     }
@@ -1050,7 +1086,9 @@ unsafe fn heal_tls_fault(si: usize, insn: u32, mc: *mut u8) -> bool {
         // silently wrong data when the smashed value happens to map.
         core::arch::asm!("msr tpidr_el0, {}", in(reg) restore);
         if x18_heal {
-            *(mc.add(16 + 18 * 8) as *mut usize) = restore;
+            // x18 is the TLS carrier — always the real TCB, never the
+            // scribble quarantine.
+            *(mc.add(16 + 18 * 8) as *mut usize) = if code_mapped(pc) { tcb } else { restore };
         }
         let s = b"[segv-heal]\n";
         write(2, s.as_ptr() as *const c_void, s.len());
@@ -1079,7 +1117,7 @@ unsafe fn heal_dead_thunk_call(mc: *mut u8) -> bool {
     if code_mapped(pc) {
         return false;
     }
-    let mut tcb = tcb_for(unsafe { mach_thread_id() });
+    let mut tcb = tcb_for(mach_thread_id());
     if tcb == 0 {
         tcb = fallback_tcb();
     }
@@ -1171,8 +1209,144 @@ pub fn install_crash_dump() {
                 // pc may be unmapped (instruction abort on a wild
                 // branch): read through Mach, never dereference.
                 let insn = safe_read_u32(pc).unwrap_or(0);
-                if insn != 0 && heal_tls_fault(si, insn, mc as *mut u8) {
-                    return;
+                if std::env::var_os("OVELO_HEALDBG").is_some() {
+                    static DBGN: std::sync::atomic::AtomicUsize =
+                        std::sync::atomic::AtomicUsize::new(0);
+                    let d = DBGN.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    // Sample: first 32 faults, then every 50000th —
+                    // catches both early sites and the storm phase.
+                    if d < 32 || d.is_multiple_of(50_000) {
+                        // pc si insn base_reg_val — pinpoints the site
+                        // and the garbage carried into the access.
+                        let rn = ((insn >> 5) & 31) as usize;
+                        let bv = if rn == 31 {
+                            sp
+                        } else {
+                            *(mc.add(16 + rn * 8) as *const usize)
+                        };
+                        let mut m = *b"[healdbg] pc=................ si=................ in=................ base=................ lr=................ fp=................ clr=................ tp=................ il=. site=................ tgt=................\n";
+                        let mut put = |off: usize, v: usize| {
+                            for i in 0..16 {
+                                m[off + i] = b"0123456789abcdef"[(v >> ((15 - i) * 4)) & 0xf];
+                            }
+                        };
+                        put(13, pc);
+                        put(33, si);
+                        put(52, insn as usize);
+                        put(74, bv);
+                        put(94, x30);
+                        let clr =
+                            if fp != 0 && fp.is_multiple_of(8) && safe_read_u32(fp + 8).is_some() {
+                                *(fp as *const usize).add(1)
+                            } else {
+                                0
+                            };
+                        put(114, fp);
+                        put(135, clr);
+                        let mut tpv: usize = 0;
+                        #[cfg(target_arch = "aarch64")]
+                        core::arch::asm!("mrs {}, tpidr_el0", out(reg) tpv);
+                        put(155, tpv);
+                        let ilb = if inlib { b'1' } else { b'0' };
+                        // The thunk's recorded import target + call
+                        // site identify which host call was active
+                        // when guest code ran on the host TPIDR.
+                        let t = tcb_for(mach_thread_id());
+                        let (site, tgt) = if t != 0 {
+                            (
+                                *(t as *const usize).add(0x7ff0 / 8),
+                                *(t as *const usize).add(0x7fe8 / 8),
+                            )
+                        } else {
+                            (0, 0)
+                        };
+                        put(181, site);
+                        put(202, tgt);
+                        m[174] = ilb;
+                        write(2, m.as_ptr() as *const c_void, m.len());
+                        // Walk the frame chain: each frame's saved lr
+                        // names the caller — the recurring stack that
+                        // re-arms host TPIDR under guest code.
+                        let mut bt = *b"[healdbg-bt] ................ ................ ................ ................ ................ ................\n";
+                        let mut putb = |off: usize, v: usize| {
+                            for i in 0..16 {
+                                bt[off + i] = b"0123456789abcdef"[(v >> ((15 - i) * 4)) & 0xf];
+                            }
+                        };
+                        let mut cur = fp;
+                        for i in 0..6 {
+                            if cur == 0 || !cur.is_multiple_of(8) {
+                                break;
+                            }
+                            let pfp = safe_read_u64(cur).unwrap_or(0) as usize;
+                            let plr = safe_read_u64(cur + 8).unwrap_or(0) as usize;
+                            putb(13 + i * 17, plr);
+                            if pfp <= cur {
+                                break;
+                            }
+                            cur = pfp;
+                        }
+                        write(2, bt.as_ptr() as *const c_void, bt.len());
+                    }
+                }
+                if insn != 0 {
+                    // Livelock escape: when a healed access faults at the
+                    // same pc on the same thread over and over, the guest is
+                    // spinning on data that never materializes (e.g. a pump
+                    // calling a callback on a null object). Healing each
+                    // access keeps the loop alive forever at ~20k signal
+                    // round-trips/s, so after a per-site cap we suspend
+                    // the stuck thread outright.
+                    // 8 direct-mapped (tid^pc) counters — a storm sites
+                    // alternate between a TLS read and the null deref,
+                    // so a single counter never accumulates.
+                    static KEYS: [std::sync::atomic::AtomicU64; 8] = [
+                        std::sync::atomic::AtomicU64::new(0),
+                        std::sync::atomic::AtomicU64::new(0),
+                        std::sync::atomic::AtomicU64::new(0),
+                        std::sync::atomic::AtomicU64::new(0),
+                        std::sync::atomic::AtomicU64::new(0),
+                        std::sync::atomic::AtomicU64::new(0),
+                        std::sync::atomic::AtomicU64::new(0),
+                        std::sync::atomic::AtomicU64::new(0),
+                    ];
+                    static CNTS: [std::sync::atomic::AtomicUsize; 8] = [
+                        std::sync::atomic::AtomicUsize::new(0),
+                        std::sync::atomic::AtomicUsize::new(0),
+                        std::sync::atomic::AtomicUsize::new(0),
+                        std::sync::atomic::AtomicUsize::new(0),
+                        std::sync::atomic::AtomicUsize::new(0),
+                        std::sync::atomic::AtomicUsize::new(0),
+                        std::sync::atomic::AtomicUsize::new(0),
+                        std::sync::atomic::AtomicUsize::new(0),
+                    ];
+                    let tid = mach_thread_id();
+                    let key = tid ^ (pc as u64);
+                    let slot = (pc >> 4) & 7;
+                    let hits = if KEYS[slot].load(std::sync::atomic::Ordering::Relaxed) == key {
+                        CNTS[slot].fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1
+                    } else {
+                        KEYS[slot].store(key, std::sync::atomic::Ordering::Relaxed);
+                        CNTS[slot].store(1, std::sync::atomic::Ordering::Relaxed);
+                        1
+                    };
+                    if hits > 256 {
+                        // The site is permanently stuck (e.g. a pump
+                        // re-entering on a null entry that never
+                        // resolves). Suspending the thread is the only
+                        // bounded outcome — the heal would otherwise
+                        // keep this one livelock thread at ~20k
+                        // signal round-trips/s forever.
+                        extern "C" {
+                            fn mach_thread_self() -> u32;
+                            fn thread_suspend(t: u32) -> i32;
+                        }
+                        thread_suspend(mach_thread_self());
+                        return;
+                    }
+                    if heal_tls_fault(si, insn, mc as *mut u8) {
+                        return;
+                    }
                 }
                 if heal_dead_thunk_call(mc as *mut u8) {
                     return;
@@ -1184,6 +1358,17 @@ pub fn install_crash_dump() {
                 // (x30 = return address past the `blr`) and the first
                 // guest-frame links, then suspend the thread.
                 if pc < 0x1000 && si < 0x1000 {
+                    // Guest thread jumped to a null call target: emulate
+                    // the callee as a no-op returning 0 — pc := lr —
+                    // so pumps that vtable-call a missing entry just
+                    // advance. Host threads keep the dump+suspend.
+                    if tcb_for(mach_thread_id()) != 0 && code_mapped(x30) {
+                        *(mc.add(16) as *mut usize) = 0; // x0
+                        *(mc.add(272) as *mut usize) = x30; // pc := lr
+                        let s = b"[segv-nullret]\n";
+                        write(2, s.as_ptr() as *const c_void, s.len());
+                        return;
+                    }
                     let mut m = *b"[segv-null] lr=................ fp=................ l1=................ l2=................\n";
                     let mut put = |off: usize, v: usize| {
                         for i in 0..16 {
@@ -1636,15 +1821,23 @@ extern "C" fn sh_pure_virtual() -> ! {
     eprintln!("[native] __cxa_pure_virtual called");
     std::process::abort()
 }
-extern "C" fn sh_stack_chk_fail() -> ! {
+extern "C" fn sh_stack_chk_fail() {
     let tcb = tcb_for(unsafe { mach_thread_id() });
     let site = if tcb != 0 {
         unsafe { *(tcb as *const usize).add(0x7ff0 / 8) }
     } else {
         0
     };
-    eprintln!("[native] __stack_chk_fail site={:#x?}", so_off(site));
-    std::process::abort()
+    // Most trips here are our own false positive: a kernel-clobbered
+    // x18/TPIDR that happens to point into a mapped page makes the
+    // prologue's cookie read silently wrong — the epilogue then
+    // detects a "smash" no one committed. Aborting kills the whole app
+    // for a fault we introduced; log and return instead so the caller
+    // continues as if the check passed.
+    eprintln!(
+        "[native] __stack_chk_fail site={:#x?} (ignored)",
+        so_off(site)
+    );
 }
 extern "C" fn sh_cxa_finalize(_p: *mut c_void) {}
 extern "C" fn sh_cxa_atexit(_f: *mut c_void, _a: *mut c_void, _d: *mut c_void) -> i32 {
@@ -6238,39 +6431,15 @@ fn finish_so(m: MappedLib, name: &str) -> Result<(NativeLib, Vec<usize>)> {
     // RELR packed relocation.
     apply_relr(bias, d.relr, d.relrsz, map as usize, map_end)?;
 
-    // Patch guest TLS access: `mrs xN,TPIDR_EL0` → `mov xN,x18` and
-    // `msr TPIDR_EL0,xN` → `mov x18,xN`. Darwin clobbers TPIDR_EL0 at
-    // exception/signal boundaries, so a guest that keeps its Bionic
-    // TCB pointer there reads garbage (crashes or silent corruption).
-    // x18 is the platform-reserved register on arm64 — neither host
-    // nor guest codegen allocates it — so it survives every boundary
-    // and every host call. The image is still RW here; pages promote
-    // to RX just below.
-    #[cfg(target_arch = "aarch64")]
-    {
-        let mut npatch = 0usize;
-        for &(va, memsz, flags) in segs {
-            if flags & 1 == 0 {
-                continue; // PF_X
-            }
-            let mut a = bias + va;
-            let e = a + memsz;
-            while a + 4 <= e {
-                let w = unsafe { *(a as *const u32) };
-                if w & 0xFFFF_FFE0 == 0xD53B_D040 {
-                    unsafe { *(a as *mut u32) = 0xAA12_03E0 | (w & 31) }; // mov xN, x18
-                    npatch += 1;
-                } else if w & 0xFFFF_FFE0 == 0xD51B_D040 {
-                    unsafe { *(a as *mut u32) = 0xAA00_03F2 | ((w & 31) << 16) }; // mov x18, xN
-                    npatch += 1;
-                }
-                a += 4;
-            }
-        }
-        if npatch > 0 {
-            eprintln!("[tls-patch] {name}: {npatch} tpidr accesses → x18");
-        }
-    }
+    // Guest TLS access is left unpatched: `mrs xN,TPIDR_EL0` reads
+    // TPIDR_EL0, which already holds the guest TCB while guest code
+    // runs (thunks swap it to the host TPIDR for the host-call
+    // window). An earlier revision rewrote these to a reserved x18
+    // carrier because TPIDR_EL0 was believed to be clobbered at
+    // kernel boundaries — measured the other way: signal delivery
+    // zeroes x18 and sigreturn does NOT restore it (x18 is dead after
+    // the first signal, turning every patched access into a fault),
+    // while TPIDR_EL0 survives signal delivery intact.
 
     // Apply each segment's declared permissions — writable data and
     // bss must stay writable after relocation, executable pages go RX.

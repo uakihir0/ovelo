@@ -342,6 +342,12 @@ pub struct Vm {
     /// `drain_runnables` once due; without this a self-rescheduling
     /// handler floods every drain tick regardless of its delay.
     pub(crate) delayed_runnables: Vec<(u32, bool, u64)>,
+    /// `SurfaceHolder.addCallback` deliveries queued for the next
+    /// drain tick: `(holder handle, callback handle, w, h)`. Android
+    /// only fires surfaceCreated/surfaceChanged once a real surface
+    /// exists — calling them inline during `init()` hits views whose
+    /// GL thread field is not assigned yet (Godot NPE'd exactly so).
+    pub(crate) pending_surface: Vec<(u32, u32, i32, i32)>,
     /// Runnables spawned by `Thread.start` — long-lived loops that
     /// legitimately park/reschedule forever (game loops like bouncy's
     /// FieldDriver), unlike executor workers which the repark budget
@@ -430,6 +436,12 @@ pub struct Vm {
     pub jni_mids: Vec<GIdx>,
     /// JNI jfieldID table — id = index+1 → field GIdx.
     pub jni_fids: Vec<GIdx>,
+    /// By-name `jmethodID`s: `GetMethodID` misses on host/JDK classes
+    /// (reflection APIs the dex chain doesn't declare) get a tagged
+    /// entry here — `(owner descriptor, name, signature)` — resolved
+    /// at call time through the normal name dispatch. Indexed by
+    /// `mid & !GX_NAMED`; see jni.rs.
+    pub(crate) jni_named: Vec<(String, String, String)>,
     /// Exception a native call left pending (Throw/ThrowNew); 0 = none,
     /// `u32::MAX` = thrown without an object handle.
     pub jni_pending_exc: u32,
@@ -562,6 +574,7 @@ impl Vm {
             choreographer_h: 0,
             activity_callbacks: Vec::new(),
             delayed_runnables: Vec::new(),
+            pending_surface: Vec::new(),
             thread_runnables: std::collections::HashSet::new(),
             cur_runnable: 0,
             sleep_until: HashMap::new(),
@@ -582,6 +595,7 @@ impl Vm {
             next_media_id: 0,
             natives: Vec::new(),
             jni_mids: Vec::new(),
+            jni_named: Vec::new(),
             jni_fids: Vec::new(),
             jni_pending_exc: 0,
             field_idx_cache: std::cell::RefCell::new(HashMap::new()),
@@ -1877,6 +1891,15 @@ impl Vm {
         // set so a nested drain from a delivered callback early-returns
         // instead of running an unbounded inner pass.
         jdk::http::drain_coil(self);
+        for (holder, cb, sw, sh) in std::mem::take(&mut self.pending_surface) {
+            let wh = V::Ref(holder);
+            let _ = self.call_virtual(cb, "surfaceCreated", &[wh]);
+            let _ = self.call_virtual(
+                cb,
+                "surfaceChanged",
+                &[wh, V::I32(0), V::I32(sw), V::I32(sh)],
+            );
+        }
         for h in std::mem::take(&mut self.pending_destroy) {
             let _ = self.call_virtual(h, "onDestroy", &[]);
         }

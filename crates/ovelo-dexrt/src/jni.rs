@@ -729,6 +729,17 @@ pub(crate) fn cstr_ro(p: u64) -> String {
 fn mid_of(id: u64) -> Option<GIdx> {
     vm().jni_mids.get(id.checked_sub(1)? as usize).copied()
 }
+
+/// `jni_mids` entries with this tag index `jni_named` instead of the
+/// dex method table — `GetMethodID` on host/JDK classes whose methods
+/// only exist as builtins (Class.getDeclaredMethods, Field.get, …).
+pub(crate) const GX_NAMED: GIdx = 1 << 63;
+
+fn named_of(midx: GIdx) -> Option<(String, String, String)> {
+    (midx & GX_NAMED != 0)
+        .then(|| vm().jni_named.get((midx & !GX_NAMED) as usize).cloned())
+        .flatten()
+}
 fn fid_of(id: u64) -> Option<GIdx> {
     vm().jni_fids.get(id.checked_sub(1)? as usize).copied()
 }
@@ -756,6 +767,9 @@ fn v_to_u64(v: V) -> u64 {
 
 /// Method proto params of a dex method id.
 fn method_params(midx: GIdx) -> (String, Vec<String>, String) {
+    if let Some((owner, _, sig)) = named_of(midx) {
+        return (owner, split_params(&sig), sig_return(&sig));
+    }
     let v = vm();
     let Some(d) = v.dex_of(midx) else {
         return (String::new(), Vec::new(), String::new());
@@ -801,6 +815,14 @@ fn sig_return(sig: &str) -> String {
 fn call_obj(obj: u64, mid: u64, args: &[V], is_static: bool) -> Option<V> {
     let g = mid_of(mid)?;
     let mut v = vm();
+    if let Some((owner, name, _)) = named_of(g) {
+        let res = if is_static {
+            v.call_static_named(&owner, &name, args.to_vec())
+        } else {
+            v.call_virtual(obj as u32, &name, args)
+        };
+        return res.ok().flatten();
+    }
     let kind = if is_static {
         crate::InvokeKind::Static
     } else {
@@ -820,6 +842,9 @@ fn call_obj(obj: u64, mid: u64, args: &[V], is_static: bool) -> Option<V> {
 fn call_obj_direct(obj: u64, mid: u64, args: &[V]) -> Option<V> {
     let g = mid_of(mid)?;
     let mut v = vm();
+    if let Some((_, name, _)) = named_of(g) {
+        return v.call_virtual(obj as u32, &name, args).ok().flatten();
+    }
     let mut a = Vec::with_capacity(args.len() + 1);
     a.push(V::Ref(obj as u32));
     a.extend_from_slice(args);
@@ -848,8 +873,19 @@ fn find_method_id(clazz: u64, name_p: u64, sig_p: u64) -> u64 {
             v.jni_mids.len() as u64
         }
         _ => {
-            eprintln!("[jni] GetMethodID miss {name}{sig}");
-            0
+            // Host/JDK class (java.lang.Class reflection and friends):
+            // the method isn't on a dex chain but the builtin surface
+            // can still answer it — register a by-name mid so the
+            // cached jmethodID stays usable (Godot's JNISingleton
+            // resolves its whole Java surface this way).
+            let owner = v.type_desc_of(ci).unwrap_or_default();
+            v.jni_named.push((owner, name.clone(), sig.clone()));
+            let idx = (v.jni_named.len() - 1) as u64;
+            v.jni_mids.push(GX_NAMED | idx);
+            if std::env::var("OVELO_JNIDBG").is_ok() {
+                eprintln!("[jni] GetMethodID named {name}{sig}");
+            }
+            v.jni_mids.len() as u64
         }
     }
 }
