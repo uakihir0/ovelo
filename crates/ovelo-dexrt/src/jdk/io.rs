@@ -1893,8 +1893,11 @@ fn json_value(vm: &mut Vm, b: &[char], i: &mut usize, depth: u32) -> Option<V> {
             let tok: String = b[start..end].iter().collect();
             *i = end;
             match tok.as_str() {
-                "true" => Some(V::I32(1)),
-                "false" => Some(V::I32(0)),
+                // Box booleans as java.lang.Boolean mirrors — a bare
+                // I32 stored into an Object[] canonicalizes to null
+                // and dumps as 0/1 instead of false/true.
+                "true" => Some(host(vm, "Ljava/lang/Boolean;", HostState::Slot(V::I32(1)))),
+                "false" => Some(host(vm, "Ljava/lang/Boolean;", HostState::Slot(V::I32(0)))),
                 "null" | "null." | "" => Some(V::Ref(0)),
                 _ => {
                     if c == '-' || c.is_ascii_digit() {
@@ -1911,11 +1914,37 @@ fn json_value(vm: &mut Vm, b: &[char], i: &mut usize, depth: u32) -> Option<V> {
     }
 }
 
+/// A boxed primitive stored in a JSON container reads back as the
+/// wrapped value for the numeric getters (`getBoolean`/`optInt`/…).
+fn json_unbox(vm: &Vm, v: V) -> V {
+    match v {
+        V::Ref(h) => match vm.heap.get(h) {
+            Some(Obj::Host {
+                state: HostState::Slot(inner),
+                ..
+            }) => *inner,
+            _ => v,
+        },
+        x => x,
+    }
+}
+
 fn json_dump_v(vm: &Vm, v: V) -> String {
     match v {
         V::Ref(0) => "null".into(),
         V::Ref(h) => match vm.heap.get(h) {
             Some(Obj::Str(s)) => format!("\"{s}\""),
+            Some(Obj::Host {
+                desc,
+                state: HostState::Slot(v),
+                ..
+            }) if desc == "Ljava/lang/Boolean;" => {
+                if matches!(v, V::I32(0)) {
+                    "false".into()
+                } else {
+                    "true".into()
+                }
+            }
             Some(Obj::Host {
                 state: HostState::Map(m),
                 ..
@@ -1994,7 +2023,7 @@ fn json_obj(vm: &mut Vm, name: &str, args: &[V]) -> Option<Option<V>> {
         | "optBoolean" => {
             let dflt = args.get(1 + (name.starts_with('o') as usize));
             match map_get(vm, h, args[1]) {
-                Some(v) if !matches!(v, V::Ref(0)) => Some(v),
+                Some(v) if !matches!(v, V::Ref(0)) => Some(json_unbox(vm, v)),
                 _ => Some(dflt.copied().unwrap_or(V::I32(0))),
             }
         }
@@ -2122,6 +2151,7 @@ fn json_arr(vm: &mut Vm, name: &str, args: &[V]) -> Option<Option<V>> {
             Some(
                 list_ref(vm, h)
                     .and_then(|l| l.get(i).copied())
+                    .map(|v| json_unbox(vm, v))
                     .unwrap_or_else(|| args.get(2).copied().unwrap_or(V::I32(0))),
             )
         }

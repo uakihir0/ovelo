@@ -447,7 +447,18 @@ pub(crate) fn v_to_s(vm: &mut Vm, v: V) -> String {
             Some(Obj::Str(t)) => t.clone(),
             Some(Obj::Host { desc, state, .. }) => match state {
                 HostState::StrBuf(t) | HostState::Path(t) | HostState::Regex(t) => t.clone(),
-                HostState::Slot(inner) => v_to_s(vm, *inner),
+                HostState::Slot(inner) => {
+                    if desc == "Ljava/lang/Boolean;" {
+                        // String.valueOf(Boolean) — "true"/"false", not 0/1.
+                        if matches!(inner, V::I32(0)) {
+                            "false".to_string()
+                        } else {
+                            "true".to_string()
+                        }
+                    } else {
+                        v_to_s(vm, *inner)
+                    }
+                }
                 HostState::Millis(ms) => time::date_to_string(*ms),
                 HostState::List(l) => {
                     let parts: Vec<String> = l.iter().map(|e| shallow_s(vm, *e)).collect();

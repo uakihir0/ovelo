@@ -4189,7 +4189,44 @@ impl Vm {
                 self.describe_method(midx)
             );
         }
-        let args = self.compact_args(midx, args, has_receiver);
+        let mut args = self.compact_args(midx, args, has_receiver);
+        // `put(boolean)` into a JSON container must arrive boxed: a
+        // bare I32 reads back as 0/1 and canonicalizes to null on a
+        // later `aput-object` into an Object[] (org.json's real put
+        // autoboxes to java.lang.Boolean).
+        let z_params: Vec<usize> = self
+            .dex_of(midx)
+            .and_then(|d| {
+                let mid = d.method(gl(midx)).ok()?;
+                let class = d.type_descriptor(mid.class_idx as u32).ok()?;
+                let name = d.string(mid.name_idx).ok()?;
+                if !matches!(
+                    class.as_str(),
+                    "Lorg/json/JSONObject;" | "Lorg/json/JSONArray;"
+                ) || name != "put"
+                {
+                    return None;
+                }
+                let p = d.proto(mid.proto_idx as u32).ok()?;
+                let ps = d.proto_params(p).ok()?;
+                let mut out = vec![];
+                for (i, ty) in ps.iter().enumerate() {
+                    if d.type_descriptor(*ty as u32)
+                        .map(|s| s == "Z")
+                        .unwrap_or(false)
+                    {
+                        out.push(i);
+                    }
+                }
+                Some(out)
+            })
+            .unwrap_or_default();
+        for i in z_params {
+            let ai = i + has_receiver as usize;
+            if let Some(V::I32(b)) = args.get(ai).copied() {
+                args[ai] = jdk::host(self, "Ljava/lang/Boolean;", HostState::Slot(V::I32(b)));
+            }
+        }
         let args = args.as_slice();
         let host = self.hosts.get(&midx).cloned().or(self.host_named(midx)?);
         if let Some(f) = host {
