@@ -2352,9 +2352,17 @@ fn url_call(vm: &mut Vm, name: &str, args: &[V]) -> Rt<Option<Option<V>>> {
     })
 }
 
+/// Normalized charset name ("UTF-8", "ISO-8859-1", "US-ASCII").
+fn charset_name(vm: &Vm, h: u32) -> String {
+    s(vm, h)
+        .unwrap_or_else(|| "UTF-8".into())
+        .to_uppercase()
+        .replace(['-', '_'], "")
+}
+
 /// Remaining bytes of a `ByteBuffer`-like host buffer (Slot-backed
-/// array at base+position).
-fn bb_bytes(vm: &Vm, h: u32) -> Vec<u8> {
+/// array at base+position), with the position the bytes start at.
+fn bb_bytes(vm: &Vm, h: u32) -> (Vec<u8>, usize) {
     let (back, base, pos) = match vm.heap.get(h) {
         Some(Obj::Host {
             state: HostState::Slot(V::Ref(b)),
@@ -2365,61 +2373,149 @@ fn bb_bytes(vm: &Vm, h: u32) -> Vec<u8> {
             (*b, base, pos)
         }
         Some(Obj::Array { .. }) => (h, 0, 0),
-        _ => return Vec::new(),
+        _ => return (Vec::new(), 0),
     };
     match vm.heap.get(back) {
-        Some(Obj::Array { data, .. }) => data
-            .iter()
-            .skip(base + pos)
-            .map(|v| i32v(*v) as u8)
-            .collect(),
-        _ => Vec::new(),
+        Some(Obj::Array { data, .. }) => (
+            data.iter()
+                .skip(base + pos)
+                .map(|v| i32v(*v) as u8)
+                .collect(),
+            pos,
+        ),
+        _ => (Vec::new(), 0),
     }
 }
 
-/// `decode(ByteBuffer)` → CharBuffer of the UTF-8 lossy content, and
+/// Remaining chars of a `CharBuffer`-like host (Slot-backed `C` array
+/// at base+position). Other buffer kinds return None.
+fn charbuf_string(vm: &Vm, h: u32) -> Option<String> {
+    let (back, base, pos) = match vm.heap.get(h) {
+        Some(Obj::Host {
+            state: HostState::Slot(V::Ref(b)),
+            ..
+        }) => (
+            *b,
+            i32v(pseudo_get(vm, h, P_BBUF_BASE).unwrap_or(V::I32(0))).max(0) as usize,
+            i32v(pseudo_get(vm, h, P_BBUF_POS).unwrap_or(V::I32(0))).max(0) as usize,
+        ),
+        Some(Obj::Array { .. }) => (h, 0, 0),
+        _ => return None,
+    };
+    match vm.heap.get(back) {
+        Some(Obj::Array { data, .. }) => Some(
+            data.iter()
+                .skip(base + pos)
+                .map(|v| char::from_u32(i32v(*v) as u32).unwrap_or('\u{FFFD}'))
+                .collect(),
+        ),
+        _ => None,
+    }
+}
+
+/// Decode `bytes` under `cs`; when `eoi` is false an incomplete UTF-8
+/// tail stays unconsumed — returns (text, consumed_byte_count).
+fn cs_decode(cs: &str, bytes: &[u8], eoi: bool) -> (String, usize) {
+    if cs.contains("88591") || cs.contains("LATIN1") {
+        return (bytes.iter().map(|b| *b as char).collect(), bytes.len());
+    }
+    if cs.contains("ASCII") {
+        return (
+            bytes
+                .iter()
+                .map(|b| if *b < 0x80 { *b as char } else { '\u{FFFD}' })
+                .collect(),
+            bytes.len(),
+        );
+    }
+    // UTF-8 (default): at end-of-input, lossy; mid-stream, cut an
+    // incomplete trailing sequence and leave it for the next chunk.
+    match std::str::from_utf8(bytes) {
+        Ok(t) => (t.to_string(), bytes.len()),
+        Err(e) => {
+            let valid = e.valid_up_to();
+            if eoi || e.error_len().is_some() {
+                (String::from_utf8_lossy(bytes).into_owned(), bytes.len())
+            } else {
+                (String::from_utf8_lossy(&bytes[..valid]).into_owned(), valid)
+            }
+        }
+    }
+}
+
+/// `decode(ByteBuffer)` → CharBuffer of the decoded content, and
 /// `decode(in, out, eoi)` — chars appended into `out`'s backing.
 fn charset_decode(vm: &mut Vm, args: &[V]) -> V {
+    let cs = args
+        .first()
+        .and_then(|v| match v {
+            V::Ref(h) => Some(charset_name(vm, *h)),
+            _ => None,
+        })
+        .unwrap_or_else(|| "UTF8".into());
     let in_h = match args.get(1) {
         Some(&V::Ref(h)) => h,
         _ => return V::Ref(0),
     };
-    let bytes = bb_bytes(vm, in_h);
-    let text = String::from_utf8_lossy(&bytes).into_owned();
-    // `in` is drained.
-    pseudo_set(vm, in_h, P_BBUF_POS, V::I32(bytes.len() as i32));
+    let (bytes, in_pos) = bb_bytes(vm, in_h);
+    let eoi = args.get(3).map(|v| i32v(*v) != 0).unwrap_or(true);
+    let (text, consumed) = cs_decode(&cs, &bytes, eoi);
     if let Some(&V::Ref(out_h)) = args.get(2) {
         // (ByteBuffer, CharBuffer, boolean): append chars to `out`.
-        let (back, base, pos) = match vm.heap.get(out_h) {
+        let (back, base, pos, cap) = match vm.heap.get(out_h) {
             Some(Obj::Host {
                 state: HostState::Slot(V::Ref(b)),
                 ..
-            }) => (
-                *b,
-                i32v(pseudo_get(vm, out_h, P_BBUF_BASE).unwrap_or(V::I32(0))).max(0) as usize,
-                i32v(pseudo_get(vm, out_h, P_BBUF_POS).unwrap_or(V::I32(0))).max(0) as usize,
-            ),
-            _ => (0, 0, 0),
+            }) => {
+                let base =
+                    i32v(pseudo_get(vm, out_h, P_BBUF_BASE).unwrap_or(V::I32(0))).max(0) as usize;
+                let pos =
+                    i32v(pseudo_get(vm, out_h, P_BBUF_POS).unwrap_or(V::I32(0))).max(0) as usize;
+                let cap = match vm.heap.get(*b) {
+                    Some(Obj::Array { data, .. }) => data.len().saturating_sub(base + pos),
+                    _ => 0,
+                };
+                (*b, base, pos, cap)
+            }
+            _ => (0, 0, 0, 0),
         };
-        let mut wrote = 0usize;
+        let chars: Vec<char> = text.chars().collect();
+        let wrote = chars.len().min(cap);
         if back != 0 {
             if let Some(Obj::Array { data, .. }) = vm.heap.get_mut(back) {
-                for (i, ch) in text.chars().enumerate() {
+                for (i, ch) in chars.iter().take(wrote).enumerate() {
                     if let Some(slot) = data.get_mut(base + pos + i) {
-                        *slot = V::I32(ch as i32);
-                        wrote = i + 1;
+                        *slot = V::I32(*ch as i32);
                     }
                 }
             }
         }
         pseudo_set(vm, out_h, P_BBUF_POS, V::I32((pos + wrote) as i32));
+        // Only the bytes backing the written chars are consumed —
+        // OVERFLOW leaves the rest for the next decode call.
+        let used = if wrote < chars.len() {
+            if cs.contains("88591") || cs.contains("LATIN1") || cs.contains("ASCII") {
+                wrote
+            } else {
+                chars[..wrote].iter().collect::<String>().len()
+            }
+        } else {
+            consumed
+        };
+        pseudo_set(vm, in_h, P_BBUF_POS, V::I32((in_pos + used) as i32));
+        let st = if wrote < chars.len() {
+            "OVERFLOW"
+        } else {
+            "UNDERFLOW"
+        };
         return host(
             vm,
             "Ljava/nio/charset/CoderResult;",
-            HostState::StrBuf("UNDERFLOW".into()),
+            HostState::StrBuf(st.into()),
         );
     }
     // (ByteBuffer) → CharBuffer
+    pseudo_set(vm, in_h, P_BBUF_POS, V::I32((in_pos + consumed) as i32));
     let arr = vm.heap.alloc(Obj::Array {
         elem: "C".into(),
         data: text.chars().map(|c| V::I32(c as i32)).collect(),
@@ -2465,7 +2561,18 @@ fn charset_call(vm: &mut Vm, class: &str, name: &str, args: &[V]) -> Option<Opti
                 "Ljava/nio/charset/CodingErrorAction;",
                 HostState::StrBuf("REPLACE".into()),
             ))),
-            "replacement" => Some(Some(jstr(vm, "\u{FFFD}"))),
+            "replacement" => {
+                // Encoder's replacement is a byte[], decoder's a String.
+                if class == "Ljava/nio/charset/CharsetEncoder;" {
+                    Some(Some(arr(
+                        vm,
+                        "B",
+                        vec![V::I32(0xEF), V::I32(0xBF), V::I32(0xBD)],
+                    )))
+                } else {
+                    Some(Some(jstr(vm, "\u{FFFD}")))
+                }
+            }
             "charset" | "detectedCharset" => Some(Some(host(
                 vm,
                 "Ljava/nio/charset/Charset;",
@@ -2508,27 +2615,61 @@ fn charset_call(vm: &mut Vm, class: &str, name: &str, args: &[V]) -> Option<Opti
             "Ljava/nio/charset/Charset;",
             HostState::StrBuf("UTF-8".into()),
         ))),
-        "newDecoder" => Some(Some(host(
-            vm,
-            "Ljava/nio/charset/CharsetDecoder;",
-            HostState::StrBuf("UTF-8".into()),
-        ))),
-        "newEncoder" => Some(Some(host(
-            vm,
-            "Ljava/nio/charset/CharsetEncoder;",
-            HostState::StrBuf("UTF-8".into()),
-        ))),
+        "newDecoder" | "newEncoder" => {
+            // Carry the receiver's charset name so ISO-8859-1 et al.
+            // decode/encode under their own mapping, not UTF-8.
+            let n = match args[0] {
+                V::Ref(h) => s(vm, h).unwrap_or_else(|| "UTF-8".into()),
+                _ => "UTF-8".into(),
+            };
+            let desc = if name == "newDecoder" {
+                "Ljava/nio/charset/CharsetDecoder;"
+            } else {
+                "Ljava/nio/charset/CharsetEncoder;"
+            };
+            Some(Some(host(vm, desc, HostState::StrBuf(n))))
+        }
         "decode" => Some(Some(charset_decode(vm, args))),
         "encode" => {
-            // `encode(CharBuffer|CharSequence)` → ByteBuffer of UTF-8.
-            let text = sv(vm, args.get(1).copied().unwrap_or(V::Ref(0))).unwrap_or_default();
-            let arr = vm.heap.alloc(Obj::Array {
-                elem: "B".into(),
-                data: text
-                    .as_bytes()
+            // `encode(CharBuffer|CharSequence)` → ByteBuffer in `cs`.
+            let cs = match args[0] {
+                V::Ref(h) => charset_name(vm, h),
+                _ => "UTF8".into(),
+            };
+            // `s()` covers String/CharSequence and CharBuffer content.
+            let text = match args.get(1) {
+                Some(&V::Ref(h)) => s(vm, h).unwrap_or_default(),
+                _ => String::new(),
+            };
+            let data: Vec<V> = if cs.contains("88591") || cs.contains("LATIN1") {
+                text.chars()
+                    .map(|c| {
+                        V::I32(if (c as u32) < 0x100 {
+                            c as i32
+                        } else {
+                            b'?' as i32
+                        })
+                    })
+                    .collect()
+            } else if cs.contains("ASCII") {
+                text.chars()
+                    .map(|c| {
+                        V::I32(if (c as u32) < 0x80 {
+                            c as i32
+                        } else {
+                            b'?' as i32
+                        })
+                    })
+                    .collect()
+            } else {
+                text.as_bytes()
                     .iter()
                     .map(|b| V::I32(*b as i8 as i32))
-                    .collect(),
+                    .collect()
+            };
+            let arr = vm.heap.alloc(Obj::Array {
+                elem: "B".into(),
+                data,
             });
             Some(Some(host(
                 vm,
@@ -2591,6 +2732,14 @@ fn nio_call(vm: &mut Vm, class: &str, name: &str, args: &[V]) -> Option<Option<V
         }
     };
     match name {
+        "toString" if class.contains("CharBuffer") => {
+            // CharBuffer.toString() yields the remaining chars, not an
+            // object identity — `Charset.decode(b).toString()` needs it.
+            Some(Some(jstr(
+                vm,
+                &charbuf_string(vm, this).unwrap_or_default(),
+            )))
+        }
         "allocate" | "allocateDirect" => {
             // `FloatBuffer.allocate(n)` allocates n ELEMENTS — the
             // backing byte array is n * esz bytes.
