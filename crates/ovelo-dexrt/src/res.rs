@@ -337,25 +337,23 @@ impl ApkResources {
     }
 
     /// `layout` res_id → path inside the APK.
+    ///
+    /// The winning bucket's value decides: when it is a reference
+    /// (`@layout/foo`), follow it — a `drawable-night`-style alias must
+    /// not fall back to the default bucket's direct path.
     pub fn layout_path(&self, res_id: u32) -> Option<&str> {
-        self.layout_paths
-            .get(&res_id)
-            .or_else(|| {
-                self.ref_target(res_id)
-                    .and_then(|t| self.layout_paths.get(&t))
-            })
+        self.ref_target(res_id)
+            .and_then(|t| self.layout_paths.get(&t))
+            .or_else(|| self.layout_paths.get(&res_id))
             .map(|s| s.as_str())
     }
 
     /// Any file-backed res_id (`xml`, `menu`, `drawable`, …) → path
-    /// inside the APK.
+    /// inside the APK. Reference-following order matches `layout_path`.
     pub fn file_path(&self, res_id: u32) -> Option<&str> {
-        self.file_paths
-            .get(&res_id)
-            .or_else(|| {
-                self.ref_target(res_id)
-                    .and_then(|t| self.file_paths.get(&t))
-            })
+        self.ref_target(res_id)
+            .and_then(|t| self.file_paths.get(&t))
+            .or_else(|| self.file_paths.get(&res_id))
             .map(|s| s.as_str())
     }
 
