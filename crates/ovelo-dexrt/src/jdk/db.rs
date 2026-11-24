@@ -1088,7 +1088,12 @@ fn sqlite_call(vm: &mut Vm, name: &str, args: &[V]) -> Rt<Option<Option<V>>> {
                     // missing method may be treated as "no migration".
                     let ci = vm.heap.class_of(this).unwrap_or(0);
                     let has_hook = vm
-                        .find_method_on_chain(ci, hook, cb_args.len())
+                        .find_method_on_chain(
+                            ci,
+                            hook,
+                            crate::arg_reg_slots(&cb_args),
+                            Some(&cb_args),
+                        )
                         .ok()
                         .flatten()
                         .is_some();

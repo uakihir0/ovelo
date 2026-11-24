@@ -70,6 +70,21 @@ fn void_resolved(o: Option<V>) -> Option<V> {
     o.or(Some(V::Ref(0)))
 }
 
+/// Register slots `args` occupy under dex's register packing —
+/// long/double values take two. Name+arity resolution must match
+/// this count or a wide-arg override is silently missed.
+fn arg_reg_slots(args: &[V]) -> usize {
+    args.iter()
+        .map(|v| {
+            if matches!(v, V::I64(_) | V::F64(_)) {
+                2
+            } else {
+                1
+            }
+        })
+        .sum()
+}
+
 /// `(w, h)` of the view owning a SurfaceHolder — its laid-out frame,
 /// (0,0) when the view has no frame yet, the window default when the
 /// holder has no owning view.
@@ -352,7 +367,7 @@ pub struct Vm {
     /// `(class GIdx, method name, arg slots)` → method GIdx — host→guest
     /// `call_virtual` (measure/layout/onViewAdded per node per pass)
     /// re-walked the superclass chain per call.
-    named_chain_cache: std::cell::RefCell<HashMap<(GIdx, String, usize), Option<GIdx>>>,
+    named_chain_cache: std::cell::RefCell<HashMap<(GIdx, String, String), Option<GIdx>>>,
     /// `(sub GIdx, sup GIdx)` → is-assignable — the chain+interface walk
     /// ran per check-cast / host registration probe.
     assignable_cache: std::cell::RefCell<HashMap<(GIdx, GIdx), bool>>,
@@ -1367,7 +1382,7 @@ impl Vm {
     /// surfaces as `dexrt.exception.uncaught`.
     pub fn run(&mut self, class_desc: &str, name: &str, args: &[V]) -> Result<Option<V>> {
         let midx = self
-            .find_method_by_name(class_desc, name, args.len())?
+            .find_method_by_name(class_desc, name, arg_reg_slots(args), Some(args))?
             .ok_or_else(|| errd("dexrt.method.missing", format!("{class_desc}.{name}")))?;
         // invoke reports a resolved void method as Some(null) — translate
         // back to the documented contract (None = void return).
@@ -1422,7 +1437,7 @@ impl Vm {
                 self.app_h = h;
             }
         }
-        if let Some(midx) = self.find_method_by_name(class_desc, "<init>", 0)? {
+        if let Some(midx) = self.find_method_by_name(class_desc, "<init>", 0, Some(&[]))? {
             match self.invoke(midx, vec![V::Ref(h)], InvokeKind::Direct) {
                 Ok(_) => {}
                 Err(E::Vm(e)) => return Err(e),
@@ -1459,17 +1474,8 @@ impl Vm {
             fields: HashMap::new(),
         });
         self.mark_view_alloc(h, ty);
-        let slots: usize = args
-            .iter()
-            .map(|a| {
-                if matches!(a, V::I64(_) | V::F64(_)) {
-                    2
-                } else {
-                    1
-                }
-            })
-            .sum();
-        if let Some(midx) = self.find_method_by_name(class_desc, "<init>", slots)? {
+        let slots = arg_reg_slots(args);
+        if let Some(midx) = self.find_method_by_name(class_desc, "<init>", slots, Some(args))? {
             let mut a = Vec::with_capacity(args.len() + 1);
             a.push(V::Ref(h));
             a.extend_from_slice(args);
@@ -1745,14 +1751,8 @@ impl Vm {
         // `find_method_by_name`'s slot count or a wide-arg dex override
         // (`Choreographer$FrameCallback.doFrame(J)V`) silently misses
         // and the builtin fallback no-ops.
-        let nslots: usize = args
-            .iter()
-            .map(|v| match v {
-                V::I64(_) | V::F64(_) => 2,
-                _ => 1,
-            })
-            .sum();
-        let Some(midx) = self.find_method_on_chain(ci, name, nslots)? else {
+        let nslots = arg_reg_slots(args);
+        let Some(midx) = self.find_method_on_chain(ci, name, nslots, Some(args))? else {
             // No dex override — a framework method (`View.layout`,
             // `View.measure`, …). Route it through the builtin
             // dispatcher so host arms still apply when the caller is
@@ -1814,14 +1814,11 @@ impl Vm {
             .heap
             .class_of(this)
             .ok_or_else(|| E::Vm(errd("dexrt.bad_this", name.to_string())))?;
-        let nslots: usize = args
-            .iter()
-            .map(|v| match v {
-                V::I64(_) | V::F64(_) => 2,
-                _ => 1,
-            })
-            .sum();
-        let Some(midx) = self.find_method_on_chain(ci, name, nslots).map_err(E::Vm)? else {
+        let nslots = arg_reg_slots(args);
+        let Some(midx) = self
+            .find_method_on_chain(ci, name, nslots, Some(args))
+            .map_err(E::Vm)?
+        else {
             if crate::dbg_flag("OVELO_VIEWDBG") && matches!(name, "onMeasure" | "onLayout") {
                 let d = self.type_desc_of(ci).unwrap_or_default();
                 eprintln!("[viewdbg] onChain miss {name} ci_desc={d}");
@@ -2725,8 +2722,23 @@ impl Vm {
         mut class_idx: GIdx,
         name: &str,
         nslots: usize,
+        args: Option<&[V]>,
     ) -> Result<Option<GIdx>> {
-        let key = (class_idx, name.to_string(), nslots);
+        // The arg profile selects among same-slot-count overloads
+        // (`doFrame(J)` vs `doFrame(int,int)` — both 2 registers), so
+        // the cache key carries it, not just `nslots`.
+        let pat = args
+            .map(|av| {
+                av.iter()
+                    .map(|v| match v {
+                        V::I64(_) => 'J',
+                        V::F64(_) => 'D',
+                        _ => '.',
+                    })
+                    .collect::<String>()
+            })
+            .unwrap_or_else(|| nslots.to_string());
+        let key = (class_idx, name.to_string(), pat);
         if let Some(hit) = self.named_chain_cache.borrow().get(&key) {
             return Ok(*hit);
         }
@@ -2737,7 +2749,7 @@ impl Vm {
             };
             let sup = def.superclass_idx;
             let desc = self.type_desc_of(cg)?;
-            if let Some(m) = self.find_method_by_name(&desc, name, nslots)? {
+            if let Some(m) = self.find_method_by_name(&desc, name, nslots, args)? {
                 out = Some(m);
                 break;
             }
@@ -2752,12 +2764,16 @@ impl Vm {
 
     /// First method `name` on `class_desc` whose params occupy exactly
     /// `nslots` registers (J/D params take two) — args pack as a register
-    /// image, so a long/double param counts double.
+    /// image, so a long/double param counts double. When `args` is given
+    /// the wide-arg positions must also line up (`doFrame(J)` beats
+    /// `doFrame(int,int)` for an `I64` call — same 2 slots, wrong
+    /// method otherwise).
     fn find_method_by_name(
         &self,
         class_desc: &str,
         name: &str,
         nslots: usize,
+        args: Option<&[V]>,
     ) -> Result<Option<GIdx>> {
         let Some(&(di, def_i)) = self.defs.get(class_desc) else {
             return Ok(None);
@@ -2772,6 +2788,7 @@ impl Vm {
             }
             let p = d.proto(mid.proto_idx as u32)?;
             let mut slots = 0usize;
+            let mut ptypes = Vec::new();
             for t in d.proto_params(p)? {
                 let ty = d.type_descriptor(t as u32)?;
                 slots += if ty.starts_with('J') || ty.starts_with('D') {
@@ -2779,10 +2796,25 @@ impl Vm {
                 } else {
                     1
                 };
+                if args.is_some() {
+                    ptypes.push(ty);
+                }
             }
-            if slots == nslots {
-                return Ok(Some(gx(di, m.method_idx)));
+            if slots != nslots {
+                continue;
             }
+            if let Some(av) = args {
+                let fits = ptypes.len() == av.len()
+                    && ptypes.iter().zip(av.iter()).all(|(ty, a)| match a {
+                        V::I64(_) => ty == "J",
+                        V::F64(_) => ty == "D",
+                        _ => !(ty.starts_with('J') || ty.starts_with('D')),
+                    });
+                if !fits {
+                    continue;
+                }
+            }
+            return Ok(Some(gx(di, m.method_idx)));
         }
         Ok(None)
     }
@@ -4281,7 +4313,8 @@ impl Vm {
             .heap
             .class_of(this)
             .ok_or_else(|| errd("dexrt.bad_this", name.to_string()))?;
-        let Some(midx) = self.find_method_on_chain(ci, name, args.len())? else {
+        let Some(midx) = self.find_method_on_chain(ci, name, arg_reg_slots(args), Some(args))?
+        else {
             let desc = self.type_desc_of(ci).unwrap_or_default();
             let mut a = Vec::with_capacity(args.len() + 1);
             a.push(V::Ref(this));
@@ -4682,7 +4715,7 @@ impl Vm {
         args: Vec<V>,
     ) -> Result<Option<V>> {
         let ci = self.type_index_of(owner).unwrap_or(GX_NONE);
-        match self.find_method_on_chain(ci, name, args.len()) {
+        match self.find_method_on_chain(ci, name, arg_reg_slots(&args), Some(&args)) {
             Ok(Some(midx)) => match self.invoke(midx, args, InvokeKind::Static) {
                 Ok(v) => Ok(v),
                 Err(E::Vm(e)) => Err(e),
