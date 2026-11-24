@@ -5669,6 +5669,14 @@ impl Vm {
         let mut pc: usize = 0;
         // Instruction budget — a guest (or stub-driven) loop that never
         // terminates must fail loudly, not hang the host process.
+        // Compose's gapbuffer SlotWriter null-fills freshly grown slot
+        // arrays one element per dex op — a big composition legitimately
+        // clears the 20M default, so the cap is env-overrideable for
+        // diagnosis/throughput trade-offs.
+        let budget: u64 = std::env::var("OVELO_BUDGET")
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(20_000_000);
         let stalldbg = crate::dbg_flag("OVELO_STALLDBG");
         let mut steps: u64 = 0;
         loop {
@@ -5687,7 +5695,7 @@ impl Vm {
                     self.total_steps
                 );
             }
-            if steps > 20_000_000 {
+            if steps > budget {
                 return Err(self.throw_builtin(
                     "Ljava/lang/InternalError;",
                     &format!("instruction budget exceeded at +{pc:04x}"),
