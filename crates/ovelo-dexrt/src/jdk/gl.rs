@@ -719,17 +719,23 @@ pub(crate) fn call(
             "eglCreateContext" => obj(vm, "Ljavax/microedition/khronos/egl/EGLContext;"),
             "eglCreateWindowSurface" | "eglCreatePbufferSurface" | "eglCreatePixmapSurface" => {
                 // Window surfaces bind a SurfaceHolder — back-trace it
-                // to the owning view for the surface size.
+                // to the owning view for the surface size, and tag the
+                // returned EGLSurface so eglQuerySurface resolves the
+                // same view later.
                 if name == "eglCreateWindowSurface" {
-                    if let Some(V::Ref(hh)) = args.get(3).copied() {
+                    let s = obj(vm, "Ljavax/microedition/khronos/egl/EGLSurface;");
+                    if let (Some(V::Ref(sh)), Some(V::Ref(hh))) = (s, args.get(3).copied()) {
                         if let Some(V::Ref(vh)) = pseudo_get(vm, hh, crate::jdk::P_TARGET) {
+                            pseudo_set(vm, sh, crate::jdk::P_TARGET, V::Ref(vh));
                             if let Some((l, t, r, b)) = vm.dex_view(vh).and_then(|i| i.frame) {
                                 *EGL_SURF.lock().unwrap() = (r - l, b - t);
                             }
                         }
                     }
+                    s
+                } else {
+                    obj(vm, "Ljavax/microedition/khronos/egl/EGLSurface;")
                 }
-                obj(vm, "Ljavax/microedition/khronos/egl/EGLSurface;")
             }
             "eglMakeCurrent" => {
                 #[cfg(target_os = "macos")]
@@ -788,7 +794,28 @@ pub(crate) fn call(
                 // EGL_WIDTH/HEIGHT — guests reshape their projection
                 // from these; reporting 0 divides a matrix by zero and
                 // NaNs every vertex (Korgw `setSize(0,0)` -> ortho).
-                let (w, hgt) = state(GL20, |s| s.size);
+                // Resolve the queried surface's owning view (tagged at
+                // eglCreateWindowSurface), then the tracked surface
+                // size, then the window default.
+                let (w, hgt) = args
+                    .get(2)
+                    .copied()
+                    .and_then(|s| match s {
+                        V::Ref(sh) => pseudo_get(vm, sh, crate::jdk::P_TARGET),
+                        _ => None,
+                    })
+                    .and_then(|t| match t {
+                        V::Ref(vh) => vm
+                            .dex_view(vh)
+                            .and_then(|i| i.frame.map(|(l, t, r, b)| (r - l, b - t))),
+                        _ => None,
+                    })
+                    .filter(|(w, h)| *w > 0 && *h > 0)
+                    .or_else(|| {
+                        let s = *EGL_SURF.lock().unwrap();
+                        (s.0 > 0 && s.1 > 0).then_some(s)
+                    })
+                    .unwrap_or(vm.window_size);
                 let val = match args.get(3).map(|v| i32v(*v)).unwrap_or(0) {
                     0x3057 => w.max(1),   // EGL_WIDTH
                     0x3056 => hgt.max(1), // EGL_HEIGHT
