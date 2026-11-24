@@ -602,6 +602,14 @@ impl GuestUi {
                 Self::on_rc(ui, vm, cls, name, sig, |ui, vm, a| {
                     let this = ref_arg(a, 0)?;
                     let child = ref_arg(a, 1)?;
+                    // Boolean-returning overloads must produce a value
+                    // — `Ok(None)` is void and aborts the caller with
+                    // dexrt.result.void.
+                    let z_ret = if sig.ends_with(")Z") {
+                        Some(V::I32(1))
+                    } else {
+                        None
+                    };
                     // Overloads differ after the child arg: LayoutParams is
                     // the last Ref; the index is the first non-negative I32
                     // (the dex arm parses them the same way).
@@ -610,15 +618,21 @@ impl GuestUi {
                         .rev()
                         .find(|x| matches!(x, V::Ref(h) if *h != 0))
                         .copied();
-                    // Exactly one int arg means positional; two ints
-                    // are the (View,w,h) dimensions overload arriving
-                    // through the canonical-sig fallback — no index.
-                    let mut ints = a[2.min(a.len())..]
+                    // The index is the int right after the child — except
+                    // the (View,w,h) dimensions overload, which has two
+                    // ints and no LayoutParams. The (V,I,LP,Z) overload's
+                    // trailing boolean must not count as a second int.
+                    let ints = a[2.min(a.len())..]
                         .iter()
-                        .filter(|x| matches!(x, V::I32(_)));
-                    let idx = match (ints.next(), ints.next()) {
-                        (Some(V::I32(i)), None) if *i >= 0 => Some(*i as usize),
-                        _ => None,
+                        .filter(|x| matches!(x, V::I32(_)))
+                        .count();
+                    let idx = if lp.is_none() && ints >= 2 {
+                        None
+                    } else {
+                        match a.get(2) {
+                            Some(V::I32(i)) if *i >= 0 => Some(*i as usize),
+                            _ => None,
+                        }
                     };
                     // Dex-side bookkeeping first: registered overloads
                     // intercept the invoke, so `attach_at` never runs
@@ -638,14 +652,14 @@ impl GuestUi {
                         cv = ui.borrow_mut().materialize_dex(vm, child);
                     }
                     let Some(cv) = cv else {
-                        return Ok(None);
+                        return Ok(z_ret);
                     };
                     let Some(rc) = ui.borrow().views.get(&this).cloned() else {
-                        return Ok(None);
+                        return Ok(z_ret);
                     };
                     let mut g = rc.borrow_mut();
                     let GuestView::Group(gr) = &mut *g else {
-                        return Ok(None);
+                        return Ok(z_ret);
                     };
                     if let Some(V::Ref(lp)) = lp {
                         let (w, h) = vm.layout_params_dims(lp);
@@ -676,7 +690,7 @@ impl GuestUi {
                         _ => gr.children.push(boxed),
                     }
                     gr.view.invalidate();
-                    Ok(None)
+                    Ok(z_ret)
                 });
             }
             for (name, notify, sigs) in [

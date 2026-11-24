@@ -1349,10 +1349,12 @@ pub(crate) fn call(
                     .and_then(|p| p.split(')').next())
                     .unwrap_or("");
                 let mut ints = 0usize;
+                let mut has_ref = false;
                 let mut it = params.bytes().peekable();
                 while let Some(b) = it.next() {
                     match b {
                         b'L' | b'[' => {
+                            has_ref = true;
                             // Object/array types swallow their name.
                             if b == b'L' {
                                 for c in it.by_ref() {
@@ -1366,13 +1368,16 @@ pub(crate) fn call(
                         _ => {}
                     }
                 }
-                let idx = if ints == 1 {
+                // The index is the int right after the child — except
+                // (View,w,h) whose two ints carry no LayoutParams. A
+                // (V,I,LP,Z) overload's trailing boolean isn't an index.
+                let idx = if !has_ref && ints >= 2 {
+                    None
+                } else {
                     match args.get(2) {
-                        Some(V::I32(i)) if *i >= 0 => Some(*i as usize),
+                        Some(V::I32(i)) if *i >= 0 && ints >= 1 => Some(*i as usize),
                         _ => None,
                     }
-                } else {
-                    None
                 };
                 let notify = !matches!(name, "attachViewToParent" | "attachViewToParentInLayout");
                 // A registered bridge impl (`ViewGroup.addView` on the
