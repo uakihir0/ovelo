@@ -383,6 +383,44 @@ unsafe fn mach_thread_id() -> u64 {
     id
 }
 
+/// Per-site repeated-fault counter for the livelock escape: returns how
+/// many times this (thread, pc) pair has faulted. 8 direct-mapped
+/// (tid^pc) slots — storm sites alternate between a TLS read and the
+/// null deref, so a single counter never accumulates.
+#[cfg(target_arch = "aarch64")]
+unsafe fn storm_hits(pc: usize) -> usize {
+    static KEYS: [std::sync::atomic::AtomicU64; 8] = [
+        std::sync::atomic::AtomicU64::new(0),
+        std::sync::atomic::AtomicU64::new(0),
+        std::sync::atomic::AtomicU64::new(0),
+        std::sync::atomic::AtomicU64::new(0),
+        std::sync::atomic::AtomicU64::new(0),
+        std::sync::atomic::AtomicU64::new(0),
+        std::sync::atomic::AtomicU64::new(0),
+        std::sync::atomic::AtomicU64::new(0),
+    ];
+    static CNTS: [std::sync::atomic::AtomicUsize; 8] = [
+        std::sync::atomic::AtomicUsize::new(0),
+        std::sync::atomic::AtomicUsize::new(0),
+        std::sync::atomic::AtomicUsize::new(0),
+        std::sync::atomic::AtomicUsize::new(0),
+        std::sync::atomic::AtomicUsize::new(0),
+        std::sync::atomic::AtomicUsize::new(0),
+        std::sync::atomic::AtomicUsize::new(0),
+        std::sync::atomic::AtomicUsize::new(0),
+    ];
+    let tid = mach_thread_id();
+    let key = tid ^ (pc as u64);
+    let slot = (pc >> 4) & 7;
+    if KEYS[slot].load(std::sync::atomic::Ordering::Relaxed) == key {
+        CNTS[slot].fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1
+    } else {
+        KEYS[slot].store(key, std::sync::atomic::Ordering::Relaxed);
+        CNTS[slot].store(1, std::sync::atomic::Ordering::Relaxed);
+        1
+    }
+}
+
 /// Last TLS window transitions + last `msr tpidr` writes, for the
 /// segv dump: [0..2]=entry site/tid/old, [3..5]=exit site/tid/old,
 /// [6]=thunk swap value, [7]=thunk restore value, [8]=window-entry tcb
@@ -1297,39 +1335,7 @@ pub fn install_crash_dump() {
                     // access keeps the loop alive forever at ~20k signal
                     // round-trips/s, so after a per-site cap we suspend
                     // the stuck thread outright.
-                    // 8 direct-mapped (tid^pc) counters — a storm sites
-                    // alternate between a TLS read and the null deref,
-                    // so a single counter never accumulates.
-                    static KEYS: [std::sync::atomic::AtomicU64; 8] = [
-                        std::sync::atomic::AtomicU64::new(0),
-                        std::sync::atomic::AtomicU64::new(0),
-                        std::sync::atomic::AtomicU64::new(0),
-                        std::sync::atomic::AtomicU64::new(0),
-                        std::sync::atomic::AtomicU64::new(0),
-                        std::sync::atomic::AtomicU64::new(0),
-                        std::sync::atomic::AtomicU64::new(0),
-                        std::sync::atomic::AtomicU64::new(0),
-                    ];
-                    static CNTS: [std::sync::atomic::AtomicUsize; 8] = [
-                        std::sync::atomic::AtomicUsize::new(0),
-                        std::sync::atomic::AtomicUsize::new(0),
-                        std::sync::atomic::AtomicUsize::new(0),
-                        std::sync::atomic::AtomicUsize::new(0),
-                        std::sync::atomic::AtomicUsize::new(0),
-                        std::sync::atomic::AtomicUsize::new(0),
-                        std::sync::atomic::AtomicUsize::new(0),
-                        std::sync::atomic::AtomicUsize::new(0),
-                    ];
-                    let tid = mach_thread_id();
-                    let key = tid ^ (pc as u64);
-                    let slot = (pc >> 4) & 7;
-                    let hits = if KEYS[slot].load(std::sync::atomic::Ordering::Relaxed) == key {
-                        CNTS[slot].fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1
-                    } else {
-                        KEYS[slot].store(key, std::sync::atomic::Ordering::Relaxed);
-                        CNTS[slot].store(1, std::sync::atomic::Ordering::Relaxed);
-                        1
-                    };
+                    let hits = storm_hits(pc);
                     if hits > 256 {
                         // The site is permanently stuck (e.g. a pump
                         // re-entering on a null entry that never
@@ -1363,6 +1369,19 @@ pub fn install_crash_dump() {
                     // so pumps that vtable-call a missing entry just
                     // advance. Host threads keep the dump+suspend.
                     if tcb_for(mach_thread_id()) != 0 && code_mapped(x30) {
+                        // Same storm bound as the heal path: a pump that
+                        // null-calls every iteration would otherwise loop
+                        // through SIGSEGV delivery unboundedly. Key on
+                        // x30 (the `blr` call site) — pc is ~0 for every
+                        // null target, so it can't tell sites apart.
+                        if storm_hits(x30) > 256 {
+                            extern "C" {
+                                fn mach_thread_self() -> u32;
+                                fn thread_suspend(t: u32) -> i32;
+                            }
+                            thread_suspend(mach_thread_self());
+                            return;
+                        }
                         *(mc.add(16) as *mut usize) = 0; // x0
                         *(mc.add(272) as *mut usize) = x30; // pc := lr
                         let s = b"[segv-nullret]\n";
@@ -1821,6 +1840,35 @@ extern "C" fn sh_pure_virtual() -> ! {
     eprintln!("[native] __cxa_pure_virtual called");
     std::process::abort()
 }
+/// Find the epilogue entry for a `__stack_chk_fail` trip: the guest
+/// reached us via `bl` inside the fail block, so the thunk's saved x30
+/// is the insn right after that `bl`. Scan backward for the `b.cond`
+/// whose target lands inside the fail block (the handful of insns
+/// ending at saved_lr-4); its fallthrough (pc+4) is the check-passed
+/// path — the function's epilogue, which unwinds the frame and returns
+/// to the real caller.
+#[cfg(target_arch = "aarch64")]
+unsafe fn chk_fail_epilogue(fail_ret: usize) -> Option<usize> {
+    let block_lo = fail_ret.saturating_sub(64);
+    let block_hi = fail_ret.saturating_sub(4);
+    let mut p = fail_ret.saturating_sub(8);
+    let lo = p.saturating_sub(2048);
+    while p > lo {
+        if let Some(w) = safe_read_u32(p) {
+            // b.cond: 0x54000000 | imm19<<5 | cond (cond < 0xE)
+            if w & 0xFF00_0010 == 0x5400_0000 && w & 0xF < 0xE {
+                let imm19 = ((w >> 5) & 0x7FFFF) as i32;
+                let off = ((imm19 << 13) >> 13) as i64 * 4;
+                let tgt = (p as i64 + off) as usize;
+                if (block_lo..=block_hi).contains(&tgt) {
+                    return Some(p + 4);
+                }
+            }
+        }
+        p -= 4;
+    }
+    None
+}
 extern "C" fn sh_stack_chk_fail() {
     let tcb = tcb_for(unsafe { mach_thread_id() });
     let site = if tcb != 0 {
@@ -1831,12 +1879,32 @@ extern "C" fn sh_stack_chk_fail() {
     // Most trips here are our own false positive: a kernel-clobbered
     // x18/TPIDR that happens to point into a mapped page makes the
     // prologue's cookie read silently wrong — the epilogue then
-    // detects a "smash" no one committed. Aborting kills the whole app
-    // for a fault we introduced; log and return instead so the caller
-    // continues as if the check passed.
+    // detects a "smash" no one committed. `__stack_chk_fail` is
+    // noreturn, so resuming at lr would land in the fail block's tail —
+    // typically the NEXT function's prologue. Instead emulate the
+    // check-passed path: rewrite the thunk's saved x30 to the epilogue
+    // address (the `b.cond` fallthrough), which unwinds the frame and
+    // returns to the real caller.
+    let mut resumed = false;
+    #[cfg(target_arch = "aarch64")]
+    if tcb != 0 {
+        unsafe {
+            let depth = *(tcb as *const usize).add(0x7fe0 / 8);
+            if depth > 0 {
+                let entry_sp = *(tcb as *const usize).add(0x7fd0 / 8);
+                // Saved guest x30 sits at thunk_sp+176 = entry_sp-16.
+                let saved_lr_slot = entry_sp - 16;
+                if let Some(epi) = chk_fail_epilogue(site) {
+                    *(saved_lr_slot as *mut usize) = epi;
+                    resumed = true;
+                }
+            }
+        }
+    }
     eprintln!(
-        "[native] __stack_chk_fail site={:#x?} (ignored)",
-        so_off(site)
+        "[native] __stack_chk_fail site={:#x?} (resumed={})",
+        so_off(site),
+        resumed
     );
 }
 extern "C" fn sh_cxa_finalize(_p: *mut c_void) {}
