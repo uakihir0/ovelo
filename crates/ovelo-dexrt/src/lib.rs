@@ -1381,9 +1381,17 @@ impl Vm {
     /// Returns `Some(value)` or `None` for void. An uncaught guest exception
     /// surfaces as `dexrt.exception.uncaught`.
     pub fn run(&mut self, class_desc: &str, name: &str, args: &[V]) -> Result<Option<V>> {
-        let midx = self
-            .find_method_by_name(class_desc, name, arg_reg_slots(args), Some(args))?
-            .ok_or_else(|| errd("dexrt.method.missing", format!("{class_desc}.{name}")))?;
+        let mut midx =
+            self.find_method_by_name(class_desc, name, arg_reg_slots(args), Some(args))?;
+        let eff_args;
+        if midx.is_none() && args.iter().any(|v| !matches!(v, V::Ref(_))) {
+            eff_args = self.box_scalars(args);
+            midx = self.find_method_by_name(class_desc, name, eff_args.len(), Some(&eff_args))?;
+        } else {
+            eff_args = args.to_vec();
+        }
+        let midx =
+            midx.ok_or_else(|| errd("dexrt.method.missing", format!("{class_desc}.{name}")))?;
         // invoke reports a resolved void method as Some(null) — translate
         // back to the documented contract (None = void return).
         let ret_void = self
@@ -1395,7 +1403,7 @@ impl Vm {
                     .and_then(|t| d.type_descriptor(t).ok())
             })
             .is_some_and(|r| r == "V");
-        match self.invoke(midx, args.to_vec(), InvokeKind::Static) {
+        match self.invoke(midx, eff_args, InvokeKind::Static) {
             Ok(v) => Ok(if ret_void { None } else { v }),
             Err(E::Vm(e)) => Err(e),
             Err(E::Throw(r)) => {
@@ -1475,10 +1483,19 @@ impl Vm {
         });
         self.mark_view_alloc(h, ty);
         let slots = arg_reg_slots(args);
-        if let Some(midx) = self.find_method_by_name(class_desc, "<init>", slots, Some(args))? {
-            let mut a = Vec::with_capacity(args.len() + 1);
+        let mut midx = self.find_method_by_name(class_desc, "<init>", slots, Some(args))?;
+        let eff_args;
+        if midx.is_none() && args.iter().any(|v| !matches!(v, V::Ref(_))) {
+            eff_args = self.box_scalars(args);
+            midx =
+                self.find_method_by_name(class_desc, "<init>", eff_args.len(), Some(&eff_args))?;
+        } else {
+            eff_args = args.to_vec();
+        }
+        if let Some(midx) = midx {
+            let mut a = Vec::with_capacity(eff_args.len() + 1);
             a.push(V::Ref(h));
-            a.extend_from_slice(args);
+            a.extend_from_slice(&eff_args);
             match self.invoke(midx, a, InvokeKind::Direct) {
                 Ok(_) => {}
                 Err(E::Vm(e)) => return Err(e),
@@ -1751,8 +1768,8 @@ impl Vm {
         // `find_method_by_name`'s slot count or a wide-arg dex override
         // (`Choreographer$FrameCallback.doFrame(J)V`) silently misses
         // and the builtin fallback no-ops.
-        let nslots = arg_reg_slots(args);
-        let Some(midx) = self.find_method_on_chain(ci, name, nslots, Some(args))? else {
+        let (midx, eff_args) = self.resolve_call_args(ci, name, args)?;
+        let Some(midx) = midx else {
             // No dex override — a framework method (`View.layout`,
             // `View.measure`, …). Route it through the builtin
             // dispatcher so host arms still apply when the caller is
@@ -1788,9 +1805,9 @@ impl Vm {
             let d = self.describe_method(midx);
             eprintln!("[viewdbg] dex layout h{this} -> {d}");
         }
-        let mut a = Vec::with_capacity(args.len() + 1);
+        let mut a = Vec::with_capacity(eff_args.len() + 1);
         a.push(V::Ref(this));
-        a.extend_from_slice(args);
+        a.extend_from_slice(&eff_args);
         let out = match self.invoke(midx, a, InvokeKind::Virtual) {
             Ok(v) => Ok(v),
             Err(E::Vm(e)) => Err(e),
@@ -1814,20 +1831,17 @@ impl Vm {
             .heap
             .class_of(this)
             .ok_or_else(|| E::Vm(errd("dexrt.bad_this", name.to_string())))?;
-        let nslots = arg_reg_slots(args);
-        let Some(midx) = self
-            .find_method_on_chain(ci, name, nslots, Some(args))
-            .map_err(E::Vm)?
-        else {
+        let (midx, eff_args) = self.resolve_call_args(ci, name, args).map_err(E::Vm)?;
+        let Some(midx) = midx else {
             if crate::dbg_flag("OVELO_VIEWDBG") && matches!(name, "onMeasure" | "onLayout") {
                 let d = self.type_desc_of(ci).unwrap_or_default();
                 eprintln!("[viewdbg] onChain miss {name} ci_desc={d}");
             }
             return Ok(None);
         };
-        let mut a = Vec::with_capacity(args.len() + 1);
+        let mut a = Vec::with_capacity(eff_args.len() + 1);
         a.push(V::Ref(this));
-        a.extend_from_slice(args);
+        a.extend_from_slice(&eff_args);
         let out = self.invoke(midx, a, InvokeKind::Virtual);
         if self.depth == 0 {
             self.drain_runnables(500);
@@ -2713,6 +2727,52 @@ impl Vm {
             Ok(format!("{class}.{name}"))
         };
         fmt().unwrap_or_else(|_| format!("field@{fidx}"))
+    }
+
+    /// Each scalar in `args` boxed into its `Number` mirror
+    /// (`HostState::Slot`); refs pass through unchanged. A raw
+    /// `V::I64` out of a JSON map fed to `Map.merge` targets
+    /// `apply(Object,Object)` — dex expects a boxed `Long`, not a
+    /// 2-register primitive image.
+    fn box_scalars(&mut self, args: &[V]) -> Vec<V> {
+        args.iter()
+            .map(|v| {
+                let desc = match v {
+                    V::I64(_) => "Ljava/lang/Long;",
+                    V::I32(_) => "Ljava/lang/Integer;",
+                    V::F64(_) => "Ljava/lang/Double;",
+                    V::F32(_) => "Ljava/lang/Float;",
+                    _ => return *v,
+                };
+                jdk::host(self, desc, HostState::Slot(*v))
+            })
+            .collect()
+    }
+
+    /// Resolve `name` on `ci`'s chain for `args`, retrying with each
+    /// scalar boxed into its `Number` mirror (`HostState::Slot`) when
+    /// the plain image misses. A raw `V::I64` out of a JSON map fed
+    /// to `Map.merge` targets `apply(Object,Object)` — an unboxed
+    /// 2-register read misses that method entirely and the caller
+    /// then deletes the entry as "absent". Returns the matching
+    /// method plus the arg image to invoke with (boxed when used).
+    pub(crate) fn resolve_call_args(
+        &mut self,
+        ci: GIdx,
+        name: &str,
+        args: &[V],
+    ) -> Result<(Option<GIdx>, Vec<V>)> {
+        let nslots = arg_reg_slots(args);
+        if let Some(m) = self.find_method_on_chain(ci, name, nslots, Some(args))? {
+            return Ok((Some(m), args.to_vec()));
+        }
+        if args.iter().any(|v| !matches!(v, V::Ref(_))) {
+            let boxed = self.box_scalars(args);
+            if let Some(m) = self.find_method_on_chain(ci, name, boxed.len(), Some(&boxed))? {
+                return Ok((Some(m), boxed));
+            }
+        }
+        Ok((None, args.to_vec()))
     }
 
     /// `find_method_by_name` over the class's superclass chain — an
@@ -4313,12 +4373,12 @@ impl Vm {
             .heap
             .class_of(this)
             .ok_or_else(|| errd("dexrt.bad_this", name.to_string()))?;
-        let Some(midx) = self.find_method_on_chain(ci, name, arg_reg_slots(args), Some(args))?
-        else {
+        let (midx, eff_args) = self.resolve_call_args(ci, name, args)?;
+        let Some(midx) = midx else {
             let desc = self.type_desc_of(ci).unwrap_or_default();
-            let mut a = Vec::with_capacity(args.len() + 1);
+            let mut a = Vec::with_capacity(eff_args.len() + 1);
             a.push(V::Ref(this));
-            a.extend_from_slice(args);
+            a.extend_from_slice(&eff_args);
             let r = jdk::call(self, &desc, name, "", &a).map_err(|e| match e {
                 E::Vm(v) => v,
                 E::Throw(t) => {
@@ -4328,9 +4388,9 @@ impl Vm {
             })?;
             return Ok(r.flatten());
         };
-        let mut a = Vec::with_capacity(args.len() + 1);
+        let mut a = Vec::with_capacity(eff_args.len() + 1);
         a.push(V::Ref(this));
-        a.extend_from_slice(args);
+        a.extend_from_slice(&eff_args);
         let out = match self.invoke_inner(midx, a, InvokeKind::Virtual, true) {
             Ok(v) => Ok(v),
             Err(E::Vm(e)) => Err(e),
@@ -4715,8 +4775,9 @@ impl Vm {
         args: Vec<V>,
     ) -> Result<Option<V>> {
         let ci = self.type_index_of(owner).unwrap_or(GX_NONE);
-        match self.find_method_on_chain(ci, name, arg_reg_slots(&args), Some(&args)) {
-            Ok(Some(midx)) => match self.invoke(midx, args, InvokeKind::Static) {
+        let (midx, eff_args) = self.resolve_call_args(ci, name, &args)?;
+        match midx {
+            Some(midx) => match self.invoke(midx, eff_args, InvokeKind::Static) {
                 Ok(v) => Ok(v),
                 Err(E::Vm(e)) => Err(e),
                 Err(E::Throw(r)) => {
