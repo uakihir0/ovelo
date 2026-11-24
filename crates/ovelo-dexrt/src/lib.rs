@@ -4197,6 +4197,31 @@ impl Vm {
         // heap access (recursive mutex — nested invoke/JNI re-enters
         // fine, call_native drops all levels while guest code runs).
         let _vmlock = jni::vm_lock();
+        if crate::dbg_flag("OVELO_HOTCALL") {
+            thread_local! {
+                static HOT: std::cell::RefCell<HashMap<GIdx, u64>> =
+                    std::cell::RefCell::new(HashMap::new());
+                static LAST: std::cell::Cell<std::time::Instant> =
+                    std::cell::Cell::new(std::time::Instant::now());
+            }
+            let dump = LAST.with(|l| l.get().elapsed().as_secs() >= 10);
+            HOT.with(|h| {
+                *h.borrow_mut().entry(midx).or_default() += 1;
+                if dump {
+                    let mut top: Vec<(GIdx, u64)> =
+                        h.borrow().iter().map(|(g, c)| (*g, *c)).collect();
+                    top.sort_by_key(|(_, c)| std::cmp::Reverse(*c));
+                    for (g, c) in top.into_iter().take(12) {
+                        eprintln!("[hotcall] {c:>9}x {}", self.describe_method(g));
+                    }
+                    eprintln!("[hotcall] ----");
+                    h.borrow_mut().clear();
+                }
+            });
+            if dump {
+                LAST.with(|l| l.set(std::time::Instant::now()));
+            }
+        }
         if crate::dbg_flag("OVELO_VIEWDBG") {
             if let Some(d) = self.dex_of(midx) {
                 if let Ok(m) = d.method(gl(midx)) {
