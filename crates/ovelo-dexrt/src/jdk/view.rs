@@ -5401,7 +5401,39 @@ pub(crate) fn attach_at(
         // attachViewToParent) already built the real params.
         if let Some(v @ V::Ref(lph)) = lp {
             if lph != 0 {
-                pseudo_set(vm, ch, P_LP, v);
+                // AOSP addViewInner: `checkLayoutParams` gates the LP —
+                // a foreign type (e.g. FrameLayout$LayoutParams on a
+                // ConstraintLayout child) is wrapped by
+                // generateLayoutParams so the parent's own LP class —
+                // whose ctor mints ConstraintLayout's solver widget —
+                // is what the child's getLayoutParams returns. Storing
+                // a foreign LP verbatim leaves `lp.widget` null and the
+                // dex onLayout NPEs on ConstraintWidget.getX.
+                let ok = vm
+                    .call_virtual_sig(
+                        parent,
+                        "checkLayoutParams",
+                        &["Landroid/view/ViewGroup$LayoutParams;"],
+                        &[v],
+                    )
+                    .ok()
+                    .flatten()
+                    .map(|r| i32v(r) != 0)
+                    .unwrap_or(true);
+                let wrapped = if !ok {
+                    vm.call_virtual_sig(
+                        parent,
+                        "generateLayoutParams",
+                        &["Landroid/view/ViewGroup$LayoutParams;"],
+                        &[v],
+                    )
+                    .ok()
+                    .flatten()
+                    .unwrap_or(v)
+                } else {
+                    v
+                };
+                pseudo_set(vm, ch, P_LP, wrapped);
             }
         }
         if pseudo_get(vm, ch, P_LP).is_none() {
