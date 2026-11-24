@@ -2075,6 +2075,24 @@ pub(crate) fn ifield(vm: &Vm, h: u32, owner: &str, name: &str) -> Option<V> {
         | ("Landroid/content/pm/ResolveInfo;", "providerInfo") => {
             Some(pseudo_get(vm, h, P_TARGET).unwrap_or(V::Ref(0)))
         }
+        // ComponentInfo.applicationInfo — minted alongside the *Info
+        // in `mint_info` and linked through P_META; packageName lives
+        // in P_COMPONENT like it does on the *Info itself.
+        ("Landroid/content/pm/ActivityInfo;", "applicationInfo")
+        | ("Landroid/content/pm/ServiceInfo;", "applicationInfo")
+        | ("Landroid/content/pm/ProviderInfo;", "applicationInfo") => {
+            Some(pseudo_get(vm, h, P_META).unwrap_or(V::Ref(0)))
+        }
+        // AppWidgetProviderInfo carries an ActivityInfo (the widget's
+        // configuration/preview activity) — P_TARGET like ResolveInfo.
+        ("Landroid/appwidget/AppWidgetProviderInfo;", "providerInfo")
+        | ("Landroid/appwidget/AppWidgetProviderInfo;", "activityInfo") => {
+            Some(pseudo_get(vm, h, P_TARGET).unwrap_or(V::Ref(0)))
+        }
+        ("Landroid/content/pm/ApplicationInfo;", "packageName")
+        | ("Landroid/content/pm/ApplicationInfo;", "name") => {
+            Some(pseudo_get(vm, h, P_COMPONENT).unwrap_or(V::Ref(0)))
+        }
         ("Landroid/content/pm/ServiceInfo;", "name")
         | ("Landroid/content/pm/ActivityInfo;", "name")
         | ("Landroid/content/pm/ProviderInfo;", "name") => {
@@ -2119,6 +2137,11 @@ pub(crate) fn ifield(vm: &Vm, h: u32, owner: &str, name: &str) -> Option<V> {
             Some(V::I32(0))
         }
         ("Landroid/content/res/Configuration;", "orientation") => Some(V::I32(1)),
+        // `getConfiguration` stores uiMode in P_META (the class has no
+        // dex field index to mint); `isSystemInDarkMode` reads it here.
+        ("Landroid/content/res/Configuration;", "uiMode") => {
+            Some(pseudo_get(vm, h, crate::P_META).unwrap_or(V::I32(0x21)))
+        }
         ("Landroid/content/res/Configuration;", "screenWidthDp")
         | ("Landroid/content/res/Configuration;", "screenHeightDp") => Some(V::I32(360)),
         _ => None,

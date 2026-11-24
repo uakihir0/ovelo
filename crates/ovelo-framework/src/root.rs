@@ -97,7 +97,7 @@ impl ViewRootImpl {
             v.draw(&mut c);
             c.restore();
         }
-        if let Some(p) = std::env::var_os("OVELO_FRAMEDUMP") {
+        if let Some(p) = dbg_flag_os("OVELO_FRAMEDUMP") {
             let px = surf.pixels();
             let mut out = format!("P6\n{} {}\n255\n", surf.width(), surf.height()).into_bytes();
             for c in px.as_chunks::<4>().0 {
@@ -105,7 +105,7 @@ impl ViewRootImpl {
             }
             let _ = std::fs::write(p, out);
         }
-        if std::env::var_os("OVELO_PIXDBG").is_some() {
+        if dbg_flag("OVELO_PIXDBG") {
             let px = surf.pixels();
             let non_white = px
                 .as_chunks::<4>()
@@ -114,10 +114,15 @@ impl ViewRootImpl {
                 .filter(|p| !(p[0] == 0xff && p[1] == 0xff && p[2] == 0xff))
                 .count();
             eprintln!(
-                "[pixdbg] {}x{} nonwhite={} first={:02x?} mid={:02x?}",
+                "[pixdbg] {}x{} nonwhite={} rejects={} rbox={:?} ok={} colors={:08x?} first={:02x?} mid={:02x?}",
                 surf.width(),
                 surf.height(),
                 non_white,
+                ovelo_ui::surface::CLIP_REJECT.with(|c| c.replace(0)),
+                ovelo_ui::surface::CLIP_REJECT_BOX
+                    .with(|b| b.replace([i32::MAX, i32::MAX, i32::MIN, i32::MIN])),
+                ovelo_ui::surface::BLEND_OK.with(|c| c.replace(0)),
+                ovelo_ui::surface::BLEND_COLORS.with(|v| v.replace(Vec::new())),
                 &px[..4],
                 &px[px.len() / 2..px.len() / 2 + 4]
             );
@@ -142,6 +147,25 @@ impl ViewRootImpl {
         }
     }
 }
+
+/// Cached env flag — per-frame checks must not hit getenv.
+fn dbg_flag(name: &'static str) -> bool {
+    dbg_flag_os(name).is_some()
+}
+
+fn dbg_flag_os(name: &'static str) -> Option<std::ffi::OsString> {
+    static CACHE: std::sync::OnceLock<
+        std::sync::RwLock<std::collections::HashMap<&'static str, Option<std::ffi::OsString>>>,
+    > = std::sync::OnceLock::new();
+    let cache = CACHE.get_or_init(|| std::sync::RwLock::new(std::collections::HashMap::new()));
+    if let Some(v) = cache.read().unwrap().get(name) {
+        return v.clone();
+    }
+    let v = std::env::var_os(name);
+    cache.write().unwrap().insert(name, v.clone());
+    v
+}
+
 
 #[cfg(test)]
 mod tests {

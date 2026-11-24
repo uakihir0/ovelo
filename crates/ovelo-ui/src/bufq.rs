@@ -335,7 +335,13 @@ impl ANativeWindow {
         }
         let s = self.queue.dequeue()?;
         self.held = Some(s);
-        self.queue.buffer_mut(s)
+        let surf = self.queue.buffer_mut(s)?;
+        // The clip stack is per-frame state; a draw path that bails
+        // mid-frame (early return, guest exception) would otherwise
+        // leave a stale — possibly empty — clip on the slot, which then
+        // intersects every later frame into nothing.
+        surf.reset_clips();
+        Ok(surf)
     }
 
     /// `ANativeWindow_unlockAndPost` — queue the written frame.

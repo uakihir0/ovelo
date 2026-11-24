@@ -11,47 +11,177 @@ use std::rc::Rc;
 
 use ovelo_apk::manifest::{Element, Value};
 
+use crate::res::ApkResources;
 use crate::value::{HostState, V};
 use crate::Vm;
 
 use super::{host, pseudo_set, P_BITMAP_SLOT, P_DRAW_COLOR};
 
+/// Resources + theme the decode/color helpers consume — a `Vm` is not
+/// needed, so foreign APK resources (installed-app icons) go through
+/// the same path.
+#[derive(Clone, Copy)]
+pub(crate) struct RCtx<'a> {
+    pub res: &'a ApkResources,
+    pub theme: u32,
+}
+
+/// `RCtx` over the Vm's own bound resources, if any.
+pub(crate) fn rctx(vm: &Vm) -> Option<RCtx<'_>> {
+    Some(RCtx {
+        res: vm.apk_res.as_ref()?,
+        theme: vm.theme_id,
+    })
+}
+
 /// Cached rasterization result: (w, h, rgba) or None when not drawable.
 type CachedDrawable = Option<(u32, u32, Rc<Vec<u8>>)>;
 
 thread_local! {
-    /// (res_id, theme_id) → rendered pixels (None = not an image we can
-    /// make). Colors resolve through the current theme, so the key must
-    /// carry it or a theme change would keep returning stale pixels.
+    /// (res_id, theme_id, package) → rendered pixels (None = not an
+    /// image we can make). Colors resolve through the current theme and
+    /// res-ids repeat across packages, so both must be in the key.
     static DRAW_CACHE: std::cell::RefCell<
-        std::collections::HashMap<(u32, u32), CachedDrawable>,
+        std::collections::HashMap<(u32, u32, String), CachedDrawable>,
     > = std::cell::RefCell::new(std::collections::HashMap::new());
 }
 
-/// Pixels for a `res/drawable` id: `<vector>` rasterized, or PNG/JPEG
-/// decoded. `None` for non-image resources.
-pub(crate) fn drawable_bitmap(vm: &Vm, res_id: u32) -> Option<(u32, u32, Rc<Vec<u8>>)> {
-    let key = (res_id, vm.theme_id);
+/// Pixels for a `res/drawable` id: `<vector>` rasterized,
+/// `<adaptive-icon>` composited, or PNG/JPEG/WebP decoded. `None` for
+/// non-image resources.
+pub(crate) fn drawable_bitmap(rv: RCtx<'_>, res_id: u32) -> Option<(u32, u32, Rc<Vec<u8>>)> {
+    let key = (
+        res_id,
+        rv.theme,
+        rv.res.package_name().unwrap_or_default().to_owned(),
+    );
     if let Some(hit) = DRAW_CACHE.with(|c| c.borrow().get(&key).cloned()) {
         return hit;
     }
-    let out = render_vector(vm, res_id).or_else(|| {
-        let res = vm.apk_res.as_ref()?;
-        let bytes = res.file_path(res_id).and_then(|p| res.read(p))?;
-        let img = image::load_from_memory(&bytes).ok()?;
-        let rgba = img.to_rgba8();
-        let (w, h) = rgba.dimensions();
-        Some((w, h, Rc::new(rgba.into_raw())))
-    });
+    let out = render_vector(rv, res_id)
+        .or_else(|| render_adaptive(rv, res_id))
+        .or_else(|| {
+            let bytes = rv.res.file_path(res_id).and_then(|p| rv.res.read(p))?;
+            let img = image::load_from_memory(&bytes).ok()?;
+            let rgba = img.to_rgba8();
+            let (w, h) = rgba.dimensions();
+            Some((w, h, Rc::new(rgba.into_raw())))
+        });
     DRAW_CACHE.with(|c| c.borrow_mut().insert(key, out.clone()));
     out
+}
+
+/// Flat composite of an `<adaptive-icon>` doc: background stretched
+/// over the canvas, foreground centered at the spec's inner size.
+/// Returns `None` when the doc isn't an adaptive icon.
+fn render_adaptive(rv: RCtx<'_>, res_id: u32) -> Option<(u32, u32, Rc<Vec<u8>>)> {
+    let els = rv.res.document(res_id)?;
+    els.iter().find(|e| e.name == "adaptive-icon")?;
+    const SZ: usize = 96;
+    let mut canvas = vec![0u8; SZ * SZ * 4];
+    for layer in ["background", "foreground"] {
+        let el = els.iter().find(|e| e.name == layer)?;
+        let Some(Value::Reference(r)) = el.android("drawable") else {
+            continue;
+        };
+        let (w, h, px) = drawable_bitmap(RCtx { ..rv }, *r).or_else(|| {
+            // `<color>` resource → solid tile.
+            resolve_ref_color(rv, *r).map(|argb| {
+                let p = argb.to_be_bytes();
+                let mut v = Vec::with_capacity(4);
+                v.extend_from_slice(&p);
+                (1u32, 1u32, Rc::new(v))
+            })
+        })?;
+        let (tw, th, ox, oy) = if layer == "foreground" {
+            // Adaptive spec: 108dp canvas, inner icon ≈72dp centered.
+            let t = (SZ as f32 * 72.0 / 108.0).round() as usize;
+            (t, t, (SZ - t) / 2, (SZ - t) / 2)
+        } else {
+            (SZ, SZ, 0, 0)
+        };
+        blit_scaled(&mut canvas, SZ, &px, w as usize, h as usize, ox, oy, tw, th);
+    }
+    Some((SZ as u32, SZ as u32, Rc::new(canvas)))
+}
+
+/// Nearest-neighbor blit of `src` into `canvas` at (ox,oy) scaled to tw×th.
+#[allow(clippy::too_many_arguments)]
+fn blit_scaled(
+    canvas: &mut [u8],
+    cw: usize,
+    src: &[u8],
+    sw: usize,
+    sh: usize,
+    ox: usize,
+    oy: usize,
+    tw: usize,
+    th: usize,
+) {
+    if sw == 0 || sh == 0 || tw == 0 || th == 0 {
+        return;
+    }
+    for dy in 0..th {
+        for dx in 0..tw {
+            let sx = dx * sw / tw;
+            let sy = dy * sh / th;
+            let si = (sy * sw + sx) * 4;
+            let a = src[si + 3] as u32;
+            if a == 0 {
+                continue;
+            }
+            let dx_ = ox + dx;
+            let dy_ = oy + dy;
+            let di = (dy_ * cw + dx_) * 4;
+            // src-over.
+            let inv = 255 - a;
+            for k in 0..4 {
+                canvas[di + k] =
+                    ((src[si + k] as u32 * a + canvas[di + k] as u32 * inv) / 255) as u8;
+            }
+        }
+    }
+}
+
+/// Launcher icon of another installed package — `loadIcon` /
+/// `getApplicationIcon` back it with this so home screens draw the
+/// real icon instead of a placeholder.
+pub(crate) fn package_icon_drawable(vm: &mut Vm, pkg: &str) -> Option<V> {
+    let bytes = vm.installed_apks.get(pkg)?.clone();
+    let decoded = crate::package_icon_rgba(&bytes);
+    let (w, h, rgba) = decoded?;
+    let d = host(
+        vm,
+        "Landroid/graphics/drawable/BitmapDrawable;",
+        HostState::Empty,
+    );
+    if let V::Ref(dh) = d {
+        let bmp = vm.alloc_host(
+            "Landroid/graphics/Bitmap;",
+            HostState::Bitmap { w, h, rgba },
+        );
+        pseudo_set(vm, dh, P_BITMAP_SLOT, V::Ref(bmp));
+    }
+    Some(d)
 }
 
 /// `Resources/appcompat getDrawable(resId)` backing: a `BitmapDrawable`
 /// host carrying the rasterized bitmap when the resource is an image,
 /// else a bare `Drawable` placeholder so callers keep flowing.
 pub(crate) fn drawable_for_res(vm: &mut Vm, res_id: u32) -> V {
-    match drawable_bitmap(vm, res_id) {
+    // All `&vm.apk_res` reads finish before any `&mut vm` host alloc.
+    let (bitmap, color) = match rctx(vm) {
+        Some(rv) => (
+            drawable_bitmap(rv, res_id),
+            if rv.res.type_name(res_id) == Some("color") {
+                resolve_ref_color(rv, res_id)
+            } else {
+                None
+            },
+        ),
+        None => (None, None),
+    };
+    match bitmap {
         Some((w, h, rgba)) => {
             let d = host(
                 vm,
@@ -71,18 +201,13 @@ pub(crate) fn drawable_for_res(vm: &mut Vm, res_id: u32) -> V {
             // A `res/color` id handed to getDrawable becomes a
             // ColorDrawable: carry the resolved ARGB so `draw` can
             // emit a fill for it.
-            let is_color = vm
-                .apk_res
-                .as_ref()
-                .and_then(|r| r.type_name(res_id))
-                .is_some_and(|t| t == "color");
-            if is_color {
+            if let Some(argb) = color {
                 let d = host(
                     vm,
                     "Landroid/graphics/drawable/ColorDrawable;",
                     HostState::Empty,
                 );
-                if let (V::Ref(dh), Some(argb)) = (d, resolve_ref_color(vm, res_id)) {
+                if let V::Ref(dh) = d {
                     pseudo_set(vm, dh, P_DRAW_COLOR, V::I32(argb as i32));
                 }
                 return d;
@@ -107,8 +232,8 @@ const SS: u32 = 4;
 
 /// Render `res_id` when its XML document is a `<vector>` drawable.
 /// Returns `(w, h, rgba8)` or `None` when it is not a vector.
-pub(crate) fn render_vector(vm: &Vm, res_id: u32) -> Option<(u32, u32, Rc<Vec<u8>>)> {
-    let res = vm.apk_res.as_ref()?;
+pub(crate) fn render_vector(rv: RCtx<'_>, res_id: u32) -> Option<(u32, u32, Rc<Vec<u8>>)> {
+    let res = rv.res;
     let els = res.document(res_id)?;
     let root = els.iter().find(|e| e.name == "vector")?;
     let vw = f32_attr(root, "viewportWidth").unwrap_or(24.0);
@@ -152,8 +277,8 @@ pub(crate) fn render_vector(vm: &Vm, res_id: u32) -> Option<(u32, u32, Rc<Vec<u8
                 if polys.is_empty() {
                     continue;
                 }
-                let fill = color_attr(vm, el, "fillColor");
-                let stroke = color_attr(vm, el, "strokeColor");
+                let fill = color_attr(rv, el, "fillColor");
+                let stroke = color_attr(rv, el, "strokeColor");
                 // No fill attr + stroke → transparent fill; no fill and no
                 // stroke → the vector spec fills black.
                 let fill_argb = match fill {
@@ -316,23 +441,23 @@ fn mul_alpha(argb: u32, alpha: f32) -> u32 {
     (a << 24) | (argb & 0x00ff_ffff)
 }
 
-fn color_attr(vm: &Vm, el: &Element, name: &str) -> Option<u32> {
-    color_of(vm, el.android(name)?)
+fn color_attr(rv: RCtx<'_>, el: &Element, name: &str) -> Option<u32> {
+    color_of(rv, el.android(name)?)
 }
 
-fn color_of(vm: &Vm, v: &Value) -> Option<u32> {
+fn color_of(rv: RCtx<'_>, v: &Value) -> Option<u32> {
     match v {
         Value::Str(s) => parse_color(s),
         Value::Int(i) => Some(*i as u32),
         Value::Other { data_type, data } if (0x1c..=0x1f).contains(data_type) => Some(*data),
-        Value::Reference(r) => resolve_ref_color(vm, *r),
+        Value::Reference(r) => resolve_ref_color(rv, *r),
         _ => None,
     }
 }
 
 /// `@color/x` → the entry; `?attr/x` → theme chain (with `?attr` chases).
-fn resolve_ref_color(vm: &Vm, id: u32) -> Option<u32> {
-    let res = vm.apk_res.as_ref()?;
+pub(crate) fn resolve_ref_color(rv: RCtx<'_>, id: u32) -> Option<u32> {
+    let res = rv.res;
     if let Some(ev) = res.entry_value(id) {
         if let Some(c) = entry_color(res, ev) {
             return Some(c);
@@ -340,7 +465,7 @@ fn resolve_ref_color(vm: &Vm, id: u32) -> Option<u32> {
     }
     let mut cur = id;
     for _ in 0..8 {
-        let ev = res.style_item(vm.theme_id, cur)?;
+        let ev = res.style_item(rv.theme, cur)?;
         match entry_color(res, ev) {
             Some(c) => return Some(c),
             None if ev.data_type == 0x02 => cur = ev.data,
@@ -357,7 +482,11 @@ fn entry_color(res: &crate::res::ApkResources, ev: &ovelo_apk::arsc::EntryValue)
     for _ in 0..8 {
         match ev.data_type {
             0x1c..=0x1f | 0x10 | 0x11 => return Some(ev.data),
-            0x01 => ev = res.entry_value(ev.data)?,
+            // `android.R.color` ids live outside the app table.
+            0x01 => match res.entry_value(ev.data) {
+                Some(next) => ev = next,
+                None => return crate::res::framework_color(ev.data),
+            },
             0x03 => return ev.string.as_deref().and_then(parse_color),
             _ => return None,
         }
@@ -365,7 +494,58 @@ fn entry_color(res: &crate::res::ApkResources, ev: &ovelo_apk::arsc::EntryValue)
     None
 }
 
-fn parse_color(s: &str) -> Option<u32> {
+/// A drawable resource's representative fill color — used when a view
+/// `background`/`foreground` resolves to an XML drawable we can't fully
+/// rasterize: `<shape><solid>`, `<color>`, `<ripple>`'s color, a
+/// `<selector>`/`<layer-list>` default item, `<inset>`'s content. Stated
+/// items that carry explicit state (`state_pressed`…) are skipped so
+/// the resting-state color wins.
+pub(crate) fn drawable_flat_color(rv: RCtx<'_>, res_id: u32) -> Option<u32> {
+    let res = rv.res;
+    let els = res.document(res_id)?;
+    let mut fallback: Option<u32> = None;
+    for el in &els {
+        match el.name.as_str() {
+            "shape" => {
+                // handled by its <solid> child below
+            }
+            "solid" | "color" | "stroke" => {
+                if let Some(c) = color_attr(rv, el, "color") {
+                    return Some(c);
+                }
+            }
+            "item" => {
+                // Skip items bound to a state set; an unqualified item
+                // is the drawable's default.
+                let has_state = el
+                    .attrs
+                    .iter()
+                    .any(|a| a.name.starts_with("state_") && a.name != "state_enabled");
+                if has_state {
+                    continue;
+                }
+                if let Some(c) = color_attr(rv, el, "color") {
+                    return Some(c);
+                }
+                if let Some(Value::Reference(r)) = el.android("drawable") {
+                    if fallback.is_none() {
+                        fallback =
+                            resolve_ref_color(rv, *r).or_else(|| drawable_flat_color(rv, *r));
+                    }
+                }
+            }
+            "ripple" => {
+                if let Some(c) = color_attr(rv, el, "color") {
+                    return Some(c);
+                }
+            }
+            _ => {}
+        }
+    }
+    fallback
+}
+
+pub(crate) fn parse_color(s: &str) -> Option<u32> {
     let s = s.trim().strip_prefix('#')?;
     let v = u32::from_str_radix(s, 16).ok()?;
     Some(match s.len() {

@@ -9,6 +9,19 @@ fn err(cause: &str) -> OveloError {
     OveloError::new(ErrorCategory::HostCrash, Phase::Ui, cause)
 }
 
+thread_local! {
+    /// Draws rejected by bounds/clip checks — PIXDBG reads and clears it.
+    pub static CLIP_REJECT: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+    /// Draws that landed — PIXDBG reads and clears it.
+    pub static BLEND_OK: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+    /// Bounding box of clip-rejected pixels (x0,y0,x1,y1).
+    pub static CLIP_REJECT_BOX: std::cell::RefCell<[i32; 4]> =
+        const { std::cell::RefCell::new([i32::MAX, i32::MAX, i32::MIN, i32::MIN]) };
+    /// Sample of distinct blended colors — PIXDBG reads and clears it.
+    pub static BLEND_COLORS: std::cell::RefCell<Vec<u32>> =
+        const { std::cell::RefCell::new(Vec::new()) };
+}
+
 /// Integer rectangle.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Rect {
@@ -109,6 +122,12 @@ impl Surface {
         self.clips.len()
     }
 
+    /// Back to just the base (whole-surface) clip — a new frame starts
+    /// with no leftover clip state.
+    pub fn reset_clips(&mut self) {
+        self.clips.truncate(1);
+    }
+
     /// Drop clip levels above `depth` (clamped to the base level).
     pub(crate) fn truncate_clips(&mut self, depth: usize) {
         self.clips.truncate(depth.max(1));
@@ -117,11 +136,21 @@ impl Surface {
     /// Premultiplied source-over at (x,y) — the only blend Android widgets use.
     fn src_over(&mut self, x: i32, y: i32, src: Color) {
         if x < 0 || y < 0 || x >= self.w as i32 || y >= self.h as i32 {
+            CLIP_REJECT.with(|c| c.set(c.get() + 1));
             return;
         }
         if !self.clips.last().unwrap().contains(x, y) {
+            CLIP_REJECT.with(|c| c.set(c.get() + 1));
+            CLIP_REJECT_BOX.with(|b| {
+                let mut b = b.borrow_mut();
+                b[0] = b[0].min(x);
+                b[1] = b[1].min(y);
+                b[2] = b[2].max(x);
+                b[3] = b[3].max(y);
+            });
             return;
         }
+        BLEND_OK.with(|c| c.set(c.get() + 1));
         let i = (y as usize * self.w + x as usize) * 4;
         let sa = src.a as u32;
         if sa == 0 {
@@ -324,8 +353,17 @@ impl Surface {
     /// `cov` scales `c`'s alpha (0..=255).
     pub(crate) fn blend_pixel(&mut self, x: i32, y: i32, c: Color, cov: u8) {
         if !self.clips.last().unwrap().contains(x, y) || cov == 0 {
+            CLIP_REJECT.with(|c| c.set(c.get() + 1));
             return;
         }
+        BLEND_OK.with(|c| c.set(c.get() + 1));
+        BLEND_COLORS.with(|v| {
+            let mut v = v.borrow_mut();
+            let k = ((c.r as u32) << 24) | ((c.g as u32) << 16) | ((c.b as u32) << 8) | c.a as u32;
+            if !v.contains(&k) && v.len() < 24 {
+                v.push(k);
+            }
+        });
         let i = (y as usize * self.w + x as usize) * 4;
         let sc = [c.r, c.g, c.b, c.a];
         let sa = (sc[3] as u32 * cov as u32 + 127) / 255;

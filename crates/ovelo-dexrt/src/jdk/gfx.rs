@@ -79,6 +79,31 @@ fn paint_state(vm: &Vm, v: V) -> PaintState {
 /// Append an op to a recording canvas handle.
 pub(crate) fn rec(vm: &mut Vm, canvas: V, op: CanvasOp) {
     let V::Ref(h) = canvas else { return };
+    // A canvas bound to a Bitmap (`new Canvas(bitmap)`) composites
+    // pixel ops into the bitmap itself — recording only would leave
+    // the target blank (Drawable.toBitmap, Glide transforms).
+    if let CanvasOp::Bitmap {
+        x,
+        y,
+        w,
+        h: dh,
+        src_w,
+        src_h,
+        rgba,
+    } = &op
+    {
+        if let Some(V::Ref(th)) = pseudo_get(vm, h, PK_TARGET) {
+            if th != 0 {
+                bitmap_blit(
+                    vm,
+                    th,
+                    (*x, *y, *w as f32, *dh as f32),
+                    (*src_w, *src_h),
+                    rgba,
+                );
+            }
+        }
+    }
     if let Some(Obj::Host {
         state: HostState::CanvasOps(ops),
         ..

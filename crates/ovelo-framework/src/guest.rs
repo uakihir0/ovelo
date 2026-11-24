@@ -211,7 +211,7 @@ impl Drawable for AbsView {
         s
     }
     fn layout(&mut self, left: i32, top: i32) {
-        if std::env::var_os("OVELO_POSDBG").is_some() {
+        if dbg_flag("OVELO_POSDBG") {
             eprintln!(
                 "[posdbg] AbsView layout left={left} top={top} rect={:?}",
                 self.rect
@@ -442,6 +442,10 @@ fn update_dex_view(g: &mut GuestView, info: &ovelo_dexrt::DexViewInfo) {
             tv.gravity = info.gravity;
             tv.invalidate();
         }
+        if tv.max_lines != info.max_lines {
+            tv.max_lines = info.max_lines;
+            tv.invalidate();
+        }
     }
     if changed {
         g.invalidate();
@@ -598,6 +602,15 @@ impl GuestUi {
                     "addViewInLayout",
                     "(Landroid/view/View;ILandroid/view/ViewGroup$LayoutParams;Z)Z",
                 ),
+                // RecyclerView attaches every visible row through
+                // attachViewToParent — bridge it or bridged groups
+                // render empty lists. Transient scrap views that
+                // also pass through are re-removed by
+                // detachViewFromParent (registered below).
+                (
+                    "attachViewToParent",
+                    "(Landroid/view/View;ILandroid/view/ViewGroup$LayoutParams;)V",
+                ),
             ] {
                 Self::on_rc(ui, vm, cls, name, sig, |ui, vm, a| {
                     let this = ref_arg(a, 0)?;
@@ -654,7 +667,18 @@ impl GuestUi {
                     let Some(cv) = cv else {
                         return Ok(z_ret);
                     };
-                    let Some(rc) = ui.borrow().views.get(&this).cloned() else {
+                    // Dex-materialized parents live in `dex_views`,
+                    // bridged `new` parents in `views` — a parent of
+                    // either kind must accept the child or rows added
+                    // to a dex group (RecyclerView's attachViewToParent)
+                    // orphan the whole subtree.
+                    let Some(rc) = ui
+                        .borrow()
+                        .views
+                        .get(&this)
+                        .cloned()
+                        .or_else(|| ui.borrow().dex_views.get(&this).cloned())
+                    else {
                         return Ok(z_ret);
                     };
                     let mut g = rc.borrow_mut();
@@ -735,7 +759,12 @@ impl GuestUi {
                         else {
                             return Ok(None);
                         };
-                        let Some(rc) = ui.views.get(&this).cloned() else {
+                        let Some(rc) = ui
+                            .views
+                            .get(&this)
+                            .cloned()
+                            .or_else(|| ui.dex_views.get(&this).cloned())
+                        else {
                             return Ok(None);
                         };
                         let mut g = rc.borrow_mut();
@@ -788,6 +817,9 @@ impl GuestUi {
                 let mut ui = ui.borrow_mut();
                 if let Some(cv) = ui.views.get(&v).cloned() {
                     ui.guest_content_set = true;
+                    if viewdbg() {
+                        eprintln!("[viewdbg] guest_content_set via bridged h{v}");
+                    }
                     ui.root.set_content_view(Box::new(SharedView(cv)));
                 }
                 Ok(None)
@@ -802,16 +834,18 @@ impl GuestUi {
             "Landroid/widget/Button;",
             "Landroid/widget/LinearLayout;",
         ] {
-            Self::on(ui, vm, cls, "setBackgroundColor", "(I)V", |ui, _vm, a| {
+            Self::on(ui, vm, cls, "setBackgroundColor", "(I)V", |ui, vm, a| {
                 let this = ref_arg(a, 0)?;
-                let color = match a.get(1) {
-                    Some(V::I32(c)) => argb(*c),
+                let raw = match a.get(1) {
+                    Some(V::I32(c)) => *c,
                     _ => return Err(crate::err("guest.arg.type")),
                 };
                 let Some(rc) = ui.views.get(&this).cloned() else {
-                    // Not a GuestView (dex-inflated) — setters no-op.
+                    // Dex-inflated view — record so dex_view_info sees it.
+                    ovelo_dexrt::pseudo_set(vm, this, ovelo_dexrt::P_BGCOLOR, V::I32(raw));
                     return Ok(None);
                 };
+                let color = argb(raw);
                 rc.borrow_mut().view_mut().background = Some(color);
                 rc.borrow_mut().view_mut().invalidate();
                 Ok(None)
@@ -986,7 +1020,31 @@ impl GuestUi {
         if !mounted {
             self.dex_root = root;
             self.dex_mounted = Some(rc.clone());
+            if viewdbg() {
+                let kids = match &*rc.borrow() {
+                    GuestView::Group(g) => g.children.len(),
+                    _ => 0,
+                };
+                eprintln!(
+                    "[viewdbg] mount root h{root} kids={kids} gcs={}",
+                    self.guest_content_set
+                );
+            }
             self.root.set_content_view(Box::new(SharedView(rc)));
+        }
+        // The window's background comes from the theme's
+        // `windowBackground` attribute — app views only paint their own
+        // rect, so a dark themed window must show through everywhere a
+        // view doesn't cover. Applied on each pass; a theme switch
+        // (fossify's color settings) re-tints without a remount.
+        // `windowBackground` may point at a platform drawable the APK
+        // doesn't carry — fall back through the app's own color attrs.
+        let win_bg = ovelo_dexrt::theme_color(vm, 0x0101_0054)
+            .or_else(|| ovelo_dexrt::theme_color_named(vm, "colorSurface"))
+            .or_else(|| ovelo_dexrt::theme_color_named(vm, "colorBackground"))
+            .or_else(|| ovelo_dexrt::theme_color_named(vm, "colorPrimaryDark"));
+        if let Some(argb) = win_bg {
+            self.root.bg = Color::srgb((argb >> 16) as u8, (argb >> 8) as u8, argb as u8);
         }
         self.dex_gen_seen = vm.view_gen;
         true
@@ -1018,7 +1076,7 @@ impl GuestUi {
         // Window decor roots / content frames fill the window — they
         // never pass through host layout either.
         vm.sync_decor_frames(self.root.w, self.root.h);
-        if std::env::var_os("OVELO_DRAWDBG").is_some() {
+        if dbg_flag("OVELO_DRAWDBG") {
             eprintln!(
                 "[gldbg] pump views={:?} dex_views={:?}",
                 self.views.keys().collect::<Vec<_>>(),
@@ -1026,7 +1084,7 @@ impl GuestUi {
             );
         }
         for (&h, rc) in self.views.iter().chain(self.dex_views.iter()) {
-            if std::env::var_os("OVELO_DRAWDBG").is_some() {
+            if dbg_flag("OVELO_DRAWDBG") {
                 eprintln!(
                     "[gldbg] cand h={h} gl={} att={} cls={} parent={:?} measured={:?}",
                     vm.has_gl_renderer(h),
@@ -1066,6 +1124,30 @@ impl GuestUi {
                 continue;
             }
             let ops = vm.guest_draw_ops(h, w, hh);
+            if std::env::var_os("OVELO_OPSDBG").is_some() && !ops.is_empty() {
+                use std::collections::BTreeMap;
+                let mut hist: BTreeMap<&'static str, usize> = BTreeMap::new();
+                let mut texts = 0usize;
+                for o in &ops {
+                    *hist
+                        .entry(match o {
+                            ovelo_dexrt::CanvasOp::Text { .. } => {
+                                texts += 1;
+                                "Text"
+                            }
+                            ovelo_dexrt::CanvasOp::Bitmap { .. } => "Bitmap",
+                            ovelo_dexrt::CanvasOp::Rect { .. } => "Rect",
+                            ovelo_dexrt::CanvasOp::Circle { .. } => "Circle",
+                            ovelo_dexrt::CanvasOp::Line { .. } => "Line",
+                            _ => "other",
+                        })
+                        .or_default() += 1;
+                }
+                eprintln!(
+                    "[opsdbg] h{h} {w}x{hh} ops={} hist={hist:?} texts={texts}",
+                    ops.len()
+                );
+            }
             let mut g = rc.borrow_mut();
             let v = g.view_mut();
             v.custom_ops = if ops.is_empty() {
@@ -1084,13 +1166,14 @@ impl GuestUi {
         let info = vm.dex_view(h)?;
         if viewdbg() {
             eprintln!(
-                "[viewdbg] node {} h{h} vis={} kids={} text={:?} frame={:?} tc={:?} lp={}x{}",
+                "[viewdbg] node {} h{h} vis={} kids={} text={:?} frame={:?} tc={:?} bg={:?} lp={}x{}",
                 info.desc,
                 info.visible as u8,
                 info.children.len(),
                 info.text,
                 info.frame,
                 info.text_color,
+                info.bg_color,
                 info.lp_w,
                 info.lp_h,
             );
@@ -1310,6 +1393,19 @@ impl GuestUi {
 fn viewdbg() -> bool {
     static V: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *V.get_or_init(|| std::env::var_os("OVELO_VIEWDBG").is_some())
+}
+
+/// Cached env flag — per-frame/per-view checks must not hit getenv.
+fn dbg_flag(name: &'static str) -> bool {
+    static CACHE: std::sync::OnceLock<std::sync::RwLock<HashMap<&'static str, bool>>> =
+        std::sync::OnceLock::new();
+    let cache = CACHE.get_or_init(|| std::sync::RwLock::new(HashMap::new()));
+    if let Some(v) = cache.read().unwrap().get(name) {
+        return *v;
+    }
+    let v = std::env::var_os(name).is_some();
+    cache.write().unwrap().insert(name, v);
+    v
 }
 
 /// Absolute (window) origin of a view handle: a bridged view answers

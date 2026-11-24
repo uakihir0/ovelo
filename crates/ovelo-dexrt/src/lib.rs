@@ -16,7 +16,7 @@ mod res_attrs;
 mod value;
 
 pub use aot::Aot;
-pub use jdk::view::{fire_global_layout, DexViewInfo, P_TCOLOR, P_TEXT, P_TSIZE};
+pub use jdk::view::{fire_global_layout, DexViewInfo, P_BGCOLOR, P_TCOLOR, P_TEXT, P_TSIZE};
 pub use jdk::{pseudo_get, pseudo_set, P_COMPONENT, P_DATA, P_META, P_TARGET};
 pub use value::{CanvasOp, PaintState};
 pub use value::{Heap, HostState, Obj, V};
@@ -185,6 +185,14 @@ pub struct Vm {
     /// Root `/storage/emulated/0` (and its `/sdcard` aliases) maps to —
     /// shared external storage, distinct from the app-private guest_root.
     pub external_root: std::path::PathBuf,
+    /// `(package, launcher activity)` of every app installed in the
+    /// store — `PackageManager.queryIntentActivities` enumerates them
+    /// for launchers, `getLaunchIntentForPackage` resolves per package.
+    pub installed_launchers: Vec<(String, String)>,
+    /// APK bytes per installed package — lets `loadIcon` /
+    /// `getApplicationIcon` decode real launcher icons out of the
+    /// store instead of returning placeholders.
+    pub installed_apks: std::collections::BTreeMap<String, std::rc::Rc<Vec<u8>>>,
     /// Live interpreter call depth — unbounded guest or builtin
     /// recursion would overflow the native stack; cap it instead.
     depth: u32,
@@ -558,6 +566,103 @@ pub fn check_zones(tag: &str) {
     native::check_all_zones(tag)
 }
 
+/// Resolve a theme attribute to an ARGB color — `android.R.attr.windowBackground`
+/// and friends. Chases `?attr` hops through the bound theme and
+/// `@drawable` references to a representative flat color.
+pub fn theme_color(vm: &Vm, attr_id: u32) -> Option<u32> {
+    let res = vm.apk_res.as_ref()?;
+    let mut cur = attr_id;
+    for _ in 0..8 {
+        let ev = res.style_item(vm.theme_id, cur).cloned()?;
+        match ev.data_type {
+            0x02 => cur = ev.data,
+            0x1c..=0x1f | 0x10 | 0x11 => return Some(ev.data),
+            0x01 => {
+                return jdk::vector::resolve_ref_color(
+                    jdk::vector::RCtx {
+                        res,
+                        theme: vm.theme_id,
+                    },
+                    ev.data,
+                )
+                .or_else(|| {
+                    jdk::vector::drawable_flat_color(
+                        jdk::vector::RCtx {
+                            res,
+                            theme: vm.theme_id,
+                        },
+                        ev.data,
+                    )
+                });
+            }
+            0x03 => return ev.string.as_deref().and_then(jdk::vector::parse_color),
+            _ => return None,
+        }
+    }
+    None
+}
+
+/// `theme_color` looked up by attr name (`colorSurface`, …) — used for
+/// fallbacks when `windowBackground` points at a framework drawable the
+/// APK doesn't carry.
+pub fn theme_color_named(vm: &Vm, attr_name: &str) -> Option<u32> {
+    let res = vm.apk_res.as_ref()?;
+    theme_color(vm, res.attr_id_named(attr_name)?)
+}
+
+/// Rasterize an installed package's launcher icon from raw APK
+/// bytes — vector XML, adaptive icon layers, or a raster image,
+/// whichever `application/@android:icon` references.
+pub fn package_icon_rgba(apk: &[u8]) -> Option<(u32, u32, std::rc::Rc<Vec<u8>>)> {
+    let ai = ovelo_apk::inspect_apk(apk).ok()?;
+    let icon = ai.manifest.icon?;
+    let res = res::ApkResources::open(apk.to_vec())?;
+    let (w, h, px) = jdk::vector::drawable_bitmap(
+        jdk::vector::RCtx {
+            res: &res,
+            theme: ai.manifest.theme.unwrap_or(0),
+        },
+        icon,
+    )?;
+    // Callers per-pixel-process these (e.g. Palette/average-color
+    // helpers interpreted in dex) — cap at a display-size decode.
+    const MAX: u32 = 144;
+    if w <= MAX && h <= MAX {
+        return Some((w, h, px));
+    }
+    let scale = MAX as f64 / w.max(h) as f64;
+    let (tw, th) = (
+        ((w as f64 * scale).round() as u32).max(1),
+        ((h as f64 * scale).round() as u32).max(1),
+    );
+    let mut out = vec![0u8; (tw * th * 4) as usize];
+    for y in 0..th {
+        for x in 0..tw {
+            let sx = (x as f64 / scale) as u32;
+            let sy = (y as f64 / scale) as u32;
+            let (si, di) = (((sy * w + sx) * 4) as usize, ((y * tw + x) * 4) as usize);
+            out[di..di + 4].copy_from_slice(&px[si..si + 4]);
+        }
+    }
+    Some((tw, th, std::rc::Rc::new(out)))
+}
+
+/// `application/@android:label` of an installed APK — resource
+/// reference resolved through its own arsc, or the literal string.
+/// `PackageItemInfo.loadLabel` resolves to this, not the component's
+/// class name.
+pub fn package_label(apk: &[u8]) -> Option<String> {
+    let ai = ovelo_apk::inspect_apk(apk).ok()?;
+    match ai.manifest.label? {
+        ovelo_apk::manifest::Value::Str(s) => Some(s),
+        ovelo_apk::manifest::Value::Reference(r) => {
+            let res = res::ApkResources::open(apk.to_vec())?;
+            res.string_of(r).map(|s| s.to_string())
+        }
+        _ => None,
+    }
+}
+
 /// Hold the VM's recursive mutex for a batch of driver-side work.
 /// `invoke` self-locks, but the driver also touches `&mut Vm` between
 /// invokes (runnable-drain bookkeeping, GC, dex-tree refresh) — wrap
@@ -595,6 +700,8 @@ impl Vm {
                 .join("storage")
                 .join("emulated")
                 .join("0"),
+            installed_launchers: Vec::new(),
+            installed_apks: std::collections::BTreeMap::new(),
             depth: 0,
             stack: Vec::new(),
             throw_sites: HashMap::new(),

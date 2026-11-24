@@ -190,6 +190,15 @@ impl ApkResources {
         self.id_by_name.get(name).copied()
     }
 
+    /// Named `attr` resource → res_id (e.g. `colorSurface` for a
+    /// material attr the app defines).
+    pub fn attr_id_named(&self, name: &str) -> Option<u32> {
+        self.entry_names
+            .iter()
+            .find(|(id, n)| n.as_str() == name && self.type_name(**id) == Some("attr"))
+            .map(|(id, _)| *id)
+    }
+
     /// res_id → entry key name.
     pub fn entry_name(&self, res_id: u32) -> Option<&str> {
         self.entry_names.get(&res_id).map(|s| s.as_str())
@@ -362,5 +371,222 @@ pub fn typed_px(v: &EntryValue) -> f32 {
         0x06 => complex_to_float(v.data) * 100.0, // TYPE_FRACTION → %
         0x04 => f32::from_bits(v.data),
         _ => v.data as i32 as f32,
+    }
+}
+/// `android.R.color` res-ids -> ARGB literals (AOSP defaults; dynamic
+/// accent/neutral palettes use the Material baseline palette).
+pub fn framework_color(res_id: u32) -> Option<u32> {
+    match res_id {
+        0x01060000 => Some(0xffaaaaaa), // darker_gray
+        0x01060001 => Some(0xffffffff), // primary_text_dark
+        0x01060002 => Some(0xffffffff), // primary_text_dark_nodisable
+        0x01060003 => Some(0xde000000), // primary_text_light
+        0x01060004 => Some(0xde000000), // primary_text_light_nodisable
+        0x01060005 => Some(0xb3ffffff), // secondary_text_dark
+        0x01060006 => Some(0xb3ffffff), // secondary_text_dark_nodisable
+        0x01060007 => Some(0x8a000000), // secondary_text_light
+        0x01060008 => Some(0x8a000000), // secondary_text_light_nodisable
+        0x01060009 => Some(0x80808080), // tab_indicator_text
+        0x0106000a => Some(0xff000000), // widget_edittext_dark
+        0x0106000b => Some(0xffffffff), // white
+        0x0106000c => Some(0xff000000), // black
+        0x0106000d => Some(0x00000000), // transparent
+        0x0106000e => Some(0xff000000), // background_dark
+        0x0106000f => Some(0xffffffff), // background_light
+        0x01060010 => Some(0x80ffffff), // tertiary_text_dark
+        0x01060011 => Some(0x61000000), // tertiary_text_light
+        0x01060012 => Some(0xff33b5e5), // holo_blue_light
+        0x01060013 => Some(0xff0099cc), // holo_blue_dark
+        0x01060014 => Some(0xff99cc00), // holo_green_light
+        0x01060015 => Some(0xff669900), // holo_green_dark
+        0x01060016 => Some(0xffff4444), // holo_red_light
+        0x01060017 => Some(0xffcc0000), // holo_red_dark
+        0x01060018 => Some(0xffffbb33), // holo_orange_light
+        0x01060019 => Some(0xffff8800), // holo_orange_dark
+        0x0106001a => Some(0xffaa66cc), // holo_purple
+        0x0106001b => Some(0xff00ddff), // holo_blue_bright
+        0x0106001c => Some(0x00000000), // system_notification_accent_color
+        0x0106001d => Some(0xffffffff), // system_neutral1_0
+        0x0106001e => Some(0xfffefbff), // system_neutral1_10
+        0x0106001f => Some(0xfff1f0f7), // system_neutral1_50
+        0x01060020 => Some(0xffe2e2e9), // system_neutral1_100
+        0x01060021 => Some(0xffc6c6cd), // system_neutral1_200
+        0x01060022 => Some(0xffababb1), // system_neutral1_300
+        0x01060023 => Some(0xff909097), // system_neutral1_400
+        0x01060024 => Some(0xff76777d), // system_neutral1_500
+        0x01060025 => Some(0xff5d5e64), // system_neutral1_600
+        0x01060026 => Some(0xff45464c), // system_neutral1_700
+        0x01060027 => Some(0xff2f3036), // system_neutral1_800
+        0x01060028 => Some(0xff1a1b20), // system_neutral1_900
+        0x01060029 => Some(0xff000000), // system_neutral1_1000
+        0x0106002a => Some(0xffffffff), // system_neutral2_0
+        0x0106002b => Some(0xfffefbff), // system_neutral2_10
+        0x0106002c => Some(0xfff0f0fa), // system_neutral2_50
+        0x0106002d => Some(0xffe1e2ec), // system_neutral2_100
+        0x0106002e => Some(0xffc5c6d0), // system_neutral2_200
+        0x0106002f => Some(0xffa9abb4), // system_neutral2_300
+        0x01060030 => Some(0xff8f9099), // system_neutral2_400
+        0x01060031 => Some(0xff757780), // system_neutral2_500
+        0x01060032 => Some(0xff5c5e67), // system_neutral2_600
+        0x01060033 => Some(0xff44464f), // system_neutral2_700
+        0x01060034 => Some(0xff2e3038), // system_neutral2_800
+        0x01060035 => Some(0xff191b23), // system_neutral2_900
+        0x01060036 => Some(0xff000000), // system_neutral2_1000
+        0x01060037 => Some(0xffffffff), // system_accent1_0
+        0x01060038 => Some(0xfffefbff), // system_accent1_10
+        0x01060039 => Some(0xffeef0ff), // system_accent1_50
+        0x0106003a => Some(0xffd9e2ff), // system_accent1_100
+        0x0106003b => Some(0xffb0c6ff), // system_accent1_200
+        0x0106003c => Some(0xff94aae4), // system_accent1_300
+        0x0106003d => Some(0xff7a90c8), // system_accent1_400
+        0x0106003e => Some(0xff6076ac), // system_accent1_500
+        0x0106003f => Some(0xff475d92), // system_accent1_600
+        0x01060040 => Some(0xff2f4578), // system_accent1_700
+        0x01060041 => Some(0xff152e60), // system_accent1_800
+        0x01060042 => Some(0xff001945), // system_accent1_900
+        0x01060043 => Some(0xff000000), // system_accent1_1000
+        0x01060044 => Some(0xffffffff), // system_accent2_0
+        0x01060045 => Some(0xfffefbff), // system_accent2_10
+        0x01060046 => Some(0xffeef0ff), // system_accent2_50
+        0x01060047 => Some(0xffdce2f9), // system_accent2_100
+        0x01060048 => Some(0xffc0c6dc), // system_accent2_200
+        0x01060049 => Some(0xffa4abc1), // system_accent2_300
+        0x0106004a => Some(0xff8a90a5), // system_accent2_400
+        0x0106004b => Some(0xff70778b), // system_accent2_500
+        0x0106004c => Some(0xff575e71), // system_accent2_600
+        0x0106004d => Some(0xff404659), // system_accent2_700
+        0x0106004e => Some(0xff2a3042), // system_accent2_800
+        0x0106004f => Some(0xff151b2c), // system_accent2_900
+        0x01060050 => Some(0xff000000), // system_accent2_1000
+        0x01060051 => Some(0xffffffff), // system_accent3_0
+        0x01060052 => Some(0xfffffbff), // system_accent3_10
+        0x01060053 => Some(0xffffebfa), // system_accent3_50
+        0x01060054 => Some(0xfffdd7fa), // system_accent3_100
+        0x01060055 => Some(0xffe0bbdd), // system_accent3_200
+        0x01060056 => Some(0xffc3a0c1), // system_accent3_300
+        0x01060057 => Some(0xffa886a6), // system_accent3_400
+        0x01060058 => Some(0xff8c6d8c), // system_accent3_500
+        0x01060059 => Some(0xff725572), // system_accent3_600
+        0x0106005a => Some(0xff593d59), // system_accent3_700
+        0x0106005b => Some(0xff412742), // system_accent3_800
+        0x0106005c => Some(0xff2a122c), // system_accent3_900
+        0x0106005d => Some(0xff000000), // system_accent3_1000
+        0x0106005e => Some(0xffd9e2ff), // system_primary_container_light
+        0x0106005f => Some(0xff2f4578), // system_on_primary_container_light
+        0x01060060 => Some(0xff475d92), // system_primary_light
+        0x01060061 => Some(0xffffffff), // system_on_primary_light
+        0x01060062 => Some(0xffdce2f9), // system_secondary_container_light
+        0x01060063 => Some(0xff404659), // system_on_secondary_container_light
+        0x01060064 => Some(0xff575e71), // system_secondary_light
+        0x01060065 => Some(0xffffffff), // system_on_secondary_light
+        0x01060066 => Some(0xfffdd7fa), // system_tertiary_container_light
+        0x01060067 => Some(0xff593d59), // system_on_tertiary_container_light
+        0x01060068 => Some(0xff725572), // system_tertiary_light
+        0x01060069 => Some(0xffffffff), // system_on_tertiary_light
+        0x0106006a => Some(0xfffaf8ff), // system_background_light
+        0x0106006b => Some(0xff1a1b20), // system_on_background_light
+        0x0106006c => Some(0xfffaf8ff), // system_surface_light
+        0x0106006d => Some(0xff1a1b20), // system_on_surface_light
+        0x0106006e => Some(0xfff4f3fa), // system_surface_container_low_light
+        0x0106006f => Some(0xffffffff), // system_surface_container_lowest_light
+        0x01060070 => Some(0xffeeedf4), // system_surface_container_light
+        0x01060071 => Some(0xffe8e7ef), // system_surface_container_high_light
+        0x01060072 => Some(0xffe2e2e9), // system_surface_container_highest_light
+        0x01060073 => Some(0xfffaf8ff), // system_surface_bright_light
+        0x01060074 => Some(0xffdad9e0), // system_surface_dim_light
+        0x01060075 => Some(0xffe1e2ec), // system_surface_variant_light
+        0x01060076 => Some(0xff44464f), // system_on_surface_variant_light
+        0x01060077 => Some(0xff757780), // system_outline_light
+        0x01060078 => Some(0xffba1a1a), // system_error_light
+        0x01060079 => Some(0xffffffff), // system_on_error_light
+        0x0106007a => Some(0xffffdad6), // system_error_container_light
+        0x0106007b => Some(0xff93000a), // system_on_error_container_light
+        0x0106007c => Some(0xffd9e2ff), // system_control_activated_light
+        0x0106007d => Some(0xff44464f), // system_control_normal_light
+        0x0106007e => Some(0xff000000), // system_control_highlight_light
+        0x0106007f => Some(0xffe2e2e9), // system_text_primary_inverse_light
+        0x01060080 => Some(0xffc5c6d0), // system_text_secondary_and_tertiary_inverse_light
+        0x01060081 => Some(0xffe2e2e9), // system_text_primary_inverse_disable_only_light
+        0x01060082 => Some(0xffe2e2e9), // system_text_secondary_and_tertiary_inverse_disabled_light
+        0x01060083 => Some(0xffe2e2e9), // system_text_hint_inverse_light
+        0x01060084 => Some(0xff6076ac), // system_palette_key_color_primary_light
+        0x01060085 => Some(0xff70778b), // system_palette_key_color_secondary_light
+        0x01060086 => Some(0xff8c6d8c), // system_palette_key_color_tertiary_light
+        0x01060087 => Some(0xff76777d), // system_palette_key_color_neutral_light
+        0x01060088 => Some(0xff757780), // system_palette_key_color_neutral_variant_light
+        0x01060089 => Some(0xff2f4578), // system_primary_container_dark
+        0x0106008a => Some(0xffd9e2ff), // system_on_primary_container_dark
+        0x0106008b => Some(0xffb0c6ff), // system_primary_dark
+        0x0106008c => Some(0xff152e60), // system_on_primary_dark
+        0x0106008d => Some(0xff404659), // system_secondary_container_dark
+        0x0106008e => Some(0xffdce2f9), // system_on_secondary_container_dark
+        0x0106008f => Some(0xffc0c6dc), // system_secondary_dark
+        0x01060090 => Some(0xff2a3042), // system_on_secondary_dark
+        0x01060091 => Some(0xff593d59), // system_tertiary_container_dark
+        0x01060092 => Some(0xfffdd7fa), // system_on_tertiary_container_dark
+        0x01060093 => Some(0xffe0bbdd), // system_tertiary_dark
+        0x01060094 => Some(0xff412742), // system_on_tertiary_dark
+        0x01060095 => Some(0xff121318), // system_background_dark
+        0x01060096 => Some(0xffe2e2e9), // system_on_background_dark
+        0x01060097 => Some(0xff121318), // system_surface_dark
+        0x01060098 => Some(0xffe2e2e9), // system_on_surface_dark
+        0x01060099 => Some(0xff1a1b20), // system_surface_container_low_dark
+        0x0106009a => Some(0xff0c0e13), // system_surface_container_lowest_dark
+        0x0106009b => Some(0xff1e1f25), // system_surface_container_dark
+        0x0106009c => Some(0xff282a2f), // system_surface_container_high_dark
+        0x0106009d => Some(0xff33343a), // system_surface_container_highest_dark
+        0x0106009e => Some(0xff38393f), // system_surface_bright_dark
+        0x0106009f => Some(0xff121318), // system_surface_dim_dark
+        0x010600a0 => Some(0xff44464f), // system_surface_variant_dark
+        0x010600a1 => Some(0xffc5c6d0), // system_on_surface_variant_dark
+        0x010600a2 => Some(0xff8f9099), // system_outline_dark
+        0x010600a3 => Some(0xffffb4ab), // system_error_dark
+        0x010600a4 => Some(0xff690005), // system_on_error_dark
+        0x010600a5 => Some(0xff93000a), // system_error_container_dark
+        0x010600a6 => Some(0xffffdad6), // system_on_error_container_dark
+        0x010600a7 => Some(0xff2f4578), // system_control_activated_dark
+        0x010600a8 => Some(0xffc5c6d0), // system_control_normal_dark
+        0x010600a9 => Some(0xffffffff), // system_control_highlight_dark
+        0x010600aa => Some(0xff1a1b20), // system_text_primary_inverse_dark
+        0x010600ab => Some(0xff44464f), // system_text_secondary_and_tertiary_inverse_dark
+        0x010600ac => Some(0xff1a1b20), // system_text_primary_inverse_disable_only_dark
+        0x010600ad => Some(0xff1a1b20), // system_text_secondary_and_tertiary_inverse_disabled_dark
+        0x010600ae => Some(0xff1a1b20), // system_text_hint_inverse_dark
+        0x010600af => Some(0xff6076ac), // system_palette_key_color_primary_dark
+        0x010600b0 => Some(0xff70778b), // system_palette_key_color_secondary_dark
+        0x010600b1 => Some(0xff8c6d8c), // system_palette_key_color_tertiary_dark
+        0x010600b2 => Some(0xff76777d), // system_palette_key_color_neutral_dark
+        0x010600b3 => Some(0xff757780), // system_palette_key_color_neutral_variant_dark
+        0x010600b4 => Some(0xffd9e2ff), // system_primary_fixed
+        0x010600b5 => Some(0xffb0c6ff), // system_primary_fixed_dim
+        0x010600b6 => Some(0xff001945), // system_on_primary_fixed
+        0x010600b7 => Some(0xff2f4578), // system_on_primary_fixed_variant
+        0x010600b8 => Some(0xffdce2f9), // system_secondary_fixed
+        0x010600b9 => Some(0xffc0c6dc), // system_secondary_fixed_dim
+        0x010600ba => Some(0xff151b2c), // system_on_secondary_fixed
+        0x010600bb => Some(0xff404659), // system_on_secondary_fixed_variant
+        0x010600bc => Some(0xfffdd7fa), // system_tertiary_fixed
+        0x010600bd => Some(0xffe0bbdd), // system_tertiary_fixed_dim
+        0x010600be => Some(0xff2a122c), // system_on_tertiary_fixed
+        0x010600bf => Some(0xff593d59), // system_on_tertiary_fixed_variant
+        0x010600c0 => Some(0xffc5c6d0), // system_outline_variant_light
+        0x010600c1 => Some(0xff44464f), // system_outline_variant_dark
+        0x010600c2 => Some(0x1f1b1b22), // system_surface_disabled
+        0x010600c3 => Some(0x1fe1e3e8), // system_on_surface_disabled
+        0x010600c4 => Some(0x1f757680), // system_outline_disabled
+        0x010600c5 => Some(0xffffffff), // system_error_0
+        0x010600c6 => Some(0xfffffbff), // system_error_10
+        0x010600c7 => Some(0xffffedea), // system_error_50
+        0x010600c8 => Some(0xffffdad6), // system_error_100
+        0x010600c9 => Some(0xffffb4ab), // system_error_200
+        0x010600ca => Some(0xffff897d), // system_error_300
+        0x010600cb => Some(0xffff5449), // system_error_400
+        0x010600cc => Some(0xffde3730), // system_error_500
+        0x010600cd => Some(0xffba1a1a), // system_error_600
+        0x010600ce => Some(0xff93000a), // system_error_700
+        0x010600cf => Some(0xff690005), // system_error_800
+        0x010600d0 => Some(0xff410002), // system_error_900
+        0x010600d1 => Some(0xff000000), // system_error_1000
+        _ => None,
     }
 }

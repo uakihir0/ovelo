@@ -473,6 +473,11 @@ pub struct ManifestInfo {
     pub theme: Option<u32>,
     /// `activity/@android:theme` resource ids by qualified activity name.
     pub activity_themes: std::collections::HashMap<String, u32>,
+    /// `application/@android:icon` resource id — the launcher icon.
+    pub icon: Option<u32>,
+    /// `application/@android:label` — a string resource reference or a
+    /// literal string (PackageItemInfo.loadLabel's app name).
+    pub label: Option<Value>,
     /// androidx.startup initializers: `meta-data` names under the
     /// `androidx.startup.InitializationProvider` whose value is
     /// `androidx.startup` (e.g. `androidx.work.WorkManagerInitializer`).
@@ -582,6 +587,15 @@ pub fn parse_manifest(b: &[u8]) -> Result<ManifestInfo> {
                     Some(Value::Reference(r)) => Some(*r),
                     _ => None,
                 };
+                info.icon = match el.android("icon") {
+                    Some(Value::Reference(r)) => Some(*r),
+                    _ => None,
+                };
+                info.label = el.android("label").and_then(|v| match v {
+                    Value::Reference(r) => Some(Value::Reference(*r)),
+                    Value::Str(s) => Some(Value::Str(s.clone())),
+                    _ => None,
+                });
             }
             "uses-sdk" => {
                 info.min_sdk = el.android_int("minSdkVersion");

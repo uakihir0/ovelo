@@ -148,6 +148,9 @@ const P_ORIENTATION: u32 = 0xFFFD_FFDD;
 pub const P_TCOLOR: u32 = 0xFFFD_FFE3;
 /// Live `setTextSize` px — same fallthrough path as [`P_TCOLOR`].
 pub const P_TSIZE: u32 = 0xFFFD_FFE2;
+/// Live `setBackgroundColor`/`setBackgroundResource` — raw int arg
+/// (packed ARGB or a res id `color_v` resolves).
+pub const P_BGCOLOR: u32 = 0xFFFD_FFE1;
 /// Resolved layout direction stored on a `*LayoutParams` by
 /// `resolveLayoutDirection` (AOSP `mLayoutDirection`).
 const P_LP_DIR: u32 = u32::MAX - 29;
@@ -303,6 +306,9 @@ pub struct DexViewInfo {
     /// `android:clipChildren` / `setClipChildren` — when false the
     /// parent's draw pass doesn't clip children to their bounds.
     pub clip_children: bool,
+    /// `android:maxLines` — caps wrapped line count; overflowing text
+    /// truncates to the first `n` lines.
+    pub max_lines: Option<i32>,
 }
 
 /// The activity's content view handle (what `setContentView` attached).
@@ -370,11 +376,69 @@ fn attr_bool_ref(vm: &Vm, id: u32) -> Option<bool> {
 fn color_v(vm: &Vm, v: V) -> Option<i32> {
     match v {
         V::I32(c) if c < 0 => Some(c),
-        V::I32(id) if id > 0 => vm
-            .apk_res
-            .as_ref()
-            .and_then(|r| r.entry_value(id as u32))
-            .map(|e| e.data as i32),
+        V::I32(id) if id > 0 => {
+            let res = vm.apk_res.as_ref()?;
+            // `@attr` ids resolve through the bound theme; TYPE_REFERENCE
+            // and TYPE_ATTRIBUTE hops chase until a literal lands. An
+            // entry that resolves to an XML drawable file yields the
+            // drawable's representative fill color (its `data` is the
+            // string-pool index of the path — NOT a color).
+            let mut cur = id as u32;
+            for _ in 0..8 {
+                // `android.R.color` ids (0x0106xxxx) aren't in the app
+                // table; the framework palette answers for them.
+                let Some(ev) = res.entry_value(cur).cloned() else {
+                    return crate::res::framework_color(cur).map(|c| c as i32);
+                };
+                match ev.data_type {
+                    0x01 => cur = ev.data,
+                    0x02 => {
+                        return vector::resolve_ref_color(
+                            vector::RCtx {
+                                res,
+                                theme: vm.theme_id,
+                            },
+                            ev.data,
+                        )
+                        .or_else(|| {
+                            res.style_item(vm.theme_id, ev.data).and_then(|n| {
+                                (n.data_type == 0x01).then(|| {
+                                    vector::drawable_flat_color(
+                                        vector::RCtx {
+                                            res,
+                                            theme: vm.theme_id,
+                                        },
+                                        n.data,
+                                    )
+                                })?
+                            })
+                        })
+                        .map(|c| c as i32);
+                    }
+                    // Color ints / plain ints — literal.
+                    0x1c..=0x1f | 0x10 | 0x11 | 0x04 => return Some(ev.data as i32),
+                    // A string (drawable/xml path or color literal text).
+                    0x03 => {
+                        return ev
+                            .string
+                            .as_deref()
+                            .and_then(vector::parse_color)
+                            .or_else(|| {
+                                vector::drawable_flat_color(
+                                    vector::RCtx {
+                                        res,
+                                        theme: vm.theme_id,
+                                    },
+                                    cur,
+                                )
+                            })
+                            .map(|c| c as i32);
+                    }
+                    _ => return None,
+                }
+            }
+            None
+        }
         _ => None,
     }
 }
@@ -489,7 +553,10 @@ pub(crate) fn dex_view_info(vm: &Vm, h: u32) -> Option<DexViewInfo> {
         Some(v @ (V::I32(_) | V::Ref(_))) => color_v(vm, v),
         _ => attr_find(vm, h, "textColor").and_then(|v| color_v(vm, v)),
     };
-    let bg_color = attr_find(vm, h, "background").and_then(|v| color_v(vm, v));
+    let bg_color = match pseudo_get(vm, h, P_BGCOLOR) {
+        Some(v @ (V::I32(_) | V::Ref(_))) => color_v(vm, v),
+        _ => attr_find(vm, h, "background").and_then(|v| color_v(vm, v)),
+    };
     let lp_w = attr_find(vm, h, "layout_width")
         .map(|v| len_v(vm, v))
         .unwrap_or(-1);
@@ -588,6 +655,13 @@ pub(crate) fn dex_view_info(vm: &Vm, h: u32) -> Option<DexViewInfo> {
                 _ => true,
             },
         },
+        max_lines: match attr_find(vm, h, "maxLines").or_else(|| attr_find(vm, h, "lines")) {
+            Some(V::I32(n)) if n > 0 => Some(n),
+            Some(V::Ref(r)) => s(vm, r)
+                .and_then(|t| t.parse::<i32>().ok())
+                .filter(|n| *n > 0),
+            _ => None,
+        },
     })
 }
 
@@ -656,7 +730,9 @@ fn image_pixels_at(vm: &Vm, v: V, depth: u32) -> Option<(u32, u32, std::rc::Rc<V
         return None;
     }
     match v {
-        V::I32(res) if res > 0 => super::vector::drawable_bitmap(vm, res as u32),
+        V::I32(res) if res > 0 => {
+            super::vector::rctx(vm).and_then(|r| super::vector::drawable_bitmap(r, res as u32))
+        }
         V::Ref(h) => super::android::bitmap_pixels(vm, v)
             .or_else(|| {
                 let path = image_source_path(vm, v)?;
@@ -1389,12 +1465,15 @@ pub(crate) fn call(
                 // `addView(View)` sig only — every overload ends in
                 // `addViewInner(child)` with the child at args[1], so
                 // fall back to it when the exact proto isn't bridged.
-                let host = if matches!(name, "addView" | "addViewInLayout") {
+                let host = if matches!(name, "addView" | "addViewInLayout" | "attachViewToParent") {
+                    // RecyclerView attaches its *visible* rows through
+                    // attachViewToParent too — leaving it dex-only
+                    // meant bridged groups rendered empty lists.
                     vm.named_host(class, name, sig)
                         .or_else(|| vm.named_host(class, name, "(Landroid/view/View;)V"))
                 } else {
-                    // attachViewToParent* are transient (RecyclerView
-                    // scrap): dex bookkeeping only, no host bridge.
+                    // attachViewToParentInLayout is transient
+                    // (RecyclerView scrap): dex bookkeeping only.
                     None
                 };
                 let mut host_ran = false;
@@ -1960,8 +2039,10 @@ pub(crate) fn call(
                 )?;
                 if crate::dbg_flag("OVELO_VIEWDBG") {
                     eprintln!(
-                        "[viewdbg] builtin measure h{this} onMeasure={:?}",
-                        r.is_some()
+                        "[viewdbg] builtin measure h{this} onMeasure={:?} meas={}x{}",
+                        r.is_some(),
+                        pint(vm, this, P_MEAS_W) & 0x00FF_FFFF,
+                        pint(vm, this, P_MEAS_H) & 0x00FF_FFFF,
                     );
                 }
             } else {
@@ -2162,11 +2243,20 @@ pub(crate) fn call(
             pseudo_set(vm, this, P_INVALID_SEQ, V::I32(n.wrapping_add(1)));
             Some(None)
         }
+        "setBackgroundColor" | "setBackgroundResource" => {
+            // Record the raw arg (packed ARGB or a res id — color_v
+            // resolves both at materialize time).
+            pseudo_set(
+                vm,
+                this,
+                P_BGCOLOR,
+                args.get(1).cloned().unwrap_or(V::I32(0)),
+            );
+            Some(None)
+        }
         "requestFocus"
         | "clearFocus"
         | "setAlpha"
-        | "setBackgroundColor"
-        | "setBackgroundResource"
         | "setPadding"
         | "setElevation"
         | "setShowDividers"
@@ -3616,8 +3706,15 @@ fn group_measure_fallback(vm: &mut Vm, this: u32, pw: i32, ph: i32) {
         }
         .abs()
         .max(1.0);
+        // An ImageView's content is its drawable: AOSP ImageView.
+        // onMeasure reports the drawable's intrinsic size (still folded
+        // through resolveSize below), never the parent's spec size.
+        let (iw, ih) = pseudo_get(vm, this, P_IMAGE)
+            .and_then(|v| image_pixels(vm, v))
+            .map(|(w, h, _)| (w as i32, h as i32))
+            .unwrap_or((0, 0));
         let (cw, chh) = if text.is_empty() {
-            (0, 0)
+            (iw, ih)
         } else {
             // Wrapping: when the unbroken text overflows the available
             // width it folds to `ceil(cw/avail)` lines — a single-line
@@ -3638,6 +3735,10 @@ fn group_measure_fallback(vm: &mut Vm, this: u32, pw: i32, ph: i32) {
             };
             (frame_w, line_h * lines)
         };
+        // resolveSize semantics on the desired extent (content or
+        // drawable intrinsic): AT_MOST → min(desired, spec). An empty
+        // leaf stays 0 — an ImageView without a drawable and an empty
+        // TextView both measure to their padding in AOSP too.
         pseudo_set(
             vm,
             this,
@@ -3659,6 +3760,7 @@ fn group_measure_fallback(vm: &mut Vm, this: u32, pw: i32, ph: i32) {
     let linear = desc.contains("LinearLayout") || vm.extends_named(&desc, "LinearLayout");
     let linear_v = linear && linear_vertical(vm, this);
     let linear_h = linear && !linear_v;
+    let relative = !linear && vm.extends_named(&desc, "RelativeLayout");
     let (mut cw, mut chh) = (0i32, 0i32);
     for c in kids.iter().copied() {
         let V::Ref(ch) = c else { continue };
@@ -3855,6 +3957,51 @@ fn group_measure_fallback(vm: &mut Vm, this: u32, pw: i32, ph: i32) {
                     cw += added;
                 }
             }
+        }
+    }
+    // AOSP RelativeLayout.onMeasure derives WRAP bounds from the
+    // rule-resolved child positions — a `layout_below` child counts at
+    // its anchor's bottom, not at the origin. Without this a relative
+    // container wraps to its tallest child alone and everything stacked
+    // below the anchor overflows past the measured bottom (fossify
+    // home's launcher label lands under the icon, outside the cell).
+    if relative {
+        const MODE_MASK: i32 = 0x3 << 30;
+        const EXACTLY: i32 = 1 << 30;
+        const SIZE_MASK: i32 = 0x3FFF_FFFF;
+        // Pass -1 on a non-EXACTLY axis: parent-edge/center/match rules
+        // can't resolve against an unknown extent (AOSP's myWidth=-1).
+        let aw = if pw & MODE_MASK == EXACTLY {
+            pw & SIZE_MASK
+        } else {
+            -1
+        };
+        let ah = if ph & MODE_MASK == EXACTLY {
+            ph & SIZE_MASK
+        } else {
+            -1
+        };
+        let pad_l = lp_px(vm, attr_find(vm, this, "paddingLeft").unwrap_or(V::I32(0))).unwrap_or(0);
+        let pad_t = lp_px(vm, attr_find(vm, this, "paddingTop").unwrap_or(V::I32(0))).unwrap_or(0);
+        let ks = relative_positions(vm, this, aw, ah);
+        if crate::dbg_flag("OVELO_VIEWDBG") {
+            eprintln!(
+                "[viewdbg] relMeas h{this} aw={aw} ah={ah} cw={cw} chh={chh} kids={}",
+                ks.len()
+            );
+            for k in &ks {
+                eprintln!(
+                    "[viewdbg]   kid h{} {}x{} rect={:?}",
+                    k.ch, k.w, k.h, k.rect
+                );
+            }
+        }
+        for k in ks {
+            let (_, _, r, b) = k.rect;
+            // rect coords include this view's padding (lead = pad +
+            // margin) — strip it so `+ pad` below isn't double-counted.
+            cw = cw.max(r + k.mr - pad_l);
+            chh = chh.max(b + k.mb - pad_t);
         }
     }
     let self_w = resolve_size(cw + pad_w, pw, true).max(0);
@@ -4071,14 +4218,30 @@ fn group_layout_fallback(vm: &mut Vm, this: u32, _l: i32, _t: i32, r: i32, b: i3
     }
 }
 
-/// `RelativeLayout` subset: resolve the usual XML rules
+struct RelKid {
+    ch: u32,
+    id: i32,
+    w: i32,
+    h: i32,
+    ml: i32,
+    mt: i32,
+    mr: i32,
+    mb: i32,
+    match_w: bool,
+    match_h: bool,
+    rect: (i32, i32, i32, i32),
+}
+
+/// `RelativeLayout` position resolution: resolve the usual XML rules
 /// (`layout_alignParent*`, `layout_center*`, `layout_below`/`above`,
 /// `layout_toRightOf`/`toLeftOf`, `layout_align*`) against the
 /// container's content rect at each child's measured size + margins.
-/// Without this every child lands on the same origin — the pile of
-/// overlapped views that used to be the whole month page.
-/// `w`/`h` are the container's content size in its own coordinates.
-fn relative_layout_fallback(vm: &mut Vm, this: u32, w: i32, h: i32) {
+/// `w`/`h` are the container's full size in its own coordinates; an
+/// axis may pass `-1` when the extent is still unknown (a WRAP_CONTENT
+/// measure) — parent-edge/center/match rules on that axis are then
+/// ignored, matching AOSP's `myWidth/myHeight = -1` behavior.
+/// Pure reads: usable from both measure (content bounds) and layout.
+fn relative_positions(vm: &mut Vm, this: u32, w: i32, h: i32) -> Vec<RelKid> {
     let pad_l = lp_px(vm, attr_find(vm, this, "paddingLeft").unwrap_or(V::I32(0))).unwrap_or(0);
     let pad_t = lp_px(vm, attr_find(vm, this, "paddingTop").unwrap_or(V::I32(0))).unwrap_or(0);
     let pad_r = lp_px(vm, attr_find(vm, this, "paddingRight").unwrap_or(V::I32(0))).unwrap_or(0);
@@ -4105,18 +4268,7 @@ fn relative_layout_fallback(vm: &mut Vm, this: u32, w: i32, h: i32) {
         }
         0
     };
-    struct Kid {
-        id: i32,
-        w: i32,
-        h: i32,
-        ml: i32,
-        mt: i32,
-        mr: i32,
-        mb: i32,
-        match_w: bool,
-        match_h: bool,
-    }
-    let mut ks: Vec<Kid> = Vec::with_capacity(n);
+    let mut ks: Vec<RelKid> = Vec::with_capacity(n);
     for &ch in &kids {
         let lp_obj = match pseudo_get(vm, ch, P_LP) {
             Some(V::Ref(lp)) => lp,
@@ -4130,7 +4282,8 @@ fn relative_layout_fallback(vm: &mut Vm, this: u32, w: i32, h: i32) {
                 .or_else(|| attr_find(vm, ch, xml).map(|v| len_v(vm, v)))
                 .unwrap_or(-2)
         };
-        ks.push(Kid {
+        ks.push(RelKid {
+            ch,
             id: pint(vm, ch, P_VIEW_ID),
             w: pint(vm, ch, P_MEAS_W) & 0x00FF_FFFF,
             h: pint(vm, ch, P_MEAS_H) & 0x00FF_FFFF,
@@ -4140,6 +4293,7 @@ fn relative_layout_fallback(vm: &mut Vm, this: u32, w: i32, h: i32) {
             mb: margin(vm, ch, "bottomMargin"),
             match_w: lp_dim("width", "layout_width") == -1,
             match_h: lp_dim("height", "layout_height") == -1,
+            rect: (0, 0, 0, 0),
         });
     }
     let idx_of = |id: i32| -> Option<usize> {
@@ -4166,7 +4320,7 @@ fn relative_layout_fallback(vm: &mut Vm, this: u32, w: i32, h: i32) {
     // missing trailing edge falls back to leading+measured.
     type Axis = Vec<Option<(i32, i32)>>;
     let resolve_edges =
-        |vm: &Vm, ch: u32, k: &Kid, placed: &Axis, horiz: bool| -> Option<(i32, i32)> {
+        |vm: &Vm, ch: u32, k: &RelKid, placed: &Axis, horiz: bool| -> Option<(i32, i32)> {
             // Leading edge: sibling rules first (toRightOf/alignLeft,
             // below/alignTop), else the parent's near edge.
             let (lead_rules, trail_parent, lead_parent, lead_sib_rules, size, mlead, mtrail, mp) =
@@ -4207,7 +4361,9 @@ fn relative_layout_fallback(vm: &mut Vm, this: u32, w: i32, h: i32) {
             let mut lead: Option<i32> = None;
             let mut trail: Option<i32> = None;
             let mut pending = false;
-            if truthy(rule(vm, ch, trail_parent)) {
+            // extent < 0: WRAP axis mid-measure — parent-edge anchors
+            // can't resolve yet (AOSP leaves myWidth/myHeight = -1).
+            if extent >= 0 && truthy(rule(vm, ch, trail_parent)) {
                 trail = Some(extent - ptrailing - mtrail);
             }
             if truthy(rule(vm, ch, lead_parent)) {
@@ -4257,7 +4413,7 @@ fn relative_layout_fallback(vm: &mut Vm, this: u32, w: i32, h: i32) {
                 (Some(l), None) => {
                     // match_parent anchored only on the leading edge fills
                     // the rest of the parent's content box.
-                    if mp {
+                    if mp && extent >= 0 {
                         Some((l, extent - ptrailing - mtrail))
                     } else {
                         Some((l, l + size))
@@ -4274,16 +4430,17 @@ fn relative_layout_fallback(vm: &mut Vm, this: u32, w: i32, h: i32) {
                     }
                 }
                 (None, None) => {
-                    if truthy(rule(vm, ch, &["layout_centerInParent"]))
-                        || truthy(rule(
-                            vm,
-                            ch,
-                            if horiz {
-                                &["layout_centerHorizontal"]
-                            } else {
-                                &["layout_centerVertical"]
-                            },
-                        ))
+                    if extent >= 0
+                        && (truthy(rule(vm, ch, &["layout_centerInParent"]))
+                            || truthy(rule(
+                                vm,
+                                ch,
+                                if horiz {
+                                    &["layout_centerHorizontal"]
+                                } else {
+                                    &["layout_centerVertical"]
+                                },
+                            )))
                     {
                         let c =
                             pleading + (extent - pleading - ptrailing - size) / 2 + mlead - mtrail;
@@ -4318,28 +4475,36 @@ fn relative_layout_fallback(vm: &mut Vm, this: u32, w: i32, h: i32) {
             break;
         }
     }
-    let pos: Vec<(i32, i32, i32, i32)> = (0..n)
-        .map(|i| {
-            let (l, r) = xf[i].unwrap_or_else(|| {
-                let l = pad_l + ks[i].ml;
-                (l, l + ks[i].w)
-            });
-            let (t, b) = yf[i].unwrap_or_else(|| {
-                let t = pad_t + ks[i].mt;
-                (t, t + ks[i].h)
-            });
-            (l, t, r, b)
-        })
-        .collect();
-    for (i, &ch) in kids.iter().enumerate() {
-        let (cl, ct, cr, cb) = pos[i];
+    for i in 0..n {
+        let (l, r) = xf[i].unwrap_or_else(|| {
+            let l = pad_l + ks[i].ml;
+            (l, l + ks[i].w)
+        });
+        let (t, b) = yf[i].unwrap_or_else(|| {
+            let t = pad_t + ks[i].mt;
+            (t, t + ks[i].h)
+        });
+        ks[i].rect = (l, t, r, b);
+    }
+    ks
+}
+
+/// `RelativeLayout` subset: lay children out at the positions
+/// `relative_positions` resolved. Without this every child lands on
+/// the same origin — the pile of overlapped views that used to be the
+/// whole month page.
+fn relative_layout_fallback(vm: &mut Vm, this: u32, w: i32, h: i32) {
+    let ks = relative_positions(vm, this, w, h);
+    for k in &ks {
+        let ch = k.ch;
+        let (cl, ct, cr, cb) = k.rect;
         // AOSP RelativeLayout measures children twice — once raw, once
         // under the dependency-resolved extent. Re-measure a child
         // whose rule-resolved size differs from its first pass so its
         // own `onLayout`/descendants see the squeezed bounds instead
         // of the unconstrained measurement.
         let (rw, rh) = (cr - cl, cb - ct);
-        if rw != ks[i].w || rh != ks[i].h {
+        if rw != k.w || rh != k.h {
             const EXACTLY: i32 = 1 << 30;
             // Read the LIVE LayoutParams dims — `setLayoutParams`
             // mutations beat the XML attrs. Spec per axis: a changed
@@ -4359,12 +4524,12 @@ fn relative_layout_fallback(vm: &mut Vm, this: u32, w: i32, h: i32) {
             };
             let dw = dim("width", "layout_width");
             let dh = dim("height", "layout_height");
-            let ws = if rw != ks[i].w {
+            let ws = if rw != k.w {
                 child_measure_spec(EXACTLY | rw.max(0), 0, dw)
             } else {
                 EXACTLY | rw.max(0)
             };
-            let hs = if rh != ks[i].h {
+            let hs = if rh != k.h {
                 child_measure_spec(EXACTLY | rh.max(0), 0, dh)
             } else {
                 EXACTLY | rh.max(0)
@@ -4399,7 +4564,7 @@ fn relative_layout_fallback(vm: &mut Vm, this: u32, w: i32, h: i32) {
             .collect();
             eprintln!(
                 "[viewdbg] relLayout h{ch} id={:#x} meas={}x{} at {cl},{ct} rules={:?}",
-                ks[i].id, ks[i].w, ks[i].h, rules
+                k.id, k.w, k.h, rules
             );
         }
         if let Err(e) = vm.call_virtual(

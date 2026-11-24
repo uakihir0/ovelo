@@ -938,6 +938,19 @@ fn register_compat_shims(
             let p = V::Ref(vm.heap.intern_str(pkg));
             ovelo_dexrt::pseudo_set(vm, h, ovelo_dexrt::P_DATA, n);
             ovelo_dexrt::pseudo_set(vm, h, ovelo_dexrt::P_COMPONENT, p);
+            // ComponentInfo.applicationInfo — guests read
+            // `activityInfo.applicationInfo.packageName` on query
+            // results (fossify home's launcher list).
+            let ai = V::Ref(vm.heap.alloc(Obj::Host {
+                class_idx: u64::MAX,
+                desc: "Landroid/content/pm/ApplicationInfo;".to_string(),
+                fields: HashMap::new(),
+                state: HostState::Empty,
+            }));
+            if let V::Ref(ah) = ai {
+                ovelo_dexrt::pseudo_set(vm, ah, ovelo_dexrt::P_COMPONENT, p);
+            }
+            ovelo_dexrt::pseudo_set(vm, h, ovelo_dexrt::P_META, ai);
         }
         info
     }
@@ -954,30 +967,54 @@ fn register_compat_shims(
         }
         ri
     }
-    // queryIntent* → List<ResolveInfo> over the declared names.
+    // queryIntent* → List<ResolveInfo> over the declared names
+    // (activity, package) pairs — launchers additionally enumerate
+    // every installed app's launcher activity so a home app can list
+    // launchable apps like AOSP does.
+    let mut launcher_pairs: Vec<(String, String)> = manifest
+        .activities
+        .iter()
+        .map(|a| (a.clone(), manifest.package.clone()))
+        .collect();
+    for (p, a) in &v.installed_launchers {
+        if *p != manifest.package {
+            launcher_pairs.push((a.clone(), p.clone()));
+        }
+    }
     for (info_desc, meth, names) in [
         (
             "Landroid/content/pm/ServiceInfo;",
             "queryIntentServices",
-            manifest.services.clone(),
+            manifest
+                .services
+                .iter()
+                .map(|s| (s.clone(), manifest.package.clone()))
+                .collect::<Vec<_>>(),
         ),
         (
             "Landroid/content/pm/ActivityInfo;",
             "queryIntentActivities",
-            manifest.activities.clone(),
+            launcher_pairs.clone(),
         ),
         (
             "Landroid/content/pm/ActivityInfo;",
             "queryBroadcastReceivers",
-            manifest.receivers.clone(),
+            manifest
+                .receivers
+                .iter()
+                .map(|s| (s.clone(), manifest.package.clone()))
+                .collect::<Vec<_>>(),
         ),
         (
             "Landroid/content/pm/ProviderInfo;",
             "queryIntentContentProviders",
-            manifest.providers.clone(),
+            manifest
+                .providers
+                .iter()
+                .map(|s| (s.clone(), manifest.package.clone()))
+                .collect::<Vec<_>>(),
         ),
     ] {
-        let pkg = manifest.package.clone();
         let _ = v.register_host(
             "Landroid/content/pm/PackageManager;",
             meth,
@@ -986,8 +1023,8 @@ fn register_compat_shims(
                 let want = intent_class(vm, a.get(1).copied());
                 let infos: Vec<V> = names
                     .iter()
-                    .filter(|n| want.as_deref().is_none_or(|c| n.ends_with(c) || *n == c))
-                    .map(|n| mint_ri(vm, info_desc, n, &pkg))
+                    .filter(|(n, _)| want.as_deref().is_none_or(|c| n.ends_with(c) || *n == c))
+                    .map(|(n, p)| mint_ri(vm, info_desc, n, p))
                     .collect();
                 if std::env::var_os("PMDEBUG").is_some() {
                     eprintln!(
@@ -1409,6 +1446,23 @@ fn run_app(store: &InstallStore, package: &str) -> Result<(), OveloError> {
                 // SMS apps compare the two to decide they are the default
                 // handler (an empty answer sends them to a setup screen).
                 v.guest_package = Some(rec.app.package.clone());
+                // Launcher queries (home screen) enumerate every
+                // installed app's launcher activity — parse each
+                // record's manifest once at startup.
+                for r in store.installed() {
+                    let Ok(bytes) = store.apk_bytes(&r) else {
+                        continue;
+                    };
+                    let Ok(ai) = ovelo_apk::inspect_apk(&bytes) else {
+                        continue;
+                    };
+                    if let Some(act) = ai.manifest.launcher_activity {
+                        v.installed_launchers
+                            .push((ai.manifest.package.clone(), act));
+                    }
+                    v.installed_apks
+                        .insert(ai.manifest.package, std::rc::Rc::new(bytes));
+                }
                 // Seed shared external storage once so file managers
                 // have something to list (safe: only fills what's absent).
                 let ext = &v.external_root;

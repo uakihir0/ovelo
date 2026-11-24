@@ -210,6 +210,19 @@ pub(crate) fn call(
         context_call(vm, class, name, sig, args)?
     } else if class == "Landroid/content/pm/PackageManager;" || class.ends_with("PackageManager;") {
         pm_call(vm, name, args)?
+    } else if class == "Landroid/content/pm/PackageItemInfo;"
+        || matches!(
+            class,
+            "Landroid/content/pm/ResolveInfo;"
+                | "Landroid/content/pm/ActivityInfo;"
+                | "Landroid/content/pm/ServiceInfo;"
+                | "Landroid/content/pm/ProviderInfo;"
+                | "Landroid/content/pm/ApplicationInfo;"
+                | "Landroid/content/pm/PackageInfo;"
+                | "Landroid/appwidget/AppWidgetProviderInfo;"
+        )
+    {
+        item_info_call(vm, name, args)?
     } else if class == "Landroid/content/ContentResolver;" || class.ends_with("ContentResolver;") {
         match name {
             "query" | "rawQuery" => {
@@ -1856,6 +1869,63 @@ fn component_call(vm: &mut Vm, name: &str, args: &[V]) -> Rt<Option<Option<V>>> 
 // ---------------------------------------------------------------------
 // SharedPreferences / Editor — map-backed; Editor writes through
 
+/// Resolve a color res-id to its ARGB int: chases `@color` reference
+/// hops and `?attr` indirection through the bound theme, then through
+/// `android.R.color` ids (`0x0106xxxx`) via the framework table.
+/// Unresolvable attrs fall back to opaque black so text stays visible.
+fn resolve_color_id(vm: &mut Vm, res_id: u32) -> u32 {
+    let mut id = res_id;
+    let mut data = 0xFF00_0000u32;
+    for _ in 0..8 {
+        let Some(res) = vm.apk_res.as_ref() else {
+            break;
+        };
+        let Some(ev) = res.entry_value(id) else {
+            if let Some(c) = crate::res::framework_color(id) {
+                data = c;
+            }
+            break;
+        };
+        match ev.data_type {
+            0x01 => {
+                id = ev.data;
+            }
+            0x02 => match view::theme_attr_entry(vm, ev.data) {
+                Some(next) if next.data_type == 0x01 => {
+                    id = next.data;
+                }
+                Some(next) => {
+                    data = next.data;
+                    break;
+                }
+                None => break,
+            },
+            0x03 => {
+                data = ev
+                    .string
+                    .as_deref()
+                    .and_then(vector::parse_color)
+                    .or_else(|| {
+                        vector::drawable_flat_color(
+                            vector::RCtx {
+                                res,
+                                theme: vm.theme_id,
+                            },
+                            id,
+                        )
+                    })
+                    .unwrap_or(0xFF00_0000);
+                break;
+            }
+            _ => {
+                data = ev.data;
+                break;
+            }
+        }
+    }
+    data
+}
+
 fn prefs_call(vm: &mut Vm, name: &str, args: &[V]) -> Rt<Option<Option<V>>> {
     let V::Ref(h) = args.first().copied().unwrap_or(V::Ref(0)) else {
         return Ok(None);
@@ -2018,7 +2088,10 @@ fn context_call(
                 },
             ))
         }
-        "getColor" => Some(Some(V::I32(0xFF000000u32 as i32))),
+        "getColor" => Some(Some(V::I32(resolve_color_id(
+            vm,
+            i64v(args.get(1).copied().unwrap_or(V::I32(0))) as u32,
+        ) as i32))),
         "getDrawable" => {
             let vdc = [
                 "Landroidx/vectordrawable/graphics/drawable/VectorDrawableCompat;",
@@ -2727,6 +2800,120 @@ fn perm_arg(vm: &Vm, args: &[V]) -> Option<String> {
         .find(|s| s.contains("permission"))
 }
 
+/// `PackageItemInfo` family (ResolveInfo, *Info, AppWidgetProviderInfo)
+/// — `loadLabel`/`loadIcon` over the pseudo fields `mint_info` fills.
+fn item_info_call(vm: &mut Vm, name: &str, args: &[V]) -> Rt<Option<Option<V>>> {
+    let V::Ref(h) = args.first().copied().unwrap_or(V::Ref(0)) else {
+        return Ok(None);
+    };
+    Ok(match name {
+        "loadLabel" => {
+            // The real application label from the installed APK's
+            // manifest (`@android:label` → arsc string or literal) —
+            // not the component's class name. The package travels as a
+            // dotted string in P_COMPONENT, same walk `loadIcon` does.
+            let pkg = {
+                let mut found = None;
+                let mut cur = Some(h);
+                for _ in 0..4 {
+                    let Some(ch) = cur else { break };
+                    if let Some(V::Ref(s)) = pseudo_get(vm, ch, P_COMPONENT) {
+                        if let Some(p) = vm.heap.str_val(s) {
+                            if p.contains('.') {
+                                found = Some(p.to_string());
+                                break;
+                            }
+                        }
+                    }
+                    cur = [P_META, P_TARGET as u64].iter().find_map(|k| {
+                        match pseudo_get(vm, ch, *k) {
+                            Some(V::Ref(x)) if x != 0 => Some(x),
+                            _ => None,
+                        }
+                    });
+                }
+                found
+            };
+            if let Some(label) = pkg
+                .and_then(|p| vm.installed_apks.get(&p).cloned())
+                .and_then(|b| crate::package_label(&b))
+            {
+                return Ok(Some(Some(jstr(vm, &label))));
+            }
+            // App label: the *Info's name (P_DATA), else its package —
+            // chasing ResolveInfo→*Info and *Info→applicationInfo when
+            // the receiver itself only carries links.
+            let live = |v: Option<V>| v.filter(|v| matches!(v, V::Ref(x) if *x != 0));
+            let via = |vh: u32, key: u32| live(pseudo_get(vm, vh, key));
+            let v = via(h, P_DATA).or_else(|| via(h, P_COMPONENT)).or_else(|| {
+                live(pseudo_get(vm, h, P_META)).and_then(|m| {
+                    if let V::Ref(mh) = m {
+                        live(pseudo_get(vm, mh, P_COMPONENT))
+                    } else {
+                        None
+                    }
+                })
+            });
+            let v = v
+                .or_else(|| match live(pseudo_get(vm, h, P_TARGET)) {
+                    Some(V::Ref(th)) => {
+                        via(th, P_DATA)
+                            .or_else(|| via(th, P_COMPONENT))
+                            .or_else(|| {
+                                live(pseudo_get(vm, th, P_META)).and_then(|m| {
+                                    if let V::Ref(mh) = m {
+                                        live(pseudo_get(vm, mh, P_COMPONENT))
+                                    } else {
+                                        None
+                                    }
+                                })
+                            })
+                    }
+                    _ => None,
+                })
+                .unwrap_or_else(|| jstr(vm, "app"));
+            Some(Some(v))
+        }
+        "loadIcon" | "loadUnbadgedIcon" => {
+            // Real icon: decode the installed APK's application icon.
+            // The package travels as P_COMPONENT (a package-like
+            // dotted string) on the *Info itself or one hop through
+            // P_META/P_TARGET — same linkage `loadLabel` walks.
+            let pkg = {
+                let mut found = None;
+                let mut cur = Some(h);
+                for _ in 0..4 {
+                    let Some(ch) = cur else { break };
+                    if let Some(V::Ref(s)) = pseudo_get(vm, ch, P_COMPONENT) {
+                        if let Some(p) = vm.heap.str_val(s) {
+                            if p.contains('.') {
+                                found = Some(p.to_string());
+                                break;
+                            }
+                        }
+                    }
+                    cur = [P_META, P_TARGET as u64].iter().find_map(|k| {
+                        match pseudo_get(vm, ch, *k) {
+                            Some(V::Ref(x)) if x != 0 => Some(x),
+                            _ => None,
+                        }
+                    });
+                }
+                found
+            };
+            match pkg.and_then(|p| super::vector::package_icon_drawable(vm, &p)) {
+                Some(d) => Some(Some(d)),
+                None => Some(Some(host(
+                    vm,
+                    "Landroid/graphics/drawable/Drawable;",
+                    HostState::Empty,
+                ))),
+            }
+        }
+        _ => None,
+    })
+}
+
 fn pm_call(vm: &mut Vm, name: &str, args: &[V]) -> Rt<Option<Option<V>>> {
     Ok(match name {
         "getPackageInfo" => {
@@ -2855,12 +3042,44 @@ fn pm_call(vm: &mut Vm, name: &str, args: &[V]) -> Rt<Option<Option<V>>> {
                 "Landroid/content/pm/ProviderInfo;",
                 HostState::Empty,
             ))),
+            "getLaunchIntentForPackage" | "getLeanbackLaunchIntentForPackage" => {
+                // Launchers resolve installed packages to an Intent
+                // carrying a ComponentName; unknown package → null.
+                let want = args
+                    .iter()
+                    .skip(1)
+                    .find_map(|a| sv(vm, *a))
+                    .unwrap_or_default();
+                match vm.installed_launchers.iter().find(|(p, _)| *p == want) {
+                    Some((pkg, act)) => {
+                        let act = act.clone();
+                        let pkg = pkg.clone();
+                        let cn = host(vm, "Landroid/content/ComponentName;", HostState::Empty);
+                        if let V::Ref(ch) = cn {
+                            let av = jstr(vm, &act);
+                            let pv = jstr(vm, &pkg);
+                            pseudo_set(vm, ch, P_DATA, av);
+                            pseudo_set(vm, ch, P_COMPONENT, pv);
+                        }
+                        let ih = host(vm, "Landroid/content/Intent;", HostState::Map(vec![]));
+                        if let V::Ref(ih2) = ih {
+                            pseudo_set(vm, ih2, P_COMPONENT, cn);
+                        }
+                        Some(Some(ih))
+                    }
+                    None => Some(Some(V::Ref(0))),
+                }
+            }
+            "getApplicationIcon" => {
+                let pkg = args.iter().skip(1).find_map(|a| sv(vm, *a));
+                match pkg.and_then(|p| super::vector::package_icon_drawable(vm, &p)) {
+                    Some(d) => Some(Some(d)),
+                    None => Some(Some(V::Ref(0))),
+                }
+            }
             "getInstallerPackageName"
-            | "getLaunchIntentForPackage"
-            | "getLeanbackLaunchIntentForPackage"
             | "getDrawable"
             | "getActivityIcon"
-            | "getApplicationIcon"
             | "getDefaultActivityIcon"
             | "getActivityBanner"
             | "getApplicationBanner"
@@ -3089,43 +3308,7 @@ fn resources_call(vm: &mut Vm, name: &str, args: &[V]) -> Rt<Option<Option<V>>> 
                 .map(|v| v.data as i32)
                 .unwrap_or(0),
         ))),
-        "getColor" => {
-            // Chase @color/@mipmap refs and ?attr indirections so a
-            // `?attr/colorPrimary`-style entry yields the real color int
-            // instead of leaking the raw attr res-id as the color value.
-            let mut id = res_id();
-            // Unresolvable `?attr` colors land here — opaque black keeps
-            // text visible instead of alpha-0 invisible.
-            let mut data = 0xFF00_0000u32;
-            for _ in 0..8 {
-                let Some(res) = vm.apk_res.as_ref() else {
-                    break;
-                };
-                let Some(ev) = res.entry_value(id) else { break };
-                match ev.data_type {
-                    0x01 => {
-                        id = ev.data;
-                        continue;
-                    }
-                    0x02 => match view::theme_attr_entry(vm, ev.data) {
-                        Some(next) if next.data_type == 0x01 => {
-                            id = next.data;
-                            continue;
-                        }
-                        Some(next) => {
-                            data = next.data;
-                            break;
-                        }
-                        None => break,
-                    },
-                    _ => {
-                        data = ev.data;
-                        break;
-                    }
-                }
-            }
-            Some(Some(V::I32(data as i32)))
-        }
+        "getColor" => Some(Some(V::I32(resolve_color_id(vm, res_id()) as i32))),
         "getDimension" | "getFraction" => Some(Some(V::F32(
             vm.apk_res
                 .as_ref()
@@ -3161,7 +3344,11 @@ fn resources_call(vm: &mut Vm, name: &str, args: &[V]) -> Rt<Option<Option<V>>> 
             // VectorDrawableCompat so the instanceof check passes, or a
             // plain Drawable host for anything else.
             let res_id = i64v(args.get(1).copied().unwrap_or(V::I32(0))) as u32;
-            let d = if res_id > 0 && super::vector::drawable_bitmap(vm, res_id).is_some() {
+            let d = if res_id > 0
+                && super::vector::rctx(vm)
+                    .and_then(|r| super::vector::drawable_bitmap(r, res_id))
+                    .is_some()
+            {
                 super::vector::drawable_for_res(vm, res_id)
             } else {
                 [
@@ -3236,11 +3423,39 @@ fn resources_call(vm: &mut Vm, name: &str, args: &[V]) -> Rt<Option<Option<V>>> 
                 "Landroid/util/DisplayMetrics;",
                 HostState::Empty,
             ))),
-            "getConfiguration" => Some(Some(host(
-                vm,
-                "Landroid/content/res/Configuration;",
-                HostState::Empty,
-            ))),
+            "getConfiguration" => {
+                let h = host(vm, "Landroid/content/res/Configuration;", HostState::Empty);
+                if let V::Ref(hh) = h {
+                    // `uiMode` night bit: apps gate text/icon colors on
+                    // `isSystemInDarkMode` — derive it from the theme's
+                    // resolved surface color so fossify's dark themes
+                    // get light text instead of black-on-dark.
+                    let lum = crate::theme_color_named(vm, "colorSurface")
+                        .or_else(|| crate::theme_color_named(vm, "colorBackground"))
+                        .map(|argb| {
+                            let (r, g, b) = (
+                                (argb >> 16) as u8,
+                                (argb >> 8) as u8,
+                                argb as u8,
+                            );
+                            (299 * r as u32 + 587 * g as u32 + 114 * b as u32) as f32 / 255_000.0
+                        });
+                    let night = match lum {
+                        Some(l) => l < 0.5,
+                        None => true, // no resolvable theme: default dark
+                    };
+                    // UI_MODE_TYPE_NORMAL | NIGHT_YES/NIGHT_NO
+                    let ui_mode = 1 | if night { 0x20 } else { 0x10 };
+                    if let Some(fidx) = vm
+                        .field_index_of("Landroid/content/res/Configuration;", "uiMode")
+                        .map(|g| vm.canon_field(g))
+                    {
+                        pseudo_set(vm, hh, fidx, V::I32(ui_mode));
+                    }
+                    pseudo_set(vm, hh, crate::P_META, V::I32(ui_mode));
+                }
+                Some(Some(h))
+            }
             "getAssets" => Some(Some(host(
                 vm,
                 "Landroid/content/res/AssetManager;",
@@ -3741,6 +3956,18 @@ fn res_misc(vm: &mut Vm, class: &str, name: &str, args: &[V]) -> Rt<Option<Optio
             "Landroid/content/res/Resources$Theme;",
             "applyStyle" | "setTo" | "rebase" | "dump" | "getKey" | "newTheme",
         ) => Some(None),
+        ("Landroid/content/res/Configuration;", "isNightModeActive") => {
+            // fossify's isSystemInDarkMode → this; answer from the
+            // uiMode `getConfiguration` minted (default dark).
+            let night = match args.first() {
+                Some(V::Ref(ch)) => match pseudo_get(vm, *ch, crate::P_META) {
+                    Some(V::I32(m)) => m & 0x30 == 0x20,
+                    _ => true,
+                },
+                _ => true,
+            };
+            Some(Some(V::I32(if night { 1 } else { 0 })))
+        }
         (
             "Landroid/content/res/Configuration;",
             "setTo"
@@ -4357,20 +4584,24 @@ fn graphics_call(vm: &mut Vm, class: &str, name: &str, args: &[V]) -> Rt<Option<
             // (Resources, resId): vector drawables rasterize too, then
             // fall back to the packaged file's PNG/JPEG decode.
             let res_id = i32v(*args.get(1).unwrap_or(args.first().unwrap_or(&V::I32(0)))) as u32;
-            Some(match super::vector::drawable_bitmap(vm, res_id) {
-                Some((w, h, rgba)) => Some(V::Ref(vm.alloc_host(
-                    "Landroid/graphics/Bitmap;",
-                    HostState::Bitmap { w, h, rgba },
-                ))),
-                None => {
-                    let bytes = vm
-                        .apk_res
-                        .as_ref()
-                        .and_then(|r| r.file_path(res_id).and_then(|p| r.read(p)))
-                        .unwrap_or_default();
-                    bitmap_decode(vm, &bytes)
-                }
-            })
+            Some(
+                match super::vector::rctx(vm)
+                    .and_then(|r| super::vector::drawable_bitmap(r, res_id))
+                {
+                    Some((w, h, rgba)) => Some(V::Ref(vm.alloc_host(
+                        "Landroid/graphics/Bitmap;",
+                        HostState::Bitmap { w, h, rgba },
+                    ))),
+                    None => {
+                        let bytes = vm
+                            .apk_res
+                            .as_ref()
+                            .and_then(|r| r.file_path(res_id).and_then(|p| r.read(p)))
+                            .unwrap_or_default();
+                        bitmap_decode(vm, &bytes)
+                    }
+                },
+            )
         }
         (
             "Landroid/graphics/Bitmap;",

@@ -579,15 +579,14 @@ impl FontSet {
             .unwrap_or(size_px * 0.5)
     }
 
-    /// Max ascent/descent across the set (Minikin's conservative metrics).
+    /// Line metrics from the primary (first) font — maxing across the
+    /// whole fallback set lets one font with an oversized ascender
+    /// (system emoji/symbol fonts) inflate every line's height.
     pub fn metrics(&self, size_px: f32) -> (f32, f32) {
-        let mut a = 0f32;
-        let mut d = 0f32;
-        for f in &self.fonts {
-            a = a.max(f.ascent(size_px));
-            d = d.max(f.descent(size_px));
-        }
-        (a, d)
+        self.fonts
+            .first()
+            .map(|f| (f.ascent(size_px), f.descent(size_px)))
+            .unwrap_or((size_px * 0.9, size_px * 0.25))
     }
 
     /// Per-char advances for `text`, itemized the same way

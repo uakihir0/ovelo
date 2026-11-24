@@ -1890,9 +1890,23 @@ fn class_call(vm: &mut Vm, name: &str, _sig: &str, args: &[V]) -> Rt<Option<Opti
             .unwrap_or_default();
             match vm.instantiate(&d) {
                 Ok(h) => Some(Some(V::Ref(h))),
-                Err(_) => {
-                    let e = vm.throw_builtin("Ljava/lang/InstantiationException;", &d);
-                    return Err(e);
+                Err(e) => {
+                    // A class with no dex def and no host impl is
+                    // absent — `ClassNotFoundException` is what callers
+                    // catching optional-dependency probes expect (the
+                    // kotlin-reflect `ReflectionFactoryImpl` fallback
+                    // catches CNFE, not InstantiationException).
+                    let absent =
+                        e.cause() == "dexrt.class.missing" || vm.type_index_of(&d).is_none();
+                    let t = vm.throw_builtin(
+                        if absent {
+                            "Ljava/lang/ClassNotFoundException;"
+                        } else {
+                            "Ljava/lang/InstantiationException;"
+                        },
+                        &d,
+                    );
+                    return Err(t);
                 }
             }
         }

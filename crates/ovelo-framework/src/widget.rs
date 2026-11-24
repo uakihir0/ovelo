@@ -207,6 +207,9 @@ impl Drawable for ViewGroup {
             if self.clip_children {
                 let (cl, ct) = ch.origin();
                 let cs = ch.measured();
+                if dbg_flag("OVELO_CLIPDBG") {
+                    eprintln!("[clipdbg] kid clip {cl},{ct} {cs:?}");
+                }
                 c.save();
                 c.clip_rect(Rect::new(cl, ct, cs.w, cs.h));
                 ch.draw(c);
@@ -253,6 +256,8 @@ pub struct TextView {
     /// AOSP gravity flags (CENTER_HORIZONTAL=1, CENTER_VERTICAL=0x10,
     /// RIGHT/END=5, BOTTOM=0x50). 0 = top|start.
     pub gravity: i32,
+    /// `android:maxLines` — draws at most this many wrapped lines.
+    pub max_lines: Option<i32>,
 }
 
 impl TextView {
@@ -266,6 +271,7 @@ impl TextView {
             text_size,
             padding: 0,
             gravity: 0,
+            max_lines: None,
         };
         v.view.desired = v.measure_text(None);
         v
@@ -331,22 +337,23 @@ impl Drawable for TextView {
             Some((s.w - self.padding * 2).max(0)),
             false,
         );
-        if std::env::var_os("OVELO_POSDBG").is_some() && !self.text.is_empty() {
-            eprintln!(
-                "[posdbg] text {:?} at {},{} size {}",
-                self.text, self.view.left, self.view.top, self.text_size
-            );
-        }
         let lh = t.ascent + t.descent;
+        // `maxLines` truncates to the first n wrapped lines (AOSP
+        // ellipsizes the last one — hiding the overflow reads close
+        // enough for labels).
+        let lines: &[ovelo_ui::Line] = match self.max_lines {
+            Some(m) if m > 0 => &t.lines[..t.lines.len().min(m as usize)],
+            _ => &t.lines,
+        };
         // Vertical gravity: 0x10 center, 0x50 bottom, else top.
-        let text_h = lh * t.lines.len().max(1) as i32;
+        let text_h = lh * lines.len().max(1) as i32;
         let vy = match self.gravity & 0x70 {
             0x10 => self.view.top + (s.h - text_h) / 2,
             0x50 => self.view.top + s.h - self.padding - text_h,
             _ => self.view.top + self.padding,
         };
         let mut baseline = vy + t.ascent;
-        for line in &t.lines {
+        for line in lines {
             let seg = &self.text[line.range.0..line.range.1];
             // Horizontal gravity: 1 center, 5 right/end, else left.
             let tx = match self.gravity & 0x7 {
@@ -354,6 +361,20 @@ impl Drawable for TextView {
                 0x5 => self.view.left + s.w - self.padding - line.width,
                 _ => self.view.left + self.padding,
             };
+            if dbg_flag("OVELO_POSDBG") && !self.text.is_empty() {
+                eprintln!(
+                    "[posdbg] text {:?} view {},{} {:?} grav={:x} lines={} draw at {},{} size {}",
+                    self.text,
+                    self.view.left,
+                    self.view.top,
+                    s,
+                    self.gravity,
+                    lines.len(),
+                    tx,
+                    baseline,
+                    self.text_size
+                );
+            }
             c.draw_text(
                 seg,
                 tx,
@@ -665,4 +686,18 @@ fn replay_guest_ops(c: &mut Canvas, ops: &[ovelo_dexrt::CanvasOp]) {
             }
         }
     }
+}
+
+/// Cached env flag — per-frame checks must not hit getenv.
+fn dbg_flag(name: &'static str) -> bool {
+    static CACHE: std::sync::OnceLock<
+        std::sync::RwLock<std::collections::HashMap<&'static str, bool>>,
+    > = std::sync::OnceLock::new();
+    let cache = CACHE.get_or_init(|| std::sync::RwLock::new(std::collections::HashMap::new()));
+    if let Some(v) = cache.read().unwrap().get(name) {
+        return *v;
+    }
+    let v = std::env::var_os(name).is_some();
+    cache.write().unwrap().insert(name, v);
+    v
 }
