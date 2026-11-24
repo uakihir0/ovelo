@@ -1441,8 +1441,18 @@ pub(crate) fn call(
 fn universal(vm: &mut Vm, class: &str, name: &str, sig: &str, args: &[V]) -> Rt<Option<Option<V>>> {
     Ok(match name {
         "toString" if ret(sig) == STRING => {
-            let t = v_to_s(vm, args[0]);
-            Some(Some(jstr(vm, &t)))
+            // JSON containers serialize through `json_dump_v`, not the
+            // generic `[a, b]` list format — let io::call see them.
+            let is_json = matches!(args[0], V::Ref(h) if matches!(
+                vm.heap.get(h),
+                Some(Obj::Host { desc, .. }) if desc.starts_with("Lorg/json/")
+            ));
+            if is_json {
+                None
+            } else {
+                let t = v_to_s(vm, args[0]);
+                Some(Some(jstr(vm, &t)))
+            }
         }
         "hashCode" => Some(Some(lang::hashcode(vm, args))),
         "equals" => Some(Some(V::I32(
