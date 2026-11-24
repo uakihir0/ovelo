@@ -2583,11 +2583,19 @@ fn nio_call(vm: &mut Vm, class: &str, name: &str, args: &[V]) -> Option<Option<V
             pseudo_set(vm, this, P_BBUF_POS, V::I32(0));
             Some(Some(args[0]))
         }
-        "nativeOrder" => Some(Some(host(
-            vm,
-            "Ljava/nio/ByteOrder;",
-            HostState::Slot(V::I32(1)),
-        ))),
+        "nativeOrder" => {
+            let h = vm.byteorder_h.get();
+            let v = if h != 0 && vm.heap.get(h).is_some() {
+                V::Ref(h)
+            } else {
+                let v = host(vm, "Ljava/nio/ByteOrder;", HostState::Slot(V::I32(1)));
+                if let V::Ref(hh) = v {
+                    vm.byteorder_h.set(hh);
+                }
+                v
+            };
+            Some(Some(v))
+        }
         "mark" | "compact" | "slice" | "duplicate" | "asReadOnlyBuffer" => Some(Some(args[0])),
         "putInt" | "putLong" | "putShort" | "putDouble" | "putFloat" | "putChar" | "putByte"
         | "put" => {

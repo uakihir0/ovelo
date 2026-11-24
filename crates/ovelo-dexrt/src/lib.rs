@@ -380,6 +380,9 @@ pub struct Vm {
     /// The one `Choreographer.getInstance()` handle — identity matters
     /// (dex code compares instances).
     pub(crate) choreographer_h: u32,
+    /// The shared `ByteOrder.nativeOrder()` object — buffer helpers
+    /// (Korge's `Lb8`) request it per window write, 100k+/10s.
+    pub(crate) byteorder_h: std::cell::Cell<u32>,
     /// `Application.ActivityLifecycleCallbacks` handles registered via
     /// `registerActivityLifecycleCallbacks` — application-global in
     /// AOSP. androidx ReportFragment relies on these to drive
@@ -629,6 +632,7 @@ impl Vm {
             pending_runnables: std::collections::VecDeque::new(),
             frame_callbacks: Vec::new(),
             choreographer_h: 0,
+            byteorder_h: std::cell::Cell::new(0),
             activity_callbacks: Vec::new(),
             delayed_runnables: Vec::new(),
             pending_surface: Vec::new(),
@@ -1908,6 +1912,7 @@ impl Vm {
         roots.extend(self.activity_callbacks.iter().copied());
         roots.extend(self.frame_callbacks.iter().map(|(h, _)| *h));
         roots.push(self.choreographer_h);
+        roots.push(self.byteorder_h.get());
         roots.extend(self.parked_runnables.keys().copied());
         roots.extend(self.thread_runnables.iter().copied());
         roots.extend(jdk::gl::live_handles());
