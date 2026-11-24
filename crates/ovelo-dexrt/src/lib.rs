@@ -1504,15 +1504,14 @@ impl Vm {
                 let mut a = Vec::with_capacity(args.len() + 1);
                 a.push(V::Ref(this));
                 a.extend_from_slice(args);
-                let r = jdk::call(self, "Ljava/lang/Class;", name, "", &a).map_err(|e| {
-                    match e {
+                let r =
+                    jdk::call(self, "Ljava/lang/Class;", name, "", &a).map_err(|e| match e {
                         E::Vm(v) => v,
                         E::Throw(t) => {
                             let d = self.describe_throw(t);
                             errd("dexrt.exception.uncaught", d)
                         }
-                    }
-                })?;
+                    })?;
                 return Ok(r.flatten());
             }
             return Err(errd("dexrt.bad_this", name.to_string()));

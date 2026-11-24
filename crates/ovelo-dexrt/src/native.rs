@@ -1343,6 +1343,11 @@ pub fn install_crash_dump() {
                         // bounded outcome — the heal would otherwise
                         // keep this one livelock thread at ~20k
                         // signal round-trips/s forever.
+                        eprintln!(
+                            "[segv-storm] suspend pc={:#x?} si={si:#x} lr={:#x?}",
+                            so_off(pc),
+                            so_off(x30)
+                        );
                         extern "C" {
                             fn mach_thread_self() -> u32;
                             fn thread_suspend(t: u32) -> i32;
