@@ -43,7 +43,7 @@ Legend:
 | Markor | `net.gsantner.markor` | 🟢 | **Renders real UI**: Documents file list with real entries + dates, preview pane, FAB, bottom nav (Files/To-Do/QuickNote/LinkBox/More) |
 | Tasks.org | `org.tasks` | 🟡 | Sign-in screen renders (Add account / Continue without sync / Import backup); Hilt DI completes — taps don't navigate yet, layout placement rough |
 | Neumorphic Calculator | `com.neumorphic.calculator` | ⛔ | Flutter app — the entire UI runs in `libflutter.so`'s Dart VM, outside the dex runtime's scope |
-| AntennaPod | `de.danoeh.antennapod` | 🟡 | Splash → MainActivity transition runs (RxJava subscribeOn→observeOn→Handler chain works); HomeFragment executes and the welcome screen renders the app icon + welcome text. Layout positioning rough (content offset off-screen). Fixed: Callable-only drain dispatch, Activity.setTheme, View.generateViewId |
+| AntennaPod | `de.danoeh.antennapod` | 🟢 | **Renders real UI**: welcome screen centered with app icon, "Welcome to AntennaPod!" text, hint arrow graphic. Splash→MainActivity works (RxJava subscribeOn→observeOn→Handler chain). Fixed: Callable-only drain dispatch, setTheme, generateViewId, foreign-LP wrap, sw600dp qualifier selection |
 
 ## Famous apps — assessment
 
