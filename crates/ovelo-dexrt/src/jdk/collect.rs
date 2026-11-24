@@ -1814,7 +1814,7 @@ fn arrays_static(vm: &mut Vm, name: &str, _sig: &str, args: &[V]) -> Rt<Option<O
             let out = if name == "copyOf" {
                 let n = i32v(*args.get(1).unwrap_or(&V::I32(0))).max(0) as usize;
                 let mut d = data;
-                d.resize(n, V::I32(0));
+                d.resize(n, V::default_for(&elem));
                 d
             } else {
                 let (a, b) = (i32v(args[1]).max(0) as usize, i32v(args[2]).max(0) as usize);
@@ -1824,28 +1824,40 @@ fn arrays_static(vm: &mut Vm, name: &str, _sig: &str, args: &[V]) -> Rt<Option<O
                     .take(b.saturating_sub(a))
                     .copied()
                     .collect();
-                d.resize(b - a, V::I32(0));
+                d.resize(b - a, V::default_for(&elem));
                 d
             };
             Some(Some(arr(vm, &elem, out)))
         }
         "fill" | "setAll" => {
             if let V::Ref(h) = args[0] {
-                if let Some(Obj::Array { data, .. }) = vm.heap.get_mut(h) {
+                if let Some(Obj::Array { elem, data }) = vm.heap.get_mut(h) {
+                    // Same canonicalization as `aput-object`: a bare I32(0)
+                    // stored into an object-typed array is the null ref.
+                    let canon = |v: V| {
+                        if matches!(v, V::I32(0))
+                            && (elem.starts_with('L') || elem.starts_with('['))
+                        {
+                            V::Ref(0)
+                        } else {
+                            v
+                        }
+                    };
                     if args.len() >= 4 {
                         // fill(arr, fromIndex, toIndex, val)
                         let (a, b, v) = (
                             i32v(args[1]).max(0) as usize,
                             (i32v(args[2]).max(0) as usize).min(data.len()),
-                            args[3],
+                            canon(args[3]),
                         );
                         for e in data.iter_mut().take(b).skip(a) {
                             *e = v;
                         }
                     } else {
                         // fill(arr, val)
+                        let v = canon(args[1]);
                         for e in data.iter_mut() {
-                            *e = args[1];
+                            *e = v;
                         }
                     }
                 }
