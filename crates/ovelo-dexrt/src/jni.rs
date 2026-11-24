@@ -166,13 +166,13 @@ fn last_env_set(name: &'static str) {
 /// entry — the LAST_ENV name then identifies whichever env call ran
 /// just before the corruption was first observed.
 pub(crate) fn env_enter(name: &'static str) {
-    if std::env::var_os("OVELO_ENVCALL").is_some() {
+    if crate::dbg_flag("OVELO_ENVCALL") {
         eprintln!("[env>] {name}");
     }
     // malloc_zone_check is a Darwin-only API; keep the whole probe macOS-gated
     // so the Linux build neither links nor runs it.
     #[cfg(target_os = "macos")]
-    if std::env::var_os("OVELO_ZONECHECK").is_some() {
+    if crate::dbg_flag("OVELO_ZONECHECK") {
         unsafe {
             extern "C" {
                 fn malloc_default_zone() -> *mut std::ffi::c_void;
@@ -309,13 +309,13 @@ pub(crate) fn call_native(
     sargs: &[u64],
 ) -> (u64, u64) {
     let mut out = [0u64; 2];
-    if std::env::var_os("OVELO_ENVCALL").is_some() {
+    if crate::dbg_flag("OVELO_ENVCALL") {
         if let Some(m) = ENV_NAMES.get() {
             let name = m.get(&fnptr).copied().unwrap_or("?");
             eprintln!("[envcall] {name}({iargs:p})");
         }
     }
-    let ncall = std::env::var_os("OVELO_NCALL").is_some();
+    let ncall = crate::dbg_flag("OVELO_NCALL");
     if ncall {
         eprintln!(
             "[ncall] -> {fnptr:#x} off={:#x?}",
@@ -855,7 +855,7 @@ fn call_obj_direct(obj: u64, mid: u64, args: &[V]) -> Option<V> {
 fn find_method_id(clazz: u64, name_p: u64, sig_p: u64) -> u64 {
     let name = cstr_ro(name_p);
     let sig = cstr_ro(sig_p);
-    if std::env::var("OVELO_JNIDBG").is_ok() {
+    if crate::dbg_flag("OVELO_JNIDBG") {
         eprintln!("[jni] GetMethodID {name}{sig} clazz={clazz:#x}");
     }
     let params = split_params(&sig);
@@ -882,7 +882,7 @@ fn find_method_id(clazz: u64, name_p: u64, sig_p: u64) -> u64 {
             v.jni_named.push((owner, name.clone(), sig.clone()));
             let idx = (v.jni_named.len() - 1) as u64;
             v.jni_mids.push(GX_NAMED | idx);
-            if std::env::var("OVELO_JNIDBG").is_ok() {
+            if crate::dbg_flag("OVELO_JNIDBG") {
                 eprintln!("[jni] GetMethodID named {name}{sig}");
             }
             v.jni_mids.len() as u64
@@ -893,7 +893,7 @@ fn find_method_id(clazz: u64, name_p: u64, sig_p: u64) -> u64 {
 fn find_field_id(clazz: u64, name_p: u64, sig_p: u64, is_static: bool) -> u64 {
     let name = cstr_ro(name_p);
     let sig = cstr_ro(sig_p);
-    if std::env::var("OVELO_JNIDBG").is_ok() {
+    if crate::dbg_flag("OVELO_JNIDBG") {
         eprintln!("[jni] GetFieldID {name} clazz={clazz:#x}");
     }
     let mut v = vm();
@@ -921,7 +921,7 @@ extern "C" fn get_version(_e: u64) -> u64 {
 extern "C" fn find_class(_e: u64, name_p: u64) -> u64 {
     env_enter("find_class");
     let name = cstr_ro(name_p);
-    let dbg = std::env::var("OVELO_JNIDBG").is_ok();
+    let dbg = crate::dbg_flag("OVELO_JNIDBG");
     if dbg {
         eprintln!("[jni] FindClass {name}");
     }
@@ -1760,7 +1760,7 @@ fn release_elems(a: u64, buf: u64, mode: u64) {
 /// verified on free and on every env entry, naming the env call that
 /// first saw an overrun.
 fn libc_malloc(n: usize) -> usize {
-    let dbg = std::env::var_os("OVELO_BUFDBG").is_some();
+    let dbg = crate::dbg_flag("OVELO_BUFDBG");
     if !dbg {
         return crate::native::guest_malloc(n);
     }
@@ -1932,7 +1932,7 @@ sr!(set_double_array_region);
 
 extern "C" fn register_natives(_e: u64, clazz: u64, methods: u64, n: u64) -> u64 {
     env_enter("register_natives");
-    if std::env::var("OVELO_JNIDBG").is_ok() {
+    if crate::dbg_flag("OVELO_JNIDBG") {
         eprintln!("[jni] RegisterNatives clazz={clazz:#x} n={n}");
     }
     let mut v = vm();
@@ -2096,7 +2096,7 @@ pub(crate) fn load_native_lib(vm: &mut Vm, arg: &str, absolute: bool) {
                 .collect()
         })
         .unwrap_or_default();
-    let denied = if std::env::var_os("OVELO_NO_SKIP_LIBS").is_some() {
+    let denied = if crate::dbg_flag("OVELO_NO_SKIP_LIBS") {
         skip.iter().any(|n| path.contains(n.as_str()))
     } else {
         path.contains("glide-webp") || skip.iter().any(|n| path.contains(n.as_str()))

@@ -1763,7 +1763,7 @@ fn class_call(vm: &mut Vm, name: &str, _sig: &str, args: &[V]) -> Rt<Option<Opti
                 && vm.is_dex_class(&owner)
                 && vm.field_index_of(&owner, &fname).is_none()
             {
-                if std::env::var_os("OVELO_REFDBG").is_some() {
+                if crate::dbg_flag("OVELO_REFDBG") {
                     eprintln!("[refdbg] NoSuchField {owner}.{fname}");
                 }
                 let t = vm.throw_builtin(
@@ -1800,7 +1800,7 @@ fn class_call(vm: &mut Vm, name: &str, _sig: &str, args: &[V]) -> Rt<Option<Opti
                 && vm.is_dex_class(&owner)
                 && !vm.has_method_named(&owner, &mname)
             {
-                if std::env::var_os("OVELO_REFDBG").is_some() {
+                if crate::dbg_flag("OVELO_REFDBG") {
                     eprintln!("[refdbg] NoSuchMethod {owner}.{mname}");
                 }
                 let t = vm.throw_builtin(
@@ -2492,7 +2492,7 @@ fn enum_call(vm: &mut Vm, class: &str, name: &str, args: &[V]) -> Rt<Option<Opti
                 _ => 0,
             };
             let d = ord(args[0]) - ord(args[1]);
-            if std::env::var_os("OVELO_ENUMDBG").is_some() {
+            if crate::dbg_flag("OVELO_ENUMDBG") {
                 let nm = |v: V| match v {
                     V::Ref(h) => pseudo_get(vm, h, P_DATA)
                         .and_then(|s| sv(vm, s))
@@ -2516,7 +2516,7 @@ fn enum_call(vm: &mut Vm, class: &str, name: &str, args: &[V]) -> Rt<Option<Opti
         }
         "values" => {
             let a = enum_values(vm, class);
-            if std::env::var_os("OVELO_TRACE").is_some() {
+            if crate::dbg_flag("OVELO_TRACE") {
                 let n = match vm.heap.get(match a {
                     V::Ref(h) => h,
                     _ => 0,
@@ -2768,19 +2768,19 @@ fn reflect_call(
             };
             match res {
                 Ok(Some(v)) => {
-                    if std::env::var_os("OVELO_REFDBG").is_some() {
+                    if crate::dbg_flag("OVELO_REFDBG") {
                         eprintln!("[refdbg] invoke {owner}.{member} ok");
                     }
                     Some(Some(v))
                 }
                 Ok(None) => {
-                    if std::env::var_os("OVELO_REFDBG").is_some() {
+                    if crate::dbg_flag("OVELO_REFDBG") {
                         eprintln!("[refdbg] invoke {owner}.{member} ok(void)");
                     }
                     Some(Some(V::Ref(0)))
                 }
                 Err(e) => {
-                    if std::env::var_os("OVELO_REFDBG").is_some() {
+                    if crate::dbg_flag("OVELO_REFDBG") {
                         eprintln!("[refdbg] invoke {owner}.{member} ERR {e}");
                     }
                     let t = vm.throw_builtin(
@@ -2819,7 +2819,7 @@ fn reflect_call(
             match res {
                 Ok(nh) => Some(Some(V::Ref(nh))),
                 Err(e) => {
-                    if std::env::var_os("OVELO_VIEWDBG").is_some() {
+                    if crate::dbg_flag("OVELO_VIEWDBG") {
                         eprintln!("[viewdbg] newInstance {owner} failed: {e}");
                     }
                     let t = vm.throw_builtin(
@@ -2858,7 +2858,7 @@ fn reflect_call(
                             let v = vm
                                 .probe_static_named(&owner, &member)
                                 .or_else(|| crate::jdk::sfield(vm, &owner, &member, OBJ));
-                            if std::env::var_os("OVELO_REFDBG").is_some() {
+                            if crate::dbg_flag("OVELO_REFDBG") {
                                 let hit = v.map(|v| !matches!(v, V::Ref(0))).unwrap_or(false);
                                 eprintln!("[refdbg] Field.get(null) {owner}.{member} hit={hit}");
                             }
@@ -3062,7 +3062,7 @@ fn unsafe_call(vm: &mut Vm, name: &str, args: &[V]) -> Rt<Option<Option<V>>> {
                     vm.unsafe_next_offset += 1;
                     UNSAFE_TOKEN_BASE + vm.unsafe_next_offset
                 });
-            if std::env::var("OVELO_TRACE_FIELD").is_ok() {
+            if crate::dbg_flag("OVELO_TRACE_FIELD") {
                 eprintln!("[ftrace] {name} {owner}.{member} -> {off:#x}");
             }
             Some(V::I64(off))
@@ -3104,7 +3104,7 @@ fn unsafe_call(vm: &mut Vm, name: &str, args: &[V]) -> Rt<Option<Option<V>>> {
         "getObject" | "getObjectVolatile" | "getAndSetObject" => {
             let (o, k) = unsafe_key(args).unwrap_or((0, 0));
             let old = unsafe_read(vm, o, k);
-            if std::env::var("OVELO_TRACE_FIELD").is_ok() {
+            if crate::dbg_flag("OVELO_TRACE_FIELD") {
                 eprintln!("[ftrace] {name} obj={o} off={k:#x} -> {old:?}");
             }
             let old = if matches!(old, V::I32(0) | V::I64(0)) {

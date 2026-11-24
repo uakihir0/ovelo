@@ -729,7 +729,7 @@ pub(crate) fn gl_frame(vm: &mut Vm, view: u32, w: i32, h: i32) -> Vec<CanvasOp> 
             ],
             &[V::Ref(gl), cfg],
         );
-        if std::env::var_os("OVELO_DRAWDBG").is_some() {
+        if crate::dbg_flag("OVELO_DRAWDBG") {
             eprintln!("[gldbg] onSurfaceCreated err={:?}", r.is_err());
         }
         state(gl, |s| s.created = true);
@@ -741,7 +741,7 @@ pub(crate) fn gl_frame(vm: &mut Vm, view: u32, w: i32, h: i32) -> Vec<CanvasOp> 
             &["Ljavax/microedition/khronos/opengles/GL10;", "I", "I"],
             &[V::Ref(gl), V::I32(w), V::I32(h)],
         );
-        if std::env::var_os("OVELO_DRAWDBG").is_some() {
+        if crate::dbg_flag("OVELO_DRAWDBG") {
             eprintln!("[gldbg] onSurfaceChanged {w}x{h} err={:?}", r.is_err());
         }
         state(gl, |s| {
@@ -788,7 +788,7 @@ pub(crate) fn gl_frame(vm: &mut Vm, view: u32, w: i32, h: i32) -> Vec<CanvasOp> 
     if gl != GL20 {
         ops.extend(state(GL20, |s| to_ops(s)));
     }
-    if std::env::var_os("OVELO_DRAWDBG").is_some() {
+    if crate::dbg_flag("OVELO_DRAWDBG") {
         eprintln!(
             "[gldbg] onDrawFrame {w}x{h} -> {} ops err={:?} first={:?}",
             ops.len(),
@@ -991,7 +991,7 @@ pub(crate) fn call(
     if h == 0 || !has_state(h) {
         return Ok(None);
     }
-    if std::env::var_os("OVELO_DRAWDBG").is_some() {
+    if crate::dbg_flag("OVELO_DRAWDBG") {
         static N: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
         if N.fetch_add(1, std::sync::atomic::Ordering::Relaxed) < 60 {
             eprintln!("[gldbg] call {name}");
@@ -1706,7 +1706,7 @@ fn record20(vm: &Vm, st: &mut GlState, mode: i32, idxs: &[i32]) {
             .find(|a| a.enabled && a.name == n)
             .cloned()
     };
-    if std::env::var_os("OVELO_DRAWDBG").is_some() {
+    if crate::dbg_flag("OVELO_DRAWDBG") {
         static N: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
         if N.fetch_add(1, std::sync::atomic::Ordering::Relaxed) < 3 {
             for (k, a) in &st.attribs {
@@ -1923,7 +1923,7 @@ pub(crate) fn call_static(
     if class != "Landroid/opengl/GLES20;" && class != "Landroid/opengl/GLES11Ext;" {
         return Ok(None);
     }
-    if std::env::var_os("OVELO_DRAWDBG").is_some() {
+    if crate::dbg_flag("OVELO_DRAWDBG") {
         static N: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
         if N.fetch_add(1, std::sync::atomic::Ordering::Relaxed) < 200 {
             eprintln!("[gldbg] gles20 {name} args={args:?}");
@@ -2039,7 +2039,7 @@ pub(crate) fn call_static(
         }
         "glBufferData" => {
             let (t, size) = (i(0), i(1).max(0) as usize);
-            if std::env::var_os("OVELO_DRAWDBG").is_some() {
+            if crate::dbg_flag("OVELO_DRAWDBG") {
                 if let V::Ref(h) = args.get(2).copied().unwrap_or(V::I32(0)) {
                     eprintln!(
                         "[gldbg] bufferData size={size} obj={:?} pos={} le={}",
@@ -2143,7 +2143,7 @@ pub(crate) fn call_static(
                 args.get(4).unwrap_or(&V::I32(0)),
                 n,
             );
-            if std::env::var_os("OVELO_DRAWDBG").is_some() {
+            if crate::dbg_flag("OVELO_DRAWDBG") {
                 static N: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
                 if N.fetch_add(1, std::sync::atomic::Ordering::Relaxed) < 12 {
                     let buf = args.get(3).copied().unwrap_or(V::I32(0));
@@ -2271,7 +2271,7 @@ pub(crate) fn call_static(
                     }) if matches!(vm.heap.get(*b), Some(Obj::Array { .. })) => {
                         // Typed view over a byte[] backing — write one
                         // element at the view's position.
-                        if std::env::var_os("OVELO_DRAWDBG").is_some() {
+                        if crate::dbg_flag("OVELO_DRAWDBG") {
                             eprintln!("[gldbg] {name} write status into view h{h}");
                         }
                         let arr = *b;
@@ -2299,7 +2299,7 @@ pub(crate) fn call_static(
                                 }
                             }
                         } else {
-                            if std::env::var_os("OVELO_DRAWDBG").is_some() {
+                            if crate::dbg_flag("OVELO_DRAWDBG") {
                                 eprintln!(
                                     "[gldbg] {name} arg h{h} kind={:?}",
                                     vm.heap.get(h).map(std::mem::discriminant)
@@ -2430,7 +2430,7 @@ pub(crate) fn call_static(
             let src = args.get(8).copied().unwrap_or(V::I32(0));
             let align = state(GL20, |s| s.unpack_align);
             let rgba = tex_pixels(vm, &src, w, h, i(6), i(7), align);
-            if std::env::var_os("OVELO_GLDBG").is_some() {
+            if crate::dbg_flag("OVELO_GLDBG") {
                 let desc = match &src {
                     V::Ref(h) => match vm.heap.get(*h) {
                         Some(Obj::Host { desc, state, .. }) => {
@@ -2558,7 +2558,7 @@ pub(crate) fn call_static(
 /// `android.opengl.Matrix` — column-major 4x4 helpers.
 /// `Some(None)` = handled void; `None` = let dex run the real method.
 fn matrix_call(vm: &mut Vm, name: &str, args: &[V]) -> Option<Option<V>> {
-    if std::env::var_os("OVELO_DRAWDBG").is_some() {
+    if crate::dbg_flag("OVELO_DRAWDBG") {
         static N: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
         if N.fetch_add(1, std::sync::atomic::Ordering::Relaxed) < 30 {
             eprintln!("[gldbg] matrix {name} args={args:?}");

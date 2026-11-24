@@ -220,7 +220,7 @@ pub fn fire_global_layout(vm: &mut Vm, root: u32) {
         .flat_map(|(_, ls)| ls.iter().copied())
         .collect();
     for l in predraw {
-        if std::env::var_os("OVELO_VIEWDBG").is_some() {
+        if crate::dbg_flag("OVELO_VIEWDBG") {
             eprintln!("[viewdbg] onPreDraw h{l} {}", vm.dbg_class_of(l));
         }
         let _ = vm.call_virtual(l, "onPreDraw", &[]);
@@ -234,15 +234,15 @@ pub fn fire_global_layout(vm: &mut Vm, root: u32) {
         })
         .flat_map(|(_, ls)| ls.iter().copied())
         .collect();
-    if std::env::var_os("OVELO_VIEWDBG").is_some() && !all.is_empty() {
+    if crate::dbg_flag("OVELO_VIEWDBG") && !all.is_empty() {
         eprintln!("[viewdbg] fire_global_layout {} listeners", all.len());
     }
     for l in all {
-        if std::env::var_os("OVELO_VIEWDBG").is_some() {
+        if crate::dbg_flag("OVELO_VIEWDBG") {
             eprintln!("[viewdbg] onGlobalLayout h{l} {}", vm.dbg_class_of(l));
         }
         if let Err(e) = vm.call_virtual(l, "onGlobalLayout", &[]) {
-            if std::env::var_os("OVELO_VIEWDBG").is_some() {
+            if crate::dbg_flag("OVELO_VIEWDBG") {
                 eprintln!("[viewdbg] onGlobalLayout {l} err {e:?}");
             }
         }
@@ -1208,7 +1208,7 @@ pub(crate) fn call(
                     }
                 }
             }
-            if hit == 0 && std::env::var_os("OVELO_VIEWDBG").is_some() {
+            if hit == 0 && crate::dbg_flag("OVELO_VIEWDBG") {
                 let nm = vm
                     .apk_res
                     .as_ref()
@@ -1281,7 +1281,7 @@ pub(crate) fn call(
         "generateDefaultLayoutParams" => Some(Some(default_lp(vm, this))),
         "getChildCount" => {
             let n = children(vm, this).len();
-            if std::env::var_os("OVELO_VIEWDBG").is_some() {
+            if crate::dbg_flag("OVELO_VIEWDBG") {
                 let d = class_of(vm, V::Ref(this));
                 eprintln!("[viewdbg] getChildCount {d} h{this} -> {n}");
             }
@@ -1292,7 +1292,7 @@ pub(crate) fn call(
                 .get(i32v(args.get(1).copied().unwrap_or(V::I32(0))) as usize)
                 .copied()
                 .unwrap_or(V::Ref(0));
-            if std::env::var_os("OVELO_VIEWDBG").is_some() {
+            if crate::dbg_flag("OVELO_VIEWDBG") {
                 let d = class_of(vm, V::Ref(this));
                 let cd = class_of(vm, got);
                 eprintln!(
@@ -1331,7 +1331,7 @@ pub(crate) fn call(
         | "addFocusables"
         | "addChildrenForAccessibility" => {
             if let Some(&child @ V::Ref(_)) = args.get(1) {
-                if std::env::var_os("OVELO_VIEWDBG").is_some() {
+                if crate::dbg_flag("OVELO_VIEWDBG") {
                     if let V::Ref(ch) = child {
                         eprintln!(
                             "[viewdbg] {name} h{this} <- h{ch} {} (ref {class})",
@@ -1394,14 +1394,14 @@ pub(crate) fn call(
                 };
                 let mut host_ran = false;
                 if let Some(f) = host {
-                    if std::env::var_os("OVELO_VIEWDBG").is_some() {
+                    if crate::dbg_flag("OVELO_VIEWDBG") {
                         eprintln!("[viewdbg] addView host-arm h{this} (ref {class})");
                     }
                     if let Ok(mut g) = f.try_borrow_mut() {
                         let _ = g(vm, args);
                         host_ran = true;
                     }
-                } else if std::env::var_os("OVELO_VIEWDBG").is_some() {
+                } else if crate::dbg_flag("OVELO_VIEWDBG") {
                     eprintln!("[viewdbg] addView host-miss h{this} (ref {class}) sig={sig}");
                 }
                 // attachViewToParent(v,i,lp) / addView(v,lp) /
@@ -1468,7 +1468,7 @@ pub(crate) fn call(
         "setRenderer" => {
             if let Some(V::Ref(r)) = args.get(1).copied() {
                 if r != 0 {
-                    if std::env::var_os("OVELO_GLDBG").is_some() {
+                    if crate::dbg_flag("OVELO_GLDBG") {
                         eprintln!("[gldbg] setRenderer view={this} r={r} class={class}");
                     }
                     pseudo_set(vm, this, crate::jdk::gl::P_GLES_RENDERER, V::Ref(r));
@@ -1570,7 +1570,7 @@ pub(crate) fn call(
                             Ok(v) => items.push(v.unwrap_or(V::I32(0))),
                             Err(e) => {
                                 items.push(V::I32(0));
-                                if std::env::var_os("OVELO_VIEWDBG").is_some() {
+                                if crate::dbg_flag("OVELO_VIEWDBG") {
                                     eprintln!("[viewdbg] instantiateItem {i} err {e:?}");
                                 }
                             }
@@ -1590,12 +1590,12 @@ pub(crate) fn call(
                             "setPrimaryItem",
                             &[V::Ref(this), V::I32(cur as i32), item],
                         ) {
-                            if std::env::var_os("OVELO_VIEWDBG").is_some() {
+                            if crate::dbg_flag("OVELO_VIEWDBG") {
                                 eprintln!("[viewdbg] setPrimaryItem {cur} err {e:?}");
                             }
                         }
                     }
-                    if std::env::var_os("OVELO_VIEWDBG").is_some() {
+                    if crate::dbg_flag("OVELO_VIEWDBG") {
                         eprintln!("[viewdbg] setAdapter {class} adapter={ad} count={n} cur={cur}");
                     }
                 }
@@ -1604,7 +1604,7 @@ pub(crate) fn call(
         }
         "getViewTreeObserver" => Some(Some(vto_of(vm, this))),
         "addOnGlobalLayoutListener" => {
-            if std::env::var_os("OVELO_VIEWDBG").is_some() {
+            if crate::dbg_flag("OVELO_VIEWDBG") {
                 eprintln!("[viewdbg] addOnGlobalLayoutListener obs={this} args={args:?}");
             }
             if let Some(&V::Ref(l)) = args.get(1) {
@@ -1623,7 +1623,7 @@ pub(crate) fn call(
             Some(None)
         }
         "addOnPreDrawListener" => {
-            if std::env::var_os("OVELO_VIEWDBG").is_some() {
+            if crate::dbg_flag("OVELO_VIEWDBG") {
                 eprintln!("[viewdbg] addOnPreDrawListener obs={this} args={args:?}");
             }
             if let Some(&V::Ref(l)) = args.get(1) {
@@ -1689,7 +1689,7 @@ pub(crate) fn call(
                 None => pseudo_get(vm, this, P_TAG),
             }
             .unwrap_or(V::Ref(0));
-            if std::env::var_os("OVELO_VIEWDBG").is_some() {
+            if crate::dbg_flag("OVELO_VIEWDBG") {
                 eprintln!(
                     "[viewdbg] getTag h{this} key={:?} -> {v:?}",
                     args.get(1).map(|k| i32v(*k))
@@ -1698,7 +1698,7 @@ pub(crate) fn call(
             Some(Some(v))
         }
         "setTag" => {
-            if std::env::var_os("OVELO_VIEWDBG").is_some() {
+            if crate::dbg_flag("OVELO_VIEWDBG") {
                 eprintln!(
                     "[viewdbg] setTag h{this} key={:?} v={:?}",
                     args.get(1).map(|k| i32v(*k)),
@@ -1718,7 +1718,7 @@ pub(crate) fn call(
         "setText" | "setTitle" | "setTextScaleX" => {
             if name != "setTextScaleX" {
                 pseudo_set(vm, this, P_TEXT, args.get(1).copied().unwrap_or(V::Ref(0)));
-                if std::env::var_os("OVELO_VIEWDBG").is_some() {
+                if crate::dbg_flag("OVELO_VIEWDBG") {
                     eprintln!(
                         "[viewdbg] setText h{this} arg={:?} stored={:?}",
                         args.get(1),
@@ -1892,7 +1892,7 @@ pub(crate) fn call(
         ))),
         "getLayoutParams" => {
             let lp = layout_params(vm, this);
-            if std::env::var_os("OVELO_VIEWDBG").is_some() {
+            if crate::dbg_flag("OVELO_VIEWDBG") {
                 let desc = class_of(vm, V::Ref(this));
                 let lp_desc = match lp {
                     V::Ref(h) => class_of(vm, V::Ref(h)),
@@ -1912,7 +1912,7 @@ pub(crate) fn call(
             Some(Some(lp))
         }
         "setLayoutParams" => {
-            if std::env::var_os("OVELO_VIEWDBG").is_some() {
+            if crate::dbg_flag("OVELO_VIEWDBG") {
                 let lp_desc = match args.get(1) {
                     Some(V::Ref(h)) => class_of(vm, V::Ref(*h)),
                     _ => "primitive".into(),
@@ -1935,7 +1935,7 @@ pub(crate) fn call(
             // View.measure(wSpec, hSpec): the EXACTLY/AT_MOST size is
             // what getMeasured* reports until the dex onMeasure calls
             // setMeasuredDimension (which many custom views do).
-            if std::env::var_os("OVELO_MEASDBG").is_some() {
+            if crate::dbg_flag("OVELO_MEASDBG") {
                 let (ws, hs) = (vint(args.get(1)), vint(args.get(2)));
                 eprintln!("[measdbg] measure h{this} spec={ws:#x},{hs:#x}");
             }
@@ -1953,7 +1953,7 @@ pub(crate) fn call(
                         args.get(2).copied().unwrap_or(V::I32(0)),
                     ],
                 )?;
-                if std::env::var_os("OVELO_VIEWDBG").is_some() {
+                if crate::dbg_flag("OVELO_VIEWDBG") {
                     eprintln!(
                         "[viewdbg] builtin measure h{this} onMeasure={:?}",
                         r.is_some()
@@ -1975,7 +1975,7 @@ pub(crate) fn call(
         "setMeasuredDimension" => {
             // AOSP masks the stored dims to MEASURED_SIZE_MASK
             // (0x00FF_FFFF); the state bits ride the AndState variant.
-            if std::env::var_os("OVELO_MEASDBG").is_some() {
+            if crate::dbg_flag("OVELO_MEASDBG") {
                 let (w, h) = (vint(args.get(1)), vint(args.get(2)));
                 eprintln!("[measdbg] setMeasured h{this} {w:#x}x{h:#x}");
             }
@@ -1990,7 +1990,7 @@ pub(crate) fn call(
                 vint(args.get(3)),
                 vint(args.get(4)),
             );
-            if std::env::var_os("OVELO_VIEWDBG").is_some() {
+            if crate::dbg_flag("OVELO_VIEWDBG") {
                 eprintln!("[viewdbg] builtin layout h{this} {l},{t},{r},{b}");
             }
             // AOSP clears PFLAG_LAYOUT_REQUESTED once the view is laid out.
@@ -2008,7 +2008,7 @@ pub(crate) fn call(
                         V::I32(b),
                     ],
                 ) {
-                    if std::env::var_os("OVELO_VIEWDBG").is_some() {
+                    if crate::dbg_flag("OVELO_VIEWDBG") {
                         match &e {
                             crate::E::Vm(oe) => {
                                 eprintln!("[viewdbg] onLayout h{this} vmerr {oe}")
@@ -2080,7 +2080,7 @@ pub(crate) fn call(
         ))),
         "getMeasuredWidth" => Some(Some(V::I32(pint(vm, this, P_MEAS_W) & 0x00FF_FFFF))),
         "getMeasuredHeight" => {
-            if std::env::var_os("OVELO_MEASDBG").is_some() {
+            if crate::dbg_flag("OVELO_MEASDBG") {
                 eprintln!(
                     "[measdbg] getMeasuredHeight h{this} -> {}",
                     pint(vm, this, P_MEAS_H) & 0x00FF_FFFF
@@ -2603,7 +2603,7 @@ fn choreographer(vm: &mut Vm) -> V {
 }
 
 fn inflate_call(vm: &mut Vm, args: &[V]) -> V {
-    if std::env::var_os("OVELO_VIEWDBG").is_some() {
+    if crate::dbg_flag("OVELO_VIEWDBG") {
         eprintln!("[viewdbg] inflate_call args={args:?}");
     }
     // inflate(int, ViewGroup, bool) — the parser-taking overloads aren't
@@ -2685,7 +2685,7 @@ fn inflate_call(vm: &mut Vm, args: &[V]) -> V {
 /// resources aren't loaded or the id doesn't name a layout).
 pub(crate) fn inflate_res(vm: &mut Vm, res_id: u32, ctx: V) -> V {
     let elems = vm.apk_res.as_ref().and_then(|r| r.layout_elements(res_id));
-    if std::env::var_os("OVELO_VIEWDBG").is_some() {
+    if crate::dbg_flag("OVELO_VIEWDBG") {
         eprintln!(
             "[viewdbg] inflate {res_id:#x}: {}",
             match &elems {
@@ -2748,7 +2748,7 @@ fn make_view_named(vm: &mut Vm, tag: &str, attrs: V, ctx: V) -> V {
     // runs — the standard overloads are (Context), (Context, AttributeSet)
     // and (Context, AttributeSet, int). A crashed ctor falls back to the
     // opaque host stub.
-    if std::env::var_os("OVELO_VIEWDBG").is_some() && desc.contains("Toolbar") {
+    if crate::dbg_flag("OVELO_VIEWDBG") && desc.contains("Toolbar") {
         let names: Vec<String> = match attrs {
             V::Ref(ah) => match vm.heap.get(ah) {
                 Some(Obj::Host {
@@ -2762,12 +2762,12 @@ fn make_view_named(vm: &mut Vm, tag: &str, attrs: V, ctx: V) -> V {
         eprintln!("[viewdbg] toolbar ctor attrs: {names:?}");
     }
     let h = try_construct_view(vm, &desc, ctx, attrs).unwrap_or_else(|| {
-        if std::env::var_os("OVELO_VIEWDBG").is_some() {
+        if crate::dbg_flag("OVELO_VIEWDBG") {
             eprintln!("[viewdbg] make_view_named {desc} -> host stub");
         }
         vm.alloc_host(&desc, HostState::Empty)
     });
-    if std::env::var_os("OVELO_VIEWDBG").is_some() && desc.contains("Toolbar") {
+    if crate::dbg_flag("OVELO_VIEWDBG") && desc.contains("Toolbar") {
         eprintln!("[viewdbg] toolbar -> {h:?}");
     }
     pseudo_set(vm, h, P_IS_VIEW, V::I32(1));
@@ -2899,12 +2899,12 @@ pub(crate) fn ta_attrs(vm: &Vm, h: u32) -> Vec<i32> {
 /// resolution chain for theme-scoped arrays and unset attrs.
 /// `None` when the value can't be resolved anywhere.
 pub(crate) fn ta_lookup(vm: &mut Vm, h: u32, index: usize) -> Option<V> {
-    if ta_attrs(vm, h).get(index).is_none() && std::env::var_os("OVELO_VIEWDBG").is_some() {
+    if ta_attrs(vm, h).get(index).is_none() && crate::dbg_flag("OVELO_VIEWDBG") {
         let n = ta_attrs(vm, h).len();
         eprintln!("[viewdbg] ta_lookup[{index}] out-of-range attrs_len={n} h={h}");
     }
     let attr_id = *ta_attrs(vm, h).get(index)? as u32;
-    if std::env::var_os("OVELO_VIEWDBG").is_some() {
+    if crate::dbg_flag("OVELO_VIEWDBG") {
         eprintln!(
             "[viewdbg] ta_lookup[{index}] attr_id={attr_id:#x} name={:?}",
             vm.apk_res
@@ -2931,15 +2931,15 @@ pub(crate) fn ta_lookup(vm: &mut Vm, h: u32, index: usize) -> Option<V> {
                 })
             );
             if let Some(v) = xml::cur_attr_value(vm, set_h, &name) {
-                if std::env::var_os("OVELO_VIEWDBG").is_some() {
+                if crate::dbg_flag("OVELO_VIEWDBG") {
                     eprintln!("[viewdbg]   ta_hit {name} = {v:?}");
                 }
                 return Some(v);
             }
-            if std::env::var_os("OVELO_VIEWDBG").is_some() {
+            if crate::dbg_flag("OVELO_VIEWDBG") {
                 eprintln!("[viewdbg]   ta_miss {name} set={set_h} xml={is_xml}");
             }
-        } else if std::env::var_os("OVELO_VIEWDBG").is_some() {
+        } else if crate::dbg_flag("OVELO_VIEWDBG") {
             eprintln!("[viewdbg]   ta_noset {name}");
         }
         if let Some(V::Ref(set_h)) = pseudo_get(vm, h, P_TA_SET) {
@@ -2955,12 +2955,12 @@ pub(crate) fn ta_lookup(vm: &mut Vm, h: u32, index: usize) -> Option<V> {
                         None
                     }
                 }) {
-                    if std::env::var_os("OVELO_VIEWDBG").is_some() {
+                    if crate::dbg_flag("OVELO_VIEWDBG") {
                         eprintln!("[viewdbg]   ta_map_hit {name} = {v:?}");
                     }
                     return Some(v);
                 }
-                if std::env::var_os("OVELO_VIEWDBG").is_some() {
+                if crate::dbg_flag("OVELO_VIEWDBG") {
                     let keys: Vec<String> = m.iter().filter_map(|(k, _)| sv(vm, *k)).collect();
                     eprintln!("[viewdbg]   ta_map_miss {name} set={set_h} keys={keys:?}");
                 }
@@ -3069,7 +3069,7 @@ pub(crate) fn resolve_ta_id(vm: &mut Vm, id: u32) -> Option<(u32, ovelo_apk::ars
 /// FragmentContainerView's 3-arg ctor).
 fn try_construct_view(vm: &mut Vm, desc: &str, ctx: V, attrs: V) -> Option<u32> {
     if vm.type_index_of(desc).is_none() {
-        if std::env::var_os("OVELO_VIEWDBG").is_some() {
+        if crate::dbg_flag("OVELO_VIEWDBG") {
             eprintln!("[viewdbg] {desc} not in dex → host stub");
         }
         return None;
@@ -3083,7 +3083,7 @@ fn try_construct_view(vm: &mut Vm, desc: &str, ctx: V, attrs: V) -> Option<u32> 
         match vm.instantiate_ctor(desc, midx, &args) {
             Ok(h) => return Some(h),
             Err(e) => {
-                if std::env::var_os("OVELO_VIEWDBG").is_some() {
+                if crate::dbg_flag("OVELO_VIEWDBG") {
                     eprintln!("[viewdbg] ctor {desc}({}) failed: {e}", params.join(","));
                 }
             }
@@ -3148,7 +3148,7 @@ fn layout_params(vm: &mut Vm, this: u32) -> V {
             &["Landroid/util/AttributeSet;"],
             &[attrs],
         );
-        if std::env::var_os("OVELO_VIEWDBG").is_some() {
+        if crate::dbg_flag("OVELO_VIEWDBG") {
             match &lp_v {
                 Err(e) => eprintln!("[viewdbg] generateLayoutParams h{this} -> {e}"),
                 Ok(v) => eprintln!(
@@ -3167,7 +3167,7 @@ fn layout_params(vm: &mut Vm, this: u32) -> V {
         // is the attr-free sibling and still fully initializes the
         // params object (ConstraintLayout$LayoutParams' widget, …).
         let dlp = vm.call_virtual_sig(p, "generateDefaultLayoutParams", &[], &[]);
-        if std::env::var_os("OVELO_VIEWDBG").is_some() {
+        if crate::dbg_flag("OVELO_VIEWDBG") {
             match &dlp {
                 Err(e) => eprintln!("[viewdbg] generateDefaultLayoutParams h{this} -> {e}"),
                 Ok(v) => eprintln!("[viewdbg] generateDefaultLayoutParams h{this} -> {v:?}"),
@@ -3190,7 +3190,7 @@ fn layout_params(vm: &mut Vm, this: u32) -> V {
                             return V::Ref(h);
                         }
                         Err(e) => {
-                            if std::env::var_os("OVELO_VIEWDBG").is_some() {
+                            if crate::dbg_flag("OVELO_VIEWDBG") {
                                 eprintln!("[viewdbg] LP {lp} ctor failed: {e}");
                             }
                         }
@@ -3214,7 +3214,7 @@ fn layout_params(vm: &mut Vm, this: u32) -> V {
         ),
     };
     pseudo_set(vm, this, P_LP, v);
-    if std::env::var_os("OVELO_VIEWDBG").is_some() {
+    if crate::dbg_flag("OVELO_VIEWDBG") {
         let p = match pseudo_get(vm, this, P_PARENT) {
             Some(V::Ref(h)) if h != 0 => class_of(vm, V::Ref(h)),
             _ => "none".into(),
@@ -3542,13 +3542,13 @@ fn measure_child(
         .unwrap_or(0);
     let ws = child_measure_spec(pw, pad_w + ml + mr + w_used, lp_w);
     let hs = child_measure_spec(ph, pad_h + mt + mb + h_used, lp_h);
-    if std::env::var_os("OVELO_VIEWDBG").is_some() {
+    if crate::dbg_flag("OVELO_VIEWDBG") {
         eprintln!(
             "[viewdbg] measureChild h{child} lp={lp_w}x{lp_h} used={w_used},{h_used} in={pw:#x}/{ph:#x} -> {ws:#x}/{hs:#x}"
         );
     }
     if let Err(e) = vm.call_virtual(child, "measure", &[V::I32(ws), V::I32(hs)]) {
-        if std::env::var_os("OVELO_VIEWDBG").is_some() {
+        if crate::dbg_flag("OVELO_VIEWDBG") {
             eprintln!("[viewdbg] measureChild h{child} err {e}");
         }
     }
@@ -4049,7 +4049,7 @@ fn group_layout_fallback(vm: &mut Vm, this: u32, _l: i32, _t: i32, r: i32, b: i3
         } else {
             (pad_l + ml, pad_t + mt)
         };
-        if std::env::var_os("OVELO_VIEWDBG").is_some() {
+        if crate::dbg_flag("OVELO_VIEWDBG") {
             eprintln!("[viewdbg] groupLayout h{ch} meas={cw}x{chh} at {cl},{ct}");
         }
         if let Err(e) = vm.call_virtual(
@@ -4057,7 +4057,7 @@ fn group_layout_fallback(vm: &mut Vm, this: u32, _l: i32, _t: i32, r: i32, b: i3
             "layout",
             &[V::I32(cl), V::I32(ct), V::I32(cl + cw), V::I32(ct + chh)],
         ) {
-            if std::env::var_os("OVELO_VIEWDBG").is_some() {
+            if crate::dbg_flag("OVELO_VIEWDBG") {
                 eprintln!("[viewdbg] groupLayout h{ch} err {e}");
             }
         }
@@ -4366,7 +4366,7 @@ fn relative_layout_fallback(vm: &mut Vm, this: u32, w: i32, h: i32) {
             };
             let _ = vm.call_virtual(ch, "measure", &[V::I32(ws), V::I32(hs)]);
         }
-        if std::env::var_os("OVELO_VIEWDBG").is_some() {
+        if crate::dbg_flag("OVELO_VIEWDBG") {
             let rules: Vec<String> = [
                 "layout_centerInParent",
                 "layout_centerHorizontal",
@@ -4402,7 +4402,7 @@ fn relative_layout_fallback(vm: &mut Vm, this: u32, w: i32, h: i32) {
             "layout",
             &[V::I32(cl), V::I32(ct), V::I32(cr), V::I32(cb)],
         ) {
-            if std::env::var_os("OVELO_VIEWDBG").is_some() {
+            if crate::dbg_flag("OVELO_VIEWDBG") {
                 eprintln!("[viewdbg] relLayout h{ch} err {e}");
             }
         }
@@ -4645,7 +4645,7 @@ fn expand_includes(vm: &Vm, elems: &[Element]) -> Vec<Element> {
                     }
                 }
                 Some(sub) if !sub.is_empty() => {
-                    if std::env::var_os("OVELO_VIEWDBG").is_some() {
+                    if crate::dbg_flag("OVELO_VIEWDBG") {
                         eprintln!(
                             "[viewdbg] include → {layout:#x} ({} elems, root {})",
                             sub.len(),
@@ -4719,7 +4719,7 @@ fn set_id_attr(el: &mut Element, id: i32) {
 
 fn build_tree(vm: &mut Vm, elems: &[Element], ctx: V) -> V {
     let expanded = expand_includes(vm, elems);
-    if std::env::var_os("OVELO_VIEWDBG").is_some() {
+    if crate::dbg_flag("OVELO_VIEWDBG") {
         let tags: Vec<String> = expanded
             .iter()
             .map(|e| format!("d{}:{}", e.depth, e.name))
@@ -4741,7 +4741,7 @@ fn build_tree(vm: &mut Vm, elems: &[Element], ctx: V) -> V {
         };
         let attrs = attrset_of(vm, el);
         let v = make_view_named(vm, &name, attrs, ctx);
-        if std::env::var_os("OVELO_VIEWDBG").is_some() {
+        if crate::dbg_flag("OVELO_VIEWDBG") {
             eprintln!("[viewdbg] elem d{} {} -> {v:?}", el.depth, el.name);
         }
         let V::Ref(h) = v else {
@@ -4807,7 +4807,7 @@ fn build_tree(vm: &mut Vm, elems: &[Element], ctx: V) -> V {
         match stack.last() {
             Some((_, p)) => {
                 let p = *p;
-                if std::env::var_os("OVELO_VIEWDBG").is_some() {
+                if crate::dbg_flag("OVELO_VIEWDBG") {
                     eprintln!("[viewdbg] attach h{h} -> parent h{p}");
                 }
                 attach(vm, p, V::Ref(h));
@@ -4917,7 +4917,7 @@ pub(crate) fn dispatch_touch(
         let t = oy + pint(vm, h, P_TOP);
         let r = ox + pint(vm, h, P_RIGHT);
         let b = oy + pint(vm, h, P_BOTTOM);
-        if std::env::var_os("OVELO_TOUCHDBG").is_some() {
+        if crate::dbg_flag("OVELO_TOUCHDBG") {
             eprintln!(
                 "[touchdbg]   try h{h} {} {l},{t},{r},{b}",
                 vm.dbg_class_of(h)
@@ -4960,7 +4960,7 @@ pub(crate) fn dispatch_touch(
         }
         (ox, oy)
     }
-    let dbg = std::env::var_os("OVELO_TOUCHDBG").is_some();
+    let dbg = crate::dbg_flag("OVELO_TOUCHDBG");
     let mut target = 0u32;
     for r in vm.view_roots.clone().iter().rev() {
         if dbg {
@@ -5140,7 +5140,7 @@ pub(crate) fn attach_at(
         let mut cur = parent;
         for _ in 0..64 {
             if cur == ch {
-                if std::env::var_os("OVELO_VIEWDBG").is_some() {
+                if crate::dbg_flag("OVELO_VIEWDBG") {
                     eprintln!(
                         "[viewdbg] attach REFUSED h{ch} -> parent h{parent} (cycle) class={}",
                         vm.dbg_class_of(ch)
@@ -5176,7 +5176,7 @@ pub(crate) fn attach_at(
     }
     if let V::Ref(ch) = child {
         pseudo_set(vm, ch, P_PARENT, V::Ref(parent));
-        if std::env::var_os("OVELO_VIEWDBG").is_some() {
+        if crate::dbg_flag("OVELO_VIEWDBG") {
             eprintln!(
                 "[viewdbg] attach_at h{ch} <- h{parent} parent_att={} cls={}",
                 pint(vm, parent, P_ATTACHED),
@@ -5321,7 +5321,7 @@ fn mark_attached(vm: &mut Vm, h: u32, depth: u32) {
     if pint(vm, h, P_ATTACHED) != 1 {
         pseudo_set(vm, h, P_ATTACHED, V::I32(1));
         let r = vm.call_virtual(h, "onAttachedToWindow", &[]);
-        if std::env::var_os("OVELO_VIEWDBG").is_some() {
+        if crate::dbg_flag("OVELO_VIEWDBG") {
             match r {
                 Ok(_) => eprintln!("[viewdbg] onAttachedToWindow h{h} ok"),
                 Err(e) => eprintln!("[viewdbg] onAttachedToWindow h{h} err {e}"),
@@ -5482,7 +5482,7 @@ pub(crate) fn decor_of(vm: &mut Vm, window: u32) -> Option<u32> {
     frame_set(vm, cf, 0, 0, ww, wh);
     vm.content_frames.insert(owner, cf);
     pseudo_set(vm, window, P_DECOR, V::Ref(d));
-    if std::env::var_os("OVELO_VIEWDBG").is_some() {
+    if crate::dbg_flag("OVELO_VIEWDBG") {
         eprintln!("[viewdbg] decor_of window=h{window} owner=h{owner} -> d=h{d} cf=h{cf}");
     }
     Some(d)
@@ -5544,7 +5544,7 @@ pub(crate) fn menu_of(vm: &mut Vm, view_h: u32) -> V {
         }
     }
     let m = host(vm, "Landroid/view/Menu;", HostState::Map(vec![]));
-    if std::env::var_os("OVELO_TRACE_MENU").is_some() {
+    if crate::dbg_flag("OVELO_TRACE_MENU") {
         eprintln!("[menu_of] view={view_h} menu={m:?}");
     }
     if let V::Ref(mh) = m {
@@ -5698,7 +5698,7 @@ fn menu_item(vm: &mut Vm, menu_h: u32, id: i32) -> V {
 }
 
 pub(crate) fn menu_find(vm: &mut Vm, menu_h: u32, id_v: Option<V>) -> V {
-    if std::env::var_os("OVELO_TRACE_MENU").is_some() {
+    if crate::dbg_flag("OVELO_TRACE_MENU") {
         eprintln!(
             "[menu_find] menu={menu_h} items={} want={id_v:?}",
             menu_items(vm, menu_h).len()
@@ -5729,7 +5729,7 @@ fn menu_title(vm: &mut Vm, v: V) -> V {
 /// `getVisibleItems`, casts to `MenuItemImpl` all see real entries. A
 /// `<menu>` nested inside an `<item>` inflates into its SubMenu.
 pub(crate) fn menu_inflate(vm: &mut Vm, res_v: Option<V>, menu_h: u32) {
-    let trace = std::env::var_os("OVELO_TRACE_MENU").is_some();
+    let trace = crate::dbg_flag("OVELO_TRACE_MENU");
     if trace {
         eprintln!("[menu_inflate] res={res_v:?} menu_h={menu_h}");
     }
@@ -5758,7 +5758,7 @@ pub(crate) fn menu_inflate(vm: &mut Vm, res_v: Option<V>, menu_h: u32) {
 /// One level of menu xml: `item` adds an entry; a nested `menu` opens
 /// its SubMenu and recurses; any other element is skipped.
 fn menu_inflate_level(vm: &mut Vm, doc: &[Element], i: &mut usize, depth: usize, menu_h: u32) {
-    let trace = std::env::var_os("OVELO_TRACE_MENU").is_some();
+    let trace = crate::dbg_flag("OVELO_TRACE_MENU");
     while *i < doc.len() {
         let el = &doc[*i];
         if el.depth < depth {
@@ -5841,7 +5841,7 @@ fn menu_add_entry(
         ) {
             Ok(Some(it)) => return it,
             r => {
-                if std::env::var_os("OVELO_TRACE_MENU").is_some() {
+                if crate::dbg_flag("OVELO_TRACE_MENU") {
                     eprintln!("[menu_add] dex {m} failed: {r:?}");
                 }
             }
@@ -5927,7 +5927,7 @@ pub(crate) fn register_menu_overrides(vm: &mut Vm) {
             "(ILandroid/view/Menu;)V",
             mk(ov_menu_inflate),
         );
-        if std::env::var_os("OVELO_TRACE_MENU").is_some() {
+        if crate::dbg_flag("OVELO_TRACE_MENU") {
             eprintln!("[menu_inflate] register_host {class} -> {ok:?}");
         }
     }

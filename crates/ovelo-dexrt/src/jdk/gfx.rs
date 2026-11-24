@@ -960,13 +960,13 @@ pub(crate) fn guest_draw_ops(vm: &mut Vm, view: u32, w: i32, h: i32) -> Vec<Canv
         }) => ops.len(),
         _ => 0,
     };
-    if std::env::var_os("OVELO_DRAWDBG").is_some() {
+    if crate::dbg_flag("OVELO_DRAWDBG") {
         let d = crate::jdk::class_of(vm, V::Ref(view));
         eprintln!(
             "[drawdbg] onDraw h{view} {d} {w}x{h} -> {n} ops err={:?}",
             r.is_err()
         );
-        if std::env::var_os("OVELO_DRAWDBG_DUMP").is_some() {
+        if crate::dbg_flag("OVELO_DRAWDBG_DUMP") {
             if let Some(Obj::Host {
                 state: HostState::CanvasOps(ops),
                 ..

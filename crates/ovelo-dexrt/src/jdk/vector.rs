@@ -87,7 +87,7 @@ pub(crate) fn drawable_for_res(vm: &mut Vm, res_id: u32) -> V {
                 }
                 return d;
             }
-            if std::env::var_os("OVELO_DRAWDBG").is_some() {
+            if crate::dbg_flag("OVELO_DRAWDBG") {
                 let tn = vm
                     .apk_res
                     .as_ref()

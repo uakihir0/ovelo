@@ -460,7 +460,7 @@ fn tls_site_id(site: &'static str) -> u64 {
 pub(crate) fn with_guest_tls_at<R>(site: &'static str, f: impl FnOnce() -> R) -> R {
     // OVELO_NOTLS: debug knob — run guest code on the host TPIDR_EL0 to
     // test whether the swap itself corrupts host state.
-    if std::env::var_os("OVELO_NOTLS").is_some() {
+    if crate::dbg_flag("OVELO_NOTLS") {
         return f();
     }
     unsafe {
@@ -482,7 +482,7 @@ pub(crate) fn with_guest_tls_at<R>(site: &'static str, f: impl FnOnce() -> R) ->
         // OVELO_TLSPROBE: allocation inside the swapped window — if the
         // crash is malloc's TPIDR-keyed per-thread magazine state, a
         // plain Vec alloc+drop dies here with the same signature.
-        if std::env::var_os("OVELO_TLSPROBE").is_some() {
+        if crate::dbg_flag("OVELO_TLSPROBE") {
             let mut v: Vec<u8> = Vec::with_capacity(4096);
             v.extend_from_slice(&[1u8, 2, 3, 4]);
             std::hint::black_box(v.as_ptr());
@@ -1247,7 +1247,7 @@ pub fn install_crash_dump() {
                 // pc may be unmapped (instruction abort on a wild
                 // branch): read through Mach, never dereference.
                 let insn = safe_read_u32(pc).unwrap_or(0);
-                if std::env::var_os("OVELO_HEALDBG").is_some() {
+                if crate::dbg_flag("OVELO_HEALDBG") {
                     static DBGN: std::sync::atomic::AtomicUsize =
                         std::sync::atomic::AtomicUsize::new(0);
                     let d = DBGN.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
@@ -2867,7 +2867,7 @@ pub(crate) fn check_all_zones(_tag: &str) {}
 /// zone functions with a `[so]` frame naming the culprit.
 #[cfg(target_os = "macos")]
 pub(crate) fn guest_malloc(size: usize) -> usize {
-    let extra = if std::env::var_os("OVELO_FREEDBG").is_some() {
+    let extra = if crate::dbg_flag("OVELO_FREEDBG") {
         16
     } else {
         0
@@ -3034,7 +3034,7 @@ fn dbg_free(p: usize, who: &'static str) -> bool {
 
 #[cfg(target_os = "macos")]
 extern "C" fn sh_malloc(size: usize) -> *mut c_void {
-    let extra = if std::env::var_os("OVELO_FREEDBG").is_some() {
+    let extra = if crate::dbg_flag("OVELO_FREEDBG") {
         16
     } else {
         0
@@ -3071,7 +3071,7 @@ extern "C" fn sh_free(ptr: *mut c_void) {
 
 #[cfg(target_os = "macos")]
 extern "C" fn sh_calloc(n: usize, size: usize) -> *mut c_void {
-    let extra = if std::env::var_os("OVELO_FREEDBG").is_some() {
+    let extra = if crate::dbg_flag("OVELO_FREEDBG") {
         16
     } else {
         0
@@ -3090,7 +3090,7 @@ extern "C" fn sh_calloc(n: usize, size: usize) -> *mut c_void {
 
 #[cfg(target_os = "macos")]
 extern "C" fn sh_realloc(ptr: *mut c_void, size: usize) -> *mut c_void {
-    if std::env::var_os("OVELO_FREEDBG").is_some() {
+    if crate::dbg_flag("OVELO_FREEDBG") {
         // realloc can't grow the tail canary in place — do alloc+copy+free
         // so every live buffer keeps its canary at p+size.
         if ptr.is_null() {
@@ -3124,7 +3124,7 @@ extern "C" fn sh_realloc(ptr: *mut c_void, size: usize) -> *mut c_void {
 
 #[cfg(target_os = "macos")]
 extern "C" fn sh_memalign(align: usize, size: usize) -> *mut c_void {
-    let extra = if std::env::var_os("OVELO_FREEDBG").is_some() {
+    let extra = if crate::dbg_flag("OVELO_FREEDBG") {
         16
     } else {
         0
@@ -3236,7 +3236,7 @@ extern "C" fn sh_strdup(s: *const i8) -> *mut i8 {
                 None => return std::ptr::null_mut(),
             }
         };
-        let extra = if std::env::var_os("OVELO_FREEDBG").is_some() {
+        let extra = if crate::dbg_flag("OVELO_FREEDBG") {
             16
         } else {
             0
@@ -3268,7 +3268,7 @@ extern "C" fn sh_strndup(s: *const i8, n: usize) -> *mut i8 {
             }
             len += 1;
         }
-        let extra = if std::env::var_os("OVELO_FREEDBG").is_some() {
+        let extra = if crate::dbg_flag("OVELO_FREEDBG") {
             16
         } else {
             0
@@ -3288,7 +3288,7 @@ extern "C" fn sh_guest_new(size: usize) -> *mut c_void {
     // operator new must not return null — spin until it succeeds is
     // what libc++ does under -fno-exceptions; for us a null means the
     // guest heap is genuinely exhausted, so abort loudly instead.
-    let extra = if std::env::var_os("OVELO_FREEDBG").is_some() {
+    let extra = if crate::dbg_flag("OVELO_FREEDBG") {
         16
     } else {
         0
@@ -3304,7 +3304,7 @@ extern "C" fn sh_guest_new(size: usize) -> *mut c_void {
 
 #[cfg(target_os = "macos")]
 extern "C" fn sh_guest_new_aligned(size: usize, align: usize) -> *mut c_void {
-    let extra = if std::env::var_os("OVELO_FREEDBG").is_some() {
+    let extra = if crate::dbg_flag("OVELO_FREEDBG") {
         16
     } else {
         0
@@ -3321,7 +3321,7 @@ extern "C" fn sh_guest_new_aligned(size: usize, align: usize) -> *mut c_void {
 /// nothrow new variants must return null on failure, never abort.
 #[cfg(target_os = "macos")]
 extern "C" fn sh_guest_new_nothrow(size: usize) -> *mut c_void {
-    let extra = if std::env::var_os("OVELO_FREEDBG").is_some() {
+    let extra = if crate::dbg_flag("OVELO_FREEDBG") {
         16
     } else {
         0
@@ -3333,7 +3333,7 @@ extern "C" fn sh_guest_new_nothrow(size: usize) -> *mut c_void {
 
 #[cfg(target_os = "macos")]
 extern "C" fn sh_guest_new_aligned_nothrow(size: usize, align: usize) -> *mut c_void {
-    let extra = if std::env::var_os("OVELO_FREEDBG").is_some() {
+    let extra = if crate::dbg_flag("OVELO_FREEDBG") {
         16
     } else {
         0
@@ -5570,7 +5570,7 @@ extern "C" fn sh_gl_shader_source(shader: u32, count: i32, strings: usize, lengt
             } else {
                 -1
             };
-            if std::env::var("OVELO_GLSLSRC").is_ok() {
+            if crate::dbg_flag("OVELO_GLSLSRC") {
                 eprintln!(
                     "[glsl-part shader={shader} i={i} p={:#x} len={len}]",
                     p as usize
@@ -5584,8 +5584,7 @@ extern "C" fn sh_gl_shader_source(shader: u32, count: i32, strings: usize, lengt
                 src.push_str(&String::from_utf8_lossy(b));
             } else if src_readable(p as *const c_void, 1) {
                 src.push_str(&std::ffi::CStr::from_ptr(p).to_string_lossy());
-                if std::env::var("OVELO_GLSLSRC").is_ok() && src_readable(p as *const c_void, 65536)
-                {
+                if crate::dbg_flag("OVELO_GLSLSRC") && src_readable(p as *const c_void, 65536) {
                     // A truncated-looking string may just hold an
                     // embedded NUL: probe past it for more text.
                     let b = std::slice::from_raw_parts(p as *const u8, 65536);
@@ -5612,7 +5611,7 @@ extern "C" fn sh_gl_shader_source(shader: u32, count: i32, strings: usize, lengt
                 .map(|t| t == 0x8B30) // GL_FRAGMENT_SHADER
                 .unwrap_or_else(|| src.contains("gl_FragColor") || src.contains("gl_FragData"));
             let t_src = glsl_es_to_gl(&src, frag);
-            if std::env::var("OVELO_GLSLSRC").is_ok() {
+            if crate::dbg_flag("OVELO_GLSLSRC") {
                 eprintln!("[glsl-src shader={shader}]\n{t_src}");
             }
             let t = std::ffi::CString::new(t_src).unwrap_or_default();
@@ -6406,11 +6405,11 @@ fn finish_so(m: MappedLib, name: &str) -> Result<(NativeLib, Vec<usize>)> {
         }
         // OVELO_NOHOSTDLSYM: debug bisection — refuse to hand guest code
         // real libSystem entry points, so every import lands on a shim.
-        if std::env::var_os("OVELO_NOHOSTDLSYM").is_some() {
+        if crate::dbg_flag("OVELO_NOHOSTDLSYM") {
             eprintln!("[dlsym-deny] {name}");
         } else {
             if let Some(a) = host_dlsym(&name) {
-                if std::env::var_os("OVELO_DLSYMLOG").is_some() {
+                if crate::dbg_flag("OVELO_DLSYMLOG") {
                     eprintln!("[dlsym] {name}");
                 }
                 // Data symbols must stay raw addresses — wrapping them in
@@ -6649,7 +6648,7 @@ fn finish_so(m: MappedLib, name: &str) -> Result<(NativeLib, Vec<usize>)> {
 /// DT_INIT then DT_INIT_ARRAY, each under the guest TLS window.
 fn run_ctors(inits: &[usize]) {
     for &a in inits {
-        if std::env::var_os("OVELO_ZONECHECK").is_some() {
+        if crate::dbg_flag("OVELO_ZONECHECK") {
             eprintln!("[zonecheck] ctor {a:#x}");
         }
         check_all_zones("pre-ctor");

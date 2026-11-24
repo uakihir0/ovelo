@@ -410,7 +410,7 @@ impl Heap {
                 _ => {}
             }
         }
-        if std::env::var_os("OVELO_MEMDBG").is_some() {
+        if crate::dbg_flag("OVELO_MEMDBG") {
             let mut kinds: HashMap<&'static str, usize> = HashMap::new();
             for (i, slot) in self.objs.iter().enumerate() {
                 if marked[i] {

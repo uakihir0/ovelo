@@ -30,6 +30,24 @@ use std::collections::HashMap;
 fn err(cause: &str) -> OveloError {
     OveloError::new(ErrorCategory::DexUnsupported, Phase::DexExec, cause)
 }
+
+/// Cached `std::env::var_os(name).is_some()` — debug flags are fixed at
+/// process start, but the interpreter consulted getenv once per
+/// instruction (`aget`/`sget`/`iget` sites) and per dispatch.
+pub(crate) fn dbg_flag(name: &'static str) -> bool {
+    thread_local! {
+        static CACHE: std::cell::RefCell<HashMap<&'static str, bool>> =
+            std::cell::RefCell::new(HashMap::new());
+    }
+    CACHE.with(|c| {
+        if let Some(v) = c.borrow().get(name) {
+            return *v;
+        }
+        let v = std::env::var_os(name).is_some();
+        c.borrow_mut().insert(name, v);
+        v
+    })
+}
 fn errd(cause: &str, detail: String) -> OveloError {
     OveloError::new(ErrorCategory::DexUnsupported, Phase::DexExec, cause).with_detail(detail)
 }
@@ -324,6 +342,21 @@ pub struct Vm {
     /// `(sub GIdx, sup GIdx)` → is-assignable — the chain+interface walk
     /// ran per check-cast / host registration probe.
     assignable_cache: std::cell::RefCell<HashMap<(GIdx, GIdx), bool>>,
+    /// `GIdx` → descriptor — `type_desc_of` re-decoded the MUTF-8 string
+    /// table on every call; assignability/super walks issue it per hop.
+    type_desc_cache: std::cell::RefCell<HashMap<GIdx, Option<String>>>,
+    /// descriptor → superclass descriptor — `super_desc` resolved the
+    /// dex class_def + its super string on every hop of every
+    /// `assignable_desc` walk.
+    super_desc_cache: std::cell::RefCell<HashMap<String, Option<String>>>,
+    /// `sub` descriptor → `sup` descriptor → is-assignable — nested so
+    /// lookups borrow `&str` keys without allocating a tuple.
+    /// `assignable_desc` is hit by `isInstance`/`isAssignableFrom` in
+    /// guest hot loops; each call re-walked the whole superclass chain.
+    assignable_desc_cache: std::cell::RefCell<HashMap<String, HashMap<String, bool>>>,
+    /// `midx` → `(params)ret` signature — the unresolved/builtin dispatch
+    /// path re-decoded the proto's full param list on every invoke.
+    proto_sig_cache: std::cell::RefCell<HashMap<GIdx, String>>,
     /// Bumped by every `pseudo_set` — lets the host render/layout
     /// passes skip rebuilding the dex-view tree when nothing changed.
     pub view_gen: u64,
@@ -565,7 +598,7 @@ impl Vm {
             unsafe_offsets: HashMap::new(),
             unsafe_next_offset: 0,
             trace_field: std::env::var("OVELO_TRACE_FIELD").ok(),
-            trace_throw: std::env::var_os("OVELO_TRACE_THROW").is_some(),
+            trace_throw: crate::dbg_flag("OVELO_TRACE_THROW"),
             trace_call: std::env::var("OVELO_TRACE_CALL").ok(),
             trace_from: std::env::var("OVELO_TRACE_FROM").ok(),
             view_roots: Vec::new(),
@@ -636,6 +669,10 @@ impl Vm {
             host_named_cache: std::cell::RefCell::new(HashMap::new()),
             named_chain_cache: std::cell::RefCell::new(HashMap::new()),
             assignable_cache: std::cell::RefCell::new(HashMap::new()),
+            type_desc_cache: std::cell::RefCell::new(HashMap::new()),
+            super_desc_cache: std::cell::RefCell::new(HashMap::new()),
+            assignable_desc_cache: std::cell::RefCell::new(HashMap::new()),
+            proto_sig_cache: std::cell::RefCell::new(HashMap::new()),
             view_gen: 0,
             layout_gen_done: std::cell::Cell::new(u64::MAX),
             gc_mark: 65_536,
@@ -673,6 +710,10 @@ impl Vm {
         self.host_named_cache.borrow_mut().clear();
         self.named_chain_cache.borrow_mut().clear();
         self.assignable_cache.borrow_mut().clear();
+        self.type_desc_cache.borrow_mut().clear();
+        self.super_desc_cache.borrow_mut().clear();
+        self.assignable_desc_cache.borrow_mut().clear();
+        self.proto_sig_cache.borrow_mut().clear();
         let di = self.dexes.len();
         for (class_idx, em) in dex.methods()? {
             self.defined
@@ -771,7 +812,7 @@ impl Vm {
             return None;
         }
         let hit = self.defs.get(&desc).copied();
-        if std::env::var_os("OVELO_ANNDBG").is_some()
+        if crate::dbg_flag("OVELO_ANNDBG")
             && (desc.contains("Navigator$Name") || desc.contains("ComposeNavigator"))
         {
             eprintln!("[anndbg] def_loc_of {desc} -> {hit:?}");
@@ -1001,9 +1042,27 @@ impl Vm {
     }
 
     pub(crate) fn type_desc_of(&self, g: GIdx) -> Result<String> {
-        self.dex_of(g)
-            .ok_or_else(|| err("dexrt.dex.idx"))?
-            .type_descriptor(gl(g))
+        if let Some(hit) = self.type_desc_cache.borrow().get(&g) {
+            return hit.clone().ok_or_else(|| err("dexrt.dex.idx"));
+        }
+        let out = self.dex_of(g).and_then(|d| d.type_descriptor(gl(g)).ok());
+        self.type_desc_cache.borrow_mut().insert(g, out.clone());
+        out.ok_or_else(|| err("dexrt.dex.idx"))
+    }
+
+    /// `(params)ret` for a method ref, memoized — the unresolved /
+    /// builtin dispatch path decodes the proto on every invoke.
+    fn proto_sig_of(&self, midx: GIdx) -> Rt<String> {
+        if let Some(hit) = self.proto_sig_cache.borrow().get(&midx) {
+            return Ok(hit.clone());
+        }
+        let d = self
+            .dex_of(midx)
+            .ok_or_else(|| E::Vm(err("dexrt.dex.idx")))?;
+        let mid = *d.method(gl(midx)).map_err(E::Vm)?;
+        let out = proto_sig(d, mid.proto_idx as u32).map_err(E::Vm)?;
+        self.proto_sig_cache.borrow_mut().insert(midx, out.clone());
+        Ok(out)
     }
 
     /// `Lowner;.name(params)ret` for a global method ref, or None when
@@ -1420,6 +1479,17 @@ impl Vm {
     /// Superclass descriptor for a class by name — the dex class def
     /// when present, else the framework `host_supers` table.
     pub(crate) fn super_desc(&self, desc: &str) -> Option<String> {
+        if let Some(hit) = self.super_desc_cache.borrow().get(desc) {
+            return hit.clone();
+        }
+        let out = self.super_desc_uncached(desc);
+        self.super_desc_cache
+            .borrow_mut()
+            .insert(desc.to_string(), out.clone());
+        out
+    }
+
+    fn super_desc_uncached(&self, desc: &str) -> Option<String> {
         if let Some(ty) = self.type_index_of(desc) {
             if let Some((cg, def)) = self.def_loc_of(ty) {
                 if def.superclass_idx == u32::MAX {
@@ -1583,7 +1653,7 @@ impl Vm {
             })?;
             return Ok(r.flatten());
         };
-        if std::env::var_os("OVELO_VIEWDBG").is_some() && (name == "layout" || name == "measure") {
+        if crate::dbg_flag("OVELO_VIEWDBG") && (name == "layout" || name == "measure") {
             let d = self.describe_method(midx);
             eprintln!("[viewdbg] dex layout h{this} -> {d}");
         }
@@ -1617,9 +1687,7 @@ impl Vm {
             .find_method_on_chain(ci, name, args.len())
             .map_err(E::Vm)?
         else {
-            if std::env::var_os("OVELO_VIEWDBG").is_some()
-                && matches!(name, "onMeasure" | "onLayout")
-            {
+            if crate::dbg_flag("OVELO_VIEWDBG") && matches!(name, "onMeasure" | "onLayout") {
                 let d = self.type_desc_of(ci).unwrap_or_default();
                 eprintln!("[viewdbg] onChain miss {name} ci_desc={d}");
             }
@@ -1908,7 +1976,7 @@ impl Vm {
         self.throw_sites.retain(|h, _| self.heap.get(*h).is_some());
         // Next collection when the heap grows another ~50%.
         self.gc_mark = (self.heap.len() * 3 / 2).max(65_536);
-        if std::env::var_os("OVELO_MEMDBG").is_some() {
+        if crate::dbg_flag("OVELO_MEMDBG") {
             eprintln!(
                 "[gc] freed {freed} slots={} mark={}",
                 self.heap.len(),
@@ -1958,7 +2026,7 @@ impl Vm {
                 (sw, sh) = (720, 1280);
             }
             let wh = V::Ref(holder);
-            if std::env::var_os("OVELO_DRAWDBG").is_some() {
+            if crate::dbg_flag("OVELO_DRAWDBG") {
                 eprintln!("[gldbg] surfaceCreated+Changed h{holder} cb{cb} {sw}x{sh}");
             }
             let _ = self.call_virtual(cb, "surfaceCreated", &[wh]);
@@ -1994,7 +2062,7 @@ impl Vm {
         let (due_cbs, pending_cbs): (Vec<_>, Vec<_>) =
             self.frame_callbacks.drain(..).partition(|(_, t)| *t <= now);
         self.frame_callbacks = pending_cbs;
-        let dbg = std::env::var_os("OVELO_DRAINDBG").is_some();
+        let dbg = crate::dbg_flag("OVELO_DRAINDBG");
         for (cb, _) in due_cbs {
             match self.call_virtual(cb, "doFrame", &[frame_nanos]) {
                 Err(e) if dbg => eprintln!("[drain] doFrame h{cb} err={e:?}"),
@@ -2318,7 +2386,7 @@ impl Vm {
         let Some(ci) = self.heap.class_of(h) else {
             return false;
         };
-        if std::env::var_os("OVELO_VIEWDBG").is_some() {
+        if crate::dbg_flag("OVELO_VIEWDBG") {
             let d = self.type_desc_of(ci).unwrap_or_else(|_| "?".into());
             eprintln!(
                 "[viewdbg] hdv h{h} ci={ci} desc={d} {name} -> {:?}",
@@ -3250,6 +3318,24 @@ impl Vm {
         if sub == sup || sup == "Ljava/lang/Object;" {
             return true;
         }
+        if let Some(hit) = self
+            .assignable_desc_cache
+            .borrow()
+            .get(sub)
+            .and_then(|m| m.get(sup))
+        {
+            return *hit;
+        }
+        let out = self.assignable_desc_uncached(sub, sup);
+        self.assignable_desc_cache
+            .borrow_mut()
+            .entry(sub.to_string())
+            .or_default()
+            .insert(sup.to_string(), out);
+        out
+    }
+
+    fn assignable_desc_uncached(&self, sub: &str, sup: &str) -> bool {
         if Self::builtin_supers(sub).contains(&sup) || jdk::host_supers(sub).contains(&sup) {
             return true;
         }
@@ -3409,7 +3495,7 @@ impl Vm {
         self.classes.get_mut(&class_idx).unwrap().clinit = 1;
         let fail = |this: &mut Self, e: E| -> Rt<()> {
             this.classes.get_mut(&class_idx).unwrap().clinit = 3;
-            if std::env::var_os("OVELO_CLINITDBG").is_some() {
+            if crate::dbg_flag("OVELO_CLINITDBG") {
                 eprintln!(
                     "[clinit] {} FAILED: {}",
                     this.type_desc_of(class_idx)
@@ -3685,9 +3771,7 @@ impl Vm {
     }
 
     fn call_builtin(&mut self, midx: GIdx, args: &[V], has_receiver: bool) -> Rt<Option<V>> {
-        if std::env::var_os("OVELO_VIEWDBG").is_some()
-            && self.describe_method(midx).contains("setText")
-        {
+        if crate::dbg_flag("OVELO_VIEWDBG") && self.describe_method(midx).contains("setText") {
             eprintln!(
                 "[viewdbg] call_builtin {} args={args:?}",
                 self.describe_method(midx)
@@ -3817,7 +3901,7 @@ impl Vm {
                     let p = d.proto(mid.proto_idx as u32).map_err(E::Vm)?;
                     ret_desc = d.type_descriptor(p.return_type_idx).map_err(E::Vm)?;
                 }
-                let sig = proto_sig(d, mid.proto_idx as u32).map_err(E::Vm)?;
+                let sig = self.proto_sig_of(midx)?;
                 // JDK/framework builtins cover real behavior for the
                 // common java.* / android.* surface.
                 if let Some(r) = jdk::call(self, &class, &name, &sig, args)? {
@@ -4091,7 +4175,7 @@ impl Vm {
                     | "Ljava/io/Serializable;"
                     | "Ljava/lang/Comparable;"
             ) && (want != "Ljava/lang/Double;" && want != "Ljava/lang/Float;" || !int_kind);
-        if std::env::var_os("OVELO_TRACE_INSTOF").is_some() {
+        if crate::dbg_flag("OVELO_TRACE_INSTOF") {
             eprintln!("[instof] scalar {:?} vs {} -> {}", v, want, hit);
         }
         hit
@@ -4113,7 +4197,7 @@ impl Vm {
         // heap access (recursive mutex — nested invoke/JNI re-enters
         // fine, call_native drops all levels while guest code runs).
         let _vmlock = jni::vm_lock();
-        if std::env::var_os("OVELO_VIEWDBG").is_some() {
+        if crate::dbg_flag("OVELO_VIEWDBG") {
             if let Some(d) = self.dex_of(midx) {
                 if let Ok(m) = d.method(gl(midx)) {
                     if let Ok(n) = d.string(m.name_idx) {
@@ -4218,7 +4302,7 @@ impl Vm {
                 (
                     d.type_descriptor(mid.class_idx as u32).map_err(E::Vm)?,
                     d.string(mid.name_idx).map_err(E::Vm)?,
-                    proto_sig(d, mid.proto_idx as u32).map_err(E::Vm)?,
+                    self.proto_sig_of(loc.midx)?,
                     d.proto(mid.proto_idx as u32)
                         .and_then(|p| d.type_descriptor(p.return_type_idx))
                         .map_err(E::Vm)?,
@@ -4586,7 +4670,7 @@ impl Vm {
     /// from the receiver mirror's elements, then its declared
     /// `AnnotationDefault`. `None` when this isn't an annotation call.
     fn annotation_method_value(&mut self, midx: GIdx, args: &[V]) -> Option<V> {
-        let dbg = std::env::var_os("OVELO_ANNDBG").is_some();
+        let dbg = crate::dbg_flag("OVELO_ANNDBG");
         if dbg {
             eprintln!("[anndbg] enter {}", self.describe_method(midx));
         }
@@ -5092,7 +5176,7 @@ impl Vm {
         let mut pc: usize = 0;
         // Instruction budget — a guest (or stub-driven) loop that never
         // terminates must fail loudly, not hang the host process.
-        let stalldbg = std::env::var_os("OVELO_STALLDBG").is_some();
+        let stalldbg = crate::dbg_flag("OVELO_STALLDBG");
         let mut steps: u64 = 0;
         loop {
             steps += 1;
@@ -5635,7 +5719,7 @@ impl Vm {
             0x44..=0x4a => {
                 let (h, i) = (Self::refv(r(1)?)?, Self::i32v(r(2)?)?);
                 let v = self.aget(h, i)?;
-                if std::env::var_os("OVELO_ARRDBG").is_some() {
+                if crate::dbg_flag("OVELO_ARRDBG") {
                     if let V::Ref(vh) = v {
                         if let Some(Obj::Array { elem, data }) = self.heap.get(vh) {
                             eprintln!(
@@ -5669,7 +5753,7 @@ impl Vm {
                         fields.get(&f).copied()
                     }
                     other => {
-                        if std::env::var_os("OVELO_VIEWDBG").is_some() {
+                        if crate::dbg_flag("OVELO_VIEWDBG") {
                             let kind = match other {
                                 Some(Obj::Array { .. }) => "array",
                                 Some(Obj::Str(_)) => "string",
@@ -5793,8 +5877,7 @@ impl Vm {
                     .statics
                     .get(&f)
                     .copied();
-                if std::env::var_os("OVELO_SGETDBG").is_some()
-                    && !matches!(stored, Some(V::Ref(h)) if h != 0)
+                if crate::dbg_flag("OVELO_SGETDBG") && !matches!(stored, Some(V::Ref(h)) if h != 0)
                 {
                     let fd = self.dexes[di].field(fl).map_err(E::Vm)?;
                     let cname = self.dexes[di]

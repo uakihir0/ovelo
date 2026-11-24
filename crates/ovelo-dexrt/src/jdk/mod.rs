@@ -572,7 +572,7 @@ pub fn pseudo_get(vm: &Vm, h: u32, key: impl Into<u64>) -> Option<V> {
 /// Write a pseudo field (`P_*` key) on a host/instance object.
 pub fn pseudo_set(vm: &mut Vm, h: u32, key: impl Into<u64>, v: V) {
     let key = key.into();
-    if key == u32::MAX as u64 - 7 && std::env::var_os("OVELO_VIEWDBG").is_some() {
+    if key == u32::MAX as u64 - 7 && crate::dbg_flag("OVELO_VIEWDBG") {
         eprintln!("[viewdbg] P_VIEW_ID h{h} <- {v:?}");
     }
     if let Some(f) = fields_mut(vm, h) {
@@ -650,7 +650,7 @@ pub(crate) fn list_snapshot(vm: &Vm, h: u32) -> Option<Vec<V>> {
         Some(Obj::Array { data, .. }) => Some(data.clone()),
         Some(Obj::Instance { .. }) => {
             let (x, off, size, ring) = guest_list_backing(vm, h, 8)?;
-            if std::env::var("OVELO_ITERDBG").is_ok() {
+            if crate::dbg_flag("OVELO_ITERDBG") {
                 let fs = match vm.heap.get(h) {
                     Some(Obj::Instance { fields, .. }) => fields
                         .iter()
@@ -1111,7 +1111,7 @@ pub(crate) fn map_get(vm: &Vm, h: u32, k: V) -> Option<V> {
                     .map(|(_, v)| *v),
                 _ => None,
             };
-            if std::env::var_os("OVELO_MAPDBG").is_some() {
+            if crate::dbg_flag("OVELO_MAPDBG") {
                 let kd = match k {
                     V::Ref(kh) => match vm.heap.get(kh) {
                         Some(Obj::Str(s)) => s.clone(),

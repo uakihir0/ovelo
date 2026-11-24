@@ -963,7 +963,7 @@ fn viewconfig_call(vm: &mut Vm, class: &str, name: &str, args: &[V]) -> Rt<Optio
                     i64v(args.get(7).copied().unwrap_or(V::I32(0))) as i32,
                 ),
             };
-            if std::env::var_os("OVELO_VIEWDBG").is_some() {
+            if crate::dbg_flag("OVELO_VIEWDBG") {
                 eprintln!("[viewdbg] gravity apply g={g:#x} {w}x{h}");
             }
             gravity_apply(vm, g, w, h, container, x_adj, y_adj, out, dir);
@@ -2033,7 +2033,7 @@ fn context_call(
                     HostState::Empty,
                 )
             });
-            if std::env::var_os("OVELO_TRACE_DRAW").is_some() {
+            if crate::dbg_flag("OVELO_TRACE_DRAW") {
                 eprintln!(
                     "[ctx.getDrawable] class={class} args={:?} -> {r:?}",
                     args.get(1)
@@ -2635,7 +2635,7 @@ fn context_call(
         }
         "runOnUiThread" => {
             if let V::Ref(r) = args[1] {
-                if std::env::var_os("OVELO_VIEWDBG").is_some() {
+                if crate::dbg_flag("OVELO_VIEWDBG") {
                     eprintln!(
                         "[viewdbg] runOnUiThread runnable={r} dex_run={}",
                         vm.has_dex_virtual(r, "run", &[])
@@ -2646,7 +2646,7 @@ fn context_call(
                     // here means the data never reaches the view. Swallowing
                     // it silently leaves every screen looking "empty for no
                     // reason", so surface it under the debug flag.
-                    if std::env::var_os("OVELO_VIEWDBG").is_some() {
+                    if crate::dbg_flag("OVELO_VIEWDBG") {
                         eprintln!("[viewdbg] runOnUiThread runnable={r} err {e:?}");
                     }
                 }
@@ -3042,7 +3042,7 @@ fn resources_call(vm: &mut Vm, name: &str, args: &[V]) -> Rt<Option<Option<V>>> 
             Some(Some(arr(vm, STRING, vals)))
         }
         "getIntArray" => {
-            if std::env::var("OVELO_VIEWDBG").is_ok() {
+            if crate::dbg_flag("OVELO_VIEWDBG") {
                 let rid = res_id();
                 let n = vm
                     .apk_res
@@ -3272,7 +3272,7 @@ fn resources_call(vm: &mut Vm, name: &str, args: &[V]) -> Rt<Option<Option<V>>> 
                         r.entry_name(i64v(args.get(1).copied().unwrap_or(V::I32(0))) as u32)
                     })
                     .map(str::to_string);
-                if std::env::var_os("OVELO_VIEWDBG").is_some() {
+                if crate::dbg_flag("OVELO_VIEWDBG") {
                     eprintln!("[viewdbg] getResourceEntryName({:?}) -> {n:?}", args.get(1));
                 }
                 Some(Some(jstr(vm, n.as_deref().unwrap_or(""))))
@@ -3670,7 +3670,7 @@ fn res_misc(vm: &mut Vm, class: &str, name: &str, args: &[V]) -> Rt<Option<Optio
             }
             // Asset reads serve real bytes out of the APK's assets/ dir.
             let fname = sv(vm, args.get(1).copied().unwrap_or(V::I32(0))).unwrap_or_default();
-            if std::env::var_os("OVELO_ASSETDBG").is_some() {
+            if crate::dbg_flag("OVELO_ASSETDBG") {
                 eprintln!("[asset] {name} '{fname}'");
             }
             let bytes = vm.apk_res.as_ref().and_then(|r| {
@@ -4154,7 +4154,7 @@ fn graphics_call(vm: &mut Vm, class: &str, name: &str, args: &[V]) -> Rt<Option<
                 return Ok(Some(None));
             };
             let px = bitmap_pixels(vm, args[0]);
-            if std::env::var_os("OVELO_DRAWDBG").is_some() {
+            if crate::dbg_flag("OVELO_DRAWDBG") {
                 eprintln!(
                     "[drawdbg] {c}.draw px={} canvas_arg={:?}",
                     px.as_ref()
@@ -4725,7 +4725,7 @@ fn gravity_apply(
     dir: i32,
 ) {
     let (V::Ref(ch), V::Ref(oh)) = (container, out) else {
-        if std::env::var_os("OVELO_VIEWDBG").is_some() {
+        if crate::dbg_flag("OVELO_VIEWDBG") {
             eprintln!("[viewdbg] gravity apply not-refs c={container:?} o={out:?}");
         }
         return;
@@ -4771,7 +4771,7 @@ fn gravity_apply(
         }
         _ => (ct + y_adj, ct + y_adj + h),
     };
-    if std::env::var_os("OVELO_VIEWDBG").is_some() {
+    if crate::dbg_flag("OVELO_VIEWDBG") {
         eprintln!("[viewdbg] gravity apply h{oh} c=({cl},{ct},{cr},{cb}) -> ({l},{t},{r},{b})");
     }
     rect_write(vm, oh, l, t, r, b);

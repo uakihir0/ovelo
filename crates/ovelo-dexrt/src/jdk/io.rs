@@ -719,7 +719,7 @@ fn stream_call(vm: &mut Vm, name: &str, args: &[V]) -> Rt<Option<Option<V>>> {
         });
         if let Some(inner) = inner {
             if inner != 0 && inner != this {
-                if std::env::var_os("OVELO_STREAMDBG").is_some() {
+                if crate::dbg_flag("OVELO_STREAMDBG") {
                     let td = match vm.heap.get(this) {
                         Some(Obj::Host { desc, .. }) => desc.clone(),
                         Some(Obj::Instance { class_idx, .. }) => {
@@ -1107,7 +1107,7 @@ fn file_call(vm: &mut Vm, name: &str, args: &[V]) -> Option<Option<V>> {
                         .collect()
                 })
                 .unwrap_or_default();
-            if std::env::var_os("OVELO_VIEWDBG").is_some() {
+            if crate::dbg_flag("OVELO_VIEWDBG") {
                 eprintln!(
                     "[viewdbg] {name} {path} -> {} ({} entries)",
                     std_path.display(),
@@ -2502,7 +2502,7 @@ fn nio_call(vm: &mut Vm, class: &str, name: &str, args: &[V]) -> Option<Option<V
             Some(Some(v))
         }
         "order" => {
-            if std::env::var("OVELO_ORDDBG").is_ok() {
+            if crate::dbg_flag("OVELO_ORDDBG") {
                 eprintln!(
                     "[orddbg] order arg={:?} heap={:?}",
                     args.get(1),
@@ -2659,7 +2659,7 @@ fn nio_call(vm: &mut Vm, class: &str, name: &str, args: &[V]) -> Option<Option<V
                             },
                             _ => Vec::new(),
                         };
-                        if std::env::var("OVELO_ORDDBG").is_ok() {
+                        if crate::dbg_flag("OVELO_ORDDBG") {
                             eprintln!(
                                 "[orddbg] bulk-put class={class} es={es} little={} ord={:?} nbytes={}",
                                 little(vm),

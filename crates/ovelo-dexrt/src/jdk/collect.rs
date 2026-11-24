@@ -110,16 +110,26 @@ const ITER_CLASSES: &[&str] = &[
     "Ljava/util/HashMap$Entry;",
 ];
 
+/// `class` equals or descends from any of `kinds` — resolves the
+/// host ancestry once instead of re-scanning `host_supers` per kind.
+fn has_kind(class: &str, kinds: &[&str]) -> bool {
+    if kinds.contains(&class) {
+        return true;
+    }
+    let supers = host_supers(class);
+    kinds.iter().any(|k| supers.contains(k))
+}
+
 fn is_list(class: &str) -> bool {
-    LIST_CLASSES.iter().any(|c| desc_is_a(class, c))
+    has_kind(class, LIST_CLASSES)
 }
 
 fn is_map(class: &str) -> bool {
-    MAP_CLASSES.iter().any(|c| desc_is_a(class, c))
+    has_kind(class, MAP_CLASSES)
 }
 
 fn is_iter(class: &str) -> bool {
-    ITER_CLASSES.iter().any(|c| desc_is_a(class, c))
+    has_kind(class, ITER_CLASSES)
         || class.contains("$")
             && (class.starts_with("Ljava/util/") || class.starts_with("Landroid/util/"))
 }
@@ -452,7 +462,7 @@ fn list_call(vm: &mut Vm, name: &str, sig: &str, args: &[V]) -> Rt<Option<Option
             } else if dup {
                 Some(Some(V::I32(0)))
             } else {
-                if std::env::var("OVELO_ITERDBG").is_ok() && matches!(args[1], V::Ref(0)) {
+                if crate::dbg_flag("OVELO_ITERDBG") && matches!(args[1], V::Ref(0)) {
                     eprintln!("[iterdbg] add(null) on h{h} len={}", l.len());
                 }
                 l.push(args[1]);
@@ -688,7 +698,7 @@ fn list_call(vm: &mut Vm, name: &str, sig: &str, args: &[V]) -> Rt<Option<Option
                     break;
                 }
             }
-            if std::env::var("OVELO_CONTAINSDBG").is_ok() {
+            if crate::dbg_flag("OVELO_CONTAINSDBG") {
                 let kind = |e: &V| match e {
                     V::Ref(eh) => {
                         let k = match vm.heap.get(*eh) {
@@ -749,7 +759,7 @@ fn list_call(vm: &mut Vm, name: &str, sig: &str, args: &[V]) -> Rt<Option<Option
             // `getBackStackEntry` found nothing and threw).
             let items: Vec<V> = match list_snapshot(vm, h) {
                 Some(l) => {
-                    if std::env::var("OVELO_ITERDBG").is_ok() {
+                    if crate::dbg_flag("OVELO_ITERDBG") {
                         eprintln!(
                             "[iterdbg] iterator on h{h} {} len={}",
                             vm.dbg_class_of(h),
@@ -759,7 +769,7 @@ fn list_call(vm: &mut Vm, name: &str, sig: &str, args: &[V]) -> Rt<Option<Option
                     l
                 }
                 None => {
-                    if std::env::var("OVELO_ITERDBG").is_ok() {
+                    if crate::dbg_flag("OVELO_ITERDBG") {
                         let cls = vm.dbg_class_of(h);
                         let kind = match vm.heap.get(h) {
                             Some(Obj::Host { state, .. }) => format!("host:{state:?}"),
@@ -858,7 +868,7 @@ fn map_call(vm: &mut Vm, name: &str, sig: &str, args: &[V]) -> Rt<Option<Option<
             Some(None)
         }
         "put" => {
-            if std::env::var_os("OVELO_MAPDBG").is_some() {
+            if crate::dbg_flag("OVELO_MAPDBG") {
                 let ks = s(
                     vm,
                     match args[1] {
@@ -930,7 +940,7 @@ fn map_call(vm: &mut Vm, name: &str, sig: &str, args: &[V]) -> Rt<Option<Option<
             Some(None)
         }
         "get" | "getOrDefault" | "remove" | "removeObject" => {
-            if std::env::var_os("OVELO_MAPDBG").is_some() {
+            if crate::dbg_flag("OVELO_MAPDBG") {
                 let ks = s(
                     vm,
                     match args[1] {
@@ -1470,7 +1480,7 @@ fn iter_call(vm: &mut Vm, name: &str, args: &[V]) -> Rt<Option<Option<V>>> {
                 }) => {
                     if *pos < items.len() {
                         let v = items[*pos];
-                        if std::env::var("OVELO_ITERDBG").is_ok() && matches!(v, V::Ref(0)) {
+                        if crate::dbg_flag("OVELO_ITERDBG") && matches!(v, V::Ref(0)) {
                             eprintln!(
                                 "[iterdbg] next on h{h} pos={pos} yields null; items={:?}",
                                 items.iter().map(|x| format!("{x:?}")).collect::<Vec<_>>()
@@ -2345,7 +2355,7 @@ fn atomic_call(vm: &mut Vm, class: &str, name: &str, args: &[V]) -> Option<Optio
             let nv = i64v(cur).wrapping_add(delta);
             let next = width_coerce(class, V::I64(nv));
             slot_put(vm, h, next);
-            if std::env::var_os("OVELO_ATOMICDBG").is_some() {
+            if crate::dbg_flag("OVELO_ATOMICDBG") {
                 eprintln!("[atomic] {class}.{name} h={h} cur={cur:?} -> {next:?}");
             }
             Some(if name.starts_with("getAnd") {

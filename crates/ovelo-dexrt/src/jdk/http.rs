@@ -575,7 +575,7 @@ fn fake_failure(vm: &mut Vm, req_h: u32, why: &str) -> Result<u32> {
 
 fn httpdbg() -> bool {
     static V: OnceLock<bool> = OnceLock::new();
-    *V.get_or_init(|| std::env::var_os("OVELO_HTTPDBG").is_some())
+    *V.get_or_init(|| crate::dbg_flag("OVELO_HTTPDBG"))
 }
 
 fn do_execute(vm: &mut Vm, call_h: u32) -> Result<Option<V>> {

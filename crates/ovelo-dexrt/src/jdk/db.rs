@@ -538,7 +538,7 @@ pub(crate) fn media_cursor(vm: &mut Vm, uri: &str, projection: &[String]) -> V {
             V::I64(0),
         ]);
     }
-    if std::env::var_os("OVELO_DRAINDBG").is_some() {
+    if crate::dbg_flag("OVELO_DRAINDBG") {
         eprintln!(
             "[media_cursor] {uri} rows={} projection={projection:?}",
             rows.len()
@@ -766,7 +766,7 @@ pub(crate) fn saf_cursor(vm: &mut Vm, uri: &str, projection: &[String]) -> V {
     } else if base.exists() {
         push_row(vm, &mut rows, &base, doc_id.clone());
     }
-    if std::env::var_os("OVELO_DRAINDBG").is_some() {
+    if crate::dbg_flag("OVELO_DRAINDBG") {
         eprintln!(
             "[saf_cursor] {uri} rows={} projection={projection:?}",
             rows.len()
@@ -1008,7 +1008,7 @@ pub(crate) fn db_call(vm: &mut Vm, name: &str, args: &[V]) -> Rt<Option<Option<V
         Some(&V::Ref(h)) => h,
         _ => 0,
     };
-    if std::env::var_os("OVELO_DBDBG").is_some() {
+    if crate::dbg_flag("OVELO_DBDBG") {
         let sql = args.get(1).and_then(|v| sv(vm, *v)).unwrap_or_default();
         let sql: String = sql.chars().take(80).collect();
         eprintln!("[db] {name}(h={h}) {sql}");
@@ -1578,7 +1578,7 @@ fn cursor_call(vm: &mut Vm, name: &str, args: &[V]) -> Rt<Option<Option<V>>> {
     };
     let n_rows = cur_rows(vm, h).len() as i32;
     let col_arg = i32v(*args.get(1).unwrap_or(&V::I32(0)));
-    let dbg = std::env::var_os("OVELO_CURDBG").is_some();
+    let dbg = crate::dbg_flag("OVELO_CURDBG");
     if dbg && matches!(name, "getCount") {
         eprintln!(
             "[cur] h={h} getCount -> {n_rows} cols={:?}",
@@ -1759,7 +1759,7 @@ pub(crate) struct BundledStmt {
 impl BundledStmt {
     fn exec(&mut self) -> rusqlite::Result<()> {
         let d = self.conn.borrow();
-        if std::env::var_os("OVELO_DBDBG").is_some() {
+        if crate::dbg_flag("OVELO_DBDBG") {
             let sql: String = self.sql.chars().take(400).collect();
             eprintln!("[bundled] exec: {sql} | params={:?}", self.params);
         }
@@ -1775,7 +1775,7 @@ impl BundledStmt {
                 }
                 self.rows.push(row);
             }
-            if std::env::var_os("OVELO_DBDBG").is_some() {
+            if crate::dbg_flag("OVELO_DBDBG") {
                 eprintln!(
                     "[bundled] query -> {} rows: {:?}",
                     self.rows.len(),
@@ -1784,7 +1784,7 @@ impl BundledStmt {
             }
         } else {
             let r = st.execute(params_from_iter(self.params.clone()))?;
-            if std::env::var_os("OVELO_DBDBG").is_some() {
+            if crate::dbg_flag("OVELO_DBDBG") {
                 eprintln!(
                     "[bundled] exec -> {r} rows rowid={}",
                     d.conn.last_insert_rowid()
@@ -1891,7 +1891,7 @@ pub(crate) fn bundled_call(vm: &mut Vm, name: &str, args: &[V]) -> Rt<Option<Opt
             "nativePrepare" => {
                 let d = bconn(vm, i64v(args[0]))?;
                 let sql = args.get(1).and_then(|v| sv(vm, *v)).unwrap_or_default();
-                if std::env::var_os("OVELO_DBDBG").is_some() {
+                if crate::dbg_flag("OVELO_DBDBG") {
                     let t: String = sql.chars().take(100).collect();
                     eprintln!("[bundled] prepare: {t}");
                 }
@@ -1923,7 +1923,7 @@ pub(crate) fn bundled_call(vm: &mut Vm, name: &str, args: &[V]) -> Rt<Option<Opt
                     let s = vm.bundled_stmts.get_mut(&(h as u64)).unwrap();
                     if !s.executed {
                         err = s.exec().err();
-                        if std::env::var_os("OVELO_DBDBG").is_some() {
+                        if crate::dbg_flag("OVELO_DBDBG") {
                             if let Some(e) = &err {
                                 eprintln!("[bundled] exec ERR: {e}");
                             }
@@ -1941,7 +1941,7 @@ pub(crate) fn bundled_call(vm: &mut Vm, name: &str, args: &[V]) -> Rt<Option<Opt
                 if let Some(e) = err {
                     return Err(sql_err(vm, e));
                 }
-                if std::env::var_os("OVELO_DBDBG").is_some() {
+                if crate::dbg_flag("OVELO_DBDBG") {
                     eprintln!(
                         "[bundled] step h={h} -> {has} (rows={}, cur={:?})",
                         vm.bundled_stmts
@@ -1970,7 +1970,7 @@ pub(crate) fn bundled_call(vm: &mut Vm, name: &str, args: &[V]) -> Rt<Option<Opt
             }
             "nativeBindNull" => {
                 let (h, idx) = (i64v(args[0]), i64v(args[1]).max(1) as usize);
-                if std::env::var_os("OVELO_DBDBG").is_some() {
+                if crate::dbg_flag("OVELO_DBDBG") {
                     eprintln!("[bundled] bindNull h={h} idx={idx}");
                 }
                 if let Some(s) = vm.bundled_stmts.get_mut(&(h as u64)) {
@@ -1984,7 +1984,7 @@ pub(crate) fn bundled_call(vm: &mut Vm, name: &str, args: &[V]) -> Rt<Option<Opt
             }
             "nativeBindLong" => {
                 let (h, idx, v) = (i64v(args[0]), i64v(args[1]).max(1) as usize, i64v(args[2]));
-                if std::env::var_os("OVELO_DBDBG").is_some() {
+                if crate::dbg_flag("OVELO_DBDBG") {
                     eprintln!("[bundled] bindLong h={h} idx={idx} v={v}");
                 }
                 if let Some(s) = vm.bundled_stmts.get_mut(&(h as u64)) {
@@ -2003,7 +2003,7 @@ pub(crate) fn bundled_call(vm: &mut Vm, name: &str, args: &[V]) -> Rt<Option<Opt
             }
             "nativeBindText" => {
                 let (h, idx) = (i64v(args[0]), i64v(args[1]).max(1) as usize);
-                if std::env::var_os("OVELO_DBDBG").is_some() {
+                if crate::dbg_flag("OVELO_DBDBG") {
                     eprintln!("[bundled] bindText h={h} idx={idx}");
                 }
                 let t = args.get(2).and_then(|v| sv(vm, *v)).unwrap_or_default();
@@ -2079,7 +2079,7 @@ pub(crate) fn bundled_call(vm: &mut Vm, name: &str, args: &[V]) -> Rt<Option<Opt
                     .get(&(h as u64))
                     .map(|s| s.cell(col))
                     .unwrap_or(SV::Null);
-                if std::env::var_os("OVELO_DBDBG").is_some() {
+                if crate::dbg_flag("OVELO_DBDBG") {
                     eprintln!("[bundled] getLong h={h} col={col} -> {:?}", v);
                 }
                 Some(V::I64(sv_long(&v)))
