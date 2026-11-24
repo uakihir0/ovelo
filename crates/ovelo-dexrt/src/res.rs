@@ -123,12 +123,14 @@ impl ApkResources {
                     return 0; // understood qualifier, doesn't match
                 }
             }
-            (has_sw << 63)
-                | (sw << 46)
-                | (has_w << 45)
-                | (w << 28)
-                | (has_h << 27)
-                | (h << 10)
+            // Keep bit 63 clear — the key must stay positive so a
+            // fully-matching bucket sorts above every fallback (0).
+            (has_sw << 62)
+                | (sw << 45)
+                | (has_w << 44)
+                | (w << 27)
+                | (has_h << 26)
+                | (h << 9)
                 | (misc << 1)
                 | 1
         }
