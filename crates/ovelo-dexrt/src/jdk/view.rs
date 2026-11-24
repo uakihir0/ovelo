@@ -5474,6 +5474,12 @@ pub(crate) fn decor_of(vm: &mut Vm, window: u32) -> Option<u32> {
     // dispatchAttachedToWindow reaches the whole existing subtree.
     mark_attached(vm, cf, 0);
     attach(vm, d, V::Ref(cf));
+    // The decor fills its window — host-side frame now, since no dex
+    // `layout()` will ever run over these objects (`getDecorView()
+    // .getWidth()` must not read 0).
+    let (ww, wh) = vm.window_size;
+    frame_set(vm, d, 0, 0, ww, wh);
+    frame_set(vm, cf, 0, 0, ww, wh);
     vm.content_frames.insert(owner, cf);
     pseudo_set(vm, window, P_DECOR, V::Ref(d));
     if std::env::var_os("OVELO_VIEWDBG").is_some() {

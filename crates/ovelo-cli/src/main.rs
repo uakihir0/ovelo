@@ -1789,6 +1789,7 @@ fn run_app(store: &InstallStore, package: &str) -> Result<(), OveloError> {
                         let u = ui2.borrow();
                         (u.root.w, u.root.h)
                     };
+                    vm.set_window_size(win_w, win_h);
                     ovelo_framework::drive_dex_layout_pass(vm, *this, dex_frame, win_w, win_h);
                 }
             }

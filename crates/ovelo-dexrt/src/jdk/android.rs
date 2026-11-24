@@ -3670,6 +3670,9 @@ fn res_misc(vm: &mut Vm, class: &str, name: &str, args: &[V]) -> Rt<Option<Optio
             }
             // Asset reads serve real bytes out of the APK's assets/ dir.
             let fname = sv(vm, args.get(1).copied().unwrap_or(V::I32(0))).unwrap_or_default();
+            if std::env::var_os("OVELO_ASSETDBG").is_some() {
+                eprintln!("[asset] {name} '{fname}'");
+            }
             let bytes = vm.apk_res.as_ref().and_then(|r| {
                 r.read(&format!("assets/{fname}"))
                     .or_else(|| r.read(&fname))

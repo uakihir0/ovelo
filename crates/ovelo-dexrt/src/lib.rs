@@ -225,6 +225,10 @@ pub struct Vm {
     /// moves its own ContentFrameLayout in, so an id-search can't be
     /// trusted to find the attachment point afterwards.
     pub(crate) content_frames: HashMap<u32, u32>,
+    /// Last known host window size — decor views are created lazily
+    /// inside guest calls and can't wait for the next layout pass to
+    /// have bounds.
+    pub(crate) window_size: (i32, i32),
     /// Interned host enum constants, keyed (desc, ordinal) — so
     /// `Month.of(1) == Month.JANUARY` and `date.getMonth()` return the
     /// same handle the static constant did.
@@ -570,6 +574,7 @@ impl Vm {
             content_views: HashMap::new(),
             decor_roots: HashMap::new(),
             content_frames: HashMap::new(),
+            window_size: (720, 1280),
             enum_cache: HashMap::new(),
             clock_views: Vec::new(),
             apk_res: None,
@@ -2228,6 +2233,31 @@ impl Vm {
     pub fn view_set_frame(&mut self, h: u32, l: i32, t: i32, r: i32, b: i32) {
         if h != 0 {
             jdk::view::frame_set(self, h, l, t, r, b);
+        }
+    }
+
+    /// Record the host window size — decor views created lazily take
+    /// their initial bounds from it.
+    pub fn set_window_size(&mut self, w: i32, h: i32) {
+        if w > 0 && h > 0 {
+            self.window_size = (w, h);
+        }
+    }
+
+    /// Give every window decor root and framework content frame the
+    /// window's bounds — they're host-created view objects that never
+    /// pass through layout, so `getDecorView().getWidth()`/`getHeight()`
+    /// would read 0 (Korge sizes its main framebuffer from exactly
+    /// those calls).
+    pub fn sync_decor_frames(&mut self, w: i32, h: i32) {
+        let views: Vec<u32> = self
+            .decor_roots
+            .values()
+            .chain(self.content_frames.values())
+            .copied()
+            .collect();
+        for v in views {
+            self.view_set_frame(v, 0, 0, w, h);
         }
     }
 
