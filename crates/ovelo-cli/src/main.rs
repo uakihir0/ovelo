@@ -704,6 +704,18 @@ fn register_compat_shims(
             })) as ovelo_dexrt::HostCall,
         );
     }
+    // androidx.profileinstaller: `ProfileInstallerInitializer` schedules
+    // `writeProfile` on the first doFrame — under interpretation that
+    // write churns for minutes while the window never opens. The
+    // baseline profile is advisory (a performance hint, not behavior),
+    // so the call is a no-op here.
+    let _ = v.register_host(
+        "Landroidx/profileinstaller/ProfileInstaller;",
+        "writeProfile",
+        "(Landroid/content/Context;Ljava/util/concurrent/Executor;Landroidx/profileinstaller/ProfileInstaller$DiagnosticsCallback;Z)V",
+        Rc::new(RefCell::new(|_vm: &mut ovelo_dexrt::Vm, _a: &[V]| Ok(None)))
+            as ovelo_dexrt::HostCall,
+    );
     // androidx.startup: `initializeComponent` enforces that the
     // initializer was discovered via manifest meta-data — our runtime
     // runs discovered initializers itself (see startup_initializers),

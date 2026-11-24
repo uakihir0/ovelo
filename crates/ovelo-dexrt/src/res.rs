@@ -77,10 +77,12 @@ impl ApkResources {
         // understood one that fails, returns 0 and stays a last-seen
         // fallback only for entries with no default.
         // Device: portrait 360x360dp (what Configuration reports),
-        // API 35, day mode.
+        // API 35, NIGHT mode (Configuration.uiMode reports
+        // UI_MODE_NIGHT_YES) — `night` buckets match, `notnight` fail.
         // Matched-key precedence follows AOSP: smallestScreenWidth >
         // screenWidthDp > screenHeightDp > other qualifiers; for each
-        // dp qualifier the largest matching N wins.
+        // dp qualifier the largest matching N wins. Among the misc
+        // qualifiers, orientation outranks night (AOSP ordering).
         fn bucket_rank(config: &str) -> i64 {
             if config == "default" {
                 return 0;
@@ -109,10 +111,14 @@ impl ApkResources {
                 } else {
                     match part {
                         "port" => {
-                            misc += 1;
+                            misc += 4;
                             true
                         }
-                        "land" | "night" | "square" => false,
+                        "night" => {
+                            misc += 2;
+                            true
+                        }
+                        "land" | "notnight" | "square" => false,
                         // Qualifiers we can't evaluate (lang, dpi,
                         // small/large, car/watch/tv) — keep the bucket
                         // as a fallback candidate only.

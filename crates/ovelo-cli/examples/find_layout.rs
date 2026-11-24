@@ -1,6 +1,6 @@
-// find layout xmls containing given tag names
+//! find layout xmls containing given tag names
 use ovelo_apk::{
-    manifest::{parse_axml, Value},
+    manifest::parse_axml,
     zip::{parse_central_directory, read_entry, ZipLimits},
 };
 fn main() {
