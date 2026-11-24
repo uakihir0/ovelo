@@ -2251,8 +2251,12 @@ fn thread_call(vm: &mut Vm, name: &str, _sig: &str, args: &[V]) -> Rt<Option<Opt
                 2_000
             };
             let until = super::now_ms() as u64 + cap_ms;
-            while alive(vm) && (super::now_ms() as u64) < until {
-                if vm.park_drain().is_err() {
+            while alive(vm) {
+                let rem = until.saturating_sub(super::now_ms() as u64);
+                if rem == 0 {
+                    break;
+                }
+                if vm.park_drain_within(rem).is_err() {
                     break;
                 }
             }

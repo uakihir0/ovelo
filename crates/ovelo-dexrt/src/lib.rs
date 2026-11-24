@@ -1887,6 +1887,13 @@ impl Vm {
     /// re-entry) but makes runBlock-style callers redo work — hence
     /// the generous cap.
     pub(crate) fn park_drain(&mut self) -> std::result::Result<(), E> {
+        self.park_drain_within(50)
+    }
+
+    /// `park_drain` with a caller-bounded internal sleep slice — joins
+    /// with a millisecond deadline pass their remaining budget so a
+    /// `join(1)` can't overshoot by the full 50ms slice.
+    pub(crate) fn park_drain_within(&mut self, max_slice_ms: u64) -> std::result::Result<(), E> {
         // Promote delayed tasks that came due — a parked scheduler
         // worker requeued with `due=now` sits in `delayed_runnables`,
         // and an unbounded park (runBlocking on the main thread) must
@@ -1913,7 +1920,9 @@ impl Vm {
             if let Some(due) = self.delayed_runnables.iter().map(|(_, _, t)| *t).min() {
                 let now2 = jdk::now_ms() as u64;
                 if due > now2 {
-                    std::thread::sleep(std::time::Duration::from_millis((due - now2).min(50)));
+                    std::thread::sleep(std::time::Duration::from_millis(
+                        (due - now2).min(max_slice_ms),
+                    ));
                 }
                 let now3 = jdk::now_ms() as u64;
                 let mut i = 0;
