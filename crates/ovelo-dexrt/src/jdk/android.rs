@@ -4388,6 +4388,184 @@ fn graphics_call(vm: &mut Vm, class: &str, name: &str, args: &[V]) -> Rt<Option<
                 _ => V::I32(1), // hasAlpha / getGenerationId
             }))
         }
+        ("Landroid/graphics/Bitmap;", "getPixels") => {
+            // getPixels(int[] dst, int offset, int stride, int x, int y, int w, int h)
+            Some(Some({
+                if let Some((bw, bh, rgba)) = bitmap_pixels(vm, args[0]) {
+                    if let V::Ref(arr) = args.get(1).copied().unwrap_or(V::I32(0)) {
+                        let (off, stride, x0, y0, w, h) = (
+                            i32v(args.get(2).copied().unwrap_or(V::I32(0))).max(0) as usize,
+                            i32v(args.get(3).copied().unwrap_or(V::I32(0))).max(0) as usize,
+                            i32v(args.get(4).copied().unwrap_or(V::I32(0))).max(0) as u32,
+                            i32v(args.get(5).copied().unwrap_or(V::I32(0))).max(0) as u32,
+                            i32v(args.get(6).copied().unwrap_or(V::I32(0))).max(0) as u32,
+                            i32v(args.get(7).copied().unwrap_or(V::I32(0))).max(0) as u32,
+                        );
+                        if let Some(Obj::Array { data, .. }) = vm.heap.get_mut(arr) {
+                            for y in 0..h.min(bh.saturating_sub(y0)) {
+                                for x in 0..w.min(bw.saturating_sub(x0)) {
+                                    let s = (((y0 + y) * bw + (x0 + x)) * 4) as usize;
+                                    let v = rgba[s] as i32
+                                        | (rgba[s + 1] as i32) << 8
+                                        | (rgba[s + 2] as i32) << 16
+                                        | (rgba[s + 3] as i32) << 24;
+                                    let d = off + y as usize * stride + x as usize;
+                                    if let Some(slot) = data.get_mut(d) {
+                                        *slot = V::I32(v);
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+                args[0]
+            }))
+        }
+        ("Landroid/graphics/Bitmap;", "setPixels") => {
+            // setPixels(int[] src, int offset, int stride, int x, int y, int w, int h)
+            Some(Some({
+                if let V::Ref(bh) = args[0] {
+                    if let (
+                        Some(Obj::Host {
+                            state:
+                                HostState::Bitmap {
+                                    w: bw,
+                                    h: bh2,
+                                    rgba,
+                                },
+                            ..
+                        }),
+                        V::Ref(arr),
+                    ) = (vm.heap.get(bh), args.get(1).copied().unwrap_or(V::I32(0)))
+                    {
+                        if let Some(Obj::Array { data, .. }) = vm.heap.get(arr) {
+                            let src: Vec<i32> = data.iter().map(|v| i32v(*v)).collect();
+                            let (off, stride, x0, y0, w, h) = (
+                                i32v(args.get(2).copied().unwrap_or(V::I32(0))).max(0) as usize,
+                                i32v(args.get(3).copied().unwrap_or(V::I32(0))).max(0) as usize,
+                                i32v(args.get(4).copied().unwrap_or(V::I32(0))).max(0) as u32,
+                                i32v(args.get(5).copied().unwrap_or(V::I32(0))).max(0) as u32,
+                                i32v(args.get(6).copied().unwrap_or(V::I32(0))).max(0) as u32,
+                                i32v(args.get(7).copied().unwrap_or(V::I32(0))).max(0) as u32,
+                            );
+                            let mut px = rgba.as_ref().clone();
+                            for y in 0..h.min(bh2.saturating_sub(y0)) {
+                                for x in 0..w.min(bw.saturating_sub(x0)) {
+                                    let v = src
+                                        .get(off + y as usize * stride + x as usize)
+                                        .copied()
+                                        .unwrap_or(0)
+                                        as u32;
+                                    let d = (((y0 + y) * bw + (x0 + x)) * 4) as usize;
+                                    px[d] = (v & 0xFF) as u8;
+                                    px[d + 1] = ((v >> 8) & 0xFF) as u8;
+                                    px[d + 2] = ((v >> 16) & 0xFF) as u8;
+                                    px[d + 3] = ((v >> 24) & 0xFF) as u8;
+                                }
+                            }
+                            if let Some(Obj::Host {
+                                state: HostState::Bitmap { rgba: dst, .. },
+                                ..
+                            }) = vm.heap.get_mut(bh)
+                            {
+                                *dst = std::rc::Rc::new(px);
+                            }
+                        }
+                    }
+                }
+                args[0]
+            }))
+        }
+        ("Landroid/graphics/Bitmap;", "copyPixelsToBuffer") => {
+            // copyPixelsToBuffer(Buffer dst): writes packed ARGB ints —
+            // byte order is CPU-native (LE), giving R,G,B,A byte lanes
+            // which is what GL_RGBA/ubyte expects on upload.
+            Some(Some({
+                if let (Some((bw, bh, rgba)), V::Ref(dh)) = (
+                    bitmap_pixels(vm, args[0]),
+                    args.get(1).copied().unwrap_or(V::I32(0)),
+                ) {
+                    if let Some(Obj::Host {
+                        state: HostState::Slot(V::Ref(arr)),
+                        ..
+                    }) = vm.heap.get(dh)
+                    {
+                        let esz = i32v(pseudo_get(vm, dh, super::P_BBUF_ESZ).unwrap_or(V::I32(1)))
+                            .clamp(1, 8) as usize;
+                        let pos = i32v(pseudo_get(vm, dh, super::P_BBUF_POS).unwrap_or(V::I32(0)))
+                            .max(0) as usize;
+                        let base = i32v(pseudo_get(vm, dh, super::P_BBUF_BASE).unwrap_or(V::I32(0)))
+                            .max(0) as usize;
+                        let mut d = base + pos * esz;
+                        if let Some(Obj::Array { data, .. }) = vm.heap.get_mut(*arr) {
+                            let n = ((bw * bh) as usize).min(rgba.len() / 4);
+                            for p in 0..n {
+                                for k in 0..4 {
+                                    if let Some(slot) = data.get_mut(d + k) {
+                                        *slot = V::I32(rgba[p * 4 + k] as i8 as i32);
+                                    }
+                                }
+                                d += 4;
+                            }
+                            pseudo_set(
+                                vm,
+                                dh,
+                                super::P_BBUF_POS,
+                                V::I32(pos as i32 + ((bw * bh * 4) / esz as u32) as i32),
+                            );
+                        }
+                    }
+                }
+                args[0]
+            }))
+        }
+        ("Landroid/graphics/Bitmap;", "copyPixelsFromBuffer") => Some(Some({
+            if let (V::Ref(bh), V::Ref(dh)) = (args[0], args.get(1).copied().unwrap_or(V::I32(0))) {
+                if let (
+                    Some(Obj::Host {
+                        state:
+                            HostState::Bitmap {
+                                w: bw,
+                                h: bh2,
+                                rgba,
+                            },
+                        ..
+                    }),
+                    Some(Obj::Host {
+                        state: HostState::Slot(V::Ref(arr)),
+                        ..
+                    }),
+                ) = (vm.heap.get(bh), vm.heap.get(dh))
+                {
+                    let esz = i32v(pseudo_get(vm, dh, super::P_BBUF_ESZ).unwrap_or(V::I32(1)))
+                        .clamp(1, 8) as usize;
+                    let pos = i32v(pseudo_get(vm, dh, super::P_BBUF_POS).unwrap_or(V::I32(0)))
+                        .max(0) as usize;
+                    let base = i32v(pseudo_get(vm, dh, super::P_BBUF_BASE).unwrap_or(V::I32(0)))
+                        .max(0) as usize;
+                    let mut px = rgba.as_ref().clone();
+                    if let Some(Obj::Array { data, .. }) = vm.heap.get(*arr) {
+                        let n = ((bw * bh2) as usize).min(px.len() / 4);
+                        let mut s = base + pos * esz;
+                        for p in 0..n {
+                            for k in 0..4 {
+                                px[p * 4 + k] =
+                                    data.get(s + k).map(|v| i32v(*v) as u8).unwrap_or(0);
+                            }
+                            s += 4;
+                        }
+                    }
+                    if let Some(Obj::Host {
+                        state: HostState::Bitmap { rgba: dst, .. },
+                        ..
+                    }) = vm.heap.get_mut(bh)
+                    {
+                        *dst = std::rc::Rc::new(px);
+                    }
+                }
+            }
+            args[0]
+        })),
         ("Landroid/graphics/Bitmap;", "createBitmap" | "createScaledBitmap") => {
             // createBitmap(w, h, Config, ...) / createScaledBitmap(src, w, h, filter)
             let (w, h, src) = if name == "createScaledBitmap" {

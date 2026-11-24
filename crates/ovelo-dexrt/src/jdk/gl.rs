@@ -65,6 +65,19 @@ struct Prim {
     verts: Vec<(f32, f32)>,
     /// Per-vertex packed ARGB.
     colors: Vec<u32>,
+    /// Texture ids + UVs per emitted vertex, parallel to `verts` —
+    /// present when the draw's shader samples bound textures.
+    tex: Option<TexVerts>,
+}
+
+/// A decoded `glTexImage2D` texture: straight RGBA8 rows in upload
+/// order (row 0 = GL v = 0, matching the guest's UV convention).
+type TexVerts = (Vec<i32>, Vec<(f32, f32)>);
+
+struct TexImg {
+    w: usize,
+    h: usize,
+    rgba: Vec<u8>,
 }
 
 /// A `glVertexAttribPointer` binding (VBO or direct-buffer form).
@@ -119,6 +132,12 @@ struct GlState {
     /// `GL_BLEND` enable — when off, source alpha is ignored
     /// (framebuffer write is opaque), so recorded colors force a=1.
     blend: bool,
+    /// Active texture unit (`glActiveTexture`).
+    tex_unit: i32,
+    /// Texture unit -> bound texture id (`glBindTexture`).
+    tex_bound: HashMap<i32, i32>,
+    /// Texture id -> decoded pixels (`glTexImage2D`/`glTexSubImage2D`).
+    textures: HashMap<i32, TexImg>,
 }
 
 impl GlState {
@@ -148,6 +167,9 @@ impl GlState {
             uniforms: HashMap::new(),
             uni_names: HashMap::new(),
             blend: false,
+            tex_unit: 0,
+            tex_bound: HashMap::new(),
+            textures: HashMap::new(),
         }
     }
 }
@@ -435,6 +457,7 @@ fn record(vm: &Vm, gl: u32, mode: i32, first: i32, count: i32) {
             mode,
             verts,
             colors,
+            tex: None,
         });
     });
 }
@@ -458,8 +481,94 @@ fn record_el(vm: &Vm, gl: u32, mode: i32, count: i32, ty: i32, buf: u32) {
             mode,
             verts,
             colors,
+            tex: None,
         });
     });
+}
+
+/// Try the six emitted vertices starting at `i` as one textured quad:
+/// two triangles over exactly four axis-aligned corners, all sampling
+/// the same texture. Extracts the UV rect from the texture and emits
+/// a tinted `CanvasOp::Bitmap`; returns None to fall back to fills.
+fn tex_quad_op(st: &GlState, p: &Prim, i: usize) -> Option<CanvasOp> {
+    let (tex_ids, uvs) = p.tex.as_ref()?;
+    if i + 5 >= p.verts.len() {
+        return None;
+    }
+    let tex = tex_ids[i];
+    if tex == 0 || tex_ids[i..i + 6].iter().any(|&t| t != tex) {
+        return None;
+    }
+    let vs = &p.verts[i..i + 6];
+    // 4 unique corners, 2 distinct xs, 2 distinct ys = a screen rect.
+    let mut xs: Vec<u32> = vs.iter().map(|v| v.0.to_bits()).collect();
+    let mut ys: Vec<u32> = vs.iter().map(|v| v.1.to_bits()).collect();
+    xs.sort_unstable();
+    xs.dedup();
+    ys.sort_unstable();
+    ys.dedup();
+    if xs.len() != 2 || ys.len() != 2 {
+        return None;
+    }
+    let t = st.textures.get(&tex)?;
+    if t.w == 0 || t.h == 0 || t.rgba.is_empty() {
+        return None;
+    }
+    let (mut u0, mut v0, mut u1, mut v1) = (f32::MAX, f32::MAX, f32::MIN, f32::MIN);
+    for &(u, v) in &uvs[i..i + 6] {
+        u0 = u0.min(u);
+        u1 = u1.max(u);
+        v0 = v0.min(v);
+        v1 = v1.max(v);
+    }
+    let (sx0, sy0) = (
+        (u0 * t.w as f32).floor().max(0.0) as usize,
+        (v0 * t.h as f32).floor().max(0.0) as usize,
+    );
+    let (sx1, sy1) = (
+        ((u1 * t.w as f32).ceil() as usize).min(t.w),
+        ((v1 * t.h as f32).ceil() as usize).min(t.h),
+    );
+    if sx1 <= sx0 || sy1 <= sy0 {
+        return None;
+    }
+    // Extract the src rect and multiply through the vertex tint
+    // (Korge colors glyphs/sprites via a_Col*; white = cheap path).
+    let tint = *p.colors.get(i).or(p.colors.last()).unwrap_or(&0xFFFF_FFFF);
+    let (ta, tr, tg, tb) = (
+        (tint >> 24) & 0xFF,
+        (tint >> 16) & 0xFF,
+        (tint >> 8) & 0xFF,
+        tint & 0xFF,
+    );
+    let mut rgba = Vec::with_capacity((sx1 - sx0) * (sy1 - sy0) * 4);
+    for y in sy0..sy1 {
+        for x in sx0..sx1 {
+            let s = (y * t.w + x) * 4;
+            let px = &t.rgba[s..s + 4];
+            if tint == 0xFFFF_FFFF {
+                rgba.extend_from_slice(px);
+            } else {
+                rgba.extend_from_slice(&[
+                    (px[0] as u32 * tr / 255) as u8,
+                    (px[1] as u32 * tg / 255) as u8,
+                    (px[2] as u32 * tb / 255) as u8,
+                    (px[3] as u32 * ta / 255) as u8,
+                ]);
+            }
+        }
+    }
+    let x0 = f32::from_bits(xs[0]);
+    let y0 = f32::from_bits(ys[0]);
+    Some(CanvasOp::Bitmap {
+        x: x0,
+        y: y0,
+        w: (f32::from_bits(xs[1]) - x0).max(0.0) as u32,
+        h: (f32::from_bits(ys[1]) - y0).max(0.0) as u32,
+        src_w: (sx1 - sx0) as u32,
+        src_h: (sy1 - sy0) as u32,
+        rgba: std::rc::Rc::new(rgba),
+    })
 }
 
 /// Flatten recorded prims into CanvasOps (post-`onDrawFrame`).
@@ -522,8 +631,19 @@ fn to_ops(st: &GlState) -> Vec<CanvasOp> {
                 }
             }
             GL_TRIANGLES => {
-                for i in (0..n.saturating_sub(2)).step_by(3) {
-                    fill(&mut ops, &[i, i + 1, i + 2]);
+                // Textured batches are quads — two tris sharing an
+                // axis-aligned rect (idxs like [a,b,c, d,a,c]). Emit
+                // one Bitmap op per quad; non-quad tris fall back to
+                // vertex-color fills.
+                let mut i = 0;
+                while i + 2 < n {
+                    if let Some(op) = tex_quad_op(st, p, i) {
+                        ops.push(op);
+                        i += 6;
+                    } else {
+                        fill(&mut ops, &[i, i + 1, i + 2]);
+                        i += 3;
+                    }
                 }
             }
             GL_TRIANGLE_STRIP => {
@@ -891,6 +1011,7 @@ pub(crate) fn call(
                         mode: -1,
                         verts: Vec::new(),
                         colors: vec![s.clear],
+                        tex: None,
                     });
                 });
             }
@@ -1271,7 +1392,134 @@ fn buf_bytes(vm: &Vm, buf: &V, size: usize) -> Vec<u8> {
     (0..size).map(|i| byte_at(vm, *h, pos + i)).collect()
 }
 
-/// Read one attribute's component set at vertex `i` — VBO or direct.
+/// Decode `glTexImage2D`/`glTexSubImage2D` source pixels to straight
+/// RGBA8. Null `pixels` yields a zeroed buffer (sized-only alloc).
+fn tex_pixels(vm: &Vm, src: &V, w: usize, h: usize, fmt: i32, ty: i32) -> Vec<u8> {
+    let npix = w.saturating_mul(h);
+    if npix == 0 {
+        return Vec::new();
+    }
+    let ch = match fmt {
+        0x1908 => 4,          // GL_RGBA
+        0x1907 => 3,          // GL_RGB
+        0x190A => 2,          // GL_LUMINANCE_ALPHA
+        0x1906 | 0x1909 => 1, // GL_ALPHA | GL_LUMINANCE
+        _ => 4,
+    };
+    let expand = |r: u32, g: u32, b: u32, a: u32, o: &mut Vec<u8>| {
+        o.extend_from_slice(&[r as u8, g as u8, b as u8, a as u8]);
+    };
+    let mut o = Vec::with_capacity(npix * 4);
+    match ty {
+        0x1401 => {
+            // GL_UNSIGNED_BYTE
+            let b = buf_bytes(vm, src, npix * ch);
+            for p in 0..npix {
+                let s = p * ch;
+                if s + ch > b.len() {
+                    break;
+                }
+                let px = &b[s..s + ch];
+                match fmt {
+                    0x1907 => expand(px[0] as u32, px[1] as u32, px[2] as u32, 255, &mut o),
+                    0x190A => expand(
+                        px[0] as u32,
+                        px[0] as u32,
+                        px[0] as u32,
+                        px[1] as u32,
+                        &mut o,
+                    ),
+                    0x1906 => expand(255, 255, 255, px[0] as u32, &mut o),
+                    0x1909 => expand(px[0] as u32, px[0] as u32, px[0] as u32, 255, &mut o),
+                    _ => o.extend_from_slice(px),
+                }
+            }
+        }
+        // Packed u16 formats — byte order follows the buffer order.
+        0x8363 | 0x8033 | 0x8034 => {
+            let le = upload_le(vm, src);
+            let b = buf_bytes(vm, src, npix * 2);
+            for p in 0..npix {
+                let s = p * 2;
+                if s + 2 > b.len() {
+                    break;
+                }
+                let v = if le {
+                    u16::from_le_bytes([b[s], b[s + 1]])
+                } else {
+                    u16::from_be_bytes([b[s], b[s + 1]])
+                };
+                match ty {
+                    0x8363 => {
+                        // RGB_565
+                        let r = ((v >> 11) & 0x1F) as u32 * 255 / 31;
+                        let g = ((v >> 5) & 0x3F) as u32 * 255 / 63;
+                        let bl = (v & 0x1F) as u32 * 255 / 31;
+                        expand(r, g, bl, 255, &mut o);
+                    }
+                    0x8033 => {
+                        // RGBA_4444
+                        let r = ((v >> 12) & 0xF) as u32 * 17;
+                        let g = ((v >> 8) & 0xF) as u32 * 17;
+                        let bl = ((v >> 4) & 0xF) as u32 * 17;
+                        let a = (v & 0xF) as u32 * 17;
+                        expand(r, g, bl, a, &mut o);
+                    }
+                    _ => {
+                        // RGB5_A1
+                        let r = ((v >> 11) & 0x1F) as u32 * 255 / 31;
+                        let g = ((v >> 6) & 0x1F) as u32 * 255 / 31;
+                        let bl = ((v >> 1) & 0x1F) as u32 * 255 / 31;
+                        let a = if v & 1 == 1 { 255 } else { 0 };
+                        expand(r, g, bl, a, &mut o);
+                    }
+                }
+            }
+        }
+        _ => o.resize(npix * 4, 0),
+    }
+    o.resize(npix * 4, 0);
+    o
+}
+
+/// Resolve the texture id vertex `i` samples: the `*TexIndex*` attrib
+/// picks the sampler (`u_Tex{n}` name suffix, single-sampler draw →
+/// index 0), the sampler's uniform holds the bound unit, the unit
+/// holds the texture id. 0 = untextured.
+fn tex_id_at(
+    vm: &Vm,
+    st: &GlState,
+    uv_ok: bool,
+    tidx_a: &Option<Attrib>,
+    samplers: &[(i32, String)],
+    i: usize,
+) -> i32 {
+    if !uv_ok || samplers.is_empty() {
+        return 0;
+    }
+    let ti = tidx_a
+        .as_ref()
+        .map(|a| attr_at(vm, st, a, i)[0] as i32)
+        .unwrap_or(0);
+    let loc = samplers
+        .iter()
+        .find(|(_, n)| n.ends_with(&ti.to_string()))
+        .map(|(l, _)| *l)
+        .or(if samplers.len() == 1 {
+            Some(samplers[0].0)
+        } else {
+            None
+        });
+    let Some(loc) = loc else { return 0 };
+    let unit = st
+        .uniforms
+        .get(&loc)
+        .and_then(|v| v.first())
+        .copied()
+        .unwrap_or(0.0) as i32;
+    st.tex_bound.get(&unit).copied().unwrap_or(0)
+}
+
 fn attr_at(vm: &Vm, st: &GlState, a: &Attrib, i: usize) -> [f32; 4] {
     if a.buf > 0 {
         // Direct buffer/array path — same decoding as glVertexPointer.
@@ -1528,6 +1776,39 @@ fn record20(vm: &Vm, st: &mut GlState, mode: i32, idxs: &[i32]) {
         });
     let ctr_a = find("inCenter");
     let rad_a = find("inRadiusSquared");
+    // Texturing: an enabled float vec2 attrib named *tex*/*uv* is the
+    // UV source; an optional index attrib (*TexIndex*) selects which
+    // sampler uniform the vertex feeds (Korge's a_Tex/a_TexIndex).
+    let uv_a = st
+        .attribs
+        .values()
+        .find(|a| {
+            a.enabled && a.ty == 0x1406 && a.size == 2 && {
+                let n = a.name.to_lowercase();
+                n.contains("tex") || n.contains("uv")
+            }
+        })
+        .cloned();
+    let tidx_a = st
+        .attribs
+        .values()
+        .find(|a| {
+            a.enabled && {
+                let n = a.name.to_lowercase();
+                n.contains("tex") && n.contains("index")
+            }
+        })
+        .cloned();
+    // Sampler uniforms: names mentioning tex/sampler; value = unit.
+    let samplers: Vec<(i32, String)> = st
+        .uni_names
+        .iter()
+        .filter(|(_, n)| {
+            let n = n.to_lowercase();
+            n.contains("tex") || n.contains("sampler")
+        })
+        .map(|(l, n)| (*l, n.clone()))
+        .collect();
     let mvp = mvp_uniform(st);
     let (vx, vy, vw, vh) = st.vp;
     let to_px = |v: [f32; 4]| -> (f32, f32) {
@@ -1543,6 +1824,8 @@ fn record20(vm: &Vm, st: &mut GlState, mode: i32, idxs: &[i32]) {
     };
     let mut verts = Vec::with_capacity(idxs.len());
     let mut colors = Vec::with_capacity(idxs.len());
+    let mut uvs = Vec::new();
+    let mut tex_ids = Vec::new();
     // Circle quads repeat one circle's center/radius per vertex —
     // dedupe consecutive repeats into a single fan (mode -2).
     let mut last_c: Option<(f32, f32, f32)> = None;
@@ -1573,17 +1856,28 @@ fn record20(vm: &Vm, st: &mut GlState, mode: i32, idxs: &[i32]) {
                     mode: -2,
                     verts: v,
                     colors: vec![col],
+                    tex: None,
                 });
             }
         }
         verts.push(to_px([p[0], p[1], p[2], 1.0]));
         colors.push(col);
+        if let Some(a) = &uv_a {
+            let u = attr_at(vm, st, a, i);
+            uvs.push((u[0], u[1]));
+            tex_ids.push(tex_id_at(vm, st, true, &tidx_a, &samplers, i));
+        }
     }
     if mode >= 0 {
         st.prims.push(Prim {
             mode,
             verts,
             colors,
+            tex: if uvs.is_empty() {
+                None
+            } else {
+                Some((tex_ids, uvs))
+            },
         });
     }
 }
@@ -1911,6 +2205,7 @@ pub(crate) fn call_static(
                         mode: -1,
                         verts: Vec::new(),
                         colors: vec![s.clear],
+                        tex: None,
                     });
                 });
             }
@@ -2048,6 +2343,162 @@ pub(crate) fn call_static(
                     }
                 }
             }
+            None
+        }
+        "glActiveTexture" => {
+            state(GL20, |s| s.tex_unit = i(0).saturating_sub(0x84C0));
+            None
+        }
+        "glBindTexture" => {
+            let id = i(1);
+            state(GL20, |s| {
+                s.tex_bound.insert(s.tex_unit, id);
+                if id > 0 {
+                    s.textures.entry(id).or_insert(TexImg {
+                        w: 0,
+                        h: 0,
+                        rgba: Vec::new(),
+                    });
+                }
+            });
+            None
+        }
+        "glDeleteTextures" => {
+            // (n, ids array | IntBuffer, off)
+            let n = i(0).max(0) as usize;
+            let ids: Vec<i32> = match args.get(1).copied().unwrap_or(V::I32(0)) {
+                V::Ref(h) => match vm.heap.get(h) {
+                    Some(Obj::Array { data, .. }) => data
+                        .iter()
+                        .skip(i(2).max(0) as usize)
+                        .take(n)
+                        .map(|v| i32v(*v))
+                        .collect(),
+                    _ => (0..n)
+                        .map(|k| i32v(elem_at(vm, h, bbuf_pos(vm, h) / 4 + k)))
+                        .collect(),
+                },
+                _ => Vec::new(),
+            };
+            state(GL20, |s| {
+                for id in ids {
+                    s.textures.remove(&id);
+                    s.tex_bound.retain(|_, v| *v != id);
+                }
+            });
+            None
+        }
+        "glTexImage2D" => {
+            // (target, level, internalformat, w, h, border, format,
+            //  type, pixels)
+            let (w, h) = (i(3).max(0) as usize, i(4).max(0) as usize);
+            let src = args.get(8).copied().unwrap_or(V::I32(0));
+            let rgba = tex_pixels(vm, &src, w, h, i(6), i(7));
+            if std::env::var_os("OVELO_GLDBG").is_some() {
+                let desc = match &src {
+                    V::Ref(h) => match vm.heap.get(*h) {
+                        Some(Obj::Host { desc, state, .. }) => {
+                            let mut s = format!("{state:?}");
+                            s.truncate(60);
+                            let inner = if let HostState::Slot(V::Ref(b)) = state {
+                                match vm.heap.get(*b) {
+                                    Some(Obj::Host {
+                                        desc: d2,
+                                        state: s2,
+                                        ..
+                                    }) => {
+                                        let mut t = format!("{s2:?}");
+                                        t.truncate(60);
+                                        format!(" -> Host({d2},{t})")
+                                    }
+                                    Some(Obj::Instance {
+                                        class_idx: c2,
+                                        fields,
+                                    }) => {
+                                        format!(" -> Instance({c2}, nfields={})", fields.len())
+                                    }
+                                    other => format!(" -> {other:?}"),
+                                }
+                            } else {
+                                String::new()
+                            };
+                            format!("Host({desc},{s}){inner}")
+                        }
+                        Some(Obj::Array { elem, data }) => {
+                            format!("Array(elem={elem}, len={})", data.len())
+                        }
+                        Some(Obj::Instance { class_idx, .. }) => {
+                            format!("Instance(class_idx={class_idx})")
+                        }
+                        other => format!("{other:?}"),
+                    },
+                    other => format!("{other:?}"),
+                };
+                eprintln!(
+                    "[gldbg] glTexImage2D {w}x{h} fmt={} ty={} src={desc} -> {} nonzero bytes",
+                    i(6),
+                    i(7),
+                    rgba.iter().filter(|b| **b != 0).count()
+                );
+            }
+            state(GL20, |s| {
+                let id = s.tex_bound.get(&s.tex_unit).copied().unwrap_or(0);
+                if id > 0 {
+                    s.textures.insert(id, TexImg { w, h, rgba });
+                }
+            });
+            None
+        }
+        "glTexSubImage2D" => {
+            // (target, level, xoff, yoff, w, h, format, type, pixels)
+            let (xo, yo) = (i(2).max(0) as usize, i(3).max(0) as usize);
+            let (w, h) = (i(4).max(0) as usize, i(5).max(0) as usize);
+            let src = args.get(8).copied().unwrap_or(V::I32(0));
+            let rgba = tex_pixels(vm, &src, w, h, i(6), i(7));
+            state(GL20, |s| {
+                let id = s.tex_bound.get(&s.tex_unit).copied().unwrap_or(0);
+                if let Some(t) = s.textures.get_mut(&id) {
+                    for y in 0..h.min(t.h.saturating_sub(yo)) {
+                        for x in 0..w.min(t.w.saturating_sub(xo)) {
+                            let d = ((yo + y) * t.w + (xo + x)) * 4;
+                            let sp = (y * w + x) * 4;
+                            if d + 4 <= t.rgba.len() && sp + 4 <= rgba.len() {
+                                t.rgba[d..d + 4].copy_from_slice(&rgba[sp..sp + 4]);
+                            }
+                        }
+                    }
+                }
+            });
+            None
+        }
+        "glUniform1i" => {
+            let (loc, v) = (i(0), f(1));
+            state(GL20, |s| {
+                s.uniforms.insert(loc, vec![v]);
+            });
+            None
+        }
+        "glUniform1f" | "glUniform2f" | "glUniform3f" | "glUniform4f" | "glUniform2i"
+        | "glUniform3i" | "glUniform4i" => {
+            let loc = i(0);
+            let vals: Vec<f32> = args[1..].iter().map(f32v).collect();
+            state(GL20, |s| {
+                s.uniforms.insert(loc, vals);
+            });
+            None
+        }
+        "glUniform1fv" | "glUniform2fv" | "glUniform3fv" | "glUniform4fv" => {
+            let dim = name.as_bytes()[8] - b'0';
+            let (loc, n) = (i(0), (i(1) * dim as i32).max(0) as usize);
+            let vals = farr(
+                vm,
+                args.get(2).unwrap_or(&V::I32(0)),
+                args.get(3).unwrap_or(&V::I32(0)),
+                n,
+            );
+            state(GL20, |s| {
+                s.uniforms.insert(loc, vals);
+            });
             None
         }
         "glGetShaderInfoLog" | "glGetProgramInfoLog" => Some(V::Ref(vm.intern_str(""))),
