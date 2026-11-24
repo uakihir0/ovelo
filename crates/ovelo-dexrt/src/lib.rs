@@ -4115,37 +4115,45 @@ impl Vm {
         let args = args.as_slice();
         let host = self.hosts.get(&midx).cloned().or(self.host_named(midx)?);
         if let Some(f) = host {
-            let Ok(mut g) = f.try_borrow_mut() else {
-                return vm("dexrt.host.reentrant");
-            };
-            let r = g(self, args).map_err(E::Vm);
-            // A registered host ctor bypasses view::call's Context
-            // capture — record the ctx arg here too so `getContext()`
-            // resolves to the real Activity for dex-instantiated views
-            // (Compose's AndroidComposeView ctor hits this path).
-            if r.is_ok() {
-                let is_init = self
-                    .dex_of(midx)
-                    .and_then(|d| {
-                        let mid = d.method(gl(midx)).ok()?;
-                        d.string(mid.name_idx).ok()
-                    })
-                    .map(|n| n == "<init>")
-                    .unwrap_or(false);
-                if is_init {
-                    if let (Some(V::Ref(this)), Some(V::Ref(c))) = (args.first(), args.get(1)) {
-                        if *c != 0
-                            && self.assignable_desc(
-                                &jdk::class_of(self, V::Ref(*this)),
-                                "Landroid/view/View;",
-                            )
-                        {
-                            jdk::pseudo_set(self, *this, jdk::view::P_CONTEXT, V::Ref(*c));
+            match f.try_borrow_mut() {
+                Ok(mut g) => {
+                    let r = g(self, args).map_err(E::Vm);
+                    // A registered host ctor bypasses view::call's Context
+                    // capture — record the ctx arg here too so `getContext()`
+                    // resolves to the real Activity for dex-instantiated views
+                    // (Compose's AndroidComposeView ctor hits this path).
+                    if r.is_ok() {
+                        let is_init = self
+                            .dex_of(midx)
+                            .and_then(|d| {
+                                let mid = d.method(gl(midx)).ok()?;
+                                d.string(mid.name_idx).ok()
+                            })
+                            .map(|n| n == "<init>")
+                            .unwrap_or(false);
+                        if is_init {
+                            if let (Some(V::Ref(this)), Some(V::Ref(c))) =
+                                (args.first(), args.get(1))
+                            {
+                                if *c != 0
+                                    && self.assignable_desc(
+                                        &jdk::class_of(self, V::Ref(*this)),
+                                        "Landroid/view/View;",
+                                    )
+                                {
+                                    jdk::pseudo_set(self, *this, jdk::view::P_CONTEXT, V::Ref(*c));
+                                }
+                            }
                         }
                     }
+                    return r;
                 }
+                // Guest code re-entering the same registered callback
+                // (attach → onAttachedToWindow → setContent → addView)
+                // must not abort: fall through to the builtin stubs,
+                // which still do the dex-side bookkeeping (attach_at).
+                Err(_) => {}
             }
-            return r;
         }
         let Some(d) = self.dex_of(midx) else {
             return vm("dexrt.invoke.unresolved");
@@ -4637,17 +4645,21 @@ impl Vm {
         // A registered host override short-circuits even a dex-defined
         // method — used for compat shims on library code that can't run
         // here (e.g. appcompat's vector-drawable path).
-        if let Some(f) = if skip_host {
+        let host = if skip_host {
             None
         } else {
             self.hosts.get(&loc.midx).cloned()
-        } {
-            let has_recv = !matches!(kind, InvokeKind::Static);
-            let args = self.compact_args(loc.midx, &args, has_recv);
-            let Ok(mut g) = f.try_borrow_mut() else {
-                return vm("dexrt.host.reentrant");
-            };
-            return g(self, &args).map_err(E::Vm);
+        };
+        if let Some(f) = host {
+            // A re-entrant call into an already-borrowed host callback
+            // falls through to dex/builtin execution — the outer call
+            // dispatching guest code (attach → onAttachedToWindow →
+            // addView) is a legitimate AOSP flow, not an error.
+            if let Ok(mut g) = f.try_borrow_mut() {
+                let has_recv = !matches!(kind, InvokeKind::Static);
+                let args = self.compact_args(loc.midx, &args, has_recv);
+                return g(self, &args).map_err(E::Vm);
+            }
         }
         if matches!(kind, InvokeKind::Static) {
             self.ensure_init(loc.class_idx)?;
