@@ -4405,10 +4405,11 @@ fn graphics_call(vm: &mut Vm, class: &str, name: &str, args: &[V]) -> Rt<Option<
                             for y in 0..h.min(bh.saturating_sub(y0)) {
                                 for x in 0..w.min(bw.saturating_sub(x0)) {
                                     let s = (((y0 + y) * bw + (x0 + x)) * 4) as usize;
-                                    let v = rgba[s] as i32
+                                    // Color ints are 0xAARRGGBB.
+                                    let v = (rgba[s + 3] as i32) << 24
+                                        | (rgba[s] as i32) << 16
                                         | (rgba[s + 1] as i32) << 8
-                                        | (rgba[s + 2] as i32) << 16
-                                        | (rgba[s + 3] as i32) << 24;
+                                        | rgba[s + 2] as i32;
                                     let d = off + y as usize * stride + x as usize;
                                     if let Some(slot) = data.get_mut(d) {
                                         *slot = V::I32(v);
@@ -4457,9 +4458,9 @@ fn graphics_call(vm: &mut Vm, class: &str, name: &str, args: &[V]) -> Rt<Option<
                                         .unwrap_or(0)
                                         as u32;
                                     let d = (((y0 + y) * bw + (x0 + x)) * 4) as usize;
-                                    px[d] = (v & 0xFF) as u8;
+                                    px[d] = ((v >> 16) & 0xFF) as u8;
                                     px[d + 1] = ((v >> 8) & 0xFF) as u8;
-                                    px[d + 2] = ((v >> 16) & 0xFF) as u8;
+                                    px[d + 2] = (v & 0xFF) as u8;
                                     px[d + 3] = ((v >> 24) & 0xFF) as u8;
                                 }
                             }
