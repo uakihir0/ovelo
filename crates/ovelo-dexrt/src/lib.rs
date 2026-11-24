@@ -436,6 +436,13 @@ pub struct Vm {
     pub(crate) surface_cbs: Vec<(u32, u32)>,
     /// Last `(w, h)` reported to each holder via `surfaceChanged`.
     pub(crate) surface_sizes: HashMap<u32, (i32, i32)>,
+    /// `(midx, args)` of host calls that lost the borrow race: a guest
+    /// call re-entered an already-running host callback (attach →
+    /// onAttachedToWindow → addView). The dex-side bookkeeping ran via
+    /// the builtin fallback, but the bridge's own side effects (GuestUi
+    /// wiring, host-view materialization) did not — retry once the
+    /// outer borrow is released, on the next drain tick.
+    pub(crate) pending_host_retry: Vec<(GIdx, Vec<V>)>,
     /// Runnables spawned by `Thread.start` — long-lived loops that
     /// legitimately park/reschedule forever (game loops like bouncy's
     /// FieldDriver), unlike executor workers which the repark budget
@@ -768,6 +775,7 @@ impl Vm {
             delayed_runnables: Vec::new(),
             pending_surface: Vec::new(),
             surface_cbs: Vec::new(),
+            pending_host_retry: Vec::new(),
             surface_sizes: HashMap::new(),
             thread_runnables: std::collections::HashSet::new(),
             cur_runnable: 0,
@@ -2159,6 +2167,22 @@ impl Vm {
         // set so a nested drain from a delivered callback early-returns
         // instead of running an unbounded inner pass.
         jdk::http::drain_coil(self);
+        // Retry host calls that lost the borrow race during the last
+        // pass — the outer callback has released by now, so the bridge
+        // runs its host-side effects (GuestUi wiring etc.). attach_at
+        // dedupes the dex side it already did via the builtin fallback.
+        for (midx, args) in std::mem::take(&mut self.pending_host_retry) {
+            let host = self
+                .hosts
+                .get(&midx)
+                .cloned()
+                .or_else(|| self.host_named(midx).ok().flatten());
+            if let Some(f) = host {
+                if let Ok(mut g) = f.try_borrow_mut() {
+                    let _ = g(self, &args);
+                }
+            }
+        }
         for (holder, cb, tries) in std::mem::take(&mut self.pending_surface) {
             let (mut sw, mut sh) = surface_holder_size(self, holder);
             if sw <= 0 || sh <= 0 {
@@ -4151,8 +4175,12 @@ impl Vm {
                 // Guest code re-entering the same registered callback
                 // (attach → onAttachedToWindow → setContent → addView)
                 // must not abort: fall through to the builtin stubs,
-                // which still do the dex-side bookkeeping (attach_at).
-                Err(_) => {}
+                // which still do the dex-side bookkeeping (attach_at),
+                // and queue the bridge for the next drain tick so its
+                // host-side effects (GuestUi wiring) still happen.
+                Err(_) => {
+                    self.pending_host_retry.push((midx, args.to_vec()));
+                }
             }
         }
         let Some(d) = self.dex_of(midx) else {
@@ -4655,10 +4683,19 @@ impl Vm {
             // falls through to dex/builtin execution — the outer call
             // dispatching guest code (attach → onAttachedToWindow →
             // addView) is a legitimate AOSP flow, not an error.
-            if let Ok(mut g) = f.try_borrow_mut() {
-                let has_recv = !matches!(kind, InvokeKind::Static);
-                let args = self.compact_args(loc.midx, &args, has_recv);
-                return g(self, &args).map_err(E::Vm);
+            match f.try_borrow_mut() {
+                Ok(mut g) => {
+                    let has_recv = !matches!(kind, InvokeKind::Static);
+                    let args = self.compact_args(loc.midx, &args, has_recv);
+                    return g(self, &args).map_err(E::Vm);
+                }
+                Err(_) => {
+                    // Queue the bridge for the next drain tick so its
+                    // host-side wiring still runs once the borrow frees.
+                    let has_recv = !matches!(kind, InvokeKind::Static);
+                    let args = self.compact_args(loc.midx, &args, has_recv);
+                    self.pending_host_retry.push((loc.midx, args));
+                }
             }
         }
         if matches!(kind, InvokeKind::Static) {

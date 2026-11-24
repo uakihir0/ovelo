@@ -1529,6 +1529,11 @@ pub(crate) fn guest_draw_ops(vm: &mut Vm, view: u32, w: i32, h: i32) -> Vec<Canv
             &["Landroid/graphics/Canvas;"],
             &[V::Ref(canvas)],
         );
+        if let Err(e) = &r {
+            if crate::dbg_flag("OVELO_DRAWDBG") {
+                eprintln!("[drawdbg] onDraw h{view} ERR {e}");
+            }
+        }
         err = r.is_err();
     }
     if has_dd {
@@ -1539,6 +1544,11 @@ pub(crate) fn guest_draw_ops(vm: &mut Vm, view: u32, w: i32, h: i32) -> Vec<Canv
             &["Landroid/graphics/Canvas;"],
             &[V::Ref(canvas)],
         );
+        if let Err(e) = &r2 {
+            if crate::dbg_flag("OVELO_DRAWDBG") {
+                eprintln!("[drawdbg] dispatchDraw h{view} ERR {e}");
+            }
+        }
         err = err || r2.is_err();
     }
     let r: Result<(), ()> = if err { Err(()) } else { Ok(()) };

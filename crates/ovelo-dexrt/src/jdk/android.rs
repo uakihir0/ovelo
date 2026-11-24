@@ -13,6 +13,23 @@ pub(crate) fn call(
 ) -> Rt<Option<Option<V>>> {
     Ok(if class == "Landroid/util/Log;" {
         log_call(vm, name, args)
+    } else if class == "Landroid/os/SystemProperties;" {
+        // Private platform API — Compose reads debug flags through it
+        // and registers a change listener; defaults + no-op keep the
+        // AOSP surface intact (the callback only fires on setprop).
+        match name {
+            "get" => match args.len() {
+                1 => Some(Some(jstr(vm, ""))),
+                _ => Some(Some(args[1])),
+            },
+            "getInt" => Some(Some(args.get(1).copied().unwrap_or(V::I32(0)))),
+            "getLong" => Some(Some(args.get(1).copied().unwrap_or(V::I64(0)))),
+            "getBoolean" => Some(Some(args.get(1).copied().unwrap_or(V::I32(0)))),
+            "set" | "addChangeCallback" | "removeChangeCallback" | "reportSyspropChanged" => {
+                Some(None)
+            }
+            _ => None,
+        }
     } else if class == "Landroid/text/TextUtils;" {
         textutils_call(vm, name, args)?
     } else if class == "Landroid/text/Html;" {
