@@ -17,7 +17,7 @@ mod value;
 
 pub use aot::Aot;
 pub use jdk::view::{fire_global_layout, DexViewInfo, P_BGCOLOR, P_TCOLOR, P_TEXT, P_TSIZE};
-pub use jdk::{pseudo_get, pseudo_set, P_COMPONENT, P_DATA, P_META, P_TARGET};
+pub use jdk::{pseudo_get, pseudo_set, P_ACTION, P_APPINFO, P_COMPONENT, P_DATA, P_META, P_TARGET};
 pub use value::{CanvasOp, PaintState};
 pub use value::{Heap, HostState, Obj, V};
 
@@ -189,10 +189,10 @@ pub struct Vm {
     /// store — `PackageManager.queryIntentActivities` enumerates them
     /// for launchers, `getLaunchIntentForPackage` resolves per package.
     pub installed_launchers: Vec<(String, String)>,
-    /// APK bytes per installed package — lets `loadIcon` /
-    /// `getApplicationIcon` decode real launcher icons out of the
-    /// store instead of returning placeholders.
-    pub installed_apks: std::collections::BTreeMap<String, std::rc::Rc<Vec<u8>>>,
+    /// On-disk path per installed package — `loadIcon` /
+    /// `getApplicationIcon` read and decode the APK lazily, so a
+    /// non-launcher app doesn't pin every installed APK in memory.
+    pub installed_apk_paths: std::collections::BTreeMap<String, std::path::PathBuf>,
     /// Live interpreter call depth — unbounded guest or builtin
     /// recursion would overflow the native stack; cap it instead.
     depth: u32,
@@ -582,6 +582,7 @@ pub fn theme_color(vm: &Vm, attr_id: u32) -> Option<u32> {
                     jdk::vector::RCtx {
                         res,
                         theme: vm.theme_id,
+                        depth: 0,
                     },
                     ev.data,
                 )
@@ -590,6 +591,7 @@ pub fn theme_color(vm: &Vm, attr_id: u32) -> Option<u32> {
                         jdk::vector::RCtx {
                             res,
                             theme: vm.theme_id,
+                            depth: 0,
                         },
                         ev.data,
                     )
@@ -621,6 +623,7 @@ pub fn package_icon_rgba(apk: &[u8]) -> Option<(u32, u32, std::rc::Rc<Vec<u8>>)>
         jdk::vector::RCtx {
             res: &res,
             theme: ai.manifest.theme.unwrap_or(0),
+            depth: 0,
         },
         icon,
     )?;
@@ -701,7 +704,7 @@ impl Vm {
                 .join("emulated")
                 .join("0"),
             installed_launchers: Vec::new(),
-            installed_apks: std::collections::BTreeMap::new(),
+            installed_apk_paths: std::collections::BTreeMap::new(),
             depth: 0,
             stack: Vec::new(),
             throw_sites: HashMap::new(),

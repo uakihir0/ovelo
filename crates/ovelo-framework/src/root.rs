@@ -166,7 +166,6 @@ fn dbg_flag_os(name: &'static str) -> Option<std::ffi::OsString> {
     v
 }
 
-
 #[cfg(test)]
 mod tests {
     use super::*;

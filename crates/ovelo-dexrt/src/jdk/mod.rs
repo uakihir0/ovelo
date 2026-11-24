@@ -30,7 +30,8 @@ pub(crate) const STRING: &str = "Ljava/lang/String;";
 
 // Pseudo field-idx keys for state a guest can't address via a real field
 // reference (Intent action/data, Runnable target, SharedPreferences link).
-pub(crate) const P_ACTION: u32 = u32::MAX - 1;
+/// The `P_ACTION` pseudo key (Intent action string).
+pub const P_ACTION: u32 = u32::MAX - 1;
 /// The `P_DATA` pseudo key (Intent data, `*Info` name, ...).
 pub const P_DATA: u32 = u32::MAX - 2;
 pub(crate) const P_FLAGS: u32 = u32::MAX - 3;
@@ -109,6 +110,10 @@ pub const P_META: u64 = 0xFFFD_FEEE;
 /// whose handle lives under these keys.
 pub(crate) const P_LIST_BACKING: u64 = 0xFFFD_FEF1;
 pub(crate) const P_MAP_BACKING: u64 = 0xFFFD_FEF2;
+/// `ComponentInfo.applicationInfo` — links a manifest-backed *Info to
+/// its ApplicationInfo. Separate from `P_META`: that slot is also the
+/// ProviderInfo `metaData` Bundle, so one key can't carry both.
+pub const P_APPINFO: u64 = 0xFFFD_FEF3;
 
 pub(crate) fn now_ms() -> i64 {
     std::time::SystemTime::now()
@@ -2081,7 +2086,7 @@ pub(crate) fn ifield(vm: &Vm, h: u32, owner: &str, name: &str) -> Option<V> {
         ("Landroid/content/pm/ActivityInfo;", "applicationInfo")
         | ("Landroid/content/pm/ServiceInfo;", "applicationInfo")
         | ("Landroid/content/pm/ProviderInfo;", "applicationInfo") => {
-            Some(pseudo_get(vm, h, P_META).unwrap_or(V::Ref(0)))
+            Some(pseudo_get(vm, h, P_APPINFO).unwrap_or(V::Ref(0)))
         }
         // AppWidgetProviderInfo carries an ActivityInfo (the widget's
         // configuration/preview activity) — P_TARGET like ResolveInfo.

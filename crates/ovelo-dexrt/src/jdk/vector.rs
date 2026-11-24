@@ -24,6 +24,11 @@ use super::{host, pseudo_set, P_BITMAP_SLOT, P_DRAW_COLOR};
 pub(crate) struct RCtx<'a> {
     pub res: &'a ApkResources,
     pub theme: u32,
+    /// Drawable-graph recursion depth — a drawable reference cycle
+    /// (an adaptive-icon layer pointing back at itself) must not
+    /// recurse unboundedly: the launcher decodes foreign APK drawables,
+    /// so a malformed icon would otherwise stack-overflow the host.
+    pub depth: u8,
 }
 
 /// `RCtx` over the Vm's own bound resources, if any.
@@ -31,6 +36,7 @@ pub(crate) fn rctx(vm: &Vm) -> Option<RCtx<'_>> {
     Some(RCtx {
         res: vm.apk_res.as_ref()?,
         theme: vm.theme_id,
+        depth: 0,
     })
 }
 
@@ -50,6 +56,9 @@ thread_local! {
 /// `<adaptive-icon>` composited, or PNG/JPEG/WebP decoded. `None` for
 /// non-image resources.
 pub(crate) fn drawable_bitmap(rv: RCtx<'_>, res_id: u32) -> Option<(u32, u32, Rc<Vec<u8>>)> {
+    if rv.depth >= 16 {
+        return None;
+    }
     let key = (
         res_id,
         rv.theme,
@@ -84,7 +93,14 @@ fn render_adaptive(rv: RCtx<'_>, res_id: u32) -> Option<(u32, u32, Rc<Vec<u8>>)>
         let Some(Value::Reference(r)) = el.android("drawable") else {
             continue;
         };
-        let (w, h, px) = drawable_bitmap(RCtx { ..rv }, *r).or_else(|| {
+        let (w, h, px) = drawable_bitmap(
+            RCtx {
+                depth: rv.depth + 1,
+                ..rv
+            },
+            *r,
+        )
+        .or_else(|| {
             // `<color>` resource → solid tile.
             resolve_ref_color(rv, *r).map(|argb| {
                 let p = argb.to_be_bytes();
@@ -147,7 +163,7 @@ fn blit_scaled(
 /// `getApplicationIcon` back it with this so home screens draw the
 /// real icon instead of a placeholder.
 pub(crate) fn package_icon_drawable(vm: &mut Vm, pkg: &str) -> Option<V> {
-    let bytes = vm.installed_apks.get(pkg)?.clone();
+    let bytes = std::fs::read(vm.installed_apk_paths.get(pkg)?).ok()?;
     let decoded = crate::package_icon_rgba(&bytes);
     let (w, h, rgba) = decoded?;
     let d = host(
@@ -501,6 +517,9 @@ fn entry_color(res: &crate::res::ApkResources, ev: &ovelo_apk::arsc::EntryValue)
 /// items that carry explicit state (`state_pressed`…) are skipped so
 /// the resting-state color wins.
 pub(crate) fn drawable_flat_color(rv: RCtx<'_>, res_id: u32) -> Option<u32> {
+    if rv.depth >= 16 {
+        return None;
+    }
     let res = rv.res;
     let els = res.document(res_id)?;
     let mut fallback: Option<u32> = None;
@@ -529,8 +548,15 @@ pub(crate) fn drawable_flat_color(rv: RCtx<'_>, res_id: u32) -> Option<u32> {
                 }
                 if let Some(Value::Reference(r)) = el.android("drawable") {
                     if fallback.is_none() {
-                        fallback =
-                            resolve_ref_color(rv, *r).or_else(|| drawable_flat_color(rv, *r));
+                        fallback = resolve_ref_color(rv, *r).or_else(|| {
+                            drawable_flat_color(
+                                RCtx {
+                                    depth: rv.depth + 1,
+                                    ..rv
+                                },
+                                *r,
+                            )
+                        });
                     }
                 }
             }

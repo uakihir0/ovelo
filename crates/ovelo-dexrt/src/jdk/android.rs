@@ -1910,6 +1910,7 @@ fn resolve_color_id(vm: &mut Vm, res_id: u32) -> u32 {
                             vector::RCtx {
                                 res,
                                 theme: vm.theme_id,
+                                depth: 0,
                             },
                             id,
                         )
@@ -2247,9 +2248,21 @@ fn context_call(
             if let Some(V::Ref(ih)) = args.get(1).copied() {
                 if let Some(c) = pseudo_get(vm, ih, P_COMPONENT) {
                     let desc = match c {
-                        V::Ref(ch) if ch != 0 => {
-                            vm.class_descriptor_of(ch).or_else(|| sv(vm, V::Ref(ch)))
-                        }
+                        // A ComponentName carries the target class
+                        // dotted in P_DATA; Class mirrors and bare
+                        // class-name strings resolve through their
+                        // own descriptors.
+                        V::Ref(ch) if ch != 0 => pseudo_get(vm, ch, P_DATA)
+                            .and_then(|v| sv(vm, v))
+                            .or_else(|| vm.class_descriptor_of(ch))
+                            .or_else(|| sv(vm, V::Ref(ch)))
+                            .map(|d| {
+                                if d.starts_with('L') && d.ends_with(';') {
+                                    d
+                                } else {
+                                    format!("L{};", d.replace('.', "/"))
+                                }
+                            }),
                         _ => None,
                     };
                     if let Some(d) = desc {
@@ -2825,17 +2838,19 @@ fn item_info_call(vm: &mut Vm, name: &str, args: &[V]) -> Rt<Option<Option<V>>> 
                             }
                         }
                     }
-                    cur = [P_META, P_TARGET as u64].iter().find_map(|k| {
-                        match pseudo_get(vm, ch, *k) {
-                            Some(V::Ref(x)) if x != 0 => Some(x),
-                            _ => None,
-                        }
-                    });
+                    cur =
+                        [P_APPINFO, P_META, P_TARGET as u64]
+                            .iter()
+                            .find_map(|k| match pseudo_get(vm, ch, *k) {
+                                Some(V::Ref(x)) if x != 0 => Some(x),
+                                _ => None,
+                            });
                 }
                 found
             };
             if let Some(label) = pkg
-                .and_then(|p| vm.installed_apks.get(&p).cloned())
+                .and_then(|p| vm.installed_apk_paths.get(&p).cloned())
+                .and_then(|b| std::fs::read(b).ok())
                 .and_then(|b| crate::package_label(&b))
             {
                 return Ok(Some(Some(jstr(vm, &label))));
@@ -2892,12 +2907,13 @@ fn item_info_call(vm: &mut Vm, name: &str, args: &[V]) -> Rt<Option<Option<V>>> 
                             }
                         }
                     }
-                    cur = [P_META, P_TARGET as u64].iter().find_map(|k| {
-                        match pseudo_get(vm, ch, *k) {
-                            Some(V::Ref(x)) if x != 0 => Some(x),
-                            _ => None,
-                        }
-                    });
+                    cur =
+                        [P_APPINFO, P_META, P_TARGET as u64]
+                            .iter()
+                            .find_map(|k| match pseudo_get(vm, ch, *k) {
+                                Some(V::Ref(x)) if x != 0 => Some(x),
+                                _ => None,
+                            });
                 }
                 found
             };
@@ -3433,11 +3449,7 @@ fn resources_call(vm: &mut Vm, name: &str, args: &[V]) -> Rt<Option<Option<V>>> 
                     let lum = crate::theme_color_named(vm, "colorSurface")
                         .or_else(|| crate::theme_color_named(vm, "colorBackground"))
                         .map(|argb| {
-                            let (r, g, b) = (
-                                (argb >> 16) as u8,
-                                (argb >> 8) as u8,
-                                argb as u8,
-                            );
+                            let (r, g, b) = ((argb >> 16) as u8, (argb >> 8) as u8, argb as u8);
                             (299 * r as u32 + 587 * g as u32 + 114 * b as u32) as f32 / 255_000.0
                         });
                     let night = match lum {

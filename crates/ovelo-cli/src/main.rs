@@ -950,7 +950,7 @@ fn register_compat_shims(
             if let V::Ref(ah) = ai {
                 ovelo_dexrt::pseudo_set(vm, ah, ovelo_dexrt::P_COMPONENT, p);
             }
-            ovelo_dexrt::pseudo_set(vm, h, ovelo_dexrt::P_META, ai);
+            ovelo_dexrt::pseudo_set(vm, h, ovelo_dexrt::P_APPINFO, ai);
         }
         info
     }
@@ -981,7 +981,8 @@ fn register_compat_shims(
             launcher_pairs.push((a.clone(), p.clone()));
         }
     }
-    for (info_desc, meth, names) in [
+    let own_pkg = manifest.package.clone();
+    for (info_desc, meth, names, launcher_scope) in [
         (
             "Landroid/content/pm/ServiceInfo;",
             "queryIntentServices",
@@ -990,11 +991,13 @@ fn register_compat_shims(
                 .iter()
                 .map(|s| (s.clone(), manifest.package.clone()))
                 .collect::<Vec<_>>(),
+            false,
         ),
         (
             "Landroid/content/pm/ActivityInfo;",
             "queryIntentActivities",
             launcher_pairs.clone(),
+            true,
         ),
         (
             "Landroid/content/pm/ActivityInfo;",
@@ -1004,6 +1007,7 @@ fn register_compat_shims(
                 .iter()
                 .map(|s| (s.clone(), manifest.package.clone()))
                 .collect::<Vec<_>>(),
+            false,
         ),
         (
             "Landroid/content/pm/ProviderInfo;",
@@ -1013,32 +1017,57 @@ fn register_compat_shims(
                 .iter()
                 .map(|s| (s.clone(), manifest.package.clone()))
                 .collect::<Vec<_>>(),
+            false,
         ),
     ] {
         let _ = v.register_host(
             "Landroid/content/pm/PackageManager;",
             meth,
             "(Landroid/content/Intent;I)Ljava/util/List;",
-            Rc::new(RefCell::new(move |vm: &mut ovelo_dexrt::Vm, a: &[V]| {
-                let want = intent_class(vm, a.get(1).copied());
-                let infos: Vec<V> = names
-                    .iter()
-                    .filter(|(n, _)| want.as_deref().is_none_or(|c| n.ends_with(c) || *n == c))
-                    .map(|(n, p)| mint_ri(vm, info_desc, n, p))
-                    .collect();
-                if std::env::var_os("PMDEBUG").is_some() {
-                    eprintln!(
-                        "[pmdbg] {meth} want={want:?} names={names:?} -> {} infos",
-                        infos.len()
-                    );
-                }
-                Ok(Some(V::Ref(vm.heap.alloc(Obj::Host {
-                    class_idx: u64::MAX,
-                    desc: "Ljava/util/List;".to_string(),
-                    fields: HashMap::new(),
-                    state: HostState::List(infos),
-                }))))
-            })) as ovelo_dexrt::HostCall,
+            {
+                let own_pkg = own_pkg.clone();
+                Rc::new(RefCell::new(move |vm: &mut ovelo_dexrt::Vm, a: &[V]| {
+                    let want = intent_class(vm, a.get(1).copied());
+                    // Other apps' launcher activities only answer a
+                    // MAIN query — an implicit VIEW/EDIT intent must not
+                    // see unrelated apps (their filters don't match).
+                    let main_query = launcher_scope
+                        && match a.get(1).copied() {
+                            Some(V::Ref(ih)) => {
+                                ovelo_dexrt::pseudo_get(vm, ih, ovelo_dexrt::P_ACTION)
+                                    .and_then(|v| match v {
+                                        V::Ref(s) => vm
+                                            .heap
+                                            .str_val(s)
+                                            .map(|t| t == "android.intent.action.MAIN"),
+                                        _ => None,
+                                    })
+                                    .unwrap_or(false)
+                            }
+                            _ => false,
+                        };
+                    let infos: Vec<V> = names
+                        .iter()
+                        .filter(|(n, p)| {
+                            want.as_deref().is_none_or(|c| n.ends_with(c) || *n == c)
+                                && (*p == own_pkg || want.is_some() || main_query)
+                        })
+                        .map(|(n, p)| mint_ri(vm, info_desc, n, p))
+                        .collect();
+                    if std::env::var_os("PMDEBUG").is_some() {
+                        eprintln!(
+                            "[pmdbg] {meth} want={want:?} names={names:?} -> {} infos",
+                            infos.len()
+                        );
+                    }
+                    Ok(Some(V::Ref(vm.heap.alloc(Obj::Host {
+                        class_idx: u64::MAX,
+                        desc: "Ljava/util/List;".to_string(),
+                        fields: HashMap::new(),
+                        state: HostState::List(infos),
+                    }))))
+                })) as ovelo_dexrt::HostCall
+            },
         );
     }
     // resolveService / resolveActivity → the first match or null.
@@ -1460,8 +1489,11 @@ fn run_app(store: &InstallStore, package: &str) -> Result<(), OveloError> {
                         v.installed_launchers
                             .push((ai.manifest.package.clone(), act));
                     }
-                    v.installed_apks
-                        .insert(ai.manifest.package, std::rc::Rc::new(bytes));
+                    // Icon/label readers re-read the APK lazily — keep
+                    // the path, not the bytes, so non-launcher apps
+                    // don't pin every installed APK in memory.
+                    v.installed_apk_paths
+                        .insert(ai.manifest.package, r.apk_path.clone());
                 }
                 // Seed shared external storage once so file managers
                 // have something to list (safe: only fills what's absent).

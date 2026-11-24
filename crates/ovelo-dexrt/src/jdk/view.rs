@@ -148,9 +148,11 @@ const P_ORIENTATION: u32 = 0xFFFD_FFDD;
 pub const P_TCOLOR: u32 = 0xFFFD_FFE3;
 /// Live `setTextSize` px — same fallthrough path as [`P_TCOLOR`].
 pub const P_TSIZE: u32 = 0xFFFD_FFE2;
-/// Live `setBackgroundColor`/`setBackgroundResource` — raw int arg
-/// (packed ARGB or a res id `color_v` resolves).
+/// Live `setBackgroundColor` — always a packed ARGB literal, even
+/// when the alpha byte reads as a positive int (never a res id).
 pub const P_BGCOLOR: u32 = 0xFFFD_FFE1;
+/// Live `setBackgroundResource` res id — resolved by `color_v`.
+pub const P_BGRES: u32 = 0xFFFD_FFE0;
 /// Resolved layout direction stored on a `*LayoutParams` by
 /// `resolveLayoutDirection` (AOSP `mLayoutDirection`).
 const P_LP_DIR: u32 = u32::MAX - 29;
@@ -397,6 +399,7 @@ fn color_v(vm: &Vm, v: V) -> Option<i32> {
                             vector::RCtx {
                                 res,
                                 theme: vm.theme_id,
+                                depth: 0,
                             },
                             ev.data,
                         )
@@ -407,6 +410,7 @@ fn color_v(vm: &Vm, v: V) -> Option<i32> {
                                         vector::RCtx {
                                             res,
                                             theme: vm.theme_id,
+                                            depth: 0,
                                         },
                                         n.data,
                                     )
@@ -428,6 +432,7 @@ fn color_v(vm: &Vm, v: V) -> Option<i32> {
                                     vector::RCtx {
                                         res,
                                         theme: vm.theme_id,
+                                        depth: 0,
                                     },
                                     cur,
                                 )
@@ -548,14 +553,20 @@ pub(crate) fn dex_view_info(vm: &Vm, h: u32) -> Option<DexViewInfo> {
         }),
     };
     let text_color = match pseudo_get(vm, h, P_TCOLOR) {
-        // `setTextColor` may hand us either a packed ARGB int or an
-        // unresolved color res id — `color_v` resolves both.
-        Some(v @ (V::I32(_) | V::Ref(_))) => color_v(vm, v),
+        // P_TCOLOR only carries setTextColor args — packed ARGB.
+        Some(V::I32(c)) => Some(c),
+        Some(v) => color_v(vm, v),
         _ => attr_find(vm, h, "textColor").and_then(|v| color_v(vm, v)),
     };
     let bg_color = match pseudo_get(vm, h, P_BGCOLOR) {
-        Some(v @ (V::I32(_) | V::Ref(_))) => color_v(vm, v),
-        _ => attr_find(vm, h, "background").and_then(|v| color_v(vm, v)),
+        // P_BGCOLOR only carries setBackgroundColor args — packed
+        // ARGB; a positive int is a low-alpha color, not a res id.
+        Some(V::I32(c)) => Some(c),
+        Some(v) => color_v(vm, v),
+        _ => match pseudo_get(vm, h, P_BGRES) {
+            Some(v) => color_v(vm, v),
+            None => attr_find(vm, h, "background").and_then(|v| color_v(vm, v)),
+        },
     };
     let lp_w = attr_find(vm, h, "layout_width")
         .map(|v| len_v(vm, v))
@@ -2243,15 +2254,19 @@ pub(crate) fn call(
             pseudo_set(vm, this, P_INVALID_SEQ, V::I32(n.wrapping_add(1)));
             Some(None)
         }
-        "setBackgroundColor" | "setBackgroundResource" => {
-            // Record the raw arg (packed ARGB or a res id — color_v
-            // resolves both at materialize time).
+        "setBackgroundColor" => {
+            // Always a packed ARGB literal — low-alpha colors are
+            // positive ints and must not be read as resource ids.
             pseudo_set(
                 vm,
                 this,
                 P_BGCOLOR,
                 args.get(1).cloned().unwrap_or(V::I32(0)),
             );
+            Some(None)
+        }
+        "setBackgroundResource" => {
+            pseudo_set(vm, this, P_BGRES, args.get(1).cloned().unwrap_or(V::I32(0)));
             Some(None)
         }
         "requestFocus"
