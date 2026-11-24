@@ -1442,7 +1442,14 @@ pub(crate) fn dump_node_tree(vm: &mut Vm, view: u32) {
             "Landroidx/compose/ui/platform/AndroidComposeView;",
             "root",
         ) {
+            // The depth-0 tail of call_virtual_sig drains queued guest
+            // callbacks — firing them mid-borrow of the UI bridge
+            // panics. Mark the VM as already draining so the walk is
+            // purely diagnostic.
+            let was = vm.draining;
+            vm.draining = true;
             node_tree_dump(vm, root, 0);
+            vm.draining = was;
         }
     }
 }
@@ -1454,7 +1461,10 @@ pub(crate) fn guest_draw_ops(vm: &mut Vm, view: u32, w: i32, h: i32) -> Vec<Canv
             "Landroidx/compose/ui/platform/AndroidComposeView;",
             "root",
         ) {
+            let was = vm.draining;
+            vm.draining = true;
             node_tree_dump(vm, root, 0);
+            vm.draining = was;
         }
     }
     // GLSurfaceView subclasses draw through a Renderer, not onDraw —
