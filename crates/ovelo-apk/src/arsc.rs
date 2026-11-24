@@ -309,9 +309,10 @@ fn config_name(b: &[u8], off: usize, size: usize) -> String {
         }
         // Orientation shares the screenType field (byte +12).
         match b[off + 12] {
+            1 => parts.push("port".into()),
             2 => parts.push("land".into()),
             3 => parts.push("square".into()),
-            _ => {} // 0=any, 1=port is the implicit default
+            _ => {} // 0=any
         }
     }
     // ResTable_config +28 screenConfig: screenLayout u8, uiMode u8,
@@ -336,8 +337,10 @@ fn config_name(b: &[u8], off: usize, size: usize) -> String {
         } else if screen_layout & 0x30 == 0x10 {
             parts.push("notlong".into());
         }
-        if ui_mode & 0x30 == 0x20 {
-            parts.push("night".into());
+        match ui_mode & 0x30 {
+            0x10 => parts.push("notnight".into()),
+            0x20 => parts.push("night".into()),
+            _ => {}
         }
         match ui_mode & 0x0f {
             0x04 => parts.push("car".into()),
