@@ -861,14 +861,21 @@ fn find_method_id(clazz: u64, name_p: u64, sig_p: u64) -> u64 {
     let params = split_params(&sig);
     let pref: Vec<&str> = params.iter().map(String::as_str).collect();
     let mut v = vm();
-    let Some(ci) = (match clazz {
-        h if h != 0 => v.class_for_jclass(h as u32),
-        _ => None,
-    }) else {
-        return 0;
-    };
-    match v.find_method_on_chain_sig(ci, &name, &pref) {
-        Ok(Some(g)) => {
+    // A `class_obj` Host mirror (FindClass of a non-dex type) names its
+    // type by descriptor — resolve THAT, not the `java.lang.Class` box.
+    let desc = (clazz != 0)
+        .then(|| crate::jdk::class_desc_of(&v, clazz as u32))
+        .flatten();
+    let ci = desc
+        .as_deref()
+        .and_then(|d| v.type_index_of(d))
+        .or_else(|| {
+            (clazz != 0)
+                .then(|| v.class_for_jclass(clazz as u32))
+                .flatten()
+        });
+    match ci.and_then(|ci| v.find_method_on_chain_sig(ci, &name, &pref).ok().flatten()) {
+        Some(g) => {
             v.jni_mids.push(g);
             v.jni_mids.len() as u64
         }
@@ -878,7 +885,10 @@ fn find_method_id(clazz: u64, name_p: u64, sig_p: u64) -> u64 {
             // can still answer it — register a by-name mid so the
             // cached jmethodID stays usable (Godot's JNISingleton
             // resolves its whole Java surface this way).
-            let owner = v.type_desc_of(ci).unwrap_or_default();
+            let owner = desc.unwrap_or_else(|| {
+                ci.and_then(|ci| v.type_desc_of(ci).ok())
+                    .unwrap_or_default()
+            });
             v.jni_named.push((owner, name.clone(), sig.clone()));
             let idx = (v.jni_named.len() - 1) as u64;
             v.jni_mids.push(GX_NAMED | idx);
@@ -897,10 +907,19 @@ fn find_field_id(clazz: u64, name_p: u64, sig_p: u64, is_static: bool) -> u64 {
         eprintln!("[jni] GetFieldID {name} clazz={clazz:#x}");
     }
     let mut v = vm();
-    let Some(ci) = (match clazz {
-        h if h != 0 => v.class_for_jclass(h as u32),
-        _ => None,
-    }) else {
+    // Same as find_method_id: a Host class mirror names its type.
+    let desc = (clazz != 0)
+        .then(|| crate::jdk::class_desc_of(&v, clazz as u32))
+        .flatten();
+    let Some(ci) = desc
+        .as_deref()
+        .and_then(|d| v.type_index_of(d))
+        .or_else(|| {
+            (clazz != 0)
+                .then(|| v.class_for_jclass(clazz as u32))
+                .flatten()
+        })
+    else {
         return 0;
     };
     if let Some(g) = v.find_field_by_name(ci, &name, is_static, Some(&sig)) {
@@ -952,21 +971,36 @@ extern "C" fn find_class(_e: u64, name_p: u64) -> u64 {
             h
         }
         None => {
-            // Descriptors with no dex type still resolve as Class objects
-            // ("[B", primitive types, JDK classes) — conscrypt et al.
-            // probe "[B"/"[C" unconditionally and abort on a miss.
-            if desc.starts_with('[')
-                || (desc.len() == 1 && !desc.contains('V'))
-                || desc.starts_with("Ljava/")
-            {
-                let V::Ref(h) = crate::jdk::class_obj(&mut v, desc.clone()) else {
-                    return 0;
-                };
-                h as u64
-            } else {
+            // Descriptors with no dex type resolve as Class objects only
+            // for things that must exist (array types "[B", primitives)
+            // or prefixes the runtime hosts — the same whitelist
+            // `Class.forName` uses. Arbitrary names return null so a
+            // native library can detect a genuinely missing class
+            // (conscrypt et al. probe "[B"/"[C" unconditionally).
+            let host_known = desc.starts_with('[')
+                || (desc.len() == 1 && desc != "V")
+                || [
+                    "Ljava/",
+                    "Ljavax/",
+                    "Lsun/",
+                    "Lcom/sun/",
+                    "Landroid/",
+                    "Lkotlin/",
+                    "Lkotlinx/",
+                    "Lorg/json/",
+                    "Lorg/xmlpull/",
+                    "Lorg/apache/",
+                ]
+                .iter()
+                .any(|p| desc.starts_with(p));
+            if !host_known {
                 eprintln!("[jni] FindClass miss {desc}");
-                0
+                return 0;
             }
+            let V::Ref(h) = crate::jdk::class_obj(&mut v, desc.clone()) else {
+                return 0;
+            };
+            h as u64
         }
     }
 }
