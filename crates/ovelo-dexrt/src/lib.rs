@@ -443,6 +443,10 @@ pub struct Vm {
     /// wiring, host-view materialization) did not — retry once the
     /// outer borrow is released, on the next drain tick.
     pub(crate) pending_host_retry: Vec<(GIdx, Vec<V>)>,
+    /// Set while the drain loop replays `pending_host_retry` — lets a
+    /// bridged method tell a retried invocation from a fresh one
+    /// (the builtin fallback already ran the dex side).
+    pub(crate) in_host_retry: bool,
     /// Runnables spawned by `Thread.start` — long-lived loops that
     /// legitimately park/reschedule forever (game loops like bouncy's
     /// FieldDriver), unlike executor workers which the repark budget
@@ -776,6 +780,7 @@ impl Vm {
             pending_surface: Vec::new(),
             surface_cbs: Vec::new(),
             pending_host_retry: Vec::new(),
+            in_host_retry: false,
             surface_sizes: HashMap::new(),
             thread_runnables: std::collections::HashSet::new(),
             cur_runnable: 0,
@@ -2171,6 +2176,7 @@ impl Vm {
         // pass — the outer callback has released by now, so the bridge
         // runs its host-side effects (GuestUi wiring etc.). attach_at
         // dedupes the dex side it already did via the builtin fallback.
+        self.in_host_retry = true;
         for (midx, args) in std::mem::take(&mut self.pending_host_retry) {
             let host = self
                 .hosts
@@ -2183,6 +2189,7 @@ impl Vm {
                 }
             }
         }
+        self.in_host_retry = false;
         for (holder, cb, tries) in std::mem::take(&mut self.pending_surface) {
             let (mut sw, mut sh) = surface_holder_size(self, holder);
             if sw <= 0 || sh <= 0 {
@@ -2456,6 +2463,26 @@ impl Vm {
         if parent != 0 && child != 0 {
             jdk::view::attach_at(self, parent, V::Ref(child), idx, true, lp);
         }
+    }
+
+    /// Parent handle recorded by `attach_at` — the bridge checks this
+    /// before re-running dex attach bookkeeping: a host call retried
+    /// after the borrow race already attached dex-side via the builtin
+    /// fallback, and a second `attach_at` would re-fire `onViewAdded`
+    /// and re-append an indexless child (moving it past siblings
+    /// added meanwhile).
+    pub fn view_parent_of(&self, h: u32) -> Option<u32> {
+        match jdk::pseudo_get(self, h, jdk::view::P_PARENT) {
+            Some(V::Ref(p)) if p != 0 => Some(p),
+            _ => None,
+        }
+    }
+
+    /// True while the drain loop replays `pending_host_retry` — the
+    /// bridge uses it to skip dex-side bookkeeping the builtin
+    /// fallback already did for this exact invocation.
+    pub fn host_retrying(&self) -> bool {
+        self.in_host_retry
     }
 
     /// `detach` for the guest bridge: registered `removeView`/`detach`
@@ -4666,7 +4693,27 @@ impl Vm {
                 // caller's own method would recurse forever.
                 match self.resolve_virtual(midx, sup, false) {
                     Ok(l) => l,
-                    Err(_) => return self.call_builtin(midx, &args, true),
+                    Err(_) => {
+                        // invoke-super on an interface default method:
+                        // the caller implements the interface, but its
+                        // superclass chain (Object) doesn't — JVM picks
+                        // the named interface's body. Search only the
+                        // caller's direct interfaces: starting at the
+                        // caller itself could re-find its own def and
+                        // recurse forever.
+                        let loc = self.def_loc_of(caller_class).and_then(|(cg, d)| {
+                            let dex = self.dex_of(cg)?;
+                            let types = dex.type_list(d.interfaces_off).ok()?;
+                            let (_, name, sig) = self.method_sig(midx).ok()?;
+                            types.iter().find_map(|&t| {
+                                self.find_interface_method(gx(gd(cg), t as u32), &name, &sig)
+                            })
+                        });
+                        match loc {
+                            Some(l) => l,
+                            None => return self.call_builtin(midx, &args, true),
+                        }
+                    }
                 }
             }
         };

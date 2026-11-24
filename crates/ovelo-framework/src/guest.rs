@@ -666,7 +666,15 @@ impl GuestUi {
                     // LP resolution and onViewAdded all live there.
                     // Runs outside the ui borrow: onViewAdded is guest
                     // code and re-enters bridged methods.
-                    vm.view_tree_attach_at(this, child, idx, lp);
+                    // A retried bridge call skips dex bookkeeping the
+                    // builtin fallback already did for this invocation:
+                    // re-running would re-fire onViewAdded and
+                    // re-append an indexless child, moving it past
+                    // siblings added meanwhile. Fresh calls (including
+                    // legit re-attaches that move the child) always run.
+                    if !(vm.host_retrying() && vm.view_parent_of(child) == Some(this)) {
+                        vm.view_tree_attach_at(this, child, idx, lp);
+                    }
                     // Bridged parents adopt dex-view-tree children too —
                     // materialize them so e.g. ViewPager2's empty
                     // FrameLayout still hosts inflated content.
