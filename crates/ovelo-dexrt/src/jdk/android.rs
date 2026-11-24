@@ -509,6 +509,11 @@ pub(crate) fn call(
             "sleep" | "setCurrentTimeMillis" => Some(None),
             _ => None,
         }
+    } else if class == "Landroid/view/animation/AnimationUtils;" {
+        match name {
+            "currentAnimationTimeMillis" => Some(Some(V::I64(now_ms()))),
+            _ => None,
+        }
     } else if class == "Landroid/os/Process;" {
         match name {
             "myPid" | "myTid" | "myUid" | "myUserHandle" => {
@@ -882,7 +887,7 @@ pub(crate) fn call(
         || class == "Landroid/util/SizeF;"
         || class == "Landroid/util/AttributeSet;"
     {
-        graphics_call(vm, class, name, args)?
+        graphics_call(vm, class, name, sig, args)?
     } else if class == "Landroid/animation/AnimatorInflater;" {
         match name {
             // Material checks `animator instanceof ObjectAnimator` and
@@ -4176,7 +4181,13 @@ fn looper_call(vm: &mut Vm, name: &str, _args: &[V]) -> Rt<Option<Option<V>>> {
 // ---------------------------------------------------------------------
 // android.graphics — Rect/Point/Color/Bitmap stubs
 
-fn graphics_call(vm: &mut Vm, class: &str, name: &str, args: &[V]) -> Rt<Option<Option<V>>> {
+fn graphics_call(
+    vm: &mut Vm,
+    class: &str,
+    name: &str,
+    sig: &str,
+    args: &[V],
+) -> Rt<Option<Option<V>>> {
     // Canvas/Paint fall through to jdk::gfx's recording model — the
     // generic set*/draw* stubs below would silently eat every call.
     if matches!(
@@ -4459,6 +4470,171 @@ fn graphics_call(vm: &mut Vm, class: &str, name: &str, args: &[V]) -> Rt<Option<
                 );
             }
             Some(None)
+        }
+        ("Landroid/graphics/Region;", n) => {
+            let this = match args.first() {
+                Some(&V::Ref(h)) => h,
+                _ => 0,
+            };
+            // Region is tracked as one bounding rect — enough for the
+            // view/contentcapture traversal paths that ask getBounds.
+            let bounds = |vm: &Vm, h: u32| rect_edges(vm, h);
+            Some(match n {
+                "<init>" => {
+                    let ints: Vec<i32> = args[1..]
+                        .iter()
+                        .filter(|a| matches!(a, V::I32(_)))
+                        .map(|a| i32v(*a))
+                        .collect();
+                    let (l, t, r, b) = if ints.len() == 4 {
+                        (ints[0], ints[1], ints[2], ints[3])
+                    } else {
+                        match args.get(1) {
+                            Some(&V::Ref(src)) => rect_edges(vm, src),
+                            _ => (0, 0, 0, 0),
+                        }
+                    };
+                    rect_write(vm, this, l, t, r, b);
+                    None
+                }
+                "set" | "setPath" | "union" | "freeStorage" => {
+                    let ints: Vec<i32> = args[1..]
+                        .iter()
+                        .filter(|a| matches!(a, V::I32(_)))
+                        .map(|a| i32v(*a))
+                        .collect();
+                    let (l, t, r, b) = if ints.len() == 4 {
+                        (ints[0], ints[1], ints[2], ints[3])
+                    } else {
+                        match args.get(1) {
+                            Some(&V::Ref(src)) => rect_edges(vm, src),
+                            _ => (0, 0, 0, 0),
+                        }
+                    };
+                    if n == "union" {
+                        let (l0, t0, r0, b0) = bounds(vm, this);
+                        if l0 < r0 && t0 < b0 {
+                            rect_write(vm, this, l0.min(l), t0.min(t), r0.max(r), b0.max(b));
+                        } else {
+                            rect_write(vm, this, l, t, r, b);
+                        }
+                    } else if n != "freeStorage" {
+                        rect_write(vm, this, l, t, r, b);
+                    }
+                    if n == "set" || n == "union" {
+                        Some(V::I32(1))
+                    } else {
+                        None
+                    }
+                }
+                "setEmpty" => {
+                    rect_write(vm, this, 0, 0, 0, 0);
+                    Some(V::I32(1))
+                }
+                "op" => {
+                    // op(Rect|Region, Op) — Op: DIFFERENCE=0, INTERSECT=1,
+                    // UNION=2, XOR=3, REVERSE_DIFFERENCE=4, REPLACE=5.
+                    let op = args.last().map(|v| i64v(*v)).unwrap_or(2);
+                    let (src_l, src_t, src_r, src_b) = match args.get(1) {
+                        Some(&V::Ref(src)) => rect_edges(vm, src),
+                        _ => (0, 0, 0, 0),
+                    };
+                    let (l, t, r, b) = bounds(vm, this);
+                    let empty = !(l < r && t < b);
+                    let mut ok = true;
+                    match op {
+                        1 => {
+                            // INTERSECT
+                            if empty || src_l >= src_r || src_t >= src_b {
+                                rect_write(vm, this, 0, 0, 0, 0);
+                                ok = false;
+                            } else {
+                                rect_write(
+                                    vm,
+                                    this,
+                                    l.max(src_l),
+                                    t.max(src_t),
+                                    r.min(src_r),
+                                    b.min(src_b),
+                                );
+                                let (nl, nt, nr, nb) = bounds(vm, this);
+                                ok = nl < nr && nt < nb;
+                            }
+                        }
+                        2 | 3 => {
+                            // UNION / XOR ≈ union of bounds.
+                            if empty {
+                                rect_write(vm, this, src_l, src_t, src_r, src_b);
+                            } else {
+                                rect_write(
+                                    vm,
+                                    this,
+                                    l.min(src_l),
+                                    t.min(src_t),
+                                    r.max(src_r),
+                                    b.max(src_b),
+                                );
+                            }
+                        }
+                        5 => {
+                            // REPLACE
+                            rect_write(vm, this, src_l, src_t, src_r, src_b);
+                        }
+                        _ => {} // DIFFERENCE / REVERSE_DIFFERENCE ≈ no-op
+                    }
+                    Some(V::I32(ok as i32))
+                }
+                "getBounds" => {
+                    let (l, t, r, b) = bounds(vm, this);
+                    if let Some(&V::Ref(out)) = args.get(1) {
+                        rect_write(vm, out, l, t, r, b);
+                        Some(V::I32((l < r && t < b) as i32))
+                    } else {
+                        let rh = host(vm, "Landroid/graphics/Rect;", HostState::Empty);
+                        if let V::Ref(h) = rh {
+                            rect_write(vm, h, l, t, r, b);
+                        }
+                        Some(rh)
+                    }
+                }
+                "isEmpty" => {
+                    let (l, t, r, b) = bounds(vm, this);
+                    Some(V::I32(!(l < r && t < b) as i32))
+                }
+                "contains" | "quickContains" => {
+                    let (l, t, r, b) = bounds(vm, this);
+                    let x = i32v(args.get(1).copied().unwrap_or(V::I32(0)));
+                    let y = i32v(args.get(2).copied().unwrap_or(V::I32(0)));
+                    Some(V::I32((x >= l && x < r && y >= t && y < b) as i32))
+                }
+                "quickReject" => {
+                    let (l, t, r, b) = bounds(vm, this);
+                    let (sl, st, sr, sb) = match args.get(1) {
+                        Some(&V::Ref(src)) => rect_edges(vm, src),
+                        _ => (0, 0, 0, 0),
+                    };
+                    Some(V::I32((sr <= l || sl >= r || sb <= t || st >= b) as i32))
+                }
+                "translate" => {
+                    let dx = i32v(args.get(1).copied().unwrap_or(V::I32(0)));
+                    let dy = i32v(args.get(2).copied().unwrap_or(V::I32(0)));
+                    let (l, t, r, b) = bounds(vm, this);
+                    rect_write(vm, this, l + dx, t + dy, r + dx, b + dy);
+                    if args.len() > 3 {
+                        if let Some(&V::Ref(dst)) = args.get(3) {
+                            rect_write(vm, dst, l + dx, t + dy, r + dx, b + dy);
+                        }
+                    }
+                    None
+                }
+                "isComplex" | "isRect" | "isConvex" => {
+                    let (l, t, r, b) = bounds(vm, this);
+                    Some(V::I32((n != "isComplex" && l < r && t < b) as i32))
+                }
+                "getBoundaryPath" => Some(V::I32(0)),
+                "describeContents" | "writeToParcel" | "equals" | "hashCode" => Some(V::I32(0)),
+                _ => return Ok(None),
+            })
         }
         ("Landroid/graphics/RectF;", n) => {
             let _ = n;
@@ -4866,8 +5042,19 @@ fn graphics_call(vm: &mut Vm, class: &str, name: &str, args: &[V]) -> Rt<Option<
                 Some(Some(host(vm, class, HostState::Empty)))
             }
         }
-        (_, n) if n.starts_with("set") || n.starts_with("draw") => Some(None),
-        (_, n) if n.starts_with("get") || n.starts_with("is") || n.starts_with("has") => {
+        // Void-only fallbacks — answering `void` for a fluent setter
+        // (LineBreakConfig$Builder.setLineBreakStyle → Builder) makes the
+        // caller's move-result blow up with `dexrt.result.void`, which
+        // unwinds past guest try/finally and leaves Compose's
+        // duringMeasureLayout flag stuck. Non-void misses fall through
+        // to the proto-typed stub instead.
+        (_, n) if (n.starts_with("set") || n.starts_with("draw")) && sig.ends_with(")V") => {
+            Some(None)
+        }
+        (_, n)
+            if (n.starts_with("get") || n.starts_with("is") || n.starts_with("has"))
+                && (sig.ends_with(")Z") || sig.ends_with(")I")) =>
+        {
             Some(Some(V::I32(0)))
         }
         _ => None,

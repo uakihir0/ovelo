@@ -2310,14 +2310,17 @@ fn atomic_call(vm: &mut Vm, class: &str, name: &str, args: &[V]) -> Option<Optio
                 h,
                 width_coerce(class, args.get(1).copied().unwrap_or(V::I32(0))),
             );
-            None
+            // Some(null): the arm must return Some so the tail's
+            // .map(Some) marks it handled —  falls through to a
+            // stub placeholder mint even though the slot was seeded.
+            Some(V::Ref(0))
         }
         "get" | "getOpaque" | "getAcquire" | "getPlain" => {
             Some(width_coerce(class, slot_of(vm, h).unwrap_or(V::I32(0))))
         }
         "set" | "setOpaque" | "setRelease" | "setPlain" | "lazySet" => {
             slot_put(vm, h, width_coerce(class, args[1]));
-            None
+            Some(V::Ref(0))
         }
         "getAndSet" => {
             let old = slot_of(vm, h).unwrap_or(V::I32(0));

@@ -10,7 +10,7 @@ use crate::{Rt, Vm};
 
 // Pseudo keys (0xFFFD_FFxx block — the menu/ta keys stop at 0xFFFD_FFE0).
 const PK_COLOR: u32 = 0xFFFD_FF00;
-const PK_TSIZE: u32 = 0xFFFD_FF01;
+pub(crate) const PK_TSIZE: u32 = 0xFFFD_FF01;
 const PK_ALIGN: u32 = 0xFFFD_FF02;
 const PK_STYLE: u32 = 0xFFFD_FF03;
 const PK_SW: u32 = 0xFFFD_FF04;
@@ -22,6 +22,10 @@ const PK_CH: u32 = 0xFFFD_FF11;
 /// transform path draws into a pooled Bitmap this way).
 const PK_TARGET: u32 = 0xFFFD_FF12;
 const PK_SAVECNT: u32 = 0xFFFD_FF13;
+/// `android.graphics.Matrix` affine coefficients — Android's first
+/// six of nine values: x' = m0·x + m1·y + m2, y' = m3·x + m4·y + m5.
+/// Perspective row stays [0,0,1].
+const PK_M0: u32 = 0xFFFD_FF20;
 
 fn flt(v: V) -> f32 {
     f64v(v) as f32
@@ -53,7 +57,7 @@ fn enum_name(vm: &Vm, v: V) -> Option<String> {
 }
 
 /// Snapshot a `Paint` handle's pseudo fields at draw time.
-fn paint_state(vm: &Vm, v: V) -> PaintState {
+pub(crate) fn paint_state(vm: &Vm, v: V) -> PaintState {
     let V::Ref(h) = v else {
         return PaintState::default();
     };
@@ -104,6 +108,31 @@ pub(crate) fn rec(vm: &mut Vm, canvas: V, op: CanvasOp) {
             }
         }
     }
+    // A dex Canvas subclass (Compose's `CanvasForAndroidGetter`/`Lsa3`)
+    // delegates to the real canvas through a field — forward ops into
+    // the delegate's recorded list, otherwise text paints vanish.
+    let h = match vm.heap.get(h) {
+        Some(Obj::Host {
+            state: HostState::CanvasOps(_),
+            ..
+        }) => h,
+        Some(Obj::Instance { fields, .. }) => {
+            match fields.values().find_map(|v| match v {
+                V::Ref(dh) if *dh != 0 => match vm.heap.get(*dh) {
+                    Some(Obj::Host {
+                        state: HostState::CanvasOps(_),
+                        ..
+                    }) => Some(*dh),
+                    _ => None,
+                },
+                _ => None,
+            }) {
+                Some(dh) => dh,
+                None => return,
+            }
+        }
+        _ => return,
+    };
     if let Some(Obj::Host {
         state: HostState::CanvasOps(ops),
         ..
@@ -209,6 +238,24 @@ fn canvas_call(vm: &mut Vm, name: &str, sig: &str, args: &[V]) -> Rt<Option<Opti
                 )
             };
             rec(vm, this, CanvasOp::ClipRect { l, t, r, b });
+            Some(Some(V::I32(1)))
+        }
+        "getClipBounds" => {
+            // AOSP fills the Rect and returns false only on an empty
+            // clip. Compose gates `Layout.draw` on this result
+            // (`TextLayout.paint → getClipBounds`), so a stub `0`
+            // hides every label: report the whole canvas rect.
+            if let V::Ref(rh) = arg(args, 1) {
+                let (w, h) = if let V::Ref(ch) = this {
+                    (
+                        i32v(pseudo_get(vm, ch, PK_CW).unwrap_or(V::I32(0))),
+                        i32v(pseudo_get(vm, ch, PK_CH).unwrap_or(V::I32(0))),
+                    )
+                } else {
+                    (0, 0)
+                };
+                super::android::rect_write(vm, rh, 0, 0, w, h);
+            }
             Some(Some(V::I32(1)))
         }
         "drawColor" | "drawRGB" | "drawARGB" => {
@@ -847,7 +894,23 @@ fn paint_call(vm: &mut Vm, name: &str, _sig: &str, args: &[V]) -> Rt<Option<Opti
         | "set"
         | "reset"
         | "setLocales"
+        | "setTextLocales"
         | "setTextLocale" => Some(None),
+        // Read-side defaults for unmodelled paint state.
+        "getFlags" => Some(Some(V::I32(0))),
+        "getTextScaleX" => Some(Some(V::F32(1.0))),
+        "getTextSkewX" => Some(Some(V::F32(0.0))),
+        "getLetterSpacing" => Some(Some(V::F32(0.0))),
+        "isAntiAlias" | "isDither" | "isFilterBitmap" | "isLinearText" | "isSubpixelText" => {
+            Some(Some(V::I32(1)))
+        }
+        "isUnderlineText" | "isStrikeThruText" | "isFakeBoldText" | "isElegantTextHeight" => {
+            Some(Some(V::I32(0)))
+        }
+        "getTypeface" => Some(Some(V::Ref(0))),
+        "getStrokeMiter" => Some(Some(V::F32(1.0))),
+        "getShader" | "getColorFilter" | "getMaskFilter" | "getPathEffect" | "getXfermode"
+        | "getTextLocale" | "getTextLocales" => Some(Some(V::Ref(0))),
         _ => None,
     })
 }
@@ -856,7 +919,7 @@ fn paint_call(vm: &mut Vm, name: &str, _sig: &str, args: &[V]) -> Rt<Option<Opti
 /// 0.55em, CJK ~1em — average enough for layout math. The real font
 /// advance table lives in ovelo-ui's FontSet; guest code mostly needs
 /// a plausible number for centering, not pixel-exact shaping.
-fn measure_text(text: &str, size: f32) -> f32 {
+pub(crate) fn measure_text(text: &str, size: f32) -> f32 {
     let w: f32 = text
         .chars()
         .map(|c| {
@@ -883,6 +946,404 @@ fn host_enum_const(vm: &mut Vm, desc: &str, name: &str) -> V {
     h
 }
 
+// ---------------------------------------------------------------------
+// android.graphics.Matrix — 2x3 affine tracked in pseudo fields.
+
+fn mat_read(vm: &Vm, h: u32) -> [f32; 6] {
+    let mut m = [1.0, 0.0, 0.0, 0.0, 1.0, 0.0];
+    for (k, e) in m.iter_mut().enumerate() {
+        if let Some(v) = pseudo_get(vm, h, PK_M0 + k as u32) {
+            *e = f64v(v) as f32;
+        }
+    }
+    m
+}
+
+fn mat_write(vm: &mut Vm, h: u32, m: [f32; 6]) {
+    for (k, e) in m.iter().enumerate() {
+        pseudo_set(vm, h, PK_M0 + k as u32, V::F32(*e));
+    }
+}
+
+/// `l × r` — applying `r` first then `l` to a point.
+fn mat_mul(l: [f32; 6], r: [f32; 6]) -> [f32; 6] {
+    [
+        l[0] * r[0] + l[1] * r[3],
+        l[0] * r[1] + l[1] * r[4],
+        l[0] * r[2] + l[1] * r[5] + l[2],
+        l[3] * r[0] + l[4] * r[3],
+        l[3] * r[1] + l[4] * r[4],
+        l[3] * r[2] + l[4] * r[5] + l[5],
+    ]
+}
+
+fn mat_inv(m: [f32; 6]) -> Option<[f32; 6]> {
+    let det = m[0] * m[4] - m[1] * m[3];
+    if det.abs() < 1e-12 {
+        return None;
+    }
+    let id = 1.0 / det;
+    let (a, b, c, d, e, f) = (m[0], m[1], m[2], m[3], m[4], m[5]);
+    Some([
+        e * id,
+        -b * id,
+        (b * f - e * c) * id,
+        -d * id,
+        a * id,
+        (d * c - a * f) * id,
+    ])
+}
+
+/// Elementary op matrix for set/pre/post variants — `pivot` applies
+/// as T(px,py) × op × T(-px,-py).
+fn mat_op(kind: &str, a1: f32, a2: f32, px: f32, py: f32) -> [f32; 6] {
+    let op = match kind {
+        "Scale" => [a1, 0.0, 0.0, 0.0, a2, 0.0],
+        "Translate" => [1.0, 0.0, a1, 0.0, 1.0, a2],
+        "Rotate" => {
+            let (s, c) = a1.to_radians().sin_cos();
+            [c, -s, 0.0, s, c, 0.0]
+        }
+        "Skew" => [1.0, a1.tan(), 0.0, a2.tan(), 1.0, 0.0],
+        _ => [1.0, 0.0, 0.0, 0.0, 1.0, 0.0],
+    };
+    if px != 0.0 || py != 0.0 {
+        mat_mul(
+            mat_mul([1.0, 0.0, px, 0.0, 1.0, py], op),
+            [1.0, 0.0, -px, 0.0, 1.0, -py],
+        )
+    } else {
+        op
+    }
+}
+
+/// Read a `float[]` arg at `args[i]` (offset `args[i+1]` when the sig
+/// asks for one) into `n` slots.
+fn mat_farr(vm: &Vm, v: &V, off: usize, n: usize) -> Vec<f32> {
+    match v {
+        V::Ref(h) => match vm.heap.get(*h) {
+            Some(Obj::Array { data, .. }) => (0..n)
+                .map(|k| data.get(off + k).map(|v| f64v(*v) as f32).unwrap_or(0.0))
+                .collect(),
+            _ => vec![0.0; n],
+        },
+        _ => vec![0.0; n],
+    }
+}
+
+fn mat_write_arr(vm: &mut Vm, v: &V, off: usize, vals: &[f32]) {
+    if let V::Ref(h) = v {
+        if let Some(Obj::Array { data, .. }) = vm.heap.get_mut(*h) {
+            for (k, f) in vals.iter().enumerate() {
+                if let Some(e) = data.get_mut(off + k) {
+                    *e = V::F32(*f);
+                }
+            }
+        }
+    }
+}
+
+/// RectF edges — canon `left/top/right/bottom` fields first (floats),
+/// pseudo/Rect ints as fallback.
+fn mat_rectf_edges(vm: &Vm, h: u32) -> (f32, f32, f32, f32) {
+    let read = |name: &str| -> Option<f32> {
+        let f = vm
+            .field_index_of("Landroid/graphics/RectF;", name)
+            .map(|g| vm.canon_field(g))?;
+        match vm.heap.get(h) {
+            Some(Obj::Instance { fields, .. } | Obj::Host { fields, .. }) => {
+                fields.get(&f).map(|v| f64v(*v) as f32)
+            }
+            _ => None,
+        }
+    };
+    (
+        read("left").unwrap_or_else(|| android::rect_edges(vm, h).0 as f32),
+        read("top").unwrap_or_else(|| android::rect_edges(vm, h).1 as f32),
+        read("right").unwrap_or_else(|| android::rect_edges(vm, h).2 as f32),
+        read("bottom").unwrap_or_else(|| android::rect_edges(vm, h).3 as f32),
+    )
+}
+
+fn mat_rectf_write(vm: &mut Vm, h: u32, l: f32, t: f32, r: f32, b: f32) {
+    for (name, v) in [("left", l), ("top", t), ("right", r), ("bottom", b)] {
+        if let Some(f) = vm
+            .field_index_of("Landroid/graphics/RectF;", name)
+            .map(|g| vm.canon_field(g))
+        {
+            if let Some(Obj::Instance { fields, .. } | Obj::Host { fields, .. }) =
+                vm.heap.get_mut(h)
+            {
+                fields.insert(f, V::F32(v));
+            }
+        }
+    }
+}
+
+fn matrix_call(vm: &mut Vm, name: &str, _sig: &str, args: &[V]) -> Rt<Option<Option<V>>> {
+    let this = match args.first() {
+        Some(&V::Ref(h)) => h,
+        _ => 0,
+    };
+    Ok(match name {
+        "<init>" => {
+            // <init>() or <init>(Matrix).
+            let m = match args.get(1) {
+                Some(&V::Ref(src)) => mat_read(vm, src),
+                _ => [1.0, 0.0, 0.0, 0.0, 1.0, 0.0],
+            };
+            mat_write(vm, this, m);
+            Some(None)
+        }
+        "set" | "setConcat" => {
+            let m = match args.get(1) {
+                Some(&V::Ref(src)) => mat_read(vm, src),
+                _ => [1.0, 0.0, 0.0, 0.0, 1.0, 0.0],
+            };
+            mat_write(vm, this, m);
+            Some(None)
+        }
+        "reset" => {
+            mat_write(vm, this, [1.0, 0.0, 0.0, 0.0, 1.0, 0.0]);
+            Some(None)
+        }
+        n if n.starts_with("set") || n.starts_with("post") || n.starts_with("pre") => {
+            // (set|pre|post)(Scale|Translate|Rotate|Skew|SinCos|Concat|...)
+            let mode = if n.starts_with("set") {
+                "set"
+            } else if n.starts_with("pre") {
+                "pre"
+            } else {
+                "post"
+            };
+            let kind = n.trim_start_matches(mode);
+            if kind == "Concat" {
+                // postConcat(a,b) = a ∘ b; preConcat(a,b) = b ∘ a.
+                let a = args.get(1).map(|v| match v {
+                    V::Ref(h) => mat_read(vm, *h),
+                    _ => [1.0, 0.0, 0.0, 0.0, 1.0, 0.0],
+                });
+                let b = args.get(2).map(|v| match v {
+                    V::Ref(h) => mat_read(vm, *h),
+                    _ => [1.0, 0.0, 0.0, 0.0, 1.0, 0.0],
+                });
+                if let (Some(l), Some(r)) = (a, b) {
+                    let m = if mode == "post" {
+                        mat_mul(l, r)
+                    } else {
+                        mat_mul(r, l)
+                    };
+                    mat_write(vm, this, m);
+                } else {
+                    // (post|pre)Concat(Matrix) — one arg.
+                    let o = args.get(1).map(|v| match v {
+                        V::Ref(h) => mat_read(vm, *h),
+                        _ => [1.0, 0.0, 0.0, 0.0, 1.0, 0.0],
+                    });
+                    let cur = mat_read(vm, this);
+                    let m = if mode == "post" {
+                        mat_mul(cur, o.unwrap_or([1.0, 0.0, 0.0, 0.0, 1.0, 0.0]))
+                    } else {
+                        mat_mul(o.unwrap_or([1.0, 0.0, 0.0, 0.0, 1.0, 0.0]), cur)
+                    };
+                    mat_write(vm, this, m);
+                }
+            } else {
+                // pivot variants carry two extra floats.
+                let nfloats = args[1..]
+                    .iter()
+                    .take_while(|v| matches!(v, V::F32(_) | V::F64(_) | V::I32(_) | V::I64(_)))
+                    .count();
+                let (a1, a2, px, py) = (
+                    flt(arg(args, 1)),
+                    flt(arg(args, 2)),
+                    if nfloats >= 4 { flt(arg(args, 3)) } else { 0.0 },
+                    if nfloats >= 4 { flt(arg(args, 4)) } else { 0.0 },
+                );
+                let kind = if kind == "SinCos" { "Rotate" } else { kind };
+                let op = if kind == "Rotate" && n == "setSinCos" || kind == "SinCos" {
+                    // setSinCos(sinValue, cosValue[, px, py])
+                    let (s, c) = (a1, a2);
+                    let m = [c, -s, 0.0, s, c, 0.0];
+                    if px != 0.0 || py != 0.0 {
+                        mat_mul(
+                            mat_mul([1.0, 0.0, px, 0.0, 1.0, py], m),
+                            [1.0, 0.0, -px, 0.0, 1.0, -py],
+                        )
+                    } else {
+                        m
+                    }
+                } else {
+                    mat_op(kind, a1, a2, px, py)
+                };
+                let cur = mat_read(vm, this);
+                let m = match mode {
+                    "set" => op,
+                    "pre" => mat_mul(op, cur),
+                    _ => mat_mul(cur, op),
+                };
+                mat_write(vm, this, m);
+            }
+            Some(Some(V::I32(1)))
+        }
+        "invert" => {
+            let cur = mat_read(vm, this);
+            let inv = mat_inv(cur);
+            match (inv, args.get(1)) {
+                (Some(m), Some(&V::Ref(dst))) => {
+                    mat_write(vm, dst, m);
+                    Some(Some(V::I32(1)))
+                }
+                _ => Some(Some(V::I32(0))),
+            }
+        }
+        "isIdentity" => {
+            let m = mat_read(vm, this);
+            let id = [1.0, 0.0, 0.0, 0.0, 1.0, 0.0];
+            Some(Some(V::I32(
+                m.iter().zip(id).all(|(a, b)| (a - b).abs() < 1e-6) as i32,
+            )))
+        }
+        "hasPerspective" => Some(Some(V::I32(0))),
+        "rectStaysRect" => {
+            let m = mat_read(vm, this);
+            Some(Some(V::I32(
+                (m[1].abs() < 1e-6 && m[3].abs() < 1e-6) as i32,
+            )))
+        }
+        "getValues" => {
+            let m = mat_read(vm, this);
+            let vals = [m[0], m[1], m[2], m[3], m[4], m[5], 0.0, 0.0, 1.0];
+            mat_write_arr(vm, &arg(args, 1), 0, &vals);
+            Some(None)
+        }
+        "setValues" => {
+            let vals = mat_farr(vm, &arg(args, 1), 0, 9);
+            mat_write(
+                vm,
+                this,
+                [vals[0], vals[1], vals[2], vals[3], vals[4], vals[5]],
+            );
+            Some(None)
+        }
+        n if n.starts_with("map") => {
+            let m = mat_read(vm, this);
+            let pmap = |x: f32, y: f32, v: bool| -> (f32, f32) {
+                if v {
+                    (m[0] * x + m[1] * y, m[3] * x + m[4] * y)
+                } else {
+                    (m[0] * x + m[1] * y + m[2], m[3] * x + m[4] * y + m[5])
+                }
+            };
+            let vectors = n == "mapVectors" || n == "mapRadius";
+            match n {
+                "mapPoints" | "mapVectors" => {
+                    // mapPoints(dst[,dstOff],src[,srcOff],count).
+                    let (dst, doff, src, soff, cnt) = if args.len() >= 5 {
+                        (
+                            arg(args, 1),
+                            i32v(arg(args, 2)).max(0) as usize,
+                            arg(args, 3),
+                            i32v(arg(args, 4)).max(0) as usize,
+                            i32v(arg(args, 5)).max(0) as usize,
+                        )
+                    } else {
+                        (
+                            arg(args, 1),
+                            0,
+                            arg(args, 2),
+                            0,
+                            i32v(arg(args, 3)).max(0) as usize,
+                        )
+                    };
+                    let srcv = mat_farr(vm, &src, soff, cnt * 2);
+                    let mut out = vec![0.0f32; cnt * 2];
+                    for k in 0..cnt {
+                        let (x, y) = pmap(srcv[2 * k], srcv[2 * k + 1], vectors);
+                        out[2 * k] = x;
+                        out[2 * k + 1] = y;
+                    }
+                    mat_write_arr(vm, &dst, doff, &out);
+                }
+                "mapRect" => {
+                    // mapRect(dst,src) / mapRect(rect) / mapRect(dst,l,t,r,b).
+                    let (l, t, r, b) = if args.len() >= 5 {
+                        (
+                            flt(arg(args, 2)),
+                            flt(arg(args, 3)),
+                            flt(arg(args, 4)),
+                            flt(arg(args, 5)),
+                        )
+                    } else {
+                        let srcv = args
+                            .get(if args.len() >= 3 { 2 } else { 1 })
+                            .map(|v| match v {
+                                V::Ref(h) => mat_rectf_edges(vm, *h),
+                                _ => (0.0, 0.0, 0.0, 0.0),
+                            })
+                            .unwrap_or((0.0, 0.0, 0.0, 0.0));
+                        srcv
+                    };
+                    let mut out = [
+                        pmap(l, t, false),
+                        pmap(r, t, false),
+                        pmap(r, b, false),
+                        pmap(l, b, false),
+                    ];
+                    out.sort_by(|a, b| a.0.partial_cmp(&b.0).unwrap_or(std::cmp::Ordering::Equal));
+                    let (xl, xr) = (out[0].0, out[3].0);
+                    let mut ys: Vec<f32> = out.iter().map(|p| p.1).collect();
+                    ys.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+                    let (yt, yb) = (ys[0], ys[3]);
+                    let dst = arg(args, 1);
+                    if let V::Ref(h) = dst {
+                        mat_rectf_write(vm, h, xl, yt, xr, yb);
+                    }
+                    let (nl, nt, nr, nb) = (xl, yt, xr, yb);
+                    return Ok(Some(Some(V::I32((nl < nr && nt < nb) as i32))));
+                }
+                "mapRadius" => {
+                    let r = flt(arg(args, 1));
+                    // average of mapped unit vectors.
+                    let (ux, uy) = pmap(1.0, 0.0, true);
+                    let (vx, vy) = pmap(0.0, 1.0, true);
+                    let len = ((ux * ux + uy * uy).sqrt() + (vx * vx + vy * vy).sqrt()) / 2.0;
+                    return Ok(Some(Some(V::F32(r * len))));
+                }
+                _ => {}
+            }
+            Some(None)
+        }
+        "equals" | "hashCode" => {
+            let eq = match args.get(1) {
+                Some(&V::Ref(o)) => {
+                    let (a, b) = (mat_read(vm, this), mat_read(vm, o));
+                    a.iter().zip(b.iter()).all(|(x, y)| (x - y).abs() < 1e-6)
+                }
+                _ => false,
+            };
+            if name == "hashCode" {
+                let m = mat_read(vm, this);
+                Some(Some(V::I32(m.iter().map(|f| f.to_bits() as i32).sum())))
+            } else {
+                Some(Some(V::I32(eq as i32)))
+            }
+        }
+        "toString" | "toShortString" => {
+            let m = mat_read(vm, this);
+            Some(Some(jstr(
+                vm,
+                &format!(
+                    "Matrix{{[{:.3},{:.3},{:.3}][{:.3},{:.3},{:.3}][0,0,1]}}",
+                    m[0], m[1], m[2], m[3], m[4], m[5]
+                ),
+            )))
+        }
+        "setPolyToPoly" | "setRectToRect" | "setScaleToFit" => Some(Some(V::I32(1))),
+        _ => return Ok(None),
+    })
+}
+
 /// `Landroid/graphics/*` methods we model.
 pub(crate) fn call(
     vm: &mut Vm,
@@ -894,6 +1355,7 @@ pub(crate) fn call(
     match class {
         "Landroid/graphics/Canvas;" => canvas_call(vm, name, sig, args),
         "Landroid/graphics/Paint;" | "Landroid/text/TextPaint;" => paint_call(vm, name, sig, args),
+        "Landroid/graphics/Matrix;" => matrix_call(vm, name, sig, args),
         _ => Ok(None),
     }
 }

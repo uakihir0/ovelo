@@ -1235,6 +1235,11 @@ impl GuestUi {
             } else {
                 Some(Rc::new(ops))
             };
+            // Ops captured after the last paint (a dex view's first
+            // onDraw runs during materialize, mid-traversal) must mark
+            // the view dirty or the frame that carries them never
+            // repaints — the window stays at its clear color.
+            g.view_mut().invalidate();
         }
         if let GuestView::Group(gr) = &mut *g {
             let mut kids: Vec<Box<dyn Drawable>> = Vec::new();

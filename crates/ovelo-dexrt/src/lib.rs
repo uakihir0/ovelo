@@ -3770,6 +3770,13 @@ impl Vm {
             }
             cur = (def.superclass_idx != u32::MAX).then(|| gx(gd(cg), def.superclass_idx));
         }
+        // Interface default methods: D8 desugars `Modifier.foldIn`-style
+        // defaults onto the interface def with a real body, and a class
+        // implements the interface without declaring the method — the
+        // superclass-only walk above then misses it and the call stubs.
+        if let Some(hit) = self.find_interface_method(start_class, &name, &sig) {
+            return Ok(hit);
+        }
         // Fall back to the declared method itself (e.g. dispatch target is the
         // declared class — a class that doesn't override).
         if fallback {
@@ -3777,6 +3784,52 @@ impl Vm {
         } else {
             Err(E::Vm(err("dexrt.invoke.unresolved")))
         }
+    }
+
+    /// First interface method carrying a code body reachable from `start`
+    /// through the whole class/interface hierarchy — where JVM dispatch
+    /// lands after the superclass chain misses (default methods).
+    fn find_interface_method(&self, start: GIdx, name: &str, sig: &str) -> Option<Loc> {
+        let mut seen = std::collections::HashSet::new();
+        let mut stack = vec![start];
+        while let Some(ci) = stack.pop() {
+            if !seen.insert(ci) {
+                continue;
+            }
+            let Some((cg, def)) = self.def_loc_of(ci) else {
+                continue;
+            };
+            let Some(d) = self.dex_of(cg) else {
+                continue;
+            };
+            if let Ok(types) = d.type_list(def.interfaces_off) {
+                for &t in &types {
+                    stack.push(gx(gd(cg), t as u32));
+                }
+            }
+            if def.superclass_idx != u32::MAX {
+                stack.push(gx(gd(cg), def.superclass_idx));
+            }
+            let Ok(cd) = d.class_data_rc(def) else {
+                continue;
+            };
+            for m in &cd.virtual_methods {
+                let Ok(om) = d.method(m.method_idx) else {
+                    continue;
+                };
+                if d.string(om.name_idx).unwrap_or_default() == name
+                    && proto_sig(d, om.proto_idx as u32).unwrap_or_default() == sig
+                    && m.code_off != 0
+                {
+                    return Some(Loc {
+                        class_idx: cg,
+                        midx: gx(gd(cg), m.method_idx),
+                        em: *m,
+                    });
+                }
+            }
+        }
+        None
     }
 
     /// Builtin method table: (class descriptor, name) — never silent success,
@@ -4128,6 +4181,9 @@ impl Vm {
         args: &[V],
     ) -> Rt<Option<V>> {
         let trace = self.describe_method(midx);
+        if crate::dbg_flag("OVELO_STUBDBG") {
+            eprintln!("[stub] {trace} -> {ret} args={}", args.len());
+        }
         if self.stub_trace.len() >= 32 {
             self.stub_trace.remove(0);
         }

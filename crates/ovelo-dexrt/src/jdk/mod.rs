@@ -14,6 +14,7 @@ pub(crate) mod http;
 mod io;
 mod lang;
 mod rx;
+mod text;
 pub(crate) mod time;
 mod util;
 pub(crate) mod vector;
@@ -1317,6 +1318,9 @@ pub(crate) fn call(
     if let Some(r) = util::call(vm, class, name, sig, args)? {
         return Ok(Some(r));
     }
+    if let Some(r) = text::call(vm, class, name, sig, args)? {
+        return Ok(Some(r));
+    }
     if let Some(r) = collect::call(vm, class, name, sig, args)? {
         return Ok(Some(r));
     }
@@ -1514,6 +1518,9 @@ pub(crate) fn sfield(vm: &mut Vm, owner: &str, name: &str, ftype: &str) -> Optio
         ("Ljava/lang/Float;", "BYTES") => V::I32(4),
         ("Ljava/lang/Math;", "PI") => V::F64(std::f64::consts::PI),
         ("Ljava/lang/Math;", "E") => V::F64(std::f64::consts::E),
+        // BreakIterator.DONE — loops compare `next()` against it; the
+        // real constant is -1 and anything else misbehaves.
+        ("Ljava/text/BreakIterator;", "DONE") => V::I32(-1),
         // java.time range constants — kotlinx-datetime reads
         // `LocalDate.MIN/MAX.toEpochDay()` into its own bounds fields;
         // missing them silently clamps every date arithmetic result.
