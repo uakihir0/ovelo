@@ -2250,8 +2250,17 @@ impl Vm {
     /// sizes its main framebuffer from exactly those calls). Content
     /// frames are left to the guest's own layout — AppCompat places
     /// them below the action bar, and syncing them would stomp that.
+    /// The exception is a synthetic (host-allocated) content frame:
+    /// it sits at the decor's origin filling the window and no dex
+    /// layout will ever re-size it, so it follows the decor.
     pub fn sync_decor_frames(&mut self, w: i32, h: i32) {
-        let views: Vec<u32> = self.decor_roots.values().copied().collect();
+        let mut views: Vec<u32> = self.decor_roots.values().copied().collect();
+        views.extend(
+            self.content_frames
+                .values()
+                .copied()
+                .filter(|cf| !self.is_dex_view(*cf)),
+        );
         for v in views {
             self.view_set_frame(v, 0, 0, w, h);
         }
