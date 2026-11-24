@@ -287,17 +287,20 @@ fn bbuf_le(vm: &Vm, buf: u32) -> bool {
 }
 
 /// Byte order of data uploaded through a `glBufferData`/`SubData`
-/// source: a ByteBuffer uses its declared order, a typed view was
-/// serialized LE by `buf_bytes`, and a raw byte[] is native (LE).
+/// source: a ByteBuffer or typed view uses its declared order
+/// (matching how `buf_bytes` serialized it), a raw byte[] is native.
 fn upload_le(vm: &Vm, buf: &V) -> bool {
     let V::Ref(h) = buf else { return true };
     if elem_arr(vm, *h).is_some() {
-        return true;
+        return bbuf_le(vm, *h);
     }
     if pseudo_get(vm, *h, super::P_BBUF_ORD).is_some() {
         return bbuf_le(vm, *h);
     }
-    true
+    // A Buffer pseudo that never declared an order is big-endian —
+    // Java's ByteBuffer default (a `ShortBuffer` view made from a
+    // default-ordered parent writes BE). Raw byte[] data is native.
+    !matches!(vm.heap.get(*h), Some(Obj::Host { .. }))
 }
 
 /// Bytes per component for a GL array type.
