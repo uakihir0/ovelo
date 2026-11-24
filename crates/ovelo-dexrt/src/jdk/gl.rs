@@ -1743,12 +1743,18 @@ pub(crate) fn call_static(
             let data = buf_bytes(vm, &src, size);
             state(GL20, |s| {
                 let id = if t == 0x8893 { s.vbo_idx } else { s.vbo_arr };
-                s.vbo_le.insert(id, upload_le(vm, &src));
                 let v = s.vbos.entry(id).or_default();
+                // A partial write can't change the order of bytes it
+                // doesn't touch — keep the recorded flag unless this
+                // write covers the whole buffer.
+                let whole = off == 0 && size >= v.len();
                 if v.len() < off + size {
                     v.resize(off + size, 0);
                 }
                 v[off..off + size].copy_from_slice(&data);
+                if whole {
+                    s.vbo_le.insert(id, upload_le(vm, &src));
+                }
             });
             None
         }
