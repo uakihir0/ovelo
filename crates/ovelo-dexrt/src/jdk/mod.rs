@@ -74,6 +74,11 @@ pub(crate) const P_SLOT: u64 = 0xFFFD_FEF0;
 /// starts — `asIntBuffer` on a positioned ByteBuffer views it from its
 /// position, not from the array base. Absent/0 = no offset.
 pub(crate) const P_BBUF_BASE: u64 = 0xFFFD_FF00;
+/// Set on `ByteBuffer.wrap(byte[])`: the bytes arrived whole from an
+/// outside source, so without a declared `order()` they are in the
+/// source's order — native little-endian — not Java's BE default that
+/// applies to buffers filled through typed `put*` calls.
+pub(crate) const P_BBUF_RAW: u64 = 0xFFFD_FF01;
 /// `Message` routing: target `Handler`, payload `obj`, `callback`
 /// `Runnable` — and a `Handler`'s own `Handler.Callback` — so
 /// `obtainMessage(...).sendToTarget()`/`sendMessage` actually deliver

@@ -2488,10 +2488,16 @@ fn nio_call(vm: &mut Vm, class: &str, name: &str, args: &[V]) -> Option<Option<V
         "wrap" => {
             // wrap(byte[]) / wrap(byte[], off, len) — keep the array so
             // `array()` returns the same handle writes went into.
+            // P_BBUF_RAW marks the content as foreign-supplied bytes
+            // (native order until `order()` says otherwise); `slice`/
+            // `duplicate` return this handle so the mark carries over.
             let b = args.first().copied().unwrap_or(V::Ref(0));
             let v = host(vm, "Ljava/nio/ByteBuffer;", HostState::Slot(b));
-            if let (V::Ref(h), true) = (v, args.len() > 2) {
-                pseudo_set(vm, h, P_BBUF_POS, V::I32(i32v(args[1])));
+            if let V::Ref(h) = v {
+                pseudo_set(vm, h, P_BBUF_RAW, V::I32(1));
+                if args.len() > 2 {
+                    pseudo_set(vm, h, P_BBUF_POS, V::I32(i32v(args[1])));
+                }
             }
             Some(Some(v))
         }

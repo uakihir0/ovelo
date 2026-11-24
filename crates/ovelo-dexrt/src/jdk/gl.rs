@@ -298,9 +298,15 @@ fn upload_le(vm: &Vm, buf: &V) -> bool {
         return bbuf_le(vm, *h);
     }
     // A Buffer pseudo that never declared an order is big-endian —
-    // Java's ByteBuffer default (a `ShortBuffer` view made from a
-    // default-ordered parent writes BE). Raw byte[] data is native.
-    !matches!(vm.heap.get(*h), Some(Obj::Host { .. }))
+    // Java's ByteBuffer default governs bytes laid down by typed
+    // `put*` (a `ShortBuffer` view on a default-ordered parent writes
+    // BE). The exception is `wrap(byte[])`: its bytes came in whole
+    // from a foreign source, so they sit in that source's order —
+    // native little-endian — like a bare byte[].
+    match vm.heap.get(*h) {
+        Some(Obj::Host { .. }) => pseudo_get(vm, *h, super::P_BBUF_RAW).is_some(),
+        _ => true,
+    }
 }
 
 /// Bytes per component for a GL array type.
