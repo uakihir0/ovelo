@@ -286,6 +286,20 @@ fn bbuf_le(vm: &Vm, buf: u32) -> bool {
     i32v(pseudo_get(vm, buf, super::P_BBUF_ORD).unwrap_or(V::I32(0))) != 0
 }
 
+/// Byte order of data uploaded through a `glBufferData`/`SubData`
+/// source: a ByteBuffer uses its declared order, a typed view was
+/// serialized LE by `buf_bytes`, and a raw byte[] is native (LE).
+fn upload_le(vm: &Vm, buf: &V) -> bool {
+    let V::Ref(h) = buf else { return true };
+    if elem_arr(vm, *h).is_some() {
+        return true;
+    }
+    if pseudo_get(vm, *h, super::P_BBUF_ORD).is_some() {
+        return bbuf_le(vm, *h);
+    }
+    true
+}
+
 /// Bytes per component for a GL array type.
 fn elem_w(ty: i32) -> usize {
     match ty {
@@ -1644,19 +1658,26 @@ pub(crate) fn call_static(
                         }
                     }
                     // `IntBuffer` overload — a typed view over a byte[]
-                    // backing; write each id little-endian at the view's
-                    // position. Without this the guest binds id 0 for
-                    // every buffer and uploads collide (Korge's vertex
-                    // and index buffers landed in the same slot).
+                    // backing; write each id at the view's position in
+                    // the view's byte order. Without this the guest
+                    // binds id 0 for every buffer and uploads collide
+                    // (Korge's vertex and index buffers landed in the
+                    // same slot).
                     Some(Obj::Host {
                         state: HostState::Slot(V::Ref(b)),
                         ..
                     }) if matches!(vm.heap.get(*b), Some(Obj::Array { .. })) => {
                         let arr = *b;
                         let pos = bbuf_pos(vm, h);
+                        let le = bbuf_le(vm, h);
                         if let Some(Obj::Array { data, .. }) = vm.heap.get_mut(arr) {
                             for (k, id) in ids.iter().enumerate() {
-                                for (j, byte) in id.to_le_bytes().iter().enumerate() {
+                                let bs = if le {
+                                    id.to_le_bytes()
+                                } else {
+                                    id.to_be_bytes()
+                                };
+                                for (j, byte) in bs.iter().enumerate() {
                                     if let Some(slot) = data.get_mut(pos + k * 4 + j) {
                                         *slot = V::I32(*byte as i8 as i32);
                                     }
@@ -1700,18 +1721,22 @@ pub(crate) fn call_static(
                     );
                 }
             }
-            let data = buf_bytes(vm, args.get(2).unwrap_or(&V::I32(0)), size);
+            let src = args.get(2).copied().unwrap_or(V::I32(0));
+            let data = buf_bytes(vm, &src, size);
             state(GL20, |s| {
                 let id = if t == 0x8893 { s.vbo_idx } else { s.vbo_arr };
                 s.vbos.insert(id, data);
+                s.vbo_le.insert(id, upload_le(vm, &src));
             });
             None
         }
         "glBufferSubData" => {
             let (t, off, size) = (i(0), i(1).max(0) as usize, i(2).max(0) as usize);
-            let data = buf_bytes(vm, args.get(3).unwrap_or(&V::I32(0)), size);
+            let src = args.get(3).copied().unwrap_or(V::I32(0));
+            let data = buf_bytes(vm, &src, size);
             state(GL20, |s| {
                 let id = if t == 0x8893 { s.vbo_idx } else { s.vbo_arr };
+                s.vbo_le.insert(id, upload_le(vm, &src));
                 let v = s.vbos.entry(id).or_default();
                 if v.len() < off + size {
                     v.resize(off + size, 0);
@@ -1834,7 +1859,11 @@ pub(crate) fn call_static(
                         let w = elem_w(ty);
                         match s.vbos.get(&s.vbo_idx) {
                             Some(d) => {
-                                let le = detect_idx_le(d, off, w, (count as usize).min(8));
+                                // Prefer the order recorded at upload;
+                                // small draws defeat the max-index heuristic.
+                                let le = s.vbo_le.get(&s.vbo_idx).copied().unwrap_or_else(|| {
+                                    detect_idx_le(d, off, w, (count as usize).min(8))
+                                });
                                 (0..count as usize)
                                     .map(|k| {
                                         let at = off + k * w;
