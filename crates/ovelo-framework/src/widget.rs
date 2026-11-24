@@ -86,7 +86,24 @@ impl Drawable for View {
         }
     }
     fn measure(&mut self, w: MeasureSpec, h: MeasureSpec) -> Size {
-        self.measure(w, h)
+        // AOSP's default `onMeasure` is `getDefaultSize` — a plain View
+        // FILLS the spec under EXACTLY and AT_MOST (only UNSPECIFIED
+        // reports the desired size). Widgets that wrap content
+        // (TextView, Button, groups) bypass this via their own measure
+        // which computes `desired` first, so this fill only applies to
+        // the bare leaf — SurfaceView/custom canvases, which otherwise
+        // measured 0x0 and never drew (andstatus 2048's GLSurfaceView).
+        self.measured = Size {
+            w: match w {
+                MeasureSpec::Exactly(s) | MeasureSpec::AtMost(s) => s,
+                MeasureSpec::Unspecified => self.desired.w,
+            },
+            h: match h {
+                MeasureSpec::Exactly(s) | MeasureSpec::AtMost(s) => s,
+                MeasureSpec::Unspecified => self.desired.h,
+            },
+        };
+        self.measured
     }
     fn layout(&mut self, left: i32, top: i32) {
         self.layout(left, top)

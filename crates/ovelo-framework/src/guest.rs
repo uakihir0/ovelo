@@ -60,7 +60,10 @@ impl GuestView {
 impl Drawable for GuestView {
     fn measure(&mut self, w: MeasureSpec, h: MeasureSpec) -> Size {
         match self {
-            GuestView::Plain(v) => v.measure(w, h),
+            // `v.measure` would resolve the inherent method (desired.min)
+            // — the leaf must fill the spec AOSP-style, so call the
+            // trait impl explicitly.
+            GuestView::Plain(v) => Drawable::measure(v, w, h),
             GuestView::Text(t) => t.measure(w, h),
             GuestView::Btn(b) => b.measure(w, h),
             GuestView::Group(g) => g.measure(w, h),
@@ -508,6 +511,17 @@ impl GuestUi {
                 GuestView::Group(ViewGroup::new(Length::MatchParent, Length::WrapContent))
             });
         }
+        // Stacking groups — children overlap rather than flow.
+        for cls in [
+            "Landroid/widget/FrameLayout;",
+            "Landroid/widget/RelativeLayout;",
+            "Landroid/widget/AbsoluteLayout;",
+            "Landroid/widget/ScrollView;",
+        ] {
+            Self::ctor(ui, vm, cls, |_ui| {
+                GuestView::Group(ViewGroup::overlay(Length::MatchParent, Length::MatchParent))
+            });
+        }
 
         // ---- ViewGroup.addView -------------------------------------------
         for cls in ["Landroid/view/ViewGroup;", "Landroid/widget/LinearLayout;"] {
@@ -520,6 +534,14 @@ impl GuestUi {
                 |ui, vm, a| {
                     let this = ref_arg(a, 0)?;
                     let child = ref_arg(a, 1)?;
+                    if std::env::var_os("OVELO_VIEWDBG").is_some() {
+                        eprintln!(
+                            "[viewdbg] bridge addView this={this} child={child} \
+                             child_in_views={} parent_in_views={}",
+                            ui.views.contains_key(&child),
+                            ui.views.contains_key(&this)
+                        );
+                    }
                     // Dex-inflated views (real Instances or view-tree stubs)
                     // aren't GuestViews — attach them in the VM's view tree
                     // instead of failing.
@@ -532,11 +554,44 @@ impl GuestUi {
                             let mut g = rc.borrow_mut();
                             match &mut *g {
                                 GuestView::Group(gr) => {
+                                    // addView(v, lp) hands the LP here —
+                                    // apply its dims so the child isn't
+                                    // measured at its 0×0 desired size.
+                                    if let Some(V::Ref(lp)) = a.get(2).copied() {
+                                        let (w, h) = vm.layout_params_dims(lp);
+                                        if std::env::var_os("OVELO_VIEWDBG").is_some() {
+                                            eprintln!(
+                                                "[viewdbg] bridge addView lp w={w:?} h={h:?}"
+                                            );
+                                        }
+                                        let mut c = cv.borrow_mut();
+                                        let v = c.view_mut();
+                                        if let Some(w) = w {
+                                            v.lp_w = Length::from_aosp(w);
+                                        }
+                                        if let Some(h) = h {
+                                            v.lp_h = Length::from_aosp(h);
+                                        }
+                                        drop(c);
+                                    }
                                     gr.children.push(Box::new(SharedView(cv)));
+                                    if std::env::var_os("OVELO_VIEWDBG").is_some() {
+                                        eprintln!(
+                                            "[viewdbg] bridge addView pushed; children={}",
+                                            gr.children.len()
+                                        );
+                                    }
                                     gr.view.invalidate();
                                     Ok(None)
                                 }
                                 _ => {
+                                    if std::env::var_os("OVELO_VIEWDBG").is_some() {
+                                        eprintln!(
+                                            "[viewdbg] bridge addView non-group kind={:?} class={}",
+                                            std::mem::discriminant(&*g),
+                                            vm.dbg_class_of(this)
+                                        );
+                                    }
                                     drop(g);
                                     vm.view_tree_add(this, child);
                                     Ok(None)
@@ -718,20 +773,24 @@ impl GuestUi {
     /// pressed state and listener closures survive rebuilds. Skipped
     /// once the guest bound a real `GuestView` as its content view.
     pub fn refresh_dex_tree(&mut self, vm: &mut Vm, activity: u32) -> bool {
+        // A bound GLSurfaceView.Renderer draws every frame in
+        // continuous mode — its output isn't triggered by view-tree
+        // changes, so pump it every tick: for materialized dex views
+        // AND for bridged `new` views (guest_content_set apps like
+        // 2048 whose whole UI is a bridged GLSurfaceView).
+        self.pump_gl_frames(vm);
         if self.guest_content_set {
             return false;
         }
         let Some(root) = vm.activity_content(activity) else {
+            if viewdbg() {
+                eprintln!("[viewdbg] refresh: no content for activity={activity}");
+            }
             return false;
         };
         // Tree unchanged since the mounted materialize — skip the
         // per-node info build (the per-frame dominant cost).
         if self.dex_root == root && self.dex_mounted.is_some() && self.dex_gen_seen == vm.view_gen {
-            // A bound GLSurfaceView.Renderer draws every frame in
-            // continuous mode — its output isn't triggered by
-            // view-tree changes, so pump it even when we skip the
-            // materialize.
-            self.pump_gl_frames(vm);
             return true;
         }
         self.dex_live.clear();
@@ -768,18 +827,45 @@ impl GuestUi {
         true
     }
 
-    /// Run `onDrawFrame` for every materialized view that has a bound
-    /// GL renderer — continuous renderers produce a new frame
-    /// independent of view-tree generation changes.
+    /// Run `onDrawFrame` for every view that has a bound GL renderer —
+    /// continuous renderers produce a new frame independent of
+    /// view-tree generation changes. Covers both the materialized dex
+    /// tree (`dex_views`) and bridged `new` views (`views`).
     fn pump_gl_frames(&mut self, vm: &mut Vm) {
-        for (&h, rc) in &self.dex_views {
-            if !self.dex_live.contains(&h) || !vm.has_gl_renderer(h) {
+        if std::env::var_os("OVELO_DRAWDBG").is_some() {
+            eprintln!(
+                "[gldbg] pump views={:?} dex_views={:?}",
+                self.views.keys().collect::<Vec<_>>(),
+                self.dex_views.keys().collect::<Vec<_>>()
+            );
+        }
+        for (&h, rc) in self.views.iter().chain(self.dex_views.iter()) {
+            if std::env::var_os("OVELO_DRAWDBG").is_some() {
+                eprintln!(
+                    "[gldbg] cand h={h} gl={} measured={:?}",
+                    vm.has_gl_renderer(h),
+                    rc.borrow_mut().view_mut().measured
+                );
+            }
+            if !vm.has_gl_renderer(h) {
                 continue;
             }
-            let Some((l, t, r, b)) = vm.dex_view(h).and_then(|i| i.frame) else {
-                continue;
+            let (w, hh) = if self.dex_views.contains_key(&h) {
+                // Materialized node: must still be mounted, and its
+                // size comes from the dex-side frame.
+                if !self.dex_live.contains(&h) {
+                    continue;
+                }
+                let Some((l, t, r, b)) = vm.dex_view(h).and_then(|i| i.frame) else {
+                    continue;
+                };
+                (r - l, b - t)
+            } else {
+                // Bridged view: laid out by the host tree — use its
+                // measured size (0 before the first traversal).
+                let s = rc.borrow_mut().view_mut().measured;
+                (s.w, s.h)
             };
-            let (w, hh) = (r - l, b - t);
             if w <= 0 || hh <= 0 {
                 continue;
             }
@@ -945,7 +1031,16 @@ impl GuestUi {
                 move |_vm: &mut Vm, a: &[V]| -> Result<Option<V>> {
                     let this = ref_arg(a, 0)?;
                     let mut g = ui2.borrow_mut();
-                    if !g.views.contains_key(&this) {
+                    // A subclass super-call can fire a LESS specific ctor
+                    // first (`View.<init>` binding Plain before
+                    // `ViewGroup.<init>` would bind Group) — Plain is the
+                    // weakest kind, so a later specific ctor upgrades it.
+                    let upgrade = g
+                        .views
+                        .get(&this)
+                        .map(|rc| matches!(*rc.borrow(), GuestView::Plain(_)))
+                        .unwrap_or(false);
+                    if upgrade || !g.views.contains_key(&this) {
                         let gv = make(&g);
                         g.views.insert(this, Rc::new(RefCell::new(gv)));
                     }

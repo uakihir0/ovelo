@@ -1333,7 +1333,10 @@ pub(crate) fn call(
             if let Some(&child @ V::Ref(_)) = args.get(1) {
                 if std::env::var_os("OVELO_VIEWDBG").is_some() {
                     if let V::Ref(ch) = child {
-                        eprintln!("[viewdbg] {name} h{this} <- h{ch} {}", vm.dbg_class_of(ch));
+                        eprintln!(
+                            "[viewdbg] {name} h{this} <- h{ch} {} (ref {class})",
+                            vm.dbg_class_of(ch)
+                        );
                     }
                 }
                 // Positional overloads (addView(v,i), attachViewToParent
@@ -1372,6 +1375,28 @@ pub(crate) fn call(
                     None
                 };
                 let notify = !matches!(name, "attachViewToParent" | "attachViewToParentInLayout");
+                // A registered bridge impl (`ViewGroup.addView` on the
+                // GuestUi side) wires the child into the mounted host
+                // tree when both ends are bridged `new` views — the
+                // dex bookkeeping below alone leaves the real group's
+                // children empty (andstatus 2048's FrameLayout).
+                // The bridge is registered for the canonical
+                // `addView(View)` sig only — every overload ends in
+                // `addViewInner(child)` with the child at args[1], so
+                // fall back to it when the exact proto isn't bridged.
+                let host = vm
+                    .named_host(class, name, sig)
+                    .or_else(|| vm.named_host(class, name, "(Landroid/view/View;)V"));
+                if let Some(f) = host {
+                    if std::env::var_os("OVELO_VIEWDBG").is_some() {
+                        eprintln!("[viewdbg] addView host-arm h{this} (ref {class})");
+                    }
+                    if let Ok(mut g) = f.try_borrow_mut() {
+                        let _ = g(vm, args);
+                    }
+                } else if std::env::var_os("OVELO_VIEWDBG").is_some() {
+                    eprintln!("[viewdbg] addView host-miss h{this} (ref {class}) sig={sig}");
+                }
                 // attachViewToParent(v,i,lp) / addView(v,lp) /
                 // addViewInLayout(v,i,lp) hand a fully-built dex
                 // LayoutParams — keep it on the child or later dex
@@ -1416,6 +1441,9 @@ pub(crate) fn call(
         "setRenderer" => {
             if let Some(V::Ref(r)) = args.get(1).copied() {
                 if r != 0 {
+                    if std::env::var_os("OVELO_GLDBG").is_some() {
+                        eprintln!("[gldbg] setRenderer view={this} r={r} class={class}");
+                    }
                     pseudo_set(vm, this, crate::jdk::gl::P_GLES_RENDERER, V::Ref(r));
                 }
             }
@@ -3367,8 +3395,19 @@ fn lp_resolve_dir_dex(vm: &mut Vm, lp: V) {
 
 /// Read an int field off a LayoutParams object under every canon key
 /// a writer could have used (owner obfuscation, LP subclasses).
-fn lp_field(vm: &Vm, lp: u32, name: &str) -> Option<V> {
+pub(crate) fn lp_field(vm: &Vm, lp: u32, name: &str) -> Option<V> {
     lp_field_t(vm, lp, name, "I")
+}
+
+/// `(width, height)` requested by a dex LayoutParams object — `-1`
+/// match_parent / `-2` wrap_content pass through. For the host-side
+/// view bridge, which must size bridged children from the LP the app
+/// handed to `addView`/`setLayoutParams`.
+pub fn lp_dims(vm: &Vm, lp: u32) -> (Option<i32>, Option<i32>) {
+    (
+        lp_field(vm, lp, "width").and_then(|v| lp_px(vm, v)),
+        lp_field(vm, lp, "height").and_then(|v| lp_px(vm, v)),
+    )
 }
 
 fn lp_field_t(vm: &Vm, lp: u32, name: &str, ty: &str) -> Option<V> {

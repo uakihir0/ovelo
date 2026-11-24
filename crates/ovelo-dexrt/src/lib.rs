@@ -1060,14 +1060,18 @@ impl Vm {
             // Misses are memoized — a subclass-named call resolved to
             // None before this registration must see the new impl.
             self.host_named_cache.borrow_mut().clear();
-            // A DEX may reference the same method through a subclass
-            // descriptor; fall back to (name, sig) in call_builtin.
-            let owner = self.type_index_of(class_desc).unwrap_or(GX_NONE);
-            self.hosts_named
-                .entry((name.to_string(), proto_desc.to_string()))
-                .or_default()
-                .push((owner, f));
         }
+        // A DEX may reference the same method through a subclass
+        // descriptor; fall back to (name, sig) in call_builtin.
+        // Registered even when the exact proto has no dex ref — apps
+        // call `addView(View,LayoutParams)` while the bridge is wired
+        // for canonical `addView(View)`, and callers below the invoke
+        // dispatch consult this map directly.
+        let owner = self.type_index_of(class_desc).unwrap_or(GX_NONE);
+        self.hosts_named
+            .entry((name.to_string(), proto_desc.to_string()))
+            .or_default()
+            .push((owner, f));
         Ok(found)
     }
 
@@ -2134,6 +2138,14 @@ impl Vm {
     /// The handle `activity` last set as its content view, if any.
     pub fn activity_content(&self, activity: u32) -> Option<u32> {
         jdk::view::activity_content(self, activity)
+    }
+
+    /// `(width, height)` a dex LayoutParams object requests —
+    /// AOSP constants (`-1` match_parent, `-2` wrap_content) pass
+    /// through; resource ids resolve to px. Used by the host view
+    /// bridge to size bridged children.
+    pub fn layout_params_dims(&self, lp: u32) -> (Option<i32>, Option<i32>) {
+        jdk::view::lp_dims(self, lp)
     }
 
     /// Snapshot one node of the dex view tree for host rendering —
@@ -3459,6 +3471,28 @@ impl Vm {
             }
         }
         Ok(None)
+    }
+
+    /// The `(name,sig)`-registered host impl for a reference class —
+    /// the same rule `host_named` applies (owner or subclass), for
+    /// builtin arms that run below the normal invoke dispatch and
+    /// would otherwise swallow a bridged call (`ViewGroup.addView`).
+    pub(crate) fn named_host(&self, class: &str, name: &str, sig: &str) -> Option<HostCall> {
+        let owner_ref = self.type_index_of(class).unwrap_or(GX_NONE);
+        if owner_ref == GX_NONE {
+            return None;
+        }
+        for (owner, f) in self
+            .hosts_named
+            .get(&(name.to_string(), sig.to_string()))
+            .into_iter()
+            .flatten()
+        {
+            if *owner == owner_ref || self.assignable(owner_ref, *owner) {
+                return Some(f.clone());
+            }
+        }
+        None
     }
 
     /// Compact `args` for a builtin: DEX passes `J`/`D` params as

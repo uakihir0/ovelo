@@ -19,6 +19,18 @@ pub enum Length {
     Exact(i32),
 }
 
+impl Length {
+    /// Map an AOSP `LayoutParams` dim — `-1` match_parent, `-2`
+    /// wrap_content, any other value an exact px size.
+    pub fn from_aosp(v: i32) -> Self {
+        match v {
+            -1 => Length::MatchParent,
+            -2 => Length::WrapContent,
+            other => Length::Exact(other.max(0)),
+        }
+    }
+}
+
 /// `View.MeasureSpec`: a mode plus a size hint from the parent.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum MeasureSpec {
