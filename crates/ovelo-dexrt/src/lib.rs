@@ -2465,6 +2465,15 @@ impl Vm {
         }
     }
 
+    /// Index of `child` in the dex-side child list of `parent` — the
+    /// authoritative order after the dex bookkeeping ran (used to mirror
+    /// host-side placement on retried addView calls).
+    pub fn view_child_index(&self, parent: u32, child: u32) -> Option<usize> {
+        jdk::view::children(self, parent)
+            .iter()
+            .position(|&c| jdk::value_eq(self, c, V::Ref(child)))
+    }
+
     /// Parent handle recorded by `attach_at` — the bridge checks this
     /// before re-running dex attach bookkeeping: a host call retried
     /// after the borrow race already attached dex-side via the builtin
@@ -4697,18 +4706,30 @@ impl Vm {
                         // invoke-super on an interface default method:
                         // the caller implements the interface, but its
                         // superclass chain (Object) doesn't — JVM picks
-                        // the named interface's body. Search only the
-                        // caller's direct interfaces: starting at the
-                        // caller itself could re-find its own def and
-                        // recurse forever.
-                        let loc = self.def_loc_of(caller_class).and_then(|(cg, d)| {
-                            let dex = self.dex_of(cg)?;
-                            let types = dex.type_list(d.interfaces_off).ok()?;
-                            let (_, name, sig) = self.method_sig(midx).ok()?;
-                            types.iter().find_map(|&t| {
-                                self.find_interface_method(gx(gd(cg), t as u32), &name, &sig)
-                            })
-                        });
+                        // the *named* interface's body. The ref's owner
+                        // is that interface, so resolve the method on the
+                        // ref itself first (guarded against the caller's
+                        // own def, which would recurse); only fall back
+                        // to scanning the caller's direct interfaces when
+                        // the owner has no body.
+                        let loc = self
+                            .resolve_defined(midx)
+                            .ok()
+                            .filter(|l| l.class_idx != caller_class && l.em.code_off != 0)
+                            .or_else(|| {
+                                self.def_loc_of(caller_class).and_then(|(cg, d)| {
+                                    let dex = self.dex_of(cg)?;
+                                    let types = dex.type_list(d.interfaces_off).ok()?;
+                                    let (_, name, sig) = self.method_sig(midx).ok()?;
+                                    types.iter().find_map(|&t| {
+                                        self.find_interface_method(
+                                            gx(gd(cg), t as u32),
+                                            &name,
+                                            &sig,
+                                        )
+                                    })
+                                })
+                            });
                         match loc {
                             Some(l) => l,
                             None => return self.call_builtin(midx, &args, true),
