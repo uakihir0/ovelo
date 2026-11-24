@@ -424,20 +424,35 @@ fn layout_call(vm: &mut Vm, _class: &str, name: &str, sig: &str, args: &[V]) -> 
         "getEllipsizedWidth" => V::I32(width as i32),
         "getDesiredWidth" => {
             if sig.starts_with("(Ljava/lang/CharSequence;") {
-                // Static `Layout.getDesiredWidth(CharSequence, TextPaint)`
-                // — args[0] is the text, not a layout. Measuring the
-                // pseudo state of a CharSequence yielded width 0 and
-                // wrap-content text never sized itself.
-                let t = cs_arg(vm, args.first().copied().unwrap_or(V::Ref(0)));
-                let sz = args
-                    .get(1)
+                // Static `Layout.getDesiredWidth` — args[0] is the text,
+                // not a layout. Two forms: `(CharSequence, TextPaint)`
+                // and the ranged `(CharSequence, int, int, TextPaint)`.
+                let ranged = sig.contains(";IILandroid/text/TextPaint;");
+                let mut t = cs_arg(vm, args.first().copied().unwrap_or(V::Ref(0)));
+                let paint_arg = if ranged { args.get(3) } else { args.get(1) };
+                if ranged {
+                    let chars: Vec<char> = t.chars().collect();
+                    let a = (args.get(1).map(|v| i64v(*v)).unwrap_or(0).max(0) as usize)
+                        .min(chars.len());
+                    let b = (args.get(2).map(|v| i64v(*v)).unwrap_or(0).max(0) as usize)
+                        .min(chars.len())
+                        .max(a);
+                    t = chars[a..b].iter().collect();
+                }
+                let sz = paint_arg
                     .and_then(|v| match v {
                         V::Ref(h) => pseudo_get(vm, *h, gfx::PK_TSIZE),
                         _ => None,
                     })
                     .map(f64v)
                     .unwrap_or(12.0) as f32;
-                V::F32(gfx::measure_text(&t, sz))
+                // Desired width is the longest line — summing widths
+                // across '\n' overstretches wrap-content text.
+                V::F32(
+                    t.split('\n')
+                        .map(|l| gfx::measure_text(l, sz))
+                        .fold(0f32, f32::max),
+                )
             } else {
                 let w = layout_lines(vm, this)
                     .iter()
