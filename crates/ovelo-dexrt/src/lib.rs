@@ -2244,18 +2244,14 @@ impl Vm {
         }
     }
 
-    /// Give every window decor root and framework content frame the
-    /// window's bounds — they're host-created view objects that never
-    /// pass through layout, so `getDecorView().getWidth()`/`getHeight()`
-    /// would read 0 (Korge sizes its main framebuffer from exactly
-    /// those calls).
+    /// Give every window decor root the window's bounds — they're
+    /// host-created view objects that never pass through layout, so
+    /// `getDecorView().getWidth()`/`getHeight()` would read 0 (Korge
+    /// sizes its main framebuffer from exactly those calls). Content
+    /// frames are left to the guest's own layout — AppCompat places
+    /// them below the action bar, and syncing them would stomp that.
     pub fn sync_decor_frames(&mut self, w: i32, h: i32) {
-        let views: Vec<u32> = self
-            .decor_roots
-            .values()
-            .chain(self.content_frames.values())
-            .copied()
-            .collect();
+        let views: Vec<u32> = self.decor_roots.values().copied().collect();
         for v in views {
             self.view_set_frame(v, 0, 0, w, h);
         }
