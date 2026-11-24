@@ -2050,11 +2050,29 @@ fn classloader_call(vm: &mut Vm, name: &str, args: &[V]) -> Option<Option<V>> {
 
 fn thread_call(vm: &mut Vm, name: &str, _sig: &str, args: &[V]) -> Rt<Option<Option<V>>> {
     Ok(match name {
-        "currentThread" => Some(Some(if vm.cur_thread != 0 {
-            V::Ref(vm.cur_thread)
-        } else {
-            main_thread(vm)
-        })),
+        "currentThread" => {
+            let r = if vm.cur_thread != 0 {
+                V::Ref(vm.cur_thread)
+            } else {
+                main_thread(vm)
+            };
+            if std::env::var("OVELO_THRDBG").is_ok()
+                && vm
+                    .stack
+                    .last()
+                    .is_some_and(|g| vm.describe_method(*g).contains("isMainThread$room_runtime"))
+                && matches!(r, V::Ref(h) if h == vm.main_thread_h)
+            {
+                eprintln!(
+                    "[thrdbg] currentThread -> {r:?} cur={} main={} worker={} runnable={}",
+                    vm.cur_thread, vm.main_thread_h, vm.worker_thread_h, vm.cur_runnable
+                );
+                for (i, g) in vm.stack.iter().take(6).enumerate() {
+                    eprintln!("[thrdbg-root{i}] {}", vm.describe_method(*g));
+                }
+            }
+            Some(Some(r))
+        }
         "getId" => Some(Some(V::I64(1))),
         "getName" => {
             let n = s(

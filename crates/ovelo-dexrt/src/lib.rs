@@ -5753,6 +5753,9 @@ impl Vm {
                     "[stall] {} +{pc:04x} steps={steps}",
                     self.describe_method(fr.loc.midx)
                 );
+                for (i, m) in self.stack.iter().rev().take(8).enumerate() {
+                    eprintln!("[stall-frm{i}] {}", self.describe_method(*m));
+                }
             }
             self.total_steps += 1;
             if stalldbg && self.total_steps.is_multiple_of(1_000_000) {
@@ -5761,6 +5764,12 @@ impl Vm {
                     self.describe_method(fr.loc.midx),
                     self.total_steps
                 );
+                if self.total_steps.is_multiple_of(10_000_000) {
+                    eprintln!("[stall-depth] {}", self.stack.len());
+                    for (i, m) in self.stack.iter().take(8).enumerate() {
+                        eprintln!("[stall-root{i}] {}", self.describe_method(*m));
+                    }
+                }
             }
             if steps > budget {
                 return Err(self.throw_builtin(

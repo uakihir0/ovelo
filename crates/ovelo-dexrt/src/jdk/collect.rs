@@ -1811,6 +1811,18 @@ fn arrays_static(vm: &mut Vm, name: &str, _sig: &str, args: &[V]) -> Rt<Option<O
                 },
                 _ => "Ljava/lang/Object;".into(),
             };
+            // The 3-arg `copyOf`/`copyOfRange` carries the target array
+            // type as a `Class` — `ArrayList.toArray(MemberScope[])` calls
+            // `copyOf(Object[], n, MemberScope[].class)` and must yield
+            // `MemberScope[]`, not `Object[]` (downstream check-cast).
+            let elem = args
+                .get(if name == "copyOf" { 2 } else { 3 })
+                .and_then(|v| match v {
+                    V::Ref(ch) => class_desc_of(vm, *ch),
+                    _ => None,
+                })
+                .and_then(|d| d.strip_prefix('[').map(str::to_string))
+                .unwrap_or(elem);
             let out = if name == "copyOf" {
                 let n = i32v(*args.get(1).unwrap_or(&V::I32(0))).max(0) as usize;
                 let mut d = data;
