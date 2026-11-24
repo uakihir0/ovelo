@@ -72,49 +72,72 @@ impl ApkResources {
         // Non-default config buckets accumulate in pending maps and are
         // merged after the walk. A bucket fully matching the device
         // config (every qualifier it carries is satisfied — e.g.
-        // `w360dp` on a 400dp-wide window) outranks `default`; among
-        // remaining buckets the last seen wins, preserving the
-        // pre-qualifier-decode order (every bucket used to be labeled
-        // "default", so the last in iteration order won).
-        // Device: portrait ~400x300dp window at density 2.0, day mode.
-        fn bucket_rank(config: &str) -> u8 {
+        // `w360dp` on a 360dp-wide screen) gets a positive key and
+        // outranks `default`; a bucket with an unknown qualifier, or an
+        // understood one that fails, returns 0 and stays a last-seen
+        // fallback only for entries with no default.
+        // Device: portrait 360x360dp (what Configuration reports),
+        // API 35, day mode.
+        // Matched-key precedence follows AOSP: smallestScreenWidth >
+        // screenWidthDp > screenHeightDp > other qualifiers; for each
+        // dp qualifier the largest matching N wins.
+        fn bucket_rank(config: &str) -> i64 {
             if config == "default" {
                 return 0;
             }
-            let mut score = 0u8;
+            let (mut sw, mut w, mut h) = (0i64, 0i64, 0i64);
+            let (mut has_sw, mut has_w, mut has_h) = (0i64, 0i64, 0i64);
+            let mut misc = 0i64;
             for part in config.split('-') {
                 let num = |p: &str, pre: &str, suf: &str| -> Option<u32> {
                     p.strip_prefix(pre)?.strip_suffix(suf)?.parse().ok()
                 };
                 let ok = if let Some(n) = num(part, "sw", "dp") {
-                    n <= 300
+                    has_sw = 1;
+                    sw = n as i64;
+                    n <= 360
                 } else if let Some(n) = num(part, "w", "dp") {
-                    n <= 400
+                    has_w = 1;
+                    w = n as i64;
+                    n <= 360
                 } else if let Some(n) = num(part, "h", "dp") {
-                    n <= 300
+                    has_h = 1;
+                    h = n as i64;
+                    n <= 360
+                } else if let Some(n) = part.strip_prefix('v').and_then(|s| s.parse::<u32>().ok()) {
+                    n <= 35
                 } else {
                     match part {
-                        "port" => true,
+                        "port" => {
+                            misc += 1;
+                            true
+                        }
                         "land" | "night" | "square" => false,
                         // Qualifiers we can't evaluate (lang, dpi,
                         // small/large, car/watch/tv) — keep the bucket
                         // as a fallback candidate only.
-                        _ => return 251,
+                        _ => return 0,
                     }
                 };
                 if !ok {
-                    return 250; // understood qualifier, doesn't match
+                    return 0; // understood qualifier, doesn't match
                 }
-                score += 1;
             }
-            score.max(1) // a bucket with only known qualifiers that all match
+            (has_sw << 63)
+                | (sw << 46)
+                | (has_w << 45)
+                | (w << 28)
+                | (has_h << 27)
+                | (h << 10)
+                | (misc << 1)
+                | 1
         }
-        let mut pend_values: HashMap<u32, (u8, EntryValue)> = HashMap::new();
-        let mut pend_files: HashMap<u32, (u8, String)> = HashMap::new();
-        let mut pend_layouts: HashMap<u32, (u8, String)> = HashMap::new();
-        type PendStyle = (u8, (u32, Vec<(u32, EntryValue)>));
+        let mut pend_values: HashMap<u32, (i64, EntryValue)> = HashMap::new();
+        let mut pend_files: HashMap<u32, (i64, String)> = HashMap::new();
+        let mut pend_layouts: HashMap<u32, (i64, String)> = HashMap::new();
+        type PendStyle = (i64, (u32, Vec<(u32, EntryValue)>));
         let mut pend_styles: HashMap<u32, PendStyle> = HashMap::new();
-        let mut pend_plurals: HashMap<u32, (u8, Vec<(String, EntryValue)>)> = HashMap::new();
+        let mut pend_plurals: HashMap<u32, (i64, Vec<(String, EntryValue)>)> = HashMap::new();
         for pkg in parse_arsc(&arsc).ok()? {
             if pkg.package_id & 0xff == 0x7f {
                 res.package_name = pkg.name.clone();
@@ -257,25 +280,25 @@ impl ApkResources {
                 }
             }
         }
-        // Merge qualified buckets: a matching qualified bucket (rank
-        // 1..=4) overrides `default`; a merely-fallback bucket (250/251)
-        // fills only entries with no default.
+        // Merge qualified buckets: a bucket whose qualifiers all
+        // matched (key > 0) overrides `default`; a fallback bucket
+        // (key == 0) fills only entries with no default.
         for (k, (r, v)) in pend_values {
-            if r < 250 {
+            if r > 0 {
                 res.entry_values.insert(k, v);
             } else {
                 res.entry_values.entry(k).or_insert(v);
             }
         }
         for (k, (r, v)) in pend_files {
-            if r < 250 {
+            if r > 0 {
                 res.file_paths.insert(k, v);
             } else {
                 res.file_paths.entry(k).or_insert(v);
             }
         }
         for (k, (r, v)) in pend_layouts {
-            if r < 250 {
+            if r > 0 {
                 res.layout_paths.insert(k, v);
             } else {
                 res.layout_paths.entry(k).or_insert(v);
@@ -283,13 +306,13 @@ impl ApkResources {
         }
         for (k, (r, (p, items))) in pend_styles {
             let s = res.styles.entry(k).or_default();
-            if r < 250 || (s.parent == 0 && s.items.is_empty()) {
+            if r > 0 || (s.parent == 0 && s.items.is_empty()) {
                 s.parent = p;
                 s.items = items;
             }
         }
         for (k, (r, v)) in pend_plurals {
-            if r < 250 {
+            if r > 0 {
                 res.plurals.insert(k, v);
             } else {
                 res.plurals.entry(k).or_insert(v);
@@ -298,15 +321,34 @@ impl ApkResources {
         Some(res)
     }
 
+    /// A resource entry whose value is a reference (`@layout/foo`)
+    /// resolves to the referenced res id.
+    fn ref_target(&self, res_id: u32) -> Option<u32> {
+        let v = self.entry_values.get(&res_id)?;
+        (v.data_type == 0x01 && v.data != 0).then_some(v.data)
+    }
+
     /// `layout` res_id → path inside the APK.
     pub fn layout_path(&self, res_id: u32) -> Option<&str> {
-        self.layout_paths.get(&res_id).map(|s| s.as_str())
+        self.layout_paths
+            .get(&res_id)
+            .or_else(|| {
+                self.ref_target(res_id)
+                    .and_then(|t| self.layout_paths.get(&t))
+            })
+            .map(|s| s.as_str())
     }
 
     /// Any file-backed res_id (`xml`, `menu`, `drawable`, …) → path
     /// inside the APK.
     pub fn file_path(&self, res_id: u32) -> Option<&str> {
-        self.file_paths.get(&res_id).map(|s| s.as_str())
+        self.file_paths
+            .get(&res_id)
+            .or_else(|| {
+                self.ref_target(res_id)
+                    .and_then(|t| self.file_paths.get(&t))
+            })
+            .map(|s| s.as_str())
     }
 
     /// Parse a file-backed resource's binary XML into flat
