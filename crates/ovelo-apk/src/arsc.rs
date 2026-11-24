@@ -315,6 +315,13 @@ fn config_name(b: &[u8], off: usize, size: usize) -> String {
             _ => {} // 0=any
         }
     }
+    // ResTable_config +24 version: sdkVersion u16 → `v<N>` buckets.
+    if size >= 28 {
+        let sdk = u16::from_le_bytes(b[off + 24..off + 26].try_into().unwrap());
+        if sdk != 0 {
+            parts.push(format!("v{sdk}"));
+        }
+    }
     // ResTable_config +28 screenConfig: screenLayout u8, uiMode u8,
     // smallestScreenWidthDp u16 — distinguishing sw<N>dp / night /
     // screen-size buckets is what keeps a sw600dp layout from being
