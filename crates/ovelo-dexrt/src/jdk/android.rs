@@ -3677,15 +3677,19 @@ fn res_misc(vm: &mut Vm, class: &str, name: &str, args: &[V]) -> Rt<Option<Optio
                 r.read(&format!("assets/{fname}"))
                     .or_else(|| r.read(&fname))
             });
-            Some(Some(match bytes {
-                Some(b) => {
-                    let h = vm.alloc_host(
-                        "Ljava/io/ByteArrayInputStream;",
-                        HostState::Bytes(std::rc::Rc::new(b), 0),
-                    );
-                    V::Ref(h)
-                }
-                None => V::Ref(0),
+            let Some(b) = bytes else {
+                // AOSP throws FileNotFoundException for a missing
+                // asset — callers probe locale variants this way and
+                // catch IOException to fall back (e.g. values-en →
+                // values). A null stream NPEs in the wrong frame.
+                return Err(vm.throw_builtin("Ljava/io/FileNotFoundException;", &fname));
+            };
+            Some(Some({
+                let h = vm.alloc_host(
+                    "Ljava/io/ByteArrayInputStream;",
+                    HostState::Bytes(std::rc::Rc::new(b), 0),
+                );
+                V::Ref(h)
             }))
         }
         (
