@@ -1458,6 +1458,41 @@ fn universal(vm: &mut Vm, class: &str, name: &str, sig: &str, args: &[V]) -> Rt<
             let c = collect::natural_cmp(vm, args[0], args[1]);
             Some(Some(V::I32(c)))
         }
+        // ----- kotlinx CoroutineContext on host objects -----
+        // `Dispatchers.getMain()` is a host-minted dispatcher: calls
+        // like `context.get(Job.Key)` on it used to fall into
+        // stub_placeholder, which minted a non-null Element — so
+        // `flowOn`'s `checkFlowContext` saw a phantom Job in every
+        // context and aborted the composition (F-Droid, Compose 1.7).
+        "get"
+            if class == "Lkotlin/coroutines/CoroutineContext;"
+                || class == "Lkotlin/coroutines/CoroutineContext$Element;" =>
+        {
+            let kd = args.get(1).map(|v| class_of(vm, *v)).unwrap_or_default();
+            // The dispatcher answers as its ContinuationInterceptor;
+            // every other key (Job, Name, …) is absent.
+            if kd.contains("ContinuationInterceptor") || kd.contains("Dispatcher$Key") {
+                Some(Some(args[0]))
+            } else {
+                Some(Some(V::Ref(0)))
+            }
+        }
+        "fold"
+            if class == "Lkotlin/coroutines/CoroutineContext;"
+                || class == "Lkotlin/coroutines/CoroutineContext$Element;" =>
+        {
+            Some(Some(args.get(1).copied().unwrap_or(args[0])))
+        }
+        "plus" | "minusKey"
+            if class == "Lkotlin/coroutines/CoroutineContext;"
+                || class == "Lkotlin/coroutines/CoroutineContext$Element;" =>
+        {
+            Some(Some(if name == "plus" {
+                args.get(1).copied().unwrap_or(args[0])
+            } else {
+                args[0]
+            }))
+        }
         _ => {
             let _ = class;
             None

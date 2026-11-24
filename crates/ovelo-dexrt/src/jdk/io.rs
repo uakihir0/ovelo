@@ -285,8 +285,12 @@ pub(crate) fn call(
             }
         } else if desc_is_a(class, "Ljava/nio/charset/Charset;")
             || class == "Ljava/nio/charset/StandardCharsets;"
+            || class == "Ljava/nio/charset/CharsetDecoder;"
+            || class == "Ljava/nio/charset/CharsetEncoder;"
+            || class == "Ljava/nio/charset/CoderResult;"
+            || class == "Ljava/nio/charset/CodingErrorAction;"
         {
-            charset_call(vm, name, args)
+            charset_call(vm, class, name, args)
         } else if desc_is_a(class, "Ljava/nio/Buffer;") || class.starts_with("Ljava/nio/") {
             nio_call(vm, class, name, args)
         } else if class == "Ljava/util/Base64;"
@@ -2348,7 +2352,137 @@ fn url_call(vm: &mut Vm, name: &str, args: &[V]) -> Rt<Option<Option<V>>> {
     })
 }
 
-fn charset_call(vm: &mut Vm, name: &str, args: &[V]) -> Option<Option<V>> {
+/// Remaining bytes of a `ByteBuffer`-like host buffer (Slot-backed
+/// array at base+position).
+fn bb_bytes(vm: &Vm, h: u32) -> Vec<u8> {
+    let (back, base, pos) = match vm.heap.get(h) {
+        Some(Obj::Host {
+            state: HostState::Slot(V::Ref(b)),
+            ..
+        }) => {
+            let base = i32v(pseudo_get(vm, h, P_BBUF_BASE).unwrap_or(V::I32(0))).max(0) as usize;
+            let pos = i32v(pseudo_get(vm, h, P_BBUF_POS).unwrap_or(V::I32(0))).max(0) as usize;
+            (*b, base, pos)
+        }
+        Some(Obj::Array { .. }) => (h, 0, 0),
+        _ => return Vec::new(),
+    };
+    match vm.heap.get(back) {
+        Some(Obj::Array { data, .. }) => data
+            .iter()
+            .skip(base + pos)
+            .map(|v| i32v(*v) as u8)
+            .collect(),
+        _ => Vec::new(),
+    }
+}
+
+/// `decode(ByteBuffer)` → CharBuffer of the UTF-8 lossy content, and
+/// `decode(in, out, eoi)` — chars appended into `out`'s backing.
+fn charset_decode(vm: &mut Vm, args: &[V]) -> V {
+    let in_h = match args.get(1) {
+        Some(&V::Ref(h)) => h,
+        _ => return V::Ref(0),
+    };
+    let bytes = bb_bytes(vm, in_h);
+    let text = String::from_utf8_lossy(&bytes).into_owned();
+    // `in` is drained.
+    pseudo_set(vm, in_h, P_BBUF_POS, V::I32(bytes.len() as i32));
+    if let Some(&V::Ref(out_h)) = args.get(2) {
+        // (ByteBuffer, CharBuffer, boolean): append chars to `out`.
+        let (back, base, pos) = match vm.heap.get(out_h) {
+            Some(Obj::Host {
+                state: HostState::Slot(V::Ref(b)),
+                ..
+            }) => (
+                *b,
+                i32v(pseudo_get(vm, out_h, P_BBUF_BASE).unwrap_or(V::I32(0))).max(0) as usize,
+                i32v(pseudo_get(vm, out_h, P_BBUF_POS).unwrap_or(V::I32(0))).max(0) as usize,
+            ),
+            _ => (0, 0, 0),
+        };
+        let mut wrote = 0usize;
+        if back != 0 {
+            if let Some(Obj::Array { data, .. }) = vm.heap.get_mut(back) {
+                for (i, ch) in text.chars().enumerate() {
+                    if let Some(slot) = data.get_mut(base + pos + i) {
+                        *slot = V::I32(ch as i32);
+                        wrote = i + 1;
+                    }
+                }
+            }
+        }
+        pseudo_set(vm, out_h, P_BBUF_POS, V::I32((pos + wrote) as i32));
+        return host(
+            vm,
+            "Ljava/nio/charset/CoderResult;",
+            HostState::StrBuf("UNDERFLOW".into()),
+        );
+    }
+    // (ByteBuffer) → CharBuffer
+    let arr = vm.heap.alloc(Obj::Array {
+        elem: "C".into(),
+        data: text.chars().map(|c| V::I32(c as i32)).collect(),
+    });
+    host(vm, "Ljava/nio/CharBuffer;", HostState::Slot(V::Ref(arr)))
+}
+
+fn charset_call(vm: &mut Vm, class: &str, name: &str, args: &[V]) -> Option<Option<V>> {
+    if class == "Ljava/nio/charset/CoderResult;" {
+        let st = match args.first() {
+            Some(&V::Ref(h)) => s(vm, h).unwrap_or_else(|| "UNDERFLOW".into()),
+            _ => "UNDERFLOW".into(),
+        };
+        return match name {
+            "isUnderflow" => Some(Some(V::I32((st == "UNDERFLOW") as i32))),
+            "isOverflow" => Some(Some(V::I32((st == "OVERFLOW") as i32))),
+            "isError" | "isMalformed" | "isUnmappable" => Some(Some(V::I32(0))),
+            "length" => Some(Some(V::I32(0))),
+            "throwException" | "toString" => {
+                if name == "toString" {
+                    Some(Some(jstr(vm, &st)))
+                } else {
+                    Some(None)
+                }
+            }
+            _ => None,
+        };
+    }
+    if class == "Ljava/nio/charset/CodingErrorAction;" {
+        return match name {
+            "toString" | "name" => Some(Some(jstr(vm, "REPLACE"))),
+            _ => None,
+        };
+    }
+    if class == "Ljava/nio/charset/CharsetDecoder;" || class == "Ljava/nio/charset/CharsetEncoder;"
+    {
+        return match name {
+            "onMalformedInput" | "onUnmappableCharacter" | "replaceWith" | "reset" => {
+                Some(Some(args[0]))
+            }
+            "malformedInputAction" | "unmappableCharacterAction" => Some(Some(host(
+                vm,
+                "Ljava/nio/charset/CodingErrorAction;",
+                HostState::StrBuf("REPLACE".into()),
+            ))),
+            "replacement" => Some(Some(jstr(vm, "\u{FFFD}"))),
+            "charset" | "detectedCharset" => Some(Some(host(
+                vm,
+                "Ljava/nio/charset/Charset;",
+                HostState::StrBuf("UTF-8".into()),
+            ))),
+            "averageCharsPerByte" | "averageBytesPerChar" => Some(Some(V::F32(1.0))),
+            "maxCharsPerByte" | "maxBytesPerChar" => Some(Some(V::F32(4.0))),
+            "isAutoDetecting" | "isCharsetDetected" => Some(Some(V::I32(0))),
+            "decode" | "decodeLoop" => Some(Some(charset_decode(vm, args))),
+            "flush" => Some(Some(host(
+                vm,
+                "Ljava/nio/charset/CoderResult;",
+                HostState::StrBuf("UNDERFLOW".into()),
+            ))),
+            _ => None,
+        };
+    }
     match name {
         "forName" => {
             let n = sv(vm, args[0]).unwrap_or_else(|| "UTF-8".into());
@@ -2374,16 +2508,41 @@ fn charset_call(vm: &mut Vm, name: &str, args: &[V]) -> Option<Option<V>> {
             "Ljava/nio/charset/Charset;",
             HostState::StrBuf("UTF-8".into()),
         ))),
-        "encode" | "decode" | "newEncoder" | "newDecoder" | "aliases" | "availableCharsets"
-        | "isSupported" | "contains" | "canEncode" => {
+        "newDecoder" => Some(Some(host(
+            vm,
+            "Ljava/nio/charset/CharsetDecoder;",
+            HostState::StrBuf("UTF-8".into()),
+        ))),
+        "newEncoder" => Some(Some(host(
+            vm,
+            "Ljava/nio/charset/CharsetEncoder;",
+            HostState::StrBuf("UTF-8".into()),
+        ))),
+        "decode" => Some(Some(charset_decode(vm, args))),
+        "encode" => {
+            // `encode(CharBuffer|CharSequence)` → ByteBuffer of UTF-8.
+            let text = sv(vm, args.get(1).copied().unwrap_or(V::Ref(0))).unwrap_or_default();
+            let arr = vm.heap.alloc(Obj::Array {
+                elem: "B".into(),
+                data: text
+                    .as_bytes()
+                    .iter()
+                    .map(|b| V::I32(*b as i8 as i32))
+                    .collect(),
+            });
+            Some(Some(host(
+                vm,
+                "Ljava/nio/ByteBuffer;",
+                HostState::Slot(V::Ref(arr)),
+            )))
+        }
+        "aliases" | "availableCharsets" | "isSupported" | "contains" | "canEncode" => {
             if name == "isSupported" || name == "canEncode" || name == "contains" {
                 Some(Some(V::I32(1)))
             } else if name == "availableCharsets" {
                 Some(Some(host(vm, "Ljava/util/Map;", HostState::Map(vec![]))))
-            } else if name == "aliases" {
-                Some(Some(host(vm, "Ljava/util/Set;", HostState::List(vec![]))))
             } else {
-                Some(Some(V::Ref(0)))
+                Some(Some(host(vm, "Ljava/util/Set;", HostState::List(vec![]))))
             }
         }
         _ => None,
