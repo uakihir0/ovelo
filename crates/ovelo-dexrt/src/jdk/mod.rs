@@ -174,6 +174,26 @@ fn s_d(vm: &Vm, h: u32, depth: u8) -> Option<String> {
             state: HostState::StrBuf(t) | HostState::Path(t) | HostState::Regex(t),
             ..
         }) => Some(t.clone()),
+        // A CharBuffer host — its text is the remaining chars of its
+        // backing `C` array, so `Charset.decode(b)` results read like
+        // their content wherever a CharSequence is taken.
+        Some(Obj::Host {
+            desc,
+            state: HostState::Slot(V::Ref(b)),
+            ..
+        }) if desc.contains("CharBuffer") => {
+            let base = i32v(pseudo_get(vm, h, P_BBUF_BASE).unwrap_or(V::I32(0))).max(0) as usize;
+            let pos = i32v(pseudo_get(vm, h, P_BBUF_POS).unwrap_or(V::I32(0))).max(0) as usize;
+            match vm.heap.get(*b) {
+                Some(Obj::Array { data, .. }) => Some(
+                    data.iter()
+                        .skip(base + pos)
+                        .map(|v| char::from_u32(i32v(*v) as u32).unwrap_or('\u{FFFD}'))
+                        .collect(),
+                ),
+                _ => None,
+            }
+        }
         // `new String(x)` — the String.<init> arm stashes the source
         // text under P_DATA so copies read like the interned form.
         // new-instance allocates a Host for Ljava/lang/String;, so both
