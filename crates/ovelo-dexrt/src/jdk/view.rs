@@ -1318,6 +1318,14 @@ pub(crate) fn call(
             Some(Some(V::Ref(hit)))
         }
         "getId" => Some(Some(V::I32(view_id(vm, this)))),
+        "generateViewId" => {
+            // AOSP: AtomicInteger starting at 1 — dex-created views
+            // (FragmentContainerView) need nonzero unique ids.
+            static NEXT: std::sync::atomic::AtomicI32 = std::sync::atomic::AtomicI32::new(1);
+            Some(Some(V::I32(
+                NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed),
+            )))
+        }
         "setId" => {
             pseudo_set(
                 vm,

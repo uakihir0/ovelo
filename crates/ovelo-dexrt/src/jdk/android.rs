@@ -2094,6 +2094,16 @@ fn context_call(
             "Landroid/content/res/Resources$Theme;",
             HostState::Empty,
         ))),
+        "setTheme" => {
+            // Theme-swapping apps (AntennaPod's ThemeSwitcher) setTheme
+            // before setContentView — theme-scoped attr resolution must
+            // follow, else AppCompat's feature check sees the manifest
+            // (splash) theme and throws.
+            if let Some(v) = args.get(1).copied() {
+                vm.theme_id = i32v(v) as u32;
+            }
+            Some(None)
+        }
         "getAssets" => Some(Some(host(
             vm,
             "Landroid/content/res/AssetManager;",
@@ -2440,7 +2450,6 @@ fn context_call(
         | "checkCallingUriPermission"
         | "registerComponentCallbacks"
         | "unregisterComponentCallbacks"
-        | "setTheme"
         | "getDisplay"
         | "getDisplayId"
         | "isRestricted"

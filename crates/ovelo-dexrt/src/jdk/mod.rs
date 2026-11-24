@@ -338,6 +338,31 @@ fn is_message(vm: &Vm, h: u32) -> bool {
     )
 }
 
+/// Run a queued task body: `run()` when the object defines it in dex,
+/// else `call()` — Callable-only tasks (RxJava `ScheduledDirectTask`)
+/// have no `run`, and the builtin `Runnable` fallback would sink the
+/// call into a silent no-op, dropping the real work.
+fn dispatch_task(vm: &mut Vm, r: u32) -> std::result::Result<Option<V>, ovelo_error::OveloError> {
+    if let Some(ci) = vm.heap.class_of(r) {
+        let has_run = vm
+            .find_method_on_chain(ci, "run", 0, Some(&[]))
+            .ok()
+            .flatten()
+            .is_some();
+        if !has_run {
+            let has_call = vm
+                .find_method_on_chain(ci, "call", 0, Some(&[]))
+                .ok()
+                .flatten()
+                .is_some();
+            if has_call {
+                return vm.call_virtual(r, "call", &[]);
+            }
+        }
+    }
+    vm.call_virtual(r, "run", &[])
+}
+
 pub(crate) fn run_on_worker(
     vm: &mut Vm,
     r: u32,
@@ -350,7 +375,7 @@ pub(crate) fn run_on_worker(
     let v = if is_message(vm, r) {
         dispatch_message(vm, r)
     } else {
-        vm.call_virtual(r, "run", &[])
+        dispatch_task(vm, r)
     };
     vm.cur_thread = prev;
     vm.cur_runnable = prev_r;
@@ -372,7 +397,7 @@ pub(crate) fn run_on_main(
     let v = if is_message(vm, r) {
         dispatch_message(vm, r)
     } else {
-        vm.call_virtual(r, "run", &[])
+        dispatch_task(vm, r)
     };
     vm.cur_thread = prev;
     vm.cur_runnable = prev_r;

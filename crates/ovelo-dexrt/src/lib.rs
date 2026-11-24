@@ -1973,6 +1973,9 @@ impl Vm {
     /// parker must retry those workers rather than assume they are
     /// still idle.
     pub(crate) fn enqueue_runnable(&mut self, r: u32, on_main: bool) {
+        if std::env::var("OVELO_DRAINDBG").is_ok() {
+            eprintln!("[drain] enqueue h{} main={}", r, on_main);
+        }
         self.reparked.clear();
         // The newly posted work may feed a worker that parked out of
         // the live queue — re-arm dropped parkers so they rescan.
