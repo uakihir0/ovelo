@@ -1929,11 +1929,39 @@ fn json_unbox(vm: &Vm, v: V) -> V {
     }
 }
 
+fn json_escape(s: &str) -> String {
+    let mut out = String::with_capacity(s.len() + 2);
+    for c in s.chars() {
+        match c {
+            '"' => out.push_str("\\\""),
+            '\\' => out.push_str("\\\\"),
+            '\n' => out.push_str("\\n"),
+            '\r' => out.push_str("\\r"),
+            '\t' => out.push_str("\\t"),
+            '\u{8}' => out.push_str("\\b"),
+            '\u{c}' => out.push_str("\\f"),
+            c if (c as u32) < 0x20 => out.push_str(&format!("\\u{:04x}", c as u32)),
+            c => out.push(c),
+        }
+    }
+    out
+}
+
 fn json_dump_v(vm: &Vm, v: V) -> String {
+    json_dump_d(vm, v, 0)
+}
+
+fn json_dump_d(vm: &Vm, v: V, depth: u32) -> String {
+    // Depth cap: a cyclic structure built with put() would otherwise
+    // recurse until the host stack dies — real org.json throws
+    // StackOverflowError; degrading the cycle to null keeps the host up.
+    if depth > 64 {
+        return "null".into();
+    }
     match v {
         V::Ref(0) => "null".into(),
         V::Ref(h) => match vm.heap.get(h) {
-            Some(Obj::Str(s)) => format!("\"{s}\""),
+            Some(Obj::Str(s)) => format!("\"{}\"", json_escape(s)),
             Some(Obj::Host {
                 desc,
                 state: HostState::Slot(v),
@@ -1953,7 +1981,11 @@ fn json_dump_v(vm: &Vm, v: V) -> String {
                 m.iter()
                     .map(|(k, v)| {
                         let ks = sv(vm, *k).unwrap_or_default();
-                        format!("\"{ks}\":{}", json_dump_v(vm, *v))
+                        format!(
+                            "\"{}\":{}",
+                            json_escape(&ks),
+                            json_dump_d(vm, *v, depth + 1)
+                        )
                     })
                     .collect::<Vec<_>>()
                     .join(",")
@@ -1964,7 +1996,7 @@ fn json_dump_v(vm: &Vm, v: V) -> String {
             }) => format!(
                 "[{}]",
                 l.iter()
-                    .map(|v| json_dump_v(vm, *v))
+                    .map(|v| json_dump_d(vm, *v, depth + 1))
                     .collect::<Vec<_>>()
                     .join(",")
             ),
