@@ -20,7 +20,7 @@ const CHOR: &str = "Landroid/view/Choreographer;";
 // Pseudo keys for view-tree state (see mod.rs for the other P_* slots).
 const P_VIEW_ID: u32 = u32::MAX - 7;
 const P_CHILDREN: u32 = u32::MAX - 8;
-const P_PARENT: u32 = u32::MAX - 9;
+pub(crate) const P_PARENT: u32 = u32::MAX - 9;
 const P_TAG: u32 = u32::MAX - 10;
 /// Bumped by `invalidate`/`postInvalidate` — the value is never read;
 /// the write exists to move `view_gen` so draw-only changes repaint.

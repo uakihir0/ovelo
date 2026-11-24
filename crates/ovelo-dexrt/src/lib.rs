@@ -2239,6 +2239,14 @@ impl Vm {
         jdk::view::lp_dims(self, lp)
     }
 
+    /// The dex parent of a view object, 0 when unattached.
+    pub fn dex_parent(&self, h: u32) -> u32 {
+        match jdk::pseudo_get(self, h, jdk::view::P_PARENT) {
+            Some(V::Ref(p)) => p,
+            _ => 0,
+        }
+    }
+
     /// Snapshot one node of the dex view tree for host rendering —
     /// text, colors, layout params, visibility, listener, children.
     pub fn dex_view(&self, h: u32) -> Option<jdk::view::DexViewInfo> {

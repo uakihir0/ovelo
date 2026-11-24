@@ -39,6 +39,15 @@ pub enum GuestView {
 
 impl GuestView {
     /// The `View` part shared by every widget.
+    fn view(&self) -> &View {
+        match self {
+            GuestView::Plain(v) => v,
+            GuestView::Text(t) => &t.view,
+            GuestView::Btn(b) => &b.tv.view,
+            GuestView::Group(g) => &g.view,
+        }
+    }
+    /// The `View` part shared by every widget.
     fn view_mut(&mut self) -> &mut View {
         match self {
             GuestView::Plain(v) => v,
@@ -938,16 +947,23 @@ impl GuestUi {
         // `getWidth()`/`getHeight()` read the dex-side frame, which the
         // host layout engine never ran `layout()` to set (Korge's GL
         // view builds its ortho matrix from these — 0x0 NaNs it).
+        // Host layout coords are window-absolute; dex frames are
+        // parent-relative (the hit test accumulates ancestors), so
+        // subtract the parent's absolute origin.
         for (&h, rc) in self.views.iter() {
             let (l, t, s) = {
-                let mut g = rc.borrow_mut();
-                let v = g.view_mut();
+                let g = rc.borrow();
+                let v = g.view();
                 (v.left, v.top, v.measured)
             };
             if s.w > 0 && s.h > 0 {
-                vm.view_set_frame(h, l, t, l + s.w, t + s.h);
+                let (pl, pt) = abs_origin(vm, &self.views, vm.dex_parent(h));
+                vm.view_set_frame(h, l - pl, t - pt, l - pl + s.w, t - pt + s.h);
             }
         }
+        // Window decor roots / content frames fill the window — they
+        // never pass through host layout either.
+        vm.sync_decor_frames(self.root.w, self.root.h);
         if std::env::var_os("OVELO_DRAWDBG").is_some() {
             eprintln!(
                 "[gldbg] pump views={:?} dex_views={:?}",
@@ -1240,6 +1256,32 @@ impl GuestUi {
 fn viewdbg() -> bool {
     static V: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *V.get_or_init(|| std::env::var_os("OVELO_VIEWDBG").is_some())
+}
+
+/// Absolute (window) origin of a view handle: a bridged view answers
+/// with its host layout coords; a dex-only ancestor contributes its
+/// own parent-relative frame and the walk continues upward.
+fn abs_origin(vm: &Vm, views: &HashMap<u32, Rc<RefCell<GuestView>>>, mut cur: u32) -> (i32, i32) {
+    let mut acc = (0, 0);
+    for _ in 0..64 {
+        if cur == 0 {
+            return acc;
+        }
+        if let Some(rc) = views.get(&cur) {
+            let g = rc.borrow();
+            let v = g.view();
+            return (acc.0 + v.left, acc.1 + v.top);
+        }
+        let Some(info) = vm.dex_view(cur) else {
+            return acc;
+        };
+        if let Some((l, t, _, _)) = info.frame {
+            acc.0 += l;
+            acc.1 += t;
+        }
+        cur = vm.dex_parent(cur);
+    }
+    acc
 }
 
 /// `frame` is a render-cycle counter — the pass runs every 30th frame
