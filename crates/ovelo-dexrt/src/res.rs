@@ -336,25 +336,37 @@ impl ApkResources {
         (v.data_type == 0x01 && v.data != 0).then_some(v.data)
     }
 
+    /// Follow the winning bucket's references until an id with a
+    /// stored path is reached (bounded against reference cycles).
+    fn resolve_path<'m>(
+        paths: &'m HashMap<u32, String>,
+        mut ref_target: impl FnMut(u32) -> Option<u32>,
+        res_id: u32,
+    ) -> Option<&'m str> {
+        let mut cur = res_id;
+        for _ in 0..16 {
+            if let Some(t) = ref_target(cur) {
+                cur = t;
+                continue;
+            }
+            return paths.get(&cur).map(|s| s.as_str());
+        }
+        None
+    }
+
     /// `layout` res_id → path inside the APK.
     ///
     /// The winning bucket's value decides: when it is a reference
     /// (`@layout/foo`), follow it — a `drawable-night`-style alias must
     /// not fall back to the default bucket's direct path.
     pub fn layout_path(&self, res_id: u32) -> Option<&str> {
-        self.ref_target(res_id)
-            .and_then(|t| self.layout_paths.get(&t))
-            .or_else(|| self.layout_paths.get(&res_id))
-            .map(|s| s.as_str())
+        Self::resolve_path(&self.layout_paths, |id| self.ref_target(id), res_id)
     }
 
     /// Any file-backed res_id (`xml`, `menu`, `drawable`, …) → path
     /// inside the APK. Reference-following order matches `layout_path`.
     pub fn file_path(&self, res_id: u32) -> Option<&str> {
-        self.ref_target(res_id)
-            .and_then(|t| self.file_paths.get(&t))
-            .or_else(|| self.file_paths.get(&res_id))
-            .map(|s| s.as_str())
+        Self::resolve_path(&self.file_paths, |id| self.ref_target(id), res_id)
     }
 
     /// Parse a file-backed resource's binary XML into flat
