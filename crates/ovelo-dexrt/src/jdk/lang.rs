@@ -2460,20 +2460,45 @@ pub(crate) fn enum_value_list(vm: &mut Vm, class: &str) -> Vec<V> {
     if vals.is_empty() {
         // Platform enums (android.graphics.* etc.) have no dex class
         // def — mint their constants so Kotlin $WhenMappings clinits
-        // and `values().length` don't die on an empty array.
+        // and `values().length` don't die on an empty array. The
+        // interned mint keeps `values()[i] == Paint.Cap.X` true.
         if let Some(names) = platform_enum_consts(class) {
-            for (i, n) in names.iter().enumerate() {
-                let h = host(vm, class, HostState::Empty);
-                if let V::Ref(hh) = h {
-                    let ns = jstr(vm, n);
-                    pseudo_set(vm, hh, P_DATA, ns);
-                    pseudo_set(vm, hh, P_FLAGS, V::I32(i as i32));
-                }
-                vals.push(h);
+            for n in names {
+                vals.push(enum_const(vm, class, n));
             }
         }
     }
     vals
+}
+
+/// Canonical enum-constant object for `(desc, name)` — interned in
+/// `vm.enum_name_cache` so `values()`, `valueOf`, getter-minted results
+/// and sget'd statics share one handle (`X.valueOf("N") == X.N`), and
+/// every path agrees on the ordinal the Kotlin `when` tables read.
+pub(crate) fn enum_const(vm: &mut Vm, desc: &str, name: &str) -> V {
+    if let Some(&h) = vm
+        .enum_name_cache
+        .get(&(desc.to_string(), name.to_string()))
+    {
+        return V::Ref(h);
+    }
+    let v = if let Some(ord) = super::time::jtime_enum_ordinal(desc, name) {
+        super::time::jtime_enum(vm, desc, name, ord)
+    } else {
+        let v = host(vm, desc, HostState::StrBuf(name.into()));
+        if let V::Ref(h) = v {
+            let ns = jstr(vm, name);
+            pseudo_set(vm, h, P_DATA, ns);
+            let ord = platform_enum_ordinal(desc, name).unwrap_or(0);
+            pseudo_set(vm, h, P_FLAGS, V::I32(ord));
+        }
+        v
+    };
+    if let V::Ref(h) = v {
+        vm.enum_name_cache
+            .insert((desc.to_string(), name.to_string()), h);
+    }
+    v
 }
 
 /// `name`'s declaration ordinal in a mirrored platform enum.
@@ -2481,9 +2506,20 @@ pub(crate) fn platform_enum_ordinal(class: &str, name: &str) -> Option<i32> {
     platform_enum_consts(class).and_then(|l| l.iter().position(|&n| n == name).map(|i| i as i32))
 }
 
-/// Declaration-order constants of Android platform enums we mirror.
+/// Declaration-order constants of dex-less JDK/platform enums we
+/// mirror — ordinals must match the JDK/AOSP declaration order since
+/// `ordinal()`/`compareTo`/`when` tables read them.
 pub(crate) fn platform_enum_consts(class: &str) -> Option<&'static [&'static str]> {
     Some(match class {
+        "Ljava/util/concurrent/TimeUnit;" => &[
+            "NANOSECONDS",
+            "MICROSECONDS",
+            "MILLISECONDS",
+            "SECONDS",
+            "MINUTES",
+            "HOURS",
+            "DAYS",
+        ],
         "Landroid/graphics/Paint$Cap;" => &["BUTT", "ROUND", "SQUARE"],
         "Landroid/graphics/Paint$Style;" => &["FILL", "STROKE", "FILL_AND_STROKE"],
         "Landroid/graphics/Paint$Join;" => &["MITER", "ROUND", "BEVEL"],
@@ -2629,7 +2665,12 @@ fn enum_call(vm: &mut Vm, class: &str, name: &str, args: &[V]) -> Rt<Option<Opti
                         .as_deref() == Some(n.as_str()))
             });
             Some(Some(hit.unwrap_or_else(|| {
-                host(vm, &cls, HostState::StrBuf(n))
+                // No dex/known list — mint through the interned path so
+                // the result is `==`-equal to the static constant and
+                // carries the right ordinal (java.time + mirrored
+                // platform enums); a fresh ordinal-0 object would
+                // mis-compare and mis-index `when` tables.
+                enum_const(vm, &cls, &n)
             })))
         }
         "values" => {

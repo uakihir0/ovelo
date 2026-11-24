@@ -280,6 +280,10 @@ pub struct Vm {
     /// `Month.of(1) == Month.JANUARY` and `date.getMonth()` return the
     /// same handle the static constant did.
     pub(crate) enum_cache: HashMap<(String, i32), u32>,
+    /// Canonical enum constant objects by (class desc, const name) —
+    /// `values()`, `valueOf` and static-field mints share handles so
+    /// `Paint.Cap.valueOf("ROUND") == Paint.Cap.ROUND` holds.
+    pub(crate) enum_name_cache: HashMap<(String, String), u32>,
     /// Attached `TextClock` views that tick — refreshed once per
     /// `drain_runnables` pass (AOSP ticks them per postDelayed).
     pub clock_views: Vec<u32>,
@@ -754,6 +758,7 @@ impl Vm {
             content_frames: HashMap::new(),
             window_size: (720, 1280),
             enum_cache: HashMap::new(),
+            enum_name_cache: HashMap::new(),
             clock_views: Vec::new(),
             apk_res: None,
             dbs: HashMap::new(),

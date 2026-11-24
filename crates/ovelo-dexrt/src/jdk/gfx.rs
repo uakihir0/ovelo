@@ -944,21 +944,11 @@ pub(crate) fn measure_text(text: &str, size: f32) -> f32 {
     w * size
 }
 
-/// Stand-in enum constant (`Paint.getTextAlign()` result): a host
-/// object whose `P_DATA` carries the constant name.
+/// Stand-in enum constant (`Paint.getTextAlign()` result) — the
+/// interned mint so `==` against the static field and ordinal lookups
+/// (`when` tables) both agree with values()/sget.
 fn host_enum_const(vm: &mut Vm, desc: &str, name: &str) -> V {
-    let h = host(vm, desc, HostState::Empty);
-    if let V::Ref(hh) = h {
-        let n = jstr(vm, name);
-        pseudo_set(vm, hh, P_DATA, n);
-        // Constants minted here (getTextAlign/getStyle/…) must carry
-        // the same ordinal `values()` and sget produce — Kotlin
-        // `when` tables index on ordinal().
-        if let Some(ord) = super::lang::platform_enum_ordinal(desc, name) {
-            pseudo_set(vm, hh, super::P_FLAGS, V::I32(ord));
-        }
-    }
-    h
+    super::lang::enum_const(vm, desc, name)
 }
 
 // ---------------------------------------------------------------------

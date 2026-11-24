@@ -2006,38 +2006,10 @@ pub(crate) fn sfield(vm: &mut Vm, owner: &str, name: &str, ftype: &str) -> Optio
             // fields give name()/ordinal() something to read; the
             // caller caches it into the class statics so reference
             // equality (`unit == TimeUnit.SECONDS`) holds.
-            // java.time enums go through the interned mint so the
-            // constant shares a handle (and ordinal) with of()/values()
-            // results and `date.getMonth() == Month.JANUARY` holds.
-            if let Some(ord) = time::jtime_enum_ordinal(owner, name) {
-                return Some(time::jtime_enum(vm, owner, name, ord));
-            }
-            let h = host(vm, owner, HostState::Empty);
-            if let V::Ref(hh) = h {
-                let n = jstr(vm, name);
-                pseudo_set(vm, hh, P_DATA, n);
-                // JDK enum ordinals by declaration order — needed by
-                // TimeUnit.convert/ordinal/compareTo (kotlin.time's
-                // Duration encoding is built on them).
-                let ord = match (owner, name) {
-                    ("Ljava/util/concurrent/TimeUnit;", n) => match n {
-                        "NANOSECONDS" => 0,
-                        "MICROSECONDS" => 1,
-                        "MILLISECONDS" => 2,
-                        "SECONDS" => 3,
-                        "MINUTES" => 4,
-                        "HOURS" => 5,
-                        "DAYS" => 6,
-                        _ => 0,
-                    },
-                    // Mirrored platform enums carry their AOSP ordinal —
-                    // Kotlin `when` tables index on it, and values()
-                    // mints the same numbers, so sget must too.
-                    _ => lang::platform_enum_ordinal(owner, name).unwrap_or(0),
-                };
-                pseudo_set(vm, hh, P_FLAGS, V::I32(ord));
-            }
-            return Some(h);
+            // Interned mint so the constant shares a handle (and
+            // ordinal) with of()/values()/valueOf results and `==`
+            // against the static field holds.
+            return Some(lang::enum_const(vm, owner, name));
         }
         _ => return None,
     };
