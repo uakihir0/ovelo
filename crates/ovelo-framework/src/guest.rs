@@ -551,7 +551,7 @@ impl GuestUi {
                 "(Landroid/view/View;ILandroid/view/ViewGroup$LayoutParams;)V",
                 "(Landroid/view/View;Landroid/view/ViewGroup$LayoutParams;)V",
             ] {
-                Self::on(ui, vm, cls, "addView", sig, |ui, vm, a| {
+                Self::on_rc(ui, vm, cls, "addView", sig, |ui, vm, a| {
                     let this = ref_arg(a, 0)?;
                     let child = ref_arg(a, 1)?;
                     // Overloads differ after the child arg: LayoutParams is
@@ -562,30 +562,36 @@ impl GuestUi {
                         .rev()
                         .find(|x| matches!(x, V::Ref(h) if *h != 0))
                         .copied();
-                    let idx = a[2.min(a.len())..]
+                    // Exactly one int arg means positional; two ints
+                    // are the (View,w,h) dimensions overload arriving
+                    // through the canonical-sig fallback — no index.
+                    let mut ints = a[2.min(a.len())..]
                         .iter()
-                        .find(|x| matches!(x, V::I32(i) if *i >= 0))
-                        .map(|x| match x {
-                            V::I32(i) => *i as usize,
-                            _ => 0,
-                        });
+                        .filter(|x| matches!(x, V::I32(_)));
+                    let idx = match (ints.next(), ints.next()) {
+                        (Some(V::I32(i)), None) if *i >= 0 => Some(*i as usize),
+                        _ => None,
+                    };
                     // Dex-side bookkeeping first: registered overloads
                     // intercept the invoke, so `attach_at` never runs
                     // unless the bridge does it — parent/attach mark,
                     // LP resolution and onViewAdded all live there.
+                    // Runs outside the ui borrow: onViewAdded is guest
+                    // code and re-enters bridged methods.
                     vm.view_tree_attach_at(this, child, idx, lp);
                     // Bridged parents adopt dex-view-tree children too —
                     // materialize them so e.g. ViewPager2's empty
                     // FrameLayout still hosts inflated content.
                     let Some(cv) = ui
+                        .borrow()
                         .views
                         .get(&child)
                         .cloned()
-                        .or_else(|| ui.materialize_dex(vm, child))
+                        .or_else(|| ui.borrow_mut().materialize_dex(vm, child))
                     else {
                         return Ok(None);
                     };
-                    let Some(rc) = ui.views.get(&this).cloned() else {
+                    let Some(rc) = ui.borrow().views.get(&this).cloned() else {
                         return Ok(None);
                     };
                     let mut g = rc.borrow_mut();
