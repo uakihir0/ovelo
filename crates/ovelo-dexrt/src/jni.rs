@@ -925,7 +925,16 @@ extern "C" fn find_class(_e: u64, name_p: u64) -> u64 {
     if dbg {
         eprintln!("[jni] FindClass {name}");
     }
-    let desc = format!("L{};", name.replace('.', "/"));
+    // JNI accepts either binary names ("java/lang/String" or
+    // "java.lang.String") or type descriptors ("[B", "Ljava/lang/String;").
+    let desc = if name.starts_with('[')
+        || (name.starts_with('L') && name.ends_with(';'))
+        || (name.len() == 1 && "ZBCSIJFDV".contains(name.as_str()))
+    {
+        name.clone()
+    } else {
+        format!("L{};", name.replace('.', "/"))
+    };
     let mut v = vm();
     if dbg {
         eprintln!("[jni]   type_index_of..");
@@ -943,8 +952,21 @@ extern "C" fn find_class(_e: u64, name_p: u64) -> u64 {
             h
         }
         None => {
-            eprintln!("[jni] FindClass miss {desc}");
-            0
+            // Descriptors with no dex type still resolve as Class objects
+            // ("[B", primitive types, JDK classes) — conscrypt et al.
+            // probe "[B"/"[C" unconditionally and abort on a miss.
+            if desc.starts_with('[')
+                || (desc.len() == 1 && !desc.contains('V'))
+                || desc.starts_with("Ljava/")
+            {
+                let V::Ref(h) = crate::jdk::class_obj(&mut v, desc.clone()) else {
+                    return 0;
+                };
+                h as u64
+            } else {
+                eprintln!("[jni] FindClass miss {desc}");
+                0
+            }
         }
     }
 }
