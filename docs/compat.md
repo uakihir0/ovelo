@@ -35,15 +35,15 @@ Legend:
 | Open Sudoku | `org.moire.opensudoku` | 🟢 | **Renders real data**: full 9×9 board drawn with given digits, pencil-mark notes and cell coloring; custom `View.onDraw` path works end to end |
 | Tiny Weather Forecast Germany | `de.kaffeemitkoffein.tinyweatherforecastgermany` | 🟡 | `WelcomeActivity` renders to the window (first real APK first frame) |
 | NewPipe | `org.schabi.newpipe` | 🟢 | **Renders real data**: kiosk "Live" tab lists actual Innertube-fetched videos with titles/channels and real image thumbnails (host-bridged Coil3 `enqueue` → HTTP → WebP decode → `setImageDrawable`). Feed tab empty is expected without subscriptions |
-| F-Droid | `org.fdroid.fdroid` | 🟡 | Multi-dex + Hilt init runs without crashing; UI is Compose — no render path yet |
+| F-Droid | `org.fdroid.fdroid` | 🟡 | Lifecycle reaches `onCreate`; Compose initial composition does not terminate (>15B interpreted steps — recompose bookkeeping recycles scopes instead of converging) |
 | 2048 (AndStatus) | `org.andstatus.game2048` | 🟡 | Splash logo renders with correct textures (GLES2 pipeline works); help scene's text batcher runs but is very slow under interpretation |
 | Snakes (drugi) | `red.drugi.snakes` | 🟡 | Lifecycle completes (Godot engine); host `Lifecycle` throwable on onCreate, blank GL window |
 | Privacy Friendly Sudoku | `org.secuso.privacyfriendlysudoku` | 🟡 | SplashActivity → TutorialActivity transition runs fully in dex; Welcome screen renders real text (layout rough — overlapping strings). Unblocked by dex-enum `compareTo` fix (LifecycleRegistry sync) |
 | Aegis Authenticator | `com.beemdevelopment.aegis` | 🟢 | Intro wizard renders real content (Welcome slide + logo + import prompt); ViewPager2 page containers materialize. Layout rough (overlapping header) |
 | Markor | `net.gsantner.markor` | 🟢 | **Renders real UI**: Documents file list with real entries + dates, preview pane, FAB, bottom nav (Files/To-Do/QuickNote/LinkBox/More) |
-| Tasks.org | `org.tasks` | 🟡 | Sign-in screen renders (Add account / Continue without sync / Import backup) — layout placement rough |
+| Tasks.org | `org.tasks` | 🟡 | Sign-in screen renders (Add account / Continue without sync / Import backup); Hilt DI completes — taps don't navigate yet, layout placement rough |
 | Neumorphic Calculator | `com.neumorphic.calculator` | ⛔ | Flutter app — the entire UI runs in `libflutter.so`'s Dart VM, outside the dex runtime's scope |
-| AntennaPod | `de.danoeh.antennapod` | 🟡 | Lifecycle completes and window opens; conscrypt JNI registers 288 natives via `libconscrypt_jni.so`; WorkManager + UserPreferences run — splash→main transition pending, window blank |
+| AntennaPod | `de.danoeh.antennapod` | 🟡 | Lifecycle completes and window opens; conscrypt JNI registers 288 natives via `libconscrypt_jni.so`; WorkManager + UserPreferences run — splash→main transition pending — a coroutine worker spins without completing, window blank |
 
 ## Famous apps — assessment
 
