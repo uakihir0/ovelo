@@ -2562,13 +2562,10 @@ fn charset_call(vm: &mut Vm, class: &str, name: &str, args: &[V]) -> Option<Opti
                 HostState::StrBuf("REPLACE".into()),
             ))),
             "replacement" => {
-                // Encoder's replacement is a byte[], decoder's a String.
+                // Encoder's replacement is a byte[] — the JDK default
+                // is the single byte '?' — decoder's a String.
                 if class == "Ljava/nio/charset/CharsetEncoder;" {
-                    Some(Some(arr(
-                        vm,
-                        "B",
-                        vec![V::I32(0xEF), V::I32(0xBF), V::I32(0xBD)],
-                    )))
+                    Some(Some(arr(vm, "B", vec![V::I32(b'?' as i32)])))
                 } else {
                     Some(Some(jstr(vm, "\u{FFFD}")))
                 }
@@ -2641,11 +2638,13 @@ fn charset_call(vm: &mut Vm, class: &str, name: &str, args: &[V]) -> Option<Opti
                 Some(&V::Ref(h)) => s(vm, h).unwrap_or_default(),
                 _ => String::new(),
             };
+            // `byte[]` elements are signed — bytes ≥0x80 store as
+            // negative ints like every other byte writer here.
             let data: Vec<V> = if cs.contains("88591") || cs.contains("LATIN1") {
                 text.chars()
                     .map(|c| {
                         V::I32(if (c as u32) < 0x100 {
-                            c as i32
+                            (c as u8) as i8 as i32
                         } else {
                             b'?' as i32
                         })
@@ -2655,7 +2654,7 @@ fn charset_call(vm: &mut Vm, class: &str, name: &str, args: &[V]) -> Option<Opti
                 text.chars()
                     .map(|c| {
                         V::I32(if (c as u32) < 0x80 {
-                            c as i32
+                            (c as u8) as i8 as i32
                         } else {
                             b'?' as i32
                         })
