@@ -2476,8 +2476,13 @@ pub(crate) fn enum_value_list(vm: &mut Vm, class: &str) -> Vec<V> {
     vals
 }
 
+/// `name`'s declaration ordinal in a mirrored platform enum.
+pub(crate) fn platform_enum_ordinal(class: &str, name: &str) -> Option<i32> {
+    platform_enum_consts(class).and_then(|l| l.iter().position(|&n| n == name).map(|i| i as i32))
+}
+
 /// Declaration-order constants of Android platform enums we mirror.
-fn platform_enum_consts(class: &str) -> Option<&'static [&'static str]> {
+pub(crate) fn platform_enum_consts(class: &str) -> Option<&'static [&'static str]> {
     Some(match class {
         "Landroid/graphics/Paint$Cap;" => &["BUTT", "ROUND", "SQUARE"],
         "Landroid/graphics/Paint$Style;" => &["FILL", "STROKE", "FILL_AND_STROKE"],
@@ -2598,8 +2603,22 @@ fn enum_call(vm: &mut Vm, class: &str, name: &str, args: &[V]) -> Rt<Option<Opti
         }
         "getDeclaringClass" => Some(Some(class_obj(vm, "Ljava/lang/Enum;".into()))),
         "valueOf" => {
-            let n = sv(vm, args[1]).unwrap_or_default();
-            Some(Some(host(vm, "Ljava/lang/Enum;", HostState::StrBuf(n))))
+            // Both `Enum.valueOf(Class,String)` (2 args) and the
+            // compiler-generated `EnumType.valueOf(String)` (1 arg)
+            // land here — the name is always the LAST argument.
+            let n = args.last().and_then(|v| sv(vm, *v)).unwrap_or_default();
+            // Resolve through values() so platform enums return a
+            // constant with its real ordinal (Kotlin `when` tables
+            // index by it).
+            let hit = enum_value_list(vm, class).into_iter().find(|v| {
+                matches!(v, V::Ref(h)
+                    if pseudo_get(vm, *h, P_DATA)
+                        .and_then(|s| sv(vm, s))
+                        .as_deref() == Some(n.as_str()))
+            });
+            Some(Some(hit.unwrap_or_else(|| {
+                host(vm, "Ljava/lang/Enum;", HostState::StrBuf(n))
+            })))
         }
         "values" => {
             let a = enum_values(vm, class);

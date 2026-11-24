@@ -951,6 +951,12 @@ fn host_enum_const(vm: &mut Vm, desc: &str, name: &str) -> V {
     if let V::Ref(hh) = h {
         let n = jstr(vm, name);
         pseudo_set(vm, hh, P_DATA, n);
+        // Constants minted here (getTextAlign/getStyle/…) must carry
+        // the same ordinal `values()` and sget produce — Kotlin
+        // `when` tables index on ordinal().
+        if let Some(ord) = super::lang::platform_enum_ordinal(desc, name) {
+            pseudo_set(vm, hh, super::P_FLAGS, V::I32(ord));
+        }
     }
     h
 }

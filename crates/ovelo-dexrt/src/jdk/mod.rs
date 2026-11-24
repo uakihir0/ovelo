@@ -2030,7 +2030,10 @@ pub(crate) fn sfield(vm: &mut Vm, owner: &str, name: &str, ftype: &str) -> Optio
                         "DAYS" => 6,
                         _ => 0,
                     },
-                    _ => 0,
+                    // Mirrored platform enums carry their AOSP ordinal —
+                    // Kotlin `when` tables index on it, and values()
+                    // mints the same numbers, so sget must too.
+                    _ => lang::platform_enum_ordinal(owner, name).unwrap_or(0),
                 };
                 pseudo_set(vm, hh, P_FLAGS, V::I32(ord));
             }
