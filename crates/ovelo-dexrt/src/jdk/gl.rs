@@ -105,6 +105,10 @@ struct GlState {
     attribs: HashMap<i32, Attrib>,
     attrib_names: HashMap<i32, String>,
     vbos: HashMap<i32, Vec<u8>>,
+    /// Detected byte order per vbo — guest buffer writes can land
+    /// either endianness when a dex wrapper keeps a non-native-ordered
+    /// view (Korge's `Lb8` keeps a LE dup beside a native-ordered one).
+    vbo_le: HashMap<i32, bool>,
     vbo_arr: i32,
     vbo_idx: i32,
     next_id: i32,
@@ -137,6 +141,7 @@ impl GlState {
             attribs: HashMap::new(),
             attrib_names: HashMap::new(),
             vbos: HashMap::new(),
+            vbo_le: HashMap::new(),
             vbo_arr: 0,
             vbo_idx: 0,
             next_id: 1,
@@ -610,15 +615,20 @@ pub(crate) fn gl_frame(vm: &mut Vm, view: u32, w: i32, h: i32) -> Vec<CanvasOp> 
     let mut ops = state(gl, |s| to_ops(s));
     #[cfg(target_os = "macos")]
     if let Some((px, rw, rh)) = crate::native::glctx::read_rgba() {
-        ops.push(CanvasOp::Bitmap {
-            x: 0.0,
-            y: 0.0,
-            w: rw as u32,
-            h: rh as u32,
-            src_w: rw as u32,
-            src_h: rh as u32,
-            rgba: std::rc::Rc::new(px),
-        });
+        // Only composite when a native renderer (JNI/Godot path)
+        // actually drew into the host context — a zeroed readback
+        // would overlay the recorded prims as a blank bitmap.
+        if px.iter().any(|&b| b != 0) {
+            ops.push(CanvasOp::Bitmap {
+                x: 0.0,
+                y: 0.0,
+                w: rw as u32,
+                h: rh as u32,
+                src_w: rw as u32,
+                src_h: rh as u32,
+                rgba: std::rc::Rc::new(px),
+            });
+        }
     }
     if gl != GL20 {
         ops.extend(state(GL20, |s| to_ops(s)));
@@ -775,7 +785,16 @@ pub(crate) fn call(
             "eglGetError" => Some(V::I32(0x3000)), // EGL_SUCCESS
             "eglGetProcAddress" => Some(V::I32(0)),
             "eglQuerySurface" | "eglQueryContext" | "eglQueryDisplay" => {
-                put_ints(vm, 4, &[0]);
+                // EGL_WIDTH/HEIGHT — guests reshape their projection
+                // from these; reporting 0 divides a matrix by zero and
+                // NaNs every vertex (Korgw `setSize(0,0)` -> ortho).
+                let (w, hgt) = state(GL20, |s| s.size);
+                let val = match args.get(3).map(|v| i32v(*v)).unwrap_or(0) {
+                    0x3057 => w.max(1),   // EGL_WIDTH
+                    0x3056 => hgt.max(1), // EGL_HEIGHT
+                    _ => 0,
+                };
+                put_ints(vm, 4, &[val]);
                 Some(V::I32(1))
             }
             _ => Some(V::I32(1)),
@@ -1120,7 +1139,42 @@ fn farr(vm: &Vm, v: &V, off: &V, n: usize) -> Vec<f32> {
                 ..
             }) => {
                 let pos = bbuf_pos(vm, *h);
-                let le = bbuf_le(vm, *h);
+                // The declared order flag can lie when data was written
+                // through a differently-ordered view — probe both ways
+                // and decode with the one yielding sane floats.
+                let le = {
+                    let sane = |le: bool| -> i64 {
+                        (0..n.min(8))
+                            .map(|k| {
+                                let b: Vec<u8> = (0..4)
+                                    .map(|j| byte_at(vm, *h, pos + o * 4 + k * 4 + j))
+                                    .collect();
+                                let a: [u8; 4] = b.try_into().unwrap_or([0; 4]);
+                                let v = if le {
+                                    f32::from_le_bytes(a)
+                                } else {
+                                    f32::from_be_bytes(a)
+                                };
+                                if !v.is_finite() {
+                                    -3
+                                } else if v != 0.0 && v.abs() < 1e-30 {
+                                    -2
+                                } else if v.abs() > 1e8 {
+                                    -1
+                                } else {
+                                    1
+                                }
+                            })
+                            .sum()
+                    };
+                    let decl = bbuf_le(vm, *h);
+                    let (dl, db) = (sane(true), sane(false));
+                    if dl == db {
+                        decl
+                    } else {
+                        dl > db
+                    }
+                };
                 (0..n)
                     .map(|k| {
                         let b: Vec<u8> = (0..4)
@@ -1186,6 +1240,7 @@ fn attr_at(vm: &Vm, st: &GlState, a: &Attrib, i: usize) -> [f32; 4] {
     let Some(data) = st.vbos.get(&(-a.buf)) else {
         return [0.0; 4];
     };
+    let le = st.vbo_le.get(&(-a.buf)).copied().unwrap_or(true);
     // GL default for missing components is (0, 0, 0, 1).
     let mut o = [0.0f32, 0.0, 0.0, 1.0];
     let w = elem_w(a.ty);
@@ -1200,7 +1255,14 @@ fn attr_at(vm: &Vm, st: &GlState, a: &Attrib, i: usize) -> [f32; 4] {
         *o = match a.ty {
             0x1406 => data
                 .get(at..at + 4)
-                .map(|b| f32::from_le_bytes([b[0], b[1], b[2], b[3]]))
+                .map(|b| {
+                    let b = [b[0], b[1], b[2], b[3]];
+                    if le {
+                        f32::from_le_bytes(b)
+                    } else {
+                        f32::from_be_bytes(b)
+                    }
+                })
                 .unwrap_or(0.0),
             0x1401 => {
                 let b = data.get(at).copied().unwrap_or(0) as f32;
@@ -1216,21 +1278,93 @@ fn attr_at(vm: &Vm, st: &GlState, a: &Attrib, i: usize) -> [f32; 4] {
     o
 }
 
-/// The first 16-float uniform whose name mentions "mvp" — the model
-/// view projection matrix guests upload via `glUniformMatrix4fv`.
+/// The composite transform guests upload via `glUniformMatrix4fv`.
+/// Some apps ship one "mvp" uniform; engines like Korge upload
+/// `u_ProjMat`/`u_ViewMat`/`u_ModelMat` separately — compose those in
+/// projection→view→model order (outermost first, as a column-vector
+/// `M*v` product).
 fn mvp_uniform(st: &GlState) -> Option<[f32; 16]> {
-    for (&loc, name) in &st.uni_names {
-        if name.to_lowercase().contains("mvp") {
-            if let Some(v) = st.uniforms.get(&loc) {
-                if v.len() >= 16 {
-                    let mut m = [0.0f32; 16];
-                    m.copy_from_slice(&v[..16]);
-                    return Some(m);
+    let mat_at = |pred: &dyn Fn(&str) -> bool| -> Option<[f32; 16]> {
+        let mut out = None;
+        for (&loc, name) in &st.uni_names {
+            if pred(&name.to_lowercase()) {
+                if let Some(v) = st.uniforms.get(&loc) {
+                    if v.len() >= 16 {
+                        let mut m = [0.0f32; 16];
+                        m.copy_from_slice(&v[..16]);
+                        out = Some(m);
+                    }
                 }
             }
         }
+        out
+    };
+    if let Some(m) = mat_at(&|n| n.contains("mvp")) {
+        return Some(m);
     }
-    None
+    let proj = mat_at(&|n| n.contains("proj") || n.contains("persp"));
+    let view = mat_at(&|n| {
+        !n.contains("proj") && (n.contains("view") || n.contains("lookat") || n.contains("cam"))
+    });
+    let model = mat_at(&|n| n.contains("model") || n.contains("world"));
+    let mut m: Option<[f32; 16]> = None;
+    for part in [proj, view, model].into_iter().flatten() {
+        m = Some(match m {
+            None => part,
+            Some(acc) => mul(&acc, &part),
+        });
+    }
+    m
+}
+
+/// Probe a float VBO's byte order: sample a few f32 lanes both ways
+/// and pick the order producing sane magnitudes (finite, not
+/// denormal-tiny — a wrong-order read of `43 82 80 00` yields
+/// ~1e-38, an unmistakable tell).
+fn detect_f32_le(data: &[u8], off: usize, stride: usize, samples: usize) -> bool {
+    let score = |le: bool| -> i64 {
+        let mut s = 0i64;
+        for i in 0..samples.max(1) {
+            let at = off + i * stride;
+            let Some(b) = data.get(at..at + 4) else { break };
+            let v = if le {
+                f32::from_le_bytes([b[0], b[1], b[2], b[3]])
+            } else {
+                f32::from_be_bytes([b[0], b[1], b[2], b[3]])
+            };
+            if !v.is_finite() {
+                s -= 3;
+            } else if v != 0.0 && v.abs() < 1e-30 {
+                s -= 2;
+            } else if v.abs() > 1e8 {
+                s -= 1;
+            } else {
+                s += 1;
+            }
+        }
+        s
+    };
+    score(true) >= score(false)
+}
+
+/// Index-buffer byte order: pick the interpretation whose max index
+/// is smaller — byte-swapped shorts read ~256x too large.
+fn detect_idx_le(data: &[u8], off: usize, w: usize, n: usize) -> bool {
+    let maxv = |le: bool| -> u64 {
+        (0..n)
+            .map(|k| {
+                let at = off + k * w;
+                (0..w)
+                    .map(|j| {
+                        let b = if le { at + j } else { at + w - 1 - j };
+                        (data.get(b).copied().unwrap_or(0) as u64) << (8 * j)
+                    })
+                    .sum::<u64>()
+            })
+            .max()
+            .unwrap_or(0)
+    };
+    maxv(true) <= maxv(false)
 }
 
 /// GLES20 draw: resolve position/color/circle attribs per vertex and
@@ -1264,7 +1398,8 @@ fn record20(vm: &Vm, st: &mut GlState, mode: i32, idxs: &[i32]) {
             if let Some(pa) = st
                 .attribs
                 .values()
-                .find(|a| a.enabled && a.name == "position")
+                .filter(|a| a.enabled && a.ty == 0x1406 && a.size >= 2)
+                .min_by_key(|a| a.off)
                 .cloned()
             {
                 for i in 0..4usize {
@@ -1283,17 +1418,60 @@ fn record20(vm: &Vm, st: &mut GlState, mode: i32, idxs: &[i32]) {
                     &idxs[..idxs.len().min(8)],
                     mvp_uniform(st).map(|m| m[..4].to_vec())
                 );
+                if let Some(d) = st.vbos.get(&(-pa.buf)) {
+                    eprintln!("[gldbg] vbuf[{}] {:02x?}", -pa.buf, &d[..d.len().min(48)]);
+                }
+                if let Some(d) = st.vbos.get(&st.vbo_idx) {
+                    eprintln!(
+                        "[gldbg] ibuf[{}] {:02x?}",
+                        st.vbo_idx,
+                        &d[..d.len().min(16)]
+                    );
+                }
             }
         }
     }
-    let Some(pos_a) = find("position") else {
-        return;
-    };
+    // Position: the attribute literally named "position" when bound
+    // by name — otherwise the first float vec2+ attribute at the
+    // lowest byte offset (Korge binds `a_Pos` at off 0 of a packed
+    // interleaved vertex).
+    let pos_a = find("position").or_else(|| {
+        st.attribs
+            .values()
+            .filter(|a| a.enabled && a.ty == 0x1406 && a.size >= 2)
+            .min_by_key(|a| a.off)
+            .cloned()
+    });
+    let Some(pos_a) = pos_a else { return };
+    // Tag the position VBO's byte order once per draw — uploads that
+    // came through a non-native-ordered guest view need BE decoding.
+    if pos_a.buf < 0 {
+        if let Some(d) = st.vbos.get(&(-pos_a.buf)) {
+            let stride = if pos_a.stride > 0 {
+                pos_a.stride as usize
+            } else {
+                pos_a.size.max(1) as usize * elem_w(pos_a.ty)
+            };
+            let le = detect_f32_le(d, pos_a.off, stride, 8);
+            st.vbo_le.insert(-pos_a.buf, le);
+        }
+    }
     let col_a = st
         .attribs
         .values()
         .find(|a| a.enabled && a.name.contains("olor"))
-        .cloned();
+        .cloned()
+        .or_else(|| {
+            // Normalized ubyte vectors at size 3-4 are virtually always
+            // packed RGBA vertex colors (Korge: `a_ColMul`/`a_ColAdd`).
+            st.attribs
+                .values()
+                .filter(|a| {
+                    a.enabled && a.ty == 0x1401 && a.normalized && (3..=4).contains(&a.size)
+                })
+                .min_by_key(|a| a.off)
+                .cloned()
+        });
     let ctr_a = find("inCenter");
     let rad_a = find("inRadiusSquared");
     let mvp = mvp_uniform(st);
@@ -1384,11 +1562,11 @@ pub(crate) fn call_static(
             // Apps parse GL_EXTENSIONS for capability checks — a null
             // or void result NPEs their probe (`Lv.d()` in 2048).
             let s = match i(0) {
-                0x1F00 => "ovelo",                    // GL_VENDOR
-                0x1F01 => "ovelo GLES 2.0",           // GL_RENDERER
-                0x1F02 => "OpenGL ES 2.0 ovelo",      // GL_VERSION
-                0x1F03 => "OveloJIT",                 // GL_SHADING_LANGUAGE_VERSION
-                _ => "",                              // GL_EXTENSIONS
+                0x1F00 => "ovelo",               // GL_VENDOR
+                0x1F01 => "ovelo GLES 2.0",      // GL_RENDERER
+                0x1F02 => "OpenGL ES 2.0 ovelo", // GL_VERSION
+                0x1F03 => "OveloJIT",            // GL_SHADING_LANGUAGE_VERSION
+                _ => "",                         // GL_EXTENSIONS
             };
             Some(V::Ref(vm.intern_str(s)))
         }
@@ -1418,7 +1596,6 @@ pub(crate) fn call_static(
         "glGenBuffers" | "glGenTextures" | "glGenFramebuffers" | "glGenRenderbuffers" => {
             let n = i(0).max(0);
             if let V::Ref(h) = args.get(1).copied().unwrap_or(V::I32(0)) {
-                let off = i(2).max(0) as usize;
                 let ids: Vec<i32> = state(GL20, |s| {
                     (0..n)
                         .map(|_| {
@@ -1428,12 +1605,39 @@ pub(crate) fn call_static(
                         })
                         .collect()
                 });
-                if let Some(Obj::Array { data, .. }) = vm.heap.get_mut(h) {
-                    for (k, id) in ids.iter().enumerate() {
-                        if let Some(slot) = data.get_mut(off + k) {
-                            *slot = V::I32(*id);
+                match vm.heap.get(h) {
+                    Some(Obj::Array { .. }) => {
+                        let off = i(2).max(0) as usize;
+                        if let Some(Obj::Array { data, .. }) = vm.heap.get_mut(h) {
+                            for (k, id) in ids.iter().enumerate() {
+                                if let Some(slot) = data.get_mut(off + k) {
+                                    *slot = V::I32(*id);
+                                }
+                            }
                         }
                     }
+                    // `IntBuffer` overload — a typed view over a byte[]
+                    // backing; write each id little-endian at the view's
+                    // position. Without this the guest binds id 0 for
+                    // every buffer and uploads collide (Korge's vertex
+                    // and index buffers landed in the same slot).
+                    Some(Obj::Host {
+                        state: HostState::Slot(V::Ref(b)),
+                        ..
+                    }) if matches!(vm.heap.get(*b), Some(Obj::Array { .. })) => {
+                        let arr = *b;
+                        let pos = bbuf_pos(vm, h);
+                        if let Some(Obj::Array { data, .. }) = vm.heap.get_mut(arr) {
+                            for (k, id) in ids.iter().enumerate() {
+                                for (j, byte) in id.to_le_bytes().iter().enumerate() {
+                                    if let Some(slot) = data.get_mut(pos + k * 4 + j) {
+                                        *slot = V::I32(*byte as i8 as i32);
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    _ => {}
                 }
             }
             None
@@ -1457,13 +1661,15 @@ pub(crate) fn call_static(
             if std::env::var_os("OVELO_DRAWDBG").is_some() {
                 if let V::Ref(h) = args.get(2).copied().unwrap_or(V::I32(0)) {
                     eprintln!(
-                        "[gldbg] bufferData size={size} obj={:?}",
+                        "[gldbg] bufferData size={size} obj={:?} pos={} le={}",
                         vm.heap.get(h).map(|o| match o {
                             Obj::Host { desc, state, .. } => format!("Host {desc} {state:?}"),
                             Obj::Instance { .. } => "Instance".into(),
                             Obj::Array { elem, .. } => format!("Array[{elem}]"),
                             _ => "other".into(),
-                        })
+                        }),
+                        bbuf_pos(vm, h),
+                        bbuf_le(vm, h),
                     );
                 }
             }
@@ -1484,6 +1690,16 @@ pub(crate) fn call_static(
                     v.resize(off + size, 0);
                 }
                 v[off..off + size].copy_from_slice(&data);
+            });
+            None
+        }
+        "glBindAttribLocation" => {
+            // Programs bind attrib indices before link — Korge uses
+            // this exclusively (never calls glGetAttribLocation), so
+            // this is where `attrib_names` actually fills.
+            let an = gstr(vm, args.get(2).unwrap_or(&V::I32(0)));
+            state(GL20, |s| {
+                s.attrib_names.insert(i(1), an);
             });
             None
         }
@@ -1536,6 +1752,35 @@ pub(crate) fn call_static(
                 args.get(4).unwrap_or(&V::I32(0)),
                 n,
             );
+            if std::env::var_os("OVELO_DRAWDBG").is_some() {
+                static N: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+                if N.fetch_add(1, std::sync::atomic::Ordering::Relaxed) < 12 {
+                    let buf = args.get(3).copied().unwrap_or(V::I32(0));
+                    let (pos, ord, kind) = match buf {
+                        V::Ref(h) => (
+                            bbuf_pos(vm, h),
+                            bbuf_le(vm, h),
+                            vm.heap
+                                .get(h)
+                                .map(|o| format!("{o:?}"))
+                                .unwrap_or_default()
+                                .chars()
+                                .take(60)
+                                .collect::<String>(),
+                        ),
+                        _ => (0, false, format!("{buf:?}")),
+                    };
+                    let dump: Vec<u8> = match buf {
+                        V::Ref(h) => (0..96).map(|j| byte_at(vm, h, j)).collect(),
+                        _ => Vec::new(),
+                    };
+                    eprintln!(
+                        "[gldbg] uniform4 loc={loc} pos={pos} le={ord} kind={kind} v={:?}\n  raw={:02x?}",
+                        &vals[..vals.len().min(4)],
+                        dump
+                    );
+                }
+            }
             state(GL20, |s| {
                 s.uniforms.insert(loc, vals);
             });
@@ -1561,17 +1806,20 @@ pub(crate) fn call_static(
                     let idxs: Vec<i32> = state(GL20, |s| {
                         let w = elem_w(ty);
                         match s.vbos.get(&s.vbo_idx) {
-                            Some(d) => (0..count as usize)
-                                .map(|k| {
-                                    let at = off + k * w;
-                                    let mut v = 0u64;
-                                    for j in 0..w {
-                                        v |=
-                                            (d.get(at + j).copied().unwrap_or(0) as u64) << (8 * j);
-                                    }
-                                    v as i32
-                                })
-                                .collect(),
+                            Some(d) => {
+                                let le = detect_idx_le(d, off, w, (count as usize).min(8));
+                                (0..count as usize)
+                                    .map(|k| {
+                                        let at = off + k * w;
+                                        let mut v = 0u64;
+                                        for j in 0..w {
+                                            let b = if le { at + j } else { at + w - 1 - j };
+                                            v |= (d.get(b).copied().unwrap_or(0) as u64) << (8 * j);
+                                        }
+                                        v as i32
+                                    })
+                                    .collect()
+                            }
                             None => Vec::new(),
                         }
                     });
@@ -1607,6 +1855,127 @@ pub(crate) fn call_static(
             None
         }
         "glGetError" => Some(V::I32(0)),
+        // Apps poll compile/link status and bail on 0 — always report
+        // success so they never enter the info-log path. Both the
+        // `int[]` and `IntBuffer` overloads land here.
+        "glGetShaderiv" | "glGetProgramiv" => {
+            if let V::Ref(h) = args.get(2).copied().unwrap_or(V::I32(0)) {
+                match vm.heap.get(h) {
+                    Some(Obj::Array { .. }) => {
+                        let off = i(3).max(0) as usize;
+                        if let Some(Obj::Array { data, .. }) = vm.heap.get_mut(h) {
+                            if let Some(slot) = data.get_mut(off) {
+                                *slot = V::I32(1);
+                            }
+                        }
+                    }
+                    Some(Obj::Host {
+                        state: HostState::Slot(V::Ref(b)),
+                        ..
+                    }) if matches!(vm.heap.get(*b), Some(Obj::Array { .. })) => {
+                        // Typed view over a byte[] backing — write one
+                        // element at the view's position.
+                        if std::env::var_os("OVELO_DRAWDBG").is_some() {
+                            eprintln!("[gldbg] {name} write status into view h{h}");
+                        }
+                        let arr = *b;
+                        let pos = bbuf_pos(vm, h);
+                        let little = bbuf_le(vm, h);
+                        let bytes = if little {
+                            1i32.to_le_bytes()
+                        } else {
+                            1i32.to_be_bytes()
+                        };
+                        if let Some(Obj::Array { data, .. }) = vm.heap.get_mut(arr) {
+                            for (k, b) in bytes.iter().enumerate() {
+                                if let Some(slot) = data.get_mut(pos + k) {
+                                    *slot = V::I32(*b as i8 as i32);
+                                }
+                            }
+                        }
+                    }
+                    _ => {
+                        if let Some(arr) = elem_arr(vm, h) {
+                            let pos = bbuf_pos(vm, h);
+                            if let Some(Obj::Array { data, .. }) = vm.heap.get_mut(arr) {
+                                if let Some(slot) = data.get_mut(pos) {
+                                    *slot = V::I32(1);
+                                }
+                            }
+                        } else {
+                            if std::env::var_os("OVELO_DRAWDBG").is_some() {
+                                eprintln!(
+                                    "[gldbg] {name} arg h{h} kind={:?}",
+                                    vm.heap.get(h).map(std::mem::discriminant)
+                                );
+                            }
+                            // Dex IntBuffer wrappers (Korge's `Lb8`) —
+                            // an Instance holding a ByteBuffer field
+                            // plus int byte-offset fields. Field names
+                            // are obfuscated, so write the status at
+                            // every int field's offset — a stray write
+                            // lands inside the status buffer anyway.
+                            let mut bb = None;
+                            let mut offs = Vec::new();
+                            if let Some(Obj::Instance { fields, .. }) = vm.heap.get(h) {
+                                for v in fields.values() {
+                                    match *v {
+                                        V::Ref(bh)
+                                            if matches!(
+                                                vm.heap.get(bh),
+                                                Some(Obj::Host {
+                                                    state: HostState::Slot(V::Ref(b)),
+                                                    ..
+                                                }) if matches!(
+                                                    vm.heap.get(*b),
+                                                    Some(Obj::Array { .. })
+                                                )
+                                            ) =>
+                                        {
+                                            bb = Some(bh);
+                                        }
+                                        V::I32(n) => offs.push(n.max(0) as usize),
+                                        _ => {}
+                                    }
+                                }
+                            }
+                            if offs.is_empty() {
+                                offs.push(0);
+                            }
+                            if let Some(bh) = bb {
+                                let base = bbuf_pos(vm, bh);
+                                let little = bbuf_le(vm, bh);
+                                let arr = match vm.heap.get(bh) {
+                                    Some(Obj::Host {
+                                        state: HostState::Slot(V::Ref(b)),
+                                        ..
+                                    }) => Some(*b),
+                                    _ => None,
+                                };
+                                if let Some(arr) = arr {
+                                    let bytes = if little {
+                                        1i32.to_le_bytes()
+                                    } else {
+                                        1i32.to_be_bytes()
+                                    };
+                                    if let Some(Obj::Array { data, .. }) = vm.heap.get_mut(arr) {
+                                        for off in offs {
+                                            for (k, b) in bytes.iter().enumerate() {
+                                                if let Some(slot) = data.get_mut(base + off + k) {
+                                                    *slot = V::I32(*b as i8 as i32);
+                                                }
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+            None
+        }
+        "glGetShaderInfoLog" | "glGetProgramInfoLog" => Some(V::Ref(vm.intern_str(""))),
         "glGetIntegerv" => {
             if let V::Ref(h) = args.get(1).copied().unwrap_or(V::I32(0)) {
                 if let Some(Obj::Array { data, .. }) = vm.heap.get_mut(h) {

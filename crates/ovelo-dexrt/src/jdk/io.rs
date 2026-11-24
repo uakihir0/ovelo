@@ -2533,7 +2533,11 @@ fn nio_call(vm: &mut Vm, class: &str, name: &str, args: &[V]) -> Option<Option<V
             _ => V::Ref(0),
         })),
         "hasArray" | "hasRemaining" => Some(Some(V::I32(1))),
-        "isDirect" | "isReadOnly" => Some(Some(V::I32(0))),
+        // Every buffer we mint is array-backed but behaves direct —
+        // guests pool-vs-copy on this (Korge picks a shared pool when
+        // a buffer reports non-direct, splitting read/write sites).
+        "isDirect" => Some(Some(V::I32(1))),
+        "isReadOnly" => Some(Some(V::I32(0))),
         "arrayOffset" => Some(Some(V::I32(0))),
         "capacity" | "limit" => {
             let n = backing(vm)
