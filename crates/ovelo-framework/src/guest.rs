@@ -591,13 +591,14 @@ impl GuestUi {
                     // Bridged parents adopt dex-view-tree children too —
                     // materialize them so e.g. ViewPager2's empty
                     // FrameLayout still hosts inflated content.
-                    let Some(cv) = ui
-                        .borrow()
-                        .views
-                        .get(&child)
-                        .cloned()
-                        .or_else(|| ui.borrow_mut().materialize_dex(vm, child))
-                    else {
+                    // Look up then materialize in two statements — the
+                    // `or_else` closure would run `borrow_mut` while the
+                    // `borrow` temporary is still live and panic.
+                    let mut cv = ui.borrow().views.get(&child).cloned();
+                    if cv.is_none() {
+                        cv = ui.borrow_mut().materialize_dex(vm, child);
+                    }
+                    let Some(cv) = cv else {
                         return Ok(None);
                     };
                     let Some(rc) = ui.borrow().views.get(&this).cloned() else {
