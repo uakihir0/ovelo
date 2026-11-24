@@ -54,6 +54,8 @@ pub(crate) const P_RECT_T: u32 = u32::MAX - 8;
 pub(crate) const P_RECT_R: u32 = u32::MAX - 9;
 pub(crate) const P_RECT_B: u32 = u32::MAX - 10;
 pub(crate) const P_BOUNDS: u32 = u32::MAX - 11;
+/// Thread was `start()`ed once — JVM forbids a second start.
+pub(crate) const P_STARTED: u32 = u32::MAX - 12;
 /// A `BitmapDrawable`'s wrapped Bitmap — kept as a fields entry so the
 /// renderer's bitmap field-walk (and `getBitmap`) find it.
 pub(crate) const P_BITMAP_SLOT: u64 = 0xFFFD_FEE0;

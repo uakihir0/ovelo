@@ -2081,8 +2081,21 @@ fn thread_call(vm: &mut Vm, name: &str, _sig: &str, args: &[V]) -> Rt<Option<Opt
             Some(None)
         }
         "getPriority" => Some(Some(V::I32(5))),
-        "isAlive" | "isDaemon" | "isVirtual" | "isInterrupted" | "interrupted"
-        | "isCCLOverriden" => Some(Some(V::I32(0))),
+        "isAlive" => {
+            // Started and its runnable is still queued/parked/running.
+            let alive = match args.first() {
+                Some(V::Ref(h)) => {
+                    let t = pseudo_get(vm, *h, P_TARGET).unwrap_or(V::Ref(*h));
+                    pseudo_get(vm, *h, P_STARTED).is_some()
+                        && matches!(t, V::Ref(r) if vm.thread_runnables.contains(&r))
+                }
+                _ => false,
+            };
+            Some(Some(V::I32(alive as i32)))
+        }
+        "isDaemon" | "isVirtual" | "isInterrupted" | "interrupted" | "isCCLOverriden" => {
+            Some(Some(V::I32(0)))
+        }
         "holdsLock" => Some(Some(V::I32(1))),
         "activeCount" => Some(Some(V::I32(1))),
         "getState" => Some(Some(host(
@@ -2129,6 +2142,16 @@ fn thread_call(vm: &mut Vm, name: &str, _sig: &str, args: &[V]) -> Rt<Option<Opt
             // execution deadlocks guests whose tasks reschedule work
             // (coroutine dispatchers, self-perpetuating handlers).
             if let V::Ref(h) = args[0] {
+                // JVM contract: a Thread starts exactly once — a second
+                // start() throws IllegalThreadStateException. Without
+                // this guard a restart double-enqueues the runnable:
+                // kotlinx's DefaultExecutor restarts when isAlive reads
+                // false after a park-unwind and each re-start pushed
+                // another copy of its run() onto the drain queue.
+                if pseudo_get(vm, h, P_STARTED).is_some() {
+                    return Err(vm.throw_builtin("Ljava/lang/IllegalThreadStateException;", ""));
+                }
+                pseudo_set(vm, h, P_STARTED, V::I32(1));
                 let t = pseudo_get(vm, h, P_TARGET).unwrap_or(V::Ref(h));
                 if let V::Ref(r) = t {
                     // Thread-spawned runnables get an unbounded park
