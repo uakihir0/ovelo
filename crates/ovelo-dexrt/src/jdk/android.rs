@@ -1990,11 +1990,19 @@ fn prefs_call(vm: &mut Vm, name: &str, args: &[V]) -> Rt<Option<Option<V>>> {
         }
     } else {
         match name {
-            "getString" => Some(Some(
-                map_get(vm, h, args[1])
+            "getString" => {
+                let r = map_get(vm, h, args[1])
                     .or_else(|| args.get(2).copied())
-                    .unwrap_or(V::Ref(0)),
-            )),
+                    .unwrap_or(V::Ref(0));
+                if std::env::var("OVELO_PREFDBG").is_ok() {
+                    eprintln!(
+                        "prefdbg getString key={:?} -> {:?}",
+                        sv(vm, args[1]),
+                        sv(vm, r)
+                    );
+                }
+                Some(Some(r))
+            }
             "getInt" | "getLong" | "getFloat" | "getBoolean" => {
                 let v = map_get(vm, h, args[1])
                     .or_else(|| args.get(2).copied())

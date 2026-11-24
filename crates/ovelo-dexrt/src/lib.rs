@@ -2102,6 +2102,13 @@ impl Vm {
         ]);
         roots.extend(self.view_roots.iter().copied());
         roots.extend(self.prefs_files.values().copied());
+        // Interned enum constants are VM-lifetime singletons (like JVM
+        // enum consts) — leaving them unrooted lets the sweep reclaim
+        // the handle and `alloc` recycle it for an unrelated object,
+        // so a later values()/valueOf/sget lookup returns a wrong
+        // object entirely.
+        roots.extend(self.enum_cache.values().copied());
+        roots.extend(self.enum_name_cache.values().copied());
         roots.extend(self.content_views.keys().copied());
         roots.extend(self.content_views.values().copied());
         roots.extend(self.decor_roots.keys().copied());
