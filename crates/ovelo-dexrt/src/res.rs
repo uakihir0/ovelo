@@ -69,6 +69,52 @@ impl ApkResources {
             plurals: HashMap::new(),
         };
         let arsc = res.read("resources.arsc")?;
+        // Non-default config buckets accumulate in pending maps and are
+        // merged after the walk. A bucket fully matching the device
+        // config (every qualifier it carries is satisfied — e.g.
+        // `w360dp` on a 400dp-wide window) outranks `default`; among
+        // remaining buckets the last seen wins, preserving the
+        // pre-qualifier-decode order (every bucket used to be labeled
+        // "default", so the last in iteration order won).
+        // Device: portrait ~400x300dp window at density 2.0, day mode.
+        fn bucket_rank(config: &str) -> u8 {
+            if config == "default" {
+                return 0;
+            }
+            let mut score = 0u8;
+            for part in config.split('-') {
+                let num = |p: &str, pre: &str, suf: &str| -> Option<u32> {
+                    p.strip_prefix(pre)?.strip_suffix(suf)?.parse().ok()
+                };
+                let ok = if let Some(n) = num(part, "sw", "dp") {
+                    n <= 300
+                } else if let Some(n) = num(part, "w", "dp") {
+                    n <= 400
+                } else if let Some(n) = num(part, "h", "dp") {
+                    n <= 300
+                } else {
+                    match part {
+                        "port" => true,
+                        "land" | "night" | "square" => false,
+                        // Qualifiers we can't evaluate (lang, dpi,
+                        // small/large, car/watch/tv) — keep the bucket
+                        // as a fallback candidate only.
+                        _ => return 251,
+                    }
+                };
+                if !ok {
+                    return 250; // understood qualifier, doesn't match
+                }
+                score += 1;
+            }
+            score.max(1) // a bucket with only known qualifiers that all match
+        }
+        let mut pend_values: HashMap<u32, (u8, EntryValue)> = HashMap::new();
+        let mut pend_files: HashMap<u32, (u8, String)> = HashMap::new();
+        let mut pend_layouts: HashMap<u32, (u8, String)> = HashMap::new();
+        type PendStyle = (u8, (u32, Vec<(u32, EntryValue)>));
+        let mut pend_styles: HashMap<u32, PendStyle> = HashMap::new();
+        let mut pend_plurals: HashMap<u32, (u8, Vec<(String, EntryValue)>)> = HashMap::new();
         for pkg in parse_arsc(&arsc).ok()? {
             if pkg.package_id & 0xff == 0x7f {
                 res.package_name = pkg.name.clone();
@@ -85,46 +131,77 @@ impl ApkResources {
                         if e.config == "default" {
                             res.entry_values.insert(e.res_id, v.clone());
                         } else {
-                            res.entry_values
-                                .entry(e.res_id)
-                                .or_insert_with(|| v.clone());
+                            let r = bucket_rank(&e.config);
+                            match pend_values.get_mut(&e.res_id) {
+                                Some((s, slot)) if r >= *s => {
+                                    *s = r;
+                                    *slot = v.clone();
+                                }
+                                Some(_) => {}
+                                None => {
+                                    pend_values.insert(e.res_id, (r, v.clone()));
+                                }
+                            }
                         }
                     }
                     // A complex (style) entry: either a parent or items
                     // marks it — a `<style name="X" parent="Y"/>` with no
                     // items still has to sit in the chain.
                     if e.parent != 0 || !e.items.is_empty() {
-                        let s = res.styles.entry(e.res_id).or_default();
-                        if e.config == "default" || (s.parent == 0 && s.items.is_empty()) {
+                        if e.config == "default" {
+                            let s = res.styles.entry(e.res_id).or_default();
                             s.parent = e.parent;
                             s.items = e.items.clone();
+                        } else {
+                            let r = bucket_rank(&e.config);
+                            match pend_styles.get_mut(&e.res_id) {
+                                Some((s, slot)) if r >= *s => {
+                                    *s = r;
+                                    *slot = (e.parent, e.items.clone());
+                                }
+                                Some(_) => {}
+                                None => {
+                                    pend_styles.insert(e.res_id, (r, (e.parent, e.items.clone())));
+                                }
+                            }
                         }
                     }
                     if t.name == "plurals" && !e.items.is_empty() {
-                        let slot = res.plurals.entry(e.res_id).or_default();
-                        if slot.is_empty() || e.config == "default" {
-                            // Plural item keys are the reserved
-                            // attr ids 0x01000004..0x01000009
-                            // (ResTable_map ATTR_other/zero/…), not
-                            // key-pool indices — a `key_strings.get`
-                            // on those yields nothing.
-                            const QTY_IDS: &[&str] =
-                                &["other", "zero", "one", "two", "few", "many"];
-                            *slot = e
-                                .items
-                                .iter()
-                                .map(|(k, v)| {
-                                    let key = if (0x01000004..=0x01000009).contains(k) {
-                                        QTY_IDS[(*k - 0x01000004) as usize].to_string()
-                                    } else {
-                                        pkg.key_strings
-                                            .get(*k as usize)
-                                            .cloned()
-                                            .unwrap_or_default()
-                                    };
-                                    (key, v.clone())
-                                })
-                                .collect();
+                        // Plural item keys are the reserved
+                        // attr ids 0x01000004..0x01000009
+                        // (ResTable_map ATTR_other/zero/…), not
+                        // key-pool indices — a `key_strings.get`
+                        // on those yields nothing.
+                        const QTY_IDS: &[&str] = &["other", "zero", "one", "two", "few", "many"];
+                        let slot: Vec<(String, EntryValue)> = e
+                            .items
+                            .iter()
+                            .map(|(k, v)| {
+                                let key = if (0x01000004..=0x01000009).contains(k) {
+                                    QTY_IDS[(*k - 0x01000004) as usize].to_string()
+                                } else {
+                                    pkg.key_strings
+                                        .get(*k as usize)
+                                        .cloned()
+                                        .unwrap_or_default()
+                                };
+                                (key, v.clone())
+                            })
+                            .collect();
+                        if e.config == "default" {
+                            res.plurals.insert(e.res_id, slot);
+                        } else {
+                            let r = bucket_rank(&e.config);
+                            match pend_plurals.get_mut(&e.res_id) {
+                                Some((s, sl)) if r >= *s => {
+                                    *s = r;
+                                    *sl = slot;
+                                }
+                                Some(_) => {}
+                                None => {
+                                    pend_plurals.insert(e.res_id, (r, slot));
+                                }
+                            }
                         }
                     }
                     // Any entry whose value is a `res/` file path —
@@ -135,9 +212,17 @@ impl ApkResources {
                             if e.config == "default" {
                                 res.file_paths.insert(e.res_id, path.clone());
                             } else {
-                                res.file_paths
-                                    .entry(e.res_id)
-                                    .or_insert_with(|| path.clone());
+                                let r = bucket_rank(&e.config);
+                                match pend_files.get_mut(&e.res_id) {
+                                    Some((s, sl)) if r >= *s => {
+                                        *s = r;
+                                        *sl = path.clone();
+                                    }
+                                    Some(_) => {}
+                                    None => {
+                                        pend_files.insert(e.res_id, (r, path.clone()));
+                                    }
+                                }
                             }
                         }
                     }
@@ -150,9 +235,17 @@ impl ApkResources {
                                 if e.config == "default" {
                                     res.layout_paths.insert(e.res_id, path.clone());
                                 } else {
-                                    res.layout_paths
-                                        .entry(e.res_id)
-                                        .or_insert_with(|| path.clone());
+                                    let r = bucket_rank(&e.config);
+                                    match pend_layouts.get_mut(&e.res_id) {
+                                        Some((s, sl)) if r >= *s => {
+                                            *s = r;
+                                            *sl = path.clone();
+                                        }
+                                        Some(_) => {}
+                                        None => {
+                                            pend_layouts.insert(e.res_id, (r, path.clone()));
+                                        }
+                                    }
                                 }
                             }
                         }
@@ -162,6 +255,44 @@ impl ApkResources {
                         _ => {}
                     }
                 }
+            }
+        }
+        // Merge qualified buckets: a matching qualified bucket (rank
+        // 1..=4) overrides `default`; a merely-fallback bucket (250/251)
+        // fills only entries with no default.
+        for (k, (r, v)) in pend_values {
+            if r < 250 {
+                res.entry_values.insert(k, v);
+            } else {
+                res.entry_values.entry(k).or_insert(v);
+            }
+        }
+        for (k, (r, v)) in pend_files {
+            if r < 250 {
+                res.file_paths.insert(k, v);
+            } else {
+                res.file_paths.entry(k).or_insert(v);
+            }
+        }
+        for (k, (r, v)) in pend_layouts {
+            if r < 250 {
+                res.layout_paths.insert(k, v);
+            } else {
+                res.layout_paths.entry(k).or_insert(v);
+            }
+        }
+        for (k, (r, (p, items))) in pend_styles {
+            let s = res.styles.entry(k).or_default();
+            if r < 250 || (s.parent == 0 && s.items.is_empty()) {
+                s.parent = p;
+                s.items = items;
+            }
+        }
+        for (k, (r, v)) in pend_plurals {
+            if r < 250 {
+                res.plurals.insert(k, v);
+            } else {
+                res.plurals.entry(k).or_insert(v);
             }
         }
         Some(res)
