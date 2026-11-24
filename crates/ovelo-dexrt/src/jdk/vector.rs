@@ -189,11 +189,11 @@ pub(crate) fn drawable_for_res(vm: &mut Vm, res_id: u32) -> V {
     let (bitmap, color) = match rctx(vm) {
         Some(rv) => (
             drawable_bitmap(rv, res_id),
-            if rv.res.type_name(res_id) == Some("color") {
-                resolve_ref_color(rv, res_id)
-            } else {
-                None
-            },
+            // Not gated on type "color": a `drawable-night` bucket may
+            // swap the image for a `@color/x` reference — resolve_ref_color
+            // walks the winning value's reference chain and only yields
+            // a color when the chain actually ends at one.
+            resolve_ref_color(rv, res_id),
         ),
         None => (None, None),
     };
