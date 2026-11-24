@@ -193,7 +193,10 @@ fn commit_or_rollback(conn: &mut rusqlite::Connection, ok: bool) -> rusqlite::Re
 /// `assertNotSuspendingTransaction` throw inside `withTransaction`.
 fn track_tx_sql(d: &mut Db, sql: &str) {
     let mut it = sql.split_whitespace();
-    let verb = it.next().unwrap_or_default();
+    // Single-word statements arrive with their `;` — `COMMIT;`
+    // must still match, or the depth never unwinds and the next
+    // `beginTransaction` thinks a tx is already open.
+    let verb = it.next().unwrap_or_default().trim_end_matches(';');
     if verb.eq_ignore_ascii_case("begin") {
         d.tx_stack.push(false);
     } else if verb.eq_ignore_ascii_case("commit")

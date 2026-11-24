@@ -2739,8 +2739,13 @@ fn nio_call(vm: &mut Vm, class: &str, name: &str, args: &[V]) -> Option<Option<V
     // it was created — `read_at`/`put` index `base + pos`.
     let base =
         |vm: &Vm| i32v(pseudo_get(vm, this, P_BBUF_BASE).unwrap_or(V::I32(0))).max(0) as usize;
-    // Capacity in element units.
+    // Capacity in element units — a view (slice/duplicate) carries
+    // its own bound in P_BBUF_CAP; otherwise it spans to the backing
+    // array's end minus the byte offset.
     let blim_capacity = |vm: &Vm| -> usize {
+        if let Some(c) = pseudo_get(vm, this, P_BBUF_CAP) {
+            return i32v(c).max(0) as usize;
+        }
         backing(vm)
             .and_then(|b| match vm.heap.get(b) {
                 Some(Obj::Array { data, .. }) => Some(data.len()),
@@ -3006,7 +3011,7 @@ fn nio_call(vm: &mut Vm, class: &str, name: &str, args: &[V]) -> Option<Option<V
                 Some(Obj::Host { desc, .. }) => desc.clone(),
                 _ => "Ljava/nio/ByteBuffer;".to_string(),
             };
-            let (pos, lim, cap) = (bpos(vm), blim(vm), blim_capacity(vm));
+            let (pos, lim, parent_cap) = (bpos(vm), blim(vm), blim_capacity(vm));
             let es = esz(vm);
             let base_new = if name == "slice" {
                 base(vm) + pos * es
@@ -3029,9 +3034,13 @@ fn nio_call(vm: &mut Vm, class: &str, name: &str, args: &[V]) -> Option<Option<V
                     pseudo_set(vm, h, P_BBUF_RAW, V::I32(1));
                 }
                 if name == "slice" {
-                    // slice: position 0, limit = parent's remaining.
+                    // slice: position 0, limit AND capacity = the
+                    // parent's remaining — a clear() must not reopen
+                    // the parent's tail beyond the sliced window.
+                    let rem = lim.saturating_sub(pos);
                     pseudo_set(vm, h, P_BBUF_POS, V::I32(0));
-                    pseudo_set(vm, h, P_BBUF_LIM, V::I32(lim.saturating_sub(pos) as i32));
+                    pseudo_set(vm, h, P_BBUF_LIM, V::I32(rem as i32));
+                    pseudo_set(vm, h, P_BBUF_CAP, V::I32(rem as i32));
                 } else {
                     // duplicate: same position/limit, same window.
                     pseudo_set(vm, h, P_BBUF_POS, V::I32(pos as i32));
@@ -3039,8 +3048,11 @@ fn nio_call(vm: &mut Vm, class: &str, name: &str, args: &[V]) -> Option<Option<V
                         vm,
                         h,
                         P_BBUF_LIM,
-                        V::I32(if lim == cap { cap } else { lim } as i32),
+                        V::I32(if lim == parent_cap { parent_cap } else { lim } as i32),
                     );
+                    if pseudo_get(vm, this, P_BBUF_CAP).is_some() {
+                        pseudo_set(vm, h, P_BBUF_CAP, V::I32(parent_cap as i32));
+                    }
                 }
             }
             Some(Some(v))
@@ -3082,8 +3094,10 @@ fn nio_call(vm: &mut Vm, class: &str, name: &str, args: &[V]) -> Option<Option<V
             match name {
                 "put" => {
                     if args.len() > 2 && matches!(args[1], V::I32(_) | V::I64(_)) {
-                        // put(index, byte) — absolute, no cursor move.
-                        let pos = i32v(args[1]).max(0) as usize * es;
+                        // put(index, byte) — absolute index inside
+                        // this view's window, so re-base like read_at
+                        // does (a slice's index 0 is backing[base]).
+                        let pos = base(vm) + i32v(args[1]).max(0) as usize * es;
                         // elem_bytes is already endian-adjusted — the
                         // `put` closure would reverse it again.
                         let x = elem_bytes(vm, args[2]);

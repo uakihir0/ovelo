@@ -87,6 +87,11 @@ pub(crate) const P_BBUF_RAW: u64 = 0xFFFD_FF01;
 pub(crate) const P_BBUF_LIM: u64 = 0xFFFD_FF02;
 /// `mark()`'s saved position for `reset()`.
 pub(crate) const P_BBUF_MARK: u64 = 0xFFFD_FF03;
+/// View-buffer capacity in element units — a `slice()`'s capacity is
+/// the parent's remaining at slice time, not `backing.len - base`;
+/// without this `clear()` would widen the window past the sliced
+/// range into the parent's tail.
+pub(crate) const P_BBUF_CAP: u64 = 0xFFFD_FF04;
 /// `Message` routing: target `Handler`, payload `obj`, `callback`
 /// `Runnable` — and a `Handler`'s own `Handler.Callback` — so
 /// `obtainMessage(...).sendToTarget()`/`sendMessage` actually deliver
