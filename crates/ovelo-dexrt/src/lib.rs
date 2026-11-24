@@ -1494,10 +1494,29 @@ impl Vm {
         } else if name == "onDetachedFromWindow" {
             jdk::pseudo_set(self, this, jdk::view::P_ATTACHED, V::I32(0));
         }
-        let ci = self
-            .heap
-            .class_of(this)
-            .ok_or_else(|| errd("dexrt.bad_this", name.to_string()))?;
+        let Some(ci) = self.heap.class_of(this) else {
+            // `Obj::Class` mirrors carry no `class_idx` — as receivers their
+            // class is `java.lang.Class` itself. JNI by-name method ids for
+            // reflection APIs (`getDeclaredMethods`, `getSimpleName`, …)
+            // reach here as CallObjectMethod on a `jclass`; without this the
+            // call silently returned null.
+            if matches!(self.heap.get(this), Some(Obj::Class { .. })) {
+                let mut a = Vec::with_capacity(args.len() + 1);
+                a.push(V::Ref(this));
+                a.extend_from_slice(args);
+                let r = jdk::call(self, "Ljava/lang/Class;", name, "", &a).map_err(|e| {
+                    match e {
+                        E::Vm(v) => v,
+                        E::Throw(t) => {
+                            let d = self.describe_throw(t);
+                            errd("dexrt.exception.uncaught", d)
+                        }
+                    }
+                })?;
+                return Ok(r.flatten());
+            }
+            return Err(errd("dexrt.bad_this", name.to_string()));
+        };
         let Some(midx) = self.find_method_on_chain(ci, name, args.len())? else {
             // No dex override — a framework method (`View.layout`,
             // `View.measure`, …). Route it through the builtin
