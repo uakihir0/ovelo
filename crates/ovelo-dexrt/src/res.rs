@@ -338,11 +338,11 @@ impl ApkResources {
 
     /// Follow the winning bucket's references until an id with a
     /// stored path is reached (bounded against reference cycles).
-    fn resolve_path<'m>(
-        paths: &'m HashMap<u32, String>,
+    fn resolve_path(
+        paths: &HashMap<u32, String>,
         mut ref_target: impl FnMut(u32) -> Option<u32>,
         res_id: u32,
-    ) -> Option<&'m str> {
+    ) -> Option<&str> {
         let mut cur = res_id;
         for _ in 0..16 {
             if let Some(t) = ref_target(cur) {
