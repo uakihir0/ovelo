@@ -730,7 +730,12 @@ impl GuestUi {
                         }),
                         None => Box::new(SharedView(cv)),
                     };
-                    match idx {
+                    // Place at the dex child index when dex bookkeeping
+                    // already ran (fresh attach_at or a retried call the
+                    // builtin fallback handled): siblings added between
+                    // the original call and the retry would otherwise
+                    // shift this child past its dex position.
+                    match vm.view_child_index(this, child).or(idx) {
                         Some(i) if i <= gr.children.len() => gr.children.insert(i, boxed),
                         _ => gr.children.push(boxed),
                     }
