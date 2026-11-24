@@ -41,7 +41,7 @@ Legend:
 | Privacy Friendly Sudoku | `org.secuso.privacyfriendlysudoku` | 🟡 | SplashActivity → TutorialActivity transition runs fully in dex; Welcome screen renders real text (layout rough — overlapping strings). Unblocked by dex-enum `compareTo` fix (LifecycleRegistry sync) |
 | Aegis Authenticator | `com.beemdevelopment.aegis` | 🟢 | Intro wizard renders real content (Welcome slide + logo + import prompt); ViewPager2 page containers materialize. Layout rough (overlapping header) |
 | Markor | `net.gsantner.markor` | 🟢 | **Renders real UI**: Documents file list with real entries + dates, preview pane, FAB, bottom nav (Files/To-Do/QuickNote/LinkBox/More) |
-| Tasks.org | `org.tasks` | 🟡 | Full lifecycle completes (Hilt DI, libsqliteJni, kotlinx-datetime) — window blank pending Compose render path |
+| Tasks.org | `org.tasks` | 🟡 | Sign-in screen renders (Add account / Continue without sync / Import backup) — layout placement rough |
 
 ## Famous apps — assessment
 
