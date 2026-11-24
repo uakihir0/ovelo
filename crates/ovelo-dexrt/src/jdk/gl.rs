@@ -627,7 +627,7 @@ pub(crate) fn gl_frame(vm: &mut Vm, view: u32, w: i32, h: i32) -> Vec<CanvasOp> 
         eprintln!(
             "[gldbg] onDrawFrame {w}x{h} -> {} ops err={:?} first={:?}",
             ops.len(),
-            r.is_err(),
+            r.as_ref().err().map(|e| format!("{e}")),
             ops.iter().take(3).collect::<Vec<_>>()
         );
     }
@@ -1380,6 +1380,18 @@ pub(crate) fn call_static(
     let i = |n: usize| args.get(n).map(|v| i32v(*v)).unwrap_or(0);
     let f = |n: usize| args.get(n).map(f32v).unwrap_or(0.0);
     Ok(Some(match name {
+        "glGetString" => {
+            // Apps parse GL_EXTENSIONS for capability checks — a null
+            // or void result NPEs their probe (`Lv.d()` in 2048).
+            let s = match i(0) {
+                0x1F00 => "ovelo",                    // GL_VENDOR
+                0x1F01 => "ovelo GLES 2.0",           // GL_RENDERER
+                0x1F02 => "OpenGL ES 2.0 ovelo",      // GL_VERSION
+                0x1F03 => "OveloJIT",                 // GL_SHADING_LANGUAGE_VERSION
+                _ => "",                              // GL_EXTENSIONS
+            };
+            Some(V::Ref(vm.intern_str(s)))
+        }
         "glCreateShader" | "glCreateProgram" | "glGetAttribLocation" | "glGetUniformLocation" => {
             Some(V::I32(state(GL20, |s| {
                 if name.starts_with("glGet") {
