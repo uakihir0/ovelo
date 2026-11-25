@@ -2642,7 +2642,13 @@ fn charset_decode(vm: &mut Vm, args: &[V]) -> V {
                     .map(|v| i32v(v).max(0) as usize)
                     .unwrap_or(usize::MAX);
                 let cap = match vm.heap.get(*b) {
-                    Some(Obj::Array { data, .. }) => lim.min(data.len()).saturating_sub(base + pos),
+                    // Limits and positions are buffer-relative. In particular a
+                    // sliced buffer has both a nonzero backing base and a
+                    // limit relative to the slice; subtracting the base here
+                    // would shrink (or empty) the writable window twice.
+                    Some(Obj::Array { data, .. }) => lim
+                        .saturating_sub(pos)
+                        .min(data.len().saturating_sub(base + pos)),
                     _ => 0,
                 };
                 (*b, base, pos, cap)
@@ -3077,6 +3083,9 @@ fn nio_call(vm: &mut Vm, class: &str, name: &str, args: &[V]) -> Option<Option<V
         "remaining" => Some(Some(V::I32(blim(vm).saturating_sub(bpos(vm)) as i32))),
         "position" => {
             if args.len() > 1 {
+                if crate::dbg_flag("OVELO_NIODBG") {
+                    eprintln!("[nio] position#{this} {} -> {}", bpos(vm), i32v(args[1]));
+                }
                 pseudo_set(vm, this, P_BBUF_POS, args[1]);
                 Some(Some(args[0]))
             } else {
@@ -3087,6 +3096,9 @@ fn nio_call(vm: &mut Vm, class: &str, name: &str, args: &[V]) -> Option<Option<V
             // limit = position, position = 0 — the written region
             // becomes the readable one.
             let pos = bpos(vm) as i32;
+            if crate::dbg_flag("OVELO_NIODBG") {
+                eprintln!("[nio] flip#{this} pos={pos} lim={}", blim(vm));
+            }
             pseudo_set(vm, this, P_BBUF_LIM, V::I32(pos));
             pseudo_set(vm, this, P_BBUF_POS, V::I32(0));
             Some(Some(args[0]))
@@ -3131,6 +3143,9 @@ fn nio_call(vm: &mut Vm, class: &str, name: &str, args: &[V]) -> Option<Option<V
             let es = esz(vm);
             let (pos, lim) = (bpos(vm), blim(vm));
             let cap = blim_capacity(vm);
+            if crate::dbg_flag("OVELO_NIODBG") {
+                eprintln!("[nio] compact#{this} pos={pos} lim={lim} cap={cap}");
+            }
             if let Some(bh) = backing(vm).filter(|_| lim > pos) {
                 let bb = base(vm);
                 if let Some(Obj::Array { data, .. }) = vm.heap.get_mut(bh) {
