@@ -1587,6 +1587,39 @@ fn universal(vm: &mut Vm, class: &str, name: &str, sig: &str, args: &[V]) -> Rt<
             let c = collect::natural_cmp(vm, args[0], args[1]);
             Some(Some(V::I32(c)))
         }
+        // ----- host-minted kotlinx Main dispatcher -----
+        // `MainDispatcherLoader.loadMainDispatcher` is shimmed with a
+        // host object (the Android factory lives behind ServiceLoader).
+        // Default/IO/Unconfined are real dex schedulers, but calls on
+        // this one must still honor coroutine dispatch semantics: a
+        // missing boolean used to stub to false, which resumed `withContext`
+        // continuations inline on the main thread (Room then failed
+        // `assertNotMainThread`).
+        "isDispatchNeeded"
+            if args.len() >= 2
+                && matches!(args.first(), Some(V::Ref(h)) if matches!(
+                    vm.heap.get(*h),
+                    Some(Obj::Host { desc, .. }) if desc == "Lkotlinx/coroutines/MainCoroutineDispatcher;"
+                )) =>
+        {
+            main_thread(vm);
+            let on_main = vm.cur_thread == 0 || vm.cur_thread == vm.main_thread_h;
+            Some(Some(V::I32((!on_main) as i32)))
+        }
+        "dispatch" | "dispatchYield"
+            if args.len() >= 3
+                && matches!(args.first(), Some(V::Ref(h)) if matches!(
+                    vm.heap.get(*h),
+                    Some(Obj::Host { desc, .. }) if desc == "Lkotlinx/coroutines/MainCoroutineDispatcher;"
+                )) =>
+        {
+            if let Some(&V::Ref(r)) = args.get(2) {
+                if r != 0 {
+                    vm.enqueue_runnable(r, true);
+                }
+            }
+            Some(None)
+        }
         // ----- kotlinx CoroutineContext on host objects -----
         // `Dispatchers.getMain()` is a host-minted dispatcher: calls
         // like `context.get(Job.Key)` on it used to fall into

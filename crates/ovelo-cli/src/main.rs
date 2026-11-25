@@ -658,52 +658,24 @@ fn register_compat_shims(
             })) as ovelo_dexrt::HostCall,
         );
     }
-    // kotlinx-coroutines: `Dispatchers.getMain()` discovers the Android
-    // main dispatcher through ServiceLoader (empty here) and throws
-    // "Module with the Main dispatcher is missing". Hand out a host
-    // dispatcher — coroutine dispatch calls on it resolve to stubs and
-    // silently no-op until a real main-loop pump exists.
-    for (class, name, sig) in [
-        (
-            "Lkotlinx/coroutines/Dispatchers;",
-            "getMain",
-            "()Lkotlinx/coroutines/MainCoroutineDispatcher;",
-        ),
-        (
-            "Lkotlinx/coroutines/Dispatchers;",
-            "getDefault",
-            "()Lkotlinx/coroutines/CoroutineDispatcher;",
-        ),
-        (
-            "Lkotlinx/coroutines/Dispatchers;",
-            "getIO",
-            "()Lkotlinx/coroutines/CoroutineDispatcher;",
-        ),
-        (
-            "Lkotlinx/coroutines/Dispatchers;",
-            "getUnconfined",
-            "()Lkotlinx/coroutines/CoroutineDispatcher;",
-        ),
-        (
-            "Lkotlinx/coroutines/internal/MainDispatcherLoader;",
-            "loadMainDispatcher",
-            "()Lkotlinx/coroutines/MainCoroutineDispatcher;",
-        ),
-    ] {
-        let _ = v.register_host(
-            class,
-            name,
-            sig,
-            Rc::new(RefCell::new(move |vm: &mut ovelo_dexrt::Vm, _a: &[V]| {
-                Ok(Some(V::Ref(vm.heap.alloc(Obj::Host {
-                    class_idx: u64::MAX,
-                    desc: "Lkotlinx/coroutines/MainCoroutineDispatcher;".to_string(),
-                    fields: HashMap::new(),
-                    state: HostState::Empty,
-                }))))
-            })) as ovelo_dexrt::HostCall,
-        );
-    }
+    // kotlinx-coroutines: only the Android main dispatcher needs a host
+    // shim — `MainDispatcherLoader` discovers it through ServiceLoader
+    // (empty here) and otherwise manufactures a throwing placeholder.
+    // `Dispatchers.getMain()` then stores this singleton in dex statics,
+    // while Default/IO/Unconfined keep their real dex schedulers.
+    let _ = v.register_host(
+        "Lkotlinx/coroutines/internal/MainDispatcherLoader;",
+        "loadMainDispatcher",
+        "()Lkotlinx/coroutines/MainCoroutineDispatcher;",
+        Rc::new(RefCell::new(move |vm: &mut ovelo_dexrt::Vm, _a: &[V]| {
+            Ok(Some(V::Ref(vm.heap.alloc(Obj::Host {
+                class_idx: u64::MAX,
+                desc: "Lkotlinx/coroutines/MainCoroutineDispatcher;".to_string(),
+                fields: HashMap::new(),
+                state: HostState::Empty,
+            }))))
+        })) as ovelo_dexrt::HostCall,
+    );
     // androidx.profileinstaller: `ProfileInstallerInitializer` schedules
     // `writeProfile` on the first doFrame — under interpretation that
     // write churns for minutes while the window never opens. The
