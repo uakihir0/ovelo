@@ -395,7 +395,7 @@ pub(crate) fn call(
                             let millis = if nanos == 0 {
                                 0
                             } else {
-                                (nanos + 999_999) / 1_000_000
+                                nanos / 1_000_000 + i64::from(nanos % 1_000_000 != 0)
                             };
                             now_ms().saturating_add(millis)
                         }
