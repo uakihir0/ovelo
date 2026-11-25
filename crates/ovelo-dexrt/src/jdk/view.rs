@@ -5749,7 +5749,7 @@ pub(crate) fn dispatch_key(
             return Ok(true);
         }
     }
-    if vm.cur_activity != 0
+    Ok(vm.cur_activity != 0
         && vm
             .call_virtual_sig(
                 vm.cur_activity,
@@ -5758,11 +5758,7 @@ pub(crate) fn dispatch_key(
                 &[V::Ref(evt)],
             )?
             .map(|v| i32v(v) != 0)
-            .unwrap_or(false)
-    {
-        return Ok(true);
-    }
-    Ok(false)
+            .unwrap_or(false))
 }
 
 pub(crate) fn attach(vm: &mut Vm, parent: u32, child: V) {
