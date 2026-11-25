@@ -404,6 +404,13 @@ pub(crate) fn call(
                     "parkUntil" => args.last().copied().map(i64v).unwrap_or_default(),
                     _ => 0,
                 };
+                // parkNanos(0) is explicitly a non-blocking boundary in
+                // Java. Treating it as an inline drain can turn
+                // kotlinx's event-loop bookkeeping into a fatal VM park
+                // when no independent runnable happens to be queued.
+                if name == "parkNanos" && args.last().map(|v| i64v(*v)) == Some(0) {
+                    return Ok(Some(None));
+                }
                 if due_ms > now_ms() && vm.cur_runnable != 0 {
                     vm.sleep_until.insert(vm.cur_runnable, due_ms.max(0) as u64);
                     vm.park_waiters.insert(vm.cur_runnable);
