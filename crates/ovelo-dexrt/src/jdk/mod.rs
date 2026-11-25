@@ -1552,14 +1552,17 @@ fn universal(vm: &mut Vm, class: &str, name: &str, sig: &str, args: &[V]) -> Rt<
                 Some(Some(jdynstr(vm, &t)))
             }
         }
-        "hashCode" => Some(Some(lang::hashcode(vm, args))),
+        // Exact boxed owners implement value equality themselves below;
+        // Object/Number interface dispatches still use this value-aware
+        // universal path.
+        "hashCode" if !lang::primitive_type(class) => Some(Some(lang::hashcode(vm, args))),
         // `Arrays.equals` is a static deep-ish array comparison, not
         // Object.equals; let the collections module implement it. Treating
         // it as identity makes two freshly copied empty input arrays differ,
         // which breaks Compose `rememberSaveable` across recompositions.
-        "equals" if class != "Ljava/util/Arrays;" => Some(Some(V::I32(
-            (args.len() > 1 && value_eq(vm, args[0], args[1])) as i32,
-        ))),
+        "equals" if class != "Ljava/util/Arrays;" && !lang::primitive_type(class) => Some(Some(
+            V::I32((args.len() > 1 && value_eq(vm, args[0], args[1])) as i32),
+        )),
         "getClass" => {
             let d = class_of(vm, args[0]);
             Some(Some(class_obj(vm, d)))

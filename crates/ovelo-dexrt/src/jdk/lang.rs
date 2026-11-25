@@ -19,7 +19,7 @@ pub(crate) fn call(
         strbuf(vm, name, sig, args)?
     } else if boxed(class) {
         boxed_call(vm, class, name, sig, args)?
-    } else if desc_is_a(class, "Ljava/lang/Number;") {
+    } else if desc_is_a(class, "Ljava/lang/Number;") || class == "Ljava/lang/Comparable;" {
         number_call(vm, name, args)
     } else if class == "Ljava/lang/Math;" || class == "Ljava/lang/StrictMath;" {
         math_call(name, args)
@@ -795,6 +795,18 @@ fn prim(vm: &Vm, v: V) -> V {
     }
 }
 
+fn compare_prims(a: V, b: V) -> std::cmp::Ordering {
+    if matches!(a, V::F32(_) | V::F64(_)) || matches!(b, V::F32(_) | V::F64(_)) {
+        f64v(a)
+            .partial_cmp(&f64v(b))
+            .unwrap_or(std::cmp::Ordering::Greater)
+    } else if matches!(a, V::I64(_)) || matches!(b, V::I64(_)) {
+        i64v(a).cmp(&i64v(b))
+    } else {
+        i32v(a).cmp(&i32v(b))
+    }
+}
+
 fn boxed_call(
     vm: &mut Vm,
     class: &str,
@@ -858,6 +870,29 @@ fn boxed_call(
                 "floatValue" => V::F32(f64v(v) as f32),
                 _ => V::I32(i32v(v)),
             }))
+        }
+        // Boxed primitives are value objects. Falling through to
+        // Object.equals/hashCode makes every autoboxed emission distinct
+        // (kotlinx distinctUntilChanged/StateFlow then repeat forever).
+        "equals" => {
+            let (a, b) = (
+                prim(vm, args[0]),
+                prim(vm, args.get(1).copied().unwrap_or(V::Ref(0))),
+            );
+            let same = if matches!(a, V::F32(_) | V::F64(_)) || matches!(b, V::F32(_) | V::F64(_)) {
+                f64v(a) == f64v(b)
+            } else {
+                a == b
+            };
+            Some(Some(V::I32(same as i32)))
+        }
+        "hashCode" if matches!(args[0], V::Ref(_)) => Some(Some(v_hash(prim(vm, args[0])))),
+        "compareTo" => {
+            let c = compare_prims(
+                prim(vm, args[0]),
+                prim(vm, args.get(1).copied().unwrap_or(V::I32(0))),
+            );
+            Some(Some(V::I32(c as i32)))
         }
         "valueOf" => {
             let p = params(sig);
@@ -1286,6 +1321,11 @@ fn number_call(vm: &mut Vm, name: &str, args: &[V]) -> Option<Option<V>> {
         "byteValue" => V::I32(i32v(v) as i8 as i32),
         "doubleValue" => V::F64(f64v(v)),
         "floatValue" => V::F32(f64v(v) as f32),
+        // `Comparable.compareTo` often arrives under the Number owner
+        // after interface dispatch; boxed values still order by value.
+        "compareTo" => {
+            V::I32(compare_prims(v, prim(vm, args.get(1).copied().unwrap_or(V::I32(0)))) as i32)
+        }
         _ => return None,
     }))
 }
