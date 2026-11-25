@@ -5,6 +5,7 @@
 use super::{i32v, jdynstr, pseudo_get, pseudo_set, sv};
 use crate::value::{Obj, V};
 use crate::Vm;
+use ovelo_error::Result;
 use std::cell::RefCell;
 use std::rc::Rc;
 
@@ -687,30 +688,48 @@ fn scan_json_string(text: &str, start_byte: usize, start_java: i32) -> Option<Sc
     None
 }
 
-fn invoke_string_lexer_dex(
+fn invoke_string_lexer_dex_rt(
     vm: &mut Vm,
     h: u32,
     name: &str,
     params: &[&str],
     extra: &[V],
-) -> Option<V> {
-    let ci = vm.heap.class_of(h)?;
-    let midx = vm
-        .find_method_on_chain_sig(ci, name, params)
-        .ok()
-        .flatten()?;
+) -> crate::Rt<Option<V>> {
+    let Some(ci) = vm.heap.class_of(h) else {
+        return Ok(None);
+    };
+    let Some(midx) = vm.find_method_on_chain_sig(ci, name, params).ok().flatten() else {
+        return Ok(None);
+    };
     let mut args = Vec::with_capacity(extra.len() + 1);
     args.push(V::Ref(h));
     args.extend_from_slice(extra);
     vm.invoke_no_host(midx, args, crate::InvokeKind::Virtual)
-        .ok()
-        .flatten()
+}
+
+fn string_lexer_dex_or_throw(
+    vm: &mut Vm,
+    h: u32,
+    name: &str,
+    params: &[&str],
+    extra: &[V],
+) -> Result<Option<V>> {
+    match invoke_string_lexer_dex_rt(vm, h, name, params, extra) {
+        Ok(out) => Ok(out),
+        Err(crate::E::Throw(t)) => {
+            vm.host_throw = Some(t);
+            // The invoke dispatcher turns `host_throw` back into E::Throw;
+            // this placeholder is never delivered to guest code.
+            Ok(Some(V::Ref(0)))
+        }
+        Err(crate::E::Vm(e)) => Err(e),
+    }
 }
 
 fn consume_key_string_string_fast(vm: &mut Vm, args: &[V]) -> Option<V> {
     let h = this(args);
     if !is_exact_string_lexer(vm, h) {
-        return invoke_string_lexer_dex(vm, h, "consumeKeyString", &[], &[]);
+        return None;
     }
     let entry = lexer_pos(vm, h);
     let scan = with_string_source(vm, h, |text| {
@@ -739,8 +758,7 @@ fn consume_key_string_string_fast(vm: &mut Vm, args: &[V]) -> Option<V> {
 fn skip_whitespaces_string_fast(vm: &mut Vm, args: &[V]) -> Option<V> {
     let h = this(args);
     if !is_exact_string_lexer(vm, h) {
-        return invoke_string_lexer_dex(vm, h, "skipWhitespaces", &[], &[])
-            .map(|v| V::I32(i32v(v)));
+        return None;
     }
     let pos = lexer_pos(vm, h);
     if pos < 0 {
@@ -760,10 +778,10 @@ fn register_string_lexer(vm: &mut Vm) {
         "consumeKeyString",
         "()Ljava/lang/String;",
         Rc::new(RefCell::new(|vm: &mut Vm, a: &[V]| {
-            let out = consume_key_string_string_fast(vm, a)
-                .or_else(|| invoke_string_lexer_dex(vm, this(a), "consumeKeyString", &[], &[]))
-                .unwrap_or(V::Ref(0));
-            Ok(Some(out))
+            if let Some(out) = consume_key_string_string_fast(vm, a) {
+                return Ok(Some(out));
+            }
+            string_lexer_dex_or_throw(vm, this(a), "consumeKeyString", &[], &[])
         })) as crate::HostCall,
     );
     let _ = vm.register_host(
@@ -771,10 +789,10 @@ fn register_string_lexer(vm: &mut Vm) {
         "skipWhitespaces",
         "()I",
         Rc::new(RefCell::new(|vm: &mut Vm, a: &[V]| {
-            let out = skip_whitespaces_string_fast(vm, a)
-                .or_else(|| invoke_string_lexer_dex(vm, this(a), "skipWhitespaces", &[], &[]))
-                .unwrap_or(V::I32(-1));
-            Ok(Some(out))
+            if let Some(out) = skip_whitespaces_string_fast(vm, a) {
+                return Ok(Some(out));
+            }
+            string_lexer_dex_or_throw(vm, this(a), "skipWhitespaces", &[], &[])
         })) as crate::HostCall,
     );
     // StringJsonLexer.getSource is a one-field getter, but the dex body is

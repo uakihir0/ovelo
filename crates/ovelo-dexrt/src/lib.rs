@@ -472,6 +472,10 @@ pub struct Vm {
     /// wiring, host-view materialization) did not — retry once the
     /// outer borrow is released, on the next drain tick.
     pub(crate) pending_host_retry: Vec<(GIdx, Vec<V>)>,
+    /// Throwable a registered host callback wants the invoke dispatch
+    /// to raise as a guest exception (host callbacks themselves cannot
+    /// return `E::Throw`).
+    pub(crate) host_throw: Option<u32>,
     /// Set while the drain loop replays `pending_host_retry` — lets a
     /// bridged method tell a retried invocation from a fresh one
     /// (the builtin fallback already ran the dex side).
@@ -823,6 +827,7 @@ impl Vm {
             pending_surface: Vec::new(),
             surface_cbs: Vec::new(),
             pending_host_retry: Vec::new(),
+            host_throw: None,
             in_host_retry: false,
             surface_sizes: HashMap::new(),
             thread_runnables: std::collections::HashSet::new(),
@@ -4371,6 +4376,9 @@ impl Vm {
             match f.try_borrow_mut() {
                 Ok(mut g) => {
                     let r = g(self, args).map_err(E::Vm);
+                    if let Some(h) = self.host_throw.take() {
+                        return Err(E::Throw(h));
+                    }
                     // A registered host ctor bypasses view::call's Context
                     // capture — record the ctx arg here too so `getContext()`
                     // resolves to the real Activity for dex-instantiated views
