@@ -2,7 +2,7 @@
 //! Their algorithms and externally visible state remain the dex object
 //! model; only the byte/char scanning loops execute natively.
 
-use super::{i32v, jdynstr, sv};
+use super::{i32v, jdynstr, pseudo_get, pseudo_set, sv};
 use crate::value::{Obj, V};
 use crate::Vm;
 use std::cell::RefCell;
@@ -559,7 +559,222 @@ fn register_lexer(vm: &mut Vm) {
     );
 }
 
+const P_SLEXER_JAVA_POS: u64 = 0xFFFD_FC71;
+const P_SLEXER_BYTE_POS: u64 = 0xFFFD_FC72;
+
+fn is_exact_string_lexer(vm: &Vm, h: u32) -> bool {
+    vm.heap
+        .class_of(h)
+        .and_then(|ci| vm.type_desc_of(ci).ok())
+        .is_some_and(|d| d == SLEXER)
+}
+
+fn with_string_source<R>(vm: &Vm, h: u32, f: impl FnOnce(&str) -> R) -> Option<R> {
+    let V::Ref(sh) = field(vm, h, SLEXER, "source")? else {
+        return None;
+    };
+    match vm.heap.get(sh) {
+        Some(Obj::Str(text)) => Some(f(text)),
+        _ => None,
+    }
+}
+
+fn byte_for_java(text: &str, start_byte: usize, start_java: i32, target: i32) -> Option<usize> {
+    if target < start_java {
+        return None;
+    }
+    let mut java = start_java;
+    for (off, ch) in text.get(start_byte..)?.char_indices() {
+        if java == target {
+            return Some(start_byte + off);
+        }
+        java = java.checked_add(ch.len_utf16() as i32)?;
+        if java > target {
+            return None;
+        }
+    }
+    (java == target).then_some(text.len())
+}
+
+fn slexer_byte_pos(vm: &Vm, h: u32, text: &str, java: i32) -> Option<usize> {
+    let (mj, mb) = match (
+        pseudo_get(vm, h, P_SLEXER_JAVA_POS).map(i32v),
+        pseudo_get(vm, h, P_SLEXER_BYTE_POS).map(i32v),
+    ) {
+        (Some(j), Some(b)) if j <= java && b >= 0 => (j, b as usize),
+        _ => (0, 0),
+    };
+    byte_for_java(text, mb, mj, java)
+}
+
+fn mark_slexer_pos(vm: &mut Vm, h: u32, java: i32, byte: usize) {
+    set_lexer_pos(vm, h, java);
+    pseudo_set(vm, h, P_SLEXER_JAVA_POS, V::I32(java));
+    pseudo_set(vm, h, P_SLEXER_BYTE_POS, V::I32(byte as i32));
+}
+
+fn skip_ws_units(text: &str, mut byte: usize, mut java: i32) -> (usize, i32) {
+    while byte < text.len() && matches!(text.as_bytes()[byte], b' ' | b'\n' | b'\r' | b'\t') {
+        byte += 1;
+        java += 1;
+    }
+    (byte, java)
+}
+
+struct ScannedString {
+    end_java: i32,
+    end_byte: usize,
+    slice_end: usize,
+    units: Vec<u16>,
+    escaped: bool,
+}
+
+fn scan_json_string(text: &str, start_byte: usize, start_java: i32) -> Option<ScannedString> {
+    let mut chars = text.get(start_byte..)?.char_indices();
+    let mut java = start_java;
+    let mut units = Vec::new();
+    let mut escaped = false;
+    let mut segment_start = 0usize;
+    while let Some((off, ch)) = chars.next() {
+        match ch {
+            '"' => {
+                if escaped {
+                    units.extend(text[start_byte + segment_start..start_byte + off].encode_utf16());
+                }
+                return Some(ScannedString {
+                    end_java: java + 1,
+                    end_byte: start_byte + off + 1,
+                    slice_end: start_byte + off,
+                    units,
+                    escaped,
+                });
+            }
+            '\\' => {
+                escaped = true;
+                units.extend(text[start_byte + segment_start..start_byte + off].encode_utf16());
+                let (eoff, esc) = chars.next()?;
+                let mut used = 1 + esc.len_utf16() as i32;
+                let mut next_byte = start_byte + eoff + esc.len_utf8();
+                match esc {
+                    '"' => units.push(34),
+                    '\\' => units.push(92),
+                    '/' => units.push(47),
+                    'b' => units.push(8),
+                    'f' => units.push(12),
+                    'n' => units.push(10),
+                    'r' => units.push(13),
+                    't' => units.push(9),
+                    'u' => {
+                        let mut value = 0u16;
+                        for _ in 0..4 {
+                            let (doff, digit) = chars.next()?;
+                            used += digit.len_utf16() as i32;
+                            next_byte = start_byte + doff + digit.len_utf8();
+                            value = (value << 4) | digit.to_digit(16)? as u16;
+                        }
+                        units.push(value);
+                    }
+                    _ => return None,
+                }
+                java += used;
+                segment_start = next_byte - start_byte;
+            }
+            _ => java += ch.len_utf16() as i32,
+        }
+    }
+    None
+}
+
+fn invoke_string_lexer_dex(
+    vm: &mut Vm,
+    h: u32,
+    name: &str,
+    params: &[&str],
+    extra: &[V],
+) -> Option<V> {
+    let ci = vm.heap.class_of(h)?;
+    let midx = vm
+        .find_method_on_chain_sig(ci, name, params)
+        .ok()
+        .flatten()?;
+    let mut args = Vec::with_capacity(extra.len() + 1);
+    args.push(V::Ref(h));
+    args.extend_from_slice(extra);
+    vm.invoke_no_host(midx, args, crate::InvokeKind::Virtual)
+        .ok()
+        .flatten()
+}
+
+fn consume_key_string_string_fast(vm: &mut Vm, args: &[V]) -> Option<V> {
+    let h = this(args);
+    if !is_exact_string_lexer(vm, h) {
+        return invoke_string_lexer_dex(vm, h, "consumeKeyString", &[], &[]);
+    }
+    let entry = lexer_pos(vm, h);
+    let scan = with_string_source(vm, h, |text| {
+        let quote_byte = slexer_byte_pos(vm, h, text, entry)?;
+        let (quote_byte, quote_java) = skip_ws_units(text, quote_byte, entry);
+        if text.as_bytes().get(quote_byte) != Some(&b'"') {
+            return None;
+        }
+        let start_java = quote_java + 1;
+        let start_byte = quote_byte + 1;
+        scan_json_string(text, start_byte, start_java).map(|s| (start_byte, s))
+    })??;
+    let (start_byte, scan) = scan;
+    let out = if scan.escaped {
+        let text = String::from_utf16_lossy(&scan.units);
+        jdynstr(vm, &text)
+    } else {
+        with_string_source(vm, h, |text| text[start_byte..scan.slice_end].to_string())
+            .map(|s| jdynstr(vm, &s))
+            .unwrap_or(V::Ref(0))
+    };
+    mark_slexer_pos(vm, h, scan.end_java, scan.end_byte);
+    Some(out)
+}
+
+fn skip_whitespaces_string_fast(vm: &mut Vm, args: &[V]) -> Option<V> {
+    let h = this(args);
+    if !is_exact_string_lexer(vm, h) {
+        return invoke_string_lexer_dex(vm, h, "skipWhitespaces", &[], &[])
+            .map(|v| V::I32(i32v(v)));
+    }
+    let pos = lexer_pos(vm, h);
+    if pos < 0 {
+        return Some(V::I32(pos));
+    }
+    let scanned = with_string_source(vm, h, |text| {
+        let byte = slexer_byte_pos(vm, h, text, pos)?;
+        Some(skip_ws_units(text, byte, pos))
+    })??;
+    mark_slexer_pos(vm, h, scanned.1, scanned.0);
+    Some(V::I32(scanned.1))
+}
+
 fn register_string_lexer(vm: &mut Vm) {
+    let _ = vm.register_host(
+        SLEXER,
+        "consumeKeyString",
+        "()Ljava/lang/String;",
+        Rc::new(RefCell::new(|vm: &mut Vm, a: &[V]| {
+            let out = consume_key_string_string_fast(vm, a)
+                .or_else(|| invoke_string_lexer_dex(vm, this(a), "consumeKeyString", &[], &[]))
+                .unwrap_or(V::Ref(0));
+            Ok(Some(out))
+        })) as crate::HostCall,
+    );
+    let _ = vm.register_host(
+        SLEXER,
+        "skipWhitespaces",
+        "()I",
+        Rc::new(RefCell::new(|vm: &mut Vm, a: &[V]| {
+            let out = skip_whitespaces_string_fast(vm, a)
+                .or_else(|| invoke_string_lexer_dex(vm, this(a), "skipWhitespaces", &[], &[]))
+                .unwrap_or(V::I32(-1));
+            Ok(Some(out))
+        })) as crate::HostCall,
+    );
     // StringJsonLexer.getSource is a one-field getter, but the dex body is
     // invoked once for every scanned character in consumeKeyString. Keep the
     // exact field semantics while avoiding two nested virtual invocations.
