@@ -584,11 +584,11 @@ fn byte_for_java(text: &str, start_byte: usize, start_java: i32, target: i32) ->
         return None;
     }
     let mut java = start_java;
-    for (off, ch) in text.get(start_byte..)?.char_indices() {
+    for (off, _ch) in text.get(start_byte..)?.char_indices() {
         if java == target {
             return Some(start_byte + off);
         }
-        java = java.checked_add(ch.len_utf16() as i32)?;
+        java = java.checked_add(1)?;
         if java > target {
             return None;
         }
@@ -679,7 +679,9 @@ fn scan_json_string(text: &str, start_byte: usize, start_java: i32) -> Option<Sc
                 java += used;
                 segment_start = next_byte - start_byte;
             }
-            _ => java += ch.len_utf16() as i32,
+            // Runtime strings index Unicode scalar values (see String.length/charAt),
+            // not UTF-16 units.
+            _ => java += 1,
         }
     }
     None
