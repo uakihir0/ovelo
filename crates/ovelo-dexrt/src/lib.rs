@@ -6591,7 +6591,11 @@ impl Vm {
                 let f = self.canon_field(gi(fl));
                 let owner =
                     self.canon(gi(self.dexes[di].field(fl).map_err(E::Vm)?.class_idx as u32));
-                self.ensure_init(owner)?;
+                let main_dispatcher_static = self.dbg_field_name(f)
+                    == "Lkotlinx/coroutines/internal/MainDispatcherLoader;.dispatcher";
+                if !main_dispatcher_static {
+                    self.ensure_init(owner)?;
+                }
                 let stored = self
                     .classes
                     .entry(owner)
@@ -6615,34 +6619,45 @@ impl Vm {
                         "[sgetdbg] miss {cname}.{fname} fl={fl} f={f:?} owner={owner:?} stored={stored:?} keys={keys:?}"
                     );
                 }
-                let v = match stored {
-                    Some(v) => v,
-                    // A static on a host-provided class (Build.VERSION,
-                    // Charset constants) comes from the builtin table —
-                    // the type default would silently lie (SDK_INT == 0
-                    // flips every `>= O` gate to the legacy path).
-                    None if self.def_of(owner).is_none() => {
-                        let v = self
-                            .builtin_sfield(f)
-                            .unwrap_or_else(|| self.field_default(f).unwrap_or(V::I32(0)));
-                        // Cache reference constants — enum singletons and
-                        // Charset/Locale objects rely on `==` identity.
-                        if matches!(v, V::Ref(h) if h != 0) {
+                let v = if main_dispatcher_static {
+                    match stored {
+                        Some(v) => v,
+                        None => {
+                            let v = jdk::main_dispatcher(self);
                             self.classes.entry(owner).or_default().statics.insert(f, v);
+                            v
                         }
-                        v
                     }
-                    None => {
-                        // A static on a guest class carries its
-                        // initializer in the dex `static_values` array —
-                        // that's where every `R.*` constant lives.
-                        let v = self
-                            .encoded_static(owner, f)
-                            .unwrap_or_else(|| self.field_default(f).unwrap_or(V::I32(0)));
-                        if matches!(v, V::Ref(h) if h != 0) {
-                            self.classes.entry(owner).or_default().statics.insert(f, v);
+                } else {
+                    match stored {
+                        Some(v) => v,
+                        // A static on a host-provided class (Build.VERSION,
+                        // Charset constants) comes from the builtin table —
+                        // the type default would silently lie (SDK_INT == 0
+                        // flips every `>= O` gate to the legacy path).
+                        None if self.def_of(owner).is_none() => {
+                            let v = self
+                                .builtin_sfield(f)
+                                .unwrap_or_else(|| self.field_default(f).unwrap_or(V::I32(0)));
+                            // Cache reference constants — enum singletons and
+                            // Charset/Locale objects rely on `==` identity.
+                            if matches!(v, V::Ref(h) if h != 0) {
+                                self.classes.entry(owner).or_default().statics.insert(f, v);
+                            }
+                            v
                         }
-                        v
+                        None => {
+                            // A static on a guest class carries its
+                            // initializer in the dex `static_values` array —
+                            // that's where every `R.*` constant lives.
+                            let v = self
+                                .encoded_static(owner, f)
+                                .unwrap_or_else(|| self.field_default(f).unwrap_or(V::I32(0)));
+                            if matches!(v, V::Ref(h) if h != 0) {
+                                self.classes.entry(owner).or_default().statics.insert(f, v);
+                            }
+                            v
+                        }
                     }
                 };
                 set!(regs[0], v);
