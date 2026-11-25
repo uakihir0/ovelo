@@ -5722,27 +5722,19 @@ pub(crate) fn dispatch_key(
         // KeyEvents so Compose's key-input node can consume them.
         if action == 0 && unicode != 0 {
             if let Some(ch) = char::from_u32(unicode as u32) {
-                let text = jstr(vm, &ch.to_string());
-                if call_input(
-                    vm,
-                    ime_view,
-                    "commitText",
-                    &["Ljava/lang/CharSequence;", "I"],
-                    &[text, V::I32(1)],
-                )? {
-                    return Ok(true);
+                if !ch.is_control() {
+                    let text = jstr(vm, &ch.to_string());
+                    if call_input(
+                        vm,
+                        ime_view,
+                        "commitText",
+                        &["Ljava/lang/CharSequence;", "I"],
+                        &[text, V::I32(1)],
+                    )? {
+                        return Ok(true);
+                    }
                 }
             }
-        } else if matches!(keycode, 19 | 20 | 21 | 22 | 61 | 66 | 67 | 111 | 112)
-            && call_input(
-                vm,
-                ime_view,
-                "sendKeyEvent",
-                &["Landroid/view/KeyEvent;"],
-                &[V::Ref(evt)],
-            )?
-        {
-            return Ok(true);
         }
     }
 
