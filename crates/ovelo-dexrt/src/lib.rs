@@ -3712,6 +3712,14 @@ impl Vm {
         if Self::builtin_supers(sub).contains(&sup) || jdk::host_supers(sub).contains(&sup) {
             return true;
         }
+        // Prefer the dex-aware walk when both types are referenced: it
+        // traverses interfaces as well as superclasses. The descriptor-only
+        // superclass fallback below cannot see `implements` edges (Ktor's
+        // ByteChannel -> ByteReadChannel being one), so reflection-driven
+        // type checks otherwise reject valid implementations.
+        if let (Some(sub_g), Some(sup_g)) = (self.type_index_of(sub), self.type_index_of(sup)) {
+            return self.assignable(sub_g, sup_g);
+        }
         // `super_desc` resolves dex class_defs first, then host_supers —
         // a dex ViewGroup subclass (custom RecyclerView etc.) walks
         // through androidx up to the framework class.
