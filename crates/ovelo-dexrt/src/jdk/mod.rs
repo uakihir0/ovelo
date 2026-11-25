@@ -107,6 +107,10 @@ pub(crate) const P_MSG_TARGET: u64 = 0xFFFD_FEE4;
 pub(crate) const P_MSG_OBJ: u64 = 0xFFFD_FEE5;
 pub(crate) const P_MSG_CALLBACK: u64 = 0xFFFD_FEE6;
 pub(crate) const P_HANDLER_CB: u64 = 0xFFFD_FEE7;
+/// `Handler`'s bound looper — kotlinx's real dex `HandlerContext`
+/// compares `Looper.myLooper()` with `handler.getLooper()` to decide
+/// whether a main-dispatch can run inline.
+pub(crate) const P_HANDLER_LOOPER: u64 = 0xFFFD_FEED;
 pub(crate) const P_MSG_WHAT: u64 = 0xFFFD_FEE8;
 /// A `LayerDrawable`/`TransitionDrawable`'s `Drawable[]` layers — kept as
 /// a fields entry so the renderer's bitmap field-walk reaches the
@@ -368,6 +372,45 @@ fn dispatch_task(vm: &mut Vm, r: u32) -> std::result::Result<Option<V>, ovelo_er
     vm.call_virtual(r, "run", &[])
 }
 
+/// Construct the real kotlinx-coroutines-android main dispatcher.
+/// ServiceLoader metadata is not available to the guest runtime, so
+/// `MainDispatcherLoader` otherwise falls into its missing-dispatcher
+/// path. The APK does ship `HandlerContext`; instantiate it with the
+/// runtime main handler and let its dex implementation provide the
+/// coroutine-context behavior (`plus`/`fold`/`getKey`) that a host
+/// placeholder cannot reproduce faithfully.
+pub(crate) fn main_dispatcher(vm: &mut Vm) -> V {
+    if vm.main_dispatcher_h != 0 {
+        return V::Ref(vm.main_dispatcher_h);
+    }
+    let looper = main_looper(vm);
+    let hh = vm.alloc_host("Landroid/os/Handler;", HostState::Empty);
+    pseudo_set(vm, hh, P_HANDLER_LOOPER, looper);
+    match vm.instantiate_with(
+        "Lkotlinx/coroutines/android/HandlerContext;",
+        &[V::Ref(hh), V::Ref(0), V::I32(0)],
+    ) {
+        Ok(h) => {
+            vm.main_dispatcher_h = h;
+            return V::Ref(h);
+        }
+        Err(e) => {
+            if crate::dbg_flag("OVELO_STUBDBG") {
+                eprintln!("[maindisp] HandlerContext failed: {e}");
+            }
+        }
+    }
+    let V::Ref(h) = host(
+        vm,
+        "Lkotlinx/coroutines/MainCoroutineDispatcher;",
+        HostState::Empty,
+    ) else {
+        unreachable!()
+    };
+    vm.main_dispatcher_h = h;
+    V::Ref(h)
+}
+
 pub(crate) fn run_on_worker(
     vm: &mut Vm,
     r: u32,
@@ -605,7 +648,15 @@ pub(crate) fn value_eq(vm: &Vm, a: V, b: V) -> bool {
                                 | "Ljava/lang/Float;"
                                 | "Ljava/lang/Double;"
                         )
-                        && value_eq(vm, *a, *b)
+                        && match (da.as_str(), *a, *b) {
+                            ("Ljava/lang/Float;", V::F32(x), V::F32(y)) => {
+                                x.to_bits() == y.to_bits() || (x.is_nan() && y.is_nan())
+                            }
+                            ("Ljava/lang/Double;", V::F64(x), V::F64(y)) => {
+                                x.to_bits() == y.to_bits() || (x.is_nan() && y.is_nan())
+                            }
+                            _ => value_eq(vm, *a, *b),
+                        }
                 }
                 // `new String(x)` mirrors its text under P_DATA on a
                 // Host object instead of carrying an interned `Str`
@@ -1487,7 +1538,11 @@ fn universal(vm: &mut Vm, class: &str, name: &str, sig: &str, args: &[V]) -> Rt<
             }
         }
         "hashCode" => Some(Some(lang::hashcode(vm, args))),
-        "equals" => Some(Some(V::I32(
+        // `Arrays.equals` is a static deep-ish array comparison, not
+        // Object.equals; let the collections module implement it. Treating
+        // it as identity makes two freshly copied empty input arrays differ,
+        // which breaks Compose `rememberSaveable` across recompositions.
+        "equals" if class != "Ljava/util/Arrays;" => Some(Some(V::I32(
             (args.len() > 1 && value_eq(vm, args[0], args[1])) as i32,
         ))),
         "getClass" => {

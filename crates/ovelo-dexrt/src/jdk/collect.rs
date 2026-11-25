@@ -2052,12 +2052,44 @@ fn arrays_static(vm: &mut Vm, name: &str, _sig: &str, args: &[V]) -> Rt<Option<O
         }
         "hashCode" | "deepHashCode" => Some(Some(V::I32(1))),
         "equals" | "deepEquals" => {
-            let eq = match (args[0], args[1]) {
+            let arrays = match (args[0], args[1]) {
                 (V::Ref(a), V::Ref(b)) => match (vm.heap.get(a), vm.heap.get(b)) {
-                    (Some(Obj::Array { data: x, .. }), Some(Obj::Array { data: y, .. })) => x == y,
-                    _ => a == b,
+                    (
+                        Some(Obj::Array { elem: ex, data: x }),
+                        Some(Obj::Array { elem: ey, data: y }),
+                    ) => Some((ex.clone(), x.clone(), ey.clone(), y.clone())),
+                    _ => None,
                 },
-                (a, b) => a == b,
+                _ => None,
+            };
+            let eq = if let Some((ex, x, _ey, y)) = arrays {
+                if x.len() != y.len() {
+                    false
+                } else {
+                    let mut all_eq = true;
+                    for (&a, &b) in x.iter().zip(y.iter()) {
+                        let one = match (ex.as_str(), a, b) {
+                            // Java primitive array equality uses the same
+                            // bit-level rules as Float/Double.equals: NaN is
+                            // equal to itself, while +0.0 and -0.0 differ.
+                            ("F", V::F32(a), V::F32(b)) => {
+                                a.to_bits() == b.to_bits() || (a.is_nan() && b.is_nan())
+                            }
+                            ("D", V::F64(a), V::F64(b)) => {
+                                a.to_bits() == b.to_bits() || (a.is_nan() && b.is_nan())
+                            }
+                            _ if ex.starts_with('L') || ex.starts_with('[') => elem_eq(vm, a, b)?,
+                            _ => a == b,
+                        };
+                        if !one {
+                            all_eq = false;
+                            break;
+                        }
+                    }
+                    all_eq
+                }
+            } else {
+                args[0] == args[1]
             };
             Some(Some(V::I32(eq as i32)))
         }
