@@ -84,6 +84,19 @@ pub enum Obj {
     },
 }
 
+/// Streaming message-digest state.
+#[derive(Debug)]
+pub enum DigestState {
+    /// SHA-1.
+    Sha1(sha1::Sha1),
+    /// SHA-256.
+    Sha256(sha2::Sha256),
+    /// SHA-384.
+    Sha384(sha2::Sha384),
+    /// SHA-512.
+    Sha512(sha2::Sha512),
+}
+
 /// Builtin payload of a [`Obj::Host`]. Objects whose class needs no
 /// internal state carry `Empty` — methods then key off the descriptor.
 #[derive(Debug)]
@@ -104,6 +117,8 @@ pub enum HostState {
     Slot(V),
     /// A filesystem path (`java.io.File`).
     Path(String),
+    /// A streaming `java.security.MessageDigest`.
+    Digest(Box<DigestState>),
     /// A regex pattern string (`java.util.regex.Pattern`).
     Regex(String),
     /// A readable byte stream (`InputStream` over real bytes — raw
