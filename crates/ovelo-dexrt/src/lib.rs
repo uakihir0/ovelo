@@ -3556,6 +3556,21 @@ impl Vm {
             ],
             // java.io exception tree — `catch (IOException)` sites (Glide's
             // header parse, stream wrappers) must see the subtype.
+            "Ljava/nio/file/FileSystemException;" => &[
+                "Ljava/io/IOException;",
+                "Ljava/lang/Exception;",
+                "Ljava/lang/Throwable;",
+                "Ljava/lang/Object;",
+            ],
+            "Ljava/nio/file/FileAlreadyExistsException;"
+            | "Ljava/nio/file/NoSuchFileException;"
+            | "Ljava/nio/file/DirectoryNotEmptyException;" => &[
+                "Ljava/nio/file/FileSystemException;",
+                "Ljava/io/IOException;",
+                "Ljava/lang/Exception;",
+                "Ljava/lang/Throwable;",
+                "Ljava/lang/Object;",
+            ],
             "Ljava/io/IOException;" => &[
                 "Ljava/lang/Exception;",
                 "Ljava/lang/Throwable;",
@@ -3563,10 +3578,6 @@ impl Vm {
             ],
             "Ljava/io/EOFException;"
             | "Ljava/io/FileNotFoundException;"
-            | "Ljava/nio/file/FileSystemException;"
-            | "Ljava/nio/file/FileAlreadyExistsException;"
-            | "Ljava/nio/file/NoSuchFileException;"
-            | "Ljava/nio/file/DirectoryNotEmptyException;"
             | "Ljava/io/InterruptedIOException;"
             | "Ljava/io/MalformedURLException;"
             | "Ljava/io/ObjectStreamException;"
