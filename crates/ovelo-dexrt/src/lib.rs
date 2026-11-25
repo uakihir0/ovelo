@@ -375,6 +375,9 @@ pub struct Vm {
     /// `midx` → display name `Lcls;.name(sig)ret` — `last_call` was
     /// formatting one per invoke.
     method_desc_cache: std::cell::RefCell<HashMap<GIdx, std::rc::Rc<str>>>,
+    /// `midx` → whether it is `Dispatchers.getMain` — decoded once instead
+    /// of decoding class/name strings for every static invoke.
+    main_getter_cache: std::cell::RefCell<HashMap<GIdx, bool>>,
     /// `(referenced midx, receiver class, defined-fallback?)` → resolved
     /// dispatch `Loc` — `resolve_virtual` re-walked the superclass chain
     /// decoding every candidate's name+proto on every invoke.
@@ -856,6 +859,7 @@ impl Vm {
             pcmap_cache: std::cell::RefCell::new(HashMap::new()),
             reg_pool: Vec::new(),
             method_desc_cache: std::cell::RefCell::new(HashMap::new()),
+            main_getter_cache: std::cell::RefCell::new(HashMap::new()),
             resolve_cache: std::cell::RefCell::new(HashMap::new()),
             canon_field_cache: std::cell::RefCell::new(HashMap::new()),
             host_named_cache: std::cell::RefCell::new(HashMap::new()),
@@ -898,6 +902,7 @@ impl Vm {
         self.insn_cache.borrow_mut().clear();
         self.pcmap_cache.borrow_mut().clear();
         self.method_desc_cache.borrow_mut().clear();
+        self.main_getter_cache.borrow_mut().clear();
         self.resolve_cache.borrow_mut().clear();
         self.canon_field_cache.borrow_mut().clear();
         self.host_named_cache.borrow_mut().clear();
@@ -1260,6 +1265,23 @@ impl Vm {
 
     /// `Lowner;.name(params)ret` for a global method ref, or None when
     /// the index doesn't resolve (sentinel).
+    fn is_main_getter(&self, midx: GIdx) -> bool {
+        if let Some(hit) = self.main_getter_cache.borrow().get(&midx) {
+            return *hit;
+        }
+        let is = self
+            .dex_of(midx)
+            .and_then(|d| {
+                let mid = d.method(gl(midx)).ok()?;
+                let class = d.type_descriptor(mid.class_idx as u32).ok()?;
+                let name = d.string(mid.name_idx).ok()?;
+                Some(class == "Lkotlinx/coroutines/Dispatchers;" && name == "getMain")
+            })
+            .unwrap_or(false);
+        self.main_getter_cache.borrow_mut().insert(midx, is);
+        is
+    }
+
     fn method_sig(&self, midx: GIdx) -> Result<(String, String, String)> {
         if let Some(hit) = self.method_sig_cache.borrow().get(&midx) {
             return Ok(hit.clone());
@@ -4792,19 +4814,8 @@ impl Vm {
         // heap access (recursive mutex — nested invoke/JNI re-enters
         // fine, call_native drops all levels while guest code runs).
         let _vmlock = jni::vm_lock();
-        if matches!(kind, InvokeKind::Static) {
-            let is_main_getter = self
-                .dex_of(midx)
-                .and_then(|d| {
-                    let mid = d.method(gl(midx)).ok()?;
-                    let class = d.type_descriptor(mid.class_idx as u32).ok()?;
-                    let name = d.string(mid.name_idx).ok()?;
-                    Some(class == "Lkotlinx/coroutines/Dispatchers;" && name == "getMain")
-                })
-                .unwrap_or(false);
-            if is_main_getter {
-                return Ok(Some(jdk::main_dispatcher(self)));
-            }
+        if matches!(kind, InvokeKind::Static) && self.is_main_getter(midx) {
+            return Ok(Some(jdk::main_dispatcher(self)));
         }
         if crate::dbg_flag("OVELO_HOTCALL") {
             thread_local! {
@@ -5851,7 +5862,7 @@ impl Vm {
         let mut fr = Frame {
             regs,
             result: None,
-            last_call: "".into(),
+            last_call: 0,
             exc: None,
             table,
             pcmap,
@@ -6025,9 +6036,9 @@ struct Frame {
     regs: Vec<V>,
     /// `move-result` source: set by the last invoke.
     result: Option<Option<V>>,
-    /// Method the last invoke targeted — names the callee when a
+    /// Method the last invoke targeted — named lazily when a
     /// `move-result` reads a void result.
-    last_call: std::rc::Rc<str>,
+    last_call: GIdx,
     /// Pending exception for `move-exception`.
     exc: Option<u32>,
     loc: Loc,
@@ -6164,7 +6175,12 @@ impl Vm {
                     .result
                     .take()
                     .ok_or_else(|| E::Vm(err("dexrt.result.missing")))?
-                    .ok_or_else(|| E::Vm(err(&format!("dexrt.result.void {}", fr.last_call))))?;
+                    .ok_or_else(|| {
+                        E::Vm(err(&format!(
+                            "dexrt.result.void {}",
+                            self.describe_method(fr.last_call)
+                        )))
+                    })?;
                 set!(regs[0], v);
             }
             0x0d => {
@@ -6803,17 +6819,17 @@ impl Vm {
                     _ => InvokeKind::Interface,
                 };
                 let midx = gi(ins.idx.unwrap_or(0));
-                let arg_regs: Vec<u16> = if ins.format == ovelo_dex::Format::F3rc {
+                let args: Vec<V> = if ins.format == ovelo_dex::Format::F3rc {
                     // {vCCCC..+AA}: `regs`=[range start], `lit`=reg count
                     let (first, n) = (regs[0] as usize, ins.lit.unwrap_or(0) as usize);
-                    (first..first + n).map(|i| i as u16).collect()
+                    (first..first + n)
+                        .map(|i| Self::reg(fr, i))
+                        .collect::<Rt<_>>()?
                 } else {
-                    regs.clone()
+                    regs.iter()
+                        .map(|&i| Self::reg(fr, i as usize))
+                        .collect::<Rt<_>>()?
                 };
-                let args: Vec<V> = arg_regs
-                    .iter()
-                    .map(|&i| Self::reg(fr, i as usize))
-                    .collect::<Rt<_>>()?;
                 let this_arg = args.first().copied();
                 // Cheap gate first: only build the expensive arg dump
                 // when the callee name actually matches the filter.
@@ -6911,11 +6927,12 @@ impl Vm {
                         E::Throw(h)
                     }
                 })?;
-                fr.last_call = self.describe_method(midx);
+                fr.last_call = midx;
                 if let Some(p) = self.trace_call.as_deref() {
+                    let callee = self.describe_method(midx);
                     let caller = self.describe_method(fr.loc.midx);
                     if p.split(',')
-                        .any(|one| !one.is_empty() && fr.last_call.contains(one))
+                        .any(|one| !one.is_empty() && callee.contains(one))
                         && self
                             .trace_from
                             .as_deref()
@@ -6947,7 +6964,7 @@ impl Vm {
                         };
                         eprintln!(
                             "[call] {} +{pc:04x} -> {} this={} args={argfmt:?} ({})",
-                            caller, fr.last_call, thisfmt, resfmt
+                            caller, callee, thisfmt, resfmt
                         );
                     }
                 }
