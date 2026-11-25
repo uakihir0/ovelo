@@ -3741,7 +3741,7 @@ fn zip_file_call(vm: &mut Vm, class: &str, name: &str, args: &[V]) -> Option<Opt
     match name {
         "close" => Some(None),
         "size" => Some(Some(V::I32(entries.len() as i32))),
-        "getEntry" => {
+        "getEntry" | "getJarEntry" => {
             let wanted = args.get(1).and_then(|v| sv(vm, *v)).unwrap_or_default();
             let entry = entries.iter().find(|e| e.name == wanted).cloned();
             let Some(entry) = entry else {
