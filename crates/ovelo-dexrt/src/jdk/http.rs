@@ -175,7 +175,7 @@ fn b64(bytes: &[u8], urlsafe: bool, pad: bool) -> String {
             | ((*c.get(1).unwrap_or(&0) as u32) << 8)
             | *c.get(2).unwrap_or(&0) as u32;
         for i in 0..4 {
-            if i >= c.len() + 1 {
+            if i > c.len() {
                 if pad {
                     out.push('=');
                 }
