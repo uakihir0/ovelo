@@ -431,7 +431,9 @@ pub struct Vm {
     /// queues when both have work. Real Android runs workers on parallel
     /// threads; strict FIFO lets continuously re-posted Compose main-queue
     /// work starve long-lived repository/parser workers forever.
-    sched_prefer_worker: bool,
+    /// Position in a four-slot fairness cycle; three slots prefer workers,
+    /// reflecting work that would run concurrently on real Android threads.
+    sched_cycle: u8,
     /// The one `Choreographer.getInstance()` handle — identity matters
     /// (dex code compares instances).
     pub(crate) choreographer_h: u32,
@@ -812,7 +814,7 @@ impl Vm {
             pending_activity: None,
             pending_runnables: std::collections::VecDeque::new(),
             frame_callbacks: Vec::new(),
-            sched_prefer_worker: false,
+            sched_cycle: 0,
             choreographer_h: 0,
             byteorder_h: std::cell::Cell::new(0),
             activity_callbacks: Vec::new(),
@@ -2344,10 +2346,13 @@ impl Vm {
             // Android normally gives workers their own threads. On this
             // cooperative VM strict FIFO is not fair: Compose re-posts
             // enough main-queue work that a queued IO worker can remain
-            // behind it indefinitely. Alternate sides when both are
-            // present; fall back to whichever side has work.
+            // behind it indefinitely. Give workers three of four slots —
+            // closer to parallel Android threads than strict FIFO — and
+            // fall back to whichever side has work.
+            self.sched_cycle = self.sched_cycle.wrapping_add(1) % 4;
+            let prefer_worker = self.sched_cycle != 0;
             let preferred = self.pending_runnables.iter().position(|(_, on_main)| {
-                if self.sched_prefer_worker {
+                if prefer_worker {
                     !on_main
                 } else {
                     *on_main
@@ -2355,7 +2360,7 @@ impl Vm {
             });
             let idx = preferred.or_else(|| {
                 self.pending_runnables.iter().position(|(_, on_main)| {
-                    if self.sched_prefer_worker {
+                    if prefer_worker {
                         *on_main
                     } else {
                         !on_main
@@ -2365,7 +2370,6 @@ impl Vm {
             let Some((r, on_main)) = idx.and_then(|i| self.pending_runnables.remove(i)) else {
                 break;
             };
-            self.sched_prefer_worker = on_main;
             let out = if on_main {
                 jdk::run_on_main(self, r)
             } else {
