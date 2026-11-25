@@ -25,6 +25,12 @@ fn elem_eq(vm: &mut Vm, e: V, other: V) -> Rt<bool> {
 }
 use std::rc::Rc;
 
+/// Iterator bookkeeping: the collection handle it was minted from and
+/// the last index `next` returned (`-1` before/after a remove). Kept as
+/// pseudo fields so `HostState::Iter` can remain a cheap snapshot.
+const P_ITER_SOURCE: u32 = u32::MAX - 50;
+const P_ITER_LAST: u32 = u32::MAX - 51;
+
 const LIST_CLASSES: &[&str] = &[
     "Ljava/util/ArrayList;",
     "Ljava/util/LinkedList;",
@@ -796,11 +802,16 @@ fn list_call(vm: &mut Vm, name: &str, sig: &str, args: &[V]) -> Rt<Option<Option
                 (items, 0)
             };
             let pos = pos.min(items.len());
-            Some(Some(host(
+            let it = host(
                 vm,
                 "Ljava/util/Iterator;",
                 HostState::Iter(Rc::new(items), pos),
-            )))
+            );
+            if let V::Ref(ih) = it {
+                pseudo_set(vm, ih, P_ITER_SOURCE, V::Ref(h));
+                pseudo_set(vm, ih, P_ITER_LAST, V::I32(-1));
+            }
+            Some(Some(it))
         }
         "toArray" => {
             let items: Vec<V> = list_snapshot(vm, h).unwrap_or_default();
@@ -1473,13 +1484,14 @@ fn iter_call(vm: &mut Vm, name: &str, args: &[V]) -> Rt<Option<Option<V>>> {
             Some(Some(V::I32(n)))
         }
         "next" | "nextElement" => {
-            let (v, ok) = match vm.heap.get_mut(h) {
+            let (v, ok, last) = match vm.heap.get_mut(h) {
                 Some(Obj::Host {
                     state: HostState::Iter(items, pos),
                     ..
                 }) => {
                     if *pos < items.len() {
-                        let v = items[*pos];
+                        let at = *pos;
+                        let v = items[at];
                         if crate::dbg_flag("OVELO_ITERDBG") && matches!(v, V::Ref(0)) {
                             eprintln!(
                                 "[iterdbg] next on h{h} pos={pos} yields null; items={:?}",
@@ -1487,9 +1499,9 @@ fn iter_call(vm: &mut Vm, name: &str, args: &[V]) -> Rt<Option<Option<V>>> {
                             );
                         }
                         *pos += 1;
-                        (v, true)
+                        (v, true, at as i32)
                     } else {
-                        (V::Ref(0), false)
+                        (V::Ref(0), false, -1)
                     }
                 }
                 Some(Obj::Host {
@@ -1497,17 +1509,20 @@ fn iter_call(vm: &mut Vm, name: &str, args: &[V]) -> Rt<Option<Option<V>>> {
                     ..
                 }) => {
                     if l.is_empty() {
-                        (V::Ref(0), false)
+                        (V::Ref(0), false, -1)
                     } else {
-                        (l.remove(0), true)
+                        (l.remove(0), true, -1)
                     }
                 }
-                _ => (V::Ref(0), false),
+                _ => (V::Ref(0), false, -1),
             };
             if !ok {
                 let e =
                     vm.throw_builtin("Ljava/util/NoSuchElementException;", "iterator exhausted");
                 return Err(e);
+            }
+            if last >= 0 {
+                pseudo_set(vm, h, P_ITER_LAST, V::I32(last));
             }
             Some(Some(v))
         }
@@ -1557,7 +1572,49 @@ fn iter_call(vm: &mut Vm, name: &str, args: &[V]) -> Rt<Option<Option<V>>> {
             };
             Some(Some(V::I32(n)))
         }
-        "remove" | "set" | "add" | "forEachRemaining" => Some(None),
+        "remove" => {
+            let last = match pseudo_get(vm, h, P_ITER_LAST) {
+                Some(V::I32(n)) => n,
+                _ => -1,
+            };
+            if last >= 0 {
+                let at = last as usize;
+                let item = match vm.heap.get(h) {
+                    Some(Obj::Host {
+                        state: HostState::Iter(items, _),
+                        ..
+                    }) => items.get(at).copied(),
+                    _ => None,
+                };
+                if let (Some(item), Some(V::Ref(src))) = (item, pseudo_get(vm, h, P_ITER_SOURCE)) {
+                    let pos = match vm.heap.get(src) {
+                        Some(Obj::Host {
+                            state: HostState::List(l),
+                            ..
+                        }) => {
+                            if at < l.len() && value_eq(vm, l[at], item) {
+                                Some(at)
+                            } else {
+                                l.iter().position(|e| value_eq(vm, *e, item))
+                            }
+                        }
+                        _ => None,
+                    };
+                    if let Some(pos) = pos {
+                        if let Some(Obj::Host {
+                            state: HostState::List(l),
+                            ..
+                        }) = vm.heap.get_mut(src)
+                        {
+                            l.remove(pos);
+                        }
+                    }
+                }
+                pseudo_set(vm, h, P_ITER_LAST, V::I32(-1));
+            }
+            Some(None)
+        }
+        "set" | "add" | "forEachRemaining" => Some(None),
         "getKey" => Some(Some(
             slot_of(vm, h)
                 .or_else(|| pseudo_get(vm, h, P_COMPONENT))
