@@ -5537,7 +5537,7 @@ fn clear_focus_tree(vm: &mut Vm, h: u32, depth: usize) {
 }
 
 fn clear_window_focus(vm: &mut Vm) {
-    for root in vm.view_roots.clone() {
+    for root in key_scan_roots(vm) {
         clear_focus_tree(vm, root, 0);
     }
 }
