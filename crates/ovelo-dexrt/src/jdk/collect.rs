@@ -2078,6 +2078,9 @@ fn arrays_static(vm: &mut Vm, name: &str, _sig: &str, args: &[V]) -> Rt<Option<O
                             ("D", V::F64(a), V::F64(b)) => {
                                 a.to_bits() == b.to_bits() || (a.is_nan() && b.is_nan())
                             }
+                            // Byte arrays in the wild mix legacy unsigned
+                            // storage with Java's signed-byte form.
+                            ("B", V::I32(a), V::I32(b)) => a as u8 == b as u8,
                             _ if ex.starts_with('L') || ex.starts_with('[') => elem_eq(vm, a, b)?,
                             _ => a == b,
                         };
