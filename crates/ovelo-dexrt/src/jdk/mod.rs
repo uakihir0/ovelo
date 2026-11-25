@@ -648,7 +648,15 @@ pub(crate) fn value_eq(vm: &Vm, a: V, b: V) -> bool {
                                 | "Ljava/lang/Float;"
                                 | "Ljava/lang/Double;"
                         )
-                        && value_eq(vm, *a, *b)
+                        && match (da.as_str(), *a, *b) {
+                            ("Ljava/lang/Float;", V::F32(x), V::F32(y)) => {
+                                x.to_bits() == y.to_bits() || (x.is_nan() && y.is_nan())
+                            }
+                            ("Ljava/lang/Double;", V::F64(x), V::F64(y)) => {
+                                x.to_bits() == y.to_bits() || (x.is_nan() && y.is_nan())
+                            }
+                            _ => value_eq(vm, *a, *b),
+                        }
                 }
                 // `new String(x)` mirrors its text under P_DATA on a
                 // Host object instead of carrying an interned `Str`

@@ -2062,8 +2062,8 @@ fn arrays_static(vm: &mut Vm, name: &str, _sig: &str, args: &[V]) -> Rt<Option<O
                 },
                 _ => None,
             };
-            let eq = if let Some((ex, x, ey, y)) = arrays {
-                if ex != ey || x.len() != y.len() {
+            let eq = if let Some((ex, x, _ey, y)) = arrays {
+                if x.len() != y.len() {
                     false
                 } else {
                     let mut all_eq = true;
