@@ -1264,6 +1264,29 @@ fn nio_file_call(vm: &mut Vm, class: &str, name: &str, args: &[V]) -> Rt<Option<
 /// Guest-visible path -> host path under `vm.guest_root`. Absolute
 /// guest paths and `..` can never escape the sandbox: root/prefix
 /// components are dropped and `..` above the root is discarded.
+fn abs_guest_path(path: &str) -> String {
+    if path.starts_with('/') {
+        path.to_string()
+    } else {
+        format!("/{path}")
+    }
+}
+
+fn canon_guest_path(path: &str) -> String {
+    let mut out: Vec<&str> = Vec::new();
+    let abs = abs_guest_path(path);
+    for part in abs.split('/') {
+        match part {
+            "" | "." => {}
+            ".." => {
+                out.pop();
+            }
+            part => out.push(part),
+        }
+    }
+    format!("/{}", out.join("/"))
+}
+
 pub(crate) fn fspath(vm: &Vm, guest: &str) -> std::path::PathBuf {
     // External-storage aliases resolve against external_root — shared
     // media the app-private guest_root has no business holding.
@@ -1337,12 +1360,22 @@ fn file_call(vm: &mut Vm, name: &str, args: &[V]) -> Option<Option<V>> {
         }
         "getPath" | "toString" => Some(jstr(vm, &path)),
         "getAbsolutePath" | "getCanonicalPath" => {
-            let p = if path.starts_with('/') {
-                path.clone()
+            let p = abs_guest_path(&path);
+            let p = if name == "getCanonicalPath" {
+                canon_guest_path(&p)
             } else {
-                format!("/data/local/ovelo/{path}")
+                p
             };
             Some(jstr(vm, &p))
+        }
+        "getAbsoluteFile" | "getCanonicalFile" => {
+            let p = abs_guest_path(&path);
+            let p = if name == "getCanonicalFile" {
+                canon_guest_path(&p)
+            } else {
+                p
+            };
+            Some(host(vm, "Ljava/io/File;", HostState::Path(p)))
         }
         "getName" => {
             let n = std::path::Path::new(&path)
