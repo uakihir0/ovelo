@@ -432,7 +432,11 @@ fn media_type(vm: &mut Vm, content_type: &str) -> Result<V> {
         .and_then(|f| vm.sget_pub(f))
     {
         for name in ["get", "parse"] {
-            if let Some(v) = vm.call_virtual_sig(companion, name, &["Ljava/lang/String;"], &[s])? {
+            if let Some(v) = vm
+                .call_virtual_sig(companion, name, &["Ljava/lang/String;"], &[s])
+                .ok()
+                .flatten()
+            {
                 if matches!(v, V::Ref(h) if h != 0) {
                     return Ok(v);
                 }
@@ -446,7 +450,10 @@ fn media_type(vm: &mut Vm, content_type: &str) -> Result<V> {
             name,
             &["Ljava/lang/String;"],
             vec![s],
-        )? {
+        )
+        .ok()
+        .flatten()
+        {
             if matches!(v, V::Ref(h) if h != 0) {
                 return Ok(v);
             }
