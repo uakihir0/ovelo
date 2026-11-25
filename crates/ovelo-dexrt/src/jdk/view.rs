@@ -5271,7 +5271,11 @@ fn el_id(vm: &Vm, el: &Element) -> Option<i32> {
 // tree storage
 
 fn tag_key(id: i32) -> u64 {
-    (u32::MAX as u64 - 20) - (id as u64 & 0xffff)
+    // Keyed tags share the pseudo-field map with host bookkeeping.
+    // Keep them in a separate u64 namespace: view pseudo keys live in
+    // the low u32 range, while Android tag ids are arbitrary signed
+    // 32-bit values whose low bits otherwise collide with those keys.
+    (1u64 << 32) | (id as u32 as u64)
 }
 
 fn children_arr(vm: &mut Vm, h: u32) -> Option<u32> {
