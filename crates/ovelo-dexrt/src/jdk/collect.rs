@@ -432,10 +432,10 @@ pub(crate) fn call(
                 if due_ms > now_ms() && vm.cur_runnable != 0 {
                     let blocking_waiter = vm.cur_thread != 0
                         && vm.cur_thread != vm.main_thread_h
-                        && vm
-                            .describe_stack()
-                            .last()
-                            .is_some_and(|m| m.contains("runBlocking"));
+                        && vm.describe_stack().last().is_some_and(|m| {
+                            m.contains("runBlocking")
+                                || m.contains("BlockingCoroutine;.joinBlocking")
+                        });
                     if blocking_waiter {
                         // `runBlocking` parks its own Java stack while a
                         // child coroutine completes. Requeue-and-restart
