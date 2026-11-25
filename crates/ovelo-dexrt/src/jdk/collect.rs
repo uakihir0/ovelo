@@ -777,6 +777,22 @@ fn list_call(vm: &mut Vm, name: &str, sig: &str, args: &[V]) -> Rt<Option<Option
                 return Ok(None);
             }
             if let Some(V::Ref(parent)) = pseudo_get(vm, h, P_SUBLIST_PARENT) {
+                let fixed_parent = match vm.heap.get(parent) {
+                    Some(Obj::Host { desc, .. }) => matches!(
+                        desc.as_str(),
+                        "Ljava/util/Arrays$ArrayList;"
+                            | "Ljava/util/Collections$EmptyList;"
+                            | "Ljava/util/Collections$SingletonList;"
+                            | "Ljava/util/Collections$UnmodifiableList;"
+                    ),
+                    _ => false,
+                };
+                if fixed_parent {
+                    return Err(vm.throw_builtin(
+                        "Ljava/lang/UnsupportedOperationException;",
+                        "clear on fixed-size subList",
+                    ));
+                }
                 let a = pseudo_get(vm, h, P_SUBLIST_START)
                     .map(i32v)
                     .unwrap_or_default()
