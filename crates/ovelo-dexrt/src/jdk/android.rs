@@ -46,6 +46,12 @@ pub(crate) fn call(
             ))),
             _ => None,
         }
+    } else if class == "Landroid/net/ConnectivityManager;"
+        || class == "Landroid/net/NetworkCapabilities;"
+        || class == "Landroid/net/NetworkInfo;"
+        || class == "Landroid/net/Network;"
+    {
+        network_call(vm, class, name, args)
     } else if desc_is_a(class, "Landroid/net/Uri;") || class == "Landroid/net/Uri$Builder;" {
         uri_call(vm, name, args)?
     } else if desc_is_a(class, "Landroid/content/Intent;") {
@@ -2101,6 +2107,46 @@ fn resolve_color_id(vm: &mut Vm, res_id: u32) -> u32 {
     data
 }
 
+fn network_call(vm: &mut Vm, class: &str, name: &str, args: &[V]) -> Option<Option<V>> {
+    match (class, name) {
+        ("Landroid/net/ConnectivityManager;", "getActiveNetwork") => {
+            Some(Some(host(vm, "Landroid/net/Network;", HostState::Empty)))
+        }
+        ("Landroid/net/ConnectivityManager;", "getNetworkCapabilities") => match args.get(1) {
+            Some(V::Ref(0)) => Some(Some(V::Ref(0))),
+            Some(_) => Some(Some(host(
+                vm,
+                "Landroid/net/NetworkCapabilities;",
+                HostState::Empty,
+            ))),
+            None => Some(Some(V::Ref(0))),
+        },
+        ("Landroid/net/ConnectivityManager;", "getActiveNetworkInfo") => Some(Some(host(
+            vm,
+            "Landroid/net/NetworkInfo;",
+            HostState::Empty,
+        ))),
+        ("Landroid/net/ConnectivityManager;", "isActiveNetworkMetered") => Some(Some(V::I32(0))),
+        ("Landroid/net/ConnectivityManager;", "registerDefaultNetworkCallback")
+        | ("Landroid/net/ConnectivityManager;", "registerNetworkCallback")
+        | ("Landroid/net/ConnectivityManager;", "unregisterNetworkCallback") => Some(None),
+        ("Landroid/net/NetworkCapabilities;", "hasCapability") => {
+            let cap = i32v(args.get(1).copied().unwrap_or(V::I32(-1)));
+            // INTERNET=12, NOT_METERED=11, VALIDATED=16. The host is a
+            // desktop with a direct connection, so expose it as unmetered.
+            Some(Some(V::I32(matches!(cap, 11 | 12 | 16) as i32)))
+        }
+        ("Landroid/net/NetworkCapabilities;", "hasTransport") => Some(Some(V::I32(1))),
+        ("Landroid/net/NetworkInfo;", "isConnected")
+        | ("Landroid/net/NetworkInfo;", "isAvailable")
+        | ("Landroid/net/NetworkInfo;", "isConnectedOrConnecting") => Some(Some(V::I32(1))),
+        ("Landroid/net/NetworkInfo;", "getType") => Some(Some(V::I32(1))),
+        ("Landroid/net/NetworkInfo;", "getTypeName") => Some(Some(jstr(vm, "WIFI"))),
+        ("Landroid/net/Network;", "toString") => Some(Some(jstr(vm, "host-network"))),
+        _ => Some(Some(stub_ret(vm, ""))),
+    }
+}
+
 fn prefs_call(vm: &mut Vm, name: &str, args: &[V]) -> Rt<Option<Option<V>>> {
     let V::Ref(h) = args.first().copied().unwrap_or(V::Ref(0)) else {
         return Ok(None);
@@ -2352,13 +2398,19 @@ fn context_call(
             // Hand out a typed placeholder per service name so calls on
             // it resolve (void stubs) and instanceof/cast work; real
             // service behavior is still surface-limited.
-            let desc = match sv(vm, args[1]).as_deref() {
+            let service = sv(vm, args[1]).or_else(|| match args[1] {
+                V::Ref(ch) => class_desc_of(vm, ch),
+                _ => None,
+            });
+            let desc = match service.as_deref() {
                 Some("activity") => "Landroid/app/ActivityManager;",
                 Some("alarm") => "Landroid/app/AlarmManager;",
                 Some("appops") => "Landroid/app/AppOpsManager;",
                 Some("audio") => "Landroid/media/AudioManager;",
                 Some("clipboard") => "Landroid/content/ClipboardManager;",
-                Some("connectivity") => "Landroid/net/ConnectivityManager;",
+                Some("connectivity") | Some("Landroid/net/ConnectivityManager;") => {
+                    "Landroid/net/ConnectivityManager;"
+                }
                 Some("device_policy") => "Landroid/app/admin/DevicePolicyManager;",
                 Some("display") => "Landroid/hardware/display/DisplayManager;",
                 Some("download") => "Landroid/app/DownloadManager;",
