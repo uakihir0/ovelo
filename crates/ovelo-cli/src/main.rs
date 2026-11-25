@@ -1869,7 +1869,9 @@ fn run_app(store: &InstallStore, package: &str) -> Result<(), OveloError> {
             // (data loads, runOnUiThread) that re-enters bridged calls.
             let attaches = ui2.borrow_mut().take_attach_pending();
             for h in attaches {
-                let _ = vm.call_virtual(h, "onAttachedToWindow", &[]);
+                if !vm.view_is_attached(h) {
+                    vm.view_window_attached(h);
+                }
             }
         }
         let mut u = ui2.borrow_mut();

@@ -5598,6 +5598,23 @@ fn mark_attached(vm: &mut Vm, h: u32, depth: u32) {
     }
 }
 
+/// First window attachment for a materialized view: ViewRootImpl
+/// attaches the whole decor subtree, not just the node the renderer
+/// happened to materialize. Climb to the highest recorded parent and
+/// dispatch downward so later addView calls also propagate attachment.
+pub(crate) fn window_attached(vm: &mut Vm, h: u32) {
+    let mut root = h;
+    let mut hops = 0;
+    while let Some(V::Ref(p)) = pseudo_get(vm, root, P_PARENT) {
+        if p == 0 || hops > 128 {
+            break;
+        }
+        root = p;
+        hops += 1;
+    }
+    mark_attached(vm, root, 0);
+}
+
 /// `dispatchDetachedFromWindow` bookkeeping: clear the attach mark on
 /// the view and its subtree (depth-bounded like `find_in_tree_at`).
 fn clear_attached(vm: &mut Vm, h: u32, depth: u32) {
@@ -5727,15 +5744,11 @@ pub(crate) fn decor_of(vm: &mut Vm, window: u32) -> Option<u32> {
     pseudo_set(vm, cf, P_IS_VIEW, V::I32(1));
     pseudo_set(vm, cf, P_IS_GROUP, V::I32(1));
     pseudo_set(vm, cf, P_VIEW_ID, V::I32(ANDROID_ID_CONTENT));
-    // The decor exists only in service of a live window — mark both
-    // frames attached so children added before any onAttachedToWindow
-    // dispatch still report `isAttachedToWindow` correctly.
-    pseudo_set(vm, d, P_ATTACHED, V::I32(1));
-    pseudo_set(vm, cf, P_ATTACHED, V::I32(1));
-    // Children added before the decor attached (an early
-    // setContentView) get their attach callbacks now — AOSP's
-    // dispatchAttachedToWindow reaches the whole existing subtree.
-    mark_attached(vm, cf, 0);
+    // The decor is not attached yet: ViewRootImpl only dispatches
+    // attach after the activity lifecycle reaches the window. Keeping
+    // it unattached during setContentView is load-bearing for Compose —
+    // otherwise AbstractComposeView starts composition reentrantly inside
+    // the activity's LifecycleRegistry forward pass.
     attach(vm, d, V::Ref(cf));
     // The decor fills its window — host-side frame now, since no dex
     // `layout()` will ever run over these objects (`getDecorView()

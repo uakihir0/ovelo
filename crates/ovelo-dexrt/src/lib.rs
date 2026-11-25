@@ -2012,6 +2012,12 @@ impl Vm {
         )
     }
 
+    /// Dispatch the first window attach over `h`'s whole decor tree —
+    /// the host frame loop uses it once the real window exists.
+    pub fn view_window_attached(&mut self, h: u32) {
+        jdk::view::window_attached(self, h);
+    }
+
     /// `View.removeCallbacks`/`Handler.removeCallbacks`/`Choreographer.remove*` —
     /// drop a queued runnable without running it.
     pub(crate) fn remove_runnable(&mut self, r: u32) {
