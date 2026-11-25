@@ -276,6 +276,15 @@ pub enum CanvasOp {
         /// Straight RGBA8 pixels (`src_w` × `src_h`).
         rgba: std::rc::Rc<Vec<u8>>,
     },
+    /// `drawRenderNode` — a *reference* to the node's recording, not a
+    /// copy: a re-recorded child layer must show through without the
+    /// parent re-recording (AOSP display lists store node references).
+    /// Expanded against the live heap when ops leave the runtime —
+    /// framework replay never sees this variant.
+    Nested {
+        /// `RenderNode` heap handle.
+        node: u32,
+    },
 }
 
 /// Snapshot of a `Paint` object's state at draw time.

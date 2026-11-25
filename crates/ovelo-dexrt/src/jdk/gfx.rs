@@ -24,6 +24,11 @@ const PK_TARGET: u32 = 0xFFFD_FF12;
 const PK_SAVECNT: u32 = 0xFFFD_FF13;
 /// RenderNode → the recording canvas produced by beginRecording.
 const PK_RECCANVAS: u32 = 0xFFFD_FF14;
+/// RenderNode placement — `setPosition(l, t, r, b)` records the node
+/// origin; `drawRenderNode` must draw the node there (Compose 1.9
+/// positions layers exclusively through these).
+const PK_RN_LEFT: u32 = 0xFFFD_FF15;
+const PK_RN_TOP: u32 = 0xFFFD_FF16;
 /// `android.graphics.Matrix` affine coefficients — Android's first
 /// six of nine values: x' = m0·x + m1·y + m2, y' = m3·x + m4·y + m5.
 /// Perspective row stays [0,0,1].
@@ -279,29 +284,21 @@ fn canvas_call(vm: &mut Vm, name: &str, sig: &str, args: &[V]) -> Rt<Option<Opti
             Some(None)
         }
         "drawRenderNode" => {
-            // Splice the node recording into this canvas in playback
-            // order. Nested layers flatten recursively because their
-            // own drawRenderNode already used this same path while
-            // recording the outer node.
+            // Record a *reference* to the node, not a copy of its
+            // current ops: AOSP display lists reference child render
+            // nodes, so a re-recorded child layer shows through even
+            // when the parent never re-records. `expand_nested`
+            // resolves the reference (applying the node's position)
+            // when ops leave the runtime.
             if let (V::Ref(_), V::Ref(rh)) = (this, arg(args, 1)) {
-                if let Some(V::Ref(ch)) = pseudo_get(vm, rh, PK_RECCANVAS) {
-                    if let Some(Obj::Host {
-                        state: HostState::CanvasOps(ops),
-                        ..
-                    }) = vm.heap.get(ch)
-                    {
-                        if crate::dbg_flag("OVELO_RNDBG") {
-                            static N: std::sync::atomic::AtomicUsize =
-                                std::sync::atomic::AtomicUsize::new(0);
-                            if N.fetch_add(1, std::sync::atomic::Ordering::Relaxed) < 40 {
-                                eprintln!("[rndbg] drawRenderNode node h{rh} ops={}", ops.len());
-                            }
-                        }
-                        for op in ops.clone() {
-                            rec(vm, this, op);
-                        }
+                if crate::dbg_flag("OVELO_RNDBG") {
+                    static N: std::sync::atomic::AtomicUsize =
+                        std::sync::atomic::AtomicUsize::new(0);
+                    if N.fetch_add(1, std::sync::atomic::Ordering::Relaxed) < 40 {
+                        eprintln!("[rndbg] drawRenderNode node h{rh} (ref)");
                     }
                 }
+                rec(vm, this, CanvasOp::Nested { node: rh });
             }
             Some(None)
         }
@@ -1413,25 +1410,73 @@ fn rendernode_call(vm: &mut Vm, name: &str, args: &[V]) -> Rt<Option<Option<V>>>
             Some(Some(V::Ref(ch)))
         }
         "endRecording" | "endRecordingAndDisplayList" => Some(None),
-        "hasDisplayList" => Some(Some(V::I32(1))),
+        "hasDisplayList" => {
+            // discardDisplayList drops the recording — answering
+            // "valid" here would let Compose skip the re-record and
+            // the layer would draw nothing.
+            let valid = match arg(args, 0) {
+                V::Ref(rh) => {
+                    matches!(pseudo_get(vm, rh, PK_RECCANVAS), Some(V::Ref(ch)) if ch != 0)
+                }
+                _ => false,
+            };
+            Some(Some(V::I32(valid as i32)))
+        }
         "discardDisplayList" | "clearDisplayList" => {
             if let V::Ref(rh) = arg(args, 0) {
                 pseudo_set(vm, rh, PK_RECCANVAS, V::Ref(0));
             }
             Some(None)
         }
-        // Transform/outline/alpha mutations configure the platform
-        // render node. NodeCoordinator has already applied the layout
-        // translation around drawLayer; the remaining effects are
-        // visual refinements we do not yet model.
-        "setPosition"
-        | "setLeftTopRightBottom"
-        | "setLeft"
-        | "setTop"
-        | "setRight"
+        // Placement: Compose positions layer render nodes through
+        // these — the origin must survive to playback or every layer
+        // draws at its parent's origin.
+        "setPosition" | "setLeftTopRightBottom" => {
+            if let V::Ref(rh) = arg(args, 0) {
+                // (IIII)V carries the edges directly; the (Rect)V
+                // overload reads them off the Rect object.
+                let (l, t) = if args.len() >= 5 {
+                    (arg(args, 1), arg(args, 2))
+                } else if let Some(e) = rect_edges_of(vm, arg(args, 1)) {
+                    (V::F32(e.0), V::F32(e.1))
+                } else {
+                    (V::I32(0), V::I32(0))
+                };
+                pseudo_set(vm, rh, PK_RN_LEFT, V::I32(i32v(l)));
+                pseudo_set(vm, rh, PK_RN_TOP, V::I32(i32v(t)));
+            }
+            Some(Some(V::I32(1)))
+        }
+        "setLeft" => {
+            if let V::Ref(rh) = arg(args, 0) {
+                pseudo_set(vm, rh, PK_RN_LEFT, arg(args, 1));
+            }
+            Some(Some(V::I32(1)))
+        }
+        "setTop" => {
+            if let V::Ref(rh) = arg(args, 0) {
+                pseudo_set(vm, rh, PK_RN_TOP, arg(args, 1));
+            }
+            Some(Some(V::I32(1)))
+        }
+        "offsetLeftAndRight" => {
+            if let V::Ref(rh) = arg(args, 0) {
+                let cur = pseudo_get(vm, rh, PK_RN_LEFT).unwrap_or(V::I32(0));
+                pseudo_set(vm, rh, PK_RN_LEFT, V::I32(i32v(cur) + i32v(arg(args, 1))));
+            }
+            Some(Some(V::I32(1)))
+        }
+        "offsetTopAndBottom" => {
+            if let V::Ref(rh) = arg(args, 0) {
+                let cur = pseudo_get(vm, rh, PK_RN_TOP).unwrap_or(V::I32(0));
+                pseudo_set(vm, rh, PK_RN_TOP, V::I32(i32v(cur) + i32v(arg(args, 1))));
+            }
+            Some(Some(V::I32(1)))
+        }
+        // Remaining transform/outline/alpha mutations are visual
+        // refinements we do not yet model.
+        "setRight"
         | "setBottom"
-        | "offsetLeftAndRight"
-        | "offsetTopAndBottom"
         | "setAlpha"
         | "setTranslationX"
         | "setTranslationY"
@@ -1706,9 +1751,49 @@ pub(crate) fn guest_draw_ops(vm: &mut Vm, view: u32, w: i32, h: i32) -> Vec<Canv
         Some(Obj::Host {
             state: HostState::CanvasOps(ops),
             ..
-        }) => ops.clone(),
+        }) => expand_nested(vm, &ops.clone(), 0),
         _ => Vec::new(),
     }
+}
+
+/// Flatten `CanvasOp::Nested` references against the live heap: the
+/// referenced node's *current* recording is spliced in at its
+/// `setPosition` origin, so re-recording a child layer shows through
+/// without the parent re-recording (AOSP display-list semantics).
+/// Depth-capped — a recursive layer cycle would never terminate.
+fn expand_nested(vm: &Vm, ops: &[CanvasOp], depth: usize) -> Vec<CanvasOp> {
+    let mut out = Vec::with_capacity(ops.len());
+    for op in ops {
+        let CanvasOp::Nested { node } = op else {
+            out.push(op.clone());
+            continue;
+        };
+        if depth >= 8 {
+            continue;
+        }
+        let inner = match pseudo_get(vm, *node, PK_RECCANVAS) {
+            Some(V::Ref(ch)) if ch != 0 => match vm.heap.get(ch) {
+                Some(Obj::Host {
+                    state: HostState::CanvasOps(inner),
+                    ..
+                }) => inner.clone(),
+                _ => Vec::new(),
+            },
+            _ => Vec::new(),
+        };
+        if inner.is_empty() {
+            continue;
+        }
+        let dx = i32v(pseudo_get(vm, *node, PK_RN_LEFT).unwrap_or(V::I32(0))) as f32;
+        let dy = i32v(pseudo_get(vm, *node, PK_RN_TOP).unwrap_or(V::I32(0))) as f32;
+        out.push(CanvasOp::Save);
+        if dx != 0.0 || dy != 0.0 {
+            out.push(CanvasOp::Translate { dx, dy });
+        }
+        out.extend(expand_nested(vm, &inner, depth + 1));
+        out.push(CanvasOp::Restore);
+    }
+    out
 }
 
 impl Default for PaintState {

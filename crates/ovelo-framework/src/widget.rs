@@ -684,6 +684,9 @@ fn replay_guest_ops(c: &mut Canvas, ops: &[ovelo_dexrt::CanvasOp]) {
                     );
                 }
             }
+            // References are flattened inside the runtime before ops
+            // reach the framework — nothing to replay here.
+            O::Nested { .. } => {}
         }
     }
 }
