@@ -5539,6 +5539,16 @@ fn prefs_file(vm: &mut Vm, file: &str) -> V {
                     .map(V::F32)
             } else if line.starts_with("<string") {
                 pref_strings(line).first().map(|x| jstr(vm, x))
+            } else if line.starts_with("<set") {
+                let items = pref_strings(line)
+                    .into_iter()
+                    .map(|x| jstr(vm, &x))
+                    .collect();
+                Some(host(
+                    vm,
+                    "Ljava/util/LinkedHashSet;",
+                    HostState::List(items),
+                ))
             } else {
                 None
             };
@@ -5574,12 +5584,28 @@ fn save_prefs(vm: &mut Vm, file: &str, h: u32) {
             V::I32(x) => out.push_str(&format!("<int name=\"{key}\" value=\"{x}\" />\n")),
             V::I64(x) => out.push_str(&format!("<long name=\"{key}\" value=\"{x}\" />\n")),
             V::F32(x) => out.push_str(&format!("<float name=\"{key}\" value=\"{x}\" />\n")),
-            V::Ref(_) => {
+            V::Ref(rh) => {
                 if let Some(x) = sv(vm, v) {
                     out.push_str(&format!(
                         "<string name=\"{key}\">{}</string>\n",
                         xml_escape(&x)
                     ));
+                } else if let Some(Obj::Host {
+                    state: HostState::List(items),
+                    ..
+                }) = vm.heap.get(rh)
+                {
+                    let items: Vec<String> = items
+                        .iter()
+                        .filter_map(|item| sv(vm, *item).map(|x| xml_escape(&x)))
+                        .collect();
+                    if !items.is_empty() {
+                        out.push_str(&format!("<set name=\"{key}\">"));
+                        for item in items {
+                            out.push_str(&format!("<string>{item}</string>"));
+                        }
+                        out.push_str("</set>\n");
+                    }
                 }
             }
             _ => {}
