@@ -5615,11 +5615,7 @@ fn save_prefs(vm: &mut Vm, file: &str, h: u32) {
                         "<string name=\"{key}\">{}</string>\n",
                         xml_escape(&x)
                     ));
-                } else if let Some(Obj::Host {
-                    state: HostState::List(items),
-                    ..
-                }) = vm.heap.get(rh)
-                {
+                } else if let Some(items) = list_snapshot(vm, rh) {
                     let items: Vec<String> = items
                         .iter()
                         .filter_map(|item| sv(vm, *item).map(|x| xml_escape(&x)))
