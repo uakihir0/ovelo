@@ -1708,16 +1708,17 @@ pub(crate) fn simple_format(vm: &mut Vm, fmt: &str, args: &[V]) -> String {
             out.push('\n');
             continue;
         }
-        // flags
+        // flags/width/precision, ending at the conversion letter itself
         let mut spec = String::new();
-        while let Some(&c2) = chars.peek() {
+        let conv = loop {
+            let Some(c2) = chars.next() else {
+                break 's';
+            };
             if c2.is_ascii_alphabetic() {
-                chars.next();
-                break;
+                break c2;
             }
-            spec.push(chars.next().unwrap_or_default());
-        }
-        let conv = chars.next().unwrap_or('s');
+            spec.push(c2);
+        };
         let v = args.get(i).copied().unwrap_or(V::Ref(0));
         i += 1;
         let body = match conv {
@@ -1726,11 +1727,39 @@ pub(crate) fn simple_format(vm: &mut Vm, fmt: &str, args: &[V]) -> String {
                     V::Ref(h) => slot_of(vm, h).unwrap_or(v),
                     _ => v,
                 });
+                let width = spec
+                    .chars()
+                    .filter(|c| c.is_ascii_digit())
+                    .collect::<String>()
+                    .parse::<usize>()
+                    .unwrap_or(0);
+                // Java formats negative Byte/Short/Integer/Long values as
+                // unsigned at their type width. Narrow host wrappers carry
+                // their type in the descriptor; primitive slots default to
+                // the platform integer width.
+                let bits = match v {
+                    V::Ref(h) => match vm.heap.get(h) {
+                        Some(Obj::Host { desc, .. }) => match desc.as_str() {
+                            "Ljava/lang/Byte;" => 8,
+                            "Ljava/lang/Short;" => 16,
+                            "Ljava/lang/Integer;" => 32,
+                            _ => 64,
+                        },
+                        _ => 64,
+                    },
+                    _ => 32,
+                };
+                let mask = if bits == 64 {
+                    u64::MAX
+                } else {
+                    (1u64 << bits) - 1
+                };
+                let u = (n as u64) & mask;
                 match conv {
-                    'x' => format!("{n:x}"),
-                    'X' => format!("{n:X}"),
-                    'o' => format!("{n:o}"),
-                    _ => format!("{n}"),
+                    'x' => format!("{u:0width$x}"),
+                    'X' => format!("{u:0width$X}"),
+                    'o' => format!("{u:0width$o}"),
+                    _ => format!("{n:0width$}"),
                 }
             }
             'f' | 'e' | 'g' | 'a' => {
