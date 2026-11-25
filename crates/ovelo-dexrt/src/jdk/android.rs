@@ -2144,7 +2144,13 @@ fn network_call(vm: &mut Vm, class: &str, name: &str, args: &[V]) -> Option<Opti
             // desktop with a direct connection, so expose it as unmetered.
             Some(Some(V::I32(matches!(cap, 11 | 12 | 16) as i32)))
         }
-        ("Landroid/net/NetworkCapabilities;", "hasTransport") => Some(Some(V::I32(1))),
+        ("Landroid/net/NetworkCapabilities;", "hasTransport") => {
+            // TRANSPORT_WIFI=1; the host connection is presented as Wi-Fi,
+            // not cellular, so metered-mobile logic does not trigger.
+            Some(Some(V::I32(
+                (i32v(args.get(1).copied().unwrap_or(V::I32(-1))) == 1) as i32,
+            )))
+        }
         ("Landroid/net/NetworkInfo;", "isConnected")
         | ("Landroid/net/NetworkInfo;", "isAvailable")
         | ("Landroid/net/NetworkInfo;", "isConnectedOrConnecting") => Some(Some(V::I32(1))),
