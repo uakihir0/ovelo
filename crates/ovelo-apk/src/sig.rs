@@ -68,6 +68,8 @@ pub struct SignerInfo {
     /// SHA-256 fingerprint (hex) of the signer's certificate DER — the
     /// identity used for same-signer update checks.
     pub cert_sha256: String,
+    /// Encoded signer certificate DER.
+    pub cert_der: Vec<u8>,
     /// Signature algorithm id used.
     pub sig_alg: u32,
     /// Certificate subject (display only).
@@ -510,6 +512,7 @@ pub fn verify_v2(bytes: &[u8]) -> Result<Vec<SignerInfo>> {
         let fp: String = sha256(cert0).iter().map(|b| format!("{b:02x}")).collect();
         infos.push(SignerInfo {
             cert_sha256: fp,
+            cert_der: cert0.to_vec(),
             sig_alg: used_alg,
             subject,
         });
@@ -1076,6 +1079,7 @@ fn verify_v1_signer(
             .iter()
             .map(|b| format!("{b:02x}"))
             .collect(),
+        cert_der: cert_der.to_vec(),
         sig_alg: 0,
         subject,
     })

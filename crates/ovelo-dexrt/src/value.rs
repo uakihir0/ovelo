@@ -113,6 +113,24 @@ pub enum HostState {
     /// `StringReader`/`CharArrayReader`/`InputStreamReader`):
     /// buffer + read cursor + mark.
     Chars(std::rc::Rc<Vec<u16>>, usize, usize),
+    /// A parsed ZIP/JAR archive.
+    ZipArchive {
+        /// Complete archive bytes.
+        bytes: std::rc::Rc<Vec<u8>>,
+        /// Central-directory entries.
+        entries: std::rc::Rc<Vec<ovelo_apk::zip::CentralEntry>>,
+        /// Verified first signer certificate DER, when v1 signing is present.
+        cert_der: Option<std::rc::Rc<Vec<u8>>>,
+    },
+    /// One ZIP/JAR entry, carrying enough archive data to open it later.
+    ZipEntry {
+        /// Complete archive bytes.
+        bytes: std::rc::Rc<Vec<u8>>,
+        /// Central-directory record for this entry.
+        entry: ovelo_apk::zip::CentralEntry,
+        /// Verified signer certificate DER inherited from the archive.
+        cert_der: Option<std::rc::Rc<Vec<u8>>>,
+    },
     /// A real writable file (`FileOutputStream` — SAF
     /// `openOutputStream` resolves documents to host files).
     File(std::fs::File),

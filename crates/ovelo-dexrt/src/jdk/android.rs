@@ -2109,31 +2109,52 @@ fn prefs_call(vm: &mut Vm, name: &str, args: &[V]) -> Rt<Option<Option<V>>> {
     Ok(if class.ends_with("$Editor;") {
         match name {
             "putString" | "putInt" | "putLong" | "putFloat" | "putBoolean" | "putStringSet" => {
-                // write through to the parent prefs (P_EDIT_PARENT link)
-                let parent = pseudo_get(vm, h, P_EDIT_PARENT).unwrap_or(V::Ref(h));
-                let ph = match parent {
-                    V::Ref(p) => p,
-                    _ => h,
-                };
-                map_put(vm, ph, args[1], args[2]);
+                // Android editors stage writes; only commit/apply publishes
+                // them to the shared backing map and disk.
+                map_put(vm, h, args[1], args[2]);
                 Some(Some(args[0]))
             }
             "remove" | "clear" => {
-                let parent = pseudo_get(vm, h, P_EDIT_PARENT).unwrap_or(V::Ref(h));
-                if let V::Ref(ph) = parent {
-                    if name == "clear" {
-                        if let Some(m) = map_mut(vm, ph) {
-                            m.clear();
-                        }
-                    } else {
-                        map_remove(vm, ph, args[1]);
+                if name == "clear" {
+                    if let Some(m) = map_mut(vm, h) {
+                        m.clear();
                     }
+                    pseudo_set(vm, h, P_DATA, V::I32(1));
+                } else {
+                    let marker = host(
+                        vm,
+                        "Landroid/content/SharedPreferences$Editor$Remove;",
+                        HostState::Empty,
+                    );
+                    map_put(vm, h, args[1], marker);
                 }
                 Some(Some(args[0]))
             }
             "commit" | "apply" => {
+                let pending = match vm.heap.get(h) {
+                    Some(Obj::Host {
+                        state: HostState::Map(m),
+                        ..
+                    }) => m.clone(),
+                    _ => vec![],
+                };
+                let clear = matches!(pseudo_get(vm, h, P_DATA), Some(V::I32(1)));
                 let parent = pseudo_get(vm, h, P_EDIT_PARENT).unwrap_or(V::Ref(h));
                 if let V::Ref(ph) = parent {
+                    if clear {
+                        if let Some(m) = map_mut(vm, ph) {
+                            m.clear();
+                        }
+                    }
+                    for (key, value) in pending {
+                        if class_of(vm, value)
+                            == "Landroid/content/SharedPreferences$Editor$Remove;"
+                        {
+                            map_remove(vm, ph, key);
+                        } else {
+                            map_put(vm, ph, key, value);
+                        }
+                    }
                     if let Some((file, _)) = vm
                         .prefs_files
                         .iter()
@@ -2143,6 +2164,10 @@ fn prefs_call(vm: &mut Vm, name: &str, args: &[V]) -> Rt<Option<Option<V>>> {
                         save_prefs(vm, &file, ph);
                     }
                 }
+                if let Some(m) = map_mut(vm, h) {
+                    m.clear();
+                }
+                pseudo_set(vm, h, P_DATA, V::I32(0));
                 if name == "commit" {
                     Some(Some(V::I32(1)))
                 } else {
@@ -2199,7 +2224,7 @@ fn prefs_call(vm: &mut Vm, name: &str, args: &[V]) -> Rt<Option<Option<V>>> {
             "edit" => {
                 let eh = vm.alloc_host(
                     "Landroid/content/SharedPreferences$Editor;",
-                    HostState::Empty,
+                    HostState::Map(vec![]),
                 );
                 pseudo_set(vm, eh, P_EDIT_PARENT, args[0]);
                 Some(Some(V::Ref(eh)))

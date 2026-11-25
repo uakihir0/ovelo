@@ -14,6 +14,16 @@ pub(crate) fn call(
     Ok(
         if desc_is_a(class, "Ljava/io/PrintStream;") || desc_is_a(class, "Ljava/io/PrintWriter;") {
             print_call(vm, name, sig, args)
+        } else if class == "Ljava/util/jar/JarFile;" || class == "Ljava/util/zip/ZipFile;" {
+            zip_file_call(vm, class, name, args)
+        } else if class == "Ljava/util/jar/JarEntry;" || class == "Ljava/util/zip/ZipEntry;" {
+            zip_entry_call(vm, name, args)
+        } else if class == "Ljava/security/CodeSigner;"
+            || class == "Ljava/security/cert/CertPath;"
+            || class == "Ljava/security/cert/Certificate;"
+            || class == "Ljava/security/cert/X509Certificate;"
+        {
+            cert_call(vm, class, name, args)
         } else if class.ends_with("FileInputStream;") && name == "<init>" {
             // Open the real file: arg is a File (Path host), a String, or a
             // FileDescriptor already carrying bytes (`getFD`/ParcelFileDescriptor).
@@ -3649,6 +3659,287 @@ fn misc_fmt(vm: &mut Vm, class: &str, name: &str, args: &[V]) -> Option<Option<V
     }
     let _ = (class, name, args);
     None
+}
+
+fn replace_host_state(vm: &mut Vm, this: V, class: &str, state: HostState) {
+    let V::Ref(this) = this else { return };
+    let (ci, d, fs) = match vm.heap.get(this) {
+        Some(Obj::Host {
+            class_idx,
+            desc,
+            fields,
+            ..
+        }) => (*class_idx, desc.clone(), fields.clone()),
+        Some(Obj::Instance { class_idx, fields }) => {
+            (*class_idx, class.to_string(), fields.clone())
+        }
+        _ => (u64::MAX, class.to_string(), Default::default()),
+    };
+    if let Some(o) = vm.heap.get_mut(this) {
+        *o = Obj::Host {
+            class_idx: ci,
+            desc: d,
+            fields: fs,
+            state,
+        };
+    }
+}
+
+fn byte_arr(vm: &mut Vm, bytes: &[u8]) -> V {
+    arr(vm, "B", bytes.iter().map(|b| V::I32(*b as i32)).collect())
+}
+
+fn zip_file_call(vm: &mut Vm, class: &str, name: &str, args: &[V]) -> Option<Option<V>> {
+    if name == "<init>" {
+        let arg = args.get(1).copied().unwrap_or(V::Ref(0));
+        let bytes = stream_arg_path(vm, arg)
+            .and_then(|p| std::fs::read(fspath(vm, &p)).ok())
+            .unwrap_or_default();
+        let entries =
+            ovelo_apk::zip::parse_central_directory(&bytes, &ovelo_apk::zip::ZipLimits::default())
+                .map(|(_, entries)| entries)
+                .unwrap_or_default();
+        let cert_der = if class == "Ljava/util/jar/JarFile;" {
+            ovelo_apk::sig::verify_v1(&bytes).ok().and_then(|infos| {
+                infos
+                    .first()
+                    .map(|info| std::rc::Rc::new(info.cert_der.clone()))
+            })
+        } else {
+            None
+        };
+        replace_host_state(
+            vm,
+            args[0],
+            class,
+            HostState::ZipArchive {
+                bytes: std::rc::Rc::new(bytes),
+                entries: std::rc::Rc::new(entries),
+                cert_der,
+            },
+        );
+        return Some(None);
+    }
+    let archive = match args.first() {
+        Some(V::Ref(h)) => match vm.heap.get(*h) {
+            Some(Obj::Host {
+                state:
+                    HostState::ZipArchive {
+                        bytes,
+                        entries,
+                        cert_der,
+                    },
+                ..
+            }) => Some((bytes.clone(), entries.clone(), cert_der.clone())),
+            _ => None,
+        },
+        _ => None,
+    };
+    let Some((bytes, entries, cert_der)) = archive else {
+        return Some(Some(stub_ret(vm, "")));
+    };
+    match name {
+        "close" => Some(None),
+        "size" => Some(Some(V::I32(entries.len() as i32))),
+        "getEntry" | "getJarEntry" => {
+            let wanted = args.get(1).and_then(|v| sv(vm, *v)).unwrap_or_default();
+            let entry = entries.iter().find(|e| e.name == wanted).cloned();
+            let Some(entry) = entry else {
+                return Some(Some(V::Ref(0)));
+            };
+            let desc = if class == "Ljava/util/jar/JarFile;" {
+                "Ljava/util/jar/JarEntry;"
+            } else {
+                "Ljava/util/zip/ZipEntry;"
+            };
+            Some(Some(host(
+                vm,
+                desc,
+                HostState::ZipEntry {
+                    bytes,
+                    entry,
+                    cert_der,
+                },
+            )))
+        }
+        "getInputStream" => Some(Some(zip_input_stream(
+            vm,
+            args.get(1).copied().unwrap_or(V::Ref(0)),
+        ))),
+        "entries" => {
+            let desc = if class == "Ljava/util/jar/JarFile;" {
+                "Ljava/util/jar/JarEntry;"
+            } else {
+                "Ljava/util/zip/ZipEntry;"
+            };
+            let items = entries
+                .iter()
+                .cloned()
+                .map(|entry| {
+                    host(
+                        vm,
+                        desc,
+                        HostState::ZipEntry {
+                            bytes: bytes.clone(),
+                            entry,
+                            cert_der: cert_der.clone(),
+                        },
+                    )
+                })
+                .collect();
+            Some(Some(host(
+                vm,
+                "Ljava/util/Enumeration;",
+                HostState::Iter(std::rc::Rc::new(items), 0),
+            )))
+        }
+        "getManifest" => Some(Some(host(vm, "Ljava/util/jar/Manifest;", HostState::Empty))),
+        _ => Some(Some(stub_ret(vm, ""))),
+    }
+}
+
+fn signer_arr(vm: &mut Vm, cert_der: Option<std::rc::Rc<Vec<u8>>>) -> V {
+    let Some(der) = cert_der else {
+        return arr(vm, "Ljava/security/CodeSigner;", vec![]);
+    };
+    let cert = host(
+        vm,
+        "Ljava/security/cert/X509Certificate;",
+        HostState::Bytes(der, 0),
+    );
+    let path = host(
+        vm,
+        "Ljava/security/cert/CertPath;",
+        HostState::List(vec![cert]),
+    );
+    let signer = host(
+        vm,
+        "Ljava/security/CodeSigner;",
+        HostState::List(vec![path]),
+    );
+    arr(vm, "Ljava/security/CodeSigner;", vec![signer])
+}
+
+fn zip_entry_call(vm: &mut Vm, name: &str, args: &[V]) -> Option<Option<V>> {
+    let entry = match args.first() {
+        Some(V::Ref(h)) => match vm.heap.get(*h) {
+            Some(Obj::Host {
+                state:
+                    HostState::ZipEntry {
+                        bytes,
+                        entry,
+                        cert_der,
+                    },
+                ..
+            }) => Some((bytes.clone(), entry.clone(), cert_der.clone())),
+            _ => None,
+        },
+        _ => None,
+    };
+    let Some((bytes, entry, cert_der)) = entry else {
+        return Some(Some(stub_ret(vm, "")));
+    };
+    match name {
+        "getName" => Some(Some(jstr(vm, &entry.name))),
+        "getSize" => Some(Some(V::I64(entry.uncompressed_size as i64))),
+        "getCompressedSize" => Some(Some(V::I64(entry.compressed_size as i64))),
+        "getCrc" => Some(Some(V::I64(entry.crc32 as i64))),
+        "getMethod" => Some(Some(V::I32(entry.method as i32))),
+        "isDirectory" => Some(Some(V::I32(entry.name.ends_with('/') as i32))),
+        "getAttributes" => Some(Some(V::Ref(0))),
+        "getCodeSigners" => Some(Some(signer_arr(vm, cert_der))),
+        "getCertificates" => {
+            let cert = cert_der.map(|der| {
+                host(
+                    vm,
+                    "Ljava/security/cert/X509Certificate;",
+                    HostState::Bytes(der, 0),
+                )
+            });
+            Some(Some(arr(
+                vm,
+                "Ljava/security/cert/Certificate;",
+                cert.into_iter().collect(),
+            )))
+        }
+        _ => {
+            let _ = bytes;
+            Some(Some(stub_ret(vm, "")))
+        }
+    }
+}
+
+fn zip_input_stream(vm: &mut Vm, entry_obj: V) -> V {
+    let entry = match entry_obj {
+        V::Ref(h) => match vm.heap.get(h) {
+            Some(Obj::Host {
+                state: HostState::ZipEntry { bytes, entry, .. },
+                ..
+            }) => Some((bytes.clone(), entry.clone())),
+            _ => None,
+        },
+        _ => None,
+    };
+    let bytes = entry
+        .and_then(|(bytes, entry)| ovelo_apk::zip::read_entry(&bytes, &entry).ok())
+        .unwrap_or_default();
+    host(
+        vm,
+        "Ljava/io/ByteArrayInputStream;",
+        HostState::Bytes(std::rc::Rc::new(bytes), 0),
+    )
+}
+
+fn cert_call(vm: &mut Vm, class: &str, name: &str, args: &[V]) -> Option<Option<V>> {
+    match (class, name) {
+        ("Ljava/security/CodeSigner;", "getSignerCertPath") => match args.first() {
+            Some(V::Ref(h)) => match vm.heap.get(*h) {
+                Some(Obj::Host {
+                    state: HostState::List(items),
+                    ..
+                }) => Some(Some(items.first().copied().unwrap_or(V::Ref(0)))),
+                _ => Some(Some(V::Ref(0))),
+            },
+            _ => Some(Some(V::Ref(0))),
+        },
+        ("Ljava/security/cert/CertPath;", "getCertificates") => match args.first() {
+            Some(V::Ref(h)) => match vm.heap.get(*h) {
+                Some(Obj::Host {
+                    state: HostState::List(items),
+                    ..
+                }) => Some(Some(host(
+                    vm,
+                    "Ljava/util/ArrayList;",
+                    HostState::List(items.clone()),
+                ))),
+                _ => Some(Some(host(
+                    vm,
+                    "Ljava/util/ArrayList;",
+                    HostState::List(vec![]),
+                ))),
+            },
+            _ => Some(Some(host(
+                vm,
+                "Ljava/util/ArrayList;",
+                HostState::List(vec![]),
+            ))),
+        },
+        (_, "getEncoded") => {
+            let bytes = match args.first() {
+                Some(V::Ref(h)) => match vm.heap.get(*h) {
+                    Some(Obj::Host {
+                        state: HostState::Bytes(bytes, pos),
+                        ..
+                    }) => bytes[*pos..].to_vec(),
+                    _ => vec![],
+                },
+                _ => vec![],
+            };
+            Some(Some(byte_arr(vm, &bytes)))
+        }
+        (_, "getType") => Some(Some(jstr(vm, "X.509"))),
+        _ => Some(Some(stub_ret(vm, ""))),
+    }
 }
 
 /// The guest path a stream ctor argument points at: `File` (Path host),
