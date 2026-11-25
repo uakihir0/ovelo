@@ -203,9 +203,11 @@ pub(crate) fn call(
         // per file so writes are visible to later readers.
         match name {
             "getDefaultSharedPreferences" => {
-                // NUL can't appear in a real prefs file name — this
-                // key can never collide with a named file.
-                Some(Some(prefs_file(vm, "\u{0}default")))
+                let name = format!(
+                    "{}_preferences",
+                    vm.guest_package.as_deref().unwrap_or("app")
+                );
+                Some(Some(prefs_file(vm, &name)))
             }
             _ => None,
         }
@@ -2130,6 +2132,17 @@ fn prefs_call(vm: &mut Vm, name: &str, args: &[V]) -> Rt<Option<Option<V>>> {
                 Some(Some(args[0]))
             }
             "commit" | "apply" => {
+                let parent = pseudo_get(vm, h, P_EDIT_PARENT).unwrap_or(V::Ref(h));
+                if let V::Ref(ph) = parent {
+                    if let Some((file, _)) = vm
+                        .prefs_files
+                        .iter()
+                        .find(|(_, phh)| **phh == ph)
+                        .map(|(f, phh)| (f.clone(), *phh))
+                    {
+                        save_prefs(vm, &file, ph);
+                    }
+                }
                 if name == "commit" {
                     Some(Some(V::I32(1)))
                 } else {
@@ -5456,19 +5469,148 @@ fn app_info(vm: &mut Vm) -> V {
 /// `SharedPreferences` host object interned per file name — Android
 /// prefs are file-backed, so every getter for one file must share a
 /// map (a fresh empty map per call silently dropped every write).
+fn xml_unescape(s: &str) -> String {
+    s.replace("&#10;", "\n")
+        .replace("&#13;", "\r")
+        .replace("&lt;", "<")
+        .replace("&gt;", ">")
+        .replace("&quot;", "\"")
+        .replace("&apos;", "'")
+        .replace("&amp;", "&")
+}
+
+fn xml_escape(s: &str) -> String {
+    s.replace('&', "&amp;")
+        .replace('<', "&lt;")
+        .replace('>', "&gt;")
+        .replace('\"', "&quot;")
+        .replace('\n', "&#10;")
+        .replace('\r', "&#13;")
+}
+
+fn pref_name(line: &str) -> Option<String> {
+    line.split("name=\"")
+        .nth(1)
+        .and_then(|x| x.split('\"').next())
+        .map(xml_unescape)
+}
+
+fn pref_strings(line: &str) -> Vec<String> {
+    line.split("<string>")
+        .skip(1)
+        .filter_map(|x| x.split("</string>").next())
+        .map(xml_unescape)
+        .collect()
+}
+
 fn prefs_file(vm: &mut Vm, file: &str) -> V {
     if let Some(&h) = vm.prefs_files.get(file) {
         return V::Ref(h);
     }
+    let mut entries = Vec::new();
+    let path = io::fspath(vm, &format!("/data/local/ovelo/shared_prefs/{file}.xml"));
+    if let Ok(xml) = std::fs::read_to_string(&path) {
+        for line in xml.lines().map(str::trim_start) {
+            let Some(name) = pref_name(line) else {
+                continue;
+            };
+            let key = jstr(vm, &name);
+            let v = if line.starts_with("<boolean") {
+                line.contains("value=\"true\"")
+                    .then_some(V::I32(1))
+                    .or(Some(V::I32(0)))
+            } else if line.starts_with("<int") {
+                line.split("value=\"")
+                    .nth(1)
+                    .and_then(|x| x.split('\"').next())
+                    .and_then(|x| x.parse::<i32>().ok())
+                    .map(V::I32)
+            } else if line.starts_with("<long") {
+                line.split("value=\"")
+                    .nth(1)
+                    .and_then(|x| x.split('\"').next())
+                    .and_then(|x| x.parse::<i64>().ok())
+                    .map(V::I64)
+            } else if line.starts_with("<float") {
+                line.split("value=\"")
+                    .nth(1)
+                    .and_then(|x| x.split('\"').next())
+                    .and_then(|x| x.parse::<f32>().ok())
+                    .map(V::F32)
+            } else if line.starts_with("<string") {
+                pref_strings(line).first().map(|x| jstr(vm, x))
+            } else if line.starts_with("<set") {
+                let items = pref_strings(line)
+                    .into_iter()
+                    .map(|x| jstr(vm, &x))
+                    .collect();
+                Some(host(
+                    vm,
+                    "Ljava/util/LinkedHashSet;",
+                    HostState::List(items),
+                ))
+            } else {
+                None
+            };
+            if let Some(v) = v {
+                entries.push((key, v));
+            }
+        }
+    }
     let V::Ref(h) = host(
         vm,
         "Landroid/content/SharedPreferences;",
-        HostState::Map(vec![]),
+        HostState::Map(entries),
     ) else {
         unreachable!()
     };
     vm.prefs_files.insert(file.to_string(), h);
     V::Ref(h)
+}
+
+fn save_prefs(vm: &mut Vm, file: &str, h: u32) {
+    let Some(Obj::Host {
+        state: HostState::Map(m),
+        ..
+    }) = vm.heap.get(h)
+    else {
+        return;
+    };
+    let mut out = String::from("<?xml version='1.0' encoding='utf-8' standalone='yes' ?>\n<map>\n");
+    for (k, v) in m.clone() {
+        let Some(key) = sv(vm, k) else { continue };
+        let key = xml_escape(&key);
+        match v {
+            V::I32(x) => out.push_str(&format!("<int name=\"{key}\" value=\"{x}\" />\n")),
+            V::I64(x) => out.push_str(&format!("<long name=\"{key}\" value=\"{x}\" />\n")),
+            V::F32(x) => out.push_str(&format!("<float name=\"{key}\" value=\"{x}\" />\n")),
+            V::Ref(rh) => {
+                if let Some(x) = sv(vm, v) {
+                    out.push_str(&format!(
+                        "<string name=\"{key}\">{}</string>\n",
+                        xml_escape(&x)
+                    ));
+                } else if let Some(items) = list_snapshot(vm, rh) {
+                    let items: Vec<String> = items
+                        .iter()
+                        .filter_map(|item| sv(vm, *item).map(|x| xml_escape(&x)))
+                        .collect();
+                    out.push_str(&format!("<set name=\"{key}\">"));
+                    for item in items {
+                        out.push_str(&format!("<string>{item}</string>"));
+                    }
+                    out.push_str("</set>\n");
+                }
+            }
+            _ => {}
+        }
+    }
+    out.push_str("</map>\n");
+    let path = io::fspath(vm, &format!("/data/local/ovelo/shared_prefs/{file}.xml"));
+    if let Some(parent) = path.parent() {
+        let _ = std::fs::create_dir_all(parent);
+    }
+    let _ = std::fs::write(path, out);
 }
 
 /// The drawable's cached bounds Rect handle (None until created).
