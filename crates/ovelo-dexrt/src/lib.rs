@@ -18,7 +18,7 @@ mod value;
 pub use aot::Aot;
 pub use jdk::view::{fire_global_layout, DexViewInfo, P_BGCOLOR, P_TCOLOR, P_TEXT, P_TSIZE};
 pub use jdk::{pseudo_get, pseudo_set, P_ACTION, P_APPINFO, P_COMPONENT, P_DATA, P_META, P_TARGET};
-pub use value::{CanvasOp, PaintState};
+pub use value::{CanvasOp, PaintState, PathCmd};
 pub use value::{Heap, HostState, Obj, V};
 
 use aot::{AotFn, TRAP_DIV_ZERO, TRAP_REM_ZERO};
@@ -3632,6 +3632,7 @@ impl Vm {
             | "Ljava/util/concurrent/Semaphore;"
             | "Landroid/os/Message;" => HostState::Slot(V::I32(0)),
             "Ljava/io/File;" => HostState::Path(String::new()),
+            "Landroid/graphics/Path;" => HostState::GraphicsPath(Vec::new()),
             "Lorg/json/JSONObject;" => HostState::Map(Vec::new()),
             "Lorg/json/JSONArray;" => HostState::List(Vec::new()),
             "Ljava/util/regex/Pattern;"

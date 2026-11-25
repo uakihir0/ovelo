@@ -509,6 +509,102 @@ impl Drawable for Button {
     }
 }
 
+/// Flatten absolute path commands into polylines, one per contour.
+/// Cubics use enough subdivisions for icon-sized curves; fill mode
+/// implicitly closes open contours during scan conversion.
+fn flatten_path(cmds: &[ovelo_dexrt::PathCmd]) -> Vec<Vec<f32>> {
+    use ovelo_dexrt::PathCmd as P;
+    let mut out = Vec::new();
+    let mut pts: Vec<f32> = Vec::new();
+    let mut cur = (0.0f32, 0.0f32);
+    let mut start = cur;
+    let mut open = false;
+    fn finish(out: &mut Vec<Vec<f32>>, pts: &mut Vec<f32>, open: &mut bool) {
+        if pts.len() >= 4 {
+            out.push(std::mem::take(pts));
+        } else {
+            pts.clear();
+        }
+        *open = false;
+    }
+    for cmd in cmds {
+        match *cmd {
+            P::MoveTo { x, y } => {
+                finish(&mut out, &mut pts, &mut open);
+                cur = (x, y);
+                start = cur;
+                pts.extend_from_slice(&[x, y]);
+                open = true;
+            }
+            P::LineTo { x, y } => {
+                if !open {
+                    pts.extend_from_slice(&[cur.0, cur.1]);
+                    start = cur;
+                    open = true;
+                }
+                pts.extend_from_slice(&[x, y]);
+                cur = (x, y);
+            }
+            P::QuadTo { cx, cy, x, y } => {
+                if !open {
+                    pts.extend_from_slice(&[cur.0, cur.1]);
+                    start = cur;
+                    open = true;
+                }
+                let (x0, y0) = cur;
+                for i in 1..=12 {
+                    let t = i as f32 / 12.0;
+                    let u = 1.0 - t;
+                    pts.extend_from_slice(&[
+                        u * u * x0 + 2.0 * u * t * cx + t * t * x,
+                        u * u * y0 + 2.0 * u * t * cy + t * t * y,
+                    ]);
+                }
+                cur = (x, y);
+            }
+            P::CubicTo {
+                cx1,
+                cy1,
+                cx2,
+                cy2,
+                x,
+                y,
+            } => {
+                if !open {
+                    pts.extend_from_slice(&[cur.0, cur.1]);
+                    start = cur;
+                    open = true;
+                }
+                let (x0, y0) = cur;
+                for i in 1..=16 {
+                    let t = i as f32 / 16.0;
+                    let u = 1.0 - t;
+                    pts.extend_from_slice(&[
+                        u * u * u * x0
+                            + 3.0 * u * u * t * cx1
+                            + 3.0 * u * t * t * cx2
+                            + t * t * t * x,
+                        u * u * u * y0
+                            + 3.0 * u * u * t * cy1
+                            + 3.0 * u * t * t * cy2
+                            + t * t * t * y,
+                    ]);
+                }
+                cur = (x, y);
+            }
+            P::Close => {
+                if open && cur != start {
+                    pts.extend_from_slice(&[start.0, start.1]);
+                    cur = start;
+                }
+                finish(&mut out, &mut pts, &mut open);
+            }
+        }
+    }
+    finish(&mut out, &mut pts, &mut open);
+    out
+}
+
 /// Replay a guest `onDraw` recording: each [`ovelo_dexrt::CanvasOp`]
 /// maps onto the `Canvas` subset (already translated to the view's
 /// absolute origin by the caller). Stroke-styled shapes approximate
@@ -611,6 +707,36 @@ fn replay_guest_ops(c: &mut Canvas, ops: &[ovelo_dexrt::CanvasOp]) {
                     c.stroke_oval(rect, p.stroke_w.max(1.0) as i32, paint(p));
                 } else {
                     stroke_or_fill(c, rect, p, *r as i32);
+                }
+            }
+            O::Path {
+                cmds,
+                fill_type,
+                paint: p,
+            } => {
+                let contours = flatten_path(cmds);
+                let col = paint(p);
+                if p.style != 1 {
+                    let contours_i: Vec<Vec<i32>> = contours
+                        .iter()
+                        .map(|pts| pts.iter().map(|v| v.round() as i32).collect())
+                        .collect();
+                    c.fill_polys(&contours_i, fill_type % 2 == 1, *fill_type >= 2, col);
+                }
+                if p.style != 0 {
+                    let w = p.stroke_w.max(1.0) as i32;
+                    for pts in &contours {
+                        for xy in pts.chunks(2).zip(pts.chunks(2).skip(1)) {
+                            c.draw_line(
+                                xy.0[0] as i32,
+                                xy.0[1] as i32,
+                                xy.1[0] as i32,
+                                xy.1[1] as i32,
+                                w,
+                                col,
+                            );
+                        }
+                    }
                 }
             }
             O::FillPoly { pts, argb } => {

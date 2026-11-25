@@ -5046,9 +5046,13 @@ fn graphics_call(
                     Some(args[0]),
                 )
             } else {
+                // API 26 adds a leading nullable DisplayMetrics to the
+                // overload Compose uses; static builtins receive every
+                // real parameter (there is no implicit `this`).
+                let shift = usize::from(sig.starts_with("(Landroid/util/DisplayMetrics;"));
                 (
-                    i32v(args[0]).max(0) as u32,
-                    i32v(args.get(1).copied().unwrap_or(V::I32(0))).max(0) as u32,
+                    i32v(args.get(shift).copied().unwrap_or(V::I32(0))).max(0) as u32,
+                    i32v(args.get(shift + 1).copied().unwrap_or(V::I32(0))).max(0) as u32,
                     None,
                 )
             };

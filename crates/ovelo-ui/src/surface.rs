@@ -222,36 +222,76 @@ impl Surface {
     /// Fill a flat-color convex polygon (scanline), clipped. `pts` is
     /// x,y pairs; anything with < 3 points is ignored.
     pub fn fill_poly(&mut self, pts: &[i32], c: Color) {
-        let n = pts.len() / 2;
-        if n < 3 {
-            return;
+        self.fill_polys(&[pts.to_vec()], true, false, c);
+    }
+
+    /// Scanline-fill multiple closed contours together. Even-odd mode
+    /// toggles at every crossing; winding mode accumulates edge direction,
+    /// which lets opposite-oriented inner contours punch holes.
+    pub fn fill_polys(&mut self, contours: &[Vec<i32>], even_odd: bool, inverse: bool, c: Color) {
+        let mut min_y = i32::MAX;
+        let mut max_y = i32::MIN;
+        for pts in contours {
+            for y in pts.iter().skip(1).step_by(2) {
+                min_y = min_y.min(*y);
+                max_y = max_y.max(*y);
+            }
         }
-        let (mut min_y, mut max_y) = (pts[1], pts[1]);
-        for i in 0..n {
-            min_y = min_y.min(pts[2 * i + 1]);
-            max_y = max_y.max(pts[2 * i + 1]);
+        if min_y == i32::MAX {
+            return;
         }
         let clip = *self.clips.last().unwrap();
         let (min_y, max_y) = (min_y.max(clip.y), max_y.min(clip.y1 - 1));
         for y in min_y..=max_y {
             let yf = y as f64 + 0.5;
-            let mut xs: Vec<f64> = Vec::new();
-            for i in 0..n {
-                let (x1, y1) = (pts[2 * i] as f64, pts[2 * i + 1] as f64);
-                let j = (i + 1) % n;
-                let (x2, y2) = (pts[2 * j] as f64, pts[2 * j + 1] as f64);
-                if (y1 <= yf && y2 > yf) || (y2 <= yf && y1 > yf) {
-                    xs.push(x1 + (yf - y1) * (x2 - x1) / (y2 - y1));
+            let mut xs: Vec<(f64, i32)> = Vec::new();
+            for pts in contours {
+                let n = pts.len() / 2;
+                if n < 3 {
+                    continue;
                 }
-            }
-            xs.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
-            for pair in xs.chunks(2) {
-                if pair.len() == 2 {
-                    let (l, r) = (pair[0].ceil() as i32, pair[1].floor() as i32);
-                    for x in l.max(clip.x)..=r.min(clip.x1 - 1) {
-                        self.src_over(x, y, c);
+                for i in 0..n {
+                    let (x1, y1) = (pts[2 * i] as f64, pts[2 * i + 1] as f64);
+                    let j = (i + 1) % n;
+                    let (x2, y2) = (pts[2 * j] as f64, pts[2 * j + 1] as f64);
+                    if y1 <= yf && y2 > yf {
+                        xs.push((x1 + (yf - y1) * (x2 - x1) / (y2 - y1), 1));
+                    } else if y2 <= yf && y1 > yf {
+                        xs.push((x1 + (yf - y1) * (x2 - x1) / (y2 - y1), -1));
                     }
                 }
+            }
+            xs.sort_by(|a, b| a.0.partial_cmp(&b.0).unwrap_or(std::cmp::Ordering::Equal));
+            let mut inside = inverse;
+            let mut winding = 0i32;
+            let mut at = 0usize;
+            let mut prev_x: Option<f64> = None;
+            while at < xs.len() {
+                let x = xs[at].0;
+                if inside {
+                    if let Some(lx) = prev_x {
+                        let (l, r) = (lx.ceil() as i32, x.floor() as i32);
+                        for px in l.max(clip.x)..=r.min(clip.x1 - 1) {
+                            self.src_over(px, y, c);
+                        }
+                    }
+                }
+                let mut delta = 0i32;
+                let mut crossings = 0i32;
+                while at < xs.len() && xs[at].0 == x {
+                    delta += xs[at].1;
+                    crossings += 1;
+                    at += 1;
+                }
+                if even_odd {
+                    if crossings % 2 != 0 {
+                        inside = !inside;
+                    }
+                } else {
+                    winding += delta;
+                    inside = (winding != 0) != inverse;
+                }
+                prev_x = Some(x);
             }
         }
     }

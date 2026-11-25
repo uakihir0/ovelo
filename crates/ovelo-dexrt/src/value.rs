@@ -135,10 +135,61 @@ pub enum HostState {
         /// Cursor: index of the current event in `events`.
         pos: usize,
     },
+    /// An `android.graphics.Path`: absolute drawing commands in the
+    /// path's own coordinate space.
+    GraphicsPath(Vec<PathCmd>),
     /// A recording `android.graphics.Canvas`: draw calls from a guest
     /// `View.onDraw` append [`CanvasOp`]s the host view materializer
     /// replays into the real surface.
     CanvasOps(Vec<CanvasOp>),
+}
+
+/// One absolute `android.graphics.Path` command. Relative path methods
+/// are resolved when the builtin records them.
+#[derive(Debug, Clone, Copy)]
+pub enum PathCmd {
+    /// Start a new contour.
+    MoveTo {
+        /// X coordinate.
+        x: f32,
+        /// Y coordinate.
+        y: f32,
+    },
+    /// Straight segment.
+    LineTo {
+        /// End x.
+        x: f32,
+        /// End y.
+        y: f32,
+    },
+    /// Quadratic Bézier segment.
+    QuadTo {
+        /// Control x.
+        cx: f32,
+        /// Control y.
+        cy: f32,
+        /// End x.
+        x: f32,
+        /// End y.
+        y: f32,
+    },
+    /// Cubic Bézier segment.
+    CubicTo {
+        /// First control x.
+        cx1: f32,
+        /// First control y.
+        cy1: f32,
+        /// Second control x.
+        cx2: f32,
+        /// Second control y.
+        cy2: f32,
+        /// End x.
+        x: f32,
+        /// End y.
+        y: f32,
+    },
+    /// Close the current contour.
+    Close,
 }
 
 /// One recorded `Canvas` call from a guest `View.onDraw`, in local
@@ -257,6 +308,15 @@ pub enum CanvasOp {
         pts: Vec<f32>,
         /// Packed ARGB.
         argb: i32,
+    },
+    /// `drawPath` — fill or stroke the recorded contours.
+    Path {
+        /// Absolute path commands.
+        cmds: Vec<PathCmd>,
+        /// Android Path.FillType ordinal (0 winding, 1 even-odd).
+        fill_type: i32,
+        /// Paint at call time.
+        paint: PaintState,
     },
     /// `drawBitmap` — decoded pixels at `(x, y)`, scaled to `(w, h)`
     /// when both are nonzero (else natural size).

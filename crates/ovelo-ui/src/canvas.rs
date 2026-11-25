@@ -172,6 +172,19 @@ impl<'a> Canvas<'a> {
         self.surf.fill_poly(&pts, p.color);
     }
 
+    /// Fill multiple contours together, preserving holes.
+    pub fn fill_polys(&mut self, contours: &[Vec<i32>], even_odd: bool, inverse: bool, p: Paint) {
+        let contours: Vec<Vec<i32>> = contours
+            .iter()
+            .map(|pts| {
+                pts.chunks(2)
+                    .flat_map(|xy| [xy[0] + self.dx, xy[1] + self.dy])
+                    .collect()
+            })
+            .collect();
+        self.surf.fill_polys(&contours, even_odd, inverse, p.color);
+    }
+
     /// `drawBitmap`-style blit: `src` (RGBA8, `src_w`×`src_h`) scaled
     /// nearest into the `w`×`h` rect at `(x, y)` — translated + clipped.
     #[allow(clippy::too_many_arguments)]
