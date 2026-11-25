@@ -5675,7 +5675,7 @@ impl Vm {
 
     /// Execute one frame to return or throw.
     fn exec(&mut self, loc: Loc, args: Vec<V>) -> Rt<Option<V>> {
-        if self.depth >= 512 {
+        if self.depth >= 4096 {
             return Err(self.throw_builtin("Ljava/lang/StackOverflowError;", "call depth exceeded"));
         }
         self.depth += 1;
