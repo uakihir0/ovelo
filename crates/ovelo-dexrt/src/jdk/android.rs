@@ -58,6 +58,17 @@ pub(crate) fn call(
         intent_call(vm, name, sig, args)?
     } else if class == "Landroid/content/ComponentName;" {
         component_call(vm, name, args)?
+    } else if class == "Landroid/app/ActivityManager;" {
+        // Report a normal modern-device memory budget. Coil derives
+        // its memory-cache byte capacity from these values; the
+        // placeholder default of zero makes `LruCache` throw
+        // `maxSize <= 0` before image fetching even starts.
+        match name {
+            "getMemoryClass" => Some(Some(V::I32(256))),
+            "getLargeMemoryClass" => Some(Some(V::I32(384))),
+            "isLowRamDevice" => Some(Some(V::I32(0))),
+            _ => None,
+        }
     } else if class.starts_with("Landroid/app/job/") {
         job_call(vm, class, name, args)?
     } else if class == "Landroid/provider/DocumentsContract;" {

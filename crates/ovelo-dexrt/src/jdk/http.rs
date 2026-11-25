@@ -167,6 +167,21 @@ fn take_result(ticket: u64) -> Option<std::result::Result<HttpResp, String>> {
 /// thread, so blocking the scheduler here only delays peer runnables
 /// for the request's duration — the same stall a real blocking
 /// `execute` imposes on its thread.
+fn blocking_fetch(spec: HttpSpec) -> Option<HttpResp> {
+    let ticket = spawn_fetch(spec);
+    let deadline = now_ms() + 30_000;
+    loop {
+        if let Some(r) = take_result(ticket) {
+            return r.ok();
+        }
+        if now_ms() > deadline {
+            slots().lock().unwrap().remove(&ticket);
+            return None;
+        }
+        std::thread::sleep(Duration::from_millis(20));
+    }
+}
+
 fn park_or_block(vm: &mut Vm, call_h: u32, ticket: u64) -> Result<Option<V>> {
     let deadline = now_ms() + 30_000;
     loop {
@@ -829,6 +844,139 @@ pub(crate) fn drain_coil(vm: &mut Vm) {
     }
 }
 
+/// Fetch an F-Droid `DownloadRequest` icon through the host network
+/// stack and answer Coil's fetcher with its own `SourceFetchResult`.
+/// The app's Ktor pipeline is a large suspend/IO surface; keeping this
+/// bridge at the fetcher boundary preserves Coil's decoder, memory
+/// cache, size handling, and Compose handoff while avoiding the Ktor
+/// client implementation.
+fn fdroid_coil_fetch(vm: &mut Vm, a: &[V]) -> Result<Option<V>> {
+    let this = match a.first() {
+        Some(V::Ref(h)) => *h,
+        _ => return Ok(Some(V::Ref(0))),
+    };
+    let req = match field_v(
+        vm,
+        this,
+        "downloadRequest",
+        Some("Lorg/fdroid/download/DownloadRequest;"),
+    ) {
+        Some(V::Ref(h)) if h != 0 => h,
+        _ => return Ok(Some(V::Ref(0))),
+    };
+    let name = member_ref(vm, req, "getIndexFile", None)
+        .and_then(|idx| member_str(vm, idx, "getName"))
+        .unwrap_or_default();
+    if name.is_empty() {
+        return Ok(Some(V::Ref(0)));
+    }
+    let mirrors = member_ref(vm, req, "getMirrors", None);
+    let mut base = None;
+    let mut fallback = None;
+    if let Some(mirrors) = mirrors {
+        for i in 0..list_len(vm, mirrors).unwrap_or(0).min(8) {
+            let mirror = list_get(vm, mirrors, i);
+            let candidate = match mirror {
+                Some(V::Ref(h)) if h != 0 => member_str(vm, h, "getBaseUrl"),
+                _ => None,
+            };
+            let Some(candidate) = candidate else { continue };
+            if candidate.contains(".onion") {
+                continue;
+            }
+            if candidate.starts_with("https://") {
+                base = Some(candidate);
+                break;
+            }
+            if fallback.is_none() {
+                fallback = Some(candidate);
+            }
+        }
+    }
+    let base = base
+        .or(fallback)
+        .unwrap_or_else(|| "https://f-droid.org/repo".into());
+    let url = format!(
+        "{}/{}",
+        base.trim_end_matches('/'),
+        name.trim_start_matches('/')
+    );
+    if httpdbg() {
+        eprintln!("[http] fdroid coil fetch {url}");
+    }
+    let Some(resp) = blocking_fetch(HttpSpec {
+        method: "GET".into(),
+        url,
+        headers: vec![("User-Agent".into(), "F-Droid/2.0".into())],
+        body: vec![],
+    }) else {
+        return Ok(Some(V::Ref(0)));
+    };
+    if resp.code != 200 || resp.body.is_empty() {
+        if httpdbg() {
+            eprintln!(
+                "[http] fdroid coil code={} bytes={}",
+                resp.code,
+                resp.body.len()
+            );
+        }
+        return Ok(Some(V::Ref(0)));
+    }
+
+    let input = host(
+        vm,
+        "Ljava/io/ByteArrayInputStream;",
+        HostState::Bytes(std::rc::Rc::new(resp.body), 0),
+    );
+    let Some(source) = static_sig(
+        vm,
+        "Lokio/Okio;",
+        "source",
+        &["Ljava/io/InputStream;"],
+        vec![input],
+    )?
+    else {
+        return Ok(Some(V::Ref(0)));
+    };
+    let Some(buffered) = static_sig(
+        vm,
+        "Lokio/Okio;",
+        "buffer",
+        &["Lokio/Source;"],
+        vec![source],
+    )?
+    else {
+        return Ok(Some(V::Ref(0)));
+    };
+    let fs = vm
+        .type_index_of("Lokio/FileSystem;")
+        .and_then(|ci| vm.find_field_by_name(ci, "SYSTEM", true, None))
+        .and_then(|f| vm.sget_pub(f))
+        .unwrap_or(V::Ref(0));
+    let image_source = vm.instantiate_with(
+        "Lcoil3/decode/SourceImageSource;",
+        &[buffered, fs, V::Ref(0)],
+    )?;
+    let data_source = vm
+        .type_index_of("Lcoil3/decode/DataSource;")
+        .and_then(|ci| vm.find_field_by_name(ci, "NETWORK", true, None))
+        .and_then(|f| vm.sget_pub(f))
+        .unwrap_or(V::Ref(0));
+    let mime = resp
+        .headers
+        .iter()
+        .find(|(k, _)| k.eq_ignore_ascii_case("content-type"))
+        .map(|(_, v)| v.split(';').next().unwrap_or(v).trim().to_string())
+        .filter(|s| !s.is_empty())
+        .map(|s| jstr(vm, &s))
+        .unwrap_or(V::Ref(0));
+    let out = vm.instantiate_with(
+        "Lcoil3/fetch/SourceFetchResult;",
+        &[V::Ref(image_source), mime, data_source],
+    )?;
+    Ok(Some(V::Ref(out)))
+}
+
 /// Called from `Vm::add_dex` — intercept the single method every
 /// okhttp call path funnels through (`execute`, `enqueue` via
 /// `RealCall$AsyncCall.run`, coil's `await`, Rx wrappers).
@@ -866,6 +1014,17 @@ pub(crate) fn install(vm: &mut Vm) {
     );
     if httpdbg() {
         eprintln!("[http] registered coil3 enqueue={ok:?}");
+    }
+    let ok = vm.register_host(
+        "Lorg/fdroid/download/coil/DownloadRequestFetcher;",
+        "fetch",
+        "(Lkotlin/coroutines/Continuation;)Ljava/lang/Object;",
+        std::rc::Rc::new(std::cell::RefCell::new(|vm: &mut Vm, a: &[V]| {
+            fdroid_coil_fetch(vm, a)
+        })),
+    );
+    if httpdbg() {
+        eprintln!("[http] registered fdroid coil fetch={ok:?}");
     }
     // OkHttp 5's `toCanonicalHost` runs a bundled punycode/IDNA dex
     // pipeline; a miss anywhere in it rejects every host with
