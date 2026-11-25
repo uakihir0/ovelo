@@ -328,12 +328,20 @@ fn string_call(vm: &mut Vm, name: &str, sig: &str, args: &[V]) -> Option<Option<
             } else {
                 t.chars().count()
             };
-            let sub: String = t.chars().skip(b).take(e.saturating_sub(b)).collect();
-            Some(jdynstr(vm, &sub))
+            if b == 0 && e == t.chars().count() {
+                Some(args[0])
+            } else {
+                let sub: String = t.chars().skip(b).take(e.saturating_sub(b)).collect();
+                Some(jdynstr(vm, &sub))
+            }
         }
         "concat" => {
             let n = sv(vm, args[1]).unwrap_or_default();
-            Some(jdynstr(vm, &format!("{t}{n}")))
+            if n.is_empty() {
+                Some(args[0])
+            } else {
+                Some(jdynstr(vm, &format!("{t}{n}")))
+            }
         }
         "replace" => {
             if p.first() == Some(&"Ljava/lang/CharSequence;") {
@@ -368,9 +376,20 @@ fn string_call(vm: &mut Vm, name: &str, sig: &str, args: &[V]) -> Option<Option<
             } else {
                 t.to_lowercase()
             };
-            Some(jdynstr(vm, &out))
+            if out == t {
+                Some(args[0])
+            } else {
+                Some(jdynstr(vm, &out))
+            }
         }
-        "trim" | "strip" => Some(jdynstr(vm, t.trim())),
+        "trim" | "strip" => {
+            let out = t.trim();
+            if out == t {
+                Some(args[0])
+            } else {
+                Some(jdynstr(vm, out))
+            }
+        }
         "isBlank" => Some(V::I32(t.trim().is_empty() as i32)),
         "repeat" => Some(jdynstr(vm, &t.repeat(i32v(args[1]).max(0) as usize))),
         "getBytes" => {
