@@ -11,7 +11,6 @@ use std::rc::Rc;
 const SEQ: &str = "Lkotlinx/serialization/json/internal/ArrayAsSequence;";
 const WRITER: &str = "Lkotlinx/serialization/json/internal/JsonToStringWriter;";
 const LEXER: &str = "Lkotlinx/serialization/json/internal/ReaderJsonLexer;";
-const ABSTRACT_LEXER: &str = "Lkotlinx/serialization/json/internal/AbstractJsonLexer;";
 
 fn this(args: &[V]) -> u32 {
     match args.first() {
@@ -357,7 +356,10 @@ fn lexer_scan_index(vm: &mut Vm, h: u32, start: i32, needle: Option<i32>, whites
             false
         };
         if hit {
-            vm.set_object_field(h, ABSTRACT_LEXER, "currentPosition", V::I32(pos));
+            // indexOf is a pure query in the dex implementation. The
+            // lexer consumes the returned index itself; moving the
+            // cursor here corrupts strings that need escape decoding or
+            // span a refill boundary.
             return pos;
         }
         pos += 1;
