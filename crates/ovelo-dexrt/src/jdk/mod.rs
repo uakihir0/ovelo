@@ -1530,7 +1530,11 @@ fn universal(vm: &mut Vm, class: &str, name: &str, sig: &str, args: &[V]) -> Rt<
             }
         }
         "hashCode" => Some(Some(lang::hashcode(vm, args))),
-        "equals" => Some(Some(V::I32(
+        // `Arrays.equals` is a static deep-ish array comparison, not
+        // Object.equals; let the collections module implement it. Treating
+        // it as identity makes two freshly copied empty input arrays differ,
+        // which breaks Compose `rememberSaveable` across recompositions.
+        "equals" if class != "Ljava/util/Arrays;" => Some(Some(V::I32(
             (args.len() > 1 && value_eq(vm, args[0], args[1])) as i32,
         ))),
         "getClass" => {
