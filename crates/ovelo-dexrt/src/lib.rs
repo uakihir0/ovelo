@@ -16,9 +16,9 @@ mod res_attrs;
 mod value;
 
 pub use aot::Aot;
-pub use jdk::view::{fire_global_layout, DexViewInfo, P_TCOLOR, P_TEXT, P_TSIZE};
-pub use value::{CanvasOp, PaintState};
-pub use jdk::{pseudo_get, pseudo_set, P_COMPONENT, P_DATA, P_META, P_TARGET};
+pub use jdk::view::{fire_global_layout, DexViewInfo, P_BGCOLOR, P_TCOLOR, P_TEXT, P_TSIZE};
+pub use jdk::{pseudo_get, pseudo_set, P_ACTION, P_APPINFO, P_COMPONENT, P_DATA, P_META, P_TARGET};
+pub use value::{CanvasOp, PaintState, PathCmd};
 pub use value::{Heap, HostState, Obj, V};
 
 use aot::{AotFn, TRAP_DIV_ZERO, TRAP_REM_ZERO};
@@ -29,6 +29,24 @@ use std::collections::HashMap;
 
 fn err(cause: &str) -> OveloError {
     OveloError::new(ErrorCategory::DexUnsupported, Phase::DexExec, cause)
+}
+
+/// Cached `std::env::var_os(name).is_some()` — debug flags are fixed at
+/// process start, but the interpreter consulted getenv once per
+/// instruction (`aget`/`sget`/`iget` sites) and per dispatch.
+pub(crate) fn dbg_flag(name: &'static str) -> bool {
+    thread_local! {
+        static CACHE: std::cell::RefCell<HashMap<&'static str, bool>> =
+            std::cell::RefCell::new(HashMap::new());
+    }
+    CACHE.with(|c| {
+        if let Some(v) = c.borrow().get(name) {
+            return *v;
+        }
+        let v = std::env::var_os(name).is_some();
+        c.borrow_mut().insert(name, v);
+        v
+    })
 }
 fn errd(cause: &str, detail: String) -> OveloError {
     OveloError::new(ErrorCategory::DexUnsupported, Phase::DexExec, cause).with_detail(detail)
@@ -52,7 +70,33 @@ fn void_resolved(o: Option<V>) -> Option<V> {
     o.or(Some(V::Ref(0)))
 }
 
-/// `(params)ret` descriptor for a proto index local to `d`.
+/// Register slots `args` occupy under dex's register packing —
+/// long/double values take two. Name+arity resolution must match
+/// this count or a wide-arg override is silently missed.
+fn arg_reg_slots(args: &[V]) -> usize {
+    args.iter()
+        .map(|v| {
+            if matches!(v, V::I64(_) | V::F64(_)) {
+                2
+            } else {
+                1
+            }
+        })
+        .sum()
+}
+
+/// `(w, h)` of the view owning a SurfaceHolder — its laid-out frame,
+/// (0,0) when the view has no frame yet, the window default when the
+/// holder has no owning view.
+fn surface_holder_size(vm: &Vm, holder: u32) -> (i32, i32) {
+    let Some(V::Ref(vh)) = jdk::pseudo_get(vm, holder, jdk::P_TARGET) else {
+        return (720, 1280);
+    };
+    vm.dex_view(vh)
+        .and_then(|i| i.frame.map(|(l, t, r, b)| (r - l, b - t)))
+        .unwrap_or((0, 0))
+}
+
 fn proto_sig(d: &DexFile, pidx: u32) -> Result<String> {
     let p = d.proto(pidx)?;
     let mut sig = String::from("(");
@@ -113,6 +157,9 @@ struct Loc {
 /// `dexrt.host.reentrant` error there instead of panicking on the
 /// RefCell's second mutable borrow.
 pub type HostCall = std::rc::Rc<std::cell::RefCell<dyn FnMut(&mut Vm, &[V]) -> Result<Option<V>>>>;
+/// One `(name,sig)`-registered host impl: owner GIdx (or `GX_NONE`
+/// for platform classes), its class descriptor, and the call itself.
+type NamedHost = (GIdx, String, HostCall);
 
 /// DEX interpreter over one or more [`DexFile`]s (multi-dex apps).
 pub struct Vm {
@@ -138,18 +185,32 @@ pub struct Vm {
     /// method through a subclass descriptor. Only a reference whose
     /// class is the owner or a subclass of it may resolve — see
     /// `host_named`.
-    hosts_named: HashMap<(String, String), Vec<(GIdx, HostCall)>>,
+    /// `(GIdx owner or GX_NONE, registered class desc, impl)` — the
+    /// desc survives platform-class registrations whose owner has no
+    /// dex type index, and matches call sites by `assignable_desc`.
+    hosts_named: HashMap<(String, String), Vec<NamedHost>>,
     /// AOT-compiled method bodies (`None` until `enable_aot`).
     aot: Option<Aot>,
     /// Package name of the guest app, set by the launcher so
     /// `Context.getPackageName` etc. answer correctly.
     pub guest_package: Option<String>,
+    /// Manifest `application/@android:name` — ApplicationInfo.name
+    /// must answer this class (null when undeclared), not the package.
+    pub guest_app_class: Option<String>,
     /// Guest-visible filesystem root: `java.io.File` paths resolve
     /// under this directory, never onto the host fs directly.
     pub guest_root: std::path::PathBuf,
     /// Root `/storage/emulated/0` (and its `/sdcard` aliases) maps to —
     /// shared external storage, distinct from the app-private guest_root.
     pub external_root: std::path::PathBuf,
+    /// `(package, launcher activity)` of every app installed in the
+    /// store — `PackageManager.queryIntentActivities` enumerates them
+    /// for launchers, `getLaunchIntentForPackage` resolves per package.
+    pub installed_launchers: Vec<(String, String)>,
+    /// On-disk path per installed package — `loadIcon` /
+    /// `getApplicationIcon` read and decode the APK lazily, so a
+    /// non-launcher app doesn't pin every installed APK in memory.
+    pub installed_apk_paths: std::collections::BTreeMap<String, std::path::PathBuf>,
     /// Live interpreter call depth — unbounded guest or builtin
     /// recursion would overflow the native stack; cap it instead.
     depth: u32,
@@ -208,12 +269,30 @@ pub struct Vm {
     /// Root of the tree that owns each activity's content frame —
     /// appcompat's real decor when it built one dex-side.
     pub(crate) decor_roots: HashMap<u32, u32>,
+    /// The frame `setContentView` attaches into, per window owner —
+    /// the frame that last wore `android.R.id.content`. AppCompat's
+    /// ensureSubDecor calls `frameworkFrame.setId(NO_ID)` before it
+    /// moves its own ContentFrameLayout in, so an id-search can't be
+    /// trusted to find the attachment point afterwards.
+    pub(crate) content_frames: HashMap<u32, u32>,
+    /// Last known host window size — decor views are created lazily
+    /// inside guest calls and can't wait for the next layout pass to
+    /// have bounds.
+    pub(crate) window_size: (i32, i32),
+    /// Interned host enum constants, keyed (desc, ordinal) — so
+    /// `Month.of(1) == Month.JANUARY` and `date.getMonth()` return the
+    /// same handle the static constant did.
+    pub(crate) enum_cache: HashMap<(String, i32), u32>,
+    /// Canonical enum constant objects by (class desc, const name) —
+    /// `values()`, `valueOf` and static-field mints share handles so
+    /// `Paint.Cap.valueOf("ROUND") == Paint.Cap.ROUND` holds.
+    pub(crate) enum_name_cache: HashMap<(String, String), u32>,
     /// Attached `TextClock` views that tick — refreshed once per
     /// `drain_runnables` pass (AOSP ticks them per postDelayed).
     pub clock_views: Vec<u32>,
     /// Installed-APK resource index for `LayoutInflater.inflate` — `None`
     /// degrades inflation to bare placeholder views.
-    pub apk_res: Option<res::ApkResources>,
+    pub apk_res: Option<Box<res::ApkResources>>,
     /// Guest SQLite connections by database name
     /// (`android.database.sqlite` — see `jdk::db`).
     pub(crate) dbs: HashMap<String, std::rc::Rc<std::cell::RefCell<jdk::db::Db>>>,
@@ -221,6 +300,36 @@ pub struct Vm {
     pub(crate) db_handles: HashMap<String, u32>,
     /// Object handle (db or statement) -> database name it talks to.
     pub(crate) obj_db: HashMap<u32, String>,
+    /// androidx.sqlite `BundledSQLite*` JNI handle spaces — Room3's
+    /// `ConnectionPool` talks straight to these natives, bypassing the
+    /// `android.database` layer. Connections share the `dbs` pool.
+    pub(crate) bundled_conns: HashMap<u64, std::rc::Rc<std::cell::RefCell<jdk::db::Db>>>,
+    pub(crate) bundled_stmts: HashMap<u64, jdk::db::BundledStmt>,
+    /// Next bundled-driver handle (conns and stmts share one counter).
+    pub(crate) bundled_h: u64,
+    /// Running Service instances by class descriptor — `startService`
+    /// reuses the live object so `onCreate` runs once per service.
+    pub(crate) services: HashMap<String, u32>,
+    /// In-flight Coil3 `RealImageLoader.enqueue` jobs the host fetch
+    /// bridge owns: `(http_ticket, image_view)`. `drain_runnables`
+    /// delivers decoded bitmaps as drawables — coil's own coroutine
+    /// pipeline suspends on a dispatcher our loop never resumes.
+    pub(crate) coil_jobs: Vec<(u64, u32)>,
+    /// Last `startId` delivered to each running Service — `stopSelf(id)`
+    /// only stops when the id matches the most recent request.
+    pub(crate) service_start_id: HashMap<u32, i64>,
+    /// Monotonic `startId` source for `onStartCommand` dispatches.
+    pub(crate) service_seq: i64,
+    /// Services that called `stopSelf` before `startService` finished
+    /// registering them (self-stop inside `onCreate`) — the starter
+    /// must not insert or start them.
+    pub(crate) service_stop_pending: std::collections::HashSet<u32>,
+    /// Services whose `onDestroy` is owed on the next drain — deferred
+    /// so `onStartCommand`/`startService` finish before teardown runs.
+    pub(crate) pending_destroy: Vec<u32>,
+    /// Accepted JobScheduler jobs `(JobInfo, ComponentName, due_ms)`
+    /// waiting for a between-callback service dispatch.
+    pub(crate) pending_jobs: Vec<(u32, u32, i64)>,
     /// The Activity/theme res id (`android:theme` from the manifest) that
     /// theme-scoped `obtainStyledAttributes` resolves attributes against.
     pub theme_id: u32,
@@ -268,10 +377,25 @@ pub struct Vm {
     /// `(class GIdx, method name, arg slots)` → method GIdx — host→guest
     /// `call_virtual` (measure/layout/onViewAdded per node per pass)
     /// re-walked the superclass chain per call.
-    named_chain_cache: std::cell::RefCell<HashMap<(GIdx, String, usize), Option<GIdx>>>,
+    named_chain_cache: std::cell::RefCell<HashMap<(GIdx, String, String), Option<GIdx>>>,
     /// `(sub GIdx, sup GIdx)` → is-assignable — the chain+interface walk
     /// ran per check-cast / host registration probe.
     assignable_cache: std::cell::RefCell<HashMap<(GIdx, GIdx), bool>>,
+    /// `GIdx` → descriptor — `type_desc_of` re-decoded the MUTF-8 string
+    /// table on every call; assignability/super walks issue it per hop.
+    type_desc_cache: std::cell::RefCell<HashMap<GIdx, Option<String>>>,
+    /// descriptor → superclass descriptor — `super_desc` resolved the
+    /// dex class_def + its super string on every hop of every
+    /// `assignable_desc` walk.
+    super_desc_cache: std::cell::RefCell<HashMap<String, Option<String>>>,
+    /// `sub` descriptor → `sup` descriptor → is-assignable — nested so
+    /// lookups borrow `&str` keys without allocating a tuple.
+    /// `assignable_desc` is hit by `isInstance`/`isAssignableFrom` in
+    /// guest hot loops; each call re-walked the whole superclass chain.
+    assignable_desc_cache: std::cell::RefCell<HashMap<String, HashMap<String, bool>>>,
+    /// `midx` → `(params)ret` signature — the unresolved/builtin dispatch
+    /// path re-decoded the proto's full param list on every invoke.
+    proto_sig_cache: std::cell::RefCell<HashMap<GIdx, String>>,
     /// Bumped by every `pseudo_set` — lets the host render/layout
     /// passes skip rebuilding the dex-view tree when nothing changed.
     pub view_gen: u64,
@@ -287,11 +411,91 @@ pub struct Vm {
     /// deadlocks on self-rescheduling executors). Drained at the
     /// outermost `call_virtual` boundary.
     pub pending_runnables: std::collections::VecDeque<(u32, bool)>,
+    /// `Choreographer.postFrameCallback*` — `(callback handle, due_ms)`.
+    /// Drained once per `drain_runnables` pass (= once per frame tick)
+    /// as `doFrame(J)V`; the Compose Recomposer's frame clock and
+    /// `View.postOnAnimation` both schedule through it.
+    pub(crate) frame_callbacks: Vec<(u32, u64)>,
+    /// The one `Choreographer.getInstance()` handle — identity matters
+    /// (dex code compares instances).
+    pub(crate) choreographer_h: u32,
+    /// The shared `ByteOrder.nativeOrder()` object — buffer helpers
+    /// (Korge's `Lb8`) request it per window write, 100k+/10s.
+    pub(crate) byteorder_h: std::cell::Cell<u32>,
+    /// `Application.ActivityLifecycleCallbacks` handles registered via
+    /// `registerActivityLifecycleCallbacks` — application-global in
+    /// AOSP. androidx ReportFragment relies on these to drive
+    /// `ComponentActivity.mLifecycleRegistry` through its states.
+    pub(crate) activity_callbacks: Vec<u32>,
     /// Time-gated posts (`Handler.postDelayed`/`sendMessageDelayed`) —
     /// `(handle, on_main, due_ms)`. Promoted into `pending_runnables` by
     /// `drain_runnables` once due; without this a self-rescheduling
     /// handler floods every drain tick regardless of its delay.
     pub(crate) delayed_runnables: Vec<(u32, bool, u64)>,
+    /// `SurfaceHolder.addCallback` deliveries queued for the next
+    /// drain tick: `(holder, callback, retries)`. Android only fires
+    /// surfaceCreated/surfaceChanged once a real surface exists —
+    /// calling them inline during `init()` hits views whose GL thread
+    /// field is not assigned yet (Godot NPE'd exactly so). The size is
+    /// resolved from the owning view's frame at delivery, not when
+    /// `addCallback` runs (the view may not be laid out yet).
+    pub(crate) pending_surface: Vec<(u32, u32, u32)>,
+    /// Registered `(holder, callback)` pairs kept for redispatching
+    /// `surfaceChanged` when the owning view's frame later changes
+    /// (e.g. it was 0x0 when `addCallback` ran).
+    pub(crate) surface_cbs: Vec<(u32, u32)>,
+    /// Last `(w, h)` reported to each holder via `surfaceChanged`.
+    pub(crate) surface_sizes: HashMap<u32, (i32, i32)>,
+    /// `(midx, args)` of host calls that lost the borrow race: a guest
+    /// call re-entered an already-running host callback (attach →
+    /// onAttachedToWindow → addView). The dex-side bookkeeping ran via
+    /// the builtin fallback, but the bridge's own side effects (GuestUi
+    /// wiring, host-view materialization) did not — retry once the
+    /// outer borrow is released, on the next drain tick.
+    pub(crate) pending_host_retry: Vec<(GIdx, Vec<V>)>,
+    /// Set while the drain loop replays `pending_host_retry` — lets a
+    /// bridged method tell a retried invocation from a fresh one
+    /// (the builtin fallback already ran the dex side).
+    pub(crate) in_host_retry: bool,
+    /// Runnables spawned by `Thread.start` — long-lived loops that
+    /// legitimately park/reschedule forever (game loops like bouncy's
+    /// FieldDriver), unlike executor workers which the repark budget
+    /// exists to stop. Keyed by runnable handle.
+    pub(crate) thread_runnables: std::collections::HashSet<u32>,
+    /// Runnable handle → the Thread that `start()`ed it, so isAlive
+    /// distinguishes which Thread a shared Runnable runs on.
+    pub(crate) runnable_thread: std::collections::HashMap<u32, u32>,
+    /// The runnable `run_on_worker` is executing right now — lets
+    /// `Thread.sleep(ms)` record a wake deadline against it.
+    pub(crate) cur_runnable: u32,
+    /// Runnable handle -> wall-clock ms the parked thread asked to
+    /// wake at (`Thread.sleep` in worker context writes; the drain
+    /// reads when requeueing into `delayed_runnables`).
+    pub(crate) sleep_until: HashMap<u32, u64>,
+    /// Runnables whose `sleep_until` deadline came from
+    /// `LockSupport.park*`/`Object.wait(ms)` — interruptible waits an
+    /// `unpark`/`notify` may cut short, unlike `Thread.sleep`.
+    pub(crate) park_waiters: std::collections::HashSet<u32>,
+    /// Handles currently sitting in `delayed_runnables` whose deadline
+    /// is interruptible — `wake_parked` promotes these early.
+    pub(crate) unparkable_delayed: std::collections::HashSet<u32>,
+    /// Runnables whose latest promotion out of `delayed_runnables` was
+    /// their own deadline expiring — not an `unpark`. An interruptible
+    /// parker that re-parks straight after a deadline wake ticks
+    /// `deadline_park_cycles` (a kotlinx surplus worker re-parks here
+    /// when its keep-alive check should have retired it).
+    pub(crate) deadline_woke: std::collections::HashSet<u32>,
+    /// Consecutive deadline-expiry wake→re-park cycles per runnable —
+    /// at the cap the runnable is retired into `parked_runnables`
+    /// (still revivable by `unpark`/`enqueue_runnable`), approximating
+    /// coroutine surplus-worker retirement.
+    pub(crate) deadline_park_cycles: HashMap<u32, u32>,
+    /// Runnables whose re-run after a long `Thread.sleep` park must
+    /// skip the first sleep call: `run()` re-executes from the top,
+    /// so without the flag a one-shot task that sleeps mid-body
+    /// (`load(); sleep(200); post()`) re-parks at the same call on
+    /// every drain and never finishes.
+    pub(crate) slept_once: std::collections::HashSet<u32>,
     /// ViewTreeObserver handle -> registered onGlobalLayout listeners.
     pub(crate) vto_listeners: HashMap<u32, Vec<u32>>,
     /// ViewTreeObserver handle -> `OnPreDrawListener` handles — Glide's
@@ -309,6 +513,11 @@ pub struct Vm {
     /// kills one (and its task is lost). Cleared whenever fresh work
     /// is enqueued — it may target those workers' internal queues.
     reparked: std::collections::HashSet<u32>,
+    /// Array handles whose fill-loop peephole scan found a non-uniform
+    /// range — re-scanning every loop iteration is O(n²), so a failed
+    /// handle is remembered and the check skipped from then on. A handle
+    /// that later becomes uniform just loses a skip (perf only).
+    fill_bad: std::collections::HashSet<u32>,
     /// Consecutive `park_drain` calls that drained only re-parked
     /// workers — bounded so mutual waiters yield to the outer drain
     /// (which re-runs them with a fresh budget) instead of spinning
@@ -344,6 +553,12 @@ pub struct Vm {
     pub jni_mids: Vec<GIdx>,
     /// JNI jfieldID table — id = index+1 → field GIdx.
     pub jni_fids: Vec<GIdx>,
+    /// By-name `jmethodID`s: `GetMethodID` misses on host/JDK classes
+    /// (reflection APIs the dex chain doesn't declare) get a tagged
+    /// entry here — `(owner descriptor, name, signature)` — resolved
+    /// at call time through the normal name dispatch. Indexed by
+    /// `mid & !GX_NAMED`; see jni.rs.
+    pub(crate) jni_named: Vec<(String, String, String)>,
     /// Exception a native call left pending (Throw/ThrowNew); 0 = none,
     /// `u32::MAX` = thrown without an object handle.
     pub jni_pending_exc: u32,
@@ -382,6 +597,119 @@ pub const NORMAL_PERMISSIONS: &[&str] = &[
     "android.permission.BLUETOOTH_ADMIN",
 ];
 
+/// Diagnostics: when the embedding binary runs all Rust allocations
+/// through a private malloc zone (ovelo-cli's ZoneAlloc), it publishes
+/// that zone's pointer here so OVELO_ZONECHECK can name it.
+#[doc(hidden)]
+pub static RUST_ZONE: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
+/// Diagnostics: `malloc_zone_check` every process zone; aborts at the
+/// first corrupt one naming `tag` — a milestone in OVELO_ZONECHECK runs.
+#[doc(hidden)]
+pub fn check_zones(tag: &str) {
+    native::check_all_zones(tag)
+}
+
+/// Resolve a theme attribute to an ARGB color — `android.R.attr.windowBackground`
+/// and friends. Chases `?attr` hops through the bound theme and
+/// `@drawable` references to a representative flat color.
+pub fn theme_color(vm: &Vm, attr_id: u32) -> Option<u32> {
+    let res = vm.apk_res.as_ref()?;
+    let mut cur = attr_id;
+    for _ in 0..8 {
+        let ev = res.style_item(vm.theme_id, cur).cloned()?;
+        match ev.data_type {
+            0x02 => cur = ev.data,
+            0x1c..=0x1f | 0x10 | 0x11 => return Some(ev.data),
+            0x01 => {
+                return jdk::vector::resolve_ref_color(
+                    jdk::vector::RCtx {
+                        res,
+                        theme: vm.theme_id,
+                        depth: 0,
+                    },
+                    ev.data,
+                )
+                .or_else(|| {
+                    jdk::vector::drawable_flat_color(
+                        jdk::vector::RCtx {
+                            res,
+                            theme: vm.theme_id,
+                            depth: 0,
+                        },
+                        ev.data,
+                    )
+                });
+            }
+            0x03 => return ev.string.as_deref().and_then(jdk::vector::parse_color),
+            _ => return None,
+        }
+    }
+    None
+}
+
+/// `theme_color` looked up by attr name (`colorSurface`, …) — used for
+/// fallbacks when `windowBackground` points at a framework drawable the
+/// APK doesn't carry.
+pub fn theme_color_named(vm: &Vm, attr_name: &str) -> Option<u32> {
+    let res = vm.apk_res.as_ref()?;
+    theme_color(vm, res.attr_id_named(attr_name)?)
+}
+
+/// Rasterize an installed package's launcher icon from raw APK
+/// bytes — vector XML, adaptive icon layers, or a raster image,
+/// whichever `application/@android:icon` references.
+pub fn package_icon_rgba(apk: &[u8]) -> Option<(u32, u32, std::rc::Rc<Vec<u8>>)> {
+    let ai = ovelo_apk::inspect_apk(apk).ok()?;
+    let icon = ai.manifest.icon?;
+    let res = res::ApkResources::open(apk.to_vec())?;
+    let (w, h, px) = jdk::vector::drawable_bitmap(
+        jdk::vector::RCtx {
+            res: &res,
+            theme: ai.manifest.theme.unwrap_or(0),
+            depth: 0,
+        },
+        icon,
+    )?;
+    // Callers per-pixel-process these (e.g. Palette/average-color
+    // helpers interpreted in dex) — cap at a display-size decode.
+    const MAX: u32 = 144;
+    if w <= MAX && h <= MAX {
+        return Some((w, h, px));
+    }
+    let scale = MAX as f64 / w.max(h) as f64;
+    let (tw, th) = (
+        ((w as f64 * scale).round() as u32).max(1),
+        ((h as f64 * scale).round() as u32).max(1),
+    );
+    let mut out = vec![0u8; (tw * th * 4) as usize];
+    for y in 0..th {
+        for x in 0..tw {
+            let sx = (x as f64 / scale) as u32;
+            let sy = (y as f64 / scale) as u32;
+            let (si, di) = (((sy * w + sx) * 4) as usize, ((y * tw + x) * 4) as usize);
+            out[di..di + 4].copy_from_slice(&px[si..si + 4]);
+        }
+    }
+    Some((tw, th, std::rc::Rc::new(out)))
+}
+
+/// `application/@android:label` of an installed APK — resource
+/// reference resolved through its own arsc, or the literal string.
+/// `PackageItemInfo.loadLabel` resolves to this, not the component's
+/// class name.
+pub fn package_label(apk: &[u8]) -> Option<String> {
+    let ai = ovelo_apk::inspect_apk(apk).ok()?;
+    match ai.manifest.label? {
+        ovelo_apk::manifest::Value::Str(s) => Some(s),
+        ovelo_apk::manifest::Value::Reference(r) => {
+            let res = res::ApkResources::open(apk.to_vec())?;
+            res.string_of(r).map(|s| s.to_string())
+        }
+        _ => None,
+    }
+}
+
 /// Hold the VM's recursive mutex for a batch of driver-side work.
 /// `invoke` self-locks, but the driver also touches `&mut Vm` between
 /// invokes (runnable-drain bookkeeping, GC, dex-tree refresh) — wrap
@@ -413,12 +741,15 @@ impl Vm {
             hosts_named: HashMap::new(),
             aot: None,
             guest_package: None,
+            guest_app_class: None,
             guest_root: std::env::temp_dir().join("ovelo-guest"),
             external_root: std::env::temp_dir()
                 .join("ovelo-guest")
                 .join("storage")
                 .join("emulated")
                 .join("0"),
+            installed_launchers: Vec::new(),
+            installed_apk_paths: std::collections::BTreeMap::new(),
             depth: 0,
             stack: Vec::new(),
             throw_sites: HashMap::new(),
@@ -431,7 +762,7 @@ impl Vm {
             unsafe_offsets: HashMap::new(),
             unsafe_next_offset: 0,
             trace_field: std::env::var("OVELO_TRACE_FIELD").ok(),
-            trace_throw: std::env::var_os("OVELO_TRACE_THROW").is_some(),
+            trace_throw: crate::dbg_flag("OVELO_TRACE_THROW"),
             trace_call: std::env::var("OVELO_TRACE_CALL").ok(),
             trace_from: std::env::var("OVELO_TRACE_FROM").ok(),
             view_roots: Vec::new(),
@@ -439,28 +770,62 @@ impl Vm {
             cur_activity: 0,
             content_views: HashMap::new(),
             decor_roots: HashMap::new(),
+            content_frames: HashMap::new(),
+            window_size: (720, 1280),
+            enum_cache: HashMap::new(),
+            enum_name_cache: HashMap::new(),
             clock_views: Vec::new(),
             apk_res: None,
             dbs: HashMap::new(),
             db_handles: HashMap::new(),
             obj_db: HashMap::new(),
+            bundled_conns: HashMap::new(),
+            bundled_stmts: HashMap::new(),
+            bundled_h: 0,
+            services: HashMap::new(),
+            coil_jobs: Vec::new(),
+            service_start_id: HashMap::new(),
+            service_seq: 0,
+            service_stop_pending: std::collections::HashSet::new(),
+            pending_destroy: Vec::new(),
+            pending_jobs: Vec::new(),
             theme_id: 0,
             total_steps: 0,
             pending_activity: None,
             pending_runnables: std::collections::VecDeque::new(),
+            frame_callbacks: Vec::new(),
+            choreographer_h: 0,
+            byteorder_h: std::cell::Cell::new(0),
+            activity_callbacks: Vec::new(),
             delayed_runnables: Vec::new(),
+            pending_surface: Vec::new(),
+            surface_cbs: Vec::new(),
+            pending_host_retry: Vec::new(),
+            in_host_retry: false,
+            surface_sizes: HashMap::new(),
+            thread_runnables: std::collections::HashSet::new(),
+            runnable_thread: std::collections::HashMap::new(),
+            cur_runnable: 0,
+            sleep_until: HashMap::new(),
+            slept_once: std::collections::HashSet::new(),
             vto_listeners: HashMap::new(),
             vto_predraw: HashMap::new(),
             draining: false,
             park_depth: 0,
             reparked: std::collections::HashSet::new(),
+            fill_bad: std::collections::HashSet::new(),
             park_spins: 0,
             repark_counts: HashMap::new(),
             parked_runnables: HashMap::new(),
+            park_waiters: std::collections::HashSet::new(),
+            unparkable_delayed: std::collections::HashSet::new(),
+            deadline_woke: std::collections::HashSet::new(),
+            deadline_park_cycles: HashMap::new(),
             media_ids: HashMap::new(),
             next_media_id: 0,
             natives: Vec::new(),
             jni_mids: Vec::new(),
+            jni_named: Vec::new(),
             jni_fids: Vec::new(),
             jni_pending_exc: 0,
             field_idx_cache: std::cell::RefCell::new(HashMap::new()),
@@ -475,6 +840,10 @@ impl Vm {
             host_named_cache: std::cell::RefCell::new(HashMap::new()),
             named_chain_cache: std::cell::RefCell::new(HashMap::new()),
             assignable_cache: std::cell::RefCell::new(HashMap::new()),
+            type_desc_cache: std::cell::RefCell::new(HashMap::new()),
+            super_desc_cache: std::cell::RefCell::new(HashMap::new()),
+            assignable_desc_cache: std::cell::RefCell::new(HashMap::new()),
+            proto_sig_cache: std::cell::RefCell::new(HashMap::new()),
             view_gen: 0,
             layout_gen_done: std::cell::Cell::new(u64::MAX),
             gc_mark: 65_536,
@@ -512,6 +881,10 @@ impl Vm {
         self.host_named_cache.borrow_mut().clear();
         self.named_chain_cache.borrow_mut().clear();
         self.assignable_cache.borrow_mut().clear();
+        self.type_desc_cache.borrow_mut().clear();
+        self.super_desc_cache.borrow_mut().clear();
+        self.assignable_desc_cache.borrow_mut().clear();
+        self.proto_sig_cache.borrow_mut().clear();
         let di = self.dexes.len();
         for (class_idx, em) in dex.methods()? {
             self.defined
@@ -546,6 +919,7 @@ impl Vm {
             }
         }
         self.dexes.push(dex);
+        jdk::http::install(self);
         Ok(())
     }
 
@@ -568,9 +942,23 @@ impl Vm {
         let out = (|| {
             let d = self.dex_of(g)?;
             let f = d.field(gl(g)).ok()?;
+            let owner_desc = d.type_descriptor(f.class_idx as u32).ok()?;
+            let name = d.string(f.name_idx).ok()?;
+            // Resolve the ref through the class hierarchy to the class
+            // that actually declares the field: `LPolygonShape;.addr`
+            // and `LShape;.addr` then share one storage slot.
+            if let Some(owner) = self.type_index_of(&owner_desc) {
+                let fty = d.type_descriptor(f.type_idx as u32).ok();
+                if let Some(decl) = self
+                    .find_field_by_name(owner, &name, false, fty.as_deref())
+                    .or_else(|| self.find_field_by_name(owner, &name, true, fty.as_deref()))
+                {
+                    return Some(decl);
+                }
+            }
             let sig = (
-                d.type_descriptor(f.class_idx as u32).unwrap_or_default(),
-                d.string(f.name_idx).unwrap_or_default(),
+                owner_desc,
+                name,
                 d.type_descriptor(f.type_idx as u32).unwrap_or_default(),
             );
             Some(self.fields_by_sig.get(&sig).copied().unwrap_or(g))
@@ -585,7 +973,22 @@ impl Vm {
     /// DEFINING dex, whose index is `gd(canon_g)`.
     pub(crate) fn def_loc_of(&self, class_idx: GIdx) -> Option<(GIdx, &ClassDef)> {
         let desc = self.type_desc_of(class_idx).ok()?;
-        let &(di, i) = self.defs.get(&desc)?;
+        // APKs ship D8-generated `android.*` stub defs whose every method
+        // throws NoClassDefFoundError (minSdk gating for post-release
+        // platform APIs). On a real device the platform class wins, so
+        // shadow the dex def the same way: treat it as not defined.
+        // `android.support.*` is bundled library code (legacy support
+        // lib ships inside the app, not the platform) — never shadow it.
+        if desc.starts_with("Landroid/") && !desc.starts_with("Landroid/support/") {
+            return None;
+        }
+        let hit = self.defs.get(&desc).copied();
+        if crate::dbg_flag("OVELO_ANNDBG")
+            && (desc.contains("Navigator$Name") || desc.contains("ComposeNavigator"))
+        {
+            eprintln!("[anndbg] def_loc_of {desc} -> {hit:?}");
+        }
+        let (di, i) = hit?;
         let def = &self.dexes[di].class_defs()[i];
         Some((gx(di, def.class_idx), def))
     }
@@ -702,6 +1105,11 @@ impl Vm {
         jdk::class_of(self, V::Ref(h))
     }
 
+    /// Debug: a view's recorded P_PARENT handle (0 when none).
+    pub fn dbg_view_parent(&self, h: u32) -> u32 {
+        jdk::view::view_parent(self, h)
+    }
+
     /// Debug: the `Class.field` name for a canonical global field index.
     pub fn dbg_field_name(&self, g: u64) -> String {
         self.dex_of(g)
@@ -743,6 +1151,18 @@ impl Vm {
         // a collection wrapper. Be permissive there; the backing-field
         // search is the real test.
         self.type_index_of("Ljava/util/Collection;")
+            .map(|t| self.assignable(*class_idx, t))
+            .unwrap_or(true)
+    }
+
+    /// `is_guest_collection` for `java.util.Map` — dex subclasses of
+    /// `HashMap` (nanojson `JsonObject`, …) need a mutation backing
+    /// store the same way list subclasses do.
+    pub(crate) fn is_guest_map(&self, h: u32) -> bool {
+        let Some(Obj::Instance { class_idx, .. }) = self.heap.get(h) else {
+            return false;
+        };
+        self.type_index_of("Ljava/util/Map;")
             .map(|t| self.assignable(*class_idx, t))
             .unwrap_or(true)
     }
@@ -793,9 +1213,27 @@ impl Vm {
     }
 
     pub(crate) fn type_desc_of(&self, g: GIdx) -> Result<String> {
-        self.dex_of(g)
-            .ok_or_else(|| err("dexrt.dex.idx"))?
-            .type_descriptor(gl(g))
+        if let Some(hit) = self.type_desc_cache.borrow().get(&g) {
+            return hit.clone().ok_or_else(|| err("dexrt.dex.idx"));
+        }
+        let out = self.dex_of(g).and_then(|d| d.type_descriptor(gl(g)).ok());
+        self.type_desc_cache.borrow_mut().insert(g, out.clone());
+        out.ok_or_else(|| err("dexrt.dex.idx"))
+    }
+
+    /// `(params)ret` for a method ref, memoized — the unresolved /
+    /// builtin dispatch path decodes the proto on every invoke.
+    fn proto_sig_of(&self, midx: GIdx) -> Rt<String> {
+        if let Some(hit) = self.proto_sig_cache.borrow().get(&midx) {
+            return Ok(hit.clone());
+        }
+        let d = self
+            .dex_of(midx)
+            .ok_or_else(|| E::Vm(err("dexrt.dex.idx")))?;
+        let mid = *d.method(gl(midx)).map_err(E::Vm)?;
+        let out = proto_sig(d, mid.proto_idx as u32).map_err(E::Vm)?;
+        self.proto_sig_cache.borrow_mut().insert(midx, out.clone());
+        Ok(out)
     }
 
     /// `Lowner;.name(params)ret` for a global method ref, or None when
@@ -817,9 +1255,7 @@ impl Vm {
         let ret = d.type_descriptor(p.return_type_idx)?;
         sig.push_str(&ret);
         let out = (class, name, sig);
-        self.method_sig_cache
-            .borrow_mut()
-            .insert(midx, out.clone());
+        self.method_sig_cache.borrow_mut().insert(midx, out.clone());
         Ok(out)
     }
 
@@ -885,15 +1321,31 @@ impl Vm {
             // Misses are memoized — a subclass-named call resolved to
             // None before this registration must see the new impl.
             self.host_named_cache.borrow_mut().clear();
-            // A DEX may reference the same method through a subclass
-            // descriptor; fall back to (name, sig) in call_builtin.
-            let owner = self.type_index_of(class_desc).unwrap_or(GX_NONE);
-            self.hosts_named
-                .entry((name.to_string(), proto_desc.to_string()))
-                .or_default()
-                .push((owner, f));
         }
+        // A DEX may reference the same method through a subclass
+        // descriptor; fall back to (name, sig) in call_builtin.
+        // Registered even when the exact proto has no dex ref — apps
+        // call `addView(View,LayoutParams)` while the bridge is wired
+        // for canonical `addView(View)`, and callers below the invoke
+        // dispatch consult this map directly.
+        let owner = self.type_index_of(class_desc).unwrap_or(GX_NONE);
+        self.hosts_named
+            .entry((name.to_string(), proto_desc.to_string()))
+            .or_default()
+            .push((owner, class_desc.to_string(), f));
         Ok(found)
+    }
+
+    /// Intern a string value — for host code and probes that need to
+    /// hand a `String` to a dex call.
+    pub fn intern_str(&mut self, s: &str) -> u32 {
+        self.heap.intern_str(s)
+    }
+
+    /// Allocate a dex array — for host code and probes passing array
+    /// args to dex calls.
+    pub fn alloc_array(&mut self, elem: &str, data: Vec<V>) -> V {
+        jdk::arr(self, elem, data)
     }
 
     /// Heap borrow.
@@ -965,9 +1417,17 @@ impl Vm {
     /// Returns `Some(value)` or `None` for void. An uncaught guest exception
     /// surfaces as `dexrt.exception.uncaught`.
     pub fn run(&mut self, class_desc: &str, name: &str, args: &[V]) -> Result<Option<V>> {
-        let midx = self
-            .find_method_by_name(class_desc, name, args.len())?
-            .ok_or_else(|| errd("dexrt.method.missing", format!("{class_desc}.{name}")))?;
+        let mut midx =
+            self.find_method_by_name(class_desc, name, arg_reg_slots(args), Some(args))?;
+        let eff_args;
+        if midx.is_none() && args.iter().any(|v| !matches!(v, V::Ref(_))) {
+            eff_args = self.box_scalars(args);
+            midx = self.find_method_by_name(class_desc, name, eff_args.len(), Some(&eff_args))?;
+        } else {
+            eff_args = args.to_vec();
+        }
+        let midx =
+            midx.ok_or_else(|| errd("dexrt.method.missing", format!("{class_desc}.{name}")))?;
         // invoke reports a resolved void method as Some(null) — translate
         // back to the documented contract (None = void return).
         let ret_void = self
@@ -979,7 +1439,7 @@ impl Vm {
                     .and_then(|t| d.type_descriptor(t).ok())
             })
             .is_some_and(|r| r == "V");
-        match self.invoke(midx, args.to_vec(), InvokeKind::Static) {
+        match self.invoke(midx, eff_args, InvokeKind::Static) {
             Ok(v) => Ok(if ret_void { None } else { v }),
             Err(E::Vm(e)) => Err(e),
             Err(E::Throw(r)) => {
@@ -1021,7 +1481,7 @@ impl Vm {
                 self.app_h = h;
             }
         }
-        if let Some(midx) = self.find_method_by_name(class_desc, "<init>", 0)? {
+        if let Some(midx) = self.find_method_by_name(class_desc, "<init>", 0, Some(&[]))? {
             match self.invoke(midx, vec![V::Ref(h)], InvokeKind::Direct) {
                 Ok(_) => {}
                 Err(E::Vm(e)) => return Err(e),
@@ -1058,20 +1518,20 @@ impl Vm {
             fields: HashMap::new(),
         });
         self.mark_view_alloc(h, ty);
-        let slots: usize = args
-            .iter()
-            .map(|a| {
-                if matches!(a, V::I64(_) | V::F64(_)) {
-                    2
-                } else {
-                    1
-                }
-            })
-            .sum();
-        if let Some(midx) = self.find_method_by_name(class_desc, "<init>", slots)? {
-            let mut a = Vec::with_capacity(args.len() + 1);
+        let slots = arg_reg_slots(args);
+        let mut midx = self.find_method_by_name(class_desc, "<init>", slots, Some(args))?;
+        let eff_args;
+        if midx.is_none() && args.iter().any(|v| !matches!(v, V::Ref(_))) {
+            eff_args = self.box_scalars(args);
+            midx =
+                self.find_method_by_name(class_desc, "<init>", eff_args.len(), Some(&eff_args))?;
+        } else {
+            eff_args = args.to_vec();
+        }
+        if let Some(midx) = midx {
+            let mut a = Vec::with_capacity(eff_args.len() + 1);
             a.push(V::Ref(h));
-            a.extend_from_slice(args);
+            a.extend_from_slice(&eff_args);
             match self.invoke(midx, a, InvokeKind::Direct) {
                 Ok(_) => {}
                 Err(E::Vm(e)) => return Err(e),
@@ -1198,6 +1658,17 @@ impl Vm {
     /// Superclass descriptor for a class by name — the dex class def
     /// when present, else the framework `host_supers` table.
     pub(crate) fn super_desc(&self, desc: &str) -> Option<String> {
+        if let Some(hit) = self.super_desc_cache.borrow().get(desc) {
+            return hit.clone();
+        }
+        let out = self.super_desc_uncached(desc);
+        self.super_desc_cache
+            .borrow_mut()
+            .insert(desc.to_string(), out.clone());
+        out
+    }
+
+    fn super_desc_uncached(&self, desc: &str) -> Option<String> {
         if let Some(ty) = self.type_index_of(desc) {
             if let Some((cg, def)) = self.def_loc_of(ty) {
                 if def.superclass_idx == u32::MAX {
@@ -1206,7 +1677,10 @@ impl Vm {
                 return self.type_desc_of(gx(gd(cg), def.superclass_idx)).ok();
             }
         }
-        jdk::host_supers(desc).first().map(|s| (*s).to_string())
+        jdk::host_supers(desc)
+            .first()
+            .map(|s| (*s).to_string())
+            .or_else(|| Self::builtin_supers(desc).first().map(|s| (*s).to_string()))
     }
 
     /// Whether `desc` is, or descends from, a class whose simple name is
@@ -1283,16 +1757,55 @@ impl Vm {
         self.cur_activity = activity;
     }
 
+    /// Deliver a host pointer event into the dex view tree
+    /// (action: 0=down, 1=up, 2=move). Dex-materialized views —
+    /// including games' input views — only see input through this
+    /// bridge; the host view tree's own dispatch does not reach them.
+    /// Ok(true) when the dex view tree claimed the point — callers
+    /// then skip their own (host-widget) dispatch so a view mirrored
+    /// in both trees never fires its listener twice.
+    pub fn dispatch_touch(&mut self, x: i32, y: i32, action: i32) -> Result<bool> {
+        jdk::view::dispatch_touch(self, x, y, action)
+    }
+
     /// Invoke `name` on the object at `this` — resolves the method on
     /// its class chain by name and arg count. `Ok(None)` when the
     /// object's class doesn't declare it — the platform base class
     /// (not in this DEX) provides the default.
     pub fn call_virtual(&mut self, this: u32, name: &str, args: &[V]) -> Result<Option<V>> {
-        let ci = self
-            .heap
-            .class_of(this)
-            .ok_or_else(|| errd("dexrt.bad_this", name.to_string()))?;
-        let Some(midx) = self.find_method_on_chain(ci, name, args.len())? else {
+        if name == "onAttachedToWindow" {
+            jdk::pseudo_set(self, this, jdk::view::P_ATTACHED, V::I32(1));
+        } else if name == "onDetachedFromWindow" {
+            jdk::pseudo_set(self, this, jdk::view::P_ATTACHED, V::I32(0));
+        }
+        let Some(ci) = self.heap.class_of(this) else {
+            // `Obj::Class` mirrors carry no `class_idx` — as receivers their
+            // class is `java.lang.Class` itself. JNI by-name method ids for
+            // reflection APIs (`getDeclaredMethods`, `getSimpleName`, …)
+            // reach here as CallObjectMethod on a `jclass`; without this the
+            // call silently returned null.
+            if matches!(self.heap.get(this), Some(Obj::Class { .. })) {
+                let mut a = Vec::with_capacity(args.len() + 1);
+                a.push(V::Ref(this));
+                a.extend_from_slice(args);
+                let r =
+                    jdk::call(self, "Ljava/lang/Class;", name, "", &a).map_err(|e| match e {
+                        E::Vm(v) => v,
+                        E::Throw(t) => {
+                            let d = self.describe_throw(t);
+                            errd("dexrt.exception.uncaught", d)
+                        }
+                    })?;
+                return Ok(r.flatten());
+            }
+            return Err(errd("dexrt.bad_this", name.to_string()));
+        };
+        // J/D params occupy two dex registers; arity must match
+        // `find_method_by_name`'s slot count or a wide-arg dex override
+        // (`Choreographer$FrameCallback.doFrame(J)V`) silently misses
+        // and the builtin fallback no-ops.
+        let (midx, eff_args) = self.resolve_call_args(ci, name, args)?;
+        let Some(midx) = midx else {
             // No dex override — a framework method (`View.layout`,
             // `View.measure`, …). Route it through the builtin
             // dispatcher so host arms still apply when the caller is
@@ -1324,13 +1837,13 @@ impl Vm {
             })?;
             return Ok(r.flatten());
         };
-        if std::env::var_os("OVELO_VIEWDBG").is_some() && (name == "layout" || name == "measure") {
+        if crate::dbg_flag("OVELO_VIEWDBG") && (name == "layout" || name == "measure") {
             let d = self.describe_method(midx);
             eprintln!("[viewdbg] dex layout h{this} -> {d}");
         }
-        let mut a = Vec::with_capacity(args.len() + 1);
+        let mut a = Vec::with_capacity(eff_args.len() + 1);
         a.push(V::Ref(this));
-        a.extend_from_slice(args);
+        a.extend_from_slice(&eff_args);
         let out = match self.invoke(midx, a, InvokeKind::Virtual) {
             Ok(v) => Ok(v),
             Err(E::Vm(e)) => Err(e),
@@ -1354,21 +1867,17 @@ impl Vm {
             .heap
             .class_of(this)
             .ok_or_else(|| E::Vm(errd("dexrt.bad_this", name.to_string())))?;
-        let Some(midx) = self
-            .find_method_on_chain(ci, name, args.len())
-            .map_err(E::Vm)?
-        else {
-            if std::env::var_os("OVELO_VIEWDBG").is_some()
-                && matches!(name, "onMeasure" | "onLayout")
-            {
+        let (midx, eff_args) = self.resolve_call_args(ci, name, args).map_err(E::Vm)?;
+        let Some(midx) = midx else {
+            if crate::dbg_flag("OVELO_VIEWDBG") && matches!(name, "onMeasure" | "onLayout") {
                 let d = self.type_desc_of(ci).unwrap_or_default();
                 eprintln!("[viewdbg] onChain miss {name} ci_desc={d}");
             }
             return Ok(None);
         };
-        let mut a = Vec::with_capacity(args.len() + 1);
+        let mut a = Vec::with_capacity(eff_args.len() + 1);
         a.push(V::Ref(this));
-        a.extend_from_slice(args);
+        a.extend_from_slice(&eff_args);
         let out = self.invoke(midx, a, InvokeKind::Virtual);
         if self.depth == 0 {
             self.drain_runnables(500);
@@ -1386,9 +1895,57 @@ impl Vm {
     /// re-entry) but makes runBlock-style callers redo work — hence
     /// the generous cap.
     pub(crate) fn park_drain(&mut self) -> std::result::Result<(), E> {
-        // Nothing queued anywhere: an inline drain can't complete the
-        // wait, so yield by unwinding — the drain loop requeues the
-        // runnable (queue-scanning workers rescan on re-entry).
+        self.park_drain_within(50)
+    }
+
+    /// `park_drain` with a caller-bounded internal sleep slice — joins
+    /// with a millisecond deadline pass their remaining budget so a
+    /// `join(1)` can't overshoot by the full 50ms slice.
+    pub(crate) fn park_drain_within(&mut self, max_slice_ms: u64) -> std::result::Result<(), E> {
+        // Promote delayed tasks that came due — a parked scheduler
+        // worker requeued with `due=now` sits in `delayed_runnables`,
+        // and an unbounded park (runBlocking on the main thread) must
+        // run it rather than unwinding as if nothing were queued.
+        let now = jdk::now_ms() as u64;
+        let mut i = 0;
+        while i < self.delayed_runnables.len() {
+            if self.delayed_runnables[i].2 <= now {
+                let (r, on_main, _) = self.delayed_runnables.swap_remove(i);
+                self.unparkable_delayed.remove(&r);
+                self.deadline_woke.insert(r);
+                self.pending_runnables.push_back((r, on_main));
+            } else {
+                i += 1;
+            }
+        }
+        // Nothing queued right now: a delayed task may still complete
+        // the wait — a `runBlocking` parked inside a dex callback
+        // (Hilt `SwitchingProvider.get` building the theme on the main
+        // thread) unwinds fatally if we give up while its completion
+        // sits in `delayed_runnables`. Wait out a short slice to the
+        // soonest deadline, promote, then only unwind when still dry.
+        if self.pending_runnables.is_empty() && self.park_depth < 8 {
+            if let Some(due) = self.delayed_runnables.iter().map(|(_, _, t)| *t).min() {
+                let now2 = jdk::now_ms() as u64;
+                if due > now2 {
+                    std::thread::sleep(std::time::Duration::from_millis(
+                        (due - now2).min(max_slice_ms),
+                    ));
+                }
+                let now3 = jdk::now_ms() as u64;
+                let mut i = 0;
+                while i < self.delayed_runnables.len() {
+                    if self.delayed_runnables[i].2 <= now3 {
+                        let (r, on_main, _) = self.delayed_runnables.swap_remove(i);
+                        self.unparkable_delayed.remove(&r);
+                        self.deadline_woke.insert(r);
+                        self.pending_runnables.push_back((r, on_main));
+                    } else {
+                        i += 1;
+                    }
+                }
+            }
+        }
         if self.pending_runnables.is_empty() || self.park_depth >= 8 {
             return Err(E::Vm(err("ovelo.park")));
         }
@@ -1424,12 +1981,60 @@ impl Vm {
     /// parker must retry those workers rather than assume they are
     /// still idle.
     pub(crate) fn enqueue_runnable(&mut self, r: u32, on_main: bool) {
+        if std::env::var("OVELO_DRAINDBG").is_ok() {
+            eprintln!("[drain] enqueue h{} main={}", r, on_main);
+        }
         self.reparked.clear();
         // The newly posted work may feed a worker that parked out of
         // the live queue — re-arm dropped parkers so they rescan.
         self.parked_runnables.remove(&r);
         self.wake_parked();
         self.pending_runnables.push_back((r, on_main));
+    }
+
+    /// True while any runnable is queued or waiting on its wake time —
+    /// the frame loop drains continuously then (game threads sleep in
+    /// `delayed_runnables` between ticks) instead of on the idle cadence.
+    pub fn has_queued_runnables(&self) -> bool {
+        !self.pending_runnables.is_empty()
+            || !self.delayed_runnables.is_empty()
+            || !self.frame_callbacks.is_empty()
+    }
+
+    /// Registered `Application.ActivityLifecycleCallbacks` handles — the
+    /// runner dispatches `onActivity{Pre,Post}*` to them around each
+    /// activity lifecycle stage (ReportFragment needs the Post/Pre
+    /// variants to advance `ComponentActivity.mLifecycleRegistry`).
+    pub fn activity_callbacks(&self) -> Vec<u32> {
+        self.activity_callbacks.clone()
+    }
+
+    /// Whether this view already received `onAttachedToWindow` — the
+    /// flag is set by `call_virtual` dispatch and by addView into an
+    /// already-attached parent, so the host's first-materialize attach
+    /// queue must skip flagged views or the callback fires twice.
+    pub fn view_is_attached(&self, h: u32) -> bool {
+        matches!(
+            jdk::pseudo_get(self, h, jdk::view::P_ATTACHED),
+            Some(V::I32(1))
+        )
+    }
+
+    /// Dispatch the first window attach over `h`'s whole decor tree —
+    /// the host frame loop uses it once the real window exists.
+    pub fn view_window_attached(&mut self, h: u32) {
+        jdk::view::window_attached(self, h);
+    }
+
+    /// `View.removeCallbacks`/`Handler.removeCallbacks`/`Choreographer.remove*` —
+    /// drop a queued runnable without running it.
+    pub(crate) fn remove_runnable(&mut self, r: u32) {
+        self.pending_runnables.retain(|(h, _)| *h != r);
+        self.delayed_runnables.retain(|(h, _, _)| *h != r);
+        self.unparkable_delayed.remove(&r);
+        self.deadline_woke.remove(&r);
+        self.deadline_park_cycles.remove(&r);
+        self.frame_callbacks.retain(|(h, _)| *h != r);
     }
 
     /// `enqueue_runnable` with a millisecond delay — the runnable sits
@@ -1444,12 +2049,32 @@ impl Vm {
 
     /// Re-arm runnables that parked out of the live queue — called
     /// from `enqueue_runnable` (fresh work may feed a dropped worker's
-    /// internal queue) and `LockSupport.unpark`.
+    /// internal queue) and `LockSupport.unpark`. Delayed sleepers
+    /// whose deadline came from `LockSupport.park*` (not `Thread.sleep`)
+    /// are also promoted early — a permit cuts the wait short.
     pub(crate) fn wake_parked(&mut self) {
         for (r, on_main) in self.parked_runnables.drain() {
             self.repark_counts.remove(&r);
             self.reparked.remove(&r);
+            self.deadline_woke.remove(&r);
+            self.deadline_park_cycles.remove(&r);
             self.pending_runnables.push_back((r, on_main));
+        }
+        let mut i = 0;
+        while i < self.delayed_runnables.len() {
+            let (r, on_main, _) = self.delayed_runnables[i];
+            if self.unparkable_delayed.contains(&r) {
+                self.delayed_runnables.swap_remove(i);
+                self.unparkable_delayed.remove(&r);
+                // An unpark-driven promotion — not a deadline expiry.
+                self.deadline_woke.remove(&r);
+                self.deadline_park_cycles.remove(&r);
+                self.repark_counts.remove(&r);
+                self.reparked.remove(&r);
+                self.pending_runnables.push_back((r, on_main));
+            } else {
+                i += 1;
+            }
         }
     }
 
@@ -1476,9 +2101,24 @@ impl Vm {
         }
         roots.extend(self.pending_runnables.iter().map(|(h, _)| *h));
         roots.extend(self.delayed_runnables.iter().map(|(h, _, _)| *h));
+        // Callback registries are the only owners of their objects —
+        // ReportFragment's ALC, Choreographer frame callbacks and the
+        // cached Choreographer itself must outlive the guest refs that
+        // registered them (those die with their registering frame).
+        roots.extend(self.activity_callbacks.iter().copied());
+        roots.extend(self.frame_callbacks.iter().map(|(h, _)| *h));
+        roots.push(self.choreographer_h);
+        roots.push(self.byteorder_h.get());
         roots.extend(self.parked_runnables.keys().copied());
+        roots.extend(self.thread_runnables.iter().copied());
+        roots.extend(jdk::gl::live_handles());
+        roots.extend(self.sleep_until.keys().copied());
         roots.extend(self.reparked.iter().copied());
         roots.extend(self.repark_counts.keys().copied());
+        roots.extend(self.park_waiters.iter().copied());
+        roots.extend(self.unparkable_delayed.iter().copied());
+        roots.extend(self.deadline_woke.iter().copied());
+        roots.extend(self.deadline_park_cycles.keys().copied());
         roots.extend(self.vto_listeners.keys().copied());
         roots.extend(self.vto_listeners.values().flatten().copied());
         roots.extend(self.vto_predraw.keys().copied());
@@ -1498,6 +2138,13 @@ impl Vm {
         ]);
         roots.extend(self.view_roots.iter().copied());
         roots.extend(self.prefs_files.values().copied());
+        // Interned enum constants are VM-lifetime singletons (like JVM
+        // enum consts) — leaving them unrooted lets the sweep reclaim
+        // the handle and `alloc` recycle it for an unrelated object,
+        // so a later values()/valueOf/sget lookup returns a wrong
+        // object entirely.
+        roots.extend(self.enum_cache.values().copied());
+        roots.extend(self.enum_name_cache.values().copied());
         roots.extend(self.content_views.keys().copied());
         roots.extend(self.content_views.values().copied());
         roots.extend(self.decor_roots.keys().copied());
@@ -1506,6 +2153,12 @@ impl Vm {
         // by its view-tree parent; once detached and unreferenced it is
         // collected and drain_runnables prunes the stale handle.
         roots.extend(self.db_handles.values().copied());
+        // Stopped services and coil delivery targets must survive until
+        // the drain runs their onDestroy / attaches the drawable —
+        // collecting either first silently drops the delivery.
+        roots.extend(self.pending_destroy.iter().copied());
+        roots.extend(self.pending_jobs.iter().flat_map(|(a, b, _)| [*a, *b]));
+        roots.extend(self.coil_jobs.iter().map(|(_, v)| *v));
         // obj_db/throw_sites/unsafe_offsets are NOT rooted: entries whose
         // owner object is dead are pruned after the sweep instead, so the
         // registries can't grow forever or keep stale values alive.
@@ -1529,12 +2182,15 @@ impl Vm {
         self.unsafe_offsets
             .retain(|(h, _), _| self.heap.get(*h).is_some());
         self.obj_db.retain(|h, _| self.heap.get(*h).is_some());
-        self.throw_sites
-            .retain(|h, _| self.heap.get(*h).is_some());
+        self.throw_sites.retain(|h, _| self.heap.get(*h).is_some());
         // Next collection when the heap grows another ~50%.
         self.gc_mark = (self.heap.len() * 3 / 2).max(65_536);
-        if std::env::var_os("OVELO_MEMDBG").is_some() {
-            eprintln!("[gc] freed {freed} slots={} mark={}", self.heap.len(), self.gc_mark);
+        if crate::dbg_flag("OVELO_MEMDBG") {
+            eprintln!(
+                "[gc] freed {freed} slots={} mark={}",
+                self.heap.len(),
+                self.gc_mark
+            );
         }
         freed
     }
@@ -1545,16 +2201,111 @@ impl Vm {
         if self.draining {
             return 0;
         }
+        native::check_all_zones("drain");
         let now = jdk::now_ms() as u64;
-        let (due, later): (Vec<_>, Vec<_>) =
-            self.delayed_runnables.drain(..).partition(|(_, _, t)| *t <= now);
+        let (due, later): (Vec<_>, Vec<_>) = self
+            .delayed_runnables
+            .drain(..)
+            .partition(|(_, _, t)| *t <= now);
         self.delayed_runnables = later;
         for (r, on_main, _) in due {
+            self.unparkable_delayed.remove(&r);
+            self.deadline_woke.insert(r);
             self.pending_runnables.push_back((r, on_main));
         }
         self.draining = true;
+        // Host-side async deliveries before guest work: finished coil
+        // image fetches become drawables, and services that stopped
+        // since the last pass get their onDestroy here — not inline
+        // inside their own callback. Runs AFTER the draining flag is
+        // set so a nested drain from a delivered callback early-returns
+        // instead of running an unbounded inner pass.
+        jdk::http::drain_coil(self);
+        jdk::android::drain_jobs(self);
+        // Retry host calls that lost the borrow race during the last
+        // pass — the outer callback has released by now, so the bridge
+        // runs its host-side effects (GuestUi wiring etc.). attach_at
+        // dedupes the dex side it already did via the builtin fallback.
+        self.in_host_retry = true;
+        for (midx, args) in std::mem::take(&mut self.pending_host_retry) {
+            let host = self
+                .hosts
+                .get(&midx)
+                .cloned()
+                .or_else(|| self.host_named(midx).ok().flatten());
+            if let Some(f) = host {
+                if let Ok(mut g) = f.try_borrow_mut() {
+                    let _ = g(self, &args);
+                }
+            }
+        }
+        self.in_host_retry = false;
+        for (holder, cb, tries) in std::mem::take(&mut self.pending_surface) {
+            let (mut sw, mut sh) = surface_holder_size(self, holder);
+            if sw <= 0 || sh <= 0 {
+                if tries < 240 {
+                    // Not laid out yet — retry next tick so the guest
+                    // never builds a projection over a 0x0 surface.
+                    self.pending_surface.push((holder, cb, tries + 1));
+                    continue;
+                }
+                // View never laid out (hidden SurfaceView etc.) —
+                // report the window default rather than 0x0.
+                (sw, sh) = (720, 1280);
+            }
+            let wh = V::Ref(holder);
+            if crate::dbg_flag("OVELO_DRAWDBG") {
+                eprintln!("[gldbg] surfaceCreated+Changed h{holder} cb{cb} {sw}x{sh}");
+            }
+            let _ = self.call_virtual(cb, "surfaceCreated", &[wh]);
+            let _ = self.call_virtual(
+                cb,
+                "surfaceChanged",
+                &[wh, V::I32(0), V::I32(sw), V::I32(sh)],
+            );
+            self.surface_sizes.insert(holder, (sw, sh));
+        }
+        // Redispatch `surfaceChanged` on registered holders whose owning
+        // view's size changed (first layout, rotation, ...).
+        for (holder, cb) in std::mem::take(&mut self.surface_cbs) {
+            let (sw, sh) = surface_holder_size(self, holder);
+            if sw > 0 && sh > 0 && self.surface_sizes.get(&holder) != Some(&(sw, sh)) {
+                self.surface_sizes.insert(holder, (sw, sh));
+                let _ = self.call_virtual(
+                    cb,
+                    "surfaceChanged",
+                    &[V::Ref(holder), V::I32(0), V::I32(sw), V::I32(sh)],
+                );
+            }
+            self.surface_cbs.push((holder, cb));
+        }
+        for h in std::mem::take(&mut self.pending_destroy) {
+            let _ = self.call_virtual(h, "onDestroy", &[]);
+        }
+        // Choreographer frame callbacks — `drain_runnables` runs once
+        // per frame tick, so a due callback fires on the next pass; one
+        // that reposts itself lands in `frame_callbacks` again (the
+        // Recomposer's loop works exactly that way).
+        let frame_nanos = V::I64(jdk::now_ms() * 1_000_000);
+        let (due_cbs, pending_cbs): (Vec<_>, Vec<_>) =
+            self.frame_callbacks.drain(..).partition(|(_, t)| *t <= now);
+        self.frame_callbacks = pending_cbs;
+        let dbg = crate::dbg_flag("OVELO_DRAINDBG");
+        if dbg && !due_cbs.is_empty() {
+            eprintln!(
+                "[drain] framecb due={} pending={}",
+                due_cbs.len(),
+                self.frame_callbacks.len()
+            );
+        }
+        for (cb, _) in due_cbs {
+            match self.call_virtual(cb, "doFrame", &[frame_nanos]) {
+                Err(e) if dbg => eprintln!("[drain] doFrame h{cb} err={e:?}"),
+                Ok(v) if dbg => eprintln!("[drain] doFrame h{cb} ok={v:?}"),
+                _ => {}
+            }
+        }
         let mut ran = 0usize;
-        let dbg = std::env::var_os("OVELO_DRAINDBG").is_some();
         for _ in 0..max {
             let Some((r, on_main)) = self.pending_runnables.pop_front() else {
                 break;
@@ -1578,6 +2329,89 @@ impl Vm {
                 }
             }
             match &out {
+                Err(e)
+                    if e.cause() == "ovelo.park"
+                        && self.thread_runnables.contains(&r)
+                        && self.sleep_until.contains_key(&r) =>
+                {
+                    if dbg {
+                        eprintln!("[drain] h={r} park -> delayed(thread)");
+                    }
+                    // A `Thread` runnable that parked on Thread.sleep
+                    // waits out its requested deadline, then re-runs —
+                    // no repark budget: a game loop legitimately parks
+                    // once per frame forever. A thread parked WITHOUT a
+                    // recorded deadline (LockSupport.park*/unpark pairs,
+                    // e.g. a kotlinx scheduler worker idling) falls
+                    // through to the counted repark path instead —
+                    // `unwrap_or(now)` here requeued it instantly and
+                    // spun the drain.
+                    let due = self.sleep_until.remove(&r).unwrap_or(now);
+                    let unparkable = self.park_waiters.remove(&r);
+                    if unparkable && self.deadline_woke.remove(&r) {
+                        if due.saturating_sub(now) >= 1_000 {
+                            // The wake was this runnable's OWN deadline,
+                            // not an unpark — a kotlinx surplus worker
+                            // past its keep-alive would retire here, but
+                            // our re-run-from-top model can't reach its
+                            // termination check. After a couple of
+                            // deadline-only cycles, retire it out of the
+                            // delayed set: `unpark`/fresh
+                            // `enqueue_runnable` still revive it via
+                            // `parked_runnables`.
+                            let n = self.deadline_park_cycles.entry(r).or_insert(0);
+                            *n += 1;
+                            if *n >= 2 {
+                                if dbg {
+                                    eprintln!("[drain] h={r} park -> retired(deadline)");
+                                }
+                                self.deadline_park_cycles.remove(&r);
+                                self.reparked.remove(&r);
+                                self.parked_runnables.insert(r, on_main);
+                                continue;
+                            }
+                        } else {
+                            // A short re-park is an active timer loop,
+                            // not an idle keep-alive — don't count it.
+                            self.deadline_park_cycles.remove(&r);
+                        }
+                    }
+                    if unparkable {
+                        self.unparkable_delayed.insert(r);
+                    }
+                    self.delayed_runnables.push((r, on_main, due));
+                }
+                Err(e) if e.cause() == "ovelo.park" && self.sleep_until.contains_key(&r) => {
+                    if dbg {
+                        eprintln!("[drain] h={r} park -> delayed(sleep)");
+                    }
+                    // A non-thread runnable parked with a recorded
+                    // deadline (e.g. RealCall.execute polling a host
+                    // fetch) waits it out rather than burning reparks.
+                    let due = self.sleep_until.remove(&r).unwrap_or(now);
+                    let unparkable = self.park_waiters.remove(&r);
+                    if unparkable && self.deadline_woke.remove(&r) {
+                        if due.saturating_sub(now) >= 1_000 {
+                            let n = self.deadline_park_cycles.entry(r).or_insert(0);
+                            *n += 1;
+                            if *n >= 2 {
+                                if dbg {
+                                    eprintln!("[drain] h={r} park -> retired(deadline)");
+                                }
+                                self.deadline_park_cycles.remove(&r);
+                                self.reparked.remove(&r);
+                                self.parked_runnables.insert(r, on_main);
+                                continue;
+                            }
+                        } else {
+                            self.deadline_park_cycles.remove(&r);
+                        }
+                    }
+                    if unparkable {
+                        self.unparkable_delayed.insert(r);
+                    }
+                    self.delayed_runnables.push((r, on_main, due));
+                }
                 Err(e) if e.cause() == "ovelo.park" => {
                     // A parked worker yields its slot and reschedules —
                     // the runnable re-enters `run()` on a later drain
@@ -1590,9 +2424,15 @@ impl Vm {
                     let n = self.repark_counts.entry(r).or_insert(0);
                     *n += 1;
                     if *n <= 64 {
+                        if dbg {
+                            eprintln!("[drain] h={r} park -> requeue #{n}");
+                        }
                         self.reparked.insert(r);
                         self.pending_runnables.push_back((r, on_main));
                     } else {
+                        if dbg {
+                            eprintln!("[drain] h={r} park -> parked out");
+                        }
                         self.reparked.remove(&r);
                         // Parked out of the live queue — not gone: a
                         // later `enqueue_runnable`/`unpark` re-arms it
@@ -1605,6 +2445,17 @@ impl Vm {
                     self.reparked.remove(&r);
                     self.repark_counts.remove(&r);
                     self.park_spins = 0;
+                    // A `Thread` runnable that returned (or threw) is
+                    // done — drop it so GC can reclaim it and its
+                    // captured references.
+                    self.thread_runnables.remove(&r);
+                    self.runnable_thread.remove(&r);
+                    self.sleep_until.remove(&r);
+                    self.park_waiters.remove(&r);
+                    self.unparkable_delayed.remove(&r);
+                    self.deadline_woke.remove(&r);
+                    self.deadline_park_cycles.remove(&r);
+                    self.slept_once.remove(&r);
                 }
             }
         }
@@ -1650,9 +2501,125 @@ impl Vm {
         jdk::view::set_content_view(self, activity, V::Ref(content));
     }
 
+    /// `attach_at` for the guest bridge: registered `addView` overloads
+    /// intercept the invoke, so the dex-side bookkeeping (parent, attach
+    /// mark, `onViewAdded`) must run from the bridge itself.
+    pub fn view_tree_attach_at(
+        &mut self,
+        parent: u32,
+        child: u32,
+        idx: Option<usize>,
+        lp: Option<V>,
+    ) {
+        if parent != 0 && child != 0 {
+            jdk::view::attach_at(self, parent, V::Ref(child), idx, true, lp);
+        }
+    }
+
+    /// Index of `child` in the dex-side child list of `parent` — the
+    /// authoritative order after the dex bookkeeping ran (used to mirror
+    /// host-side placement on retried addView calls).
+    pub fn view_child_index(&self, parent: u32, child: u32) -> Option<usize> {
+        jdk::view::children(self, parent)
+            .iter()
+            .position(|&c| jdk::value_eq(self, c, V::Ref(child)))
+    }
+
+    /// Parent handle recorded by `attach_at` — the bridge checks this
+    /// before re-running dex attach bookkeeping: a host call retried
+    /// after the borrow race already attached dex-side via the builtin
+    /// fallback, and a second `attach_at` would re-fire `onViewAdded`
+    /// and re-append an indexless child (moving it past siblings
+    /// added meanwhile).
+    pub fn view_parent_of(&self, h: u32) -> Option<u32> {
+        match jdk::pseudo_get(self, h, jdk::view::P_PARENT) {
+            Some(V::Ref(p)) if p != 0 => Some(p),
+            _ => None,
+        }
+    }
+
+    /// True while the drain loop replays `pending_host_retry` — the
+    /// bridge uses it to skip dex-side bookkeeping the builtin
+    /// fallback already did for this exact invocation.
+    pub fn host_retrying(&self) -> bool {
+        self.in_host_retry
+    }
+
+    /// `detach` for the guest bridge: registered `removeView`/`detach`
+    /// overloads intercept the invoke, so the dex-side bookkeeping must
+    /// run from the bridge itself (`notify` mirrors AOSP's
+    /// removeView-vs-detachViewFromParent split).
+    pub fn view_tree_detach(&mut self, parent: u32, child: u32, notify: bool) {
+        if parent != 0 && child != 0 {
+            jdk::view::detach(self, parent, V::Ref(child), notify);
+        }
+    }
+
     /// The handle `activity` last set as its content view, if any.
     pub fn activity_content(&self, activity: u32) -> Option<u32> {
         jdk::view::activity_content(self, activity)
+    }
+
+    /// Push a host-computed frame onto a dex view object — the host
+    /// layout engine positions bridged views without running the dex
+    /// `layout()` call, so `getWidth()`/`getHeight()` would read 0
+    /// (Korge's GL view NaN'd its ortho matrix exactly so).
+    pub fn view_set_frame(&mut self, h: u32, l: i32, t: i32, r: i32, b: i32) {
+        if h != 0 {
+            jdk::view::frame_set(self, h, l, t, r, b);
+        }
+    }
+
+    /// Whether dex `layout()` owns this view's frame — host layout
+    /// size pushes must not stomp it.
+    pub fn view_layout_done(&self, h: u32) -> bool {
+        jdk::view::layout_done(self, h)
+    }
+
+    /// Record the host window size — decor views created lazily take
+    /// their initial bounds from it.
+    pub fn set_window_size(&mut self, w: i32, h: i32) {
+        if w > 0 && h > 0 {
+            self.window_size = (w, h);
+        }
+    }
+
+    /// Give every window decor root the window's bounds — they're
+    /// host-created view objects that never pass through layout, so
+    /// `getDecorView().getWidth()`/`getHeight()` would read 0 (Korge
+    /// sizes its main framebuffer from exactly those calls). Content
+    /// frames are left to the guest's own layout — AppCompat places
+    /// them below the action bar, and syncing them would stomp that.
+    /// The exception is a synthetic (host-allocated) content frame:
+    /// it sits at the decor's origin filling the window and no dex
+    /// layout will ever re-size it, so it follows the decor.
+    pub fn sync_decor_frames(&mut self, w: i32, h: i32) {
+        let mut views: Vec<u32> = self.decor_roots.values().copied().collect();
+        views.extend(
+            self.content_frames
+                .values()
+                .copied()
+                .filter(|cf| !self.is_dex_view(*cf)),
+        );
+        for v in views {
+            self.view_set_frame(v, 0, 0, w, h);
+        }
+    }
+
+    /// `(width, height)` a dex LayoutParams object requests —
+    /// AOSP constants (`-1` match_parent, `-2` wrap_content) pass
+    /// through; resource ids resolve to px. Used by the host view
+    /// bridge to size bridged children.
+    pub fn layout_params_dims(&self, lp: u32) -> (Option<i32>, Option<i32>) {
+        jdk::view::lp_dims(self, lp)
+    }
+
+    /// The dex parent of a view object, 0 when unattached.
+    pub fn dex_parent(&self, h: u32) -> u32 {
+        match jdk::pseudo_get(self, h, jdk::view::P_PARENT) {
+            Some(V::Ref(p)) => p,
+            _ => 0,
+        }
     }
 
     /// Snapshot one node of the dex view tree for host rendering —
@@ -1666,6 +2633,18 @@ impl Vm {
     /// no class in the chain overrides `onDraw` or the call fails.
     pub fn guest_draw_ops(&mut self, view: u32, w: i32, h: i32) -> Vec<crate::value::CanvasOp> {
         jdk::gfx::guest_draw_ops(self, view, w, h)
+    }
+
+    /// Log the dex LayoutNode tree under `view` (OVELO_NODEDUMP).
+    pub fn dump_node_tree(&mut self, view: u32) {
+        jdk::gfx::dump_node_tree(self, view)
+    }
+
+    /// Whether `view` has a bound `GLSurfaceView.Renderer` — such views
+    /// draw every frame (continuous render mode) independent of
+    /// view-tree generation changes.
+    pub fn has_gl_renderer(&self, view: u32) -> bool {
+        jdk::pseudo_get(self, view, jdk::gl::P_GLES_RENDERER).is_some()
     }
 
     /// Cheap P_IS_VIEW probe — `dex_view` builds full node info
@@ -1684,14 +2663,14 @@ impl Vm {
         let Some(ci) = self.heap.class_of(h) else {
             return false;
         };
-        if std::env::var_os("OVELO_VIEWDBG").is_some() {
+        if crate::dbg_flag("OVELO_VIEWDBG") {
             let d = self.type_desc_of(ci).unwrap_or_else(|_| "?".into());
-            eprintln!("[viewdbg] hdv h{h} ci={ci} desc={d} {name} -> {:?}", self.find_method_on_chain_sig(ci, name, params));
+            eprintln!(
+                "[viewdbg] hdv h{h} ci={ci} desc={d} {name} -> {:?}",
+                self.find_method_on_chain_sig(ci, name, params)
+            );
         }
-        matches!(
-            self.find_method_on_chain_sig(ci, name, params),
-            Ok(Some(_))
-        )
+        matches!(self.find_method_on_chain_sig(ci, name, params), Ok(Some(_)))
     }
 
     /// The options `Menu` attached to an Activity — the runner hands it
@@ -1818,9 +2797,7 @@ impl Vm {
             .map(|(class, name, sig)| format!("{class}.{name}{sig}"))
             .unwrap_or_else(|_| format!("method@{midx}"))
             .into();
-        self.method_desc_cache
-            .borrow_mut()
-            .insert(midx, s.clone());
+        self.method_desc_cache.borrow_mut().insert(midx, s.clone());
         s
     }
 
@@ -1869,6 +2846,52 @@ impl Vm {
         fmt().unwrap_or_else(|_| format!("field@{fidx}"))
     }
 
+    /// Each scalar in `args` boxed into its `Number` mirror
+    /// (`HostState::Slot`); refs pass through unchanged. A raw
+    /// `V::I64` out of a JSON map fed to `Map.merge` targets
+    /// `apply(Object,Object)` — dex expects a boxed `Long`, not a
+    /// 2-register primitive image.
+    fn box_scalars(&mut self, args: &[V]) -> Vec<V> {
+        args.iter()
+            .map(|v| {
+                let desc = match v {
+                    V::I64(_) => "Ljava/lang/Long;",
+                    V::I32(_) => "Ljava/lang/Integer;",
+                    V::F64(_) => "Ljava/lang/Double;",
+                    V::F32(_) => "Ljava/lang/Float;",
+                    _ => return *v,
+                };
+                jdk::host(self, desc, HostState::Slot(*v))
+            })
+            .collect()
+    }
+
+    /// Resolve `name` on `ci`'s chain for `args`, retrying with each
+    /// scalar boxed into its `Number` mirror (`HostState::Slot`) when
+    /// the plain image misses. A raw `V::I64` out of a JSON map fed
+    /// to `Map.merge` targets `apply(Object,Object)` — an unboxed
+    /// 2-register read misses that method entirely and the caller
+    /// then deletes the entry as "absent". Returns the matching
+    /// method plus the arg image to invoke with (boxed when used).
+    pub(crate) fn resolve_call_args(
+        &mut self,
+        ci: GIdx,
+        name: &str,
+        args: &[V],
+    ) -> Result<(Option<GIdx>, Vec<V>)> {
+        let nslots = arg_reg_slots(args);
+        if let Some(m) = self.find_method_on_chain(ci, name, nslots, Some(args))? {
+            return Ok((Some(m), args.to_vec()));
+        }
+        if args.iter().any(|v| !matches!(v, V::Ref(_))) {
+            let boxed = self.box_scalars(args);
+            if let Some(m) = self.find_method_on_chain(ci, name, boxed.len(), Some(&boxed))? {
+                return Ok((Some(m), boxed));
+            }
+        }
+        Ok((None, args.to_vec()))
+    }
+
     /// `find_method_by_name` over the class's superclass chain — an
     /// inherited callback (e.g. onCreate on a DEX parent) still runs.
     fn find_method_on_chain(
@@ -1876,8 +2899,23 @@ impl Vm {
         mut class_idx: GIdx,
         name: &str,
         nslots: usize,
+        args: Option<&[V]>,
     ) -> Result<Option<GIdx>> {
-        let key = (class_idx, name.to_string(), nslots);
+        // The arg profile selects among same-slot-count overloads
+        // (`doFrame(J)` vs `doFrame(int,int)` — both 2 registers), so
+        // the cache key carries it, not just `nslots`.
+        let pat = args
+            .map(|av| {
+                av.iter()
+                    .map(|v| match v {
+                        V::I64(_) => 'J',
+                        V::F64(_) => 'D',
+                        _ => '.',
+                    })
+                    .collect::<String>()
+            })
+            .unwrap_or_else(|| nslots.to_string());
+        let key = (class_idx, name.to_string(), pat);
         if let Some(hit) = self.named_chain_cache.borrow().get(&key) {
             return Ok(*hit);
         }
@@ -1888,7 +2926,7 @@ impl Vm {
             };
             let sup = def.superclass_idx;
             let desc = self.type_desc_of(cg)?;
-            if let Some(m) = self.find_method_by_name(&desc, name, nslots)? {
+            if let Some(m) = self.find_method_by_name(&desc, name, nslots, args)? {
                 out = Some(m);
                 break;
             }
@@ -1903,12 +2941,16 @@ impl Vm {
 
     /// First method `name` on `class_desc` whose params occupy exactly
     /// `nslots` registers (J/D params take two) — args pack as a register
-    /// image, so a long/double param counts double.
+    /// image, so a long/double param counts double. When `args` is given
+    /// the wide-arg positions must also line up (`doFrame(J)` beats
+    /// `doFrame(int,int)` for an `I64` call — same 2 slots, wrong
+    /// method otherwise).
     fn find_method_by_name(
         &self,
         class_desc: &str,
         name: &str,
         nslots: usize,
+        args: Option<&[V]>,
     ) -> Result<Option<GIdx>> {
         let Some(&(di, def_i)) = self.defs.get(class_desc) else {
             return Ok(None);
@@ -1923,15 +2965,61 @@ impl Vm {
             }
             let p = d.proto(mid.proto_idx as u32)?;
             let mut slots = 0usize;
+            let mut ptypes = Vec::new();
             for t in d.proto_params(p)? {
                 let ty = d.type_descriptor(t as u32)?;
-                slots += if ty.starts_with('J') || ty.starts_with('D') { 2 } else { 1 };
+                slots += if ty.starts_with('J') || ty.starts_with('D') {
+                    2
+                } else {
+                    1
+                };
+                if args.is_some() {
+                    ptypes.push(ty);
+                }
             }
-            if slots == nslots {
-                return Ok(Some(gx(di, m.method_idx)));
+            if slots != nslots {
+                continue;
             }
+            if let Some(av) = args {
+                let fits = ptypes.len() == av.len()
+                    && ptypes.iter().zip(av.iter()).all(|(ty, a)| match a {
+                        V::I64(_) => ty == "J",
+                        V::F64(_) => ty == "D",
+                        _ => !(ty.starts_with('J') || ty.starts_with('D')),
+                    });
+                if !fits {
+                    continue;
+                }
+            }
+            return Ok(Some(gx(di, m.method_idx)));
         }
         Ok(None)
+    }
+
+    /// Whether `class_desc` declares a method named `name` at all —
+    /// the existence probe `Class.getDeclaredMethod` needs (it throws
+    /// NoSuchMethodException on a miss, unlike a name+arity resolve).
+    pub(crate) fn has_method_named(&self, class_desc: &str, name: &str) -> bool {
+        let Some(&(di, def_i)) = self.defs.get(class_desc) else {
+            return false;
+        };
+        let d = &self.dexes[di];
+        let Some(def) = d.class_defs().get(def_i) else {
+            return false;
+        };
+        let Ok(cd) = d.class_data_rc(def) else {
+            return false;
+        };
+        cd.direct_methods
+            .iter()
+            .chain(cd.virtual_methods.iter())
+            .any(|m| {
+                d.method(m.method_idx)
+                    .ok()
+                    .and_then(|mid| d.string(mid.name_idx).ok())
+                    .map(|n| n == name)
+                    .unwrap_or(false)
+            })
     }
 
     /// Whether `desc` names a class defined by a loaded dex — host
@@ -2238,7 +3326,10 @@ impl Vm {
     /// Superclass descriptor for a host-provided framework class (the
     /// first entry of [`jdk::host_supers`]; `None` at `Object`/unknown).
     fn framework_super(d: &str) -> Option<&'static str> {
-        jdk::host_supers(d).first().copied()
+        jdk::host_supers(d)
+            .first()
+            .copied()
+            .or_else(|| Self::builtin_supers(d).first().copied())
     }
 
     /// Known supers of builtin throwable descriptors.
@@ -2250,7 +3341,47 @@ impl Vm {
             | "Ljava/lang/ArithmeticException;"
             | "Ljava/lang/ClassCastException;"
             | "Ljava/lang/NegativeArraySizeException;"
-            | "Ljava/util/NoSuchElementException;" => &[
+            | "Ljava/util/NoSuchElementException;"
+            | "Ljava/util/ConcurrentModificationException;"
+            | "Ljava/util/EmptyStackException;"
+            | "Ljava/util/MissingResourceException;"
+            | "Ljava/util/InputMismatchException;"
+            | "Ljava/util/IllegalFormatException;"
+            | "Ljava/util/MissingFormatArgumentException;"
+            | "Ljava/util/CompletionException;"
+            | "Ljava/lang/IllegalStateException;"
+            | "Ljava/lang/IllegalArgumentException;"
+            | "Ljava/lang/IllegalMonitorStateException;"
+            | "Ljava/lang/UnsupportedOperationException;"
+            | "Ljava/lang/NumberFormatException;"
+            | "Ljava/lang/IllegalCallerException;"
+            | "Ljava/lang/SecurityException;"
+            | "Ljava/lang/StringIndexOutOfBoundsException;"
+            | "Ljava/lang/TypeNotPresentException;"
+            | "Ljava/lang/EnumConstantNotPresentException;"
+            | "Ljava/lang/reflect/UndeclaredThrowableException;"
+            | "Ljava/lang/reflect/MalformedParameterizedTypeException;"
+            | "Ljava/lang/annotation/AnnotationTypeMismatchException;"
+            | "Ljava/lang/invoke/WrongMethodTypeException;"
+            | "Ljava/nio/BufferOverflowException;"
+            | "Ljava/nio/BufferUnderflowException;"
+            | "Ljava/nio/ReadOnlyBufferException;"
+            | "Ljava/nio/file/ProviderMismatchException;"
+            | "Ljava/security/ProviderException;"
+            | "Ljava/time/DateTimeException;"
+            | "Ljava/io/UncheckedIOException;"
+            | "Ljava/util/regex/PatternSyntaxException;"
+            | "Ljava/util/concurrent/RejectedExecutionException;"
+            | "Ljava/util/concurrent/CompletionException;"
+            | "Ljava/util/concurrent/CancellationException;"
+            | "Ljava/lang/reflect/MalformedParametersException;" => &[
+                "Ljava/lang/RuntimeException;",
+                "Ljava/lang/Exception;",
+                "Ljava/lang/Throwable;",
+                "Ljava/lang/Object;",
+            ],
+            "Ljava/lang/IllegalThreadStateException;" => &[
+                "Ljava/lang/IllegalArgumentException;",
                 "Ljava/lang/RuntimeException;",
                 "Ljava/lang/Exception;",
                 "Ljava/lang/Throwable;",
@@ -2316,10 +3447,58 @@ impl Vm {
                 "Ljava/lang/Throwable;",
                 "Ljava/lang/Object;",
             ],
+            // Checked exceptions that map straight to `Exception`
+            // (skipping `RuntimeException` — `catch (RuntimeException)`
+            // must not catch these).
+            "Ljava/security/GeneralSecurityException;"
+            | "Ljava/security/NoSuchAlgorithmException;"
+            | "Ljava/security/NoSuchProviderException;"
+            | "Ljava/security/InvalidKeyException;"
+            | "Ljava/security/SignatureException;"
+            | "Ljava/security/KeyException;"
+            | "Ljava/security/cert/CertificateException;"
+            | "Ljavax/crypto/BadPaddingException;"
+            | "Ljavax/crypto/IllegalBlockSizeException;"
+            | "Ljavax/crypto/NoSuchPaddingException;"
+            | "Ljavax/crypto/ShortBufferException;"
+            | "Ljava/text/ParseException;"
+            | "Ljava/lang/instrument/IllegalClassFormatException;"
+            | "Ljava/lang/InterruptedException;"
+            | "Ljava/lang/CloneNotSupportedException;"
+            | "Ljava/lang/ReflectiveOperationException;"
+            | "Ljava/lang/ClassNotFoundException;"
+            | "Ljava/lang/InstantiationException;"
+            | "Ljava/lang/IllegalAccessException;"
+            | "Ljava/lang/NoSuchMethodException;"
+            | "Ljava/lang/NoSuchFieldException;"
+            | "Ljava/lang/reflect/InvocationTargetException;"
+            | "Ljava/util/concurrent/ExecutionException;"
+            | "Ljava/util/concurrent/TimeoutException;"
+            | "Ljava/util/zip/DataFormatException;"
+            | "Ljava/net/URISyntaxException;"
+            | "Landroid/os/RemoteException;" => &[
+                "Ljava/lang/Exception;",
+                "Ljava/lang/Throwable;",
+                "Ljava/lang/Object;",
+            ],
             "Ljava/lang/Exception;" | "Ljava/lang/Error;" => {
                 &["Ljava/lang/Throwable;", "Ljava/lang/Object;"]
             }
             "Ljava/lang/Throwable;" => &["Ljava/lang/Object;"],
+            // Unknown throwable descriptors absent from the dex: a
+            // framework `*Error` is an Error subclass, `*Exception` an
+            // Exception subclass (not RuntimeException — catching it
+            // must not claim unchecked-throwable semantics).
+            _ if d.ends_with("Error;") => &[
+                "Ljava/lang/Error;",
+                "Ljava/lang/Throwable;",
+                "Ljava/lang/Object;",
+            ],
+            _ if d.ends_with("Exception;") => &[
+                "Ljava/lang/Exception;",
+                "Ljava/lang/Throwable;",
+                "Ljava/lang/Object;",
+            ],
             _ => &[],
         }
     }
@@ -2352,6 +3531,11 @@ impl Vm {
         };
         match desc {
             "Ljava/lang/StringBuilder;" | "Ljava/lang/StringBuffer;" => {
+                HostState::StrBuf(String::new())
+            }
+            // Writers that accumulate characters in memory — writes
+            // append to the buffer and toString() yields it back.
+            "Ljava/io/StringWriter;" | "Ljava/io/CharArrayWriter;" => {
                 HostState::StrBuf(String::new())
             }
             "Ljava/util/ArrayList;"
@@ -2401,11 +3585,15 @@ impl Vm {
             | "Landroid/util/SparseArray;"
             | "Landroid/util/SparseIntArray;"
             | "Landroid/util/SparseBooleanArray;"
+            | "Landroid/util/SparseLongArray;"
             | "Landroid/util/LongSparseArray;"
             | "Landroid/util/LruCache;"
             | "Landroid/os/Bundle;"
             | "Landroid/os/BaseBundle;"
             | "Landroid/os/PersistableBundle;"
+            | "Landroid/app/job/JobInfo;"
+            | "Landroid/app/job/JobInfo$Builder;"
+            | "Landroid/app/job/JobParameters;"
             | "Landroid/content/Intent;" => HostState::Map(Vec::new()),
             "Ljava/util/Calendar;"
             | "Ljava/util/GregorianCalendar;"
@@ -2454,6 +3642,7 @@ impl Vm {
             | "Ljava/util/concurrent/Semaphore;"
             | "Landroid/os/Message;" => HostState::Slot(V::I32(0)),
             "Ljava/io/File;" => HostState::Path(String::new()),
+            "Landroid/graphics/Path;" => HostState::GraphicsPath(Vec::new()),
             "Lorg/json/JSONObject;" => HostState::Map(Vec::new()),
             "Lorg/json/JSONArray;" => HostState::List(Vec::new()),
             "Ljava/util/regex/Pattern;"
@@ -2499,6 +3688,24 @@ impl Vm {
         if sub == sup || sup == "Ljava/lang/Object;" {
             return true;
         }
+        if let Some(hit) = self
+            .assignable_desc_cache
+            .borrow()
+            .get(sub)
+            .and_then(|m| m.get(sup))
+        {
+            return *hit;
+        }
+        let out = self.assignable_desc_uncached(sub, sup);
+        self.assignable_desc_cache
+            .borrow_mut()
+            .entry(sub.to_string())
+            .or_default()
+            .insert(sup.to_string(), out);
+        out
+    }
+
+    fn assignable_desc_uncached(&self, sub: &str, sup: &str) -> bool {
         if Self::builtin_supers(sub).contains(&sup) || jdk::host_supers(sub).contains(&sup) {
             return true;
         }
@@ -2658,6 +3865,17 @@ impl Vm {
         self.classes.get_mut(&class_idx).unwrap().clinit = 1;
         let fail = |this: &mut Self, e: E| -> Rt<()> {
             this.classes.get_mut(&class_idx).unwrap().clinit = 3;
+            if crate::dbg_flag("OVELO_CLINITDBG") {
+                eprintln!(
+                    "[clinit] {} FAILED: {}",
+                    this.type_desc_of(class_idx)
+                        .unwrap_or_else(|_| format!("class#{class_idx}")),
+                    match &e {
+                        E::Throw(h) => format!("guest throwable {}", this.describe_throw(*h)),
+                        E::Vm(v) => format!("{v}"),
+                    }
+                );
+            }
             Err(e)
         };
         // Superclasses initialize before their subclasses. `sup` is a
@@ -2721,14 +3939,37 @@ impl Vm {
             });
         }
         if let Ok((class, name, sig)) = self.method_sig(midx) {
-            if let Some(&g) = self.methods_by_sig.get(&(class, name, sig)) {
-                if let Some(&(c, em)) = self.defined.get(&g) {
-                    return Ok(Loc {
-                        class_idx: c,
-                        midx: g,
-                        em,
-                    });
+            // Static/direct refs may name a subclass of the actual
+            // declarer — ART resolves them walking the superclass
+            // chain (`V3/g.b` declared on `V3/i` etc.), so do the
+            // same on a direct-table miss.
+            let mut cur = Some(class);
+            for _ in 0..64 {
+                let Some(desc) = cur else { break };
+                if let Some(&g) =
+                    self.methods_by_sig
+                        .get(&(desc.clone(), name.clone(), sig.clone()))
+                {
+                    if let Some(&(c, em)) = self.defined.get(&g) {
+                        return Ok(Loc {
+                            class_idx: c,
+                            midx: g,
+                            em,
+                        });
+                    }
                 }
+                let Some(&(di, def_i)) = self.defs.get(&desc) else {
+                    break;
+                };
+                let d = &self.dexes[di];
+                let def = &d.class_defs()[def_i];
+                if def.superclass_idx == u32::MAX {
+                    break;
+                }
+                cur = d
+                    .type_descriptor(def.superclass_idx)
+                    .ok()
+                    .map(|s| s.to_string());
             }
         }
         Err(E::Vm(err("dexrt.invoke.unresolved")))
@@ -2749,12 +3990,7 @@ impl Vm {
         out.ok_or_else(|| E::Vm(err("dexrt.invoke.unresolved")))
     }
 
-    fn resolve_virtual_uncached(
-        &self,
-        midx: GIdx,
-        start_class: GIdx,
-        fallback: bool,
-    ) -> Rt<Loc> {
+    fn resolve_virtual_uncached(&self, midx: GIdx, start_class: GIdx, fallback: bool) -> Rt<Loc> {
         let Ok((_, name, sig)) = self.method_sig(midx) else {
             return Err(E::Vm(err("dexrt.invoke.unresolved")));
         };
@@ -2783,6 +4019,13 @@ impl Vm {
             }
             cur = (def.superclass_idx != u32::MAX).then(|| gx(gd(cg), def.superclass_idx));
         }
+        // Interface default methods: D8 desugars `Modifier.foldIn`-style
+        // defaults onto the interface def with a real body, and a class
+        // implements the interface without declaring the method — the
+        // superclass-only walk above then misses it and the call stubs.
+        if let Some(hit) = self.find_interface_method(start_class, &name, &sig) {
+            return Ok(hit);
+        }
         // Fall back to the declared method itself (e.g. dispatch target is the
         // declared class — a class that doesn't override).
         if fallback {
@@ -2790,6 +4033,52 @@ impl Vm {
         } else {
             Err(E::Vm(err("dexrt.invoke.unresolved")))
         }
+    }
+
+    /// First interface method carrying a code body reachable from `start`
+    /// through the whole class/interface hierarchy — where JVM dispatch
+    /// lands after the superclass chain misses (default methods).
+    fn find_interface_method(&self, start: GIdx, name: &str, sig: &str) -> Option<Loc> {
+        let mut seen = std::collections::HashSet::new();
+        let mut stack = vec![start];
+        while let Some(ci) = stack.pop() {
+            if !seen.insert(ci) {
+                continue;
+            }
+            let Some((cg, def)) = self.def_loc_of(ci) else {
+                continue;
+            };
+            let Some(d) = self.dex_of(cg) else {
+                continue;
+            };
+            if let Ok(types) = d.type_list(def.interfaces_off) {
+                for &t in &types {
+                    stack.push(gx(gd(cg), t as u32));
+                }
+            }
+            if def.superclass_idx != u32::MAX {
+                stack.push(gx(gd(cg), def.superclass_idx));
+            }
+            let Ok(cd) = d.class_data_rc(def) else {
+                continue;
+            };
+            for m in &cd.virtual_methods {
+                let Ok(om) = d.method(m.method_idx) else {
+                    continue;
+                };
+                if d.string(om.name_idx).unwrap_or_default() == name
+                    && proto_sig(d, om.proto_idx as u32).unwrap_or_default() == sig
+                    && m.code_off != 0
+                {
+                    return Some(Loc {
+                        class_idx: cg,
+                        midx: gx(gd(cg), m.method_idx),
+                        em: *m,
+                    });
+                }
+            }
+        }
+        None
     }
 
     /// Builtin method table: (class descriptor, name) — never silent success,
@@ -2819,12 +4108,74 @@ impl Vm {
         // `Activity.setContentView` is bridged) would steal the call.
         let key = (name.to_string(), sig);
         let owner_ref = gx(gd(midx), mid.class_idx as u32);
-        for (owner, f) in self.hosts_named.get(&key).into_iter().flatten() {
-            if *owner == owner_ref || self.assignable(owner_ref, *owner) {
+        for (owner, desc, f) in self.hosts_named.get(&key).into_iter().flatten() {
+            if *owner != GX_NONE && (*owner == owner_ref || self.assignable(owner_ref, *owner)) {
                 return Ok(Some(f.clone()));
+            }
+            // Descriptor fallback covers every GX_NONE mix (platform
+            // classes have no dex type on one or both sides).
+            // `<init>` is non-virtual: only the exact declared class
+            // may match — `new EditText` reaching the inherited `View`
+            // ctor bridge builds the wrong GuestView kind (the dex
+            // EditText's setText then hits a type error).
+            if let Ok(site) = self.type_desc_of(owner_ref) {
+                if if name == "<init>" {
+                    site == *desc
+                } else {
+                    self.assignable_desc(&site, desc)
+                } {
+                    return Ok(Some(f.clone()));
+                }
             }
         }
         Ok(None)
+    }
+
+    /// The `(name,sig)`-registered host impl for a reference class —
+    /// the same rule `host_named` applies (owner or subclass), for
+    /// builtin arms that run below the normal invoke dispatch and
+    /// would otherwise swallow a bridged call (`ViewGroup.addView`).
+    pub(crate) fn named_host(&self, class: &str, name: &str, sig: &str) -> Option<HostCall> {
+        let owner_ref = self.type_index_of(class).unwrap_or(GX_NONE);
+        if crate::dbg_flag("OVELO_VIEWDBG") {
+            let key = (name.to_string(), sig.to_string());
+            let es: Vec<String> = self
+                .hosts_named
+                .get(&key)
+                .into_iter()
+                .flatten()
+                .map(|(o, d, _)| format!("o{o}={d}"))
+                .collect();
+            eprintln!(
+                "[viewdbg] named_host {class}.{name}{sig} owner_ref={owner_ref} entries={es:?}"
+            );
+        }
+        for (owner, desc, f) in self
+            .hosts_named
+            .get(&(name.to_string(), sig.to_string()))
+            .into_iter()
+            .flatten()
+        {
+            if *owner != GX_NONE
+                && owner_ref != GX_NONE
+                && (*owner == owner_ref || self.assignable(owner_ref, *owner))
+            {
+                return Some(f.clone());
+            }
+            // Descriptor ancestry covers platform classes on either
+            // side — `ViewGroup.addView` invoked via a `ViewGroup`-typed
+            // ref must not miss the bridge (fossify documents white
+            // frame was exactly this: 4-arg addView host-miss).
+            // `<init>` is non-virtual: exact declared class only.
+            if if name == "<init>" {
+                class == desc
+            } else {
+                self.assignable_desc(class, desc)
+            } {
+                return Some(f.clone());
+            }
+        }
+        None
     }
 
     /// Compact `args` for a builtin: DEX passes `J`/`D` params as
@@ -2883,19 +4234,96 @@ impl Vm {
     }
 
     fn call_builtin(&mut self, midx: GIdx, args: &[V], has_receiver: bool) -> Rt<Option<V>> {
-        if std::env::var_os("OVELO_VIEWDBG").is_some()
-            && self.describe_method(midx).contains("setText")
-        {
-            eprintln!("[viewdbg] call_builtin {} args={args:?}", self.describe_method(midx));
+        if crate::dbg_flag("OVELO_VIEWDBG") && self.describe_method(midx).contains("setText") {
+            eprintln!(
+                "[viewdbg] call_builtin {} args={args:?}",
+                self.describe_method(midx)
+            );
         }
-        let args = self.compact_args(midx, args, has_receiver);
+        let mut args = self.compact_args(midx, args, has_receiver);
+        // `put(boolean)` into a JSON container must arrive boxed: a
+        // bare I32 reads back as 0/1 and canonicalizes to null on a
+        // later `aput-object` into an Object[] (org.json's real put
+        // autoboxes to java.lang.Boolean).
+        let z_params: Vec<usize> = self
+            .dex_of(midx)
+            .and_then(|d| {
+                let mid = d.method(gl(midx)).ok()?;
+                let class = d.type_descriptor(mid.class_idx as u32).ok()?;
+                let name = d.string(mid.name_idx).ok()?;
+                if !matches!(
+                    class.as_str(),
+                    "Lorg/json/JSONObject;" | "Lorg/json/JSONArray;"
+                ) || name != "put"
+                {
+                    return None;
+                }
+                let p = d.proto(mid.proto_idx as u32).ok()?;
+                let ps = d.proto_params(p).ok()?;
+                let mut out = vec![];
+                for (i, ty) in ps.iter().enumerate() {
+                    if d.type_descriptor(*ty as u32)
+                        .map(|s| s == "Z")
+                        .unwrap_or(false)
+                    {
+                        out.push(i);
+                    }
+                }
+                Some(out)
+            })
+            .unwrap_or_default();
+        for i in z_params {
+            let ai = i + has_receiver as usize;
+            if let Some(V::I32(b)) = args.get(ai).copied() {
+                args[ai] = jdk::host(self, "Ljava/lang/Boolean;", HostState::Slot(V::I32(b)));
+            }
+        }
         let args = args.as_slice();
         let host = self.hosts.get(&midx).cloned().or(self.host_named(midx)?);
         if let Some(f) = host {
-            let Ok(mut g) = f.try_borrow_mut() else {
-                return vm("dexrt.host.reentrant");
-            };
-            return g(self, args).map_err(E::Vm);
+            match f.try_borrow_mut() {
+                Ok(mut g) => {
+                    let r = g(self, args).map_err(E::Vm);
+                    // A registered host ctor bypasses view::call's Context
+                    // capture — record the ctx arg here too so `getContext()`
+                    // resolves to the real Activity for dex-instantiated views
+                    // (Compose's AndroidComposeView ctor hits this path).
+                    if r.is_ok() {
+                        let is_init = self
+                            .dex_of(midx)
+                            .and_then(|d| {
+                                let mid = d.method(gl(midx)).ok()?;
+                                d.string(mid.name_idx).ok()
+                            })
+                            .map(|n| n == "<init>")
+                            .unwrap_or(false);
+                        if is_init {
+                            if let (Some(V::Ref(this)), Some(V::Ref(c))) =
+                                (args.first(), args.get(1))
+                            {
+                                if *c != 0
+                                    && self.assignable_desc(
+                                        &jdk::class_of(self, V::Ref(*this)),
+                                        "Landroid/view/View;",
+                                    )
+                                {
+                                    jdk::pseudo_set(self, *this, jdk::view::P_CONTEXT, V::Ref(*c));
+                                }
+                            }
+                        }
+                    }
+                    return r;
+                }
+                // Guest code re-entering the same registered callback
+                // (attach → onAttachedToWindow → setContent → addView)
+                // must not abort: fall through to the builtin stubs,
+                // which still do the dex-side bookkeeping (attach_at),
+                // and queue the bridge for the next drain tick so its
+                // host-side effects (GuestUi wiring) still happen.
+                Err(_) => {
+                    self.pending_host_retry.push((midx, args.to_vec()));
+                }
+            }
         }
         let Some(d) = self.dex_of(midx) else {
             return vm("dexrt.invoke.unresolved");
@@ -2925,8 +4353,7 @@ impl Vm {
             ("Ljava/lang/String;", "length") => {
                 if let V::Ref(h) = args.first().copied().unwrap_or(V::Ref(0)) {
                     if let Some(s) = self.heap.str_val(h).map(|x| x.to_string()).or_else(|| {
-                        jdk::pseudo_get(self, h, jdk::P_DATA)
-                            .and_then(|v| jdk::sv(self, v))
+                        jdk::pseudo_get(self, h, jdk::P_DATA).and_then(|v| jdk::sv(self, v))
                     }) {
                         return Ok(Some(V::I32(s.chars().count() as i32)));
                     }
@@ -2939,10 +4366,41 @@ impl Vm {
             ("Ljava/lang/String;", "<init>") => {
                 if let V::Ref(this) = args.first().copied().unwrap_or(V::Ref(0)) {
                     if this != 0 {
-                        let t = args
-                            .get(1)
-                            .and_then(|v| jdk::sv(self, *v))
-                            .unwrap_or_default();
+                        // `new String(byte[], charset)` — decode the
+                        // byte array; `new String(x)` mirrors the text.
+                        let t = match args.get(1).copied() {
+                            Some(V::Ref(ah)) => match self.heap.get(ah) {
+                                Some(Obj::Array { elem, data }) => {
+                                    // `String(x[], off, len, ...)` — the
+                                    // (off,len) pair bounds the decode;
+                                    // ignoring it leaks segment padding
+                                    // (okio reads share 8192-buf tails).
+                                    let (lo, hi) = if args.len() >= 4 {
+                                        let o = jdk::i64v(args[2]).max(0) as usize;
+                                        let n = jdk::i64v(args[3]).max(0) as usize;
+                                        (o.min(data.len()), (o + n).min(data.len()))
+                                    } else {
+                                        (0, data.len())
+                                    };
+                                    if elem == "C" {
+                                        let units: Vec<u16> = data[lo..hi]
+                                            .iter()
+                                            .map(|v| jdk::i64v(*v) as u16)
+                                            .collect();
+                                        Some(String::from_utf16_lossy(&units))
+                                    } else {
+                                        let bytes: Vec<u8> = data[lo..hi]
+                                            .iter()
+                                            .map(|v| jdk::i64v(*v) as u8)
+                                            .collect();
+                                        Some(String::from_utf8_lossy(&bytes).into_owned())
+                                    }
+                                }
+                                _ => jdk::sv(self, V::Ref(ah)),
+                            },
+                            _ => None,
+                        }
+                        .unwrap_or_default();
                         let r = self.heap.intern_str(&t);
                         jdk::pseudo_set(self, this, jdk::P_DATA, V::Ref(r));
                     }
@@ -2955,7 +4413,7 @@ impl Vm {
                     let p = d.proto(mid.proto_idx as u32).map_err(E::Vm)?;
                     ret_desc = d.type_descriptor(p.return_type_idx).map_err(E::Vm)?;
                 }
-                let sig = proto_sig(d, mid.proto_idx as u32).map_err(E::Vm)?;
+                let sig = self.proto_sig_of(midx)?;
                 // JDK/framework builtins cover real behavior for the
                 // common java.* / android.* surface.
                 if let Some(r) = jdk::call(self, &class, &name, &sig, args)? {
@@ -3021,6 +4479,9 @@ impl Vm {
         args: &[V],
     ) -> Rt<Option<V>> {
         let trace = self.describe_method(midx);
+        if crate::dbg_flag("OVELO_STUBDBG") {
+            eprintln!("[stub] {trace} -> {ret} args={}", args.len());
+        }
         if self.stub_trace.len() >= 32 {
             self.stub_trace.remove(0);
         }
@@ -3085,21 +4546,17 @@ impl Vm {
     /// ROOT method only — compat shims delegate to the real dex body
     /// through this once the genuine path is known to work (nested
     /// invokes inside the dex body still honor host overrides).
-    pub fn call_virtual_direct(
-        &mut self,
-        this: u32,
-        name: &str,
-        args: &[V],
-    ) -> Result<Option<V>> {
+    pub fn call_virtual_direct(&mut self, this: u32, name: &str, args: &[V]) -> Result<Option<V>> {
         let ci = self
             .heap
             .class_of(this)
             .ok_or_else(|| errd("dexrt.bad_this", name.to_string()))?;
-        let Some(midx) = self.find_method_on_chain(ci, name, args.len())? else {
+        let (midx, eff_args) = self.resolve_call_args(ci, name, args)?;
+        let Some(midx) = midx else {
             let desc = self.type_desc_of(ci).unwrap_or_default();
-            let mut a = Vec::with_capacity(args.len() + 1);
+            let mut a = Vec::with_capacity(eff_args.len() + 1);
             a.push(V::Ref(this));
-            a.extend_from_slice(args);
+            a.extend_from_slice(&eff_args);
             let r = jdk::call(self, &desc, name, "", &a).map_err(|e| match e {
                 E::Vm(v) => v,
                 E::Throw(t) => {
@@ -3109,9 +4566,9 @@ impl Vm {
             })?;
             return Ok(r.flatten());
         };
-        let mut a = Vec::with_capacity(args.len() + 1);
+        let mut a = Vec::with_capacity(eff_args.len() + 1);
         a.push(V::Ref(this));
-        a.extend_from_slice(args);
+        a.extend_from_slice(&eff_args);
         let out = match self.invoke_inner(midx, a, InvokeKind::Virtual, true) {
             Ok(v) => Ok(v),
             Err(E::Vm(e)) => Err(e),
@@ -3124,6 +4581,120 @@ impl Vm {
             self.drain_runnables(500);
         }
         out
+    }
+
+    /// Unboxed scalar (I64/F64/I32/F32) used as an Object — JSON values
+    /// reach `((Number)x).doubleValue()` unboxed. Answer the boxing
+    /// surface by coercion; anything else stays unhandled so the
+    // caller falls back to the null-receiver NPE.
+    fn scalar_virtual(&mut self, midx: GIdx, v: V, args: &[V]) -> Rt<Option<V>> {
+        let d = match self.dex_of(midx) {
+            Some(d) => d,
+            None => return Ok(None),
+        };
+        let m = d.method(gl(midx)).map_err(E::Vm)?;
+        let name = d.string(m.name_idx).map_err(E::Vm)?;
+        // A zero scalar in a reference slot is `null`, not the number
+        // zero — `null.toString()` must NPE, not yield "0". But when the
+        // resolved method belongs to a numeric box (unboxed JSON numbers
+        // reach `Number.intValue()`), zero is a legitimate value.
+        if Self::scalar_is_zero(v) {
+            let owner = d.type_descriptor(m.class_idx as u32).unwrap_or_default();
+            if !matches!(
+                owner.as_str(),
+                "Ljava/lang/Number;"
+                    | "Ljava/lang/Integer;"
+                    | "Ljava/lang/Long;"
+                    | "Ljava/lang/Short;"
+                    | "Ljava/lang/Byte;"
+                    | "Ljava/lang/Double;"
+                    | "Ljava/lang/Float;"
+            ) {
+                return Ok(None);
+            }
+        }
+        let as_f64 = match v {
+            V::I32(i) => i as f64,
+            V::I64(i) => i as f64,
+            V::F32(f) => f as f64,
+            V::F64(f) => f,
+            _ => return Ok(None),
+        };
+        let as_i64 = as_f64 as i64;
+        Ok(Some(match name.as_str() {
+            "intValue" | "shortValue" | "byteValue" | "charValue" => V::I32(as_i64 as i32),
+            "longValue" => V::I64(as_i64),
+            "floatValue" => V::F32(as_f64 as f32),
+            "doubleValue" => V::F64(as_f64),
+            "booleanValue" => V::I32((as_i64 != 0) as i32),
+            "toString" => {
+                let t = match v {
+                    V::I64(i) => i.to_string(),
+                    V::I32(i) => i.to_string(),
+                    _ => {
+                        if as_f64.fract() == 0.0 {
+                            format!("{}", as_f64 as i64)
+                        } else {
+                            as_f64.to_string()
+                        }
+                    }
+                };
+                jdk::jstr(self, &t)
+            }
+            "hashCode" => V::I32(as_i64 as i32 ^ (as_i64 >> 32) as i32),
+            "equals" => {
+                let eq = match args.get(1).copied() {
+                    Some(o) => match (v, o) {
+                        (V::I32(a), V::I32(b)) => a == b,
+                        (V::I64(a), V::I64(b)) => a == b,
+                        (V::F32(a), V::F32(b)) => a == b,
+                        (V::F64(a), V::F64(b)) => a == b,
+                        _ => false,
+                    },
+                    _ => false,
+                };
+                V::I32(eq as i32)
+            }
+            _ => return Ok(None),
+        }))
+    }
+
+    /// Zero-valued scalar in a reference slot — `const/4 v, 0x0` is
+    /// how dex writes `null`, so 0 is the null literal there.
+    fn scalar_is_zero(v: V) -> bool {
+        match v {
+            V::I32(0) | V::I64(0) => true,
+            V::F32(f) => f == 0.0,
+            V::F64(f) => f == 0.0,
+            _ => false,
+        }
+    }
+
+    /// `instanceof`/check-cast target test for an unboxed scalar —
+    /// numbers satisfy Number/Object and the matching box class.
+    fn scalar_is_instance(&mut self, v: V, ty: GIdx) -> bool {
+        let want = self.type_desc_of(ty).unwrap_or_default();
+        let num =
+            matches!(v, V::I32(_) | V::I64(_) | V::F32(_) | V::F64(_)) && !Self::scalar_is_zero(v);
+        let int_kind = matches!(v, V::I32(_) | V::I64(_));
+        let hit =
+            num && matches!(
+                want.as_str(),
+                "Ljava/lang/Object;"
+                    | "Ljava/lang/Number;"
+                    | "Ljava/lang/Integer;"
+                    | "Ljava/lang/Long;"
+                    | "Ljava/lang/Short;"
+                    | "Ljava/lang/Byte;"
+                    | "Ljava/lang/Double;"
+                    | "Ljava/lang/Float;"
+                    | "Ljava/io/Serializable;"
+                    | "Ljava/lang/Comparable;"
+            ) && (want != "Ljava/lang/Double;" && want != "Ljava/lang/Float;" || !int_kind);
+        if crate::dbg_flag("OVELO_TRACE_INSTOF") {
+            eprintln!("[instof] scalar {:?} vs {} -> {}", v, want, hit);
+        }
+        hit
     }
 
     fn invoke(&mut self, midx: GIdx, args: Vec<V>, kind: InvokeKind) -> Rt<Option<V>> {
@@ -3142,12 +4713,47 @@ impl Vm {
         // heap access (recursive mutex — nested invoke/JNI re-enters
         // fine, call_native drops all levels while guest code runs).
         let _vmlock = jni::vm_lock();
-        if std::env::var_os("OVELO_VIEWDBG").is_some() {
+        if crate::dbg_flag("OVELO_HOTCALL") {
+            thread_local! {
+                static HOT: std::cell::RefCell<HashMap<GIdx, u64>> =
+                    std::cell::RefCell::new(HashMap::new());
+                static LAST: std::cell::Cell<std::time::Instant> =
+                    std::cell::Cell::new(std::time::Instant::now());
+            }
+            let dump = LAST.with(|l| l.get().elapsed().as_secs() >= 10);
+            HOT.with(|h| {
+                *h.borrow_mut().entry(midx).or_default() += 1;
+                if dump {
+                    let mut top: Vec<(GIdx, u64)> =
+                        h.borrow().iter().map(|(g, c)| (*g, *c)).collect();
+                    top.sort_by_key(|(_, c)| std::cmp::Reverse(*c));
+                    for (g, c) in top.into_iter().take(12) {
+                        eprintln!("[hotcall] {c:>9}x {}", self.describe_method(g));
+                    }
+                    eprintln!("[hotcall] ----");
+                    h.borrow_mut().clear();
+                }
+            });
+            if dump {
+                LAST.with(|l| l.set(std::time::Instant::now()));
+            }
+        }
+        if crate::dbg_flag("OVELO_VIEWDBG") {
             if let Some(d) = self.dex_of(midx) {
                 if let Ok(m) = d.method(gl(midx)) {
                     if let Ok(n) = d.string(m.name_idx) {
-                        if matches!(n.as_str(), "measure" | "measureChild" | "measureChildWithMargins" | "onMeasureChild") {
-                            eprintln!("[viewdbg] invoke {} recv={:?}", self.describe_method(midx), args.first());
+                        if matches!(
+                            n.as_str(),
+                            "measure"
+                                | "measureChild"
+                                | "measureChildWithMargins"
+                                | "onMeasureChild"
+                        ) {
+                            eprintln!(
+                                "[viewdbg] invoke {} recv={:?}",
+                                self.describe_method(midx),
+                                args.first()
+                            );
                         }
                     }
                 }
@@ -3163,7 +4769,23 @@ impl Vm {
             InvokeKind::Virtual | InvokeKind::Interface => {
                 let recv = match args.first() {
                     Some(&V::Ref(h)) if h != 0 => h,
-                    _ => {
+                    Some(v) => {
+                        // JSON/scalar values arrive unboxed (I64/F64):
+                        // `Number.*Value`/`Object` methods on them
+                        // coerce the scalar instead of faulting.
+                        if let Some(r) = self.scalar_virtual(midx, *v, &args)? {
+                            return Ok(Some(r));
+                        }
+                        return Err(self.throw_builtin(
+                            "Ljava/lang/NullPointerException;",
+                            &format!(
+                                "null receiver calling {} arg={:?}",
+                                self.describe_method(midx),
+                                v
+                            ),
+                        ));
+                    }
+                    None => {
                         return Err(self.throw_builtin(
                             "Ljava/lang/NullPointerException;",
                             &format!("null receiver calling {}", self.describe_method(midx)),
@@ -3186,24 +4808,69 @@ impl Vm {
                 // caller's own method would recurse forever.
                 match self.resolve_virtual(midx, sup, false) {
                     Ok(l) => l,
-                    Err(_) => return self.call_builtin(midx, &args, true),
+                    Err(_) => {
+                        // invoke-super on an interface default method:
+                        // the caller implements the interface, but its
+                        // superclass chain (Object) doesn't — JVM picks
+                        // the *named* interface's body. The ref's owner
+                        // is that interface, so resolve the method on the
+                        // ref itself first (guarded against the caller's
+                        // own def, which would recurse); only fall back
+                        // to scanning the caller's direct interfaces when
+                        // the owner has no body.
+                        let loc = self
+                            .resolve_defined(midx)
+                            .ok()
+                            .filter(|l| l.class_idx != caller_class && l.em.code_off != 0)
+                            .or_else(|| {
+                                self.def_loc_of(caller_class).and_then(|(cg, d)| {
+                                    let dex = self.dex_of(cg)?;
+                                    let types = dex.type_list(d.interfaces_off).ok()?;
+                                    let (_, name, sig) = self.method_sig(midx).ok()?;
+                                    types.iter().find_map(|&t| {
+                                        self.find_interface_method(
+                                            gx(gd(cg), t as u32),
+                                            &name,
+                                            &sig,
+                                        )
+                                    })
+                                })
+                            });
+                        match loc {
+                            Some(l) => l,
+                            None => return self.call_builtin(midx, &args, true),
+                        }
+                    }
                 }
             }
         };
         // A registered host override short-circuits even a dex-defined
         // method — used for compat shims on library code that can't run
         // here (e.g. appcompat's vector-drawable path).
-        if let Some(f) = if skip_host {
+        let host = if skip_host {
             None
         } else {
             self.hosts.get(&loc.midx).cloned()
-        } {
-            let has_recv = !matches!(kind, InvokeKind::Static);
-            let args = self.compact_args(loc.midx, &args, has_recv);
-            let Ok(mut g) = f.try_borrow_mut() else {
-                return vm("dexrt.host.reentrant");
-            };
-            return g(self, &args).map_err(E::Vm);
+        };
+        if let Some(f) = host {
+            // A re-entrant call into an already-borrowed host callback
+            // falls through to dex/builtin execution — the outer call
+            // dispatching guest code (attach → onAttachedToWindow →
+            // addView) is a legitimate AOSP flow, not an error.
+            match f.try_borrow_mut() {
+                Ok(mut g) => {
+                    let has_recv = !matches!(kind, InvokeKind::Static);
+                    let args = self.compact_args(loc.midx, &args, has_recv);
+                    return g(self, &args).map_err(E::Vm);
+                }
+                Err(_) => {
+                    // Queue the bridge for the next drain tick so its
+                    // host-side wiring still runs once the borrow frees.
+                    let has_recv = !matches!(kind, InvokeKind::Static);
+                    let args = self.compact_args(loc.midx, &args, has_recv);
+                    self.pending_host_retry.push((loc.midx, args));
+                }
+            }
         }
         if matches!(kind, InvokeKind::Static) {
             self.ensure_init(loc.class_idx)?;
@@ -3221,7 +4888,7 @@ impl Vm {
                 (
                     d.type_descriptor(mid.class_idx as u32).map_err(E::Vm)?,
                     d.string(mid.name_idx).map_err(E::Vm)?,
-                    proto_sig(d, mid.proto_idx as u32).map_err(E::Vm)?,
+                    self.proto_sig_of(loc.midx)?,
                     d.proto(mid.proto_idx as u32)
                         .and_then(|p| d.type_descriptor(p.return_type_idx))
                         .map_err(E::Vm)?,
@@ -3230,6 +4897,32 @@ impl Vm {
             let args = self.compact_args(loc.midx, &args, !matches!(kind, InvokeKind::Static));
             if let Some(r) = jdk::call(self, &class, &name, &sig, &args)? {
                 return Ok(r);
+            }
+            // Annotation-interface calls (`Navigator.Name.value()`,
+            // `Subscribe.threadMode()`) are bodiless decls too — answer
+            // from the receiver mirror's elements (or declared
+            // AnnotationDefault) before falling to the stub path.
+            if let Some(v) = self.annotation_method_value(loc.midx, &args) {
+                return Ok(Some(v));
+            }
+            // Debug bisection: OVELO_STUB_NATIVE=<substring> skips the
+            // native call entirely, returning a zero value for its
+            // return type — used to isolate which guest `.so` entry
+            // point's execution corrupts state.
+            static STUB_PAT: std::sync::OnceLock<Option<String>> = std::sync::OnceLock::new();
+            let stub = STUB_PAT
+                .get_or_init(|| std::env::var("OVELO_STUB_NATIVE").ok())
+                .as_deref();
+            if stub.is_some_and(|p| name.contains(p)) {
+                eprintln!("[stubnative] {class}.{name}{sig} skipped");
+                return Ok(void_resolved(match ret_desc.as_str() {
+                    "V" => None,
+                    "Z" | "B" | "C" | "S" | "I" => Some(V::I32(0)),
+                    "J" => Some(V::I64(0)),
+                    "F" => Some(V::F32(0.0)),
+                    "D" => Some(V::F64(0.0)),
+                    _ => Some(V::Ref(0)),
+                }));
             }
             // A dex `native` method resolves to a loaded `.so`: the
             // `Java_<cls>_<name>` symbol or a RegisterNatives binding.
@@ -3258,7 +4951,12 @@ impl Vm {
 
     /// JNI-facing wrappers — the `jni` module sits outside `Vm` but
     /// needs the same interpreter surface the opcodes use.
-    pub(crate) fn invoke_pub(&mut self, midx: GIdx, args: Vec<V>, kind: InvokeKind) -> Rt<Option<V>> {
+    pub(crate) fn invoke_pub(
+        &mut self,
+        midx: GIdx,
+        args: Vec<V>,
+        kind: InvokeKind,
+    ) -> Rt<Option<V>> {
         self.invoke(midx, args, kind)
     }
 
@@ -3300,8 +4998,9 @@ impl Vm {
         args: Vec<V>,
     ) -> Result<Option<V>> {
         let ci = self.type_index_of(owner).unwrap_or(GX_NONE);
-        match self.find_method_on_chain(ci, name, args.len()) {
-            Ok(Some(midx)) => match self.invoke(midx, args, InvokeKind::Static) {
+        let (midx, eff_args) = self.resolve_call_args(ci, name, &args)?;
+        match midx {
+            Some(midx) => match self.invoke(midx, eff_args, InvokeKind::Static) {
                 Ok(v) => Ok(v),
                 Err(E::Vm(e)) => Err(e),
                 Err(E::Throw(r)) => {
@@ -3314,21 +5013,16 @@ impl Vm {
                 // descriptor can't resolve on a dex chain, but the
                 // builtin surface can still answer it — same fallback
                 // `call_virtual_sig` uses.
-                if let Some(r) = jdk::call(self, owner, name, "", &args)
-                    .map_err(|e| match e {
-                        E::Vm(v) => v,
-                        E::Throw(h) => {
-                            let d = self.describe_throw(h);
-                            errd("dexrt.exception.uncaught", d)
-                        }
-                    })?
-                {
+                if let Some(r) = jdk::call(self, owner, name, "", &args).map_err(|e| match e {
+                    E::Vm(v) => v,
+                    E::Throw(h) => {
+                        let d = self.describe_throw(h);
+                        errd("dexrt.exception.uncaught", d)
+                    }
+                })? {
                     return Ok(r);
                 }
-                Err(errd(
-                    "dexrt.invoke.unresolved",
-                    format!("{owner}.{name}"),
-                ))
+                Err(errd("dexrt.invoke.unresolved", format!("{owner}.{name}")))
             }
         }
     }
@@ -3372,10 +5066,9 @@ impl Vm {
                 });
                 Some(V::Ref(h))
             }
-            EV::Annotation {
-                type_idx,
-                elements,
-            } => self.annotation_mirror(cg, *type_idx, elements),
+            EV::Annotation { type_idx, elements } => {
+                self.annotation_mirror(cg, *type_idx, elements)
+            }
             _ => None,
         }
     }
@@ -3456,6 +5149,67 @@ impl Vm {
             .collect()
     }
 
+    /// The annotation set declared on a class — items are local to
+    /// the class's defining dex (`cg` pairs them back).
+    pub(crate) fn class_annotation_items(
+        &self,
+        cg: GIdx,
+    ) -> (GIdx, Vec<ovelo_dex::AnnotationItem>) {
+        let fallback = (cg, Vec::new());
+        let Some((_, def)) = self.def_loc_of(cg) else {
+            return fallback;
+        };
+        let Some(d) = self.dex_of(cg) else {
+            return fallback;
+        };
+        let Ok(dir) = d.annotations_directory(def) else {
+            return (cg, Vec::new());
+        };
+        if dir.class_annotations_off == 0 {
+            return (cg, Vec::new());
+        }
+        let items = d
+            .annotation_set(dir.class_annotations_off)
+            .unwrap_or_default();
+        (cg, items)
+    }
+
+    /// `Class.getAnnotation(Class)`: the declared class-level
+    /// annotation whose type descriptor matches, minted on demand.
+    pub(crate) fn class_annotation(&mut self, cg: GIdx, annot_desc: &str) -> V {
+        let (cg, items) = self.class_annotation_items(cg);
+        for it in &items {
+            if self
+                .dex_of(cg)
+                .and_then(|d| d.type_descriptor(it.type_idx).ok())
+                .as_deref()
+                == Some(annot_desc)
+            {
+                return self
+                    .annotation_mirror(cg, it.type_idx, &it.elements)
+                    .unwrap_or(V::Ref(0));
+            }
+        }
+        V::Ref(0)
+    }
+
+    /// All declared class-level annotations as minted mirrors.
+    pub(crate) fn class_annotations(&mut self, cg: GIdx) -> Vec<V> {
+        let (cg, items) = self.class_annotation_items(cg);
+        items
+            .iter()
+            .filter_map(|it| self.annotation_mirror(cg, it.type_idx, &it.elements))
+            .collect()
+    }
+
+    /// Canonical class GIdx for a type descriptor, when the dex
+    /// defines it — class-annotation lookups key off this.
+    pub(crate) fn class_gidx_of(&self, desc: &str) -> Option<GIdx> {
+        let &(di, i) = self.defs.get(desc)?;
+        let def = &self.dexes[di].class_defs()[i];
+        Some(gx(di, def.class_idx))
+    }
+
     /// `Method.getDefaultValue` — the `AnnotationDefault` element for an
     /// annotation-interface method. DX stores it on the interface's
     /// *class* annotation set with elements keyed by method name.
@@ -3491,12 +5245,7 @@ impl Vm {
                 continue;
             }
             for (ni, ev) in &it.elements {
-                if self
-                    .dex_of(cg)
-                    .and_then(|d| d.string(*ni).ok())
-                    .as_deref()
-                    == Some(name)
-                {
+                if self.dex_of(cg).and_then(|d| d.string(*ni).ok()).as_deref() == Some(name) {
                     return self.encoded_to_v(cg, ev);
                 }
             }
@@ -3508,13 +5257,35 @@ impl Vm {
     /// from the receiver mirror's elements, then its declared
     /// `AnnotationDefault`. `None` when this isn't an annotation call.
     fn annotation_method_value(&mut self, midx: GIdx, args: &[V]) -> Option<V> {
+        let dbg = crate::dbg_flag("OVELO_ANNDBG");
+        if dbg {
+            eprintln!("[anndbg] enter {}", self.describe_method(midx));
+        }
         let (cg, name) = {
             let d = self.dex_of(midx)?;
             let mid = d.method(gl(midx)).ok()?;
             let cg = gx(gd(midx), mid.class_idx as u32);
-            let (_, def) = self.def_loc_of(cg)?;
+            let (_, def) = match self.def_loc_of(cg) {
+                Some(x) => x,
+                None => {
+                    if dbg {
+                        eprintln!(
+                            "[anndbg] no def for {}",
+                            self.type_desc_of(cg).unwrap_or_default()
+                        );
+                    }
+                    return None;
+                }
+            };
             // ACC_ANNOTATION — only interface-style dex classes qualify.
             if def.access_flags & 0x2000 == 0 {
+                if dbg {
+                    eprintln!(
+                        "[anndbg] {} not annotation flags={:#x}",
+                        self.type_desc_of(cg).unwrap_or_default(),
+                        def.access_flags
+                    );
+                }
                 return None;
             }
             (cg, d.string(mid.name_idx).ok()?)
@@ -3523,6 +5294,18 @@ impl Vm {
             return None;
         };
         let owner_desc = self.type_desc_of(cg).ok()?;
+        if dbg {
+            let recv = self.heap.get(h).map(|o| match o {
+                Obj::Host { desc, .. } => desc.clone(),
+                Obj::Instance { class_idx, .. } => {
+                    self.type_desc_of(*class_idx).unwrap_or_else(|_| "?".into())
+                }
+                _ => "?".to_string(),
+            });
+            eprintln!(
+                "[anndbg] annotation_method_value owner={owner_desc} name={name} recv={recv:?}"
+            );
+        }
         if let Some(Obj::Host {
             desc,
             state: HostState::Map(m),
@@ -3592,6 +5375,70 @@ impl Vm {
             .collect()
     }
 
+    /// `Class.getDeclaredFields`/`getFields`: mint a `Field` mirror per
+    /// declared dex field (statics first, like the dex class data). The
+    /// mirror carries the exact field index in `P_DATA` so `Field.get`
+    /// and `getType`/`getModifiers` answer for the real member.
+    pub(crate) fn declared_field_mirrors(&mut self, owner: &str) -> Vec<V> {
+        let mut specs: Vec<(GIdx, String, u32)> = Vec::new();
+        {
+            let Some(ci) = self.type_index_of(owner) else {
+                return Vec::new();
+            };
+            let Some((cg, def)) = self.def_loc_of(ci) else {
+                return Vec::new();
+            };
+            let Some(d) = self.dex_of(cg) else {
+                return Vec::new();
+            };
+            let Ok(cd) = d.class_data_rc(def) else {
+                return Vec::new();
+            };
+            for ef in cd.static_fields.iter().chain(cd.instance_fields.iter()) {
+                let name = d
+                    .field(ef.field_idx)
+                    .ok()
+                    .and_then(|f| d.string(f.name_idx).ok())
+                    .unwrap_or_default();
+                specs.push((gx(gd(cg), ef.field_idx), name, ef.access_flags));
+            }
+        }
+        let cv = jdk::jstr(self, owner);
+        specs
+            .into_iter()
+            .map(|(fidx, name, flags)| {
+                let hv = jdk::host(self, "Ljava/lang/reflect/Field;", HostState::StrBuf(name));
+                if let V::Ref(h) = hv {
+                    jdk::pseudo_set(self, h, jdk::P_COMPONENT, cv);
+                    jdk::pseudo_set(self, h, jdk::P_DATA, V::I64(fidx as i64));
+                    jdk::pseudo_set(self, h, jdk::P_FLAGS, V::I32(flags as i32));
+                }
+                hv
+            })
+            .collect()
+    }
+
+    /// `Class.getDeclaredClasses`: `Class` objects for the nested classes
+    /// defined in the dex (`Foo$Inner`, `Foo$$serializer`, ...).
+    pub(crate) fn nested_class_mirrors(&mut self, owner: &str) -> Vec<V> {
+        let prefix = format!("{}$", owner.trim_end_matches(';'));
+        let names: Vec<String> = self
+            .defs
+            .keys()
+            .filter(|k| k.starts_with(prefix.as_str()))
+            .cloned()
+            .collect();
+        names.into_iter().map(|n| jdk::class_obj(self, n)).collect()
+    }
+
+    /// A field's declared type descriptor.
+    pub(crate) fn field_type_desc(&self, fidx: GIdx) -> Option<String> {
+        let fidx = self.canon_field(fidx);
+        let d = self.dex_of(fidx)?;
+        let f = d.field(gl(fidx)).ok()?;
+        d.type_descriptor(f.type_idx as u32).ok()
+    }
+
     /// A method's declared parameter type descriptors (proto order).
     pub(crate) fn method_param_descs(&self, midx: GIdx) -> Vec<String> {
         let Some(d) = self.dex_of(midx) else {
@@ -3625,6 +5472,54 @@ impl Vm {
         self.sget_pub(g)
     }
 
+    /// Reflective static read for `Field.get(null)`. Unlike `sget`, a
+    /// `<clinit>` failure triggered by the probe is rolled back: a
+    /// reflective miss (kotlinx.serialization's `INSTANCE`/`Companion`
+    /// probes touch many classes) must not poison the class for the
+    /// real `sget`s that run later.
+    pub(crate) fn probe_static_named(&mut self, owner: &str, name: &str) -> Option<V> {
+        let f = self
+            .field_index_of(owner, name)
+            .map(|g| self.canon_field(g))?;
+        let owner_idx = self
+            .dex_of(f)
+            .and_then(|d| d.field(gl(f)).ok())
+            .map(|fi| self.canon(gx(gd(f), fi.class_idx as u32)))
+            .unwrap_or(f);
+        match self.classes.get(&owner_idx).map(|c| c.clinit) {
+            Some(2) => {}
+            // In-progress or already-failed: probing more is wrong.
+            _ if self.classes.contains_key(&owner_idx) => return None,
+            _ => {
+                let prev3: std::collections::HashSet<GIdx> = self
+                    .classes
+                    .iter()
+                    .filter(|(_, c)| c.clinit == 3)
+                    .map(|(k, _)| *k)
+                    .collect();
+                if self.ensure_init(owner_idx).is_err() {
+                    for (k, c) in self.classes.iter_mut() {
+                        if c.clinit == 3 && !prev3.contains(k) {
+                            c.clinit = 0;
+                        }
+                    }
+                    return None;
+                }
+            }
+        }
+        self.classes
+            .get(&owner_idx)
+            .and_then(|c| c.statics.get(&f))
+            .copied()
+            .or_else(|| {
+                if self.def_of(owner_idx).is_none() {
+                    self.builtin_sfield(f).or_else(|| self.field_default(f))
+                } else {
+                    self.encoded_static(owner_idx, f)
+                }
+            })
+    }
+
     /// Read a static like the `sget` opcode: guest-encoded value,
     /// builtin table for host classes, field-type default last.
     pub(crate) fn sget_pub(&mut self, f: GIdx) -> Option<V> {
@@ -3641,7 +5536,8 @@ impl Vm {
         let v = if self.def_of(owner).is_none() {
             self.builtin_sfield(f).or_else(|| self.field_default(f))
         } else {
-            self.encoded_static(owner, f).or_else(|| self.field_default(f))
+            self.encoded_static(owner, f)
+                .or_else(|| self.field_default(f))
         }?;
         if matches!(v, V::Ref(h) if h != 0) {
             self.classes.entry(owner).or_default().statics.insert(f, v);
@@ -3661,17 +5557,28 @@ impl Vm {
     }
 
     /// Walk `class_idx`'s chain for a field by name (static when
-    /// `is_static`, instance otherwise) → global field idx.
+    /// `is_static`, instance otherwise) → global field idx. When
+    /// `want_ty` is given and several fields share the name (legal in
+    /// dex, common under obfuscation), the one declaring that type wins
+    /// over an earlier same-name hit on a shallower class.
     pub(crate) fn find_field_by_name(
         &self,
         mut class_idx: GIdx,
         name: &str,
         is_static: bool,
+        want_ty: Option<&str>,
     ) -> Option<GIdx> {
+        let mut name_hit = None;
         for _ in 0..64 {
-            let (cg, def) = self.def_loc_of(class_idx)?;
-            let d = self.dex_of(cg)?;
-            let cd = d.class_data_rc(def).ok()?;
+            let Some((cg, def)) = self.def_loc_of(class_idx) else {
+                return name_hit;
+            };
+            let Some(d) = self.dex_of(cg) else {
+                return name_hit;
+            };
+            let Ok(cd) = d.class_data_rc(def) else {
+                return name_hit;
+            };
             let it = if is_static {
                 &cd.static_fields
             } else {
@@ -3679,17 +5586,28 @@ impl Vm {
             };
             for f in it {
                 if let Ok(fi) = d.field(f.field_idx) {
-                    if d.string(fi.name_idx).ok()? == name {
-                        return Some(gx(gd(cg), f.field_idx));
+                    let Ok(fname) = d.string(fi.name_idx) else {
+                        continue;
+                    };
+                    if fname != name {
+                        continue;
+                    }
+                    if let Some(want) = want_ty {
+                        if d.type_descriptor(fi.type_idx as u32).ok().as_deref() == Some(want) {
+                            return Some(gx(gd(cg), f.field_idx));
+                        }
+                    }
+                    if name_hit.is_none() {
+                        name_hit = Some(gx(gd(cg), f.field_idx));
                     }
                 }
             }
             if def.superclass_idx == u32::MAX {
-                return None;
+                return name_hit;
             }
             class_idx = gx(gd(cg), def.superclass_idx);
         }
-        None
+        name_hit
     }
 
     /// Run a compiled method under the shared register/ABI contract
@@ -3703,19 +5621,37 @@ impl Vm {
             .map_err(E::Vm)?
             .ok_or_else(|| E::Vm(err("dexrt.method.no_code")))?;
         let nregs = code.registers_size as usize;
-        let start = nregs.saturating_sub(code.ins_size as usize);
+        let ins = code.ins_size as usize;
+        let start = nregs.saturating_sub(ins);
         let mut regs = vec![0i64; nregs];
-        for (i, a) in args.iter().enumerate() {
-            if start + i >= nregs {
-                break;
+        let write = |regs: &mut Vec<i64>, i: usize, a: &V| {
+            if i < regs.len() {
+                regs[i] = match a {
+                    V::I32(v) => *v as i64,
+                    V::I64(v) => *v,
+                    V::F32(v) => v.to_bits() as i64,
+                    V::F64(v) => v.to_bits() as i64,
+                    V::Ref(h) => *h as i64,
+                };
             }
-            regs[start + i] = match a {
-                V::I32(v) => *v as i64,
-                V::I64(v) => *v,
-                V::F32(v) => v.to_bits() as i64,
-                V::F64(v) => v.to_bits() as i64,
-                V::Ref(h) => *h as i64,
-            };
+        };
+        // Same reg-vs-param convention split as exec_frame: dex sites
+        // pass every register incl. wide high halves; host calls pass
+        // one V per parameter and J/D consume two registers.
+        if args.len() == ins {
+            for (i, a) in args.iter().enumerate() {
+                write(&mut regs, start + i, a);
+            }
+        } else {
+            let mut ri = start;
+            for a in &args {
+                write(&mut regs, ri, a);
+                ri += if matches!(a, V::I64(_) | V::F64(_)) {
+                    2
+                } else {
+                    1
+                };
+            }
         }
         let mut trap: u8 = 0;
         self.stack.push(midx);
@@ -3754,7 +5690,7 @@ impl Vm {
 
     /// Execute one frame to return or throw.
     fn exec(&mut self, loc: Loc, args: Vec<V>) -> Rt<Option<V>> {
-        if self.depth >= 512 {
+        if self.depth >= 4096 {
             return Err(self.throw_builtin("Ljava/lang/StackOverflowError;", "call depth exceeded"));
         }
         self.depth += 1;
@@ -3798,18 +5734,44 @@ impl Vm {
             loc,
             code,
         };
-        // Copy args into the last `ins_size` registers.
+        // Copy args into the last `ins_size` registers. Dex invoke
+        // sites pass one entry per *register* (a wide arg's high half
+        // is listed too, so args.len()==ins_size); host-side callers
+        // pass one V per *parameter* — a J/D arg then needs an extra
+        // register slot after it or every later arg shifts one reg.
         let ins = fr.code.ins_size as usize;
         let start = nregs.saturating_sub(ins);
-        for (i, a) in args.iter().enumerate() {
-            if start + i < nregs {
-                fr.regs[start + i] = *a;
+        if args.len() == ins {
+            for (i, a) in args.iter().enumerate() {
+                if start + i < nregs {
+                    fr.regs[start + i] = *a;
+                }
+            }
+        } else {
+            let mut ri = start;
+            for a in &args {
+                if ri < nregs {
+                    fr.regs[ri] = *a;
+                }
+                ri += if matches!(a, V::I64(_) | V::F64(_)) {
+                    2
+                } else {
+                    1
+                };
             }
         }
         let mut pc: usize = 0;
         // Instruction budget — a guest (or stub-driven) loop that never
         // terminates must fail loudly, not hang the host process.
-        let stalldbg = std::env::var_os("OVELO_STALLDBG").is_some();
+        // Compose's gapbuffer SlotWriter null-fills freshly grown slot
+        // arrays one element per dex op — a big composition legitimately
+        // clears the 20M default, so the cap is env-overrideable for
+        // diagnosis/throughput trade-offs.
+        let budget: u64 = std::env::var("OVELO_BUDGET")
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(20_000_000);
+        let stalldbg = crate::dbg_flag("OVELO_STALLDBG");
         let mut steps: u64 = 0;
         loop {
             steps += 1;
@@ -3818,6 +5780,9 @@ impl Vm {
                     "[stall] {} +{pc:04x} steps={steps}",
                     self.describe_method(fr.loc.midx)
                 );
+                for (i, m) in self.stack.iter().rev().take(8).enumerate() {
+                    eprintln!("[stall-frm{i}] {}", self.describe_method(*m));
+                }
             }
             self.total_steps += 1;
             if stalldbg && self.total_steps.is_multiple_of(1_000_000) {
@@ -3826,8 +5791,14 @@ impl Vm {
                     self.describe_method(fr.loc.midx),
                     self.total_steps
                 );
+                if self.total_steps.is_multiple_of(10_000_000) {
+                    eprintln!("[stall-depth] {}", self.stack.len());
+                    for (i, m) in self.stack.iter().take(8).enumerate() {
+                        eprintln!("[stall-root{i}] {}", self.describe_method(*m));
+                    }
+                }
             }
-            if steps > 20_000_000 {
+            if steps > budget {
                 return Err(self.throw_builtin(
                     "Ljava/lang/InternalError;",
                     &format!("instruction budget exceeded at +{pc:04x}"),
@@ -3848,16 +5819,7 @@ impl Vm {
                 }
                 Err(E::Throw(r)) => match self.find_handler(&fr, pc, r) {
                     _ if self.trace_throw => {
-                        let d = match self.heap.get(r) {
-                            Some(Obj::Throwable { descriptor, detail }) => {
-                                format!("{descriptor} {detail}")
-                            }
-                            Some(Obj::Host { desc, .. }) => desc.clone(),
-                            Some(Obj::Instance { class_idx, .. }) => self
-                                .type_desc_of(*class_idx)
-                                .unwrap_or_else(|_| format!("instance(class_idx={class_idx})")),
-                            _ => format!("h{r}"),
-                        };
+                        let d = self.describe_throw(r);
                         eprintln!(
                             "[throw] {} +{pc:04x} -> {d}",
                             self.describe_method(fr.loc.midx)
@@ -3946,13 +5908,14 @@ enum InvokeKind {
 impl Vm {
     /// Set a possibly-wide value: mirrors into `regs[i+1]` for `I64`/`F64`.
     fn set(fr: &mut Frame, i: usize, v: V) {
+        // One V slot carries a whole wide value (I64/F64), so a
+        // single-register op writes exactly one slot. Mirroring into
+        // i+1 would clobber the *next live register* — e.g.
+        // `move-result-object v2` returning an unboxed number must not
+        // overwrite v3. Dex only ever addresses wide pairs by their
+        // low slot, so the mirror slot is never read.
         if let Some(r) = fr.regs.get_mut(i) {
             *r = v;
-        }
-        if matches!(v, V::I64(_) | V::F64(_)) {
-            if let Some(r2) = fr.regs.get_mut(i + 1) {
-                *r2 = v;
-            }
         }
     }
 
@@ -3966,27 +5929,27 @@ impl Vm {
     fn i32v(v: V) -> Rt<i32> {
         match v {
             V::I32(i) => Ok(i),
-            _ => vm("dexrt.type"),
+            _ => Err(E::Vm(errd("dexrt.type", format!("i32v {v:?}")))),
         }
     }
     fn i64v(v: V) -> Rt<i64> {
         match v {
             V::I64(i) => Ok(i),
-            _ => vm("dexrt.type"),
+            _ => Err(E::Vm(errd("dexrt.type", format!("i64v {v:?}")))),
         }
     }
     fn f32v(v: V) -> Rt<f32> {
         match v {
             V::F32(f) => Ok(f),
             V::I32(i) => Ok(f32::from_bits(i as u32)),
-            _ => vm("dexrt.type"),
+            _ => Err(E::Vm(errd("dexrt.type", format!("f32v {v:?}")))),
         }
     }
     fn f64v(v: V) -> Rt<f64> {
         match v {
             V::F64(f) => Ok(f),
             V::I64(i) => Ok(f64::from_bits(i as u64)),
-            _ => vm("dexrt.type"),
+            _ => Err(E::Vm(errd("dexrt.type", format!("f64v {v:?}")))),
         }
     }
     fn refv(v: V) -> Rt<u32> {
@@ -3994,7 +5957,7 @@ impl Vm {
             V::Ref(h) => Ok(h),
             // `const/4 vx, 0` is how dex puts a null reference in a register.
             V::I32(0) => Ok(0),
-            _ => vm("dexrt.type"),
+            _ => Err(E::Vm(errd("dexrt.type", format!("refv {v:?}")))),
         }
     }
 
@@ -4085,7 +6048,21 @@ impl Vm {
             }
             // ---- casts ----
             0x1f => {
-                let h = Self::refv(r(0)?)?;
+                // A scalar reaching check-cast is valid when the target
+                // is a box class it can satisfy (JSON numbers as Number).
+                let h = match r(0)? {
+                    V::Ref(h) => h,
+                    // `const 0` is the null literal in a reference slot —
+                    // null casts to anything.
+                    v if Self::scalar_is_zero(v) => 0,
+                    v if self.scalar_is_instance(v, gi(ins.idx.unwrap_or(0))) => 0,
+                    _ => {
+                        return Err(self.throw_builtin(
+                            "Ljava/lang/ClassCastException;",
+                            "check-cast on primitive",
+                        ))
+                    }
+                };
                 // Opaque placeholders (empty stubs we minted to satisfy a
                 // return type) carry no verifiable class — let the cast
                 // pass. `instanceof`/catch matching stay strict.
@@ -4118,8 +6095,13 @@ impl Vm {
                 }
             }
             0x20 => {
-                let h = Self::refv(r(1)?)?;
-                let res = h != 0 && self.is_instance(h, gi(ins.idx.unwrap_or(0)));
+                // Untyped dex registers can hand a number to
+                // `instanceof` (JSON values map to I64/F64) — a
+                // non-reference is never an instance: false, not fault.
+                let res = match r(1)? {
+                    V::Ref(h) => h != 0 && self.is_instance(h, gi(ins.idx.unwrap_or(0))),
+                    v => self.scalar_is_instance(v, gi(ins.idx.unwrap_or(0))),
+                };
                 set!(regs[0], V::I32(res as i32));
             }
             0x21 => {
@@ -4127,7 +6109,12 @@ impl Vm {
                 self.null_check(h, "array-length")?;
                 let n = match self.heap.get(h) {
                     Some(Obj::Array { data, .. }) => data.len() as i32,
-                    _ => return vm("dexrt.type"),
+                    other => {
+                        return Err(E::Vm(errd(
+                            "dexrt.type",
+                            format!("array-length h{h} {:?}", other.map(std::mem::discriminant)),
+                        )))
+                    }
                 };
                 set!(regs[0], V::I32(n));
             }
@@ -4166,10 +6153,7 @@ impl Vm {
                 let desc = self.dexes[di]
                     .type_descriptor(ins.idx.unwrap_or(0))
                     .map_err(E::Vm)?;
-                let elem = desc
-                    .strip_prefix('[')
-                    .unwrap_or(&desc)
-                    .to_string();
+                let elem = desc.strip_prefix('[').unwrap_or(&desc).to_string();
                 let h = self.heap.alloc(Obj::Array {
                     data: vec![V::default_for(&elem); len as usize],
                     elem,
@@ -4182,10 +6166,7 @@ impl Vm {
                 let desc = self.dexes[di]
                     .type_descriptor(ins.idx.unwrap_or(0))
                     .map_err(E::Vm)?;
-                let elem = desc
-                    .strip_prefix('[')
-                    .unwrap_or(&desc)
-                    .to_string();
+                let elem = desc.strip_prefix('[').unwrap_or(&desc).to_string();
                 let arg_regs: Vec<usize> = if ins.opcode == 0x25 {
                     // {vCCCC..+AA}: `regs`=[range start], `lit`=reg count
                     let (first, n) = (regs[0] as usize, ins.lit.unwrap_or(0) as usize);
@@ -4281,7 +6262,14 @@ impl Vm {
                         };
                         let eq = match (refv(va), refv(vb)) {
                             (Some(a), Some(b)) => a == b,
-                            _ => Self::i32v(va)? == Self::i32v(vb)?,
+                            _ => match (va, vb) {
+                                (V::I32(a), V::I32(b)) => a == b,
+                                // A reference (or null) never equals a
+                                // wide/float value in dex's untyped
+                                // registers — report unequal rather
+                                // than faulting on i32v.
+                                _ => false,
+                            },
                         };
                         if op == 0x32 {
                             eq
@@ -4299,6 +6287,90 @@ impl Vm {
                         }
                     }
                 };
+                if !t && op == 0x35 {
+                    // Canonical constant-fill counted loop:
+                    //   if-ge i, n, EXIT
+                    //   const z, C
+                    //   aput-object z, arr, i
+                    //   add-int/lit8 i, i, +1
+                    //   goto HEAD
+                    // `new-array` already default-fills its data, so
+                    // re-storing the same constant is a pure no-op —
+                    // but Compose's SlotWriter.insertSlots emits this
+                    // shape over arrays grown to ~2M slots, burning
+                    // the whole instruction budget one element per
+                    // step. When the write range already holds the
+                    // constant, finish the loop in one step.
+                    let pat = |o: usize| fr.table.get(o);
+                    // Pull every operand out as a value first so the
+                    // `fr.table` borrow ends before `Self::set(fr,…)`.
+                    let fill = if let (Some(cst), Some(ap), Some(inc), Some(go)) =
+                        (pat(pos + 1), pat(pos + 2), pat(pos + 3), pat(pos + 4))
+                    {
+                        let lit = match cst.opcode {
+                            0x12..=0x14 => cst.lit.unwrap_or(0),
+                            0x15 => cst.lit.unwrap_or(0) << 16,
+                            _ => i64::MAX,
+                        };
+                        if lit != i64::MAX
+                            && ap.opcode == 0x4d
+                            && ap.regs.first() == cst.regs.first()
+                            && ap.regs.get(2) == ins.regs.first()
+                            && inc.opcode == 0xd8
+                            && inc.regs.first() == ins.regs.first()
+                            && inc.regs.get(1) == ins.regs.first()
+                            && inc.lit == Some(1)
+                            && go.opcode == 0x28
+                            && go.target == Some(ins.offset)
+                            // The const target must not alias the
+                            // counter, bound or array register — an
+                            // aliased store would also change what the
+                            // loop compares or writes through.
+                            && cst.regs.first() != ins.regs.first()
+                            && cst.regs.first() != ins.regs.get(1)
+                            && cst.regs.first() != ap.regs.get(1)
+                        {
+                            Some((cst.regs[0] as usize, ap.regs[1] as usize, lit as i32))
+                        } else {
+                            None
+                        }
+                    } else {
+                        None
+                    };
+                    if let Some((z, arr_reg, c)) = fill {
+                        let (i0, n) = (Self::i32v(va)?, Self::i32v(vb)?);
+                        let ah = Self::refv(Self::reg(fr, arr_reg)?)?;
+                        let probed = !self.fill_bad.contains(&ah);
+                        if let Some(Obj::Array { data, .. }) = self.heap.get(ah).filter(|_| probed)
+                        {
+                            // The loop is a no-op iff every slot it
+                            // would touch already holds the canonical
+                            // value the store would leave — for
+                            // aput-object that is Ref(0) (aput
+                            // canonicalizes I32(0) → Ref(0) on object
+                            // arrays), so a skipped range is bit-equal
+                            // to a looped one, including under
+                            // Arrays.equals.
+                            let stored = if c == 0 { V::Ref(0) } else { V::I32(c) };
+                            let uniform = i0 >= 0
+                                && n >= 0
+                                && n as usize <= data.len()
+                                && data[i0 as usize..n as usize].iter().all(|v| *v == stored);
+                            if uniform {
+                                Self::set(fr, ins.regs[0] as usize, V::I32(n));
+                                Self::set(fr, z, V::I32(c));
+                                return Ok(Out::Next(
+                                    ins.target.ok_or_else(|| E::Vm(err("dexrt.branch")))? as usize,
+                                ));
+                            }
+                            // Non-uniform: the real loop runs — and a
+                            // rescan on every head hit would be O(n²),
+                            // so the failed handle is remembered and
+                            // later hits go straight to interpretation.
+                            self.fill_bad.insert(ah);
+                        }
+                    }
+                }
                 if t {
                     return Ok(Out::Next(
                         ins.target.ok_or_else(|| E::Vm(err("dexrt.branch")))? as usize,
@@ -4307,9 +6379,14 @@ impl Vm {
             }
             0x38..=0x3d => {
                 let va = r(0)?;
-                // if-eqz/if-nez also test references against null.
+                // if-eqz/if-nez also test references against null — and
+                // unboxed scalars standing in for boxed values (a JSON
+                // Number reaching the slot) count as non-null/nonzero.
                 let a = match va {
                     V::Ref(h) => h as i32,
+                    V::I64(i) => (i != 0) as i32,
+                    V::F64(f) => (f != 0.0) as i32,
+                    V::F32(f) => (f != 0.0) as i32,
                     _ => Self::i32v(va)?,
                 };
                 let t = match op {
@@ -4330,6 +6407,17 @@ impl Vm {
             0x44..=0x4a => {
                 let (h, i) = (Self::refv(r(1)?)?, Self::i32v(r(2)?)?);
                 let v = self.aget(h, i)?;
+                if crate::dbg_flag("OVELO_ARRDBG") {
+                    if let V::Ref(vh) = v {
+                        if let Some(Obj::Array { elem, data }) = self.heap.get(vh) {
+                            eprintln!(
+                                "[arrdbg] aget h{h}[{i}] -> array h{vh} elem={elem} len={} in {}",
+                                data.len(),
+                                self.describe_method(fr.loc.midx)
+                            );
+                        }
+                    }
+                }
                 set!(regs[0], v);
             }
             0x4b..=0x51 => {
@@ -4341,7 +6429,7 @@ impl Vm {
                 let h = Self::refv(r(1)?)?;
                 if h == 0 {
                     let d = format!(
-                        "iget {} in {}",
+                        "iget {} @{pc:04x} in {}",
                         self.describe_field(gi(ins.idx.unwrap_or(0))),
                         self.describe_method(fr.loc.midx),
                     );
@@ -4353,7 +6441,7 @@ impl Vm {
                         fields.get(&f).copied()
                     }
                     other => {
-                        if std::env::var_os("OVELO_VIEWDBG").is_some() {
+                        if crate::dbg_flag("OVELO_VIEWDBG") {
                             let kind = match other {
                                 Some(Obj::Array { .. }) => "array",
                                 Some(Obj::Str(_)) => "string",
@@ -4368,7 +6456,26 @@ impl Vm {
                                 self.describe_method(fr.loc.midx)
                             );
                         }
-                        return vm("dexrt.type");
+                        return Err(E::Vm(errd(
+                            "dexrt.type",
+                            format!(
+                                "iget h{h} field={} kind={:?} arr={:?}",
+                                self.describe_field(gi(ins.idx.unwrap_or(0))),
+                                self.heap.get(h).map(std::mem::discriminant),
+                                match self.heap.get(h) {
+                                    Some(Obj::Array { elem, data }) => format!(
+                                        "elem={elem} len={} e0={:?}",
+                                        data.len(),
+                                        data.first().and_then(|v| match v {
+                                            V::Ref(eh) =>
+                                                self.heap.get(*eh).map(std::mem::discriminant),
+                                            _ => None,
+                                        })
+                                    ),
+                                    _ => "-".into(),
+                                }
+                            ),
+                        )));
                     }
                 };
                 if self
@@ -4432,7 +6539,16 @@ impl Vm {
                     Some(Obj::Instance { fields, .. }) | Some(Obj::Host { fields, .. }) => {
                         fields.insert(f, r(0)?);
                     }
-                    _ => return vm("dexrt.type"),
+                    _ => {
+                        return Err(E::Vm(errd(
+                            "dexrt.type",
+                            format!(
+                                "iput h{h} field={} v={:?}",
+                                self.describe_field(gi(ins.idx.unwrap_or(0))),
+                                r(0).ok()
+                            ),
+                        )))
+                    }
                 }
             }
             // ---- static fields ----
@@ -4449,6 +6565,22 @@ impl Vm {
                     .statics
                     .get(&f)
                     .copied();
+                if crate::dbg_flag("OVELO_SGETDBG") && !matches!(stored, Some(V::Ref(h)) if h != 0)
+                {
+                    let fd = self.dexes[di].field(fl).map_err(E::Vm)?;
+                    let cname = self.dexes[di]
+                        .type_descriptor(fd.class_idx as u32)
+                        .unwrap_or_default();
+                    let fname = self.dexes[di].string(fd.name_idx).unwrap_or_default();
+                    let keys: Vec<GIdx> = self
+                        .classes
+                        .get(&owner)
+                        .map(|c| c.statics.keys().copied().collect())
+                        .unwrap_or_default();
+                    eprintln!(
+                        "[sgetdbg] miss {cname}.{fname} fl={fl} f={f:?} owner={owner:?} stored={stored:?} keys={keys:?}"
+                    );
+                }
                 let v = match stored {
                     Some(v) => v,
                     // A static on a host-provided class (Build.VERSION,
@@ -4517,7 +6649,23 @@ impl Vm {
                     .map(|&i| Self::reg(fr, i as usize))
                     .collect::<Rt<_>>()?;
                 let this_arg = args.first().copied();
-                let argfmt: Vec<String> = if self.trace_call.is_some() {
+                // Cheap gate first: only build the expensive arg dump
+                // when the callee name actually matches the filter.
+                let trace_hit = self
+                    .trace_call
+                    .as_deref()
+                    .map(|p| {
+                        let callee = self.describe_method(midx);
+                        let caller = self.describe_method(fr.loc.midx);
+                        p.split(',')
+                            .any(|one| !one.is_empty() && callee.contains(one))
+                            && self
+                                .trace_from
+                                .as_deref()
+                                .is_none_or(|f| caller.contains(f))
+                    })
+                    .unwrap_or(false);
+                let argfmt: Vec<String> = if trace_hit {
                     args.iter()
                         .skip(1)
                         .map(|v| match v {
@@ -4545,7 +6693,10 @@ impl Vm {
                                     s.push_str(&format!("[{}]", els.join(",")));
                                 }
                                 if let Some(Obj::Str(t)) = self.heap.get(*h) {
-                                    s.push_str(&format!("=\"{}\"", t.chars().take(80).collect::<String>()));
+                                    s.push_str(&format!(
+                                        "=\"{}\"",
+                                        t.chars().take(80).collect::<String>()
+                                    ));
                                 }
                                 if let Some(Obj::Class { type_idx }) = self.heap.get(*h) {
                                     if let Ok(d) = self.type_desc_of(*type_idx) {
@@ -4564,7 +6715,8 @@ impl Vm {
                 if let Some(p) = self.trace_call.as_deref() {
                     let callee = self.describe_method(midx);
                     let caller = self.describe_method(fr.loc.midx);
-                    if p.split(',').any(|one| !one.is_empty() && callee.contains(one))
+                    if p.split(',')
+                        .any(|one| !one.is_empty() && callee.contains(one))
                         && self
                             .trace_from
                             .as_deref()
@@ -4606,7 +6758,10 @@ impl Vm {
                         let thisfmt = match this_arg {
                             Some(V::Ref(h)) => match self.heap.get(h) {
                                 Some(Obj::Str(t)) => {
-                                    format!("h{h}:String=\"{}\"", t.chars().take(80).collect::<String>())
+                                    format!(
+                                        "h{h}:String=\"{}\"",
+                                        t.chars().take(80).collect::<String>()
+                                    )
                                 }
                                 _ => format!("{:?}", this_arg.unwrap()),
                             },
@@ -4615,7 +6770,10 @@ impl Vm {
                         let resfmt = match res {
                             Some(V::Ref(h)) if h != 0 => match self.heap.get(h) {
                                 Some(Obj::Str(t)) => {
-                                    format!("Some(h{h}:String=\"{}\")", t.chars().take(80).collect::<String>())
+                                    format!(
+                                        "Some(h{h}:String=\"{}\")",
+                                        t.chars().take(80).collect::<String>()
+                                    )
                                 }
                                 _ => format!("{res:?}"),
                             },
@@ -4788,24 +6946,34 @@ impl Vm {
                 }
                 Ok(data[i])
             }
-            _ => vm("dexrt.type"),
+            _ => Err(E::Vm(errd("dexrt.type", format!("aget h{h}")))),
         }
     }
 
     fn aput(&mut self, h: u32, i: i32, v: V) -> Rt<()> {
         self.null_check(h, "aput")?;
         match self.heap.get_mut(h) {
-            Some(Obj::Array { data, .. }) => {
+            Some(Obj::Array { elem, data }) => {
                 if i < 0 || i as usize >= data.len() {
                     let d = format!("aput idx {i} len {}", data.len());
                     return Err(
                         self.throw_builtin("Ljava/lang/ArrayIndexOutOfBoundsException;", &d)
                     );
                 }
+                // A `const/4 0` null written through aput-object must
+                // read back as a reference — canonicalize to Ref(0) so a
+                // stored null compares equal to the new-array default
+                // (Arrays.equals, if-eq, Object[] of fresh nulls).
+                let v =
+                    if matches!(v, V::I32(0)) && (elem.starts_with('L') || elem.starts_with('[')) {
+                        V::Ref(0)
+                    } else {
+                        v
+                    };
                 data[i as usize] = v;
                 Ok(())
             }
-            _ => vm("dexrt.type"),
+            _ => Err(E::Vm(errd("dexrt.type", format!("aput h{h}")))),
         }
     }
 
@@ -4849,7 +7017,7 @@ impl Vm {
                 "Ljava/lang/ArrayIndexOutOfBoundsException;",
                 "fill-array-data",
             )),
-            _ => vm("dexrt.type"),
+            _ => Err(E::Vm(errd("dexrt.type", format!("fill-array h{h}")))),
         }
     }
 

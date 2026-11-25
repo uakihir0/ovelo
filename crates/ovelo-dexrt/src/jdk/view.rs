@@ -15,12 +15,21 @@ const VIEWGROUP: &str = "Landroid/view/ViewGroup;";
 const FRAMELAYOUT: &str = "Landroid/widget/FrameLayout;";
 const WINDOW: &str = "Landroid/view/Window;";
 const INFLATER: &str = "Landroid/view/LayoutInflater;";
+const CHOR: &str = "Landroid/view/Choreographer;";
 
 // Pseudo keys for view-tree state (see mod.rs for the other P_* slots).
 const P_VIEW_ID: u32 = u32::MAX - 7;
 const P_CHILDREN: u32 = u32::MAX - 8;
-const P_PARENT: u32 = u32::MAX - 9;
+pub(crate) const P_PARENT: u32 = u32::MAX - 9;
 const P_TAG: u32 = u32::MAX - 10;
+/// Bumped by `invalidate`/`postInvalidate` — the value is never read;
+/// the write exists to move `view_gen` so draw-only changes repaint.
+const P_INVALID_SEQ: u32 = u32::MAX - 49;
+/// Set while the view is attached to a window — `isAttachedToWindow`
+/// must report false before `onAttachedToWindow` actually fires
+/// (AbstractComposeView defers `ensureCompositionCreated` until it
+/// does; a hardcoded true composes a parentless view).
+pub(crate) const P_ATTACHED: u32 = u32::MAX - 48;
 /// Live `setText`/`setHint` argument — read by `dex_view` before the
 /// inflated `android:text` attribute. `pub`: the guest bridge's setter
 /// overrides write it for dex-inflated (non-GuestView) receivers.
@@ -33,16 +42,27 @@ pub const P_CDESC: u32 = u32::MAX - 28;
 const P_HINT: u32 = u32::MAX - 26;
 const P_CONTENT: u32 = u32::MAX - 12;
 const P_WINDOW: u32 = u32::MAX - 13;
+/// The SurfaceHolder pseudo object handed out by `getHolder` — held
+/// per SurfaceView so callbacks registered on it survive.
+const P_HOLDER: u32 = u32::MAX - 46;
+/// Callbacks registered via `SurfaceHolder.addCallback` — Array of Refs
+/// plus a "created" flag so surfaceCreated/surfaceChanged fire once.
+const P_HOLDER_CBS: u32 = u32::MAX - 47;
 // Marker keys are pub(crate): `is_instance` consults them so inflated
 // views pass `instanceof View`/`ViewGroup` checks.
 pub(crate) const P_IS_VIEW: u32 = u32::MAX - 14;
 pub(crate) const P_IS_GROUP: u32 = u32::MAX - 15;
 const P_DECOR: u32 = u32::MAX - 16;
 const P_LISTENER: u32 = u32::MAX - 17;
-const P_CONTEXT: u32 = u32::MAX - 18;
+/// The `Context` a view was constructed with — read by `getContext`.
+/// pub(crate): `call_builtin` sets it for host-registered ctors too.
+pub(crate) const P_CONTEXT: u32 = u32::MAX - 18;
 const P_VIS: u32 = u32::MAX - 19;
 /// Pseudo key: root element was `<merge>` — splice children on attach.
 const P_MERGE: u32 = u32::MAX - 21;
+/// `setClipChildren(bool)` / `android:clipChildren` — I32 1 clips
+/// (default), 0 lets children draw outside their bounds.
+const P_CLIP_CHILDREN: u32 = u32::MAX - 29;
 /// Pseudo keys: drawables given to `setIndeterminateDrawable` /
 /// `setProgressDrawable` — ProgressBar getters must hand them back (not
 /// a zero-init stub) or their dex fields read null downstream.
@@ -115,6 +135,9 @@ const P_LEFT: u32 = 0xFFFD_FFE9;
 const P_TOP: u32 = 0xFFFD_FFE8;
 const P_RIGHT: u32 = 0xFFFD_FFE7;
 const P_BOTTOM: u32 = 0xFFFD_FFE6;
+/// Set by the real `layout()` builtin — host size pushes must not
+/// overwrite frames the dex layout pass computed.
+const P_LAYOUT_DONE: u32 = u32::MAX - 52;
 const P_MEAS_W: u32 = 0xFFFD_FFE5;
 const P_MEAS_H: u32 = 0xFFFD_FFE4;
 /// `setMinimumWidth`/`setMinimumHeight` — feed `getMinimum*`/
@@ -128,6 +151,11 @@ const P_ORIENTATION: u32 = 0xFFFD_FFDD;
 pub const P_TCOLOR: u32 = 0xFFFD_FFE3;
 /// Live `setTextSize` px — same fallthrough path as [`P_TCOLOR`].
 pub const P_TSIZE: u32 = 0xFFFD_FFE2;
+/// Live `setBackgroundColor` — always a packed ARGB literal, even
+/// when the alpha byte reads as a positive int (never a res id).
+pub const P_BGCOLOR: u32 = 0xFFFD_FFE1;
+/// Live `setBackgroundResource` res id — resolved by `color_v`.
+pub const P_BGRES: u32 = 0xFFFD_FFE0;
 /// Resolved layout direction stored on a `*LayoutParams` by
 /// `resolveLayoutDirection` (AOSP `mLayoutDirection`).
 const P_LP_DIR: u32 = u32::MAX - 29;
@@ -136,6 +164,17 @@ const P_LP_DIR: u32 = u32::MAX - 29;
 /// by dex, so they get no canon field key to store under.
 const P_MSTART: u32 = u32::MAX - 42;
 const P_MEND: u32 = u32::MAX - 43;
+/// `setOnTouchListener` target — kept apart from P_LISTENER (click)
+/// so a view can carry both.
+const P_TOUCH_L: u32 = u32::MAX - 44;
+/// MotionEvent pseudo fields (host-bridged pointer events).
+const P_ME_ACTION: u32 = u32::MAX - 45;
+const P_ME_X: u32 = u32::MAX - 46;
+const P_ME_Y: u32 = u32::MAX - 47;
+const P_ME_DOWN_TIME: u32 = u32::MAX - 60;
+const P_ME_EVENT_TIME: u32 = u32::MAX - 61;
+const P_ME_RAWX: u32 = u32::MAX - 62;
+const P_ME_RAWY: u32 = u32::MAX - 63;
 
 /// Lazily mint a per-view `ViewTreeObserver` — guests register
 /// `OnGlobalLayoutListener`s on it; `fire_global_layout` (called from
@@ -193,7 +232,7 @@ pub fn fire_global_layout(vm: &mut Vm, root: u32) {
         .flat_map(|(_, ls)| ls.iter().copied())
         .collect();
     for l in predraw {
-        if std::env::var_os("OVELO_VIEWDBG").is_some() {
+        if crate::dbg_flag("OVELO_VIEWDBG") {
             eprintln!("[viewdbg] onPreDraw h{l} {}", vm.dbg_class_of(l));
         }
         let _ = vm.call_virtual(l, "onPreDraw", &[]);
@@ -207,15 +246,15 @@ pub fn fire_global_layout(vm: &mut Vm, root: u32) {
         })
         .flat_map(|(_, ls)| ls.iter().copied())
         .collect();
-    if std::env::var_os("OVELO_VIEWDBG").is_some() && !all.is_empty() {
+    if crate::dbg_flag("OVELO_VIEWDBG") && !all.is_empty() {
         eprintln!("[viewdbg] fire_global_layout {} listeners", all.len());
     }
     for l in all {
-        if std::env::var_os("OVELO_VIEWDBG").is_some() {
+        if crate::dbg_flag("OVELO_VIEWDBG") {
             eprintln!("[viewdbg] onGlobalLayout h{l} {}", vm.dbg_class_of(l));
         }
         if let Err(e) = vm.call_virtual(l, "onGlobalLayout", &[]) {
-            if std::env::var_os("OVELO_VIEWDBG").is_some() {
+            if crate::dbg_flag("OVELO_VIEWDBG") {
                 eprintln!("[viewdbg] onGlobalLayout {l} err {e:?}");
             }
         }
@@ -273,6 +312,12 @@ pub struct DexViewInfo {
     /// CENTER_HORIZONTAL=1, TOP=0x30, BOTTOM=0x50, CENTER_VERTICAL=0x10).
     /// 0 = unset — treat as top|start.
     pub gravity: i32,
+    /// `android:clipChildren` / `setClipChildren` — when false the
+    /// parent's draw pass doesn't clip children to their bounds.
+    pub clip_children: bool,
+    /// `android:maxLines` — caps wrapped line count; overflowing text
+    /// truncates to the first `n` lines.
+    pub max_lines: Option<i32>,
 }
 
 /// The activity's content view handle (what `setContentView` attached).
@@ -314,15 +359,98 @@ fn attr_find(vm: &Vm, h: u32, name: &str) -> Option<V> {
     None
 }
 
+/// `@bool/x` (possibly chained) → the boolean it holds.
+fn attr_bool_ref(vm: &Vm, id: u32) -> Option<bool> {
+    let res = vm.apk_res.as_ref()?;
+    let mut ev = res.entry_value(id)?;
+    for _ in 0..8 {
+        match ev.data_type {
+            // TYPE_INT_BOOLEAN / ints / floats — truthiness on data.
+            0x12 | 0x10 | 0x11 | 0x04 => return Some(ev.data != 0),
+            // TYPE_REFERENCE — follow one level.
+            0x01 => ev = res.entry_value(ev.data)?,
+            0x03 => {
+                return ev
+                    .string
+                    .as_deref()
+                    .map(|t| t.trim() != "false" && t.trim() != "0")
+            }
+            _ => return None,
+        }
+    }
+    None
+}
+
 /// Resolve an ARGB color from an int literal or a color resource ref.
 fn color_v(vm: &Vm, v: V) -> Option<i32> {
     match v {
         V::I32(c) if c < 0 => Some(c),
-        V::I32(id) if id > 0 => vm
-            .apk_res
-            .as_ref()
-            .and_then(|r| r.entry_value(id as u32))
-            .map(|e| e.data as i32),
+        V::I32(id) if id > 0 => {
+            let res = vm.apk_res.as_ref()?;
+            // `@attr` ids resolve through the bound theme; TYPE_REFERENCE
+            // and TYPE_ATTRIBUTE hops chase until a literal lands. An
+            // entry that resolves to an XML drawable file yields the
+            // drawable's representative fill color (its `data` is the
+            // string-pool index of the path — NOT a color).
+            let mut cur = id as u32;
+            for _ in 0..8 {
+                // `android.R.color` ids (0x0106xxxx) aren't in the app
+                // table; the framework palette answers for them.
+                let Some(ev) = res.entry_value(cur).cloned() else {
+                    return crate::res::framework_color(cur).map(|c| c as i32);
+                };
+                match ev.data_type {
+                    0x01 => cur = ev.data,
+                    0x02 => {
+                        return vector::resolve_ref_color(
+                            vector::RCtx {
+                                res,
+                                theme: vm.theme_id,
+                                depth: 0,
+                            },
+                            ev.data,
+                        )
+                        .or_else(|| {
+                            res.style_item(vm.theme_id, ev.data).and_then(|n| {
+                                (n.data_type == 0x01).then(|| {
+                                    vector::drawable_flat_color(
+                                        vector::RCtx {
+                                            res,
+                                            theme: vm.theme_id,
+                                            depth: 0,
+                                        },
+                                        n.data,
+                                    )
+                                })?
+                            })
+                        })
+                        .map(|c| c as i32);
+                    }
+                    // Color ints / plain ints — literal.
+                    0x1c..=0x1f | 0x10 | 0x11 | 0x04 => return Some(ev.data as i32),
+                    // A string (drawable/xml path or color literal text).
+                    0x03 => {
+                        return ev
+                            .string
+                            .as_deref()
+                            .and_then(vector::parse_color)
+                            .or_else(|| {
+                                vector::drawable_flat_color(
+                                    vector::RCtx {
+                                        res,
+                                        theme: vm.theme_id,
+                                        depth: 0,
+                                    },
+                                    cur,
+                                )
+                            })
+                            .map(|c| c as i32);
+                    }
+                    _ => return None,
+                }
+            }
+            None
+        }
         _ => None,
     }
 }
@@ -361,9 +489,14 @@ fn pint(vm: &Vm, h: u32, key: u32) -> i32 {
     }
 }
 
+/// Whether the dex `layout()` builtin established this view's frame.
+pub(crate) fn layout_done(vm: &Vm, h: u32) -> bool {
+    pseudo_get(vm, h, P_LAYOUT_DONE).is_some()
+}
+
 /// Store a view frame; returns whether it changed (View.setFrame's
 /// contract and `layout`'s `changed` argument).
-fn frame_set(vm: &mut Vm, h: u32, l: i32, t: i32, r: i32, b: i32) -> bool {
+pub(crate) fn frame_set(vm: &mut Vm, h: u32, l: i32, t: i32, r: i32, b: i32) -> bool {
     let changed = pint(vm, h, P_LEFT) != l
         || pint(vm, h, P_TOP) != t
         || pint(vm, h, P_RIGHT) != r
@@ -432,12 +565,21 @@ pub(crate) fn dex_view_info(vm: &Vm, h: u32) -> Option<DexViewInfo> {
         }),
     };
     let text_color = match pseudo_get(vm, h, P_TCOLOR) {
-        // `setTextColor` may hand us either a packed ARGB int or an
-        // unresolved color res id — `color_v` resolves both.
-        Some(v @ (V::I32(_) | V::Ref(_))) => color_v(vm, v),
+        // P_TCOLOR only carries setTextColor args — packed ARGB.
+        Some(V::I32(c)) => Some(c),
+        Some(v) => color_v(vm, v),
         _ => attr_find(vm, h, "textColor").and_then(|v| color_v(vm, v)),
     };
-    let bg_color = attr_find(vm, h, "background").and_then(|v| color_v(vm, v));
+    let bg_color = match pseudo_get(vm, h, P_BGCOLOR) {
+        // P_BGCOLOR only carries setBackgroundColor args — packed
+        // ARGB; a positive int is a low-alpha color, not a res id.
+        Some(V::I32(c)) => Some(c),
+        Some(v) => color_v(vm, v),
+        _ => match pseudo_get(vm, h, P_BGRES) {
+            Some(v) => color_v(vm, v),
+            None => attr_find(vm, h, "background").and_then(|v| color_v(vm, v)),
+        },
+    };
     let lp_w = attr_find(vm, h, "layout_width")
         .map(|v| len_v(vm, v))
         .unwrap_or(-1);
@@ -523,9 +665,28 @@ pub(crate) fn dex_view_info(vm: &Vm, h: u32) -> Option<DexViewInfo> {
         },
         children: kids,
         gravity,
+        clip_children: match pseudo_get(vm, h, P_CLIP_CHILDREN) {
+            Some(v) => i32v(v) != 0,
+            None => match attr_find(vm, h, "clipChildren") {
+                // A `@bool/x` reference arrives as its res-id — a
+                // nonzero I32 that must be resolved to the real bool.
+                Some(V::I32(n)) if (n as u32) >= 0x7f00_0000 => {
+                    attr_bool_ref(vm, n as u32).unwrap_or(true)
+                }
+                Some(V::I32(n)) => n != 0,
+                Some(V::Ref(r)) => s(vm, r).as_deref() != Some("false"),
+                _ => true,
+            },
+        },
+        max_lines: match attr_find(vm, h, "maxLines").or_else(|| attr_find(vm, h, "lines")) {
+            Some(V::I32(n)) if n > 0 => Some(n),
+            Some(V::Ref(r)) => s(vm, r)
+                .and_then(|t| t.parse::<i32>().ok())
+                .filter(|n| *n > 0),
+            _ => None,
+        },
     })
 }
-
 
 /// `ImageView.getDrawable()` — the stored image source normalized to a
 /// Drawable-typed object: guest Drawable instances pass through; bare
@@ -557,9 +718,7 @@ fn image_drawable(vm: &mut Vm, this: u32) -> V {
             // A previous call's BitmapDrawable is already a proper
             // drawable — re-wrapping would nest drawable-in-drawable
             // and break getBitmap().
-            Some(Obj::Host { desc, .. }) => {
-                desc != "Landroid/graphics/drawable/BitmapDrawable;"
-            }
+            Some(Obj::Host { desc, .. }) => desc != "Landroid/graphics/drawable/BitmapDrawable;",
             _ => true,
         },
         _ => false,
@@ -588,28 +747,24 @@ fn image_pixels(vm: &Vm, v: V) -> Option<(u32, u32, std::rc::Rc<Vec<u8>>)> {
     image_pixels_at(vm, v, 0)
 }
 
-fn image_pixels_at(
-    vm: &Vm,
-    v: V,
-    depth: u32,
-) -> Option<(u32, u32, std::rc::Rc<Vec<u8>>)> {
+fn image_pixels_at(vm: &Vm, v: V, depth: u32) -> Option<(u32, u32, std::rc::Rc<Vec<u8>>)> {
     // Depth bound: drawable graphs can be cyclic.
     if depth > 8 {
         return None;
     }
     match v {
-        V::I32(res) if res > 0 => super::vector::drawable_bitmap(vm, res as u32),
+        V::I32(res) if res > 0 => {
+            super::vector::rctx(vm).and_then(|r| super::vector::drawable_bitmap(r, res as u32))
+        }
         V::Ref(h) => super::android::bitmap_pixels(vm, v)
             .or_else(|| {
                 let path = image_source_path(vm, v)?;
                 decode_image(&std::fs::read(io::fspath(vm, &path)).ok()?)
             })
             .or_else(|| match vm.heap.get(h) {
-                Some(Obj::Instance { fields, .. }) | Some(Obj::Host { fields, .. }) => {
-                    fields
-                        .values()
-                        .find_map(|f| image_pixels_at(vm, *f, depth + 1))
-                }
+                Some(Obj::Instance { fields, .. }) | Some(Obj::Host { fields, .. }) => fields
+                    .values()
+                    .find_map(|f| image_pixels_at(vm, *f, depth + 1)),
                 // LayerDrawable/TransitionDrawable keep their drawables
                 // in an array field — the topmost (last) layer wins: a
                 // TransitionDrawable's "to" drawable is the real image,
@@ -668,9 +823,26 @@ pub(crate) fn is_viewish(vm: &Vm, class: &str, args: &[V]) -> bool {
             | "Landroidx/appcompat/view/menu/MenuBuilder;"
             | "Landroidx/appcompat/view/menu/MenuItemImpl;"
             | "Landroid/view/ViewTreeObserver;"
+            | "Landroid/view/MotionEvent;"
+            | "Landroid/view/WindowManager;"
+            | "Landroid/view/SurfaceHolder;"
+            | "Landroid/view/WindowMetrics;"
+            | "Landroid/view/WindowInsets;"
+            | "Landroid/view/Choreographer;"
+            | "Landroid/graphics/Insets;"
     ) || class.ends_with("LayoutParams;")
         || desc_is_a(class, VIEW)
         || class.ends_with("$DecorView;")
+        // Dex View subclasses (ConstraintLayout, appcompat Toolbar):
+        // static calls like the inherited
+        // `ViewGroup.getChildMeasureSpec` carry an int receiver slot,
+        // so the args check below can't see them — walk the dex
+        // superclass chain instead.
+        || vm
+            .type_index_of(class)
+            .zip(vm.type_index_of("Landroid/view/View;"))
+            .map(|(ci, v)| vm.assignable(ci, v))
+            .unwrap_or(false)
     {
         return true;
     }
@@ -697,6 +869,108 @@ pub(crate) fn call(
             lp_ctor(vm, class, sig, args);
             Some(None)
         }
+        // ---------- MotionEvent ----------
+        "<init>" if class == "Landroid/view/MotionEvent;" => Some(None),
+        "obtain" if class == "Landroid/view/MotionEvent;" => {
+            let V::Ref(h) = host(vm, "Landroid/view/MotionEvent;", HostState::Empty) else {
+                return Ok(Some(Some(V::Ref(0))));
+            };
+            if h != 0 {
+                // Copy-overload (obtain(MotionEvent)) inherits the
+                // source's fields; the canonical (JJIFF…) overload
+                // takes them positionally.
+                if let Some(V::Ref(src)) = args
+                    .iter()
+                    .find(|a| matches!(a, V::Ref(h) if *h != 0))
+                    .copied()
+                {
+                    for k in [P_ME_ACTION, P_ME_X, P_ME_Y] {
+                        if let Some(v) = pseudo_get(vm, src, k) {
+                            pseudo_set(vm, h, k, v);
+                        }
+                    }
+                } else {
+                    if let Some(V::I32(a)) = args.get(2).copied() {
+                        pseudo_set(vm, h, P_ME_ACTION, V::I32(a));
+                    }
+                    if let Some(V::F32(x)) = args.get(3).copied() {
+                        pseudo_set(vm, h, P_ME_X, V::F32(x));
+                    }
+                    if let Some(V::F32(y)) = args.get(4).copied() {
+                        pseudo_set(vm, h, P_ME_Y, V::F32(y));
+                    }
+                }
+            }
+            Some(Some(V::Ref(h)))
+        }
+        "getAction" | "getActionMasked" if class == "Landroid/view/MotionEvent;" => {
+            Some(Some(V::I32(pint(vm, this, P_ME_ACTION))))
+        }
+        "getX" if class == "Landroid/view/MotionEvent;" => {
+            Some(Some(pseudo_get(vm, this, P_ME_X).unwrap_or(V::F32(0.0))))
+        }
+        "getY" if class == "Landroid/view/MotionEvent;" => {
+            Some(Some(pseudo_get(vm, this, P_ME_Y).unwrap_or(V::F32(0.0))))
+        }
+        "getRawX" if class == "Landroid/view/MotionEvent;" => Some(Some(
+            pseudo_get(vm, this, P_ME_RAWX)
+                .or_else(|| pseudo_get(vm, this, P_ME_X))
+                .unwrap_or(V::F32(0.0)),
+        )),
+        "getRawY" if class == "Landroid/view/MotionEvent;" => Some(Some(
+            pseudo_get(vm, this, P_ME_RAWY)
+                .or_else(|| pseudo_get(vm, this, P_ME_Y))
+                .unwrap_or(V::F32(0.0)),
+        )),
+        "getPointerCount" if class == "Landroid/view/MotionEvent;" => Some(Some(V::I32(1))),
+        "getPointerId" | "findPointerIndex" | "getActionIndex"
+            if class == "Landroid/view/MotionEvent;" =>
+        {
+            Some(Some(V::I32(0)))
+        }
+        "getToolType" if class == "Landroid/view/MotionEvent;" => Some(Some(V::I32(1))),
+        "getSource" if class == "Landroid/view/MotionEvent;" => Some(Some(V::I32(0x1002))),
+        "getButtonState" | "getHistorySize" | "getMetaState"
+            if class == "Landroid/view/MotionEvent;" =>
+        {
+            Some(Some(V::I32(0)))
+        }
+        "getPressure" | "getSize" | "getTouchMajor" | "getTouchMinor"
+            if class == "Landroid/view/MotionEvent;" =>
+        {
+            Some(Some(V::F32(if name == "getPressure" { 1.0 } else { 0.0 })))
+        }
+        "getDownTime" if class == "Landroid/view/MotionEvent;" => Some(Some(
+            pseudo_get(vm, this, P_ME_DOWN_TIME).unwrap_or(V::I64(now_ms())),
+        )),
+        "getEventTime" if class == "Landroid/view/MotionEvent;" => Some(Some(
+            pseudo_get(vm, this, P_ME_EVENT_TIME).unwrap_or(V::I64(now_ms())),
+        )),
+        "setLocation" if class == "Landroid/view/MotionEvent;" => {
+            pseudo_set(
+                vm,
+                this,
+                P_ME_X,
+                args.get(1).copied().unwrap_or(V::F32(0.0)),
+            );
+            pseudo_set(
+                vm,
+                this,
+                P_ME_Y,
+                args.get(2).copied().unwrap_or(V::F32(0.0)),
+            );
+            Some(None)
+        }
+        "offsetLocation" if class == "Landroid/view/MotionEvent;" => {
+            let x = f64v(pseudo_get(vm, this, P_ME_X).unwrap_or(V::F32(0.0)))
+                + f64v(args.get(1).copied().unwrap_or(V::F32(0.0)));
+            let y = f64v(pseudo_get(vm, this, P_ME_Y).unwrap_or(V::F32(0.0)))
+                + f64v(args.get(2).copied().unwrap_or(V::F32(0.0)));
+            pseudo_set(vm, this, P_ME_X, V::F32(x as f32));
+            pseudo_set(vm, this, P_ME_Y, V::F32(y as f32));
+            Some(None)
+        }
+        "recycle" if class == "Landroid/view/MotionEvent;" => Some(None),
         // Dex-constructed views (`new PlayerFragment(ctx, attrs)` in an
         // adapter) never see the inflater: their `View.<init>` invoke-super
         // is the only place the Context reaches us. Record it so
@@ -714,6 +988,67 @@ pub(crate) fn call(
             }
             Some(None)
         }
+        // ---------- Choreographer ----------
+        // The Recomposer's frame clock (MonotonicFrameClock on the main
+        // dispatcher) and `View.postOnAnimation` ride postFrameCallback —
+        // stubbing it left the first composition permanently unscheduled.
+        "getInstance" if class == CHOR => Some(Some(choreographer(vm))),
+        "postFrameCallback" | "postFrameCallbackDelayed" | "postVsyncCallback" if class == CHOR => {
+            // (FrameCallback [, long delayMillis])
+            let delay = if name == "postFrameCallback" {
+                0
+            } else {
+                args.get(2).map(|v| i64v(*v)).unwrap_or(0)
+            };
+            if let Some(V::Ref(cb)) = args.get(1).copied() {
+                if cb != 0 {
+                    if crate::dbg_flag("OVELO_DRAINDBG") {
+                        eprintln!("[drain] push framecb h{cb} delay={delay}");
+                    }
+                    vm.frame_callbacks
+                        .push((cb, (now_ms() + delay.max(0)) as u64));
+                }
+            }
+            Some(None)
+        }
+        "postCallback" | "postCallbackDelayed" | "postCallbackDelayedInternal" if class == CHOR => {
+            // (int callbackType, Runnable action, Object token [, long delay])
+            let delay = if args.len() > 4 { i64v(args[4]) } else { 0 };
+            if let Some(V::Ref(r)) = args.get(2).copied() {
+                if r != 0 {
+                    if delay > 0 {
+                        vm.enqueue_runnable_delayed(r, true, delay);
+                    } else {
+                        vm.enqueue_runnable(r, true);
+                    }
+                }
+            }
+            Some(None)
+        }
+        "removeFrameCallback" | "removeCallbacks" if class == CHOR => {
+            for v in [args.get(1), args.get(2)].into_iter().flatten() {
+                if let V::Ref(r) = v {
+                    if *r != 0 {
+                        vm.remove_runnable(*r);
+                    }
+                }
+            }
+            Some(None)
+        }
+        "getFrameTime"
+        | "getLastFrameTimeNanos"
+        | "getFrameTimeNanos"
+        | "getFrameDeadlineNanos"
+            if class == CHOR =>
+        {
+            let t = if name == "getFrameTime" {
+                now_ms()
+            } else {
+                now_ms() * 1_000_000
+            };
+            Some(Some(V::I64(t)))
+        }
+        "isNewPostCallbackOnMainThread" if class == CHOR => Some(Some(V::I32(1))),
         // AOSP `MarginLayoutParams.resolveLayoutDirection` — the
         // ConstraintLayout dex override resolves the start/end anchors
         // into its resolved* fields and invoke-supers here for the
@@ -724,9 +1059,7 @@ pub(crate) fn call(
             Some(None)
         }
         "getLayoutDirection" if class.ends_with("LayoutParams;") => {
-            Some(Some(
-                pseudo_get(vm, this, P_LP_DIR).unwrap_or(V::I32(0)),
-            ))
+            Some(Some(pseudo_get(vm, this, P_LP_DIR).unwrap_or(V::I32(0))))
         }
         "inflate" if class.contains("MenuInflater") => {
             // MenuInflater.inflate(menuRes, Menu)
@@ -1011,22 +1344,15 @@ pub(crate) fn call(
             } else {
                 this
             };
+            // AOSP: `View.findViewById` searches this view's subtree
+            // only. Generated ViewBinding `bind` implementations rely
+            // on that — they iterate a merged root's children calling
+            // `child.findViewById(id)` and treat a miss as "try the
+            // next child". Widening a miss to the whole window hands
+            // back a view from a *different* page (NewPipe's feed
+            // binding bound its adapter onto the kiosk page's
+            // RecyclerView), so no top-of-tree retry here.
             let mut hit = find_in_tree(vm, root, id).unwrap_or(0);
-            if hit == 0 && class != WINDOW {
-                // View-binding lookups sometimes run on a child of the
-                // real root (obfuscated `j(root, id)` callers seen
-                // passing an inner view): retry from the tree's top.
-                let mut top = this;
-                for _ in 0..64 {
-                    match pseudo_get(vm, top, P_PARENT) {
-                        Some(V::Ref(p)) if p != 0 && p != top => top = p,
-                        _ => break,
-                    }
-                }
-                if top != this {
-                    hit = find_in_tree(vm, top, id).unwrap_or(0);
-                }
-            }
             if hit == 0 && class == WINDOW {
                 // Window searches span trees: appcompat content lives
                 // in its own decor tree, so retry across inflated roots
@@ -1042,7 +1368,7 @@ pub(crate) fn call(
                     }
                 }
             }
-            if hit == 0 && std::env::var_os("OVELO_VIEWDBG").is_some() {
+            if hit == 0 && crate::dbg_flag("OVELO_VIEWDBG") {
                 let nm = vm
                     .apk_res
                     .as_ref()
@@ -1062,6 +1388,14 @@ pub(crate) fn call(
             Some(Some(V::Ref(hit)))
         }
         "getId" => Some(Some(V::I32(view_id(vm, this)))),
+        "generateViewId" => {
+            // AOSP: AtomicInteger starting at 1 — dex-created views
+            // (FragmentContainerView) need nonzero unique ids.
+            static NEXT: std::sync::atomic::AtomicI32 = std::sync::atomic::AtomicI32::new(1);
+            Some(Some(V::I32(
+                NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed),
+            )))
+        }
         "setId" => {
             pseudo_set(
                 vm,
@@ -1115,7 +1449,7 @@ pub(crate) fn call(
         "generateDefaultLayoutParams" => Some(Some(default_lp(vm, this))),
         "getChildCount" => {
             let n = children(vm, this).len();
-            if std::env::var_os("OVELO_VIEWDBG").is_some() {
+            if crate::dbg_flag("OVELO_VIEWDBG") {
                 let d = class_of(vm, V::Ref(this));
                 eprintln!("[viewdbg] getChildCount {d} h{this} -> {n}");
             }
@@ -1126,10 +1460,13 @@ pub(crate) fn call(
                 .get(i32v(args.get(1).copied().unwrap_or(V::I32(0))) as usize)
                 .copied()
                 .unwrap_or(V::Ref(0));
-            if std::env::var_os("OVELO_VIEWDBG").is_some() {
+            if crate::dbg_flag("OVELO_VIEWDBG") {
                 let d = class_of(vm, V::Ref(this));
                 let cd = class_of(vm, got);
-                eprintln!("[viewdbg] getChildAt {d} h{this}[{}] -> {cd}", i32v(args.get(1).copied().unwrap_or(V::I32(0))));
+                eprintln!(
+                    "[viewdbg] getChildAt {d} h{this}[{}] -> {cd}",
+                    i32v(args.get(1).copied().unwrap_or(V::I32(0)))
+                );
             }
             Some(Some(got))
         }
@@ -1162,9 +1499,12 @@ pub(crate) fn call(
         | "addFocusables"
         | "addChildrenForAccessibility" => {
             if let Some(&child @ V::Ref(_)) = args.get(1) {
-                if std::env::var_os("OVELO_VIEWDBG").is_some() {
+                if crate::dbg_flag("OVELO_VIEWDBG") {
                     if let V::Ref(ch) = child {
-                        eprintln!("[viewdbg] {name} h{this} <- h{ch} {}", vm.dbg_class_of(ch));
+                        eprintln!(
+                            "[viewdbg] {name} h{this} <- h{ch} {} (ref {class})",
+                            vm.dbg_class_of(ch)
+                        );
                     }
                 }
                 // Positional overloads (addView(v,i), attachViewToParent
@@ -1177,10 +1517,12 @@ pub(crate) fn call(
                     .and_then(|p| p.split(')').next())
                     .unwrap_or("");
                 let mut ints = 0usize;
+                let mut has_ref = false;
                 let mut it = params.bytes().peekable();
                 while let Some(b) = it.next() {
                     match b {
                         b'L' | b'[' => {
+                            has_ref = true;
                             // Object/array types swallow their name.
                             if b == b'L' {
                                 for c in it.by_ref() {
@@ -1194,18 +1536,50 @@ pub(crate) fn call(
                         _ => {}
                     }
                 }
-                let idx = if ints == 1 {
+                // The index is the int right after the child — except
+                // (View,w,h) whose two ints carry no LayoutParams. A
+                // (V,I,LP,Z) overload's trailing boolean isn't an index.
+                let idx = if !has_ref && ints >= 2 {
+                    None
+                } else {
                     match args.get(2) {
-                        Some(V::I32(i)) if *i >= 0 => Some(*i as usize),
+                        Some(V::I32(i)) if *i >= 0 && ints >= 1 => Some(*i as usize),
                         _ => None,
                     }
+                };
+                let notify = !matches!(name, "attachViewToParent" | "attachViewToParentInLayout");
+                // A registered bridge impl (`ViewGroup.addView` on the
+                // GuestUi side) wires the child into the mounted host
+                // tree when both ends are bridged `new` views — the
+                // dex bookkeeping below alone leaves the real group's
+                // children empty (andstatus 2048's FrameLayout).
+                // The bridge is registered for the canonical
+                // `addView(View)` sig only — every overload ends in
+                // `addViewInner(child)` with the child at args[1], so
+                // fall back to it when the exact proto isn't bridged.
+                let host = if matches!(name, "addView" | "addViewInLayout" | "attachViewToParent") {
+                    // RecyclerView attaches its *visible* rows through
+                    // attachViewToParent too — leaving it dex-only
+                    // meant bridged groups rendered empty lists.
+                    vm.named_host(class, name, sig)
+                        .or_else(|| vm.named_host(class, name, "(Landroid/view/View;)V"))
                 } else {
+                    // attachViewToParentInLayout is transient
+                    // (RecyclerView scrap): dex bookkeeping only.
                     None
                 };
-                let notify = !matches!(
-                    name,
-                    "attachViewToParent" | "attachViewToParentInLayout"
-                );
+                let mut host_ran = false;
+                if let Some(f) = host {
+                    if crate::dbg_flag("OVELO_VIEWDBG") {
+                        eprintln!("[viewdbg] addView host-arm h{this} (ref {class})");
+                    }
+                    if let Ok(mut g) = f.try_borrow_mut() {
+                        let _ = g(vm, args);
+                        host_ran = true;
+                    }
+                } else if crate::dbg_flag("OVELO_VIEWDBG") {
+                    eprintln!("[viewdbg] addView host-miss h{this} (ref {class}) sig={sig}");
+                }
                 // attachViewToParent(v,i,lp) / addView(v,lp) /
                 // addViewInLayout(v,i,lp) hand a fully-built dex
                 // LayoutParams — keep it on the child or later dex
@@ -1216,7 +1590,12 @@ pub(crate) fn call(
                     .rev()
                     .find(|a| matches!(a, V::Ref(h) if *h != 0))
                     .copied();
-                attach_at(vm, this, child, idx, notify, lp);
+                // A host bridge that ran already did the attach
+                // bookkeeping itself — attaching again would fire
+                // onViewAdded twice.
+                if !host_ran {
+                    attach_at(vm, this, child, idx, notify, lp);
+                }
             }
             Some(match ret(sig) {
                 "V" => None,
@@ -1224,7 +1603,22 @@ pub(crate) fn call(
             })
         }
         "removeView" | "removeViewInLayout" => {
-            detach(vm, this, args.get(1).copied().unwrap_or(V::Ref(0)), true);
+            // Mirror addView: a bridged group gets its host-side child
+            // removed by the registered arm (which also detaches); the
+            // fallback covers overloads the bridge didn't register.
+            let host = vm
+                .named_host(class, name, sig)
+                .or_else(|| vm.named_host(class, name, "(Landroid/view/View;)V"));
+            let mut ran = false;
+            if let Some(f) = host {
+                if let Ok(mut g) = f.try_borrow_mut() {
+                    let _ = g(vm, args);
+                    ran = true;
+                }
+            }
+            if !ran {
+                detach(vm, this, args.get(1).copied().unwrap_or(V::Ref(0)), true);
+            }
             Some(None)
         }
         "removeViewAt" => {
@@ -1243,6 +1637,97 @@ pub(crate) fn call(
         }
         "bringChildToFront" => Some(None),
         // ---------- ViewPager ----------
+        // ---------- GLSurfaceView ----------
+        // The invoke site may name the dex subclass (GLFieldView), so
+        // GL-distinctive names match unguarded; generic ones check the
+        // class chain resolves through GLSurfaceView/SurfaceView.
+        "setRenderer" => {
+            if let Some(V::Ref(r)) = args.get(1).copied() {
+                if r != 0 {
+                    if crate::dbg_flag("OVELO_GLDBG") {
+                        eprintln!("[gldbg] setRenderer view={this} r={r} class={class}");
+                    }
+                    pseudo_set(vm, this, crate::jdk::gl::P_GLES_RENDERER, V::Ref(r));
+                }
+            }
+            Some(None)
+        }
+        "setRenderMode" | "requestRender" => Some(None),
+        "queueEvent" | "onPause" | "onResume"
+            if class.contains("GLSurfaceView")
+                || desc_is_a(class, "Landroid/opengl/GLSurfaceView;") =>
+        {
+            Some(None)
+        }
+        "getRenderMode" if class.contains("GLSurfaceView") => Some(Some(V::I32(1))),
+        "getHolder" | "getSurface"
+            if class.contains("SurfaceView") || desc_is_a(class, "Landroid/view/SurfaceView;") =>
+        {
+            eprintln!("[holder] getHolder called class={class}");
+            let h = match pseudo_get(vm, this, P_HOLDER) {
+                Some(V::Ref(h)) if h != 0 => h,
+                _ => {
+                    let V::Ref(h) = host(vm, "Landroid/view/SurfaceHolder;", HostState::Empty)
+                    else {
+                        return Ok(Some(Some(V::Ref(0))));
+                    };
+                    // Back-ref: eglCreateWindowSurface sizes the
+                    // surface from the owning view's frame.
+                    pseudo_set(vm, h, crate::jdk::P_TARGET, V::Ref(this));
+                    pseudo_set(vm, this, P_HOLDER, V::Ref(h));
+                    h
+                }
+            };
+            Some(Some(V::Ref(h)))
+        }
+        // ---------- SurfaceHolder ----------
+        "addCallback" | "removeCallback"
+            if class.contains("SurfaceHolder")
+                || desc_is_a(class, "Landroid/view/SurfaceHolder;") =>
+        {
+            eprintln!("[holder] {name} called class={class} nargs={}", args.len());
+            if name == "addCallback" {
+                if let Some(V::Ref(cb)) = args.get(1).copied() {
+                    if cb != 0 {
+                        pseudo_set(vm, this, P_HOLDER_CBS, V::Ref(cb));
+                        // Defer to the next drain tick: Android only
+                        // fires these once a real surface exists, and
+                        // Godot's `init()` runs this before its
+                        // `glThread` field is assigned — inline calls
+                        // NPE on the null receiver. The size is resolved
+                        // at delivery, not here: the view is often still
+                        // unlaid-out when the callback registers (Korge
+                        // saw 0x0 and NaN'd its ortho matrix).
+                        vm.pending_surface.push((this, cb, 0));
+                        if !vm.surface_cbs.iter().any(|&(_, c)| c == cb) {
+                            vm.surface_cbs.push((this, cb));
+                        }
+                    }
+                }
+            }
+            Some(None)
+        }
+        "isCreating"
+        | "setType"
+        | "setFixedSize"
+        | "setFormat"
+        | "setSizeFromLayout"
+        | "getSurfaceFrame"
+        | "lockCanvas"
+        | "lockHardwareCanvas"
+        | "unlockCanvasAndPost"
+        | "setKeepScreenOn"
+            if class.contains("SurfaceHolder")
+                || desc_is_a(class, "Landroid/view/SurfaceHolder;") =>
+        {
+            Some(if name == "isCreating" {
+                Some(V::I32(0))
+            } else if name.starts_with("lock") || name == "getSurfaceFrame" {
+                Some(V::Ref(0))
+            } else {
+                None
+            })
+        }
         "setAdapter" if class.contains("ViewPager") => {
             // Drive the PagerAdapter the way populate() would: count,
             // then instantiateItem per page — androidx attaches each
@@ -1257,12 +1742,11 @@ pub(crate) fn call(
                     };
                     let mut items: Vec<V> = Vec::new();
                     for i in 0..n {
-                        match vm.call_virtual(ad, "instantiateItem", &[V::Ref(this), V::I32(i)])
-                        {
+                        match vm.call_virtual(ad, "instantiateItem", &[V::Ref(this), V::I32(i)]) {
                             Ok(v) => items.push(v.unwrap_or(V::I32(0))),
                             Err(e) => {
                                 items.push(V::I32(0));
-                                if std::env::var_os("OVELO_VIEWDBG").is_some() {
+                                if crate::dbg_flag("OVELO_VIEWDBG") {
                                     eprintln!("[viewdbg] instantiateItem {i} err {e:?}");
                                 }
                             }
@@ -1282,12 +1766,12 @@ pub(crate) fn call(
                             "setPrimaryItem",
                             &[V::Ref(this), V::I32(cur as i32), item],
                         ) {
-                            if std::env::var_os("OVELO_VIEWDBG").is_some() {
+                            if crate::dbg_flag("OVELO_VIEWDBG") {
                                 eprintln!("[viewdbg] setPrimaryItem {cur} err {e:?}");
                             }
                         }
                     }
-                    if std::env::var_os("OVELO_VIEWDBG").is_some() {
+                    if crate::dbg_flag("OVELO_VIEWDBG") {
                         eprintln!("[viewdbg] setAdapter {class} adapter={ad} count={n} cur={cur}");
                     }
                 }
@@ -1296,7 +1780,7 @@ pub(crate) fn call(
         }
         "getViewTreeObserver" => Some(Some(vto_of(vm, this))),
         "addOnGlobalLayoutListener" => {
-            if std::env::var_os("OVELO_VIEWDBG").is_some() {
+            if crate::dbg_flag("OVELO_VIEWDBG") {
                 eprintln!("[viewdbg] addOnGlobalLayoutListener obs={this} args={args:?}");
             }
             if let Some(&V::Ref(l)) = args.get(1) {
@@ -1315,7 +1799,7 @@ pub(crate) fn call(
             Some(None)
         }
         "addOnPreDrawListener" => {
-            if std::env::var_os("OVELO_VIEWDBG").is_some() {
+            if crate::dbg_flag("OVELO_VIEWDBG") {
                 eprintln!("[viewdbg] addOnPreDrawListener obs={this} args={args:?}");
             }
             if let Some(&V::Ref(l)) = args.get(1) {
@@ -1375,14 +1859,28 @@ pub(crate) fn call(
             }
             Some(Some(V::Ref(cur)))
         }
-        "getTag" => Some(Some(
-            match args.get(1) {
+        "getTag" => {
+            let v = match args.get(1) {
                 Some(&key) => pseudo_get(vm, this, tag_key(i32v(key))),
                 None => pseudo_get(vm, this, P_TAG),
             }
-            .unwrap_or(V::Ref(0)),
-        )),
+            .unwrap_or(V::Ref(0));
+            if crate::dbg_flag("OVELO_VIEWDBG") {
+                eprintln!(
+                    "[viewdbg] getTag h{this} key={:?} -> {v:?}",
+                    args.get(1).map(|k| i32v(*k))
+                );
+            }
+            Some(Some(v))
+        }
         "setTag" => {
+            if crate::dbg_flag("OVELO_VIEWDBG") {
+                eprintln!(
+                    "[viewdbg] setTag h{this} key={:?} v={:?}",
+                    args.get(1).map(|k| i32v(*k)),
+                    args.get(2)
+                );
+            }
             match args.len() {
                 n if n >= 3 => {
                     pseudo_set(vm, this, tag_key(i32v(args[1])), args[2]);
@@ -1396,8 +1894,12 @@ pub(crate) fn call(
         "setText" | "setTitle" | "setTextScaleX" => {
             if name != "setTextScaleX" {
                 pseudo_set(vm, this, P_TEXT, args.get(1).copied().unwrap_or(V::Ref(0)));
-                if std::env::var_os("OVELO_VIEWDBG").is_some() {
-                    eprintln!("[viewdbg] setText h{this} arg={:?} stored={:?}", args.get(1), pseudo_get(vm, this, P_TEXT));
+                if crate::dbg_flag("OVELO_VIEWDBG") {
+                    eprintln!(
+                        "[viewdbg] setText h{this} arg={:?} stored={:?}",
+                        args.get(1),
+                        pseudo_get(vm, this, P_TEXT)
+                    );
                 }
             }
             Some(None)
@@ -1428,9 +1930,20 @@ pub(crate) fn call(
             Some(None)
         }
         "getDrawable" => Some(Some(image_drawable(vm, this))),
+        "setOnTouchListener" => {
+            pseudo_set(
+                vm,
+                this,
+                P_TOUCH_L,
+                args.get(1).copied().unwrap_or(V::Ref(0)),
+            );
+            Some(match ret(sig) {
+                "V" => None,
+                _ => Some(V::I32(1)),
+            })
+        }
         "setOnClickListener"
         | "setOnLongClickListener"
-        | "setOnTouchListener"
         | "setOnFocusChangeListener"
         | "setOnKeyListener"
         | "setOnAttachStateChangeListener"
@@ -1447,7 +1960,7 @@ pub(crate) fn call(
             })
         }
         "performClick" | "callOnClick" => {
-            let fired = match pseudo_get(vm, this, P_LISTENER) {
+            let mut fired = match pseudo_get(vm, this, P_LISTENER) {
                 Some(V::Ref(l)) if l != 0 => vm
                     .call_virtual(l, "onClick", &[V::Ref(this)])
                     .ok()
@@ -1455,6 +1968,22 @@ pub(crate) fn call(
                     .is_some(),
                 _ => false,
             };
+            // `android:onClick="method"` in layout XML: AOSP's
+            // DeclaredOnClickListener invokes the named method on the
+            // Context. No listener object exists to attach, so invoke
+            // the Activity method straight from the attr.
+            if !fired {
+                if let Some(mname) = attr_find(vm, this, "onClick").and_then(|v| match v {
+                    V::Ref(r) if r != 0 => s(vm, r),
+                    _ => None,
+                }) {
+                    let act = vm.cur_activity;
+                    if act != 0 {
+                        let _ = vm.call_virtual(act, &mname, &[V::Ref(this)]);
+                        fired = true;
+                    }
+                }
+            }
             Some(Some(V::I32(fired as i32)))
         }
         "setVisibility" => {
@@ -1462,8 +1991,16 @@ pub(crate) fn call(
             Some(None)
         }
         "getVisibility" => Some(Some(pseudo_get(vm, this, P_VIS).unwrap_or(V::I32(0)))),
+        "setClipChildren" => {
+            pseudo_set(
+                vm,
+                this,
+                P_CLIP_CHILDREN,
+                args.get(1).copied().unwrap_or(V::I32(1)),
+            );
+            Some(None)
+        }
         "isShown"
-        | "isAttachedToWindow"
         | "hasWindowFocus"
         | "isEnabled"
         | "isClickable"
@@ -1472,6 +2009,7 @@ pub(crate) fn call(
         | "isFocusableOnScreen"
         | "hasFocusable"
         | "isImportantForAccessibility" => Some(Some(V::I32(1))),
+        "isAttachedToWindow" => Some(Some(V::I32(pint(vm, this, P_ATTACHED)))),
         "isSelected"
         | "isActivated"
         | "isPressed"
@@ -1496,10 +2034,33 @@ pub(crate) fn call(
             HostState::Empty,
         ))),
         "getHandler" => Some(Some(host(vm, "Landroid/os/Handler;", HostState::Empty))),
-        "post" | "postDelayed" | "postOnAnimation" | "postOnAnimationDelayed" => {
+        "post" | "postOnAnimation" => {
+            // AttachInfo.mRunQueue work runs on the next traversal —
+            // our drain pass is the same tick; Compose's OwnerSnapshot
+            // and AndroidComposeView's invalidation dispatcher post
+            // here (dropping the runnable = silent blank).
+            if let Some(V::Ref(r)) = args.get(1).copied() {
+                if r != 0 {
+                    vm.enqueue_runnable(r, true);
+                }
+            }
             Some(Some(V::I32(1)))
         }
-        "removeCallbacks" => Some(Some(V::I32(1))),
+        "postDelayed" | "postOnAnimationDelayed" => {
+            if let Some(V::Ref(r)) = args.get(1).copied() {
+                if r != 0 {
+                    let d = args.get(2).map(|v| i64v(*v)).unwrap_or(0);
+                    vm.enqueue_runnable_delayed(r, true, d);
+                }
+            }
+            Some(Some(V::I32(1)))
+        }
+        "removeCallbacks" => {
+            if let Some(V::Ref(r)) = args.get(1).copied() {
+                vm.remove_runnable(r);
+            }
+            Some(Some(V::I32(1)))
+        }
         "animate" => Some(Some(host(
             vm,
             "Landroid/view/ViewPropertyAnimator;",
@@ -1507,7 +2068,7 @@ pub(crate) fn call(
         ))),
         "getLayoutParams" => {
             let lp = layout_params(vm, this);
-            if std::env::var_os("OVELO_VIEWDBG").is_some() {
+            if crate::dbg_flag("OVELO_VIEWDBG") {
                 let desc = class_of(vm, V::Ref(this));
                 let lp_desc = match lp {
                     V::Ref(h) => class_of(vm, V::Ref(h)),
@@ -1517,10 +2078,7 @@ pub(crate) fn call(
                 if let V::Ref(lh) = lp {
                     let dump: Vec<String> = match vm.heap.get(lh) {
                         Some(Obj::Instance { fields, .. }) | Some(Obj::Host { fields, .. }) => {
-                            fields
-                                .iter()
-                                .map(|(g, v)| format!("{g}={v:?}"))
-                                .collect()
+                            fields.iter().map(|(g, v)| format!("{g}={v:?}")).collect()
                         }
                         _ => Vec::new(),
                     };
@@ -1530,7 +2088,7 @@ pub(crate) fn call(
             Some(Some(lp))
         }
         "setLayoutParams" => {
-            if std::env::var_os("OVELO_VIEWDBG").is_some() {
+            if crate::dbg_flag("OVELO_VIEWDBG") {
                 let lp_desc = match args.get(1) {
                     Some(V::Ref(h)) => class_of(vm, V::Ref(*h)),
                     _ => "primitive".into(),
@@ -1553,7 +2111,7 @@ pub(crate) fn call(
             // View.measure(wSpec, hSpec): the EXACTLY/AT_MOST size is
             // what getMeasured* reports until the dex onMeasure calls
             // setMeasuredDimension (which many custom views do).
-            if std::env::var_os("OVELO_MEASDBG").is_some() {
+            if crate::dbg_flag("OVELO_MEASDBG") {
                 let (ws, hs) = (vint(args.get(1)), vint(args.get(2)));
                 eprintln!("[measdbg] measure h{this} spec={ws:#x},{hs:#x}");
             }
@@ -1571,8 +2129,13 @@ pub(crate) fn call(
                         args.get(2).copied().unwrap_or(V::I32(0)),
                     ],
                 )?;
-                if std::env::var_os("OVELO_VIEWDBG").is_some() {
-                    eprintln!("[viewdbg] builtin measure h{this} onMeasure={:?}", r.is_some());
+                if crate::dbg_flag("OVELO_VIEWDBG") {
+                    eprintln!(
+                        "[viewdbg] builtin measure h{this} onMeasure={:?} meas={}x{}",
+                        r.is_some(),
+                        pint(vm, this, P_MEAS_W) & 0x00FF_FFFF,
+                        pint(vm, this, P_MEAS_H) & 0x00FF_FFFF,
+                    );
                 }
             } else {
                 // Framework skeleton container — no dex onMeasure
@@ -1590,7 +2153,7 @@ pub(crate) fn call(
         "setMeasuredDimension" => {
             // AOSP masks the stored dims to MEASURED_SIZE_MASK
             // (0x00FF_FFFF); the state bits ride the AndState variant.
-            if std::env::var_os("OVELO_MEASDBG").is_some() {
+            if crate::dbg_flag("OVELO_MEASDBG") {
                 let (w, h) = (vint(args.get(1)), vint(args.get(2)));
                 eprintln!("[measdbg] setMeasured h{this} {w:#x}x{h:#x}");
             }
@@ -1605,12 +2168,13 @@ pub(crate) fn call(
                 vint(args.get(3)),
                 vint(args.get(4)),
             );
-            if std::env::var_os("OVELO_VIEWDBG").is_some() {
+            if crate::dbg_flag("OVELO_VIEWDBG") {
                 eprintln!("[viewdbg] builtin layout h{this} {l},{t},{r},{b}");
             }
             // AOSP clears PFLAG_LAYOUT_REQUESTED once the view is laid out.
             pseudo_set(vm, this, P_LAYOUT_REQ, V::I32(0));
             let changed = frame_set(vm, this, l, t, r, b);
+            pseudo_set(vm, this, P_LAYOUT_DONE, V::I32(1));
             if vm.has_dex_virtual(this, "onLayout", &["Z", "I", "I", "I", "I"]) {
                 if let Err(e) = vm.call_virtual_rt(
                     this,
@@ -1623,7 +2187,7 @@ pub(crate) fn call(
                         V::I32(b),
                     ],
                 ) {
-                    if std::env::var_os("OVELO_VIEWDBG").is_some() {
+                    if crate::dbg_flag("OVELO_VIEWDBG") {
                         match &e {
                             crate::E::Vm(oe) => {
                                 eprintln!("[viewdbg] onLayout h{this} vmerr {oe}")
@@ -1695,13 +2259,39 @@ pub(crate) fn call(
         ))),
         "getMeasuredWidth" => Some(Some(V::I32(pint(vm, this, P_MEAS_W) & 0x00FF_FFFF))),
         "getMeasuredHeight" => {
-            if std::env::var_os("OVELO_MEASDBG").is_some() {
+            if crate::dbg_flag("OVELO_MEASDBG") {
                 eprintln!(
                     "[measdbg] getMeasuredHeight h{this} -> {}",
                     pint(vm, this, P_MEAS_H) & 0x00FF_FFFF
                 );
             }
             Some(Some(V::I32(pint(vm, this, P_MEAS_H) & 0x00FF_FFFF)))
+        }
+        "getLocalVisibleRect" | "getHitRect" | "getGlobalVisibleRect" | "getDrawingRect" => {
+            // `new Rect()` arg gets (0,0,w,h) — local coords; global
+            // rect adds the view's absolute origin.
+            let w = pint(vm, this, P_RIGHT).saturating_sub(pint(vm, this, P_LEFT));
+            let h = pint(vm, this, P_BOTTOM).saturating_sub(pint(vm, this, P_TOP));
+            if let Some(V::Ref(rh)) = args.get(1) {
+                if *rh != 0 {
+                    let (ox, oy) = if name == "getGlobalVisibleRect" {
+                        let (mut x, mut y, mut v) = (0, 0, this);
+                        for _ in 0..64 {
+                            x += pint(vm, v, P_LEFT);
+                            y += pint(vm, v, P_TOP);
+                            v = match pseudo_get(vm, v, P_PARENT) {
+                                Some(V::Ref(p)) => p,
+                                _ => break,
+                            };
+                        }
+                        (x, y)
+                    } else {
+                        (0, 0)
+                    };
+                    super::android::rect_write(vm, *rh, ox, oy, ox + w, oy + h);
+                }
+            }
+            Some(Some(V::I32(1)))
         }
         "getMeasuredWidthAndState" => Some(Some(V::I32(pint(vm, this, P_MEAS_W)))),
         "getMeasuredHeightAndState" => Some(Some(V::I32(pint(vm, this, P_MEAS_H)))),
@@ -1714,9 +2304,7 @@ pub(crate) fn call(
         // AOSP: max(minDim, background minimum). Drawable minimums are
         // ~0 for colors/bitmaps, so the explicit minimum wins.
         "getSuggestedMinimumWidth" => Some(Some(V::I32(min_dim(vm, this, P_MINW, "minWidth")))),
-        "getSuggestedMinimumHeight" => {
-            Some(Some(V::I32(min_dim(vm, this, P_MINH, "minHeight"))))
-        }
+        "getSuggestedMinimumHeight" => Some(Some(V::I32(min_dim(vm, this, P_MINH, "minHeight")))),
         "getBaseline" => Some(Some(V::I32(-1))),
         // requestLayout must be observable: ConstraintLayout re-arms
         // mDirtyHierarchy only when a child reports isLayoutRequested,
@@ -1739,13 +2327,33 @@ pub(crate) fn call(
             Some(None)
         }
         "willNotDraw" => Some(Some(V::I32(0))),
-        "invalidate"
-        | "postInvalidate"
-        | "requestFocus"
+        "invalidate" | "postInvalidate" => {
+            // A draw-only change touches no layout/text field, but the
+            // host only re-records draw ops when `view_gen` moved —
+            // a dedicated sequence slot flips on every invalidate so
+            // the next traversal re-runs guest_draw_ops for this tree.
+            let n = pint(vm, this, P_INVALID_SEQ);
+            pseudo_set(vm, this, P_INVALID_SEQ, V::I32(n.wrapping_add(1)));
+            Some(None)
+        }
+        "setBackgroundColor" => {
+            // Always a packed ARGB literal — low-alpha colors are
+            // positive ints and must not be read as resource ids.
+            pseudo_set(
+                vm,
+                this,
+                P_BGCOLOR,
+                args.get(1).cloned().unwrap_or(V::I32(0)),
+            );
+            Some(None)
+        }
+        "setBackgroundResource" => {
+            pseudo_set(vm, this, P_BGRES, args.get(1).cloned().unwrap_or(V::I32(0)));
+            Some(None)
+        }
+        "requestFocus"
         | "clearFocus"
         | "setAlpha"
-        | "setBackgroundColor"
-        | "setBackgroundResource"
         | "setPadding"
         | "setElevation"
         | "setShowDividers"
@@ -1771,7 +2379,6 @@ pub(crate) fn call(
         | "setFocusableInTouchMode"
         | "setWillNotDraw"
         | "setDescendantFocusability"
-        | "setClipChildren"
         | "setClipToPadding"
         | "setNestedScrollingEnabled"
         | "startNestedScroll"
@@ -1943,6 +2550,45 @@ pub(crate) fn call(
         | "setHideOverlayWindows"
         | "setDecorFitsSystemWindows" => Some(None),
         "isFloating" | "isActive" | "hasFeature" => Some(Some(V::I32(0))),
+        // WindowMetrics carries a Rect of the display bounds — androidx
+        // (WindowInsetsAnimationCompat$Impl30's <clinit>, BottomSheet)
+        // reads it for inset math. Matches the DisplayMetrics default.
+        "getCurrentWindowMetrics" | "getMaximumWindowMetrics"
+            if class == "Landroid/view/WindowManager;" =>
+        {
+            let m = host(vm, "Landroid/view/WindowMetrics;", HostState::Empty);
+            if let V::Ref(mh) = m {
+                let r = host(vm, "Landroid/graphics/Rect;", HostState::Empty);
+                if let V::Ref(rh) = r {
+                    pseudo_set(vm, rh, P_RECT_L, V::I32(0));
+                    pseudo_set(vm, rh, P_RECT_T, V::I32(0));
+                    pseudo_set(vm, rh, P_RECT_R, V::I32(1080));
+                    pseudo_set(vm, rh, P_RECT_B, V::I32(1920));
+                }
+                slot_put(vm, mh, r);
+            }
+            Some(Some(m))
+        }
+        "getBounds" if class == "Landroid/view/WindowMetrics;" => {
+            Some(Some(slot_of(vm, this).unwrap_or(V::Ref(0))))
+        }
+        "getWindowInsets" if class == "Landroid/view/WindowMetrics;" => Some(Some(host(
+            vm,
+            "Landroid/view/WindowInsets;",
+            HostState::Empty,
+        ))),
+        "getInsets" | "getInsetsIgnoringVisibility" | "isVisible"
+            if class == "Landroid/view/WindowInsets;" =>
+        {
+            // Zero insets: no system bars are carved out of our window.
+            Some(Some(match ret(sig) {
+                "Z" => V::I32(0),
+                "Landroid/graphics/Insets;" => {
+                    host(vm, "Landroid/graphics/Insets;", HostState::Empty)
+                }
+                _ => V::I32(0),
+            }))
+        }
         "getWindowManager"
         | "getContainer"
         | "getCurrentFocus"
@@ -2016,11 +2662,27 @@ pub(crate) fn textclock_update(vm: &mut Vm, this: u32) {
 /// quoted literals, other chars verbatim.
 fn clock_pattern(pat: &str, ms: i64) -> String {
     const MONTHS: [&str; 12] = [
-        "January", "February", "March", "April", "May", "June", "July", "August", "September",
-        "October", "November", "December",
+        "January",
+        "February",
+        "March",
+        "April",
+        "May",
+        "June",
+        "July",
+        "August",
+        "September",
+        "October",
+        "November",
+        "December",
     ];
     const DAYS: [&str; 7] = [
-        "Sunday", "Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday",
+        "Sunday",
+        "Monday",
+        "Tuesday",
+        "Wednesday",
+        "Thursday",
+        "Friday",
+        "Saturday",
     ];
     let (y, mo, d, h24, mi, s, _) = time::ms_fields(ms);
     let dow = ((ms.div_euclid(86_400_000) + 4).rem_euclid(7)) as usize; // 0=Sun
@@ -2122,8 +2784,18 @@ pub(crate) fn inflater(vm: &mut Vm, ctx: Option<V>) -> V {
     V::Ref(h)
 }
 
+/// The one `Choreographer.getInstance()` — dex code compares it by
+/// identity (`AndroidUiDispatcher` hangs the frame clock off the
+/// exact object it fetched).
+fn choreographer(vm: &mut Vm) -> V {
+    if vm.choreographer_h == 0 {
+        vm.choreographer_h = vm.alloc_host(CHOR, HostState::Empty);
+    }
+    V::Ref(vm.choreographer_h)
+}
+
 fn inflate_call(vm: &mut Vm, args: &[V]) -> V {
-    if std::env::var_os("OVELO_VIEWDBG").is_some() {
+    if crate::dbg_flag("OVELO_VIEWDBG") {
         eprintln!("[viewdbg] inflate_call args={args:?}");
     }
     // inflate(int, ViewGroup, bool) — the parser-taking overloads aren't
@@ -2205,7 +2877,7 @@ fn inflate_call(vm: &mut Vm, args: &[V]) -> V {
 /// resources aren't loaded or the id doesn't name a layout).
 pub(crate) fn inflate_res(vm: &mut Vm, res_id: u32, ctx: V) -> V {
     let elems = vm.apk_res.as_ref().and_then(|r| r.layout_elements(res_id));
-    if std::env::var_os("OVELO_VIEWDBG").is_some() {
+    if crate::dbg_flag("OVELO_VIEWDBG") {
         eprintln!(
             "[viewdbg] inflate {res_id:#x}: {}",
             match &elems {
@@ -2268,7 +2940,7 @@ fn make_view_named(vm: &mut Vm, tag: &str, attrs: V, ctx: V) -> V {
     // runs — the standard overloads are (Context), (Context, AttributeSet)
     // and (Context, AttributeSet, int). A crashed ctor falls back to the
     // opaque host stub.
-    if std::env::var_os("OVELO_VIEWDBG").is_some() && desc.contains("Toolbar") {
+    if crate::dbg_flag("OVELO_VIEWDBG") && desc.contains("Toolbar") {
         let names: Vec<String> = match attrs {
             V::Ref(ah) => match vm.heap.get(ah) {
                 Some(Obj::Host {
@@ -2282,12 +2954,12 @@ fn make_view_named(vm: &mut Vm, tag: &str, attrs: V, ctx: V) -> V {
         eprintln!("[viewdbg] toolbar ctor attrs: {names:?}");
     }
     let h = try_construct_view(vm, &desc, ctx, attrs).unwrap_or_else(|| {
-        if std::env::var_os("OVELO_VIEWDBG").is_some() {
+        if crate::dbg_flag("OVELO_VIEWDBG") {
             eprintln!("[viewdbg] make_view_named {desc} -> host stub");
         }
         vm.alloc_host(&desc, HostState::Empty)
     });
-    if std::env::var_os("OVELO_VIEWDBG").is_some() && desc.contains("Toolbar") {
+    if crate::dbg_flag("OVELO_VIEWDBG") && desc.contains("Toolbar") {
         eprintln!("[viewdbg] toolbar -> {h:?}");
     }
     pseudo_set(vm, h, P_IS_VIEW, V::I32(1));
@@ -2419,14 +3091,12 @@ pub(crate) fn ta_attrs(vm: &Vm, h: u32) -> Vec<i32> {
 /// resolution chain for theme-scoped arrays and unset attrs.
 /// `None` when the value can't be resolved anywhere.
 pub(crate) fn ta_lookup(vm: &mut Vm, h: u32, index: usize) -> Option<V> {
-    if ta_attrs(vm, h).get(index).is_none()
-        && std::env::var_os("OVELO_VIEWDBG").is_some()
-    {
+    if ta_attrs(vm, h).get(index).is_none() && crate::dbg_flag("OVELO_VIEWDBG") {
         let n = ta_attrs(vm, h).len();
         eprintln!("[viewdbg] ta_lookup[{index}] out-of-range attrs_len={n} h={h}");
     }
     let attr_id = *ta_attrs(vm, h).get(index)? as u32;
-    if std::env::var_os("OVELO_VIEWDBG").is_some() {
+    if crate::dbg_flag("OVELO_VIEWDBG") {
         eprintln!(
             "[viewdbg] ta_lookup[{index}] attr_id={attr_id:#x} name={:?}",
             vm.apk_res
@@ -2453,15 +3123,15 @@ pub(crate) fn ta_lookup(vm: &mut Vm, h: u32, index: usize) -> Option<V> {
                 })
             );
             if let Some(v) = xml::cur_attr_value(vm, set_h, &name) {
-                if std::env::var_os("OVELO_VIEWDBG").is_some() {
+                if crate::dbg_flag("OVELO_VIEWDBG") {
                     eprintln!("[viewdbg]   ta_hit {name} = {v:?}");
                 }
                 return Some(v);
             }
-            if std::env::var_os("OVELO_VIEWDBG").is_some() {
+            if crate::dbg_flag("OVELO_VIEWDBG") {
                 eprintln!("[viewdbg]   ta_miss {name} set={set_h} xml={is_xml}");
             }
-        } else if std::env::var_os("OVELO_VIEWDBG").is_some() {
+        } else if crate::dbg_flag("OVELO_VIEWDBG") {
             eprintln!("[viewdbg]   ta_noset {name}");
         }
         if let Some(V::Ref(set_h)) = pseudo_get(vm, h, P_TA_SET) {
@@ -2477,16 +3147,13 @@ pub(crate) fn ta_lookup(vm: &mut Vm, h: u32, index: usize) -> Option<V> {
                         None
                     }
                 }) {
-                    if std::env::var_os("OVELO_VIEWDBG").is_some() {
+                    if crate::dbg_flag("OVELO_VIEWDBG") {
                         eprintln!("[viewdbg]   ta_map_hit {name} = {v:?}");
                     }
                     return Some(v);
                 }
-                if std::env::var_os("OVELO_VIEWDBG").is_some() {
-                    let keys: Vec<String> = m
-                        .iter()
-                        .filter_map(|(k, _)| sv(vm, *k))
-                        .collect();
+                if crate::dbg_flag("OVELO_VIEWDBG") {
+                    let keys: Vec<String> = m.iter().filter_map(|(k, _)| sv(vm, *k)).collect();
                     eprintln!("[viewdbg]   ta_map_miss {name} set={set_h} keys={keys:?}");
                 }
             }
@@ -2566,15 +3233,8 @@ pub(crate) fn theme_attr_entry(vm: &mut Vm, attr_id: u32) -> Option<ovelo_apk::a
 /// own res id, but the theme-binding step is supposed to rewrite them —
 /// chase those through the bound theme, then follow @ref hops to the
 /// final entry. Returns `(resolved res_id, final entry value)`.
-pub(crate) fn resolve_ta_id(
-    vm: &mut Vm,
-    id: u32,
-) -> Option<(u32, ovelo_apk::arsc::EntryValue)> {
-    let mut ev = match vm
-        .apk_res
-        .as_ref()
-        .and_then(|r| r.type_name(id))
-    {
+pub(crate) fn resolve_ta_id(vm: &mut Vm, id: u32) -> Option<(u32, ovelo_apk::arsc::EntryValue)> {
+    let mut ev = match vm.apk_res.as_ref().and_then(|r| r.type_name(id)) {
         Some("attr") => theme_attr_entry(vm, id)?,
         _ => vm.apk_res.as_ref()?.entry_value(id)?.clone(),
     };
@@ -2601,7 +3261,7 @@ pub(crate) fn resolve_ta_id(
 /// FragmentContainerView's 3-arg ctor).
 fn try_construct_view(vm: &mut Vm, desc: &str, ctx: V, attrs: V) -> Option<u32> {
     if vm.type_index_of(desc).is_none() {
-        if std::env::var_os("OVELO_VIEWDBG").is_some() {
+        if crate::dbg_flag("OVELO_VIEWDBG") {
             eprintln!("[viewdbg] {desc} not in dex → host stub");
         }
         return None;
@@ -2615,7 +3275,7 @@ fn try_construct_view(vm: &mut Vm, desc: &str, ctx: V, attrs: V) -> Option<u32> 
         match vm.instantiate_ctor(desc, midx, &args) {
             Ok(h) => return Some(h),
             Err(e) => {
-                if std::env::var_os("OVELO_VIEWDBG").is_some() {
+                if crate::dbg_flag("OVELO_VIEWDBG") {
                     eprintln!("[viewdbg] ctor {desc}({}) failed: {e}", params.join(","));
                 }
             }
@@ -2680,7 +3340,7 @@ fn layout_params(vm: &mut Vm, this: u32) -> V {
             &["Landroid/util/AttributeSet;"],
             &[attrs],
         );
-        if std::env::var_os("OVELO_VIEWDBG").is_some() {
+        if crate::dbg_flag("OVELO_VIEWDBG") {
             match &lp_v {
                 Err(e) => eprintln!("[viewdbg] generateLayoutParams h{this} -> {e}"),
                 Ok(v) => eprintln!(
@@ -2699,14 +3359,13 @@ fn layout_params(vm: &mut Vm, this: u32) -> V {
         // is the attr-free sibling and still fully initializes the
         // params object (ConstraintLayout$LayoutParams' widget, …).
         let dlp = vm.call_virtual_sig(p, "generateDefaultLayoutParams", &[], &[]);
-        if std::env::var_os("OVELO_VIEWDBG").is_some() {
+        if crate::dbg_flag("OVELO_VIEWDBG") {
             match &dlp {
                 Err(e) => eprintln!("[viewdbg] generateDefaultLayoutParams h{this} -> {e}"),
                 Ok(v) => eprintln!("[viewdbg] generateDefaultLayoutParams h{this} -> {v:?}"),
             }
         }
-        if let Ok(Some(v @ V::Ref(h))) = dlp
-        {
+        if let Ok(Some(v @ V::Ref(h))) = dlp {
             if h != 0 {
                 pseudo_set(vm, this, P_LP, v);
                 return v;
@@ -2723,7 +3382,7 @@ fn layout_params(vm: &mut Vm, this: u32) -> V {
                             return V::Ref(h);
                         }
                         Err(e) => {
-                            if std::env::var_os("OVELO_VIEWDBG").is_some() {
+                            if crate::dbg_flag("OVELO_VIEWDBG") {
                                 eprintln!("[viewdbg] LP {lp} ctor failed: {e}");
                             }
                         }
@@ -2740,10 +3399,14 @@ fn layout_params(vm: &mut Vm, this: u32) -> V {
     // lp_ctor — an empty placeholder leaves `iget lp.width` reading 0.
     let v = match pseudo_get(vm, this, P_PARENT) {
         Some(V::Ref(p)) if p != 0 => gen_lp(vm, p, attrs),
-        _ => host(vm, "Landroid/view/ViewGroup$LayoutParams;", HostState::Empty),
+        _ => host(
+            vm,
+            "Landroid/view/ViewGroup$LayoutParams;",
+            HostState::Empty,
+        ),
     };
     pseudo_set(vm, this, P_LP, v);
-    if std::env::var_os("OVELO_VIEWDBG").is_some() {
+    if crate::dbg_flag("OVELO_VIEWDBG") {
         let p = match pseudo_get(vm, this, P_PARENT) {
             Some(V::Ref(h)) if h != 0 => class_of(vm, V::Ref(h)),
             _ => "none".into(),
@@ -2805,14 +3468,21 @@ fn attrset_value(vm: &mut Vm, set: V, name: &str) -> Option<V> {
 
 /// `LinearLayout` orientation: `setOrientation` wins, else the
 /// `android:orientation` attr (0=horizontal, 1=vertical); the AOSP
-/// documented default is horizontal.
+/// documented default is horizontal — except `TableLayout`, whose
+/// constructor forces VERTICAL, and `TableRow`, forced HORIZONTAL.
 fn linear_vertical(vm: &mut Vm, this: u32) -> bool {
     if let Some(V::I32(o)) = pseudo_get(vm, this, P_ORIENTATION) {
         return o != 0;
     }
+    let dflt = vm
+        .heap
+        .class_of(this)
+        .and_then(|ci| vm.type_desc_of(ci).ok())
+        .map(|d| d.contains("TableLayout"))
+        .unwrap_or(false);
     attr_find(vm, this, "orientation")
         .map(|v| i32v(v) != 0)
-        .unwrap_or(false)
+        .unwrap_or(dflt)
 }
 
 /// `getMinimum*`/`getSuggestedMinimum*`: explicit `setMinimum*` wins,
@@ -2937,12 +3607,27 @@ fn lp_resolve_dir_dex(vm: &mut Vm, lp: V) {
 
 /// Read an int field off a LayoutParams object under every canon key
 /// a writer could have used (owner obfuscation, LP subclasses).
-fn lp_field(vm: &Vm, lp: u32, name: &str) -> Option<V> {
+pub(crate) fn lp_field(vm: &Vm, lp: u32, name: &str) -> Option<V> {
+    lp_field_t(vm, lp, name, "I")
+}
+
+/// `(width, height)` requested by a dex LayoutParams object — `-1`
+/// match_parent / `-2` wrap_content pass through. For the host-side
+/// view bridge, which must size bridged children from the LP the app
+/// handed to `addView`/`setLayoutParams`.
+pub fn lp_dims(vm: &Vm, lp: u32) -> (Option<i32>, Option<i32>) {
+    (
+        lp_field(vm, lp, "width").and_then(|v| lp_px(vm, v)),
+        lp_field(vm, lp, "height").and_then(|v| lp_px(vm, v)),
+    )
+}
+
+fn lp_field_t(vm: &Vm, lp: u32, name: &str, ty: &str) -> Option<V> {
     let fields = match vm.heap.get(lp) {
         Some(Obj::Instance { fields, .. }) | Some(Obj::Host { fields, .. }) => fields,
         _ => return None,
     };
-    vm.field_keys_named(name, "I")
+    vm.field_keys_named(name, ty)
         .iter()
         .find_map(|(_, g)| fields.get(g).copied())
 }
@@ -3031,21 +3716,31 @@ fn measure_child(
     }
     let (lp_w, lp_h) = (lp_w.unwrap_or(-2), lp_h.unwrap_or(-2));
     // Parent padding halves the space handed to children.
-    let pad_w = lp_px(vm, attr_find(vm, parent, "paddingLeft").unwrap_or(V::I32(0)))
-        .unwrap_or(0)
-        + lp_px(vm, attr_find(vm, parent, "paddingRight").unwrap_or(V::I32(0))).unwrap_or(0);
-    let pad_h = lp_px(vm, attr_find(vm, parent, "paddingTop").unwrap_or(V::I32(0)))
-        .unwrap_or(0)
-        + lp_px(vm, attr_find(vm, parent, "paddingBottom").unwrap_or(V::I32(0))).unwrap_or(0);
+    let pad_w = lp_px(
+        vm,
+        attr_find(vm, parent, "paddingLeft").unwrap_or(V::I32(0)),
+    )
+    .unwrap_or(0)
+        + lp_px(
+            vm,
+            attr_find(vm, parent, "paddingRight").unwrap_or(V::I32(0)),
+        )
+        .unwrap_or(0);
+    let pad_h = lp_px(vm, attr_find(vm, parent, "paddingTop").unwrap_or(V::I32(0))).unwrap_or(0)
+        + lp_px(
+            vm,
+            attr_find(vm, parent, "paddingBottom").unwrap_or(V::I32(0)),
+        )
+        .unwrap_or(0);
     let ws = child_measure_spec(pw, pad_w + ml + mr + w_used, lp_w);
     let hs = child_measure_spec(ph, pad_h + mt + mb + h_used, lp_h);
-    if std::env::var_os("OVELO_VIEWDBG").is_some() {
+    if crate::dbg_flag("OVELO_VIEWDBG") {
         eprintln!(
             "[viewdbg] measureChild h{child} lp={lp_w}x{lp_h} used={w_used},{h_used} in={pw:#x}/{ph:#x} -> {ws:#x}/{hs:#x}"
         );
     }
     if let Err(e) = vm.call_virtual(child, "measure", &[V::I32(ws), V::I32(hs)]) {
-        if std::env::var_os("OVELO_VIEWDBG").is_some() {
+        if crate::dbg_flag("OVELO_VIEWDBG") {
             eprintln!("[viewdbg] measureChild h{child} err {e}");
         }
     }
@@ -3062,7 +3757,11 @@ fn group_measure_fallback(vm: &mut Vm, this: u32, pw: i32, ph: i32) {
     let pad_w = lp_px(vm, attr_find(vm, this, "paddingLeft").unwrap_or(V::I32(0))).unwrap_or(0)
         + lp_px(vm, attr_find(vm, this, "paddingRight").unwrap_or(V::I32(0))).unwrap_or(0);
     let pad_h = lp_px(vm, attr_find(vm, this, "paddingTop").unwrap_or(V::I32(0))).unwrap_or(0)
-        + lp_px(vm, attr_find(vm, this, "paddingBottom").unwrap_or(V::I32(0))).unwrap_or(0);
+        + lp_px(
+            vm,
+            attr_find(vm, this, "paddingBottom").unwrap_or(V::I32(0)),
+        )
+        .unwrap_or(0);
     let kids = children(vm, this);
     if kids.is_empty() {
         // Leaf view (TextView/Button with no dex onMeasure): report
@@ -3077,6 +3776,26 @@ fn group_measure_fallback(vm: &mut Vm, this: u32, pw: i32, ph: i32) {
                 .unwrap_or_default(),
             _ => String::new(),
         };
+        // The `android:text` attr lives in P_ATTRS until the dex ctor
+        // calls setText — measure from it or XML-inflated TextViews
+        // wrap to 0 wide.
+        let text = if text.is_empty() {
+            attr_find(vm, this, "text")
+                .or_else(|| attr_find(vm, this, "hint"))
+                .map(|v| match v {
+                    V::Ref(th) if th != 0 => s(vm, th).unwrap_or_default(),
+                    V::I32(id) if id > 0 => vm
+                        .apk_res
+                        .as_ref()
+                        .and_then(|r| r.string_of(id as u32))
+                        .map(|s| s.to_string())
+                        .unwrap_or_default(),
+                    _ => String::new(),
+                })
+                .unwrap_or_default()
+        } else {
+            text
+        };
         let ts = match pseudo_get(vm, this, P_TSIZE) {
             Some(V::F32(f)) => f,
             Some(V::I32(b)) => f32::from_bits(b as u32),
@@ -3084,16 +3803,51 @@ fn group_measure_fallback(vm: &mut Vm, this: u32, pw: i32, ph: i32) {
         }
         .abs()
         .max(1.0);
+        // An ImageView's content is its drawable: AOSP ImageView.
+        // onMeasure reports the drawable's intrinsic size (still folded
+        // through resolveSize below), never the parent's spec size.
+        let (iw, ih) = pseudo_get(vm, this, P_IMAGE)
+            .and_then(|v| image_pixels(vm, v))
+            .map(|(w, h, _)| (w as i32, h as i32))
+            .unwrap_or((0, 0));
         let (cw, chh) = if text.is_empty() {
-            (0, 0)
+            (iw, ih)
         } else {
-            (
-                (text.chars().count() as f32 * ts * 0.6) as i32,
-                (ts * 1.3) as i32,
-            )
+            // Wrapping: when the unbroken text overflows the available
+            // width it folds to `ceil(cw/avail)` lines — a single-line
+            // height lets the overflow draw over the next sibling.
+            // Width is estimated per-char; the renderer's real glyph
+            // advance runs wider than a naive 0.6·size, so the wrap
+            // check uses a fatter factor than the extent itself or a
+            // frame measured "one line" renders two.
+            let line_h = (ts * 1.3) as i32;
+            let raw_w = (text.chars().count() as f32 * ts * 0.6) as i32;
+            let avail = (pw & 0x3FFF_FFFF) - pad_w;
+            let frame_w = if avail > 0 { raw_w.min(avail) } else { raw_w };
+            let real_w = (text.chars().count() as f32 * ts * 0.85) as i32;
+            let lines = if frame_w > 0 {
+                ((real_w + frame_w - 1) / frame_w).max(1)
+            } else {
+                1
+            };
+            (frame_w, line_h * lines)
         };
-        pseudo_set(vm, this, P_MEAS_W, V::I32(resolve_size(cw + pad_w, pw, true)));
-        pseudo_set(vm, this, P_MEAS_H, V::I32(resolve_size(chh + pad_h, ph, true)));
+        // resolveSize semantics on the desired extent (content or
+        // drawable intrinsic): AT_MOST → min(desired, spec). An empty
+        // leaf stays 0 — an ImageView without a drawable and an empty
+        // TextView both measure to their padding in AOSP too.
+        pseudo_set(
+            vm,
+            this,
+            P_MEAS_W,
+            V::I32(resolve_size(cw + pad_w, pw, true)),
+        );
+        pseudo_set(
+            vm,
+            this,
+            P_MEAS_H,
+            V::I32(resolve_size(chh + pad_h, ph, true)),
+        );
         return;
     }
     // Stack containers by ancestry, not name — a `MyColumn extends
@@ -3103,6 +3857,7 @@ fn group_measure_fallback(vm: &mut Vm, this: u32, pw: i32, ph: i32) {
     let linear = desc.contains("LinearLayout") || vm.extends_named(&desc, "LinearLayout");
     let linear_v = linear && linear_vertical(vm, this);
     let linear_h = linear && !linear_v;
+    let relative = !linear && vm.extends_named(&desc, "RelativeLayout");
     let (mut cw, mut chh) = (0i32, 0i32);
     for c in kids.iter().copied() {
         let V::Ref(ch) = c else { continue };
@@ -3159,6 +3914,191 @@ fn group_measure_fallback(vm: &mut Vm, this: u32, pw: i32, ph: i32) {
         } else {
             cw = cw.max(w);
             chh = chh.max(hh + mv);
+        }
+    }
+    // AOSP LinearLayout weight pass: children with `layout_weight`
+    // get a second measure that adds their share of the parent's
+    // leftover axis space — the classic `0dp`+weight pattern stays
+    // at zero extent without it.
+    if linear_v || linear_h {
+        let axis_size = (if linear_v { ph } else { pw }) & 0x3FFF_FFFF;
+        let axis_total = if linear_v { chh } else { cw };
+        let axis_pad = if linear_v { pad_h } else { pad_w };
+        let remaining = (axis_size - axis_pad - axis_total).max(0);
+        if remaining > 0 {
+            let mut total_weight = 0f32;
+            let mut shares: Vec<(u32, f32)> = Vec::new();
+            for c in kids.iter().copied() {
+                let V::Ref(ch) = c else { continue };
+                if ch == 0 {
+                    continue;
+                }
+                let lp_obj = match pseudo_get(vm, ch, P_LP) {
+                    Some(V::Ref(l)) => l,
+                    _ => 0,
+                };
+                // `weight` is a float LP field — try F first so a
+                // runtime `lp.weight = 0` overrides the XML attr. Dex
+                // registers are untyped: an F field write can land as
+                // raw I32 bits — reinterpret via from_bits (1065353216
+                // must read as 1.0, not a billion).
+                let w = lp_field_t(vm, lp_obj, "weight", "F")
+                    .map(|v| match v {
+                        V::F32(f) => f,
+                        V::F64(f) => f as f32,
+                        V::I32(i) => f32::from_bits(i as u32),
+                        V::I64(l) => f64::from_bits(l as u64) as f32,
+                        _ => 0.0,
+                    })
+                    .or_else(|| {
+                        lp_field(vm, lp_obj, "weight")
+                            .or_else(|| attr_find(vm, ch, "layout_weight"))
+                            .map(|v| match v {
+                                V::F32(f) => f,
+                                V::I32(i) => i as f32,
+                                _ => 0.0,
+                            })
+                    })
+                    .unwrap_or(0.0);
+                if w > 0.0 {
+                    shares.push((ch, w));
+                    total_weight += w;
+                }
+            }
+            if total_weight > 0.0 {
+                let wsum = attr_find(vm, this, "weightSum")
+                    .map(|v| match v {
+                        V::F32(f) => f,
+                        V::I32(i) => i as f32,
+                        _ => 0.0,
+                    })
+                    .unwrap_or(0.0);
+                let wsum = if wsum > 0.0 { wsum } else { total_weight };
+                let mut added = 0i32;
+                for (ch, w) in shares {
+                    let share = (remaining as f32 * w / wsum) as i32;
+                    if share <= 0 {
+                        continue;
+                    }
+                    let lp_obj = match pseudo_get(vm, ch, P_LP) {
+                        Some(V::Ref(l)) => l,
+                        _ => 0,
+                    };
+                    let lp_dim = |field: &str, xml: &str| -> i32 {
+                        lp_field(vm, lp_obj, field)
+                            .and_then(|v| lp_px(vm, v))
+                            .or_else(|| attr_find(vm, ch, xml).map(|v| len_v(vm, v)))
+                            .unwrap_or(-2)
+                    };
+                    let ml = lp_field(vm, lp_obj, "leftMargin")
+                        .and_then(|f| lp_px(vm, f))
+                        .unwrap_or(0)
+                        + lp_field(vm, lp_obj, "rightMargin")
+                            .and_then(|f| lp_px(vm, f))
+                            .unwrap_or(0);
+                    let mv = lp_field(vm, lp_obj, "topMargin")
+                        .and_then(|f| lp_px(vm, f))
+                        .unwrap_or(0)
+                        + lp_field(vm, lp_obj, "bottomMargin")
+                            .and_then(|f| lp_px(vm, f))
+                            .unwrap_or(0);
+                    // AOSP: `skippedMeasure` (axis lp dim == 0) gets
+                    // EXACTLY(share); a fixed axis dim wins via
+                    // getChildMeasureSpec and is left alone; a
+                    // wrap/match axis grows by content + share.
+                    let axis_dim = if linear_v {
+                        lp_dim("height", "layout_height")
+                    } else {
+                        lp_dim("width", "layout_width")
+                    };
+                    if axis_dim > 0 {
+                        continue;
+                    }
+                    let old_axis = if linear_v {
+                        pint(vm, ch, P_MEAS_H) & 0x00FF_FFFF
+                    } else {
+                        pint(vm, ch, P_MEAS_W) & 0x00FF_FFFF
+                    };
+                    let new_axis = old_axis + share;
+                    let (ws, hs) = if linear_v {
+                        (
+                            child_measure_spec(pw, pad_w + ml, lp_dim("width", "layout_width")),
+                            EXACTLY | new_axis,
+                        )
+                    } else {
+                        (
+                            EXACTLY | new_axis,
+                            child_measure_spec(ph, pad_h + mv, lp_dim("height", "layout_height")),
+                        )
+                    };
+                    if vm
+                        .call_virtual(ch, "measure", &[V::I32(ws), V::I32(hs)])
+                        .is_ok()
+                    {
+                        added += new_axis - old_axis;
+                        let new_cross = if linear_v {
+                            pint(vm, ch, P_MEAS_W) & 0x00FF_FFFF
+                        } else {
+                            pint(vm, ch, P_MEAS_H) & 0x00FF_FFFF
+                        };
+                        if linear_v {
+                            cw = cw.max(new_cross + ml);
+                        } else {
+                            chh = chh.max(new_cross + mv);
+                        }
+                    }
+                }
+                if linear_v {
+                    chh += added;
+                } else {
+                    cw += added;
+                }
+            }
+        }
+    }
+    // AOSP RelativeLayout.onMeasure derives WRAP bounds from the
+    // rule-resolved child positions — a `layout_below` child counts at
+    // its anchor's bottom, not at the origin. Without this a relative
+    // container wraps to its tallest child alone and everything stacked
+    // below the anchor overflows past the measured bottom (fossify
+    // home's launcher label lands under the icon, outside the cell).
+    if relative {
+        const MODE_MASK: i32 = 0x3 << 30;
+        const EXACTLY: i32 = 1 << 30;
+        const SIZE_MASK: i32 = 0x3FFF_FFFF;
+        // Pass -1 on a non-EXACTLY axis: parent-edge/center/match rules
+        // can't resolve against an unknown extent (AOSP's myWidth=-1).
+        let aw = if pw & MODE_MASK == EXACTLY {
+            pw & SIZE_MASK
+        } else {
+            -1
+        };
+        let ah = if ph & MODE_MASK == EXACTLY {
+            ph & SIZE_MASK
+        } else {
+            -1
+        };
+        let pad_l = lp_px(vm, attr_find(vm, this, "paddingLeft").unwrap_or(V::I32(0))).unwrap_or(0);
+        let pad_t = lp_px(vm, attr_find(vm, this, "paddingTop").unwrap_or(V::I32(0))).unwrap_or(0);
+        let ks = relative_positions(vm, this, aw, ah);
+        if crate::dbg_flag("OVELO_VIEWDBG") {
+            eprintln!(
+                "[viewdbg] relMeas h{this} aw={aw} ah={ah} cw={cw} chh={chh} kids={}",
+                ks.len()
+            );
+            for k in &ks {
+                eprintln!(
+                    "[viewdbg]   kid h{} {}x{} rect={:?}",
+                    k.ch, k.w, k.h, k.rect
+                );
+            }
+        }
+        for k in ks {
+            let (_, _, r, b) = k.rect;
+            // rect coords include this view's padding (lead = pad +
+            // margin) — strip it so `+ pad` below isn't double-counted.
+            cw = cw.max(r + k.mr - pad_l);
+            chh = chh.max(b + k.mb - pad_t);
         }
     }
     let self_w = resolve_size(cw + pad_w, pw, true).max(0);
@@ -3310,8 +4250,7 @@ fn group_layout_fallback(vm: &mut Vm, this: u32, _l: i32, _t: i32, r: i32, b: i3
     let pad_l = lp_px(vm, attr_find(vm, this, "paddingLeft").unwrap_or(V::I32(0))).unwrap_or(0);
     let pad_t = lp_px(vm, attr_find(vm, this, "paddingTop").unwrap_or(V::I32(0))).unwrap_or(0);
     let desc = class_of(vm, V::Ref(this));
-    let linear =
-        desc.contains("LinearLayout") || vm.extends_named(&desc, "LinearLayout");
+    let linear = desc.contains("LinearLayout") || vm.extends_named(&desc, "LinearLayout");
     let linear_h = linear && !linear_vertical(vm, this);
     if !linear && vm.extends_named(&desc, "RelativeLayout") {
         relative_layout_fallback(vm, this, r - _l, b - _t);
@@ -3359,7 +4298,7 @@ fn group_layout_fallback(vm: &mut Vm, this: u32, _l: i32, _t: i32, r: i32, b: i3
         } else {
             (pad_l + ml, pad_t + mt)
         };
-        if std::env::var_os("OVELO_VIEWDBG").is_some() {
+        if crate::dbg_flag("OVELO_VIEWDBG") {
             eprintln!("[viewdbg] groupLayout h{ch} meas={cw}x{chh} at {cl},{ct}");
         }
         if let Err(e) = vm.call_virtual(
@@ -3367,8 +4306,38 @@ fn group_layout_fallback(vm: &mut Vm, this: u32, _l: i32, _t: i32, r: i32, b: i3
             "layout",
             &[V::I32(cl), V::I32(ct), V::I32(cl + cw), V::I32(ct + chh)],
         ) {
-            if std::env::var_os("OVELO_VIEWDBG").is_some() {
+            if crate::dbg_flag("OVELO_VIEWDBG") {
                 eprintln!("[viewdbg] groupLayout h{ch} err {e}");
+                if e.to_string().contains("ConstraintWidget") {
+                    for k in children(vm, ch) {
+                        if let V::Ref(kh) = k {
+                            let lp = pseudo_get(vm, kh, P_LP).unwrap_or(V::Ref(0));
+                            let (lc, wid) = match lp {
+                                V::Ref(lh) if lh != 0 => {
+                                    let w = match vm.heap.get(lh) {
+                                        Some(Obj::Instance { fields, .. })
+                                        | Some(Obj::Host { fields, .. }) => vm
+                                            .field_keys_named(
+                                                "widget",
+                                                "Landroidx/constraintlayout/solver/widgets/ConstraintWidget;",
+                                            )
+                                            .iter()
+                                            .any(|(_, g)| {
+                                                fields.get(g).is_some_and(|v| *v != V::Ref(0))
+                                            }),
+                                        _ => false,
+                                    };
+                                    (class_of(vm, lp), w)
+                                }
+                                _ => ("none".into(), false),
+                            };
+                            eprintln!(
+                                "[viewdbg]   clkid h{kh} {} lp={lc} widget={wid}",
+                                class_of(vm, k)
+                            );
+                        }
+                    }
+                }
             }
         }
         cur_t = ct + chh + mb;
@@ -3376,18 +4345,38 @@ fn group_layout_fallback(vm: &mut Vm, this: u32, _l: i32, _t: i32, r: i32, b: i3
     }
 }
 
-/// `RelativeLayout` subset: resolve the usual XML rules
+struct RelKid {
+    ch: u32,
+    id: i32,
+    w: i32,
+    h: i32,
+    ml: i32,
+    mt: i32,
+    mr: i32,
+    mb: i32,
+    match_w: bool,
+    match_h: bool,
+    rect: (i32, i32, i32, i32),
+}
+
+/// `RelativeLayout` position resolution: resolve the usual XML rules
 /// (`layout_alignParent*`, `layout_center*`, `layout_below`/`above`,
 /// `layout_toRightOf`/`toLeftOf`, `layout_align*`) against the
 /// container's content rect at each child's measured size + margins.
-/// Without this every child lands on the same origin — the pile of
-/// overlapped views that used to be the whole month page.
-/// `w`/`h` are the container's content size in its own coordinates.
-fn relative_layout_fallback(vm: &mut Vm, this: u32, w: i32, h: i32) {
+/// `w`/`h` are the container's full size in its own coordinates; an
+/// axis may pass `-1` when the extent is still unknown (a WRAP_CONTENT
+/// measure) — parent-edge/center/match rules on that axis are then
+/// ignored, matching AOSP's `myWidth/myHeight = -1` behavior.
+/// Pure reads: usable from both measure (content bounds) and layout.
+fn relative_positions(vm: &mut Vm, this: u32, w: i32, h: i32) -> Vec<RelKid> {
     let pad_l = lp_px(vm, attr_find(vm, this, "paddingLeft").unwrap_or(V::I32(0))).unwrap_or(0);
     let pad_t = lp_px(vm, attr_find(vm, this, "paddingTop").unwrap_or(V::I32(0))).unwrap_or(0);
     let pad_r = lp_px(vm, attr_find(vm, this, "paddingRight").unwrap_or(V::I32(0))).unwrap_or(0);
-    let pad_b = lp_px(vm, attr_find(vm, this, "paddingBottom").unwrap_or(V::I32(0))).unwrap_or(0);
+    let pad_b = lp_px(
+        vm,
+        attr_find(vm, this, "paddingBottom").unwrap_or(V::I32(0)),
+    )
+    .unwrap_or(0);
     let kids: Vec<u32> = children(vm, this)
         .into_iter()
         .filter_map(|v| match v {
@@ -3406,18 +4395,7 @@ fn relative_layout_fallback(vm: &mut Vm, this: u32, w: i32, h: i32) {
         }
         0
     };
-    struct Kid {
-        id: i32,
-        w: i32,
-        h: i32,
-        ml: i32,
-        mt: i32,
-        mr: i32,
-        mb: i32,
-        match_w: bool,
-        match_h: bool,
-    }
-    let mut ks: Vec<Kid> = Vec::with_capacity(n);
+    let mut ks: Vec<RelKid> = Vec::with_capacity(n);
     for &ch in &kids {
         let lp_obj = match pseudo_get(vm, ch, P_LP) {
             Some(V::Ref(lp)) => lp,
@@ -3431,7 +4409,8 @@ fn relative_layout_fallback(vm: &mut Vm, this: u32, w: i32, h: i32) {
                 .or_else(|| attr_find(vm, ch, xml).map(|v| len_v(vm, v)))
                 .unwrap_or(-2)
         };
-        ks.push(Kid {
+        ks.push(RelKid {
+            ch,
             id: pint(vm, ch, P_VIEW_ID),
             w: pint(vm, ch, P_MEAS_W) & 0x00FF_FFFF,
             h: pint(vm, ch, P_MEAS_H) & 0x00FF_FFFF,
@@ -3441,6 +4420,7 @@ fn relative_layout_fallback(vm: &mut Vm, this: u32, w: i32, h: i32) {
             mb: margin(vm, ch, "bottomMargin"),
             match_w: lp_dim("width", "layout_width") == -1,
             match_h: lp_dim("height", "layout_height") == -1,
+            rect: (0, 0, 0, 0),
         });
     }
     let idx_of = |id: i32| -> Option<usize> {
@@ -3466,143 +4446,138 @@ fn relative_layout_fallback(vm: &mut Vm, this: u32, w: i32, h: i32) {
     // Each axis yields (leading, trailing) content-coord edges; a
     // missing trailing edge falls back to leading+measured.
     type Axis = Vec<Option<(i32, i32)>>;
-    let resolve_edges = |vm: &Vm,
-                         ch: u32,
-                         k: &Kid,
-                         placed: &Axis,
-                         horiz: bool|
-     -> Option<(i32, i32)> {
-        // Leading edge: sibling rules first (toRightOf/alignLeft,
-        // below/alignTop), else the parent's near edge.
-        let (lead_rules, trail_parent, lead_parent, lead_sib_rules, size, mlead, mtrail, mp) =
-            if horiz {
-                (
-                    &["layout_toRightOf", "layout_toEndOf"][..],
-                    &["layout_alignParentRight", "layout_alignParentEnd"][..],
-                    &["layout_alignParentLeft", "layout_alignParentStart"][..],
-                    &["layout_alignLeft", "layout_alignStart"][..],
-                    k.w,
-                    k.ml,
-                    k.mr,
-                    k.match_w,
-                )
+    let resolve_edges =
+        |vm: &Vm, ch: u32, k: &RelKid, placed: &Axis, horiz: bool| -> Option<(i32, i32)> {
+            // Leading edge: sibling rules first (toRightOf/alignLeft,
+            // below/alignTop), else the parent's near edge.
+            let (lead_rules, trail_parent, lead_parent, lead_sib_rules, size, mlead, mtrail, mp) =
+                if horiz {
+                    (
+                        &["layout_toRightOf", "layout_toEndOf"][..],
+                        &["layout_alignParentRight", "layout_alignParentEnd"][..],
+                        &["layout_alignParentLeft", "layout_alignParentStart"][..],
+                        &["layout_alignLeft", "layout_alignStart"][..],
+                        k.w,
+                        k.ml,
+                        k.mr,
+                        k.match_w,
+                    )
+                } else {
+                    (
+                        &["layout_below"][..],
+                        &["layout_alignParentBottom"][..],
+                        &["layout_alignParentTop"][..],
+                        &["layout_alignTop"][..],
+                        k.h,
+                        k.mt,
+                        k.mb,
+                        k.match_h,
+                    )
+                };
+            let (extent, pleading, ptrailing) = if horiz {
+                (w, pad_l, pad_r)
             } else {
-                (
-                    &["layout_below"][..],
-                    &["layout_alignParentBottom"][..],
-                    &["layout_alignParentTop"][..],
-                    &["layout_alignTop"][..],
-                    k.h,
-                    k.mt,
-                    k.mb,
-                    k.match_h,
-                )
+                (h, pad_t, pad_b)
             };
-        let (extent, pleading, ptrailing) = if horiz {
-            (w, pad_l, pad_r)
-        } else {
-            (h, pad_t, pad_b)
-        };
-        let sib_edge = |id: i32, trailing: bool| -> Option<Option<i32>> {
-            // Some(edge) = rule present; the inner Option is the
-            // sibling's resolved edge (None while unplaced).
-            Some(idx_of(id).and_then(|j| {
-                placed[j].map(|(a, b)| if trailing { b } else { a })
-            }))
-        };
+            let sib_edge = |id: i32, trailing: bool| -> Option<Option<i32>> {
+                // Some(edge) = rule present; the inner Option is the
+                // sibling's resolved edge (None while unplaced).
+                Some(idx_of(id).and_then(|j| placed[j].map(|(a, b)| if trailing { b } else { a })))
+            };
 
-        let mut lead: Option<i32> = None;
-        let mut trail: Option<i32> = None;
-        let mut pending = false;
-        if truthy(rule(vm, ch, trail_parent)) {
-            trail = Some(extent - ptrailing - mtrail);
-        }
-        if truthy(rule(vm, ch, lead_parent)) {
-            lead = Some(pleading + mlead);
-        }
-        if let Some(dep) = ref_id(rule(vm, ch, lead_rules)) {
-            match sib_edge(dep, true) {
-                Some(Some(e)) => lead = Some(e + mlead),
-                Some(None) => pending = true,
-                None => {}
+            let mut lead: Option<i32> = None;
+            let mut trail: Option<i32> = None;
+            let mut pending = false;
+            // extent < 0: WRAP axis mid-measure — parent-edge anchors
+            // can't resolve yet (AOSP leaves myWidth/myHeight = -1).
+            if extent >= 0 && truthy(rule(vm, ch, trail_parent)) {
+                trail = Some(extent - ptrailing - mtrail);
             }
-        }
-        if let Some(dep) = ref_id(rule(vm, ch, lead_sib_rules)) {
-            match sib_edge(dep, false) {
-                Some(Some(e)) => lead = Some(e + mlead),
-                Some(None) => pending = true,
-                None => {}
+            if truthy(rule(vm, ch, lead_parent)) {
+                lead = Some(pleading + mlead);
             }
-        }
-        // Trailing edge, sibling-anchored: `toLeftOf`/`toStartOf`/
-        // `above` anchor the sibling's leading edge, `alignRight`/
-        // `alignEnd`/`alignBottom` its trailing edge — separate rule
-        // sets since they read opposite edges.
-        let (trail_lead_anchor, trail_trail_anchor) = if horiz {
-            (
-                &["layout_toLeftOf", "layout_toStartOf"][..],
-                &["layout_alignRight", "layout_alignEnd"][..],
-            )
-        } else {
-            (&["layout_above"][..], &["layout_alignBottom"][..])
-        };
-        for (names, on_trailing) in [
-            (trail_lead_anchor, false),
-            (trail_trail_anchor, true),
-        ] {
-            if let Some(dep) = ref_id(rule(vm, ch, names)) {
-                match sib_edge(dep, on_trailing) {
-                    Some(Some(e)) => trail = Some(e - mtrail),
+            if let Some(dep) = ref_id(rule(vm, ch, lead_rules)) {
+                match sib_edge(dep, true) {
+                    Some(Some(e)) => lead = Some(e + mlead),
                     Some(None) => pending = true,
                     None => {}
                 }
             }
-        }
+            if let Some(dep) = ref_id(rule(vm, ch, lead_sib_rules)) {
+                match sib_edge(dep, false) {
+                    Some(Some(e)) => lead = Some(e + mlead),
+                    Some(None) => pending = true,
+                    None => {}
+                }
+            }
+            // Trailing edge, sibling-anchored: `toLeftOf`/`toStartOf`/
+            // `above` anchor the sibling's leading edge, `alignRight`/
+            // `alignEnd`/`alignBottom` its trailing edge — separate rule
+            // sets since they read opposite edges.
+            let (trail_lead_anchor, trail_trail_anchor) = if horiz {
+                (
+                    &["layout_toLeftOf", "layout_toStartOf"][..],
+                    &["layout_alignRight", "layout_alignEnd"][..],
+                )
+            } else {
+                (&["layout_above"][..], &["layout_alignBottom"][..])
+            };
+            for (names, on_trailing) in [(trail_lead_anchor, false), (trail_trail_anchor, true)] {
+                if let Some(dep) = ref_id(rule(vm, ch, names)) {
+                    match sib_edge(dep, on_trailing) {
+                        Some(Some(e)) => trail = Some(e - mtrail),
+                        Some(None) => pending = true,
+                        None => {}
+                    }
+                }
+            }
 
-        if pending {
-            return None;
-        }
-        match (lead, trail) {
-            (Some(l), Some(t)) => Some((l, t)),
-            (Some(l), None) => {
-                // match_parent anchored only on the leading edge fills
-                // the rest of the parent's content box.
-                if mp {
-                    Some((l, extent - ptrailing - mtrail))
-                } else {
-                    Some((l, l + size))
+            if pending {
+                return None;
+            }
+            match (lead, trail) {
+                (Some(l), Some(t)) => Some((l, t)),
+                (Some(l), None) => {
+                    // match_parent anchored only on the leading edge fills
+                    // the rest of the parent's content box.
+                    if mp && extent >= 0 {
+                        Some((l, extent - ptrailing - mtrail))
+                    } else {
+                        Some((l, l + size))
+                    }
+                }
+                (None, Some(t)) => {
+                    // match_parent anchored only on the trailing edge
+                    // (`layout_above` + match_height) stretches up to the
+                    // parent's leading edge instead of overflowing above it.
+                    if mp {
+                        Some((pleading + mlead, t))
+                    } else {
+                        Some((t - size, t))
+                    }
+                }
+                (None, None) => {
+                    if extent >= 0
+                        && (truthy(rule(vm, ch, &["layout_centerInParent"]))
+                            || truthy(rule(
+                                vm,
+                                ch,
+                                if horiz {
+                                    &["layout_centerHorizontal"]
+                                } else {
+                                    &["layout_centerVertical"]
+                                },
+                            )))
+                    {
+                        let c =
+                            pleading + (extent - pleading - ptrailing - size) / 2 + mlead - mtrail;
+                        Some((c, c + size))
+                    } else {
+                        Some((pleading + mlead, pleading + mlead + size))
+                    }
                 }
             }
-            (None, Some(t)) => {
-                // match_parent anchored only on the trailing edge
-                // (`layout_above` + match_height) stretches up to the
-                // parent's leading edge instead of overflowing above it.
-                if mp {
-                    Some((pleading + mlead, t))
-                } else {
-                    Some((t - size, t))
-                }
-            }
-            (None, None) => {
-                if truthy(rule(vm, ch, &["layout_centerInParent"]))
-                    || truthy(rule(
-                        vm,
-                        ch,
-                        if horiz {
-                            &["layout_centerHorizontal"]
-                        } else {
-                            &["layout_centerVertical"]
-                        },
-                    ))
-                {
-                    let c = pleading + (extent - pleading - ptrailing - size) / 2 + mlead - mtrail;
-                    Some((c, c + size))
-                } else {
-                    Some((pleading + mlead, pleading + mlead + size))
-                }
-            }
-        }
-    };
+        };
     // Bounded fixpoint per axis — each pass places every child whose
     // deps resolved; cycles/missing ids leave the child at origin.
     let mut xf: Axis = vec![None; n];
@@ -3627,28 +4602,36 @@ fn relative_layout_fallback(vm: &mut Vm, this: u32, w: i32, h: i32) {
             break;
         }
     }
-    let pos: Vec<(i32, i32, i32, i32)> = (0..n)
-        .map(|i| {
-            let (l, r) = xf[i].unwrap_or_else(|| {
-                let l = pad_l + ks[i].ml;
-                (l, l + ks[i].w)
-            });
-            let (t, b) = yf[i].unwrap_or_else(|| {
-                let t = pad_t + ks[i].mt;
-                (t, t + ks[i].h)
-            });
-            (l, t, r, b)
-        })
-        .collect();
-    for (i, &ch) in kids.iter().enumerate() {
-        let (cl, ct, cr, cb) = pos[i];
+    for i in 0..n {
+        let (l, r) = xf[i].unwrap_or_else(|| {
+            let l = pad_l + ks[i].ml;
+            (l, l + ks[i].w)
+        });
+        let (t, b) = yf[i].unwrap_or_else(|| {
+            let t = pad_t + ks[i].mt;
+            (t, t + ks[i].h)
+        });
+        ks[i].rect = (l, t, r, b);
+    }
+    ks
+}
+
+/// `RelativeLayout` subset: lay children out at the positions
+/// `relative_positions` resolved. Without this every child lands on
+/// the same origin — the pile of overlapped views that used to be the
+/// whole month page.
+fn relative_layout_fallback(vm: &mut Vm, this: u32, w: i32, h: i32) {
+    let ks = relative_positions(vm, this, w, h);
+    for k in &ks {
+        let ch = k.ch;
+        let (cl, ct, cr, cb) = k.rect;
         // AOSP RelativeLayout measures children twice — once raw, once
         // under the dependency-resolved extent. Re-measure a child
         // whose rule-resolved size differs from its first pass so its
         // own `onLayout`/descendants see the squeezed bounds instead
         // of the unconstrained measurement.
         let (rw, rh) = (cr - cl, cb - ct);
-        if rw != ks[i].w || rh != ks[i].h {
+        if rw != k.w || rh != k.h {
             const EXACTLY: i32 = 1 << 30;
             // Read the LIVE LayoutParams dims — `setLayoutParams`
             // mutations beat the XML attrs. Spec per axis: a changed
@@ -3668,33 +4651,47 @@ fn relative_layout_fallback(vm: &mut Vm, this: u32, w: i32, h: i32) {
             };
             let dw = dim("width", "layout_width");
             let dh = dim("height", "layout_height");
-            let ws = if rw != ks[i].w {
+            let ws = if rw != k.w {
                 child_measure_spec(EXACTLY | rw.max(0), 0, dw)
             } else {
                 EXACTLY | rw.max(0)
             };
-            let hs = if rh != ks[i].h {
+            let hs = if rh != k.h {
                 child_measure_spec(EXACTLY | rh.max(0), 0, dh)
             } else {
                 EXACTLY | rh.max(0)
             };
             let _ = vm.call_virtual(ch, "measure", &[V::I32(ws), V::I32(hs)]);
         }
-        if std::env::var_os("OVELO_VIEWDBG").is_some() {
+        if crate::dbg_flag("OVELO_VIEWDBG") {
             let rules: Vec<String> = [
-                "layout_centerInParent", "layout_centerHorizontal", "layout_centerVertical",
-                "layout_alignParentRight", "layout_alignParentEnd", "layout_alignParentBottom",
-                "layout_alignParentTop", "layout_alignParentLeft", "layout_toRightOf",
-                "layout_toEndOf", "layout_toLeftOf", "layout_toStartOf", "layout_alignLeft",
-                "layout_alignStart", "layout_alignRight", "layout_alignEnd", "layout_below",
-                "layout_above", "layout_alignTop", "layout_alignBottom",
+                "layout_centerInParent",
+                "layout_centerHorizontal",
+                "layout_centerVertical",
+                "layout_alignParentRight",
+                "layout_alignParentEnd",
+                "layout_alignParentBottom",
+                "layout_alignParentTop",
+                "layout_alignParentLeft",
+                "layout_toRightOf",
+                "layout_toEndOf",
+                "layout_toLeftOf",
+                "layout_toStartOf",
+                "layout_alignLeft",
+                "layout_alignStart",
+                "layout_alignRight",
+                "layout_alignEnd",
+                "layout_below",
+                "layout_above",
+                "layout_alignTop",
+                "layout_alignBottom",
             ]
             .iter()
             .filter_map(|n| attr_find(vm, ch, n).map(|v| format!("{n}={v:?}")))
             .collect();
             eprintln!(
                 "[viewdbg] relLayout h{ch} id={:#x} meas={}x{} at {cl},{ct} rules={:?}",
-                ks[i].id, ks[i].w, ks[i].h, rules
+                k.id, k.w, k.h, rules
             );
         }
         if let Err(e) = vm.call_virtual(
@@ -3702,7 +4699,7 @@ fn relative_layout_fallback(vm: &mut Vm, this: u32, w: i32, h: i32) {
             "layout",
             &[V::I32(cl), V::I32(ct), V::I32(cr), V::I32(cb)],
         ) {
-            if std::env::var_os("OVELO_VIEWDBG").is_some() {
+            if crate::dbg_flag("OVELO_VIEWDBG") {
                 eprintln!("[viewdbg] relLayout h{ch} err {e}");
             }
         }
@@ -3744,8 +4741,7 @@ fn lp_ctor(vm: &mut Vm, class: &str, sig: &str, args: &[V]) {
     let mut writes: Vec<(String, String, V)> = Vec::new();
     if sig.contains("AttributeSet") {
         for (attr, fields) in LP_ATTRS {
-            let Some(v) = attrset_value(vm, args.get(2).copied().unwrap_or(V::Ref(0)), attr)
-            else {
+            let Some(v) = attrset_value(vm, args.get(2).copied().unwrap_or(V::Ref(0)), attr) else {
                 continue;
             };
             for f in *fields {
@@ -3859,12 +4855,7 @@ fn lp_class_for(vm: &Vm, parent: u32) -> String {
 fn default_lp(vm: &mut Vm, parent: u32) -> V {
     let lp = lp_class_for(vm, parent);
     let h = vm.alloc_host(&lp, HostState::Empty);
-    lp_ctor(
-        vm,
-        &lp,
-        "(II)V",
-        &[V::Ref(h), V::I32(-2), V::I32(-2)],
-    );
+    lp_ctor(vm, &lp, "(II)V", &[V::Ref(h), V::I32(-2), V::I32(-2)]);
     V::Ref(h)
 }
 
@@ -3951,7 +4942,7 @@ fn expand_includes(vm: &Vm, elems: &[Element]) -> Vec<Element> {
                     }
                 }
                 Some(sub) if !sub.is_empty() => {
-                    if std::env::var_os("OVELO_VIEWDBG").is_some() {
+                    if crate::dbg_flag("OVELO_VIEWDBG") {
                         eprintln!(
                             "[viewdbg] include → {layout:#x} ({} elems, root {})",
                             sub.len(),
@@ -4025,7 +5016,7 @@ fn set_id_attr(el: &mut Element, id: i32) {
 
 fn build_tree(vm: &mut Vm, elems: &[Element], ctx: V) -> V {
     let expanded = expand_includes(vm, elems);
-    if std::env::var_os("OVELO_VIEWDBG").is_some() {
+    if crate::dbg_flag("OVELO_VIEWDBG") {
         let tags: Vec<String> = expanded
             .iter()
             .map(|e| format!("d{}:{}", e.depth, e.name))
@@ -4047,7 +5038,7 @@ fn build_tree(vm: &mut Vm, elems: &[Element], ctx: V) -> V {
         };
         let attrs = attrset_of(vm, el);
         let v = make_view_named(vm, &name, attrs, ctx);
-        if std::env::var_os("OVELO_VIEWDBG").is_some() {
+        if crate::dbg_flag("OVELO_VIEWDBG") {
             eprintln!("[viewdbg] elem d{} {} -> {v:?}", el.depth, el.name);
         }
         let V::Ref(h) = v else {
@@ -4064,6 +5055,29 @@ fn build_tree(vm: &mut Vm, elems: &[Element], ctx: V) -> V {
         if let Some(Value::Str(t)) = el.android("tag") {
             let v = jstr(vm, t);
             pseudo_set(vm, h, P_TAG, v);
+        }
+        // `android:visibility` — the XML enum (0=visible, 1=invisible,
+        // 2=gone) maps onto the View constants (0/4/8); AOSP honors it
+        // in the ctor's AttributeSet read so getVisibility reflects it
+        // before any setVisibility call.
+        // A ctor-set visibility wins over the XML default — in AOSP the
+        // attr is read inside the constructor, so a later setVisibility
+        // call in the same ctor would override it.
+        if pseudo_get(vm, h, P_VIS).is_none() {
+            if let Some(v) = el.android("visibility") {
+                let vis = match v {
+                    Value::Int(1) => 4,
+                    Value::Int(2) => 8,
+                    Value::Int(_) => 0,
+                    Value::Str(s) => match s.as_str() {
+                        "invisible" => 4,
+                        "gone" => 8,
+                        _ => 0,
+                    },
+                    _ => 0,
+                };
+                pseudo_set(vm, h, P_VIS, V::I32(vis));
+            }
         }
         if let Some(Value::Str(t)) = el.android("text") {
             let v = jstr(vm, t);
@@ -4090,7 +5104,7 @@ fn build_tree(vm: &mut Vm, elems: &[Element], ctx: V) -> V {
         match stack.last() {
             Some((_, p)) => {
                 let p = *p;
-                if std::env::var_os("OVELO_VIEWDBG").is_some() {
+                if crate::dbg_flag("OVELO_VIEWDBG") {
                     eprintln!("[viewdbg] attach h{h} -> parent h{p}");
                 }
                 attach(vm, p, V::Ref(h));
@@ -4173,6 +5187,234 @@ fn view_id(vm: &Vm, h: u32) -> i32 {
     }
 }
 
+/// Route a host pointer event into the dex view tree: the deepest view
+/// whose frame contains (x,y) gets a MotionEvent, propagated up the
+/// parent chain until handled — dex `dispatchTouchEvent` /
+/// `onTouchEvent` first, then a registered `OnTouchListener`. Without
+/// this bridge, dex-materialized views (games: libGDX's input view)
+/// never see host input.
+pub(crate) fn dispatch_touch(
+    vm: &mut Vm,
+    x: i32,
+    y: i32,
+    action: i32,
+) -> ovelo_error::Result<bool> {
+    // Ok(true) when the dex tree claimed the point — the caller then
+    // skips its own (host-widget) dispatch for the gesture so a view
+    // mirrored in both trees never fires its listener twice.
+    // Child frames are stored in the PARENT's content coordinates
+    // (group_layout_fallback), so the hit test must carry each
+    // ancestor's absolute origin down the recursion.
+    fn deepest(vm: &Vm, h: u32, x: i32, y: i32, ox: i32, oy: i32) -> Option<u32> {
+        // AOSP: INVISIBLE/GONE views can't receive touches.
+        if pint(vm, h, P_VIS) != 0 {
+            return None;
+        }
+        let l = ox + pint(vm, h, P_LEFT);
+        let t = oy + pint(vm, h, P_TOP);
+        let r = ox + pint(vm, h, P_RIGHT);
+        let b = oy + pint(vm, h, P_BOTTOM);
+        if crate::dbg_flag("OVELO_TOUCHDBG") {
+            eprintln!(
+                "[touchdbg]   try h{h} {} {l},{t},{r},{b}",
+                vm.dbg_class_of(h)
+            );
+        }
+        let inside = x >= l && x < r && y >= t && y < b;
+        if !inside && r > l && b > t {
+            return None;
+        }
+        // Later children draw on top — hit-test them first. A node
+        // with a degenerate frame (r<=l || b<=t — the layout pass
+        // never ran or produced 0×0, e.g. a FragmentContainerView
+        // whose fragment tree was materialized without a real layout)
+        // still descends: its children can carry real frames, and
+        // pruning here leaves the whole subtree untouchable.
+        for c in children(vm, h).iter().rev() {
+            if let V::Ref(ch) = c {
+                if *ch != 0 {
+                    if let Some(v) = deepest(vm, *ch, x, y, l, t) {
+                        return Some(v);
+                    }
+                }
+            }
+        }
+        // A degenerate-frame node claims nothing by itself.
+        if !inside {
+            return None;
+        }
+        Some(h)
+    }
+    fn abs_origin(vm: &Vm, mut v: u32) -> (i32, i32) {
+        let (mut ox, mut oy) = (0, 0);
+        for _ in 0..64 {
+            ox += pint(vm, v, P_LEFT);
+            oy += pint(vm, v, P_TOP);
+            v = match pseudo_get(vm, v, P_PARENT) {
+                Some(V::Ref(p)) => p,
+                _ => break,
+            };
+        }
+        (ox, oy)
+    }
+    let dbg = crate::dbg_flag("OVELO_TOUCHDBG");
+    let mut target = 0u32;
+    for r in vm.view_roots.clone().iter().rev() {
+        if dbg {
+            eprintln!(
+                "[touchdbg] root h{r} {} {},{},{},{}",
+                vm.dbg_class_of(*r),
+                pint(vm, *r, P_LEFT),
+                pint(vm, *r, P_TOP),
+                pint(vm, *r, P_RIGHT),
+                pint(vm, *r, P_BOTTOM)
+            );
+        }
+        // A laid-out root only wins when the point is inside it —
+        // view_roots also collects detached adapter rows/dialog
+        // trees, and the last one would otherwise swallow every tap.
+        let l = pint(vm, *r, P_LEFT);
+        let t = pint(vm, *r, P_TOP);
+        let rr = pint(vm, *r, P_RIGHT);
+        let b = pint(vm, *r, P_BOTTOM);
+        let inside = if rr > l || b > t {
+            x >= l && x < rr && y >= t && y < b
+        } else {
+            // Never laid out yet — accept so early taps still land.
+            true
+        };
+        if !inside {
+            continue;
+        }
+        // A root's frame is already absolute (screen origin).
+        if let Some(v) = deepest(vm, *r, x, y, 0, 0) {
+            target = v;
+            break;
+        }
+    }
+    if target == 0 {
+        if dbg {
+            eprintln!(
+                "[touchdbg] {x},{y} a{action} no hit (roots {})",
+                vm.view_roots.len()
+            );
+        }
+        return Ok(false);
+    }
+    if dbg {
+        eprintln!(
+            "[touchdbg] {x},{y} a{action} hit h{target} {}",
+            vm.dbg_class_of(target)
+        );
+    }
+    let V::Ref(evt) = host(vm, "Landroid/view/MotionEvent;", HostState::Empty) else {
+        return Ok(false);
+    };
+    pseudo_set(vm, evt, P_ME_ACTION, V::I32(action));
+    let now = now_ms();
+    pseudo_set(vm, evt, P_ME_DOWN_TIME, V::I64(now));
+    pseudo_set(vm, evt, P_ME_EVENT_TIME, V::I64(now));
+    pseudo_set(vm, evt, P_ME_RAWX, V::F32(x as f32));
+    pseudo_set(vm, evt, P_ME_RAWY, V::F32(y as f32));
+    let mut v = target;
+    for _ in 0..32 {
+        if v == 0 {
+            break;
+        }
+        // getX/getY report coordinates relative to the receiving
+        // view (AOSP transforms on dispatch) — rewrite before each hop.
+        let (ox, oy) = abs_origin(vm, v);
+        pseudo_set(vm, evt, P_ME_X, V::F32((x - ox) as f32));
+        pseudo_set(vm, evt, P_ME_Y, V::F32((y - oy) as f32));
+        if vm.has_dex_virtual(v, "dispatchTouchEvent", &["Landroid/view/MotionEvent;"]) {
+            if dbg {
+                eprintln!(
+                    "[touchdbg] h{v} dex dispatchTouchEvent {}",
+                    vm.dbg_class_of(v)
+                );
+            }
+            if vm
+                .call_virtual(v, "dispatchTouchEvent", &[V::Ref(evt)])
+                .is_ok()
+            {
+                return Ok(true);
+            }
+        }
+        if vm.has_dex_virtual(v, "onTouchEvent", &["Landroid/view/MotionEvent;"]) {
+            if dbg {
+                eprintln!("[touchdbg] h{v} dex onTouchEvent {}", vm.dbg_class_of(v));
+            }
+            let _ = vm.call_virtual(v, "onTouchEvent", &[V::Ref(evt)]);
+            return Ok(true);
+        }
+        if let Some(V::Ref(l)) = pseudo_get(vm, v, P_TOUCH_L) {
+            if l != 0 {
+                if dbg {
+                    eprintln!("[touchdbg] h{v} OnTouchListener.onTouch l{l}");
+                }
+                let _ = vm.call_virtual(l, "onTouch", &[V::Ref(v), V::Ref(evt)]);
+                return Ok(true);
+            }
+        }
+        // AOSP `View.onTouchEvent`: a clickable view consumes the touch
+        // and `performClick` fires the OnClickListener on ACTION_UP.
+        // The deepest ancestor with a listener wins.
+        if action == 1 {
+            if let Some(V::Ref(l)) = pseudo_get(vm, v, P_LISTENER) {
+                if l != 0 {
+                    if dbg {
+                        eprintln!("[touchdbg] h{v} OnClickListener.onClick l{l}");
+                    }
+                    let _ = vm.call_virtual(l, "onClick", &[V::Ref(v)]);
+                    return Ok(true);
+                }
+            }
+            if let Some(mname) = attr_find(vm, v, "onClick").and_then(|a| match a {
+                V::Ref(r) if r != 0 => s(vm, r),
+                _ => None,
+            }) {
+                let act = vm.cur_activity;
+                if act != 0 {
+                    if dbg {
+                        eprintln!("[touchdbg] h{v} xml onClick {mname}");
+                    }
+                    let _ = vm.call_virtual(act, &mname, &[V::Ref(v)]);
+                    return Ok(true);
+                }
+            }
+        }
+        v = match pseudo_get(vm, v, P_PARENT) {
+            Some(V::Ref(p)) => p,
+            _ => break,
+        };
+    }
+    // AOSP: touches no view consumed reach Activity.onTouchEvent —
+    // fullscreen games hook input there rather than on a view.
+    let act = vm.cur_activity;
+    if dbg {
+        eprintln!(
+            "[touchdbg] act={act} ote={}",
+            vm.has_dex_virtual(act, "onTouchEvent", &["Landroid/view/MotionEvent;"])
+        );
+    }
+    if act != 0 && vm.has_dex_virtual(act, "onTouchEvent", &["Landroid/view/MotionEvent;"]) {
+        pseudo_set(vm, evt, P_ME_X, V::F32(x as f32));
+        pseudo_set(vm, evt, P_ME_Y, V::F32(y as f32));
+        if dbg {
+            eprintln!("[touchdbg] activity onTouchEvent h{act}");
+        }
+        let _ = vm.call_virtual(act, "onTouchEvent", &[V::Ref(evt)]);
+        return Ok(true);
+    }
+    if dbg {
+        eprintln!("[touchdbg] {x},{y} a{action} unhandled");
+    }
+    // The hit view had no dex dispatchTouchEvent/onTouchEvent, no
+    // listener, and no activity hook — the host tree may hold the
+    // handler (host-materialized views keep listeners host-side).
+    Ok(false)
+}
+
 pub(crate) fn attach(vm: &mut Vm, parent: u32, child: V) {
     attach_at(vm, parent, child, None, true, None)
 }
@@ -4200,7 +5442,7 @@ pub(crate) fn attach_at(
         let mut cur = parent;
         for _ in 0..64 {
             if cur == ch {
-                if std::env::var_os("OVELO_VIEWDBG").is_some() {
+                if crate::dbg_flag("OVELO_VIEWDBG") {
                     eprintln!(
                         "[viewdbg] attach REFUSED h{ch} -> parent h{parent} (cycle) class={}",
                         vm.dbg_class_of(ch)
@@ -4236,6 +5478,22 @@ pub(crate) fn attach_at(
     }
     if let V::Ref(ch) = child {
         pseudo_set(vm, ch, P_PARENT, V::Ref(parent));
+        if crate::dbg_flag("OVELO_VIEWDBG") {
+            eprintln!(
+                "[viewdbg] attach_at h{ch} <- h{parent} parent_att={} cls={}",
+                pint(vm, parent, P_ATTACHED),
+                vm.dbg_class_of(ch)
+            );
+        }
+        // AOSP ViewGroup.addView → child.dispatchAttachedToWindow when
+        // the parent is already attached — set the flag first (AttachInfo
+        // is installed before the callback), then deliver the callback.
+        // AndroidComposeView.onAttachedToWindow is where the Compose
+        // root LayoutNode gets its Owner; skipping it leaves
+        // DepthSortedSet.remove crashing on unattached nodes.
+        if pint(vm, parent, P_ATTACHED) == 1 {
+            mark_attached(vm, ch, 0);
+        }
         // AOSP addViewInner checkLayoutParams → generateLayoutParams
         // first: ConstraintLayout's onViewAdded reads getLayoutParams()
         // and mints the child widget from the LP, so the LP must exist
@@ -4271,6 +5529,43 @@ pub(crate) fn attach_at(
             if let Some(v @ V::Ref(lp)) = lp {
                 if lp != 0 {
                     pseudo_set(vm, ch, P_LP, v);
+                }
+            }
+        }
+        // AOSP addViewInner: `checkLayoutParams` gates whatever LP the
+        // child ended up with — a foreign type (e.g. a bare
+        // ViewGroup$LayoutParams on a ConstraintLayout child, or a
+        // FrameLayout$LayoutParams from another parent) is wrapped by
+        // generateLayoutParams so the parent's own LP class — whose
+        // ctor mints ConstraintLayout's solver widget — is what the
+        // child's getLayoutParams returns. Storing a foreign LP
+        // verbatim leaves `lp.widget` null and the dex onLayout NPEs
+        // on ConstraintWidget.getX.
+        if let Some(v @ V::Ref(lph)) = pseudo_get(vm, ch, P_LP) {
+            if lph != 0 {
+                let ok = vm
+                    .call_virtual_sig(
+                        parent,
+                        "checkLayoutParams",
+                        &["Landroid/view/ViewGroup$LayoutParams;"],
+                        &[v],
+                    )
+                    .ok()
+                    .flatten()
+                    .map(|r| i32v(r) != 0)
+                    .unwrap_or(false);
+                if !ok {
+                    let wrapped = vm
+                        .call_virtual_sig(
+                            parent,
+                            "generateLayoutParams",
+                            &["Landroid/view/ViewGroup$LayoutParams;"],
+                            &[v],
+                        )
+                        .ok()
+                        .flatten()
+                        .unwrap_or(v);
+                    pseudo_set(vm, ch, P_LP, wrapped);
                 }
             }
         }
@@ -4314,6 +5609,7 @@ pub(crate) fn attach_at(
                 Some(V::Ref(a)) => a,
                 _ => vm.cur_activity,
             };
+            vm.content_frames.insert(owner, parent);
             vm.content_views.insert(owner, ch);
             vm.decor_roots.insert(owner, top);
         }
@@ -4323,7 +5619,7 @@ pub(crate) fn attach_at(
 /// `notify` fires `onViewRemoved` — real `removeView*` paths only;
 /// the ChildHelper's transient `detachViewFromParent` never notifies
 /// (the child is coming right back).
-fn detach(vm: &mut Vm, parent: u32, child: V, notify: bool) {
+pub(crate) fn detach(vm: &mut Vm, parent: u32, child: V, notify: bool) {
     let Some(a) = children_arr(vm, parent) else {
         return;
     };
@@ -4340,10 +5636,71 @@ fn detach(vm: &mut Vm, parent: u32, child: V, notify: bool) {
             // Mirror onViewAdded: dex parents unregister the child here
             // (ConstraintLayout drops it from mChildrenById; adapters
             // recycle through detach and stale registrations would keep
-            // dead views in subsequent passes).
+            // dead views in subsequent passes). A real remove also ends
+            // the child's attach — `view_is_attached` must stop being
+            // true or e.g. the GL pump keeps driving an orphaned
+            // SurfaceView after setContentView replaces the tree.
             if notify {
+                clear_attached(vm, ch, 0);
                 let _ = vm.call_virtual_rt(parent, "onViewRemoved", &[V::Ref(ch)]);
             }
+        }
+    }
+}
+
+/// `dispatchAttachedToWindow` bookkeeping: set the attach mark and
+/// deliver `onAttachedToWindow` on the view and every still-unattached
+/// descendant (depth-bounded like `find_in_tree_at`). Needed when a
+/// view was added before its parent attached — the parent's later
+/// attach must reach the existing subtree, not just future children.
+fn mark_attached(vm: &mut Vm, h: u32, depth: u32) {
+    if h == 0 || depth > 128 {
+        return;
+    }
+    if pint(vm, h, P_ATTACHED) != 1 {
+        pseudo_set(vm, h, P_ATTACHED, V::I32(1));
+        let r = vm.call_virtual(h, "onAttachedToWindow", &[]);
+        if crate::dbg_flag("OVELO_VIEWDBG") {
+            match r {
+                Ok(_) => eprintln!("[viewdbg] onAttachedToWindow h{h} ok"),
+                Err(e) => eprintln!("[viewdbg] onAttachedToWindow h{h} err {e}"),
+            }
+        }
+    }
+    for c in children(vm, h) {
+        if let V::Ref(ch) = c {
+            mark_attached(vm, ch, depth + 1);
+        }
+    }
+}
+
+/// First window attachment for a materialized view: ViewRootImpl
+/// attaches the whole decor subtree, not just the node the renderer
+/// happened to materialize. Climb to the highest recorded parent and
+/// dispatch downward so later addView calls also propagate attachment.
+pub(crate) fn window_attached(vm: &mut Vm, h: u32) {
+    let mut root = h;
+    let mut hops = 0;
+    while let Some(V::Ref(p)) = pseudo_get(vm, root, P_PARENT) {
+        if p == 0 || hops > 128 {
+            break;
+        }
+        root = p;
+        hops += 1;
+    }
+    mark_attached(vm, root, 0);
+}
+
+/// `dispatchDetachedFromWindow` bookkeeping: clear the attach mark on
+/// the view and its subtree (depth-bounded like `find_in_tree_at`).
+fn clear_attached(vm: &mut Vm, h: u32, depth: u32) {
+    if h == 0 || depth > 128 {
+        return;
+    }
+    pseudo_set(vm, h, P_ATTACHED, V::I32(0));
+    for c in children(vm, h) {
+        if let V::Ref(ch) = c {
+            clear_attached(vm, ch, depth + 1);
         }
     }
 }
@@ -4374,6 +5731,14 @@ fn find_in_tree_at(vm: &Vm, root: u32, id: i32, depth: u32) -> Option<u32> {
 
 fn is_marked(vm: &Vm, h: u32) -> bool {
     h != 0 && pseudo_get(vm, h, P_IS_VIEW).is_some()
+}
+
+/// The view's recorded parent handle (0 when none).
+pub(crate) fn view_parent(vm: &Vm, h: u32) -> u32 {
+    match pseudo_get(vm, h, P_PARENT) {
+        Some(V::Ref(p)) => p,
+        _ => 0,
+    }
 }
 
 fn stub_ctx(vm: &mut Vm) -> V {
@@ -4455,8 +5820,23 @@ pub(crate) fn decor_of(vm: &mut Vm, window: u32) -> Option<u32> {
     pseudo_set(vm, cf, P_IS_VIEW, V::I32(1));
     pseudo_set(vm, cf, P_IS_GROUP, V::I32(1));
     pseudo_set(vm, cf, P_VIEW_ID, V::I32(ANDROID_ID_CONTENT));
+    // The decor is not attached yet: ViewRootImpl only dispatches
+    // attach after the activity lifecycle reaches the window. Keeping
+    // it unattached during setContentView is load-bearing for Compose —
+    // otherwise AbstractComposeView starts composition reentrantly inside
+    // the activity's LifecycleRegistry forward pass.
     attach(vm, d, V::Ref(cf));
+    // The decor fills its window — host-side frame now, since no dex
+    // `layout()` will ever run over these objects (`getDecorView()
+    // .getWidth()` must not read 0).
+    let (ww, wh) = vm.window_size;
+    frame_set(vm, d, 0, 0, ww, wh);
+    frame_set(vm, cf, 0, 0, ww, wh);
+    vm.content_frames.insert(owner, cf);
     pseudo_set(vm, window, P_DECOR, V::Ref(d));
+    if crate::dbg_flag("OVELO_VIEWDBG") {
+        eprintln!("[viewdbg] decor_of window=h{window} owner=h{owner} -> d=h{d} cf=h{cf}");
+    }
     Some(d)
 }
 
@@ -4467,6 +5847,16 @@ pub(crate) const ANDROID_ID_CONTENT: i32 = 0x0102_0002;
 /// `ensureSubDecor` rebinds app content into).
 pub(crate) fn content_frame_of(vm: &mut Vm, window: u32) -> Option<u32> {
     let d = decor_of(vm, window)?;
+    // Prefer the frame we already handed out: ensureSubDecor strips
+    // `android.R.id.content` off the framework frame before moving its
+    // own ContentFrameLayout in, and the id-search then misses.
+    let owner = match pseudo_get(vm, window, P_TARGET) {
+        Some(V::Ref(a)) => a,
+        _ => vm.cur_activity,
+    };
+    if let Some(&cf) = vm.content_frames.get(&owner) {
+        return Some(cf);
+    }
     find_in_tree(vm, d, ANDROID_ID_CONTENT)
 }
 
@@ -4506,7 +5896,7 @@ pub(crate) fn menu_of(vm: &mut Vm, view_h: u32) -> V {
         }
     }
     let m = host(vm, "Landroid/view/Menu;", HostState::Map(vec![]));
-    if std::env::var_os("OVELO_TRACE_MENU").is_some() {
+    if crate::dbg_flag("OVELO_TRACE_MENU") {
         eprintln!("[menu_of] view={view_h} menu={m:?}");
     }
     if let V::Ref(mh) = m {
@@ -4660,7 +6050,7 @@ fn menu_item(vm: &mut Vm, menu_h: u32, id: i32) -> V {
 }
 
 pub(crate) fn menu_find(vm: &mut Vm, menu_h: u32, id_v: Option<V>) -> V {
-    if std::env::var_os("OVELO_TRACE_MENU").is_some() {
+    if crate::dbg_flag("OVELO_TRACE_MENU") {
         eprintln!(
             "[menu_find] menu={menu_h} items={} want={id_v:?}",
             menu_items(vm, menu_h).len()
@@ -4691,7 +6081,7 @@ fn menu_title(vm: &mut Vm, v: V) -> V {
 /// `getVisibleItems`, casts to `MenuItemImpl` all see real entries. A
 /// `<menu>` nested inside an `<item>` inflates into its SubMenu.
 pub(crate) fn menu_inflate(vm: &mut Vm, res_v: Option<V>, menu_h: u32) {
-    let trace = std::env::var_os("OVELO_TRACE_MENU").is_some();
+    let trace = crate::dbg_flag("OVELO_TRACE_MENU");
     if trace {
         eprintln!("[menu_inflate] res={res_v:?} menu_h={menu_h}");
     }
@@ -4720,7 +6110,7 @@ pub(crate) fn menu_inflate(vm: &mut Vm, res_v: Option<V>, menu_h: u32) {
 /// One level of menu xml: `item` adds an entry; a nested `menu` opens
 /// its SubMenu and recurses; any other element is skipped.
 fn menu_inflate_level(vm: &mut Vm, doc: &[Element], i: &mut usize, depth: usize, menu_h: u32) {
-    let trace = std::env::var_os("OVELO_TRACE_MENU").is_some();
+    let trace = crate::dbg_flag("OVELO_TRACE_MENU");
     while *i < doc.len() {
         let el = &doc[*i];
         if el.depth < depth {
@@ -4803,7 +6193,7 @@ fn menu_add_entry(
         ) {
             Ok(Some(it)) => return it,
             r => {
-                if std::env::var_os("OVELO_TRACE_MENU").is_some() {
+                if crate::dbg_flag("OVELO_TRACE_MENU") {
                     eprintln!("[menu_add] dex {m} failed: {r:?}");
                 }
             }
@@ -4844,6 +6234,14 @@ pub(crate) fn set_content_view(vm: &mut Vm, activity: u32, content: V) {
     pseudo_set(vm, activity, P_CONTENT, cv);
     if let Some(w) = window_of(vm, activity) {
         if let Some(cf) = content_frame_of(vm, w) {
+            // A second setContentView replaces the content view — the
+            // old tree must leave the frame or it keeps drawing (and
+            // e.g. keeps pumping an orphaned GLSurfaceView renderer).
+            for c in children(vm, cf) {
+                if matches!(c, V::Ref(h) if h != 0) {
+                    detach(vm, cf, c, true);
+                }
+            }
             attach(vm, cf, cv);
         }
     }
@@ -4881,7 +6279,7 @@ pub(crate) fn register_menu_overrides(vm: &mut Vm) {
             "(ILandroid/view/Menu;)V",
             mk(ov_menu_inflate),
         );
-        if std::env::var_os("OVELO_TRACE_MENU").is_some() {
+        if crate::dbg_flag("OVELO_TRACE_MENU") {
             eprintln!("[menu_inflate] register_host {class} -> {ok:?}");
         }
     }

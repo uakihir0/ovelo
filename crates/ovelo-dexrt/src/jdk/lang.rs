@@ -33,13 +33,22 @@ pub(crate) fn call(
         classloader_call(vm, name, args)
     } else if class == "Ljava/lang/Package;" {
         package_call(vm, name, sig, args)
-    } else if desc_is_a(class, "Ljava/lang/Thread;") {
+    } else if desc_is_a(class, "Ljava/lang/Thread;")
+        || vm.assignable_desc(class, "Ljava/lang/Thread;")
+    {
         thread_call(vm, name, sig, args)?
     } else if class.ends_with("ThreadLocal;") {
         threadlocal_call(vm, name, args)
     } else if desc_is_a(class, THROWABLE) {
         throwable_call(vm, name, sig, args)?
-    } else if class == "Ljava/lang/Enum;" || vm.assignable_desc(class, "Ljava/lang/Enum;") {
+    } else if class == "Ljava/lang/Enum;"
+        || platform_enum_consts(class).is_some()
+        || (!class.starts_with("Ljava/time/") && vm.assignable_desc(class, "Ljava/lang/Enum;"))
+    {
+        // java.time's enums carry the Enum super but have dedicated
+        // (interned, correctly-ordinal'd) handling in jtime_call —
+        // routing them through enum_call would return empty values()
+        // and panic on 1-arg valueOf.
         enum_call(vm, class, name, args)?
     } else if class == "Lsun/misc/Unsafe;" {
         unsafe_call(vm, name, args)?
@@ -83,10 +92,8 @@ pub(crate) fn call(
                 match cached {
                     Some(v) => Some(Some(v)),
                     _ => {
-                        let r = vm.alloc_host(
-                            "Ljava/lang/ref/Reference;",
-                            HostState::Slot(V::Ref(0)),
-                        );
+                        let r =
+                            vm.alloc_host("Ljava/lang/ref/Reference;", HostState::Slot(V::Ref(0)));
                         Some(Some(V::Ref(r)))
                     }
                 }
@@ -342,7 +349,13 @@ fn string_call(vm: &mut Vm, name: &str, sig: &str, args: &[V]) -> Option<Option<
         "replaceAll" | "replaceFirst" => {
             let pat = sv(vm, args[1]).unwrap_or_default();
             let rep = sv(vm, args[2]).unwrap_or_default();
-            let out = if name == "replaceFirst" {
+            // `String.replaceAll` takes a regex, not a literal —
+            // `replaceAll("\\D+", "")` is how callers scrub digits out
+            // of strings (NewPipe view-count parsing depends on this).
+            let out = if let Ok(rx) = super::rx::Rx::compile(&pat) {
+                let chars: Vec<char> = t.chars().collect();
+                super::io::rx_replace(&rx, &chars, &rep, name == "replaceFirst")
+            } else if name == "replaceFirst" {
                 t.replacen(&pat, &rep, 1)
             } else {
                 t.replace(&pat, &rep)
@@ -370,23 +383,35 @@ fn string_call(vm: &mut Vm, name: &str, sig: &str, args: &[V]) -> Option<Option<
         }
         "matches" => {
             let pat = sv(vm, args[1]).unwrap_or_default();
-            Some(V::I32(io::literal_match(&pat, &t) as i32))
+            Some(V::I32(
+                (super::rx::full_match(&pat, &t) || io::literal_match(&pat, &t)) as i32,
+            ))
         }
         "split" => {
+            // Java takes a regex here (`"a.b".split("\\.")`), not a
+            // literal separator — NewPipe's Parser.getValue dot-paths
+            // came back as one un-split key when we split literally.
             let pat = sv(vm, args[1]).unwrap_or_default();
             let lim = args.get(2).map(|v| i32v(*v)).unwrap_or(0);
-            let parts: Vec<V> = t
-                .split(if pat == "." { "\\." } else { &pat })
-                .take(if lim > 0 { lim as usize } else { usize::MAX })
-                .map(|x| jstr(vm, x))
+            let parts: Vec<V> = super::rx::regex_split(&pat, &t, lim)
+                .into_iter()
+                .map(|x| jstr(vm, &x))
                 .collect();
             Some(arr(vm, STRING, parts))
         }
         "intern" => Some(args[0]),
         "toString" => Some(args[0]),
         "valueOf" => {
-            // static: valueOf(x) → string of arg (or char array slice)
+            // static: valueOf(x) → string of arg. `valueOf(char)` must
+            // render the character — a bare int falls through to
+            // v_to_s which prints the digits ("|" → "124"), breaking
+            // every caller that relies on the char overload (kotlin's
+            // StringsKt.split delimiter conversion did).
             let s = match args[0] {
+                V::I32(c) if p.first() == Some(&"C") => char::from_u32(c as u32)
+                    .map(|c| c.to_string())
+                    .unwrap_or_default(),
+                V::I32(b) if p.first() == Some(&"Z") => (b != 0).to_string(),
                 V::Ref(h) => match vm.heap.get(h) {
                     Some(Obj::Array { data, .. }) => {
                         let a = args.get(1).map(|v| i32v(*v) as usize).unwrap_or(0);
@@ -463,6 +488,28 @@ fn strbuf(vm: &mut Vm, name: &str, sig: &str, args: &[V]) -> Rt<Option<Option<V>
     let V::Ref(h) = args.first().copied().unwrap_or(V::Ref(0)) else {
         return Ok(None);
     };
+    // `StringWriter.getBuffer()` hands out a StringBuffer view that
+    // delegates through P_DATA to the writer's shared buffer — follow
+    // the chain so view operations hit the real storage.
+    let h = {
+        let mut cur = h;
+        for _ in 0..4 {
+            if matches!(
+                vm.heap.get(cur),
+                Some(Obj::Host {
+                    state: HostState::StrBuf(_),
+                    ..
+                })
+            ) {
+                break;
+            }
+            match pseudo_get(vm, cur, P_DATA) {
+                Some(V::Ref(n)) if n != cur => cur = n,
+                _ => break,
+            }
+        }
+        cur
+    };
     Ok(match name {
         "<init>" => {
             // StringBuilder(String|CharSequence|int capacity).
@@ -488,14 +535,37 @@ fn strbuf(vm: &mut Vm, name: &str, sig: &str, args: &[V]) -> Rt<Option<Option<V>
                 "F" | "D" => fmt_f64(f64v(args[1])),
                 "[C" => match args[1] {
                     V::Ref(ah) => match vm.heap.get(ah) {
-                        Some(Obj::Array { data, .. }) => data
-                            .iter()
-                            .filter_map(|v| char::from_u32(i32v(*v) as u32))
-                            .collect(),
+                        Some(Obj::Array { data, .. }) => {
+                            // `append(char[], off, len)` takes a slice —
+                            // tokener/scanner code passes a shared
+                            // buffer and bounds the view (nanojson
+                            // `JsonTokener.consumeTokenSemiString`).
+                            let slice: &[V] = if p.len() == 3 {
+                                let off = i32v(args[2]).max(0) as usize;
+                                let n = i32v(args[3]).max(0) as usize;
+                                &data[off.min(data.len())..(off + n).min(data.len())]
+                            } else {
+                                data
+                            };
+                            // char[] is UTF-16 — decode code units so
+                            // surrogate pairs survive.
+                            let units: Vec<u16> = slice.iter().map(|v| i32v(*v) as u16).collect();
+                            String::from_utf16_lossy(&units)
+                        }
                         _ => String::new(),
                     },
                     _ => String::new(),
                 },
+                "Ljava/lang/CharSequence;" if p.len() == 3 => {
+                    // `append(CharSequence, start, end)` appends the
+                    // char-range view — kotlin's replace/split builders
+                    // rely on it (appending the whole input instead
+                    // duplicated the source into the output).
+                    let t = sv(vm, args[1]).unwrap_or_default();
+                    let lo = i32v(args[2]).max(0) as usize;
+                    let hi = i32v(args[3]).max(0) as usize;
+                    t.chars().skip(lo).take(hi.saturating_sub(lo)).collect()
+                }
                 _ => v_to_s(vm, args[1]),
             };
             if let Some(Obj::Host {
@@ -708,6 +778,35 @@ fn boxed_call(
     args: &[V],
 ) -> Rt<Option<Option<V>>> {
     Ok(match name {
+        "<init>" => {
+            // `new Integer(1)` allocates a dex `Obj::Instance` — without
+            // this the boxed value never lands and intValue() reads 0.
+            let arg = args.get(1).copied().unwrap_or(V::I32(0));
+            let v = match arg {
+                V::Ref(h) => match sv(vm, arg) {
+                    Some(t) if class != "Ljava/lang/Character;" => {
+                        let t = t.trim();
+                        match class {
+                            "Ljava/lang/Long;" => t.parse::<i64>().map(V::I64).unwrap_or(V::I64(0)),
+                            "Ljava/lang/Double;" => {
+                                t.parse::<f64>().map(V::F64).unwrap_or(V::F64(0.0))
+                            }
+                            "Ljava/lang/Float;" => {
+                                t.parse::<f32>().map(V::F32).unwrap_or(V::F32(0.0))
+                            }
+                            "Ljava/lang/Boolean;" => V::I32((t == "true") as i32),
+                            _ => t.parse::<i32>().map(V::I32).unwrap_or(V::I32(0)),
+                        }
+                    }
+                    _ => V::Ref(h),
+                },
+                other => other,
+            };
+            if let V::Ref(this) = args[0] {
+                slot_put(vm, this, v);
+            }
+            Some(None)
+        }
         "intValue" | "longValue" | "shortValue" | "byteValue" | "charValue" | "booleanValue"
         | "doubleValue" | "floatValue" => {
             let v = prim(vm, args[0]);
@@ -994,7 +1093,18 @@ fn boxed_call(
                 }),
             )))
         }
-        "getInteger" => Some(Some(V::Ref(0))),
+        "getInteger" => {
+            // Integer.getInteger(nm[, val]) — the named system
+            // properties callers ask for (rx3.*-priority etc.) are
+            // never set in this runtime, so the answer is the
+            // caller's default: boxed when int, passed through when
+            // an Integer (or null).
+            match args.get(1) {
+                Some(&V::I32(v)) => Some(Some(host(vm, class, HostState::Slot(V::I32(v))))),
+                Some(v) => Some(Some(*v)),
+                None => Some(Some(V::Ref(0))),
+            }
+        }
         "isNaN" | "isInfinite" | "isFinite" => {
             let v = f64v(args[0]);
             let r = match name {
@@ -1318,8 +1428,9 @@ fn system_call(vm: &mut Vm, name: &str, _sig: &str, args: &[V]) -> Rt<Option<Opt
                 "java.runtime.name" => "Android Runtime",
                 "java.vm.name" => "Dalvik",
                 "java.vm.version" => "2.1.0",
-                "java.vm.vendor" | "java.specification.vendor"
-                | "java.vm.specification.vendor" => "The Android Project",
+                "java.vm.vendor" | "java.specification.vendor" | "java.vm.specification.vendor" => {
+                    "The Android Project"
+                }
                 "java.io.tmpdir" => "/data/local/ovelo/tmp",
                 "file.encoding"
                 | "sun.jnu.encoding"
@@ -1341,8 +1452,8 @@ fn system_call(vm: &mut Vm, name: &str, _sig: &str, args: &[V]) -> Rt<Option<Opt
             crate::jni::load_native_lib(vm, &arg, name == "load");
             Some(None)
         }
-        "gc" | "runFinalization" | "exit" | "halt" | "setIn"
-        | "setOut" | "setErr" | "setProperties" | "setSecurityManager" => Some(None),
+        "gc" | "runFinalization" | "exit" | "halt" | "setIn" | "setOut" | "setErr"
+        | "setProperties" | "setSecurityManager" => Some(None),
         "mapLibraryName" => {
             let n = sv(vm, args[0]).unwrap_or_default();
             Some(Some(jstr(vm, &format!("lib{n}.so"))))
@@ -1432,8 +1543,18 @@ fn class_call(vm: &mut Vm, name: &str, _sig: &str, args: &[V]) -> Rt<Option<Opti
             )
             .unwrap_or_else(|| class_of(vm, args[0]));
             let base = dotted(&d);
-            let short = base.rsplit(['.', '$']).next().unwrap_or(&base).to_string();
-            Some(Some(jstr(vm, &short)))
+            // Member name per InnerClasses: the part after the last
+            // `$` — but when that last `$` is itself preceded by `$`
+            // (`Foo$$serializer`), the member's declared name keeps
+            // the leading `$`. kotlinx.serialization's fallback scans
+            // getDeclaredClasses for simpleName == "$serializer".
+            let after_pkg = base.rsplit('.').next().unwrap_or(&base);
+            let short = match after_pkg.rfind('$') {
+                Some(i) if i > 0 && after_pkg.as_bytes()[i - 1] == b'$' => &after_pkg[i - 1..],
+                Some(i) => &after_pkg[i + 1..],
+                None => after_pkg,
+            };
+            Some(Some(jstr(vm, short)))
         }
         "getPackageName" | "getPackage" => {
             let d = class_desc_of(
@@ -1456,18 +1577,9 @@ fn class_call(vm: &mut Vm, name: &str, _sig: &str, args: &[V]) -> Rt<Option<Opti
                 )))
             }
         }
-        "isInterface"
-        | "isPrimitive"
-        | "isEnum"
-        | "isAnnotation"
-        | "isSynthetic"
-        | "isAnonymousClass"
-        | "isLocalClass"
-        | "isMemberClass"
-        | "isSealed"
-        | "isRecord"
-        | "isHidden"
-        | "isAnnotationPresent" => Some(Some(V::I32(0))),
+        "isInterface" | "isPrimitive" | "isEnum" | "isAnnotation" | "isSynthetic"
+        | "isAnonymousClass" | "isLocalClass" | "isMemberClass" | "isSealed" | "isRecord"
+        | "isHidden" => Some(Some(V::I32(0))),
         "isArray" => {
             let d = class_desc_of(
                 vm,
@@ -1489,7 +1601,8 @@ fn class_call(vm: &mut Vm, name: &str, _sig: &str, args: &[V]) -> Rt<Option<Opti
             )
             .unwrap_or_default();
             let got = class_of(vm, args[1]);
-            Some(Some(V::I32(desc_is_a(&got, &want) as i32)))
+            let ok = desc_is_a(&got, &want) || vm.assignable_desc(&got, &want);
+            Some(Some(V::I32(ok as i32)))
         }
         "isAssignableFrom" => {
             let a = class_desc_of(
@@ -1508,7 +1621,11 @@ fn class_call(vm: &mut Vm, name: &str, _sig: &str, args: &[V]) -> Rt<Option<Opti
                 },
             )
             .unwrap_or_default();
-            Some(Some(V::I32(desc_is_a(&b, &a) as i32)))
+            // desc_is_a only knows host classes — dex-to-dex
+            // subclassing (e.g. a generated protobuf class extending
+            // GeneratedMessageLite) needs assignable_desc's dex walk.
+            let ok = desc_is_a(&b, &a) || vm.assignable_desc(&b, &a);
+            Some(Some(V::I32(ok as i32)))
         }
         "getSuperclass" => {
             // `s()` returns None for `Obj::Class` mirrors — resolve the
@@ -1532,9 +1649,7 @@ fn class_call(vm: &mut Vm, name: &str, _sig: &str, args: &[V]) -> Rt<Option<Opti
                 .or_else(|| vm.super_desc(&d));
             match sup {
                 Some(sup) => Some(Some(class_obj(vm, sup))),
-                None if !d.is_empty() && d != OBJ => {
-                    Some(Some(class_obj(vm, OBJ.into())))
-                }
+                None if !d.is_empty() && d != OBJ => Some(Some(class_obj(vm, OBJ.into()))),
                 None => Some(Some(V::Ref(0))),
             }
         }
@@ -1560,10 +1675,8 @@ fn class_call(vm: &mut Vm, name: &str, _sig: &str, args: &[V]) -> Rt<Option<Opti
                     let raw = V::Ref(vm.class_handle(&sup));
                     let obj = V::Ref(vm.class_handle(OBJ));
                     let args_arr = arr(vm, OBJ, vec![obj]);
-                    let h = vm.alloc_host(
-                        "Ljava/lang/reflect/ParameterizedType;",
-                        HostState::Empty,
-                    );
+                    let h =
+                        vm.alloc_host("Ljava/lang/reflect/ParameterizedType;", HostState::Empty);
                     pseudo_set(vm, h, P_TARGET, raw);
                     pseudo_set(vm, h, P_DATA, args_arr);
                     Some(Some(V::Ref(h)))
@@ -1599,15 +1712,33 @@ fn class_call(vm: &mut Vm, name: &str, _sig: &str, args: &[V]) -> Rt<Option<Opti
             let items = vm.declared_method_mirrors(&owner);
             Some(Some(arr(vm, "Ljava/lang/reflect/Method;", items)))
         }
-        "getFields"
-        | "getDeclaredFields"
-        | "getConstructors"
+        "getFields" | "getDeclaredFields" => {
+            let owner = class_desc_of(
+                vm,
+                match args[0] {
+                    V::Ref(h) => h,
+                    _ => 0,
+                },
+            )
+            .unwrap_or_default();
+            let items = vm.declared_field_mirrors(&owner);
+            Some(Some(arr(vm, "Ljava/lang/reflect/Field;", items)))
+        }
+        "getDeclaredClasses" | "getClasses" => {
+            let owner = class_desc_of(
+                vm,
+                match args[0] {
+                    V::Ref(h) => h,
+                    _ => 0,
+                },
+            )
+            .unwrap_or_default();
+            let items = vm.nested_class_mirrors(&owner);
+            Some(Some(arr(vm, "Ljava/lang/Class;", items)))
+        }
+        "getConstructors"
         | "getDeclaredConstructors"
         | "getInterfaces"
-        | "getDeclaredClasses"
-        | "getClasses"
-        | "getAnnotations"
-        | "getDeclaredAnnotations"
         | "getEnumConstants"
         | "getPermittedSubclasses"
         | "getSigners"
@@ -1625,6 +1756,23 @@ fn class_call(vm: &mut Vm, name: &str, _sig: &str, args: &[V]) -> Rt<Option<Opti
             )
             .unwrap_or_default();
             let fname = sv(vm, args[1]).unwrap_or_default();
+            // Missing field → NoSuchFieldException: reflective probes
+            // (kotlinx.serialization's Companion/INSTANCE lookup) branch
+            // on the throw, not on null. Host classes (`sun.misc.Unsafe`)
+            // have no dex field table — always mirror them.
+            if !fname.is_empty()
+                && vm.is_dex_class(&owner)
+                && vm.field_index_of(&owner, &fname).is_none()
+            {
+                if crate::dbg_flag("OVELO_REFDBG") {
+                    eprintln!("[refdbg] NoSuchField {owner}.{fname}");
+                }
+                let t = vm.throw_builtin(
+                    "Ljava/lang/NoSuchFieldException;",
+                    &format!("{owner}.{fname}"),
+                );
+                return Err(t);
+            }
             let cv = jstr(vm, &owner);
             let hv = host(
                 vm,
@@ -1646,6 +1794,22 @@ fn class_call(vm: &mut Vm, name: &str, _sig: &str, args: &[V]) -> Rt<Option<Opti
             )
             .unwrap_or_default();
             let mname = sv(vm, args[1]).unwrap_or_default();
+            // Missing method → NoSuchMethodException: reflective
+            // serializer lookup branches on the throw.
+            if !mname.is_empty()
+                && !mname.starts_with('<')
+                && vm.is_dex_class(&owner)
+                && !vm.has_method_named(&owner, &mname)
+            {
+                if crate::dbg_flag("OVELO_REFDBG") {
+                    eprintln!("[refdbg] NoSuchMethod {owner}.{mname}");
+                }
+                let t = vm.throw_builtin(
+                    "Ljava/lang/NoSuchMethodException;",
+                    &format!("{owner}.{mname}"),
+                );
+                return Err(t);
+            }
             let cv = jstr(vm, &owner);
             let hv = host(
                 vm,
@@ -1727,9 +1891,23 @@ fn class_call(vm: &mut Vm, name: &str, _sig: &str, args: &[V]) -> Rt<Option<Opti
             .unwrap_or_default();
             match vm.instantiate(&d) {
                 Ok(h) => Some(Some(V::Ref(h))),
-                Err(_) => {
-                    let e = vm.throw_builtin("Ljava/lang/InstantiationException;", &d);
-                    return Err(e);
+                Err(e) => {
+                    // A class with no dex def and no host impl is
+                    // absent — `ClassNotFoundException` is what callers
+                    // catching optional-dependency probes expect (the
+                    // kotlin-reflect `ReflectionFactoryImpl` fallback
+                    // catches CNFE, not InstantiationException).
+                    let absent =
+                        e.cause() == "dexrt.class.missing" || vm.type_index_of(&d).is_none();
+                    let t = vm.throw_builtin(
+                        if absent {
+                            "Ljava/lang/ClassNotFoundException;"
+                        } else {
+                            "Ljava/lang/InstantiationException;"
+                        },
+                        &d,
+                    );
+                    return Err(t);
                 }
             }
         }
@@ -1742,11 +1920,73 @@ fn class_call(vm: &mut Vm, name: &str, _sig: &str, args: &[V]) -> Rt<Option<Opti
         | "getDeclaringClass"
         | "getModule"
         | "getNestHost"
-        | "getAnnotation"
-        | "getDeclaredAnnotation"
         | "describeConstable"
         | "getModifiers0" => Some(Some(V::Ref(0))),
         "getModifiers" => Some(Some(V::I32(1))),
+        // Class-level dex annotations — Navigator.@Name, DI scopes,
+        // retrofit annotations all ride getAnnotation; a null stub
+        // throws IllegalArgumentException in getNameForNavigator.
+        "getAnnotation" | "getDeclaredAnnotation" => {
+            let cdesc = class_desc_of(
+                vm,
+                match args[0] {
+                    V::Ref(h) => h,
+                    _ => 0,
+                },
+            )
+            .unwrap_or_default();
+            let adesc = class_desc_of(
+                vm,
+                match args[1] {
+                    V::Ref(h) => h,
+                    _ => 0,
+                },
+            )
+            .unwrap_or_default();
+            let v = vm
+                .class_gidx_of(&cdesc)
+                .map(|cg| vm.class_annotation(cg, &adesc))
+                .unwrap_or(V::Ref(0));
+            Some(Some(v))
+        }
+        "getAnnotations" | "getDeclaredAnnotations" => {
+            let cdesc = class_desc_of(
+                vm,
+                match args[0] {
+                    V::Ref(h) => h,
+                    _ => 0,
+                },
+            )
+            .unwrap_or_default();
+            let items = vm
+                .class_gidx_of(&cdesc)
+                .map(|cg| vm.class_annotations(cg))
+                .unwrap_or_default();
+            Some(Some(arr(vm, "Ljava/lang/annotation/Annotation;", items)))
+        }
+        "isAnnotationPresent" => {
+            let cdesc = class_desc_of(
+                vm,
+                match args[0] {
+                    V::Ref(h) => h,
+                    _ => 0,
+                },
+            )
+            .unwrap_or_default();
+            let adesc = class_desc_of(
+                vm,
+                match args[1] {
+                    V::Ref(h) => h,
+                    _ => 0,
+                },
+            )
+            .unwrap_or_default();
+            let v = vm
+                .class_gidx_of(&cdesc)
+                .map(|cg| vm.class_annotation(cg, &adesc))
+                .unwrap_or(V::Ref(0));
+            Some(Some(V::I32((v != V::Ref(0)) as i32)))
+        }
         // `cast(obj)` yields the object arg; `asSubclass(Class)` yields
         // `this` Class (the arg is the bound to check, not the result).
         "cast" => Some(Some(args.get(1).copied().unwrap_or(args[0]))),
@@ -1810,11 +2050,29 @@ fn classloader_call(vm: &mut Vm, name: &str, args: &[V]) -> Option<Option<V>> {
 
 fn thread_call(vm: &mut Vm, name: &str, _sig: &str, args: &[V]) -> Rt<Option<Option<V>>> {
     Ok(match name {
-        "currentThread" => Some(Some(if vm.cur_thread != 0 {
-            V::Ref(vm.cur_thread)
-        } else {
-            main_thread(vm)
-        })),
+        "currentThread" => {
+            let r = if vm.cur_thread != 0 {
+                V::Ref(vm.cur_thread)
+            } else {
+                main_thread(vm)
+            };
+            if std::env::var("OVELO_THRDBG").is_ok()
+                && vm
+                    .stack
+                    .last()
+                    .is_some_and(|g| vm.describe_method(*g).contains("isMainThread$room_runtime"))
+                && matches!(r, V::Ref(h) if h == vm.main_thread_h)
+            {
+                eprintln!(
+                    "[thrdbg] currentThread -> {r:?} cur={} main={} worker={} runnable={}",
+                    vm.cur_thread, vm.main_thread_h, vm.worker_thread_h, vm.cur_runnable
+                );
+                for (i, g) in vm.stack.iter().take(6).enumerate() {
+                    eprintln!("[thrdbg-root{i}] {}", vm.describe_method(*g));
+                }
+            }
+            Some(Some(r))
+        }
         "getId" => Some(Some(V::I64(1))),
         "getName" => {
             let n = s(
@@ -1841,8 +2099,22 @@ fn thread_call(vm: &mut Vm, name: &str, _sig: &str, args: &[V]) -> Rt<Option<Opt
             Some(None)
         }
         "getPriority" => Some(Some(V::I32(5))),
-        "isAlive" | "isDaemon" | "isVirtual" | "isInterrupted" | "interrupted"
-        | "isCCLOverriden" => Some(Some(V::I32(0))),
+        "isAlive" => {
+            // Started and its runnable is still queued/parked/running.
+            let alive = match args.first() {
+                Some(V::Ref(h)) => {
+                    let t = pseudo_get(vm, *h, P_TARGET).unwrap_or(V::Ref(*h));
+                    pseudo_get(vm, *h, P_STARTED).is_some()
+                        && matches!(t, V::Ref(r) if vm.thread_runnables.contains(&r)
+                            && vm.runnable_thread.get(&r) == Some(h))
+                }
+                _ => false,
+            };
+            Some(Some(V::I32(alive as i32)))
+        }
+        "isDaemon" | "isVirtual" | "isInterrupted" | "interrupted" | "isCCLOverriden" => {
+            Some(Some(V::I32(0)))
+        }
         "holdsLock" => Some(Some(V::I32(1))),
         "activeCount" => Some(Some(V::I32(1))),
         "getState" => Some(Some(host(
@@ -1850,36 +2122,7 @@ fn thread_call(vm: &mut Vm, name: &str, _sig: &str, args: &[V]) -> Rt<Option<Opt
             "Ljava/lang/Thread$State;",
             HostState::StrBuf("RUNNABLE".into()),
         ))),
-        "getStackTrace" => {
-            // Real frames — kotlin's Intrinsics.checkNotNullParameter
-            // walks this array to sanitize its NPE, so an empty array
-            // turns every guest NPE into an aget AIOOBE.
-            let frames: Vec<V> = vm
-                .describe_stack()
-                .into_iter()
-                .rev()
-                .map(|d| {
-                    // "Lpkg/Cls;.name(sig)ret" -> (pkg.Cls, name)
-                    let (cn, mn) = d
-                        .strip_prefix('L')
-                        .and_then(|r| r.split_once(";."))
-                        .map(|(c, r)| {
-                            (
-                                c.replace('/', "."),
-                                r.split('(').next().unwrap_or("").to_string(),
-                            )
-                        })
-                        .unwrap_or((d.clone(), String::new()));
-                    let v = host(vm, "Ljava/lang/StackTraceElement;", HostState::StrBuf(cn));
-                    if let V::Ref(h) = v {
-                        let m = jstr(vm, &mn);
-                        pseudo_set(vm, h, P_COMPONENT, m);
-                    }
-                    v
-                })
-                .collect();
-            Some(Some(arr(vm, "Ljava/lang/StackTraceElement;", frames)))
-        }
+        "getStackTrace" => Some(Some(stack_frames(vm))),
         "getAllStackTraces" => Some(Some(arr(vm, "Ljava/lang/StackTraceElement;", vec![]))),
         "getContextClassLoader" => {
             Some(Some(host(vm, "Ljava/lang/ClassLoader;", HostState::Empty)))
@@ -1918,9 +2161,121 @@ fn thread_call(vm: &mut Vm, name: &str, _sig: &str, args: &[V]) -> Rt<Option<Opt
             // execution deadlocks guests whose tasks reschedule work
             // (coroutine dispatchers, self-perpetuating handlers).
             if let V::Ref(h) = args[0] {
+                // JVM contract: a Thread starts exactly once — a second
+                // start() throws IllegalThreadStateException. Without
+                // this guard a restart double-enqueues the runnable:
+                // kotlinx's DefaultExecutor restarts when isAlive reads
+                // false after a park-unwind and each re-start pushed
+                // another copy of its run() onto the drain queue.
+                if pseudo_get(vm, h, P_STARTED).is_some() {
+                    return Err(vm.throw_builtin("Ljava/lang/IllegalThreadStateException;", ""));
+                }
+                pseudo_set(vm, h, P_STARTED, V::I32(1));
                 let t = pseudo_get(vm, h, P_TARGET).unwrap_or(V::Ref(h));
                 if let V::Ref(r) = t {
+                    vm.runnable_thread.insert(r, h);
+                    // Thread-spawned runnables get an unbounded park
+                    // budget — a `while (running)` game loop parks on
+                    // every Thread.sleep and must never hit the worker
+                    // repark cap.
+                    let rcls = super::class_of(vm, V::Ref(r));
+                    eprintln!("[thread] start {rcls} runnable=0x{r:x}");
+                    // GLSurfaceView$GLThread waits on surface state inside
+                    // its own manager — set it directly since the real
+                    // SurfaceHolder.Callback chain never fires here.
+                    if rcls.contains("GLSurfaceView$GLThread") {
+                        for (m, a) in [
+                            ("surfaceCreated", vec![]),
+                            ("onWindowResize", vec![V::I32(720), V::I32(1280)]),
+                            ("setRenderMode", vec![V::I32(1)]),
+                            ("requestRender", vec![]),
+                        ] {
+                            let r_ = vm.call_virtual(r, m, &a);
+                            eprintln!("[thread] {m} -> {r_:?}");
+                        }
+                    }
+                    vm.thread_runnables.insert(r);
                     vm.enqueue_runnable(r, false);
+                }
+            }
+            Some(None)
+        }
+        "sleep" => {
+            // A guest thread can't really suspend: on a worker context
+            // record the requested wake time and unwind with ovelo.park
+            // — the drain requeues the runnable into delayed_runnables
+            // at that deadline. On the main thread a real sleep would
+            // freeze the UI, so stay a no-op.
+            if vm.cur_thread != 0 && vm.cur_thread != vm.main_thread_h {
+                // `sleep` is static: args[0] is the millisecond count
+                // (args[1] is the nanos of the (JI)V overload).
+                let ms = match args.first().copied().unwrap_or(V::I64(0)) {
+                    V::I64(m) => m,
+                    V::I32(m) => m as i64,
+                    V::F64(m) => m as i64,
+                    _ => 0,
+                }
+                .max(0);
+                // A spawned Thread's run() IS the loop — restart it at
+                // the top and re-enter: parking yields the drain slice
+                // so frame-scheduler loops (`while { work; sleep(1) }`)
+                // don't captive the worker inside one drain call.
+                // Executor workers instead keep a short real sleep —
+                // parking there re-runs the whole queued task.
+                if ms <= 500 && !vm.thread_runnables.contains(&vm.cur_runnable) {
+                    std::thread::sleep(std::time::Duration::from_millis(ms as u64));
+                    return Ok(Some(None));
+                }
+                let due = (now_ms().saturating_add(ms)).max(0) as u64;
+                if vm.cur_runnable != 0 {
+                    if vm.slept_once.remove(&vm.cur_runnable) {
+                        // Re-run past the waited-out deadline — the
+                        // first sleep after resume returns at once or
+                        // the task re-parks at this call forever.
+                        return Ok(Some(None));
+                    }
+                    vm.slept_once.insert(vm.cur_runnable);
+                    vm.sleep_until.insert(vm.cur_runnable, due);
+                }
+                return Err(crate::E::Vm(crate::err("ovelo.park")));
+            }
+            Some(None)
+        }
+        "join" => {
+            // Wait for the target thread's runnable to finish by
+            // draining the queue inline — a no-op return leaves a
+            // `while (t.isAlive()) t.join()` poll spinning forever on
+            // this thread while the worker can never run. Park-yield
+            // instead would re-run the caller's run() from the top, so
+            // drain inline with a wall-clock bound (join's millis arg,
+            // capped) and give up quietly when the queue dries.
+            let h = match args.first() {
+                Some(V::Ref(h)) => *h,
+                _ => return Ok(Some(None)),
+            };
+            let t = pseudo_get(vm, h, P_TARGET).unwrap_or(V::Ref(h));
+            let alive = |vm: &Vm| {
+                matches!(t, V::Ref(r) if vm.thread_runnables.contains(&r)
+                    && vm.runnable_thread.get(&r) == Some(&h))
+            };
+            let m_raw: i64 = match args.get(1).copied().unwrap_or(V::I64(0)) {
+                V::I64(m) => m,
+                V::I32(m) => m as i64,
+                _ => 0,
+            };
+            let cap_ms = if m_raw > 0 {
+                (m_raw as u64).min(2_000)
+            } else {
+                2_000
+            };
+            let until = super::now_ms() as u64 + cap_ms;
+            while alive(vm) {
+                let rem = until.saturating_sub(super::now_ms() as u64);
+                if rem == 0 {
+                    break;
+                }
+                if vm.park_drain_within(rem).is_err() {
+                    break;
                 }
             }
             Some(None)
@@ -1928,8 +2283,6 @@ fn thread_call(vm: &mut Vm, name: &str, _sig: &str, args: &[V]) -> Rt<Option<Opt
         "setPriority"
         | "setDaemon"
         | "interrupt"
-        | "join"
-        | "sleep"
         | "yield"
         | "setUncaughtExceptionHandler"
         | "setDefaultUncaughtExceptionHandler"
@@ -1973,21 +2326,49 @@ fn package_call(vm: &mut Vm, name: &str, sig: &str, args: &[V]) -> Option<Option
     }
 }
 
+/// The guest thread `Thread.currentThread()` would return now —
+/// key for a ThreadLocal's value table.
+fn tls_thread(vm: &Vm) -> u32 {
+    if vm.cur_thread != 0 {
+        vm.cur_thread
+    } else {
+        vm.main_thread_h
+    }
+}
+
+/// The per-thread value table of a ThreadLocal — a `HostState::Map`
+/// keyed by thread handle, minted on first access.
+fn tls_map(vm: &mut Vm, h: u32) -> Option<u32> {
+    if let Some(V::Ref(m)) = pseudo_get(vm, h, P_TLS) {
+        return Some(m);
+    }
+    let m = vm.alloc_host("Ljava/util/HashMap;", HostState::Map(Vec::new()));
+    pseudo_set(vm, h, P_TLS, V::Ref(m));
+    Some(m)
+}
+
 fn threadlocal_call(vm: &mut Vm, name: &str, args: &[V]) -> Option<Option<V>> {
     match name {
         "get" => {
             let V::Ref(h) = args[0] else {
                 return Some(Some(V::Ref(0)));
             };
-            let cur = slot_of(vm, h)
-                .or_else(|| pseudo_get(vm, h, P_TARGET))
-                .unwrap_or(V::Ref(0));
-            if !matches!(cur, V::Ref(0) | V::I32(0)) {
-                return Some(Some(cur));
+            // Values are per calling thread — Room's
+            // `suspendingTransactionId` set on the transaction
+            // executor must read unset everywhere else.
+            let th = tls_thread(vm);
+            let Some(m) = tls_map(vm, h) else {
+                return Some(Some(V::Ref(0)));
+            };
+            if let Some(v) = map_get(vm, m, V::Ref(th)) {
+                if crate::dbg_flag("OVELO_TLSDBG") {
+                    eprintln!("[tls] get h{h} th{th} -> {v:?}");
+                }
+                return Some(Some(v));
             }
-            // First access: `initialValue` is virtual so a dex-defined
-            // subclass (desugared ThreadLocalRandom's `u`) supplies it;
-            // `withInitial` locals call their stored supplier instead.
+            // First access on this thread: `initialValue` is virtual so
+            // a dex-defined subclass (desugared ThreadLocalRandom's `u`)
+            // supplies it; `withInitial` locals call their supplier.
             let init = match pseudo_get(vm, h, P_DATA) {
                 Some(V::Ref(sup)) if sup != 0 => vm
                     .call_virtual(sup, "get", &[])
@@ -2000,30 +2381,24 @@ fn threadlocal_call(vm: &mut Vm, name: &str, args: &[V]) -> Option<Option<V>> {
                     .flatten()
                     .unwrap_or(V::Ref(0)),
             };
-            if let Some(Obj::Host {
-                state: HostState::Slot(s),
-                ..
-            }) = vm.heap.get_mut(h)
-            {
-                *s = init;
-            } else {
-                // Dex-defined ThreadLocal subclass: cache on a pseudo field
-                // so repeated get() returns the same value.
-                pseudo_set(vm, h, P_TARGET, init);
-            }
+            map_put(vm, m, V::Ref(th), init);
             Some(Some(init))
         }
         "set" | "remove" => {
             if let V::Ref(h) = args[0] {
-                let v = if name == "set" { args[1] } else { V::Ref(0) };
-                if let Some(Obj::Host {
-                    state: HostState::Slot(s),
-                    ..
-                }) = vm.heap.get_mut(h)
-                {
-                    *s = v;
-                } else {
-                    pseudo_set(vm, h, P_TARGET, v);
+                let th = tls_thread(vm);
+                if let Some(m) = tls_map(vm, h) {
+                    if name == "set" {
+                        if crate::dbg_flag("OVELO_TLSDBG") {
+                            eprintln!("[tls] set h{h} th{th} = {:?}", args[1]);
+                        }
+                        map_put(vm, m, V::Ref(th), args[1]);
+                    } else {
+                        if crate::dbg_flag("OVELO_TLSDBG") {
+                            eprintln!("[tls] remove h{h} th{th}");
+                        }
+                        map_remove(vm, m, V::Ref(th));
+                    }
                 }
             }
             Some(None)
@@ -2043,6 +2418,37 @@ fn threadlocal_call(vm: &mut Vm, name: &str, args: &[V]) -> Option<Option<V>> {
 
 // ---------------------------------------------------------------------
 // Throwable / Enum / StackTraceElement
+
+/// The current guest call stack as a `StackTraceElement[]` —
+/// declaring class in the element's StrBuf, method name in
+/// P_COMPONENT (the slots `<init>`/`getStackTrace` fill).
+fn stack_frames(vm: &mut Vm) -> V {
+    let frames: Vec<V> = vm
+        .describe_stack()
+        .into_iter()
+        .rev()
+        .map(|d| {
+            // "Lpkg/Cls;.name(sig)ret" -> (pkg.Cls, name)
+            let (cn, mn) = d
+                .strip_prefix('L')
+                .and_then(|r| r.split_once(";."))
+                .map(|(c, r)| {
+                    (
+                        c.replace('/', "."),
+                        r.split('(').next().unwrap_or("").to_string(),
+                    )
+                })
+                .unwrap_or((d.clone(), String::new()));
+            let v = host(vm, "Ljava/lang/StackTraceElement;", HostState::StrBuf(cn));
+            if let V::Ref(h) = v {
+                let m = jstr(vm, &mn);
+                pseudo_set(vm, h, P_COMPONENT, m);
+            }
+            v
+        })
+        .collect();
+    arr(vm, "Ljava/lang/StackTraceElement;", frames)
+}
 
 fn throwable_call(vm: &mut Vm, name: &str, _sig: &str, args: &[V]) -> Rt<Option<Option<V>>> {
     let V::Ref(h) = args.first().copied().unwrap_or(V::Ref(0)) else {
@@ -2088,15 +2494,31 @@ fn throwable_call(vm: &mut Vm, name: &str, _sig: &str, args: &[V]) -> Rt<Option<
             Some(Some(args[0]))
         }
         "fillInStackTrace" => Some(Some(args[0])),
-        "getStackTrace" | "getOurStackTrace" => {
-            Some(Some(arr(vm, "Ljava/lang/StackTraceElement;", vec![])))
-        }
+        // Real frames — Timber's getTag and kotlin's
+        // checkNotNullParameter both index this array; an empty
+        // array turns those into first{} crashes / aget AIOOBEs.
+        "getStackTrace" | "getOurStackTrace" => Some(Some(stack_frames(vm))),
         "setStackTrace" | "addSuppressed" => Some(None),
         "getSuppressed" => Some(Some(arr(vm, THROWABLE, vec![]))),
         "printStackTrace" => {
             let d = class_of(vm, args[0]);
-            let msg = slot_of(vm, h).and_then(|v| sv(vm, v)).unwrap_or_default();
-            eprintln!("[guest] {}: {}", dotted(&d), msg);
+            let mut msg = slot_of(vm, h).and_then(|v| sv(vm, v)).unwrap_or_default();
+            // Runtime-generated throwables keep their message and throw
+            // site on the Obj::Throwable itself rather than in a detail
+            // field — surface both so printStackTrace shows something
+            // useful for VM-thrown exceptions.
+            if let Some(Obj::Throwable { detail, .. }) = vm.heap.get(h) {
+                if msg.is_empty() {
+                    msg = detail.clone();
+                }
+                if let Some(site) = vm.throw_sites.get(&h) {
+                    eprintln!("[guest] {}: {msg} at {site}", dotted(&d));
+                } else {
+                    eprintln!("[guest] {}: {}", dotted(&d), msg);
+                }
+            } else {
+                eprintln!("[guest] {}: {}", dotted(&d), msg);
+            }
             Some(None)
         }
         _ => None,
@@ -2118,7 +2540,9 @@ pub(crate) fn enum_value_list(vm: &mut Vm, class: &str) -> Vec<V> {
             if d.type_descriptor(cd.class_idx).ok().as_deref() != Some(class) {
                 continue;
             }
-            let Ok(data) = d.class_data_rc(cd) else { continue };
+            let Ok(data) = d.class_data_rc(cd) else {
+                continue;
+            };
             for ef in &data.static_fields {
                 let is_const = d
                     .field(ef.field_idx)
@@ -2136,7 +2560,120 @@ pub(crate) fn enum_value_list(vm: &mut Vm, class: &str) -> Vec<V> {
             }
         }
     }
+    if vals.is_empty() {
+        // Platform enums (android.graphics.* etc.) have no dex class
+        // def — mint their constants so Kotlin $WhenMappings clinits
+        // and `values().length` don't die on an empty array. The
+        // interned mint keeps `values()[i] == Paint.Cap.X` true.
+        if let Some(names) = platform_enum_consts(class) {
+            for n in names {
+                vals.push(enum_const(vm, class, n));
+            }
+        }
+    }
     vals
+}
+
+/// Canonical enum-constant object for `(desc, name)` — interned in
+/// `vm.enum_name_cache` so `values()`, `valueOf`, getter-minted results
+/// and sget'd statics share one handle (`X.valueOf("N") == X.N`), and
+/// every path agrees on the ordinal the Kotlin `when` tables read.
+pub(crate) fn enum_const(vm: &mut Vm, desc: &str, name: &str) -> V {
+    if let Some(&h) = vm
+        .enum_name_cache
+        .get(&(desc.to_string(), name.to_string()))
+    {
+        return V::Ref(h);
+    }
+    let v = if let Some(ord) = super::time::jtime_enum_ordinal(desc, name) {
+        super::time::jtime_enum(vm, desc, name, ord)
+    } else {
+        let v = host(vm, desc, HostState::StrBuf(name.into()));
+        if let V::Ref(h) = v {
+            let ns = jstr(vm, name);
+            pseudo_set(vm, h, P_DATA, ns);
+            let ord = platform_enum_ordinal(desc, name).unwrap_or(0);
+            pseudo_set(vm, h, P_FLAGS, V::I32(ord));
+        }
+        v
+    };
+    if let V::Ref(h) = v {
+        vm.enum_name_cache
+            .insert((desc.to_string(), name.to_string()), h);
+    }
+    v
+}
+
+/// `name`'s declaration ordinal in a mirrored platform enum.
+pub(crate) fn platform_enum_ordinal(class: &str, name: &str) -> Option<i32> {
+    platform_enum_consts(class).and_then(|l| l.iter().position(|&n| n == name).map(|i| i as i32))
+}
+
+/// Declaration-order constants of dex-less JDK/platform enums we
+/// mirror — ordinals must match the JDK/AOSP declaration order since
+/// `ordinal()`/`compareTo`/`when` tables read them.
+pub(crate) fn platform_enum_consts(class: &str) -> Option<&'static [&'static str]> {
+    Some(match class {
+        "Ljava/util/concurrent/TimeUnit;" => &[
+            "NANOSECONDS",
+            "MICROSECONDS",
+            "MILLISECONDS",
+            "SECONDS",
+            "MINUTES",
+            "HOURS",
+            "DAYS",
+        ],
+        "Landroid/graphics/Paint$Cap;" => &["BUTT", "ROUND", "SQUARE"],
+        "Landroid/graphics/Paint$Style;" => &["FILL", "STROKE", "FILL_AND_STROKE"],
+        "Landroid/graphics/Paint$Join;" => &["MITER", "ROUND", "BEVEL"],
+        "Landroid/graphics/Paint$Align;" => &["LEFT", "CENTER", "RIGHT"],
+        "Landroid/graphics/PorterDuff$Mode;" => &[
+            "CLEAR", "SRC", "DST", "SRC_OVER", "DST_OVER", "SRC_IN", "DST_IN", "SRC_OUT",
+            "DST_OUT", "SRC_ATOP", "DST_ATOP", "XOR", "DARKEN", "LIGHTEN", "MULTIPLY", "SCREEN",
+            "ADD", "OVERLAY",
+        ],
+        "Landroid/graphics/BlendMode;" => &[
+            "CLEAR",
+            "SRC",
+            "DST",
+            "SRC_OVER",
+            "DST_OVER",
+            "SRC_IN",
+            "DST_IN",
+            "SRC_OUT",
+            "DST_OUT",
+            "SRC_ATOP",
+            "DST_ATOP",
+            "XOR",
+            "PLUS",
+            "MODULATE",
+            "SCREEN",
+            "OVERLAY",
+            "DARKEN",
+            "LIGHTEN",
+            "COLOR_DODGE",
+            "COLOR_BURN",
+            "HARD_LIGHT",
+            "SOFT_LIGHT",
+            "DIFFERENCE",
+            "EXCLUSION",
+            "MULTIPLY",
+            "HUE",
+            "SATURATION",
+            "COLOR",
+            "LUMINOSITY",
+        ],
+        "Landroid/graphics/Path$Direction;" => &["CW", "CCW"],
+        "Landroid/graphics/Region$Op;" => &[
+            "DIFFERENCE",
+            "INTERSECT",
+            "UNION",
+            "XOR",
+            "REVERSE_DIFFERENCE",
+            "REPLACE",
+        ],
+        _ => return None,
+    })
 }
 
 /// An enum constant's `ordinal()` as stored by `Enum.<init>`.
@@ -2186,16 +2723,62 @@ fn enum_call(vm: &mut Vm, class: &str, name: &str, args: &[V]) -> Rt<Option<Opti
                 _ => 0,
             };
             let d = ord(args[0]) - ord(args[1]);
+            if crate::dbg_flag("OVELO_ENUMDBG") {
+                let nm = |v: V| match v {
+                    V::Ref(h) => pseudo_get(vm, h, P_DATA)
+                        .and_then(|s| sv(vm, s))
+                        .unwrap_or_else(|| "?".into()),
+                    _ => "nonref".into(),
+                };
+                eprintln!(
+                    "[enumdbg] compareTo {}({}) vs {}({}) -> {d}",
+                    nm(args[0]),
+                    ord(args[0]),
+                    nm(args[1]),
+                    ord(args[1])
+                );
+            }
             Some(Some(V::I32(d.signum() as i32)))
         }
         "getDeclaringClass" => Some(Some(class_obj(vm, "Ljava/lang/Enum;".into()))),
         "valueOf" => {
-            let n = sv(vm, args[1]).unwrap_or_default();
-            Some(Some(host(vm, "Ljava/lang/Enum;", HostState::StrBuf(n))))
+            // Both `Enum.valueOf(Class,String)` (2 args) and the
+            // compiler-generated `EnumType.valueOf(String)` (1 arg)
+            // land here — the name is always the LAST argument, and
+            // for the 2-arg form the enum type comes from the Class
+            // mirror arg, not the invoke owner (`Ljava/lang/Enum;`) —
+            // minting a base-Enum object fails the caller's
+            // check-cast to the concrete type.
+            let n = args.last().and_then(|v| sv(vm, *v)).unwrap_or_default();
+            let cls = args
+                .first()
+                .and_then(|v| match v {
+                    V::Ref(h) => vm.class_descriptor_of(*h),
+                    _ => None,
+                })
+                .filter(|d| d != "Ljava/lang/Enum;")
+                .unwrap_or_else(|| class.to_string());
+            // Resolve through values() so platform enums return a
+            // constant with its real ordinal (Kotlin `when` tables
+            // index by it).
+            let hit = enum_value_list(vm, &cls).into_iter().find(|v| {
+                matches!(v, V::Ref(h)
+                    if pseudo_get(vm, *h, P_DATA)
+                        .and_then(|s| sv(vm, s))
+                        .as_deref() == Some(n.as_str()))
+            });
+            Some(Some(hit.unwrap_or_else(|| {
+                // No dex/known list — mint through the interned path so
+                // the result is `==`-equal to the static constant and
+                // carries the right ordinal (java.time + mirrored
+                // platform enums); a fresh ordinal-0 object would
+                // mis-compare and mis-index `when` tables.
+                enum_const(vm, &cls, &n)
+            })))
         }
         "values" => {
             let a = enum_values(vm, class);
-            if std::env::var_os("OVELO_TRACE").is_some() {
+            if crate::dbg_flag("OVELO_TRACE") {
                 let n = match vm.heap.get(match a {
                     V::Ref(h) => h,
                     _ => 0,
@@ -2322,7 +2905,12 @@ fn reflect_call(
             // java.lang.reflect.Modifier bit set; bare mirrors default
             // to public (the stub behavior they had before).
             let f = match pseudo_get(vm, h, P_FLAGS) {
-                Some(V::I32(x)) if pseudo_get(vm, h, P_METH).is_some() => x & 0xffff,
+                Some(V::I32(x))
+                    if pseudo_get(vm, h, P_METH).is_some()
+                        || pseudo_get(vm, h, P_DATA).is_some() =>
+                {
+                    x & 0xffff
+                }
                 _ => 1,
             };
             Some(Some(V::I32(f)))
@@ -2336,9 +2924,7 @@ fn reflect_call(
         } else {
             None
         }),
-        "isAccessible" | "canAccess" | "isDefault" | "isEnumConstant" => {
-            Some(Some(V::I32(1)))
-        }
+        "isAccessible" | "canAccess" | "isDefault" | "isEnumConstant" => Some(Some(V::I32(1))),
         "isSynthetic" | "isBridge" | "isVarArgs" => {
             let f = pseudo_get(vm, h, P_FLAGS)
                 .map(|v| match v {
@@ -2354,7 +2940,14 @@ fn reflect_call(
             Some(Some(V::I32(if f & bit != 0 { 1 } else { 0 })))
         }
         "getType" | "getReturnType" | "getGenericType" | "getGenericReturnType" => {
-            let d = meth_idx(vm, h).and_then(|m| vm.method_return_desc(m));
+            // Method mirror → declared return type; Field mirror (P_DATA
+            // carries the field index) → declared field type.
+            let d = meth_idx(vm, h)
+                .and_then(|m| vm.method_return_desc(m))
+                .or_else(|| match pseudo_get(vm, h, P_DATA) {
+                    Some(V::I64(f)) => vm.field_type_desc(f as crate::GIdx),
+                    _ => None,
+                });
             Some(Some(class_obj(vm, d.unwrap_or_else(|| OBJ.into()))))
         }
         "getParameterTypes" | "getGenericParameterTypes" => {
@@ -2436,9 +3029,22 @@ fn reflect_call(
                 }
             };
             match res {
-                Ok(Some(v)) => Some(Some(v)),
-                Ok(None) => Some(Some(V::Ref(0))),
+                Ok(Some(v)) => {
+                    if crate::dbg_flag("OVELO_REFDBG") {
+                        eprintln!("[refdbg] invoke {owner}.{member} ok");
+                    }
+                    Some(Some(v))
+                }
+                Ok(None) => {
+                    if crate::dbg_flag("OVELO_REFDBG") {
+                        eprintln!("[refdbg] invoke {owner}.{member} ok(void)");
+                    }
+                    Some(Some(V::Ref(0)))
+                }
                 Err(e) => {
+                    if crate::dbg_flag("OVELO_REFDBG") {
+                        eprintln!("[refdbg] invoke {owner}.{member} ERR {e}");
+                    }
                     let t = vm.throw_builtin(
                         "Ljava/lang/reflect/InvocationTargetException;",
                         &format!("{member}: {e}"),
@@ -2475,7 +3081,7 @@ fn reflect_call(
             match res {
                 Ok(nh) => Some(Some(V::Ref(nh))),
                 Err(e) => {
-                    if std::env::var_os("OVELO_VIEWDBG").is_some() {
+                    if crate::dbg_flag("OVELO_VIEWDBG") {
                         eprintln!("[viewdbg] newInstance {owner} failed: {e}");
                     }
                     let t = vm.throw_builtin(
@@ -2487,10 +3093,13 @@ fn reflect_call(
             }
         }
         _ if class.contains("Field") => {
-            let fid = vm
-                .field_index_of(&owner, &member)
-                .map(|g| vm.canon_field(g))
-                .unwrap_or(P_DATA as u64);
+            let fid = match pseudo_get(vm, h, P_DATA) {
+                Some(V::I64(f)) => vm.canon_field(f as crate::GIdx),
+                _ => vm
+                    .field_index_of(&owner, &member)
+                    .map(|g| vm.canon_field(g))
+                    .unwrap_or(P_DATA as u64),
+            };
             match name {
                 "get" | "getInt" | "getLong" | "getBoolean" | "getByte" | "getShort"
                 | "getChar" | "getFloat" | "getDouble" => {
@@ -2502,10 +3111,21 @@ fn reflect_call(
                             }
                             _ => V::Ref(0),
                         },
-                        // `Field.get(null)` reads a static field — the
-                        // field id is guest-owned (`Unsafe.theUnsafe` etc.),
-                        // so hand back an opaque placeholder.
-                        _ if name == "get" => host(vm, OBJ, HostState::Empty),
+                        // `Field.get(null)` reads a static field — pull the
+                        // real stored value first (kotlinx.serialization's
+                        // `INSTANCE`/`Companion` probes depend on it),
+                        // then fall back to an opaque placeholder for
+                        // guest-owned fields we can't decode.
+                        _ if name == "get" => {
+                            let v = vm
+                                .probe_static_named(&owner, &member)
+                                .or_else(|| crate::jdk::sfield(vm, &owner, &member, OBJ));
+                            if crate::dbg_flag("OVELO_REFDBG") {
+                                let hit = v.map(|v| !matches!(v, V::Ref(0))).unwrap_or(false);
+                                eprintln!("[refdbg] Field.get(null) {owner}.{member} hit={hit}");
+                            }
+                            v.unwrap_or_else(|| host(vm, OBJ, HostState::Empty))
+                        }
                         _ if name == "getLong" => V::I64(0),
                         _ if name == "getFloat" => V::F32(0.0),
                         _ if name == "getDouble" => V::F64(0.0),
@@ -2533,16 +3153,12 @@ fn reflect_call(
                 // component may itself be an array (`int[].class` →
                 // `int[][]`) or a primitive (`int.class` → `int[]`).
                 let comp = match args.first() {
-                    Some(V::Ref(h)) => {
-                        class_desc_of(vm, *h).unwrap_or_else(|| OBJ.to_string())
-                    }
+                    Some(V::Ref(h)) => class_desc_of(vm, *h).unwrap_or_else(|| OBJ.to_string()),
                     _ => OBJ.to_string(),
                 };
                 let dims: Vec<i32> = match args.get(1) {
                     Some(V::Ref(dh)) => match vm.heap.get(*dh) {
-                        Some(Obj::Array { data, .. }) => {
-                            data.iter().map(|v| i32v(*v)).collect()
-                        }
+                        Some(Obj::Array { data, .. }) => data.iter().map(|v| i32v(*v)).collect(),
                         _ => vec![0],
                     },
                     Some(v) => vec![i32v(*v)],
@@ -2708,7 +3324,7 @@ fn unsafe_call(vm: &mut Vm, name: &str, args: &[V]) -> Rt<Option<Option<V>>> {
                     vm.unsafe_next_offset += 1;
                     UNSAFE_TOKEN_BASE + vm.unsafe_next_offset
                 });
-            if std::env::var("OVELO_TRACE_FIELD").is_ok() {
+            if crate::dbg_flag("OVELO_TRACE_FIELD") {
                 eprintln!("[ftrace] {name} {owner}.{member} -> {off:#x}");
             }
             Some(V::I64(off))
@@ -2750,7 +3366,7 @@ fn unsafe_call(vm: &mut Vm, name: &str, args: &[V]) -> Rt<Option<Option<V>>> {
         "getObject" | "getObjectVolatile" | "getAndSetObject" => {
             let (o, k) = unsafe_key(args).unwrap_or((0, 0));
             let old = unsafe_read(vm, o, k);
-            if std::env::var("OVELO_TRACE_FIELD").is_ok() {
+            if crate::dbg_flag("OVELO_TRACE_FIELD") {
                 eprintln!("[ftrace] {name} obj={o} off={k:#x} -> {old:?}");
             }
             let old = if matches!(old, V::I32(0) | V::I64(0)) {
@@ -2830,6 +3446,14 @@ fn unsafe_call(vm: &mut Vm, name: &str, args: &[V]) -> Rt<Option<Option<V>>> {
                 args.get(4).copied().unwrap_or(V::I32(0)),
             );
             let cur = unsafe_read(vm, o, k);
+            // An unset field reads I32(0) while a long CAS expects
+            // I64 — coerce the raw read to the operand width or the
+            // CAS never succeeds and the retry loop spins.
+            let cur = match (cur, expect) {
+                (V::I32(i), V::I64(_)) => V::I64(i as i64),
+                (V::I64(i), V::I32(_)) => V::I32(i as i32),
+                _ => cur,
+            };
             Some(V::I32(if cas_eq(vm, cur, expect) {
                 unsafe_write(vm, o, k, new);
                 1
@@ -2884,8 +3508,7 @@ fn unsafe_call(vm: &mut Vm, name: &str, args: &[V]) -> Rt<Option<Option<V>>> {
             // call so the guest's own deadline check eventually trips.
             let time = i64v(args.get(2).copied().unwrap_or(V::I64(0)));
             if time > 0 {
-                let absolute =
-                    i64v(args.get(1).copied().unwrap_or(V::I32(0))) != 0;
+                let absolute = i64v(args.get(1).copied().unwrap_or(V::I32(0))) != 0;
                 let remain_ms = if absolute {
                     time.saturating_sub(now_ms())
                 } else {
@@ -2914,9 +3537,7 @@ fn unsafe_call(vm: &mut Vm, name: &str, args: &[V]) -> Rt<Option<Option<V>>> {
                         .map(|(_, _, t)| t.saturating_sub(now))
                         .min()
                         .unwrap_or(u64::MAX);
-                    let ms = (remain_ms.max(0) as u64)
-                        .min(until_due)
-                        .clamp(1, 64);
+                    let ms = (remain_ms.max(0) as u64).min(until_due).clamp(1, 64);
                     std::thread::sleep(std::time::Duration::from_millis(ms));
                 }
                 return Ok(Some(None));
@@ -2933,9 +3554,7 @@ fn unsafe_call(vm: &mut Vm, name: &str, args: &[V]) -> Rt<Option<Option<V>>> {
             vm.wake_parked();
             None
         }
-        "loadFence" | "storeFence" | "fullFence" | "monitorEnter" | "monitorExit" => {
-            None
-        }
+        "loadFence" | "storeFence" | "fullFence" | "monitorEnter" | "monitorExit" => None,
         _ => return Ok(None),
     };
     Ok(Some(v))
@@ -2955,7 +3574,9 @@ fn new_array_dims(vm: &mut Vm, comp: &str, dims: &[i32]) -> V {
     let data = if dims.len() <= 1 {
         vec![V::default_for(&elem); n]
     } else {
-        (0..n).map(|_| new_array_dims(vm, comp, &dims[1..])).collect()
+        (0..n)
+            .map(|_| new_array_dims(vm, comp, &dims[1..]))
+            .collect()
     };
     arr(vm, &elem, data)
 }

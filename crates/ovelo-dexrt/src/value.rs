@@ -109,6 +109,10 @@ pub enum HostState {
     /// A readable byte stream (`InputStream` over real bytes — raw
     /// resources, asset files): buffer + read cursor.
     Bytes(std::rc::Rc<Vec<u8>>, usize),
+    /// A readable char stream (`Reader` over UTF-16 units —
+    /// `StringReader`/`CharArrayReader`/`InputStreamReader`):
+    /// buffer + read cursor + mark.
+    Chars(std::rc::Rc<Vec<u16>>, usize, usize),
     /// A real writable file (`FileOutputStream` — SAF
     /// `openOutputStream` resolves documents to host files).
     File(std::fs::File),
@@ -131,10 +135,61 @@ pub enum HostState {
         /// Cursor: index of the current event in `events`.
         pos: usize,
     },
+    /// An `android.graphics.Path`: absolute drawing commands in the
+    /// path's own coordinate space.
+    GraphicsPath(Vec<PathCmd>),
     /// A recording `android.graphics.Canvas`: draw calls from a guest
     /// `View.onDraw` append [`CanvasOp`]s the host view materializer
     /// replays into the real surface.
     CanvasOps(Vec<CanvasOp>),
+}
+
+/// One absolute `android.graphics.Path` command. Relative path methods
+/// are resolved when the builtin records them.
+#[derive(Debug, Clone, Copy)]
+pub enum PathCmd {
+    /// Start a new contour.
+    MoveTo {
+        /// X coordinate.
+        x: f32,
+        /// Y coordinate.
+        y: f32,
+    },
+    /// Straight segment.
+    LineTo {
+        /// End x.
+        x: f32,
+        /// End y.
+        y: f32,
+    },
+    /// Quadratic Bézier segment.
+    QuadTo {
+        /// Control x.
+        cx: f32,
+        /// Control y.
+        cy: f32,
+        /// End x.
+        x: f32,
+        /// End y.
+        y: f32,
+    },
+    /// Cubic Bézier segment.
+    CubicTo {
+        /// First control x.
+        cx1: f32,
+        /// First control y.
+        cy1: f32,
+        /// Second control x.
+        cx2: f32,
+        /// Second control y.
+        cy2: f32,
+        /// End x.
+        x: f32,
+        /// End y.
+        y: f32,
+    },
+    /// Close the current contour.
+    Close,
 }
 
 /// One recorded `Canvas` call from a guest `View.onDraw`, in local
@@ -246,6 +301,23 @@ pub enum CanvasOp {
         /// Paint at call time.
         paint: PaintState,
     },
+    /// Flat-color convex polygon (GL triangle fan/strip flattened to
+    /// a fill) — `pts` is x,y pairs in canvas space.
+    FillPoly {
+        /// x,y vertex pairs.
+        pts: Vec<f32>,
+        /// Packed ARGB.
+        argb: i32,
+    },
+    /// `drawPath` — fill or stroke the recorded contours.
+    Path {
+        /// Absolute path commands.
+        cmds: Vec<PathCmd>,
+        /// Android Path.FillType ordinal (0 winding, 1 even-odd).
+        fill_type: i32,
+        /// Paint at call time.
+        paint: PaintState,
+    },
     /// `drawBitmap` — decoded pixels at `(x, y)`, scaled to `(w, h)`
     /// when both are nonzero (else natural size).
     Bitmap {
@@ -263,6 +335,15 @@ pub enum CanvasOp {
         src_h: u32,
         /// Straight RGBA8 pixels (`src_w` × `src_h`).
         rgba: std::rc::Rc<Vec<u8>>,
+    },
+    /// `drawRenderNode` — a *reference* to the node's recording, not a
+    /// copy: a re-recorded child layer must show through without the
+    /// parent re-recording (AOSP display lists store node references).
+    /// Expanded against the live heap when ops leave the runtime —
+    /// framework replay never sees this variant.
+    Nested {
+        /// `RenderNode` heap handle.
+        node: u32,
     },
 }
 
@@ -392,13 +473,27 @@ impl Heap {
                         HostState::Slot(v) => {
                             wl.extend(handle(v));
                         }
+                        // Display-list recordings reference RenderNode
+                        // handles — a node reachable only through a
+                        // parent's display list must survive or child
+                        // layers vanish after a GC.
+                        HostState::CanvasOps(ops) => {
+                            wl.extend(ops.iter().filter_map(|op| match op {
+                                CanvasOp::Nested { node }
+                                    if *node != 0 && (*node as usize) <= self.objs.len() =>
+                                {
+                                    Some(*node)
+                                }
+                                _ => None,
+                            }));
+                        }
                         _ => {}
                     }
                 }
                 _ => {}
             }
         }
-        if std::env::var_os("OVELO_MEMDBG").is_some() {
+        if crate::dbg_flag("OVELO_MEMDBG") {
             let mut kinds: HashMap<&'static str, usize> = HashMap::new();
             for (i, slot) in self.objs.iter().enumerate() {
                 if marked[i] {

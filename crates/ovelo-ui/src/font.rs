@@ -30,8 +30,8 @@ pub trait GlyphSource {
     }
     /// Raster coverage for `c`, or `None` when the font can't rasterize
     /// or doesn't cover the char (triggers fallback).
-    /// `ymin`/`ymax` follow fontdue convention: distance from the baseline
-    /// to the bitmap's bottom edge (positive = below baseline).
+    /// `ymin` follows fontdue's font-coordinate convention: distance from
+    /// the baseline to the bitmap's bottom edge, positive above baseline.
     fn raster_for(&self, _c: char, _size_px: f32) -> Option<GlyphBmp> {
         None
     }
@@ -67,7 +67,7 @@ pub struct ShapedGlyph {
 pub struct GlyphBmp {
     /// Left edge offset from the pen origin (may be negative).
     pub xmin: i32,
-    /// Bottom edge offset from the baseline (positive = below).
+    /// Bottom edge offset from the baseline (positive = above).
     pub ymin: i32,
     /// Bitmap width px.
     pub w: usize,
@@ -106,7 +106,8 @@ impl TtfFont {
     /// between faces — a `.ttc` registered per-face otherwise carries
     /// one full copy of the collection each.
     fn from_arc(bytes: std::sync::Arc<Vec<u8>>, index: u32) -> Result<Self> {
-        let face = ttf_parser::Face::parse(&bytes[..], index).map_err(|e| err("ui.font.parse", e))?;
+        let face =
+            ttf_parser::Face::parse(&bytes[..], index).map_err(|e| err("ui.font.parse", e))?;
         if face.is_variable() {
             // Variable fonts need instance pinning for deterministic layout;
             // reject until pinning is implemented.
@@ -305,6 +306,27 @@ impl FontSet {
     /// Register a font; earlier registrations win for shared glyphs.
     pub fn push(&mut self, f: Box<dyn GlyphSource>) {
         self.fonts.push(f);
+    }
+
+    /// Load one font file, registering every face of a collection.
+    /// Missing/unparseable files are skipped like directory entries.
+    pub fn load_file(&mut self, path: &str) -> usize {
+        let Ok(bytes) = std::fs::read(path) else {
+            return 0;
+        };
+        let faces = ttf_parser::fonts_in_collection(&bytes).unwrap_or(1).max(1);
+        let shared = std::sync::Arc::new(bytes);
+        let mut n = 0;
+        for i in 0..faces {
+            if let Ok(f) = TtfFont::from_arc(shared.clone(), i) {
+                if f.name.starts_with('.') {
+                    continue;
+                }
+                self.fonts.push(Box::new(f));
+                n += 1;
+            }
+        }
+        n
     }
 
     /// Scan directories for `.ttf`/`.otf`/`.ttc` files, registering
@@ -578,15 +600,14 @@ impl FontSet {
             .unwrap_or(size_px * 0.5)
     }
 
-    /// Max ascent/descent across the set (Minikin's conservative metrics).
+    /// Line metrics from the primary (first) font — maxing across the
+    /// whole fallback set lets one font with an oversized ascender
+    /// (system emoji/symbol fonts) inflate every line's height.
     pub fn metrics(&self, size_px: f32) -> (f32, f32) {
-        let mut a = 0f32;
-        let mut d = 0f32;
-        for f in &self.fonts {
-            a = a.max(f.ascent(size_px));
-            d = d.max(f.descent(size_px));
-        }
-        (a, d)
+        self.fonts
+            .first()
+            .map(|f| (f.ascent(size_px), f.descent(size_px)))
+            .unwrap_or((size_px * 0.9, size_px * 0.25))
     }
 
     /// Per-char advances for `text`, itemized the same way

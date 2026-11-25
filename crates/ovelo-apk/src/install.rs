@@ -130,6 +130,23 @@ impl InstallStore {
         Ok(d)
     }
 
+    /// Every installed app with a readable `current` record.
+    pub fn installed(&self) -> Vec<InstallRecord> {
+        let mut out = Vec::new();
+        let Ok(rd) = std::fs::read_dir(self.root.join("apps")) else {
+            return out;
+        };
+        for e in rd.flatten() {
+            let Ok(text) = std::fs::read_to_string(e.path().join("current")) else {
+                continue;
+            };
+            if let Ok(r) = parse_record(&text, &self.root) {
+                out.push(r);
+            }
+        }
+        out
+    }
+
     /// Current install record for `app`, if any.
     pub fn current(&self, app: &AppId) -> Result<Option<InstallRecord>> {
         let cur = self.app_dir(app).join("current");

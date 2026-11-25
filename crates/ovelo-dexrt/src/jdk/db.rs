@@ -24,6 +24,8 @@ pub(crate) const P_CUR_POS: u32 = u32::MAX - 32;
 pub(crate) const P_SQL: u32 = u32::MAX - 33;
 pub(crate) const P_DBNAME: u32 = u32::MAX - 34;
 pub(crate) const P_DBVER: u32 = u32::MAX - 35;
+/// Marker: this helper's `onOpen` already ran for the current open.
+pub(crate) const P_DBOPENED: u32 = u32::MAX - 36;
 
 /// One open SQLite database (connection + transaction state).
 pub(crate) struct Db {
@@ -59,18 +61,30 @@ fn safe_name(name: &str) -> String {
     }
 }
 
-/// Open (or fetch) the connection for `name`; `:memory:` stays in RAM.
+/// Open (or fetch) the pooled connection for `name`; `:memory:` stays
+/// in RAM. Callers that need an independent handle (the bundled
+/// androidx driver — Room puts reader connections under
+/// `PRAGMA query_only`, which must not poison the writer) use
+/// `open_raw` instead.
 fn conn_for(vm: &mut Vm, name: &str) -> Result<Rc<RefCell<Db>>, E> {
     let name = safe_name(name);
     if let Some(d) = vm.dbs.get(&name) {
         return Ok(d.clone());
     }
+    let d = open_raw(vm, &name)?;
+    vm.dbs.insert(name, d.clone());
+    Ok(d)
+}
+
+/// A fresh connection to `name` — same sandboxing, collations and
+/// authorizer as the pooled path, but not shared with `vm.dbs`.
+fn open_raw(vm: &mut Vm, name: &str) -> Result<Rc<RefCell<Db>>, E> {
     let conn = if name == ":memory:" {
         Connection::open_in_memory()
     } else {
         let dir = db_dir(vm);
         let _ = std::fs::create_dir_all(&dir);
-        Connection::open(dir.join(&name))
+        Connection::open(dir.join(name))
     }
     .map_err(|e| {
         vm.throw_builtin(
@@ -100,13 +114,11 @@ fn conn_for(vm: &mut Vm, name: &str) -> Result<Rc<RefCell<Db>>, E> {
             an.cmp(&bn)
         });
     }
-    let d = Rc::new(RefCell::new(Db {
+    Ok(Rc::new(RefCell::new(Db {
         conn,
         tx_stack: Vec::new(),
         tx_failed: false,
-    }));
-    vm.dbs.insert(name, d.clone());
-    Ok(d)
+    })))
 }
 
 /// The `SQLiteDatabase` object for `name` — one per name (AOSP caches
@@ -170,6 +182,39 @@ fn commit_or_rollback(conn: &mut rusqlite::Connection, ok: bool) -> rusqlite::Re
             Err(e)
         }
         r => r,
+    }
+}
+
+/// Mirror transaction depth when a guest drives BEGIN/COMMIT/ROLLBACK
+/// as raw SQL. Room's bundled androidx.sqlite driver wraps them in
+/// `TransactionSQLiteStatement`s that reach us through `execSQL` /
+/// `SQLiteStatement.execute` — not `beginTransaction` — and
+/// `RoomDatabase.inTransaction` would read an empty stack and let
+/// `assertNotSuspendingTransaction` throw inside `withTransaction`.
+fn track_tx_sql(d: &mut Db, sql: &str) {
+    let mut it = sql.split_whitespace();
+    // Single-word statements arrive with their `;` — `COMMIT;`
+    // must still match, or the depth never unwinds and the next
+    // `beginTransaction` thinks a tx is already open.
+    let verb = it.next().unwrap_or_default().trim_end_matches(';');
+    if verb.eq_ignore_ascii_case("begin") {
+        d.tx_stack.push(false);
+    } else if verb.eq_ignore_ascii_case("commit")
+        || verb.eq_ignore_ascii_case("end")
+        || verb.eq_ignore_ascii_case("release")
+    {
+        d.tx_stack.pop();
+        if d.tx_stack.is_empty() {
+            d.tx_failed = false;
+        }
+    } else if verb.eq_ignore_ascii_case("rollback") {
+        // Both `ROLLBACK` and `ROLLBACK TO SAVEPOINT` unwind a level.
+        d.tx_stack.pop();
+        if d.tx_stack.is_empty() {
+            d.tx_failed = false;
+        }
+    } else if verb.eq_ignore_ascii_case("savepoint") {
+        d.tx_stack.push(false);
     }
 }
 
@@ -238,13 +283,7 @@ fn run_query(vm: &mut Vm, h: u32, sql: &str, binds: V) -> Result<V, E> {
             let mut row = Vec::with_capacity(cols.len());
             for i in 0..cols.len() {
                 let v = r.get_ref(i).map_err(|e| sql_err(vm, e))?;
-                row.push(match v {
-                    ValueRef::Null => SV::Null,
-                    ValueRef::Integer(i) => SV::Integer(i),
-                    ValueRef::Real(f) => SV::Real(f),
-                    ValueRef::Text(t) => SV::Text(String::from_utf8_lossy(t).to_string()),
-                    ValueRef::Blob(b) => SV::Blob(b.to_vec()),
-                });
+                row.push(sv_ref(v));
             }
             cells.push(row);
         }
@@ -384,12 +423,11 @@ pub(crate) fn media_cursor(vm: &mut Vm, uri: &str, projection: &[String]) -> V {
     let mut bucket_audio: std::collections::BTreeMap<String, i64> =
         std::collections::BTreeMap::new();
     for f in files.iter().filter(|f| f.2 == 2) {
-        let rel = f
-            .0
-            .strip_prefix(&vm.external_root)
-            .ok()
-            .map(|r| r.to_string_lossy().replace('\\', "/"))
-            .unwrap_or_default();
+        let rel =
+            f.0.strip_prefix(&vm.external_root)
+                .ok()
+                .map(|r| r.to_string_lossy().replace('\\', "/"))
+                .unwrap_or_default();
         let dir = rel
             .rsplit_once('/')
             .map(|(d, _)| format!("{d}/"))
@@ -398,145 +436,148 @@ pub(crate) fn media_cursor(vm: &mut Vm, uri: &str, projection: &[String]) -> V {
     }
     let audio_albums = bucket_audio.len() as i64;
     for (p, mime, mtype) in files {
-            // A scoped volume (images/video/audio) filters by media
-            // type; "file"/"media" volumes accept everything.
-            let wanted = if images {
-                mtype == 1
-            } else if video {
-                mtype == 3
-            } else if audio {
-                mtype == 2
-            } else {
-                true
-            };
-            if !wanted {
-                continue;
-            }
-            let rel = p
-                .strip_prefix(&vm.external_root)
-                .ok()
-                .map(|r| r.to_string_lossy().replace('\\', "/"))
-                .unwrap_or_default();
-            let name = p
-                .file_name()
-                .map(|n| n.to_string_lossy().to_string())
-                .unwrap_or_default();
-            let title = p
-                .file_stem()
-                .map(|n| n.to_string_lossy().to_string())
-                .unwrap_or_default();
-            let bucket = p
-                .parent()
-                .and_then(|x| x.file_name())
-                .map(|n| n.to_string_lossy().to_string())
-                .unwrap_or_default();
-            // Full parent path relative to the storage root, with a
-            // trailing slash — nested folders keep their ancestors
-            // (DCIM/Camera/ → "DCIM/Camera/", root files → "").
-            let rel_dir = rel
-                .rsplit_once('/')
-                .map(|(d, _)| format!("{d}/"))
-                .unwrap_or_default();
-            let meta = std::fs::metadata(&p).ok();
-            let size = meta.as_ref().map(|m| m.len() as i64).unwrap_or(0);
-            let mtime = meta
-                .and_then(|m| m.modified().ok())
-                .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
-                .map(|d| d.as_secs() as i64)
-                .unwrap_or(0);
-            let (w, h) = img_dims(&p);
-            let dur = if mtype == 2 {
-                audio_duration_ms(&p, size)
+        // A scoped volume (images/video/audio) filters by media
+        // type; "file"/"media" volumes accept everything.
+        let wanted = if images {
+            mtype == 1
+        } else if video {
+            mtype == 3
+        } else if audio {
+            mtype == 2
+        } else {
+            true
+        };
+        if !wanted {
+            continue;
+        }
+        let rel = p
+            .strip_prefix(&vm.external_root)
+            .ok()
+            .map(|r| r.to_string_lossy().replace('\\', "/"))
+            .unwrap_or_default();
+        let name = p
+            .file_name()
+            .map(|n| n.to_string_lossy().to_string())
+            .unwrap_or_default();
+        let title = p
+            .file_stem()
+            .map(|n| n.to_string_lossy().to_string())
+            .unwrap_or_default();
+        let bucket = p
+            .parent()
+            .and_then(|x| x.file_name())
+            .map(|n| n.to_string_lossy().to_string())
+            .unwrap_or_default();
+        // Full parent path relative to the storage root, with a
+        // trailing slash — nested folders keep their ancestors
+        // (DCIM/Camera/ → "DCIM/Camera/", root files → "").
+        let rel_dir = rel
+            .rsplit_once('/')
+            .map(|(d, _)| format!("{d}/"))
+            .unwrap_or_default();
+        let meta = std::fs::metadata(&p).ok();
+        let size = meta.as_ref().map(|m| m.len() as i64).unwrap_or(0);
+        let mtime = meta
+            .and_then(|m| m.modified().ok())
+            .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+            .map(|d| d.as_secs() as i64)
+            .unwrap_or(0);
+        let (w, h) = img_dims(&p);
+        let dur = if mtype == 2 {
+            audio_duration_ms(&p, size)
+        } else {
+            0
+        };
+        let data = format!("/storage/emulated/0/{rel}");
+        // `_id` persists per path for the runtime's life — like a
+        // real MediaStore rowid, adding/removing other files never
+        // reshuffles it. `bucket_id` follows MediaStore's
+        // parent-path hashCode (AOSP collides there too).
+        let row_id = if let Some(&id) = vm.media_ids.get(&data) {
+            id
+        } else {
+            vm.next_media_id += 1;
+            vm.media_ids.insert(data.clone(), vm.next_media_id);
+            vm.next_media_id
+        };
+        let bucket_id = java_hash(&rel_dir.to_lowercase()) as i64;
+        // Scoped aggregate URIs key `_id` by their own entity:
+        // `audio/albums` rows must expose `album_id` as `_id` —
+        // apps join `track.album_id == album._id` (and likewise
+        // artists/genres); a media rowid would fail that join.
+        // `…/{id}/members` lists tracks — those rows keep their own
+        // media rowid or playback URIs break.
+        let album_id = java_hash(&rel_dir.to_lowercase()) as i64;
+        let artist_id = 1i64;
+        let genre_id = 0i64;
+        let scoped_id = if uri.contains("/members") {
+            row_id
+        } else if uri.contains("/albums") {
+            album_id
+        } else if uri.contains("/artists") {
+            artist_id
+        } else if uri.contains("/genres") {
+            genre_id
+        } else {
+            row_id
+        };
+        rows.push(vec![
+            V::I64(scoped_id),
+            jstr(vm, &data),
+            jstr(vm, &name),
+            jstr(vm, &title),
+            V::I64(size),
+            V::I64(mtime),
+            V::I64(mtime),
+            V::I64(mtime * 1000),
+            jstr(vm, mime),
+            V::I64(mtype),
+            V::I64(bucket_id),
+            jstr(vm, &bucket),
+            jstr(vm, &rel_dir),
+            V::I64(w),
+            V::I64(h),
+            V::I64(0),
+            V::I64(dur),
+            V::I64(0),
+            jstr(vm, "external"),
+            // The parent folder doubles as the album name (like a
+            // Music/<Album>/<Track>.mp3 library layout); artist is
+            // left at the conventional unknown-artist label.
+            jstr(vm, "<unknown>"),
+            jstr(vm, &bucket),
+            V::I64(java_hash(&rel_dir.to_lowercase()) as i64),
+            V::I64(1),
+            // `track` = disc*1000 + number (MediaStore encoding);
+            // apps filter `track > 0` — 0 drops the row entirely.
+            V::I64(if mtype == 2 { 1001 } else { 0 }),
+            V::I64(0),
+            V::I64(0),
+            jstr(vm, "<unknown>"),
+            V::Ref(0),
+            V::I64((mtype == 2) as i64),
+            V::I64(0),
+            V::I64(0),
+            V::I64(0),
+            V::I64(0),
+            V::I64(0),
+            V::I64(if mtype == 2 { audio_total } else { 0 }),
+            V::I64(if mtype == 2 { audio_albums } else { 0 }),
+            V::I64(if mtype == 2 {
+                *bucket_audio.get(&rel_dir).unwrap_or(&0)
             } else {
                 0
-            };
-            let data = format!("/storage/emulated/0/{rel}");
-            // `_id` persists per path for the runtime's life — like a
-            // real MediaStore rowid, adding/removing other files never
-            // reshuffles it. `bucket_id` follows MediaStore's
-            // parent-path hashCode (AOSP collides there too).
-            let row_id = if let Some(&id) = vm.media_ids.get(&data) {
-                id
-            } else {
-                vm.next_media_id += 1;
-                vm.media_ids.insert(data.clone(), vm.next_media_id);
-                vm.next_media_id
-            };
-            let bucket_id = java_hash(&rel_dir.to_lowercase()) as i64;
-            // Scoped aggregate URIs key `_id` by their own entity:
-            // `audio/albums` rows must expose `album_id` as `_id` —
-            // apps join `track.album_id == album._id` (and likewise
-            // artists/genres); a media rowid would fail that join.
-            // `…/{id}/members` lists tracks — those rows keep their own
-            // media rowid or playback URIs break.
-            let album_id = java_hash(&rel_dir.to_lowercase()) as i64;
-            let artist_id = 1i64;
-            let genre_id = 0i64;
-            let scoped_id = if uri.contains("/members") {
-                row_id
-            } else if uri.contains("/albums") {
-                album_id
-            } else if uri.contains("/artists") {
-                artist_id
-            } else if uri.contains("/genres") {
-                genre_id
-            } else {
-                row_id
-            };
-            rows.push(vec![
-                V::I64(scoped_id),
-                jstr(vm, &data),
-                jstr(vm, &name),
-                jstr(vm, &title),
-                V::I64(size),
-                V::I64(mtime),
-                V::I64(mtime),
-                V::I64(mtime * 1000),
-                jstr(vm, mime),
-                V::I64(mtype),
-                V::I64(bucket_id),
-                jstr(vm, &bucket),
-                jstr(vm, &rel_dir),
-                V::I64(w),
-                V::I64(h),
-                V::I64(0),
-                V::I64(dur),
-                V::I64(0),
-                jstr(vm, "external"),
-                // The parent folder doubles as the album name (like a
-                // Music/<Album>/<Track>.mp3 library layout); artist is
-                // left at the conventional unknown-artist label.
-                jstr(vm, "<unknown>"),
-                jstr(vm, &bucket),
-                V::I64(java_hash(&rel_dir.to_lowercase()) as i64),
-                V::I64(1),
-                // `track` = disc*1000 + number (MediaStore encoding);
-                // apps filter `track > 0` — 0 drops the row entirely.
-                V::I64(if mtype == 2 { 1001 } else { 0 }),
-                V::I64(0),
-                V::I64(0),
-                jstr(vm, "<unknown>"),
-                V::Ref(0),
-                V::I64((mtype == 2) as i64),
-                V::I64(0),
-                V::I64(0),
-                V::I64(0),
-                V::I64(0),
-                V::I64(0),
-                V::I64(if mtype == 2 { audio_total } else { 0 }),
-                V::I64(if mtype == 2 { audio_albums } else { 0 }),
-                V::I64(if mtype == 2 {
-                    *bucket_audio.get(&rel_dir).unwrap_or(&0)
-                } else {
-                    0
-                }),
-                V::I64(0),
-                jstr(vm, "<unknown>"),
-                V::I64(0),
-            ]);
+            }),
+            V::I64(0),
+            jstr(vm, "<unknown>"),
+            V::I64(0),
+        ]);
     }
-    if std::env::var_os("OVELO_DRAINDBG").is_some() {
-        eprintln!("[media_cursor] {uri} rows={} projection={projection:?}", rows.len());
+    if crate::dbg_flag("OVELO_DRAINDBG") {
+        eprintln!(
+            "[media_cursor] {uri} rows={} projection={projection:?}",
+            rows.len()
+        );
     }
     // Honor the projection: the cursor's column set is exactly the
     // requested names, in the requested order — positional reads must
@@ -712,10 +753,7 @@ pub(crate) fn saf_cursor(vm: &mut Vm, uri: &str, projection: &[String]) -> V {
             _ => "application/octet-stream",
         }
     };
-    let vol = doc_id
-        .split_once(':')
-        .map(|(v, _)| v)
-        .unwrap_or("primary");
+    let vol = doc_id.split_once(':').map(|(v, _)| v).unwrap_or("primary");
     let push_row = |vm: &mut Vm, rows: &mut Vec<Vec<V>>, p: &std::path::Path, id: String| {
         let meta = std::fs::metadata(p).ok();
         let size = meta.as_ref().map(|m| m.len() as i64).unwrap_or(0);
@@ -763,8 +801,11 @@ pub(crate) fn saf_cursor(vm: &mut Vm, uri: &str, projection: &[String]) -> V {
     } else if base.exists() {
         push_row(vm, &mut rows, &base, doc_id.clone());
     }
-    if std::env::var_os("OVELO_DRAINDBG").is_some() {
-        eprintln!("[saf_cursor] {uri} rows={} projection={projection:?}", rows.len());
+    if crate::dbg_flag("OVELO_DRAINDBG") {
+        eprintln!(
+            "[saf_cursor] {uri} rows={} projection={projection:?}",
+            rows.len()
+        );
     }
     let (cols, rows) = if projection.is_empty() || projection.iter().any(|c| c == "*") {
         (COLS.iter().map(|c| c.to_string()).collect(), rows)
@@ -821,9 +862,8 @@ fn audio_duration_ms(p: &std::path::Path, size: i64) -> i64 {
                     let tag = &b[i..i + 4];
                     let len = u32::from_le_bytes(b[i + 4..i + 8].try_into().unwrap()) as usize;
                     if tag == b"fmt " && i + 8 + len <= b.len() && len >= 16 {
-                        rate = u32::from_le_bytes(
-                            b[i + 8 + 8..i + 8 + 12].try_into().unwrap(),
-                        ) as u64;
+                        rate =
+                            u32::from_le_bytes(b[i + 8 + 8..i + 8 + 12].try_into().unwrap()) as u64;
                     } else if tag == b"data" {
                         data = len as u64;
                     }
@@ -1003,8 +1043,10 @@ pub(crate) fn db_call(vm: &mut Vm, name: &str, args: &[V]) -> Rt<Option<Option<V
         Some(&V::Ref(h)) => h,
         _ => 0,
     };
-    if std::env::var_os("OVELO_DBDBG").is_some() {
-        eprintln!("[db] {name}(h={h})");
+    if crate::dbg_flag("OVELO_DBDBG") {
+        let sql = args.get(1).and_then(|v| sv(vm, *v)).unwrap_or_default();
+        let sql: String = sql.chars().take(80).collect();
+        eprintln!("[db] {name}(h={h}) {sql}");
     }
     // A SQLiteStatement also lands here (database/* dispatch): it
     // carries P_SQL, so it takes the statement path.
@@ -1045,6 +1087,15 @@ fn sqlite_call(vm: &mut Vm, name: &str, args: &[V]) -> Rt<Option<Option<V>>> {
         "getWritableDatabase" | "getReadableDatabase" => {
             let n = db_name_of(vm, this).unwrap_or_else(|| "ovelo".into());
             let out = db_obj(vm, &n)?;
+            // AOSP open sequence: onConfigure runs first on a fresh
+            // open (Room's SupportOpenHelperCallback enables foreign
+            // keys there), then the version check below, then onOpen.
+            // The handle is cached afterwards — once per helper, not
+            // once per getWritableDatabase call.
+            let first_open = pseudo_get(vm, this, P_DBOPENED).map(i32v).unwrap_or(0) == 0;
+            if first_open {
+                vm.call_virtual_rt(this, "onConfigure", &[out])?;
+            }
             // AOSP migrates on open: when the stored user_version
             // differs from the helper's schema version the matching
             // guest callback runs before the db is handed out.
@@ -1081,9 +1132,9 @@ fn sqlite_call(vm: &mut Vm, name: &str, args: &[V]) -> Rt<Option<Option<V>>> {
                     // missing method may be treated as "no migration".
                     let ci = vm.heap.class_of(this).unwrap_or(0);
                     let has_hook = vm
-                        .find_method_on_chain(ci, hook, cb_args.len())
+                        .resolve_call_args(ci, hook, &cb_args)
                         .ok()
-                        .flatten()
+                        .and_then(|(m, _)| m)
                         .is_some();
                     let res = if has_hook {
                         vm.call_virtual_rt(this, hook, &cb_args)
@@ -1127,12 +1178,38 @@ fn sqlite_call(vm: &mut Vm, name: &str, args: &[V]) -> Rt<Option<Option<V>>> {
                     }
                 }
             }
+            // Room's RoomConnectionManager installs an onOpen callback
+            // that records its supportDatabase wrapper here — skipping
+            // it leaves isSupportDatabaseOpen() false and Room's
+            // assertNotSuspendingTransaction fires mid-transaction.
+            if first_open {
+                pseudo_set(vm, this, P_DBOPENED, V::I32(1));
+                vm.call_virtual_rt(this, "onOpen", &[out])?;
+            }
+            Some(Some(out))
+        }
+        "getThreadSession" => {
+            // Room reflects this hidden AOSP method for read-only
+            // transactions. Model the session as a lightweight link back
+            // to its database; reflective SQLiteSession.beginTransaction
+            // delegates through it below.
+            let out = host(
+                vm,
+                "Landroid/database/sqlite/SQLiteSession;",
+                HostState::Empty,
+            );
+            if let (V::Ref(sh), V::Ref(dbh)) = (out, args[0]) {
+                pseudo_set(vm, sh, crate::P_META as u32, V::Ref(dbh));
+            }
             Some(Some(out))
         }
         "beginTransaction"
         | "beginTransactionNonExclusive"
         | "beginTransactionWithListener"
         | "beginTransactionWithListenerNonExclusive" => {
+            if let Some(V::Ref(dbh)) = pseudo_get(vm, this, crate::P_META as u32) {
+                return db_call(vm, name, &[V::Ref(dbh)]);
+            }
             let db = conn_of(vm, this)?;
             let mut d = db.borrow_mut();
             // Nested begins stack on one level each — only the
@@ -1208,6 +1285,7 @@ fn sqlite_call(vm: &mut Vm, name: &str, args: &[V]) -> Rt<Option<Option<V>>> {
                     .execute_batch(&sql)
                     .map_err(|e| sql_err(vm, e))?;
             }
+            track_tx_sql(&mut db.borrow_mut(), &sql);
             Some(None)
         }
         "rawQuery" | "rawQueryWithFactory" => {
@@ -1376,6 +1454,8 @@ fn sqlite_call(vm: &mut Vm, name: &str, args: &[V]) -> Rt<Option<Option<V>>> {
             if let Some(n) = db_name_of(vm, this) {
                 vm.dbs.remove(&safe_name(&n));
             }
+            // A re-open must run the configure/open callbacks again.
+            pseudo_set(vm, this, P_DBOPENED, V::I32(0));
             Some(None)
         }
         "getVersion" => {
@@ -1478,6 +1558,7 @@ fn stmt_call(vm: &mut Vm, name: &str, args: &[V]) -> Rt<Option<Option<V>>> {
                 .conn
                 .execute(&sql, params_from_iter(params))
                 .map_err(|e| sql_err(vm, e))?;
+            track_tx_sql(&mut db.borrow_mut(), &sql);
             Some(None)
         }
         "executeInsert" => {
@@ -1571,9 +1652,12 @@ fn cursor_call(vm: &mut Vm, name: &str, args: &[V]) -> Rt<Option<Option<V>>> {
     };
     let n_rows = cur_rows(vm, h).len() as i32;
     let col_arg = i32v(*args.get(1).unwrap_or(&V::I32(0)));
-    let dbg = std::env::var_os("OVELO_CURDBG").is_some();
+    let dbg = crate::dbg_flag("OVELO_CURDBG");
     if dbg && matches!(name, "getCount") {
-        eprintln!("[cur] h={h} getCount -> {n_rows} cols={:?}", cur_cols(vm, h));
+        eprintln!(
+            "[cur] h={h} getCount -> {n_rows} cols={:?}",
+            cur_cols(vm, h)
+        );
     }
     Ok(match name {
         "getCount" => Some(Some(V::I32(n_rows))),
@@ -1631,9 +1715,7 @@ fn cursor_call(vm: &mut Vm, name: &str, args: &[V]) -> Rt<Option<Option<V>>> {
         // after-last. Returning false there makes guest loops like
         // `while (!isAfterLast()) { moveToNext() }` spin forever and
         // blow the interpreter's instruction budget.
-        "isBeforeFirst" => Some(Some(V::I32(
-            (n_rows == 0 || cur_pos(vm, h) < 0) as i32,
-        ))),
+        "isBeforeFirst" => Some(Some(V::I32((n_rows == 0 || cur_pos(vm, h) < 0) as i32))),
         "isAfterLast" => Some(Some(V::I32(
             (n_rows == 0 || cur_pos(vm, h) >= n_rows) as i32,
         ))),
@@ -1672,7 +1754,11 @@ fn cursor_call(vm: &mut Vm, name: &str, args: &[V]) -> Rt<Option<Option<V>>> {
                 eprintln!(
                     "[cur] h={h} getString pos={} col={col_arg} -> {}",
                     cur_pos(vm, h),
-                    sv(vm, v).unwrap_or_else(|| format!("{v:?}")).chars().take(60).collect::<String>()
+                    sv(vm, v)
+                        .unwrap_or_else(|| format!("{v:?}"))
+                        .chars()
+                        .take(60)
+                        .collect::<String>()
                 );
             }
             Some(Some(match v {
@@ -1712,4 +1798,407 @@ fn cursor_call(vm: &mut Vm, name: &str, args: &[V]) -> Rt<Option<Option<V>>> {
         | "setExtras" => Some(None),
         _ => None,
     })
+}
+
+fn sv_ref(v: ValueRef) -> SV {
+    match v {
+        ValueRef::Null => SV::Null,
+        ValueRef::Integer(i) => SV::Integer(i),
+        ValueRef::Real(f) => SV::Real(f),
+        ValueRef::Text(t) => SV::Text(String::from_utf8_lossy(t).to_string()),
+        ValueRef::Blob(b) => SV::Blob(b.to_vec()),
+    }
+}
+
+/// androidx.sqlite `BundledSQLite*` driver — JNI natives backed by the
+/// same rusqlite connection pool as `SQLiteDatabase`. Room3's
+/// `ConnectionPool` talks straight to these (the app's `libsqliteJni.so`
+/// is never touched), so without them every Room query no-ops.
+///
+/// A statement handle carries its sql + pending binds; the whole result
+/// is materialized on the first `step` (`run_query` semantics), later
+/// steps walk the rows.
+pub(crate) struct BundledStmt {
+    pub conn: Rc<RefCell<Db>>,
+    pub sql: String,
+    pub params: Vec<SV>,
+    pub cols: Vec<String>,
+    pub rows: Vec<Vec<SV>>,
+    /// Row a successful `step` landed on.
+    pub cur: Option<usize>,
+    /// The statement ran at least once since prepare/reset.
+    pub executed: bool,
+}
+
+impl BundledStmt {
+    fn exec(&mut self) -> rusqlite::Result<()> {
+        let d = self.conn.borrow();
+        if crate::dbg_flag("OVELO_DBDBG") {
+            let sql: String = self.sql.chars().take(400).collect();
+            eprintln!("[bundled] exec: {sql} | params={:?}", self.params);
+        }
+        let mut st = d.conn.prepare(&self.sql)?;
+        if st.column_count() > 0 {
+            self.cols = st.column_names().iter().map(|c| c.to_string()).collect();
+            let mut rows = st.query(params_from_iter(self.params.clone()))?;
+            self.rows.clear();
+            while let Some(r) = rows.next()? {
+                let mut row = Vec::with_capacity(self.cols.len());
+                for i in 0..self.cols.len() {
+                    row.push(sv_ref(r.get_ref(i)?));
+                }
+                self.rows.push(row);
+            }
+            if crate::dbg_flag("OVELO_DBDBG") {
+                eprintln!(
+                    "[bundled] query -> {} rows: {:?}",
+                    self.rows.len(),
+                    self.rows.first()
+                );
+            }
+        } else {
+            let r = st.execute(params_from_iter(self.params.clone()))?;
+            if crate::dbg_flag("OVELO_DBDBG") {
+                eprintln!(
+                    "[bundled] exec -> {r} rows rowid={}",
+                    d.conn.last_insert_rowid()
+                );
+            }
+            self.cols = Vec::new();
+            self.rows = Vec::new();
+        }
+        self.cur = None;
+        self.executed = true;
+        Ok(())
+    }
+
+    fn cur_row(&self) -> Option<&[SV]> {
+        self.cur
+            .and_then(|i| self.rows.get(i))
+            .map(|r| r.as_slice())
+    }
+
+    fn cell(&self, col: i64) -> SV {
+        self.cur_row()
+            .and_then(|r| r.get(col.max(0) as usize))
+            .cloned()
+            .unwrap_or(SV::Null)
+    }
+}
+
+fn sv_long(v: &SV) -> i64 {
+    match v {
+        SV::Integer(i) => *i,
+        SV::Real(f) => *f as i64,
+        SV::Text(t) => t.trim().parse().unwrap_or(0),
+        _ => 0,
+    }
+}
+
+fn sv_double(v: &SV) -> f64 {
+    match v {
+        SV::Integer(i) => *i as f64,
+        SV::Real(f) => *f,
+        SV::Text(t) => t.trim().parse().unwrap_or(0.0),
+        _ => 0.0,
+    }
+}
+
+/// SQLITE_COLUMN_* type of a cell (5 = NULL before/without a row).
+fn sv_coltype(v: &SV) -> i32 {
+    match v {
+        SV::Integer(_) => 1,
+        SV::Real(_) => 2,
+        SV::Text(_) => 3,
+        SV::Blob(_) => 4,
+        SV::Null => 5,
+    }
+}
+
+fn bconn(vm: &mut Vm, h: i64) -> Result<Rc<RefCell<Db>>, E> {
+    vm.bundled_conns
+        .get(&(h as u64))
+        .cloned()
+        .ok_or_else(|| sql_err(vm, format!("connection {h} is closed")))
+}
+
+fn next_bundled_h(vm: &mut Vm) -> i64 {
+    vm.bundled_h += 1;
+    vm.bundled_h as i64
+}
+
+/// `Landroidx/sqlite/driver/bundled/*Kt;` native declarations.
+pub(crate) fn bundled_call(vm: &mut Vm, name: &str, args: &[V]) -> Rt<Option<Option<V>>> {
+    let r: Result<Option<V>, E> = (|| {
+        Ok(match name {
+            "nativeThreadSafeMode" => Some(V::I32(1)),
+            "nativeOpen" => {
+                let p = args.first().and_then(|v| sv(vm, *v)).unwrap_or_default();
+                let dbname = if p.contains(":memory:") {
+                    ":memory:".to_string()
+                } else {
+                    let path = p.strip_prefix("file:").unwrap_or(&p);
+                    safe_name(path.split('?').next().unwrap_or(path))
+                };
+                // NOT conn_for: every bundled open gets its own
+                // Connection — Room's reader pool sets
+                // `PRAGMA query_only = 1`, which would turn the shared
+                // handle readonly for the writer too.
+                let d = open_raw(vm, &dbname)?;
+                let h = next_bundled_h(vm);
+                vm.bundled_conns.insert(h as u64, d);
+                Some(V::I64(h))
+            }
+            "nativeClose" => {
+                let h = i64v(args[0]);
+                if vm.bundled_stmts.remove(&(h as u64)).is_none() {
+                    vm.bundled_conns.remove(&(h as u64));
+                }
+                None
+            }
+            "nativeInTransaction" => {
+                let d = bconn(vm, i64v(args[0]))?;
+                let auto = d.borrow().conn.is_autocommit();
+                Some(V::I32(!auto as i32))
+            }
+            "nativeLoadExtension" => None,
+            "nativePrepare" => {
+                let d = bconn(vm, i64v(args[0]))?;
+                let sql = args.get(1).and_then(|v| sv(vm, *v)).unwrap_or_default();
+                if crate::dbg_flag("OVELO_DBDBG") {
+                    let t: String = sql.chars().take(100).collect();
+                    eprintln!("[bundled] prepare: {t}");
+                }
+                // Compile now: the real JNI surfaces syntax errors here,
+                // not at first step.
+                d.borrow().conn.prepare(&sql).map_err(|e| sql_err(vm, e))?;
+                let h = next_bundled_h(vm);
+                vm.bundled_stmts.insert(
+                    h as u64,
+                    BundledStmt {
+                        conn: d,
+                        sql,
+                        params: Vec::new(),
+                        cols: Vec::new(),
+                        rows: Vec::new(),
+                        cur: None,
+                        executed: false,
+                    },
+                );
+                Some(V::I64(h))
+            }
+            "nativeStep" => {
+                let h = i64v(args[0]);
+                if !vm.bundled_stmts.contains_key(&(h as u64)) {
+                    return Err(sql_err(vm, format!("statement {h} is closed")));
+                }
+                let mut err = None;
+                let has = {
+                    let s = vm.bundled_stmts.get_mut(&(h as u64)).unwrap();
+                    if !s.executed {
+                        err = s.exec().err();
+                        if crate::dbg_flag("OVELO_DBDBG") {
+                            if let Some(e) = &err {
+                                eprintln!("[bundled] exec ERR: {e}");
+                            }
+                        }
+                    }
+                    if err.is_none() {
+                        let next = s.cur.map(|i| i + 1).unwrap_or(0);
+                        let has = next < s.rows.len();
+                        s.cur = if has { Some(next) } else { None };
+                        has
+                    } else {
+                        false
+                    }
+                };
+                if let Some(e) = err {
+                    return Err(sql_err(vm, e));
+                }
+                if crate::dbg_flag("OVELO_DBDBG") {
+                    eprintln!(
+                        "[bundled] step h={h} -> {has} (rows={}, cur={:?})",
+                        vm.bundled_stmts
+                            .get(&(h as u64))
+                            .map(|s| s.rows.len())
+                            .unwrap_or(0),
+                        vm.bundled_stmts.get(&(h as u64)).and_then(|s| s.cur)
+                    );
+                }
+                Some(V::I32(has as i32))
+            }
+            "nativeReset" => {
+                let h = i64v(args[0]);
+                if let Some(s) = vm.bundled_stmts.get_mut(&(h as u64)) {
+                    s.cur = None;
+                    s.executed = false;
+                }
+                None
+            }
+            "nativeClearBindings" => {
+                let h = i64v(args[0]);
+                if let Some(s) = vm.bundled_stmts.get_mut(&(h as u64)) {
+                    s.params.clear();
+                }
+                None
+            }
+            "nativeBindNull" => {
+                let (h, idx) = (i64v(args[0]), i64v(args[1]).max(1) as usize);
+                if crate::dbg_flag("OVELO_DBDBG") {
+                    eprintln!("[bundled] bindNull h={h} idx={idx}");
+                }
+                if let Some(s) = vm.bundled_stmts.get_mut(&(h as u64)) {
+                    s.params.resize(s.params.len().max(idx), SV::Null);
+                    // Batch use: the caller binds params for row N+1 over
+                    // the same statement — a resize without the store
+                    // leaves row N's value at this index.
+                    s.params[idx - 1] = SV::Null;
+                }
+                None
+            }
+            "nativeBindLong" => {
+                let (h, idx, v) = (i64v(args[0]), i64v(args[1]).max(1) as usize, i64v(args[2]));
+                if crate::dbg_flag("OVELO_DBDBG") {
+                    eprintln!("[bundled] bindLong h={h} idx={idx} v={v}");
+                }
+                if let Some(s) = vm.bundled_stmts.get_mut(&(h as u64)) {
+                    s.params.resize(s.params.len().max(idx), SV::Null);
+                    s.params[idx - 1] = SV::Integer(v);
+                }
+                None
+            }
+            "nativeBindDouble" => {
+                let (h, idx, v) = (i64v(args[0]), i64v(args[1]).max(1) as usize, f64v(args[2]));
+                if let Some(s) = vm.bundled_stmts.get_mut(&(h as u64)) {
+                    s.params.resize(s.params.len().max(idx), SV::Null);
+                    s.params[idx - 1] = SV::Real(v);
+                }
+                None
+            }
+            "nativeBindText" => {
+                let (h, idx) = (i64v(args[0]), i64v(args[1]).max(1) as usize);
+                if crate::dbg_flag("OVELO_DBDBG") {
+                    eprintln!("[bundled] bindText h={h} idx={idx}");
+                }
+                let t = args.get(2).and_then(|v| sv(vm, *v)).unwrap_or_default();
+                if let Some(s) = vm.bundled_stmts.get_mut(&(h as u64)) {
+                    s.params.resize(s.params.len().max(idx), SV::Null);
+                    s.params[idx - 1] = SV::Text(t);
+                }
+                None
+            }
+            "nativeBindBlob" => {
+                let (h, idx) = (i64v(args[0]), i64v(args[1]).max(1) as usize);
+                let b = match args.get(2) {
+                    Some(V::Ref(h)) => match vm.heap.get(*h) {
+                        Some(Obj::Array { data, .. }) => {
+                            data.iter().map(|b| i32v(*b) as u8).collect()
+                        }
+                        _ => Vec::new(),
+                    },
+                    _ => Vec::new(),
+                };
+                if let Some(s) = vm.bundled_stmts.get_mut(&(h as u64)) {
+                    s.params.resize(s.params.len().max(idx), SV::Null);
+                    s.params[idx - 1] = SV::Blob(b);
+                }
+                None
+            }
+            "nativeGetColumnCount" => {
+                let h = i64v(args[0]);
+                if !vm.bundled_stmts.contains_key(&(h as u64)) {
+                    return Err(sql_err(vm, format!("statement {h} is closed")));
+                }
+                let (err, n) = {
+                    let s = vm.bundled_stmts.get_mut(&(h as u64)).unwrap();
+                    let err = if s.executed { None } else { s.exec().err() };
+                    (err, s.cols.len() as i32)
+                };
+                if let Some(e) = err {
+                    return Err(sql_err(vm, e));
+                }
+                Some(V::I32(n))
+            }
+            "nativeGetColumnName" => {
+                let (h, col) = (i64v(args[0]), i64v(args[1]));
+                if !vm.bundled_stmts.contains_key(&(h as u64)) {
+                    return Err(sql_err(vm, format!("statement {h} is closed")));
+                }
+                let (err, n) = {
+                    let s = vm.bundled_stmts.get_mut(&(h as u64)).unwrap();
+                    let err = if s.executed { None } else { s.exec().err() };
+                    (
+                        err,
+                        s.cols.get(col.max(0) as usize).cloned().unwrap_or_default(),
+                    )
+                };
+                if let Some(e) = err {
+                    return Err(sql_err(vm, e));
+                }
+                Some(jstr(vm, &n))
+            }
+            "nativeGetColumnType" => {
+                let (h, col) = (i64v(args[0]), i64v(args[1]));
+                let t = vm
+                    .bundled_stmts
+                    .get(&(h as u64))
+                    .map(|s| sv_coltype(&s.cell(col)))
+                    .unwrap_or(5);
+                Some(V::I32(t))
+            }
+            "nativeGetLong" => {
+                let (h, col) = (i64v(args[0]), i64v(args[1]));
+                let v = vm
+                    .bundled_stmts
+                    .get(&(h as u64))
+                    .map(|s| s.cell(col))
+                    .unwrap_or(SV::Null);
+                if crate::dbg_flag("OVELO_DBDBG") {
+                    eprintln!("[bundled] getLong h={h} col={col} -> {:?}", v);
+                }
+                Some(V::I64(sv_long(&v)))
+            }
+            "nativeGetDouble" => {
+                let (h, col) = (i64v(args[0]), i64v(args[1]));
+                let v = vm
+                    .bundled_stmts
+                    .get(&(h as u64))
+                    .map(|s| s.cell(col))
+                    .unwrap_or(SV::Null);
+                Some(V::F64(sv_double(&v)))
+            }
+            "nativeGetText" => {
+                let (h, col) = (i64v(args[0]), i64v(args[1]));
+                let v = vm
+                    .bundled_stmts
+                    .get(&(h as u64))
+                    .map(|s| s.cell(col))
+                    .unwrap_or(SV::Null);
+                Some(match v {
+                    SV::Null => V::Ref(0),
+                    SV::Text(t) => jstr(vm, &t),
+                    SV::Integer(i) => jstr(vm, &i.to_string()),
+                    SV::Real(f) => jstr(vm, &f.to_string()),
+                    SV::Blob(b) => jstr(vm, &String::from_utf8_lossy(&b)),
+                })
+            }
+            "nativeGetBlob" => {
+                let (h, col) = (i64v(args[0]), i64v(args[1]));
+                let v = vm
+                    .bundled_stmts
+                    .get(&(h as u64))
+                    .map(|s| s.cell(col))
+                    .unwrap_or(SV::Null);
+                Some(match v {
+                    SV::Blob(b) => arr(vm, "B", b.iter().map(|&x| V::I32(x as i32)).collect()),
+                    _ => V::Ref(0),
+                })
+            }
+            _ => return Ok(None),
+        })
+    })();
+    match r {
+        Ok(v) => Ok(Some(v)),
+        Err(e) => Err(e),
+    }
 }

@@ -1,5 +1,6 @@
 //! java.io / java.net / java.nio / regex / SimpleDateFormat / org.json.
 
+use super::rx::{full_match, Rx};
 use super::*;
 use crate::value::{HostState, Obj, V};
 
@@ -61,10 +62,7 @@ pub(crate) fn call(
             let arg = args.get(1).copied().unwrap_or(V::Ref(0));
             let mut bytes: Vec<u8> = match arg {
                 V::Ref(h) => match vm.heap.get(h) {
-                    Some(Obj::Array { data, .. }) => data
-                        .iter()
-                        .map(|v| i32v(*v) as u8)
-                        .collect(),
+                    Some(Obj::Array { data, .. }) => data.iter().map(|v| i32v(*v) as u8).collect(),
                     _ => Vec::new(),
                 },
                 _ => Vec::new(),
@@ -72,15 +70,90 @@ pub(crate) fn call(
             if args.len() > 3 {
                 let off = i64v(args[2]).max(0) as usize;
                 let len = i64v(args[3]).max(0) as usize;
-                bytes = bytes
-                    .into_iter()
-                    .skip(off)
-                    .take(len)
-                    .collect();
+                bytes = bytes.into_iter().skip(off).take(len).collect();
             }
             if let Some(V::Ref(this)) = args.first() {
                 if let Some(Obj::Host { state, .. }) = vm.heap.get_mut(*this) {
                     *state = HostState::Bytes(std::rc::Rc::new(bytes), 0);
+                }
+            }
+            Some(None)
+        } else if name == "<init>" && class.ends_with("Reader;") {
+            // Char-stream constructors: materialize the source into a
+            // `Chars` payload (StringReader/CharArrayReader), eagerly
+            // decode a byte-backed stream (InputStreamReader), or keep
+            // the wrapped reader in `in` for delegation (wrapper readers
+            // like BufferedReader/FilterReader).
+            if let Some(V::Ref(this)) = args.first() {
+                let this = *this;
+                let arg = args.get(1).copied().unwrap_or(V::Ref(0));
+                let chars: Option<Vec<u16>> = if class == "Ljava/io/StringReader;" {
+                    let s = sv(vm, arg).unwrap_or_default();
+                    if let Some(p) = std::env::var_os("OVELO_DUMP_READER") {
+                        use std::io::Write as _;
+                        let _ = std::fs::OpenOptions::new()
+                            .create(true)
+                            .append(true)
+                            .open(&p)
+                            .map(|mut f| {
+                                let _ = write!(
+                                    f,
+                                    "=== StringReader #{} len={} tail={:?}\n{}\n",
+                                    this,
+                                    s.chars().count(),
+                                    s.chars().rev().take(80).collect::<String>(),
+                                    s
+                                );
+                            });
+                    }
+                    Some(s.encode_utf16().collect())
+                } else if class == "Ljava/io/CharArrayReader;" {
+                    match arg {
+                        V::Ref(h) => match vm.heap.get(h) {
+                            Some(Obj::Array { data, .. }) => {
+                                Some(data.iter().map(|v| i32v(*v) as u16).collect())
+                            }
+                            _ => Some(Vec::new()),
+                        },
+                        _ => Some(Vec::new()),
+                    }
+                } else if class == "Ljava/io/InputStreamReader;" {
+                    match arg {
+                        V::Ref(h) => match vm.heap.get(h) {
+                            Some(Obj::Host {
+                                state: HostState::Bytes(b, p),
+                                ..
+                            }) => {
+                                let s = String::from_utf8_lossy(&b[*p..]).into_owned();
+                                Some(s.encode_utf16().collect())
+                            }
+                            _ => None,
+                        },
+                        _ => None,
+                    }
+                } else {
+                    None
+                };
+                match chars {
+                    Some(c) => {
+                        if let Some(Obj::Host { state, .. }) = vm.heap.get_mut(this) {
+                            *state = HostState::Chars(std::rc::Rc::new(c), 0, 0);
+                        }
+                    }
+                    None => {
+                        // Wrapper reader: remember the delegate.
+                        for owner in ["Ljava/io/FilterReader;", "Ljava/io/Reader;"] {
+                            field_set(vm, this, owner, "in", arg);
+                        }
+                    }
+                }
+            }
+            Some(None)
+        } else if class == "Ljava/io/ByteArrayOutputStream;" && name == "<init>" {
+            // The output side of the Bytes payload: writes append.
+            if let Some(V::Ref(this)) = args.first() {
+                if let Some(Obj::Host { state, .. }) = vm.heap.get_mut(*this) {
+                    *state = HostState::Bytes(std::rc::Rc::new(Vec::new()), 0);
                 }
             }
             Some(None)
@@ -166,6 +239,14 @@ pub(crate) fn call(
             }
         } else if class == "Ljava/net/URLEncoder;" || class == "Ljava/net/URLDecoder;" {
             url_codec(vm, name, args)
+        } else if class == "Ljava/net/IDN;" {
+            match name {
+                // IDN.toASCII: ASCII input passes through unchanged; the
+                // punycode path only matters for non-ASCII domains.
+                "toASCII" | "toUnicode" => Some(args.first().copied().unwrap_or(V::Ref(0))),
+                _ => return Ok(None),
+            }
+            .map(Some)
         } else if class == "Ljava/net/URL;" || class == "Ljava/net/URI;" {
             url_call(vm, name, args)?
         } else if class == "Ljava/net/URLConnection;"
@@ -204,10 +285,14 @@ pub(crate) fn call(
             }
         } else if desc_is_a(class, "Ljava/nio/charset/Charset;")
             || class == "Ljava/nio/charset/StandardCharsets;"
+            || class == "Ljava/nio/charset/CharsetDecoder;"
+            || class == "Ljava/nio/charset/CharsetEncoder;"
+            || class == "Ljava/nio/charset/CoderResult;"
+            || class == "Ljava/nio/charset/CodingErrorAction;"
         {
-            charset_call(vm, name, args)
+            charset_call(vm, class, name, args)
         } else if desc_is_a(class, "Ljava/nio/Buffer;") || class.starts_with("Ljava/nio/") {
-            nio_call(vm, name, args)
+            nio_call(vm, class, name, args)
         } else if class == "Ljava/util/Base64;"
             || class == "Ljava/util/Base64$Encoder;"
             || class == "Ljava/util/Base64$Decoder;"
@@ -233,14 +318,18 @@ pub(crate) fn call(
 fn print_call(vm: &mut Vm, name: &str, _sig: &str, args: &[V]) -> Option<Option<V>> {
     match name {
         "print" | "println" => {
-            let t = if args.len() > 1 {
+            let mut t = if args.len() > 1 {
                 v_to_s(vm, args[1])
             } else {
                 String::new()
             };
             if name == "println" {
-                eprintln!("{t}");
-            } else {
+                t.push('\n');
+            }
+            // Forward into the wrapped writer's buffer when there is
+            // one; a non-buffered sink (e.g. PrintWriter(System.out))
+            // mirrors to stderr instead of dropping the text.
+            if !push_strbuf(vm, h_of(args[0]), &t) {
                 eprint!("{t}");
             }
             Some(None)
@@ -259,16 +348,134 @@ fn print_call(vm: &mut Vm, name: &str, _sig: &str, args: &[V]) -> Option<Option<
             eprint!("{}", simple_format(vm, &fmt, &flat));
             Some(Some(args[0]))
         }
-        "write" | "flush" | "close" | "checkError" | "append" => {
-            if name == "checkError" {
-                Some(Some(V::I32(0)))
-            } else if name == "append" {
+        "write" | "append" => {
+            // PrintWriter(Writer) forwards — the wrapped writer is under
+            // P_DATA so prints land in its buffer.
+            if let Some(&a1) = args.get(1) {
+                let t = writer_text(
+                    vm,
+                    a1,
+                    args.get(2).copied(),
+                    args.get(3).copied(),
+                    name == "write",
+                );
+                if !push_strbuf(vm, h_of(args[0]), &t) {
+                    eprint!("{t}");
+                }
+            }
+            if name == "append" {
                 Some(Some(args[0]))
             } else {
                 Some(None)
             }
         }
+        "flush" | "close" | "checkError" => {
+            if name == "checkError" {
+                Some(Some(V::I32(0)))
+            } else {
+                Some(None)
+            }
+        }
+        "<init>" => {
+            if let Some(&V::Ref(w)) = args.get(1) {
+                pseudo_set(vm, h_of(args[0]), P_DATA, V::Ref(w));
+            }
+            Some(None)
+        }
         _ => None,
+    }
+}
+
+/// Follow the P_DATA chain of wrapper writers (PrintWriter,
+/// BufferedWriter, OutputStreamWriter) to the innermost target.
+fn wrapped_writer(vm: &mut Vm, this: u32) -> Option<u32> {
+    let mut h = this;
+    for _ in 0..4 {
+        match pseudo_get(vm, h, P_DATA) {
+            Some(V::Ref(n)) if n != h => h = n,
+            _ => break,
+        }
+    }
+    if h != this {
+        Some(h)
+    } else {
+        None
+    }
+}
+
+fn h_of(v: V) -> u32 {
+    match v {
+        V::Ref(h) => h,
+        _ => 0,
+    }
+}
+
+/// Append `t` to the innermost wrapped writer's StrBuf — returns false
+/// when the chain ends somewhere that cannot hold text.
+fn push_strbuf(vm: &mut Vm, this: u32, t: &str) -> bool {
+    let Some(w) = wrapped_writer(vm, this) else {
+        return false;
+    };
+    match vm.heap.get_mut(w) {
+        Some(Obj::Host {
+            state: HostState::StrBuf(b),
+            ..
+        }) => {
+            b.push_str(t);
+            true
+        }
+        _ => false,
+    }
+}
+
+/// The text a writer's `write`/`append` argument denotes: an int is a
+/// single UTF-16 unit, a char[] is decoded as UTF-16 (surrogate pairs
+/// survive), anything else is its CharSequence view. `lo_v`/`hi_v` are
+/// the optional (off,len) bounds of `write` or the (start,end) bounds
+/// of `append` — `len_mode` picks which.
+fn writer_text(vm: &mut Vm, v: V, lo_v: Option<V>, hi_v: Option<V>, len_mode: bool) -> String {
+    match v {
+        V::I32(c) => char::from_u32(c as u32)
+            .map(|c| c.to_string())
+            .unwrap_or_default(),
+        V::Ref(ah) if matches!(vm.heap.get(ah), Some(Obj::Array { .. })) => {
+            let Some(Obj::Array { data, .. }) = vm.heap.get(ah) else {
+                return String::new();
+            };
+            let lo = lo_v
+                .map(|v| i64v(v).max(0) as usize)
+                .unwrap_or(0)
+                .min(data.len());
+            let hi = if len_mode {
+                hi_v.map(|v| lo + i64v(v).max(0) as usize)
+            } else {
+                hi_v.map(|v| i64v(v).max(0) as usize)
+            }
+            .unwrap_or(data.len())
+            .min(data.len());
+            let units: Vec<u16> = data[lo..hi.max(lo)]
+                .iter()
+                .map(|v| i64v(*v) as u16)
+                .collect();
+            String::from_utf16_lossy(&units)
+        }
+        _ => {
+            let t = v_to_s(vm, v);
+            let n = t.chars().count();
+            let lo = lo_v.map(|v| i64v(v).max(0) as usize).unwrap_or(0).min(n);
+            let hi = if len_mode {
+                hi_v.map(|v| lo + i64v(v).max(0) as usize)
+            } else {
+                hi_v.map(|v| i64v(v).max(0) as usize)
+            }
+            .unwrap_or(n)
+            .min(n);
+            if lo == 0 && hi == n {
+                t
+            } else {
+                t.chars().skip(lo).take(hi.max(lo) - lo).collect()
+            }
+        }
     }
 }
 
@@ -277,8 +484,99 @@ fn stream_call(vm: &mut Vm, name: &str, args: &[V]) -> Rt<Option<Option<V>>> {
         Some(&V::Ref(h)) => h,
         _ => 0,
     };
+    // ByteArrayOutputStream accumulates into the same Bytes payload —
+    // handled before the mutable borrow below because the write source
+    // and the returned array/string need second heap accesses.
+    let is_baos = matches!(
+        vm.heap.get(this),
+        Some(Obj::Host {
+            desc,
+            state: HostState::Bytes(..),
+            ..
+        }) if desc == "Ljava/io/ByteArrayOutputStream;"
+    );
+    if is_baos {
+        match name {
+            "write" => {
+                let mut chunk: Vec<u8> = Vec::new();
+                match args.get(1) {
+                    Some(&V::Ref(bh)) => {
+                        if let Some(Obj::Array { data: src, .. }) = vm.heap.get(bh) {
+                            let off = args.get(2).map(|v| i64v(*v).max(0) as usize).unwrap_or(0);
+                            let want = args
+                                .get(3)
+                                .map(|v| i64v(*v).max(0) as usize)
+                                .unwrap_or(src.len());
+                            chunk = src
+                                .iter()
+                                .skip(off)
+                                .take(want)
+                                .map(|v| i64v(*v) as u8)
+                                .collect();
+                        }
+                    }
+                    Some(v) => chunk.push(i64v(*v) as u8),
+                    _ => {}
+                }
+                if let Some(Obj::Host {
+                    state: HostState::Bytes(data, _),
+                    ..
+                }) = vm.heap.get_mut(this)
+                {
+                    std::rc::Rc::make_mut(data).extend_from_slice(&chunk);
+                }
+                return Ok(Some(None));
+            }
+            "toByteArray" => {
+                let bytes = match vm.heap.get(this) {
+                    Some(Obj::Host {
+                        state: HostState::Bytes(d, _),
+                        ..
+                    }) => d.clone(),
+                    _ => std::rc::Rc::new(Vec::new()),
+                };
+                let out: Vec<V> = bytes.iter().map(|b| V::I32(*b as i8 as i32)).collect();
+                return Ok(Some(Some(arr(vm, "B", out))));
+            }
+            "size" => {
+                let n = match vm.heap.get(this) {
+                    Some(Obj::Host {
+                        state: HostState::Bytes(d, _),
+                        ..
+                    }) => d.len() as i32,
+                    _ => 0,
+                };
+                return Ok(Some(Some(V::I32(n))));
+            }
+            "reset" => {
+                if let Some(Obj::Host {
+                    state: HostState::Bytes(d, p),
+                    ..
+                }) = vm.heap.get_mut(this)
+                {
+                    std::rc::Rc::make_mut(d).clear();
+                    *p = 0;
+                }
+                return Ok(Some(None));
+            }
+            "toString" => {
+                let bytes = match vm.heap.get(this) {
+                    Some(Obj::Host {
+                        state: HostState::Bytes(d, _),
+                        ..
+                    }) => d.clone(),
+                    _ => std::rc::Rc::new(Vec::new()),
+                };
+                let t = String::from_utf8_lossy(&bytes).into_owned();
+                return Ok(Some(Some(jstr(vm, &t))));
+            }
+            "writeTo" | "flush" | "close" => return Ok(Some(None)),
+            _ => {}
+        }
+    }
     // Byte-backed streams (raw resources, assets): real reads.
     if let Some(Obj::Host {
+        desc: stream_desc,
         state: HostState::Bytes(data, pos),
         ..
     }) = vm.heap.get_mut(this)
@@ -311,6 +609,17 @@ fn stream_call(vm: &mut Vm, name: &str, args: &[V]) -> Rt<Option<Option<V>>> {
                 let n = want.min(avail);
                 let chunk: Vec<u8> = data[*pos..*pos + n].to_vec();
                 *pos += n;
+                if crate::dbg_flag("OVELO_STREAMDBG") {
+                    eprintln!(
+                        "[sdbg] read {stream_desc}#{this} pos-{} n={} want={} off={} args={:?} head={:?}",
+                        *pos,
+                        n,
+                        want,
+                        off,
+                        args,
+                        chunk.iter().take(24).collect::<Vec<_>>()
+                    );
+                }
                 if let Some(Obj::Array { data: dst, .. }) = vm.heap.get_mut(buf) {
                     for (i, b) in chunk.iter().enumerate() {
                         if let Some(slot) = dst.get_mut(off + i) {
@@ -338,6 +647,71 @@ fn stream_call(vm: &mut Vm, name: &str, args: &[V]) -> Rt<Option<Option<V>>> {
             _ => {}
         }
     }
+    // Char-backed readers (StringReader & friends): real char reads.
+    if let Some(Obj::Host {
+        state: HostState::Chars(data, pos, mark),
+        ..
+    }) = vm.heap.get_mut(this)
+    {
+        match name {
+            "read" => {
+                if args.len() == 1 {
+                    return Ok(Some(Some(if *pos < data.len() {
+                        let c = data[*pos] as i32;
+                        *pos += 1;
+                        V::I32(c)
+                    } else {
+                        V::I32(-1)
+                    })));
+                }
+                // read(char[]) / read(char[], off, len)
+                let buf = match args.get(1) {
+                    Some(&V::Ref(h)) => h,
+                    _ => 0,
+                };
+                let (mut off, mut want) = (0usize, usize::MAX);
+                if args.len() > 3 {
+                    off = i64v(args[2]).max(0) as usize;
+                    want = i64v(args[3]).max(0) as usize;
+                }
+                let avail = data.len() - *pos;
+                if avail == 0 && want != 0 {
+                    return Ok(Some(Some(V::I32(-1))));
+                }
+                let n = want.min(avail);
+                let chunk: Vec<u16> = data[*pos..*pos + n].to_vec();
+                *pos += n;
+                if let Some(Obj::Array { data: dst, .. }) = vm.heap.get_mut(buf) {
+                    for (i, c) in chunk.iter().enumerate() {
+                        if let Some(slot) = dst.get_mut(off + i) {
+                            *slot = V::I32(*c as i32);
+                        }
+                    }
+                }
+                return Ok(Some(Some(V::I32(n as i32))));
+            }
+            "available" | "ready" => {
+                return Ok(Some(Some(V::I32(if *pos < data.len() { 1 } else { 0 }))));
+            }
+            "skip" => {
+                let n = i64v(args.get(1).copied().unwrap_or(V::I64(0))).max(0) as usize;
+                let took = n.min(data.len() - *pos);
+                *pos += took;
+                return Ok(Some(Some(V::I64(took as i64))));
+            }
+            "mark" => {
+                *mark = *pos;
+                return Ok(Some(None));
+            }
+            "reset" => {
+                *pos = *mark;
+                return Ok(Some(None));
+            }
+            "markSupported" => return Ok(Some(Some(V::I32(1)))),
+            "close" => return Ok(Some(None)),
+            _ => {}
+        }
+    }
     // `FilterInputStream`-style wrappers: the java methods we don't
     // model delegate to the protected `in` field (stored by the
     // `<init>` shim). A guest IOException propagates so the app's own
@@ -346,11 +720,22 @@ fn stream_call(vm: &mut Vm, name: &str, args: &[V]) -> Rt<Option<Option<V>>> {
         name,
         "read" | "available" | "skip" | "mark" | "reset" | "markSupported" | "ready" | "close"
     ) {
-        if let Some(V::Ref(inner)) =
-            field_get(vm, this, "Ljava/io/FilterInputStream;", "in")
-        {
+        let inner = [
+            "Ljava/io/FilterInputStream;",
+            "Ljava/io/FilterReader;",
+            "Ljava/io/Reader;",
+            "Ljava/io/BufferedReader;",
+            "Ljava/io/InputStreamReader;",
+        ]
+        .iter()
+        .find_map(|owner| field_get(vm, this, owner, "in"))
+        .and_then(|v| match v {
+            V::Ref(h) => Some(h),
+            _ => None,
+        });
+        if let Some(inner) = inner {
             if inner != 0 && inner != this {
-                if std::env::var_os("OVELO_STREAMDBG").is_some() {
+                if crate::dbg_flag("OVELO_STREAMDBG") {
                     let td = match vm.heap.get(this) {
                         Some(Obj::Host { desc, .. }) => desc.clone(),
                         Some(Obj::Instance { class_idx, .. }) => {
@@ -416,10 +801,7 @@ fn stream_call(vm: &mut Vm, name: &str, args: &[V]) -> Rt<Option<Option<V>>> {
                     _ => 0,
                 };
                 let (off, len) = if args.len() > 3 {
-                    (
-                        i64v(args[2]).max(0) as usize,
-                        i64v(args[3]).max(0) as usize,
-                    )
+                    (i64v(args[2]).max(0) as usize, i64v(args[3]).max(0) as usize)
                 } else {
                     (0, usize::MAX)
                 };
@@ -450,6 +832,113 @@ fn stream_call(vm: &mut Vm, name: &str, args: &[V]) -> Rt<Option<Option<V>>> {
             let _ = f.flush();
         }
         return Ok(Some(None));
+    }
+    // `<init>(Writer/OutputStream)` wrappers record the wrapped sink so
+    // writes can be forwarded into the innermost buffer.
+    if name == "<init>" {
+        if let Some(&V::Ref(w)) = args.get(1) {
+            pseudo_set(vm, this, P_DATA, V::Ref(w));
+        }
+        return Ok(Some(None));
+    }
+    // StringWriter/CharArrayWriter accumulate into a StrBuf — writes
+    // append text and toString()/getBuffer() hand it back. A bare
+    // `toString` that returned the identity string poisoned resource
+    // strings in tasks.org (Okio.Utf8 getString via StringWriter).
+    let wthis = wrapped_writer(vm, this).unwrap_or(this);
+    let is_strbuf = matches!(
+        vm.heap.get(wthis),
+        Some(Obj::Host {
+            state: HostState::StrBuf(_),
+            ..
+        })
+    );
+    if is_strbuf {
+        match name {
+            "write" => {
+                let t = match args.get(1).copied() {
+                    Some(V::I32(c)) => char::from_u32(c as u32)
+                        .map(|c| c.to_string())
+                        .unwrap_or_default(),
+                    Some(V::Ref(ah)) => match vm.heap.get(ah) {
+                        Some(Obj::Array { data, .. }) => {
+                            // char[] is UTF-16 — decode code units so
+                            // surrogate pairs (emoji) survive.
+                            let lo = args.get(2).map(|v| i64v(*v).max(0) as usize).unwrap_or(0);
+                            let hi = args
+                                .get(3)
+                                .map(|v| (lo + i64v(*v).max(0) as usize).min(data.len()))
+                                .unwrap_or(data.len());
+                            let units: Vec<u16> = data[lo.min(data.len())..hi]
+                                .iter()
+                                .map(|v| i64v(*v) as u16)
+                                .collect();
+                            String::from_utf16_lossy(&units)
+                        }
+                        _ => {
+                            let t = sv(vm, args[1]).unwrap_or_default();
+                            let lo = args.get(2).map(|v| i64v(*v).max(0) as usize).unwrap_or(0);
+                            let hi = args
+                                .get(3)
+                                .map(|v| lo + i64v(*v).max(0) as usize)
+                                .unwrap_or(t.chars().count());
+                            t.chars().skip(lo).take(hi - lo.min(hi)).collect()
+                        }
+                    },
+                    _ => String::new(),
+                };
+                if let Some(Obj::Host {
+                    state: HostState::StrBuf(b),
+                    ..
+                }) = vm.heap.get_mut(wthis)
+                {
+                    b.push_str(&t);
+                }
+                return Ok(Some(None));
+            }
+            "append" => {
+                let t = args
+                    .get(1)
+                    .map(|v| writer_text(vm, *v, args.get(2).copied(), args.get(3).copied(), false))
+                    .unwrap_or_default();
+                if let Some(Obj::Host {
+                    state: HostState::StrBuf(b),
+                    ..
+                }) = vm.heap.get_mut(wthis)
+                {
+                    b.push_str(&t);
+                }
+                return Ok(Some(Some(args[0])));
+            }
+            "getBuffer" => {
+                // StringWriter.getBuffer() returns the *shared* buffer:
+                // hand back a StringBuffer view that delegates through
+                // P_DATA to this writer's StrBuf so guest-side appends
+                // land in the same storage.
+                let b = host(vm, "Ljava/lang/StringBuffer;", HostState::Empty);
+                if let V::Ref(bh) = b {
+                    pseudo_set(vm, bh, P_DATA, V::Ref(wthis));
+                }
+                return Ok(Some(Some(b)));
+            }
+            "toString" | "toCharArray" => {
+                let t = match vm.heap.get(wthis) {
+                    Some(Obj::Host {
+                        state: HostState::StrBuf(b),
+                        ..
+                    }) => b.clone(),
+                    _ => String::new(),
+                };
+                if name == "toCharArray" {
+                    // char[] is UTF-16 units, not scalar values.
+                    let cs: Vec<V> = t.encode_utf16().map(|u| V::I32(u as i32)).collect();
+                    return Ok(Some(Some(arr(vm, "C", cs))));
+                }
+                return Ok(Some(Some(jstr(vm, &t))));
+            }
+            "flush" | "close" => return Ok(Some(None)),
+            _ => {}
+        }
     }
     Ok(match name {
         "read" => {
@@ -634,7 +1123,7 @@ fn file_call(vm: &mut Vm, name: &str, args: &[V]) -> Option<Option<V>> {
                         .collect()
                 })
                 .unwrap_or_default();
-            if std::env::var_os("OVELO_VIEWDBG").is_some() {
+            if crate::dbg_flag("OVELO_VIEWDBG") {
                 eprintln!(
                     "[viewdbg] {name} {path} -> {} ({} entries)",
                     std_path.display(),
@@ -778,8 +1267,7 @@ pub(crate) fn literal_match(pat: &str, text: &str) -> bool {
                         false
                     }
                     '?' => {
-                        (!t.is_empty() && class_ok(spec, t[0]) && m(rest, &t[1..]))
-                            || m(rest, t)
+                        (!t.is_empty() && class_ok(spec, t[0]) && m(rest, &t[1..])) || m(rest, t)
                     }
                     _ => !t.is_empty() && class_ok(spec, t[0]) && m(rest, &t[1..]),
                 };
@@ -859,7 +1347,9 @@ fn pattern_call(vm: &mut Vm, name: &str, args: &[V]) -> Option<Option<V>> {
             }
             let pat = sv(vm, args[0]).unwrap_or_default();
             let t = sv(vm, args[1]).unwrap_or_default();
-            Some(Some(V::I32(literal_match(&pat, &t) as i32)))
+            Some(Some(V::I32(
+                (full_match(&pat, &t) || literal_match(&pat, &t)) as i32,
+            )))
         }
         "matcher" => {
             let h = vm.alloc_host("Ljava/util/regex/Matcher;", HostState::Slot(args[1]));
@@ -892,10 +1382,50 @@ fn pattern_call(vm: &mut Vm, name: &str, args: &[V]) -> Option<Option<V>> {
             )
             .unwrap_or_default();
             let t = sv(vm, args[1]).unwrap_or_default();
-            let parts: Vec<V> = t.split(&pat).map(|x| jstr(vm, x)).collect();
+            let lim = args.get(2).map(|v| i32v(*v)).unwrap_or(0);
+            let parts: Vec<V> = rx::regex_split(&pat, &t, lim)
+                .into_iter()
+                .map(|x| jstr(vm, &x))
+                .collect();
             Some(Some(arr(vm, STRING, parts)))
         }
         "quote" => Some(args.first().copied()),
+        _ => None,
+    }
+}
+
+// Matcher state pseudo-fields (`P_*` sentinels live in mod.rs): the
+// last match's group spans, the match region, and find()'s resume point.
+const P_RX_SPANS: u64 = 0xFFFD_FEF4;
+const P_RX_LO: u64 = 0xFFFD_FEF5;
+const P_RX_HI: u64 = 0xFFFD_FEF6;
+const P_RX_FROM: u64 = 0xFFFD_FEF7;
+
+/// Persist a search result on the matcher: `Ref(0)` = searched, no
+/// match; `Ref([I)` = flat slot array `[g0s, g0e, g1s, g1e, …]`, -1 for
+/// a group that did not participate.
+fn rx_store(vm: &mut Vm, h: u32, m: Option<Vec<Option<usize>>>) {
+    match m {
+        None => pseudo_set(vm, h, P_RX_SPANS, V::Ref(0)),
+        Some(s) => {
+            let flat: Vec<V> = s
+                .iter()
+                .map(|o| V::I32(o.map(|x| x as i32).unwrap_or(-1)))
+                .collect();
+            let a = arr(vm, "I", flat);
+            pseudo_set(vm, h, P_RX_SPANS, a);
+        }
+    }
+}
+
+/// The stored span array, or None when no search ran yet.
+fn rx_spans(vm: &Vm, h: u32) -> Option<Vec<i32>> {
+    match pseudo_get(vm, h, P_RX_SPANS)? {
+        V::Ref(0) => None,
+        V::Ref(a) => match vm.heap.get(a) {
+            Some(Obj::Array { data, .. }) => Some(data.iter().map(|v| i32v(*v)).collect()),
+            _ => None,
+        },
         _ => None,
     }
 }
@@ -905,24 +1435,94 @@ fn matcher_call(vm: &mut Vm, name: &str, args: &[V]) -> Rt<Option<Option<V>>> {
         return Ok(None);
     };
     let text = slot_of(vm, h).and_then(|v| sv(vm, v)).unwrap_or_default();
+    let t: Vec<char> = text.chars().collect();
     let pat = pseudo_get(vm, h, P_ACTION)
         .and_then(|v| sv(vm, v))
         .unwrap_or_default();
+    let lo = pseudo_get(vm, h, P_RX_LO)
+        .map(|v| i32v(v).max(0) as usize)
+        .unwrap_or(0);
+    let hi = pseudo_get(vm, h, P_RX_HI)
+        .map(|v| i32v(v).max(0) as usize)
+        .unwrap_or(t.len());
+    let rx = || Rx::compile(&pat).ok();
     Ok(match name {
-        "matches" => Some(Some(V::I32(literal_match(&pat, &text) as i32))),
-        "lookingAt" | "find" => {
-            let found = literal_match(&pat, &text) || (!pat.is_empty() && text.contains(&pat));
+        "matches" => {
+            let m = rx().and_then(|rx| rx.matches(&t, lo, hi));
+            let found = m.is_some() || literal_match(&pat, &text);
+            rx_store(vm, h, m);
+            Some(Some(V::I32(found as i32)))
+        }
+        "lookingAt" => {
+            let m = rx().and_then(|rx| rx.looking_at(&t, lo, lo, hi));
+            let found = m.is_some() || literal_match(&pat, &text);
+            rx_store(vm, h, m);
+            Some(Some(V::I32(found as i32)))
+        }
+        "find" => {
+            let from = if args.len() > 1 {
+                i32v(args[1]).max(0) as usize
+            } else {
+                pseudo_get(vm, h, P_RX_FROM)
+                    .map(|v| i32v(v).max(0) as usize)
+                    .unwrap_or(lo)
+            };
+            let m = rx().and_then(|rx| rx.find(&t, lo, from, hi));
+            let found = m.is_some() || (!pat.is_empty() && text.contains(&pat));
+            if let Some(s) = &m {
+                let st = s[0].unwrap_or(0) as i32;
+                let en = s[1].unwrap_or(0) as i32;
+                // Java resumes after the match; empty matches advance 1.
+                pseudo_set(vm, h, P_RX_FROM, V::I32(if en > st { en } else { en + 1 }));
+            }
+            rx_store(vm, h, m);
             Some(Some(V::I32(found as i32)))
         }
         "group" => {
-            let i = i32v(*args.get(1).unwrap_or(&V::I32(0)));
-            let g = if i == 0 { text.clone() } else { String::new() };
-            Some(Some(jstr(vm, &g)))
+            let i = i32v(*args.get(1).unwrap_or(&V::I32(0))).max(0) as usize;
+            let chars: Vec<char> = text.chars().collect();
+            let out = match rx_spans(vm, h) {
+                Some(sp) if 2 * i + 1 < sp.len() && sp[2 * i] >= 0 => {
+                    let (a, b) = (sp[2 * i] as usize, sp[2 * i + 1] as usize);
+                    jstr(
+                        vm,
+                        &chars[a.min(chars.len())..b.min(chars.len())]
+                            .iter()
+                            .collect::<String>(),
+                    )
+                }
+                _ => V::Ref(0),
+            };
+            Some(Some(out))
         }
-        "groupCount" => Some(Some(V::I32(0))),
+        "groupCount" => {
+            let n = rx().map(|rx| rx.ngroups()).unwrap_or(0) as i32;
+            Some(Some(V::I32(n)))
+        }
+        "start" | "end" => {
+            let i = i32v(*args.get(1).unwrap_or(&V::I32(0))).max(0) as usize;
+            let v = match rx_spans(vm, h) {
+                Some(sp) if 2 * i + 1 < sp.len() => {
+                    sp[if name == "start" { 2 * i } else { 2 * i + 1 }]
+                }
+                _ => -1,
+            };
+            Some(Some(V::I32(v)))
+        }
+        "region" => {
+            let a = i32v(*args.get(1).unwrap_or(&V::I32(0))).max(0);
+            let b = i32v(*args.get(2).unwrap_or(&V::I32(0))).max(0);
+            pseudo_set(vm, h, P_RX_LO, V::I32(a));
+            pseudo_set(vm, h, P_RX_HI, V::I32(b));
+            Some(Some(args[0]))
+        }
+        "regionStart" => Some(Some(V::I32(lo as i32))),
+        "regionEnd" => Some(Some(V::I32(hi as i32))),
         "replaceAll" | "replaceFirst" => {
             let rep = sv(vm, args[1]).unwrap_or_default();
-            let out = if pat.is_empty() {
+            let out = if let Some(rx) = rx() {
+                rx_replace(&rx, &t, &rep, name == "replaceFirst")
+            } else if pat.is_empty() {
                 text.clone()
             } else if name == "replaceFirst" {
                 text.replacen(&pat, &rep, 1)
@@ -932,19 +1532,106 @@ fn matcher_call(vm: &mut Vm, name: &str, args: &[V]) -> Rt<Option<Option<V>>> {
             Some(Some(jstr(vm, &out)))
         }
         "quoteReplacement" => Some(args.first().copied()),
-        "start" | "end" => Some(Some(V::I32(0))),
         "reset" => Some(Some(args[0])),
-        "region"
-        | "useAnchoringBounds"
-        | "useTransparentBounds"
-        | "usePattern"
-        | "appendReplacement" => Some(Some(args[0])),
+        "usePattern" => {
+            if let Some(p2) = args.get(1).and_then(|v| sv(vm, *v)) {
+                let pv = jstr(vm, &p2);
+                pseudo_set(vm, h, P_ACTION, pv);
+            }
+            Some(Some(args[0]))
+        }
+        "useAnchoringBounds" | "useTransparentBounds" | "appendReplacement" => Some(Some(args[0])),
         "appendTail" => Some(Some(args[1])),
         "pattern" => Some(Some(args[0])),
         "requireEnd" | "hasAnchoringBounds" | "hasTransparentBounds" => Some(Some(V::I32(0))),
         "namedGroups" => Some(Some(host(vm, "Ljava/util/Set;", HostState::List(vec![])))),
         _ => None,
     })
+}
+
+/// `Matcher.replaceAll/First` over real match spans, expanding `$g` and
+/// `${g}` references in the replacement (Java semantics minus quoting —
+/// callers pass `quoteReplacement` output through already).
+pub(crate) fn rx_replace(rx: &Rx, t: &[char], rep: &str, first_only: bool) -> String {
+    let mut out: Vec<char> = Vec::new();
+    let rep_chars: Vec<char> = rep.chars().collect();
+    let mut pos = 0usize;
+    let hi = t.len();
+    while let Some(m) = rx.find(t, 0, pos, hi) {
+        let (ms, me) = (m[0].unwrap_or(pos), m[1].unwrap_or(pos));
+        out.extend_from_slice(&t[pos..ms]);
+        // expand $d / ${name-free digits}
+        let mut i = 0;
+        while i < rep_chars.len() {
+            if rep_chars[i] == '$' && i + 1 < rep_chars.len() {
+                if rep_chars[i + 1] == '{' {
+                    if let Some(close) = rep_chars[i + 2..].iter().position(|c| *c == '}') {
+                        let name: String = rep_chars[i + 2..i + 2 + close].iter().collect();
+                        if let Ok(g) = name.parse::<usize>() {
+                            if 2 * g + 1 < m.len() {
+                                if let (Some(a), Some(b)) = (m[2 * g], m[2 * g + 1]) {
+                                    out.extend_from_slice(&t[a..b]);
+                                }
+                            }
+                        }
+                        i += 3 + close;
+                        continue;
+                    }
+                } else if rep_chars[i + 1].is_ascii_digit() {
+                    let mut j = i + 1;
+                    while j < rep_chars.len() && rep_chars[j].is_ascii_digit() {
+                        j += 1;
+                    }
+                    // Longest valid group number wins ($12 → g12 else g1 + '2').
+                    let mut k = j;
+                    loop {
+                        let g: usize = rep_chars[i + 1..k]
+                            .iter()
+                            .collect::<String>()
+                            .parse()
+                            .unwrap_or(usize::MAX);
+                        if 2 * g + 1 < m.len() || k <= i + 2 {
+                            if 2 * g + 1 < m.len() {
+                                if let (Some(a), Some(b)) = (m[2 * g], m[2 * g + 1]) {
+                                    out.extend_from_slice(&t[a..b]);
+                                }
+                            }
+                            out.extend_from_slice(&rep_chars[k..j]);
+                            break;
+                        }
+                        k -= 1;
+                    }
+                    i = j;
+                    continue;
+                }
+            }
+            out.push(rep_chars[i]);
+            i += 1;
+        }
+        if first_only {
+            pos = me;
+            break;
+        }
+        pos = if me > ms {
+            me
+        } else {
+            // Zero-width match: the char it sits on is unmatched text —
+            // emit it before advancing past it (Java emits it through
+            // the following `t[pos..ms]` region).
+            if me < hi {
+                out.push(t[me]);
+            }
+            me + 1
+        };
+        if pos > hi {
+            pos = hi;
+            break;
+        }
+    }
+    if pos <= hi {
+        out.extend_from_slice(&t[pos.min(hi)..]);
+    }
+    out.into_iter().collect()
 }
 
 // ---------------------------------------------------------------------
@@ -1206,8 +1893,11 @@ fn json_value(vm: &mut Vm, b: &[char], i: &mut usize, depth: u32) -> Option<V> {
             let tok: String = b[start..end].iter().collect();
             *i = end;
             match tok.as_str() {
-                "true" => Some(V::I32(1)),
-                "false" => Some(V::I32(0)),
+                // Box booleans as java.lang.Boolean mirrors — a bare
+                // I32 stored into an Object[] canonicalizes to null
+                // and dumps as 0/1 instead of false/true.
+                "true" => Some(host(vm, "Ljava/lang/Boolean;", HostState::Slot(V::I32(1)))),
+                "false" => Some(host(vm, "Ljava/lang/Boolean;", HostState::Slot(V::I32(0)))),
                 "null" | "null." | "" => Some(V::Ref(0)),
                 _ => {
                     if c == '-' || c.is_ascii_digit() {
@@ -1224,11 +1914,65 @@ fn json_value(vm: &mut Vm, b: &[char], i: &mut usize, depth: u32) -> Option<V> {
     }
 }
 
+/// A boxed primitive stored in a JSON container reads back as the
+/// wrapped value for the numeric getters (`getBoolean`/`optInt`/…).
+fn json_unbox(vm: &Vm, v: V) -> V {
+    match v {
+        V::Ref(h) => match vm.heap.get(h) {
+            Some(Obj::Host {
+                state: HostState::Slot(inner),
+                ..
+            }) => *inner,
+            _ => v,
+        },
+        x => x,
+    }
+}
+
+fn json_escape(s: &str) -> String {
+    let mut out = String::with_capacity(s.len() + 2);
+    for c in s.chars() {
+        match c {
+            '"' => out.push_str("\\\""),
+            '\\' => out.push_str("\\\\"),
+            '\n' => out.push_str("\\n"),
+            '\r' => out.push_str("\\r"),
+            '\t' => out.push_str("\\t"),
+            '\u{8}' => out.push_str("\\b"),
+            '\u{c}' => out.push_str("\\f"),
+            c if (c as u32) < 0x20 => out.push_str(&format!("\\u{:04x}", c as u32)),
+            c => out.push(c),
+        }
+    }
+    out
+}
+
 fn json_dump_v(vm: &Vm, v: V) -> String {
+    json_dump_d(vm, v, 0)
+}
+
+fn json_dump_d(vm: &Vm, v: V, depth: u32) -> String {
+    // Depth cap: a cyclic structure built with put() would otherwise
+    // recurse until the host stack dies — real org.json throws
+    // StackOverflowError; degrading the cycle to null keeps the host up.
+    if depth > 64 {
+        return "null".into();
+    }
     match v {
         V::Ref(0) => "null".into(),
         V::Ref(h) => match vm.heap.get(h) {
-            Some(Obj::Str(s)) => format!("\"{s}\""),
+            Some(Obj::Str(s)) => format!("\"{}\"", json_escape(s)),
+            Some(Obj::Host {
+                desc,
+                state: HostState::Slot(v),
+                ..
+            }) if desc == "Ljava/lang/Boolean;" => {
+                if matches!(v, V::I32(0)) {
+                    "false".into()
+                } else {
+                    "true".into()
+                }
+            }
             Some(Obj::Host {
                 state: HostState::Map(m),
                 ..
@@ -1237,7 +1981,11 @@ fn json_dump_v(vm: &Vm, v: V) -> String {
                 m.iter()
                     .map(|(k, v)| {
                         let ks = sv(vm, *k).unwrap_or_default();
-                        format!("\"{ks}\":{}", json_dump_v(vm, *v))
+                        format!(
+                            "\"{}\":{}",
+                            json_escape(&ks),
+                            json_dump_d(vm, *v, depth + 1)
+                        )
                     })
                     .collect::<Vec<_>>()
                     .join(",")
@@ -1248,7 +1996,7 @@ fn json_dump_v(vm: &Vm, v: V) -> String {
             }) => format!(
                 "[{}]",
                 l.iter()
-                    .map(|v| json_dump_v(vm, *v))
+                    .map(|v| json_dump_d(vm, *v, depth + 1))
                     .collect::<Vec<_>>()
                     .join(",")
             ),
@@ -1307,7 +2055,7 @@ fn json_obj(vm: &mut Vm, name: &str, args: &[V]) -> Option<Option<V>> {
         | "optBoolean" => {
             let dflt = args.get(1 + (name.starts_with('o') as usize));
             match map_get(vm, h, args[1]) {
-                Some(v) if !matches!(v, V::Ref(0)) => Some(v),
+                Some(v) if !matches!(v, V::Ref(0)) => Some(json_unbox(vm, v)),
                 _ => Some(dflt.copied().unwrap_or(V::I32(0))),
             }
         }
@@ -1435,10 +2183,18 @@ fn json_arr(vm: &mut Vm, name: &str, args: &[V]) -> Option<Option<V>> {
             Some(
                 list_ref(vm, h)
                     .and_then(|l| l.get(i).copied())
+                    .map(|v| json_unbox(vm, v))
                     .unwrap_or_else(|| args.get(2).copied().unwrap_or(V::I32(0))),
             )
         }
         "length" => Some(V::I32(list_ref(vm, h).map(|l| l.len() as i32).unwrap_or(0))),
+        // Dex code treats JSON arrays as java.util.List when a parsed
+        // map is consumed generically (`asFloatList(list.get(k))`) —
+        // answer the List shape too so interface dispatch resolves.
+        "size" => Some(V::I32(list_ref(vm, h).map(|l| l.len() as i32).unwrap_or(0))),
+        "isEmpty" => Some(V::I32(
+            list_ref(vm, h).map(|l| l.is_empty()).unwrap_or(true) as i32,
+        )),
         "remove" => {
             let i = i32v(args[1]) as usize;
             let v = list_mut(vm, h)
@@ -1491,30 +2247,432 @@ fn url_codec(vm: &mut Vm, name: &str, args: &[V]) -> Option<Option<V>> {
     Some(Some(jstr(vm, &out)))
 }
 
+/// Split an absolute URL text into its JDK `URL` components. Missing
+/// parts come back empty/`-1`, matching the platform's lenient parse
+/// (no validation — `new URL` in the guest accepts anything).
+fn url_parts(u: &str) -> (String, String, i32, String, String, String) {
+    // scheme — text before "://" or, for opaque URIs, before ':'
+    let (scheme, rest) = match u.find("://") {
+        Some(i) => (&u[..i], &u[i + 3..]),
+        None => match u.find(':') {
+            Some(i) if i > 0 => (&u[..i], &u[i + 1..]),
+            _ => ("", u),
+        },
+    };
+    // authority ends at the first / ? #
+    let aend = rest.find(['/', '?', '#']).unwrap_or(rest.len());
+    let authority = &rest[..aend];
+    let after = &rest[aend..];
+    let (_userinfo, hostport) = match authority.rfind('@') {
+        Some(i) => (&authority[..i], &authority[i + 1..]),
+        None => ("", authority),
+    };
+    let (host_s, port) = match hostport.rfind(':') {
+        Some(i) if hostport[i + 1..].parse::<i32>().is_ok() => (
+            &hostport[..i],
+            hostport[i + 1..].parse::<i32>().unwrap_or(-1),
+        ),
+        _ => (hostport, -1),
+    };
+    // path / query / ref
+    let (no_ref, ref_s) = match after.find('#') {
+        Some(i) => (&after[..i], &after[i + 1..]),
+        None => (after, ""),
+    };
+    let (path, query) = match no_ref.find('?') {
+        Some(i) => (&no_ref[..i], &no_ref[i + 1..]),
+        None => (no_ref, ""),
+    };
+    (
+        scheme.to_string(),
+        host_s.to_string(),
+        port,
+        path.to_string(),
+        query.to_string(),
+        ref_s.to_string(),
+    )
+}
+
 fn url_call(vm: &mut Vm, name: &str, args: &[V]) -> Rt<Option<Option<V>>> {
+    let t = s(
+        vm,
+        match args.first() {
+            Some(V::Ref(h)) => *h,
+            _ => 0,
+        },
+    )
+    .unwrap_or_default();
     Ok(match name {
-        "openConnection" | "openStream" | "getContent" | "toURI" | "toURL" => {
-            Some(Some(host(vm, "Ljava/net/URLConnection;", HostState::Empty)))
+        "<init>" => {
+            // URL(String) / URL(URL, String) — keep the spec text so the
+            // component getters can parse it. A base URL resolves a
+            // relative spec by joining at the last '/' of its path.
+            let (spec, base) = if args.len() >= 3 {
+                (sv(vm, args[2]).unwrap_or_default(), t.clone())
+            } else {
+                (
+                    sv(vm, args.get(1).copied().unwrap_or(V::Ref(0))).unwrap_or_default(),
+                    String::new(),
+                )
+            };
+            let resolved = if spec.contains("://") || spec.starts_with('/') || base.is_empty() {
+                spec
+            } else {
+                let trim = match base.find(['?', '#']) {
+                    Some(i) => &base[..i],
+                    None => &base[..],
+                };
+                match trim.rfind('/') {
+                    Some(i) => format!("{}{spec}", &trim[..i + 1]),
+                    None => spec,
+                }
+            };
+            if let Some(V::Ref(h)) = args.first() {
+                if let Some(Obj::Host { state, .. }) = vm.heap.get_mut(*h) {
+                    *state = HostState::StrBuf(resolved);
+                }
+            }
+            Some(None)
         }
-        "getProtocol" | "getHost" | "getPath" | "getFile" | "getQuery" | "getAuthority"
-        | "getUserInfo" | "getRef" | "toExternalForm" | "toString" => {
-            let t = s(
+        "openConnection" | "openStream" | "getContent" => Some(Some(host(
+            vm,
+            "Ljava/net/URLConnection;",
+            HostState::StrBuf(t),
+        ))),
+        "toURI" => Some(Some(host(vm, "Ljava/net/URI;", HostState::StrBuf(t)))),
+        "toURL" => Some(Some(host(vm, "Ljava/net/URL;", HostState::StrBuf(t)))),
+        "getProtocol" => {
+            let (scheme, ..) = url_parts(&t);
+            Some(Some(jstr(vm, &scheme)))
+        }
+        "getHost" => {
+            let (_, host_s, ..) = url_parts(&t);
+            Some(Some(jstr(vm, &host_s)))
+        }
+        "getPort" => {
+            let (_, _, port, ..) = url_parts(&t);
+            Some(Some(V::I32(port)))
+        }
+        "getDefaultPort" => {
+            let p = match t.split("://").next().unwrap_or("") {
+                "https" | "wss" => 443,
+                "http" | "ws" | "ftp" => 80,
+                _ => -1,
+            };
+            Some(Some(V::I32(p)))
+        }
+        "getAuthority" => {
+            let authority = if let Some(i) = t.find("://") {
+                let rest = &t[i + 3..];
+                let e = rest.find(['/', '?', '#']).unwrap_or(rest.len());
+                rest[..e].to_string()
+            } else {
+                String::new()
+            };
+            Some(Some(jstr(vm, &authority)))
+        }
+        "getUserInfo" => {
+            let ui = if let Some(i) = t.find("://") {
+                let rest = &t[i + 3..];
+                let e = rest.find(['/', '?', '#']).unwrap_or(rest.len());
+                match rest[..e].rfind('@') {
+                    Some(j) => rest[..j].to_string(),
+                    None => String::new(),
+                }
+            } else {
+                String::new()
+            };
+            Some(Some(jstr(vm, &ui)))
+        }
+        "getPath" => {
+            let (_, _, _, path, ..) = url_parts(&t);
+            Some(Some(jstr(vm, &path)))
+        }
+        "getQuery" => {
+            let (_, _, _, _, query, _) = url_parts(&t);
+            Some(Some(jstr(vm, &query)))
+        }
+        "getRef" => {
+            let (_, _, _, _, _, ref_s) = url_parts(&t);
+            Some(Some(jstr(vm, &ref_s)))
+        }
+        "getFile" => {
+            let (_, _, _, path, query, _) = url_parts(&t);
+            let f = if query.is_empty() {
+                path
+            } else {
+                format!("{path}?{query}")
+            };
+            Some(Some(jstr(vm, &f)))
+        }
+        "toExternalForm" | "toString" => Some(Some(jstr(vm, &t))),
+        "sameFile" | "equals" => {
+            let other = s(
                 vm,
-                match args[0] {
-                    V::Ref(h) => h,
+                match args.get(1) {
+                    Some(V::Ref(h)) => *h,
                     _ => 0,
                 },
             )
             .unwrap_or_default();
-            Some(Some(jstr(vm, &t)))
+            Some(Some(V::I32((t == other) as i32)))
         }
-        "getPort" | "getDefaultPort" => Some(Some(V::I32(-1))),
-        "sameFile" | "equals" => Some(Some(V::I32(1))),
+        "hashCode" => {
+            Some(Some(V::I32(t.bytes().fold(0i32, |a, b| {
+                a.wrapping_mul(31).wrapping_add(b as i32)
+            }))))
+        }
         _ => None,
     })
 }
 
-fn charset_call(vm: &mut Vm, name: &str, args: &[V]) -> Option<Option<V>> {
+/// Normalized charset name ("UTF-8", "ISO-8859-1", "US-ASCII").
+fn charset_name(vm: &Vm, h: u32) -> String {
+    s(vm, h)
+        .unwrap_or_else(|| "UTF-8".into())
+        .to_uppercase()
+        .replace(['-', '_'], "")
+}
+
+/// Remaining bytes of a `ByteBuffer`-like host buffer (Slot-backed
+/// array at base+position), with the position the bytes start at.
+fn bb_bytes(vm: &Vm, h: u32) -> (Vec<u8>, usize) {
+    let (back, base, pos, lim, es) = match vm.heap.get(h) {
+        Some(Obj::Host {
+            state: HostState::Slot(V::Ref(b)),
+            ..
+        }) => {
+            let base = i32v(pseudo_get(vm, h, P_BBUF_BASE).unwrap_or(V::I32(0))).max(0) as usize;
+            let pos = i32v(pseudo_get(vm, h, P_BBUF_POS).unwrap_or(V::I32(0))).max(0) as usize;
+            let es = i32v(pseudo_get(vm, h, P_BBUF_ESZ).unwrap_or(V::I32(1))).clamp(1, 8) as usize;
+            let lim = pseudo_get(vm, h, P_BBUF_LIM)
+                .map(|v| i32v(v).max(0) as usize)
+                .unwrap_or(usize::MAX);
+            (*b, base, pos, lim, es)
+        }
+        Some(Obj::Array { .. }) => (h, 0, 0, usize::MAX, 1),
+        _ => return (Vec::new(), 0),
+    };
+    match vm.heap.get(back) {
+        Some(Obj::Array { data, .. }) => (
+            data.iter()
+                .skip(base + pos * es)
+                .take(lim.saturating_sub(pos) * es)
+                .map(|v| i32v(*v) as u8)
+                .collect(),
+            pos,
+        ),
+        _ => (Vec::new(), 0),
+    }
+}
+
+/// Remaining chars of a `CharBuffer`-like host (Slot-backed `C` array
+/// at base+position). Other buffer kinds return None.
+fn charbuf_string(vm: &Vm, h: u32) -> Option<String> {
+    let (back, base, pos, lim) = match vm.heap.get(h) {
+        Some(Obj::Host {
+            state: HostState::Slot(V::Ref(b)),
+            ..
+        }) => (
+            *b,
+            i32v(pseudo_get(vm, h, P_BBUF_BASE).unwrap_or(V::I32(0))).max(0) as usize,
+            i32v(pseudo_get(vm, h, P_BBUF_POS).unwrap_or(V::I32(0))).max(0) as usize,
+            pseudo_get(vm, h, P_BBUF_LIM)
+                .map(|v| i32v(v).max(0) as usize)
+                .unwrap_or(usize::MAX),
+        ),
+        Some(Obj::Array { .. }) => (h, 0, 0, usize::MAX),
+        _ => return None,
+    };
+    match vm.heap.get(back) {
+        Some(Obj::Array { data, .. }) => Some(
+            data.iter()
+                .skip(base + pos)
+                .take(lim.saturating_sub(pos))
+                .map(|v| char::from_u32(i32v(*v) as u32).unwrap_or('\u{FFFD}'))
+                .collect(),
+        ),
+        _ => None,
+    }
+}
+
+/// Decode `bytes` under `cs`; when `eoi` is false an incomplete UTF-8
+/// tail stays unconsumed — returns (text, consumed_byte_count).
+fn cs_decode(cs: &str, bytes: &[u8], eoi: bool) -> (String, usize) {
+    if cs.contains("88591") || cs.contains("LATIN1") {
+        return (bytes.iter().map(|b| *b as char).collect(), bytes.len());
+    }
+    if cs.contains("ASCII") {
+        return (
+            bytes
+                .iter()
+                .map(|b| if *b < 0x80 { *b as char } else { '\u{FFFD}' })
+                .collect(),
+            bytes.len(),
+        );
+    }
+    // UTF-8 (default): at end-of-input, lossy; mid-stream, cut an
+    // incomplete trailing sequence and leave it for the next chunk.
+    match std::str::from_utf8(bytes) {
+        Ok(t) => (t.to_string(), bytes.len()),
+        Err(e) => {
+            let valid = e.valid_up_to();
+            if eoi || e.error_len().is_some() {
+                (String::from_utf8_lossy(bytes).into_owned(), bytes.len())
+            } else {
+                (String::from_utf8_lossy(&bytes[..valid]).into_owned(), valid)
+            }
+        }
+    }
+}
+
+/// `decode(ByteBuffer)` → CharBuffer of the decoded content, and
+/// `decode(in, out, eoi)` — chars appended into `out`'s backing.
+fn charset_decode(vm: &mut Vm, args: &[V]) -> V {
+    let cs = args
+        .first()
+        .and_then(|v| match v {
+            V::Ref(h) => Some(charset_name(vm, *h)),
+            _ => None,
+        })
+        .unwrap_or_else(|| "UTF8".into());
+    let in_h = match args.get(1) {
+        Some(&V::Ref(h)) => h,
+        _ => return V::Ref(0),
+    };
+    let (bytes, in_pos) = bb_bytes(vm, in_h);
+    let eoi = args.get(3).map(|v| i32v(*v) != 0).unwrap_or(true);
+    let (text, consumed) = cs_decode(&cs, &bytes, eoi);
+    if let Some(&V::Ref(out_h)) = args.get(2) {
+        // (ByteBuffer, CharBuffer, boolean): append chars to `out`.
+        let (back, base, pos, cap) = match vm.heap.get(out_h) {
+            Some(Obj::Host {
+                state: HostState::Slot(V::Ref(b)),
+                ..
+            }) => {
+                let base =
+                    i32v(pseudo_get(vm, out_h, P_BBUF_BASE).unwrap_or(V::I32(0))).max(0) as usize;
+                let pos =
+                    i32v(pseudo_get(vm, out_h, P_BBUF_POS).unwrap_or(V::I32(0))).max(0) as usize;
+                let lim = pseudo_get(vm, out_h, P_BBUF_LIM)
+                    .map(|v| i32v(v).max(0) as usize)
+                    .unwrap_or(usize::MAX);
+                let cap = match vm.heap.get(*b) {
+                    Some(Obj::Array { data, .. }) => lim.min(data.len()).saturating_sub(base + pos),
+                    _ => 0,
+                };
+                (*b, base, pos, cap)
+            }
+            _ => (0, 0, 0, 0),
+        };
+        let chars: Vec<char> = text.chars().collect();
+        let wrote = chars.len().min(cap);
+        if back != 0 {
+            if let Some(Obj::Array { data, .. }) = vm.heap.get_mut(back) {
+                for (i, ch) in chars.iter().take(wrote).enumerate() {
+                    if let Some(slot) = data.get_mut(base + pos + i) {
+                        *slot = V::I32(*ch as i32);
+                    }
+                }
+            }
+        }
+        pseudo_set(vm, out_h, P_BBUF_POS, V::I32((pos + wrote) as i32));
+        // Only the bytes backing the written chars are consumed —
+        // OVERFLOW leaves the rest for the next decode call.
+        let used = if wrote < chars.len() {
+            if cs.contains("88591") || cs.contains("LATIN1") || cs.contains("ASCII") {
+                wrote
+            } else {
+                chars[..wrote].iter().collect::<String>().len()
+            }
+        } else {
+            consumed
+        };
+        pseudo_set(vm, in_h, P_BBUF_POS, V::I32((in_pos + used) as i32));
+        let st = if wrote < chars.len() {
+            "OVERFLOW"
+        } else {
+            "UNDERFLOW"
+        };
+        return host(
+            vm,
+            "Ljava/nio/charset/CoderResult;",
+            HostState::StrBuf(st.into()),
+        );
+    }
+    // (ByteBuffer) → CharBuffer
+    pseudo_set(vm, in_h, P_BBUF_POS, V::I32((in_pos + consumed) as i32));
+    let arr = vm.heap.alloc(Obj::Array {
+        elem: "C".into(),
+        data: text.chars().map(|c| V::I32(c as i32)).collect(),
+    });
+    host(vm, "Ljava/nio/CharBuffer;", HostState::Slot(V::Ref(arr)))
+}
+
+fn charset_call(vm: &mut Vm, class: &str, name: &str, args: &[V]) -> Option<Option<V>> {
+    if class == "Ljava/nio/charset/CoderResult;" {
+        let st = match args.first() {
+            Some(&V::Ref(h)) => s(vm, h).unwrap_or_else(|| "UNDERFLOW".into()),
+            _ => "UNDERFLOW".into(),
+        };
+        return match name {
+            "isUnderflow" => Some(Some(V::I32((st == "UNDERFLOW") as i32))),
+            "isOverflow" => Some(Some(V::I32((st == "OVERFLOW") as i32))),
+            "isError" | "isMalformed" | "isUnmappable" => Some(Some(V::I32(0))),
+            "length" => Some(Some(V::I32(0))),
+            "throwException" | "toString" => {
+                if name == "toString" {
+                    Some(Some(jstr(vm, &st)))
+                } else {
+                    Some(None)
+                }
+            }
+            _ => None,
+        };
+    }
+    if class == "Ljava/nio/charset/CodingErrorAction;" {
+        return match name {
+            "toString" | "name" => Some(Some(jstr(vm, "REPLACE"))),
+            _ => None,
+        };
+    }
+    if class == "Ljava/nio/charset/CharsetDecoder;" || class == "Ljava/nio/charset/CharsetEncoder;"
+    {
+        return match name {
+            "onMalformedInput" | "onUnmappableCharacter" | "replaceWith" | "reset" => {
+                Some(Some(args[0]))
+            }
+            "malformedInputAction" | "unmappableCharacterAction" => Some(Some(host(
+                vm,
+                "Ljava/nio/charset/CodingErrorAction;",
+                HostState::StrBuf("REPLACE".into()),
+            ))),
+            "replacement" => {
+                // Encoder's replacement is a byte[] — the JDK default
+                // is the single byte '?' — decoder's a String.
+                if class == "Ljava/nio/charset/CharsetEncoder;" {
+                    Some(Some(arr(vm, "B", vec![V::I32(b'?' as i32)])))
+                } else {
+                    Some(Some(jstr(vm, "\u{FFFD}")))
+                }
+            }
+            "charset" | "detectedCharset" => Some(Some(host(
+                vm,
+                "Ljava/nio/charset/Charset;",
+                HostState::StrBuf("UTF-8".into()),
+            ))),
+            "averageCharsPerByte" | "averageBytesPerChar" => Some(Some(V::F32(1.0))),
+            "maxCharsPerByte" | "maxBytesPerChar" => Some(Some(V::F32(4.0))),
+            "isAutoDetecting" | "isCharsetDetected" => Some(Some(V::I32(0))),
+            "decode" | "decodeLoop" => Some(Some(charset_decode(vm, args))),
+            "flush" => Some(Some(host(
+                vm,
+                "Ljava/nio/charset/CoderResult;",
+                HostState::StrBuf("UNDERFLOW".into()),
+            ))),
+            _ => None,
+        };
+    }
     match name {
         "forName" => {
             let n = sv(vm, args[0]).unwrap_or_else(|| "UTF-8".into());
@@ -1540,23 +2698,84 @@ fn charset_call(vm: &mut Vm, name: &str, args: &[V]) -> Option<Option<V>> {
             "Ljava/nio/charset/Charset;",
             HostState::StrBuf("UTF-8".into()),
         ))),
-        "encode" | "decode" | "newEncoder" | "newDecoder" | "aliases" | "availableCharsets"
-        | "isSupported" | "contains" | "canEncode" => {
+        "newDecoder" | "newEncoder" => {
+            // Carry the receiver's charset name so ISO-8859-1 et al.
+            // decode/encode under their own mapping, not UTF-8.
+            let n = match args[0] {
+                V::Ref(h) => s(vm, h).unwrap_or_else(|| "UTF-8".into()),
+                _ => "UTF-8".into(),
+            };
+            let desc = if name == "newDecoder" {
+                "Ljava/nio/charset/CharsetDecoder;"
+            } else {
+                "Ljava/nio/charset/CharsetEncoder;"
+            };
+            Some(Some(host(vm, desc, HostState::StrBuf(n))))
+        }
+        "decode" => Some(Some(charset_decode(vm, args))),
+        "encode" => {
+            // `encode(CharBuffer|CharSequence)` → ByteBuffer in `cs`.
+            let cs = match args[0] {
+                V::Ref(h) => charset_name(vm, h),
+                _ => "UTF8".into(),
+            };
+            // `s()` covers String/CharSequence and CharBuffer content.
+            let text = match args.get(1) {
+                Some(&V::Ref(h)) => s(vm, h).unwrap_or_default(),
+                _ => String::new(),
+            };
+            // `byte[]` elements are signed — bytes ≥0x80 store as
+            // negative ints like every other byte writer here.
+            let data: Vec<V> = if cs.contains("88591") || cs.contains("LATIN1") {
+                text.chars()
+                    .map(|c| {
+                        V::I32(if (c as u32) < 0x100 {
+                            (c as u8) as i8 as i32
+                        } else {
+                            b'?' as i32
+                        })
+                    })
+                    .collect()
+            } else if cs.contains("ASCII") {
+                text.chars()
+                    .map(|c| {
+                        V::I32(if (c as u32) < 0x80 {
+                            (c as u8) as i8 as i32
+                        } else {
+                            b'?' as i32
+                        })
+                    })
+                    .collect()
+            } else {
+                text.as_bytes()
+                    .iter()
+                    .map(|b| V::I32(*b as i8 as i32))
+                    .collect()
+            };
+            let arr = vm.heap.alloc(Obj::Array {
+                elem: "B".into(),
+                data,
+            });
+            Some(Some(host(
+                vm,
+                "Ljava/nio/ByteBuffer;",
+                HostState::Slot(V::Ref(arr)),
+            )))
+        }
+        "aliases" | "availableCharsets" | "isSupported" | "contains" | "canEncode" => {
             if name == "isSupported" || name == "canEncode" || name == "contains" {
                 Some(Some(V::I32(1)))
             } else if name == "availableCharsets" {
                 Some(Some(host(vm, "Ljava/util/Map;", HostState::Map(vec![]))))
-            } else if name == "aliases" {
-                Some(Some(host(vm, "Ljava/util/Set;", HostState::List(vec![]))))
             } else {
-                Some(Some(V::Ref(0)))
+                Some(Some(host(vm, "Ljava/util/Set;", HostState::List(vec![]))))
             }
         }
         _ => None,
     }
 }
 
-fn nio_call(vm: &mut Vm, name: &str, args: &[V]) -> Option<Option<V>> {
+fn nio_call(vm: &mut Vm, class: &str, name: &str, args: &[V]) -> Option<Option<V>> {
     let this = match args.first() {
         Some(&V::Ref(h)) => h,
         _ => 0,
@@ -1571,59 +2790,166 @@ fn nio_call(vm: &mut Vm, name: &str, args: &[V]) -> Option<Option<V>> {
             _ => None,
         }
     };
-    let bpos = |vm: &Vm| i32v(pseudo_get(vm, this, P_BBUF_POS).unwrap_or(V::I32(0))).max(0) as usize;
-    let little =
-        |vm: &Vm| i32v(pseudo_get(vm, this, P_BBUF_ORD).unwrap_or(V::I32(0))) != 0;
-    // Read `n` bytes at `pos`; None when out of bounds.
+    let bpos =
+        |vm: &Vm| i32v(pseudo_get(vm, this, P_BBUF_POS).unwrap_or(V::I32(0))).max(0) as usize;
+    let little = |vm: &Vm| i32v(pseudo_get(vm, this, P_BBUF_ORD).unwrap_or(V::I32(0))) != 0;
+    // Typed views (`asIntBuffer`…) keep the same byte backing but
+    // address it in elements of `esz` bytes.
+    let esz =
+        |vm: &Vm| i32v(pseudo_get(vm, this, P_BBUF_ESZ).unwrap_or(V::I32(1))).clamp(1, 8) as usize;
+    // A typed view's content starts at the parent's byte position when
+    // it was created — `read_at`/`put` index `base + pos`.
+    let base =
+        |vm: &Vm| i32v(pseudo_get(vm, this, P_BBUF_BASE).unwrap_or(V::I32(0))).max(0) as usize;
+    // Capacity in element units — a view (slice/duplicate) carries
+    // its own bound in P_BBUF_CAP; otherwise it spans to the backing
+    // array's end minus the byte offset.
+    let blim_capacity = |vm: &Vm| -> usize {
+        if let Some(c) = pseudo_get(vm, this, P_BBUF_CAP) {
+            return i32v(c).max(0) as usize;
+        }
+        backing(vm)
+            .and_then(|b| match vm.heap.get(b) {
+                Some(Obj::Array { data, .. }) => Some(data.len()),
+                _ => None,
+            })
+            .unwrap_or(0)
+            .saturating_sub(base(vm))
+            / esz(vm)
+    };
+    // Limit in element units — absent means capacity.
+    let blim = |vm: &Vm| -> usize {
+        match pseudo_get(vm, this, P_BBUF_LIM) {
+            Some(v) => i32v(v).max(0) as usize,
+            None => blim_capacity(vm),
+        }
+    };
+    // Read `n` bytes at `pos`; None when out of bounds. `pos` is a byte
+    // offset; the limit bounds it (elements → bytes via `esz`).
     let read_at = |vm: &Vm, pos: usize, n: usize| -> Option<Vec<u8>> {
+        let pos = base(vm) + pos;
+        let lim_bytes = base(vm) + blim(vm) * esz(vm);
         let b = backing(vm)?;
         match vm.heap.get(b) {
             Some(Obj::Array { data, .. }) => {
-                if pos + n > data.len() {
+                if pos + n > data.len() || pos + n > lim_bytes {
                     None
                 } else {
-                    Some(
-                        data[pos..pos + n]
-                            .iter()
-                            .map(|v| i32v(*v) as u8)
-                            .collect(),
-                    )
+                    Some(data[pos..pos + n].iter().map(|v| i32v(*v) as u8).collect())
                 }
             }
             _ => None,
         }
     };
     match name {
+        "toString" if class.contains("CharBuffer") => {
+            // CharBuffer.toString() yields the remaining chars, not an
+            // object identity — `Charset.decode(b).toString()` needs it.
+            Some(Some(jstr(
+                vm,
+                &charbuf_string(vm, this).unwrap_or_default(),
+            )))
+        }
         "allocate" | "allocateDirect" => {
-            let n = i32v(*args.get(if args.len() > 1 { 1 } else { 0 }).unwrap_or(&V::I32(0)));
+            // `FloatBuffer.allocate(n)` allocates n ELEMENTS — the
+            // backing byte array is n * esz bytes.
+            let (desc, w) = match class {
+                c if c.contains("IntBuffer") => ("Ljava/nio/IntBuffer;", 4),
+                c if c.contains("FloatBuffer") => ("Ljava/nio/FloatBuffer;", 4),
+                c if c.contains("LongBuffer") => ("Ljava/nio/LongBuffer;", 8),
+                c if c.contains("DoubleBuffer") => ("Ljava/nio/DoubleBuffer;", 8),
+                c if c.contains("ShortBuffer") => ("Ljava/nio/ShortBuffer;", 2),
+                c if c.contains("CharBuffer") => ("Ljava/nio/CharBuffer;", 2),
+                _ => ("Ljava/nio/ByteBuffer;", 1),
+            };
+            let n = i32v(
+                *args
+                    .get(if args.len() > 1 { 1 } else { 0 })
+                    .unwrap_or(&V::I32(0)),
+            );
             let buf = vm.heap.alloc(Obj::Array {
                 elem: "B".into(),
-                data: vec![V::I32(0); n.max(0) as usize],
+                data: vec![V::I32(0); (n.max(0) as usize) * w],
             });
-            Some(Some(host(
-                vm,
-                "Ljava/nio/ByteBuffer;",
-                HostState::Slot(V::Ref(buf)),
-            )))
+            let v = host(vm, desc, HostState::Slot(V::Ref(buf)));
+            if let (V::Ref(h), true) = (v, w > 1) {
+                pseudo_set(vm, h, P_BBUF_ESZ, V::I32(w as i32));
+            }
+            Some(Some(v))
+        }
+        "asIntBuffer" | "asFloatBuffer" | "asLongBuffer" | "asDoubleBuffer" | "asShortBuffer"
+        | "asCharBuffer" => {
+            // Typed view over the same byte backing; positions/capacity
+            // are element-indexed via P_BBUF_ESZ.
+            let (desc, w) = match name {
+                "asIntBuffer" => ("Ljava/nio/IntBuffer;", 4),
+                "asFloatBuffer" => ("Ljava/nio/FloatBuffer;", 4),
+                "asLongBuffer" => ("Ljava/nio/LongBuffer;", 8),
+                "asDoubleBuffer" => ("Ljava/nio/DoubleBuffer;", 8),
+                "asShortBuffer" => ("Ljava/nio/ShortBuffer;", 2),
+                _ => ("Ljava/nio/CharBuffer;", 2),
+            };
+            let b = backing(vm).map(V::Ref).unwrap_or(V::I32(0));
+            let base0 = base(vm) + bpos(vm) * esz(vm);
+            let v = host(vm, desc, HostState::Slot(b));
+            if let V::Ref(h) = v {
+                pseudo_set(vm, h, P_BBUF_ESZ, V::I32(w));
+                if base0 != 0 {
+                    pseudo_set(vm, h, P_BBUF_BASE, V::I32(base0 as i32));
+                }
+                if let Some(o) = pseudo_get(vm, this, P_BBUF_ORD) {
+                    pseudo_set(vm, h, P_BBUF_ORD, o);
+                }
+            }
+            Some(Some(v))
         }
         "wrap" => {
             // wrap(byte[]) / wrap(byte[], off, len) — keep the array so
             // `array()` returns the same handle writes went into.
+            // P_BBUF_RAW marks the content as foreign-supplied bytes
+            // (native order until `order()` says otherwise); `slice`/
+            // `duplicate` return this handle so the mark carries over.
             let b = args.first().copied().unwrap_or(V::Ref(0));
             let v = host(vm, "Ljava/nio/ByteBuffer;", HostState::Slot(b));
-            if let (V::Ref(h), true) = (v, args.len() > 2) {
-                pseudo_set(vm, h, P_BBUF_POS, V::I32(i32v(args[1])));
+            if let V::Ref(h) = v {
+                pseudo_set(vm, h, P_BBUF_RAW, V::I32(1));
+                if args.len() > 2 {
+                    pseudo_set(vm, h, P_BBUF_POS, V::I32(i32v(args[1])));
+                    // wrap(arr, off, len): limit = off + len.
+                    pseudo_set(
+                        vm,
+                        h,
+                        P_BBUF_LIM,
+                        V::I32(i32v(args[1]) + i32v(args.get(2).copied().unwrap_or(V::I32(0)))),
+                    );
+                }
             }
             Some(Some(v))
         }
         "order" => {
+            if crate::dbg_flag("OVELO_ORDDBG") {
+                eprintln!(
+                    "[orddbg] order arg={:?} heap={:?}",
+                    args.get(1),
+                    match args.get(1) {
+                        Some(&V::Ref(h)) => vm
+                            .heap
+                            .get(h)
+                            .map(|o| format!("{:?}", o))
+                            .unwrap_or("?".into()),
+                        _ => "not-ref".to_string(),
+                    }
+                );
+            }
             let ord = match args.get(1) {
                 Some(&V::Ref(bo)) => match vm.heap.get(bo) {
                     Some(Obj::Host {
                         state: HostState::Slot(v),
                         ..
                     }) => *v,
-                    _ => V::I32(0),
+                    // `nativeOrder()` (little on our targets) and any
+                    // unknown ByteOrder object — ARM64 is little-endian.
+                    _ => V::I32(1),
                 },
                 _ => V::I32(0),
             };
@@ -1637,31 +2963,34 @@ fn nio_call(vm: &mut Vm, name: &str, args: &[V]) -> Option<Option<V>> {
             }) => *v,
             _ => V::Ref(0),
         })),
-        "hasArray" | "hasRemaining" => Some(Some(V::I32(1))),
-        "isDirect" | "isReadOnly" => Some(Some(V::I32(0))),
+        "hasArray" => Some(Some(V::I32(1))),
+        "hasRemaining" => Some(Some(V::I32((blim(vm) > bpos(vm)) as i32))),
+        // Every buffer we mint is array-backed but behaves direct —
+        // guests pool-vs-copy on this (Korge picks a shared pool when
+        // a buffer reports non-direct, splitting read/write sites).
+        "isDirect" => Some(Some(V::I32(1))),
+        "isReadOnly" => Some(Some(V::I32(0))),
         "arrayOffset" => Some(Some(V::I32(0))),
-        "capacity" | "limit" => {
+        "capacity" => {
             let n = backing(vm)
                 .and_then(|b| match vm.heap.get(b) {
                     Some(Obj::Array { data, .. }) => Some(data.len()),
                     _ => None,
                 })
-                .unwrap_or(0);
+                .unwrap_or(0)
+                .saturating_sub(base(vm))
+                / esz(vm);
+            Some(Some(V::I32(n as i32)))
+        }
+        "limit" => {
             if args.len() > 1 {
+                pseudo_set(vm, this, P_BBUF_LIM, args[1]);
                 Some(Some(args[0]))
             } else {
-                Some(Some(V::I32(n as i32)))
+                Some(Some(V::I32(blim(vm) as i32)))
             }
         }
-        "remaining" => {
-            let n = backing(vm)
-                .and_then(|b| match vm.heap.get(b) {
-                    Some(Obj::Array { data, .. }) => Some(data.len()),
-                    _ => None,
-                })
-                .unwrap_or(0);
-            Some(Some(V::I32(n.saturating_sub(bpos(vm)) as i32)))
-        }
+        "remaining" => Some(Some(V::I32(blim(vm).saturating_sub(bpos(vm)) as i32))),
         "position" => {
             if args.len() > 1 {
                 pseudo_set(vm, this, P_BBUF_POS, args[1]);
@@ -1670,21 +2999,150 @@ fn nio_call(vm: &mut Vm, name: &str, args: &[V]) -> Option<Option<V>> {
                 Some(Some(V::I32(bpos(vm) as i32)))
             }
         }
-        "flip" | "clear" | "rewind" | "reset" => {
+        "flip" => {
+            // limit = position, position = 0 — the written region
+            // becomes the readable one.
+            let pos = bpos(vm) as i32;
+            pseudo_set(vm, this, P_BBUF_LIM, V::I32(pos));
             pseudo_set(vm, this, P_BBUF_POS, V::I32(0));
             Some(Some(args[0]))
         }
-        "mark" | "compact" | "slice" | "duplicate" | "asReadOnlyBuffer" => {
+        "clear" => {
+            // position = 0, limit = capacity.
+            pseudo_set(vm, this, P_BBUF_POS, V::I32(0));
+            pseudo_set(vm, this, P_BBUF_LIM, V::I32(blim_capacity(vm) as i32));
             Some(Some(args[0]))
+        }
+        "rewind" => {
+            pseudo_set(vm, this, P_BBUF_POS, V::I32(0));
+            Some(Some(args[0]))
+        }
+        "reset" => {
+            // position = mark (0 when none was taken).
+            let m = i32v(pseudo_get(vm, this, P_BBUF_MARK).unwrap_or(V::I32(0)));
+            pseudo_set(vm, this, P_BBUF_POS, V::I32(m.max(0)));
+            Some(Some(args[0]))
+        }
+        "nativeOrder" => {
+            let h = vm.byteorder_h.get();
+            let v = if h != 0 && vm.heap.get(h).is_some() {
+                V::Ref(h)
+            } else {
+                let v = host(vm, "Ljava/nio/ByteOrder;", HostState::Slot(V::I32(1)));
+                if let V::Ref(hh) = v {
+                    vm.byteorder_h.set(hh);
+                }
+                v
+            };
+            Some(Some(v))
+        }
+        "mark" => {
+            pseudo_set(vm, this, P_BBUF_MARK, V::I32(bpos(vm) as i32));
+            Some(Some(args[0]))
+        }
+        "compact" => {
+            // Move the unread region [pos, limit) to the front, then
+            // position = remaining, limit = capacity — the caller reads
+            // into the tail and `flip`s back to read mode.
+            let es = esz(vm);
+            let (pos, lim) = (bpos(vm), blim(vm));
+            let cap = blim_capacity(vm);
+            if let Some(bh) = backing(vm).filter(|_| lim > pos) {
+                let bb = base(vm);
+                if let Some(Obj::Array { data, .. }) = vm.heap.get_mut(bh) {
+                    for i in 0..(lim - pos) * es {
+                        let src = data.get(bb + pos * es + i).copied().unwrap_or(V::I32(0));
+                        if let Some(slot) = data.get_mut(bb + i) {
+                            *slot = src;
+                        }
+                    }
+                }
+            }
+            pseudo_set(vm, this, P_BBUF_POS, V::I32((lim - pos) as i32));
+            pseudo_set(vm, this, P_BBUF_LIM, V::I32(cap as i32));
+            Some(Some(args[0]))
+        }
+        "slice" | "duplicate" | "asReadOnlyBuffer" => {
+            // A view buffer is a NEW object sharing the same backing:
+            // its own position/limit must not alias the parent's.
+            // `slice` re-bases to the parent's current position;
+            // `duplicate`/`asReadOnlyBuffer` copy position/limit as-is.
+            // (ByteBuffer order matters little — our element model
+            // reads via esz/ord flags, which carry over.)
+            let desc = match vm.heap.get(this) {
+                Some(Obj::Host { desc, .. }) => desc.clone(),
+                _ => "Ljava/nio/ByteBuffer;".to_string(),
+            };
+            let (pos, lim, parent_cap) = (bpos(vm), blim(vm), blim_capacity(vm));
+            let es = esz(vm);
+            let base_new = if name == "slice" {
+                base(vm) + pos * es
+            } else {
+                base(vm)
+            };
+            let b = backing(vm).map(V::Ref).unwrap_or(V::I32(0));
+            let v = host(vm, &desc, HostState::Slot(b));
+            if let V::Ref(h) = v {
+                if base_new != 0 {
+                    pseudo_set(vm, h, P_BBUF_BASE, V::I32(base_new as i32));
+                }
+                if es != 1 {
+                    pseudo_set(vm, h, P_BBUF_ESZ, V::I32(es as i32));
+                }
+                if let Some(o) = pseudo_get(vm, this, P_BBUF_ORD) {
+                    pseudo_set(vm, h, P_BBUF_ORD, o);
+                }
+                if pseudo_get(vm, this, P_BBUF_RAW).is_some() {
+                    pseudo_set(vm, h, P_BBUF_RAW, V::I32(1));
+                }
+                if name == "slice" {
+                    // slice: position 0, limit AND capacity = the
+                    // parent's remaining — a clear() must not reopen
+                    // the parent's tail beyond the sliced window.
+                    let rem = lim.saturating_sub(pos);
+                    pseudo_set(vm, h, P_BBUF_POS, V::I32(0));
+                    pseudo_set(vm, h, P_BBUF_LIM, V::I32(rem as i32));
+                    pseudo_set(vm, h, P_BBUF_CAP, V::I32(rem as i32));
+                } else {
+                    // duplicate: same position/limit, same window.
+                    pseudo_set(vm, h, P_BBUF_POS, V::I32(pos as i32));
+                    pseudo_set(
+                        vm,
+                        h,
+                        P_BBUF_LIM,
+                        V::I32(if lim == parent_cap { parent_cap } else { lim } as i32),
+                    );
+                    if pseudo_get(vm, this, P_BBUF_CAP).is_some() {
+                        pseudo_set(vm, h, P_BBUF_CAP, V::I32(parent_cap as i32));
+                    }
+                }
+            }
+            Some(Some(v))
         }
         "putInt" | "putLong" | "putShort" | "putDouble" | "putFloat" | "putChar" | "putByte"
         | "put" => {
-            let pos0 = bpos(vm);
+            let (pos0, es) = (bpos(vm), esz(vm));
+            // One V -> `es` bytes, endian-adjusted like `put`'s reverse.
+            let elem_bytes = |vm: &Vm, v: V| -> Vec<u8> {
+                let mut b = match (v, es) {
+                    (V::F32(f), 4) => f.to_be_bytes().to_vec(),
+                    (V::F64(d), 8) => d.to_be_bytes().to_vec(),
+                    (V::I64(l), 8) => l.to_be_bytes().to_vec(),
+                    (_, 4) => i32v(v).to_be_bytes().to_vec(),
+                    (_, 2) => (i32v(v) as u16).to_be_bytes().to_vec(),
+                    _ => vec![i32v(v) as u8],
+                };
+                if little(vm) {
+                    b.reverse();
+                }
+                b
+            };
             let put = |vm: &mut Vm, pos: usize, bytes: &[u8]| {
                 let mut b = bytes.to_vec();
                 if little(vm) {
                     b.reverse();
                 }
+                let pos = base(vm) + pos;
                 if let Some(bh) = backing(vm) {
                     if let Some(Obj::Array { data, .. }) = vm.heap.get_mut(bh) {
                         for (i, x) in b.iter().enumerate() {
@@ -1698,10 +3156,22 @@ fn nio_call(vm: &mut Vm, name: &str, args: &[V]) -> Option<Option<V>> {
             match name {
                 "put" => {
                     if args.len() > 2 && matches!(args[1], V::I32(_) | V::I64(_)) {
-                        // put(index, byte) — absolute, no cursor move.
-                        let pos = i32v(args[1]).max(0) as usize;
-                        let x = i32v(args[2]) as u8;
-                        put(vm, pos, &[x]);
+                        // put(index, byte) — absolute index inside
+                        // this view's window, so re-base like read_at
+                        // does (a slice's index 0 is backing[base]).
+                        let pos = base(vm) + i32v(args[1]).max(0) as usize * es;
+                        // elem_bytes is already endian-adjusted — the
+                        // `put` closure would reverse it again.
+                        let x = elem_bytes(vm, args[2]);
+                        if let Some(bh) = backing(vm) {
+                            if let Some(Obj::Array { data, .. }) = vm.heap.get_mut(bh) {
+                                for (i, b) in x.iter().enumerate() {
+                                    if let Some(slot) = data.get_mut(pos + i) {
+                                        *slot = V::I32(*b as i8 as i32);
+                                    }
+                                }
+                            }
+                        }
                     } else if args.len() > 2 {
                         // put(byte[], off, len)
                         let (src, off, len) = (
@@ -1715,16 +3185,25 @@ fn nio_call(vm: &mut Vm, name: &str, args: &[V]) -> Option<Option<V>> {
                                     .iter()
                                     .skip(off)
                                     .take(len)
-                                    .map(|v| i32v(*v) as u8)
+                                    .flat_map(|v| elem_bytes(vm, *v))
                                     .collect(),
                                 _ => Vec::new(),
                             },
                             _ => Vec::new(),
                         };
+                        if crate::dbg_flag("OVELO_ORDDBG") {
+                            eprintln!(
+                                "[orddbg] bulk-put class={class} es={es} little={} ord={:?} nbytes={}",
+                                little(vm),
+                                pseudo_get(vm, this, P_BBUF_ORD),
+                                bytes.len()
+                            );
+                        }
                         if let Some(bh) = backing(vm) {
+                            let bb = base(vm);
                             if let Some(Obj::Array { data, .. }) = vm.heap.get_mut(bh) {
                                 for (i, x) in bytes.iter().enumerate() {
-                                    if let Some(slot) = data.get_mut(pos0 + i) {
+                                    if let Some(slot) = data.get_mut(bb + pos0 * es + i) {
                                         *slot = V::I32(*x as i8 as i32);
                                     }
                                 }
@@ -1736,7 +3215,7 @@ fn nio_call(vm: &mut Vm, name: &str, args: &[V]) -> Option<Option<V>> {
                         let bytes: Vec<u8> = match args.get(1).copied() {
                             Some(V::Ref(sh)) => match vm.heap.get(sh) {
                                 Some(Obj::Array { data, .. }) => {
-                                    data.iter().map(|v| i32v(*v) as u8).collect()
+                                    data.iter().flat_map(|v| elem_bytes(vm, *v)).collect()
                                 }
                                 _ => {
                                     // Another ByteBuffer: drain its
@@ -1756,16 +3235,26 @@ fn nio_call(vm: &mut Vm, name: &str, args: &[V]) -> Option<Option<V>> {
                                     };
                                     let mut v = Vec::new();
                                     if let Some(sb) = src_backing {
+                                        let ses = i32v(
+                                            pseudo_get(vm, sh, P_BBUF_ESZ).unwrap_or(V::I32(1)),
+                                        )
+                                        .clamp(1, 8)
+                                            as usize;
                                         let sp = i32v(
-                                            pseudo_get(vm, sh, P_BBUF_POS)
-                                                .unwrap_or(V::I32(0)),
+                                            pseudo_get(vm, sh, P_BBUF_POS).unwrap_or(V::I32(0)),
+                                        )
+                                        .max(0)
+                                            as usize
+                                            * ses;
+                                        let sb_off = i32v(
+                                            pseudo_get(vm, sh, P_BBUF_BASE).unwrap_or(V::I32(0)),
                                         )
                                         .max(0)
                                             as usize;
                                         if let Some(Obj::Array { data, .. }) = vm.heap.get(sb) {
                                             v = data
                                                 .iter()
-                                                .skip(sp)
+                                                .skip(sb_off + sp)
                                                 .map(|x| i32v(*x) as u8)
                                                 .collect();
                                         }
@@ -1774,27 +3263,26 @@ fn nio_call(vm: &mut Vm, name: &str, args: &[V]) -> Option<Option<V>> {
                                             vm,
                                             sh,
                                             P_BBUF_POS,
-                                            V::I32((sp + n) as i32),
+                                            V::I32((sp / ses + n / ses) as i32),
                                         );
                                     }
                                     v
                                 }
                             },
-                            v => vec![i32v(v.unwrap_or(V::I32(0))) as u8],
+                            v => elem_bytes(vm, v.unwrap_or(V::I32(0))),
                         };
                         let len = bytes.len();
-                        // Byte-order applies to multi-byte primitives,
-                        // not bulk copies — write through directly.
                         if let Some(bh) = backing(vm) {
+                            let bb = base(vm);
                             if let Some(Obj::Array { data, .. }) = vm.heap.get_mut(bh) {
                                 for (i, x) in bytes.iter().enumerate() {
-                                    if let Some(slot) = data.get_mut(pos0 + i) {
+                                    if let Some(slot) = data.get_mut(bb + pos0 * es + i) {
                                         *slot = V::I32(*x as i8 as i32);
                                     }
                                 }
                             }
                         }
-                        pseudo_set(vm, this, P_BBUF_POS, V::I32((pos0 + len) as i32));
+                        pseudo_set(vm, this, P_BBUF_POS, V::I32((pos0 + len / es) as i32));
                     }
                 }
                 _ => {
@@ -1809,9 +3297,9 @@ fn nio_call(vm: &mut Vm, name: &str, args: &[V]) -> Option<Option<V>> {
                     };
                     // Index form putInt(i, v) etc.: 3 args.
                     let (pos, adv) = if args.len() > 2 {
-                        (i32v(args[1]).max(0) as usize, 0)
+                        (i32v(args[1]).max(0) as usize * es, 0)
                     } else {
-                        (pos0, bytes.len())
+                        (pos0 * es, bytes.len() / es)
                     };
                     let v2 = if args.len() > 2 { args[2] } else { v };
                     let bytes = if args.len() > 2 {
@@ -1820,9 +3308,7 @@ fn nio_call(vm: &mut Vm, name: &str, args: &[V]) -> Option<Option<V>> {
                             "putLong" => i64v(v2).to_be_bytes().to_vec(),
                             "putDouble" => f64v(v2).to_be_bytes().to_vec(),
                             "putFloat" => (f64v(v2) as f32).to_be_bytes().to_vec(),
-                            "putShort" | "putChar" => {
-                                (i32v(v2) as u16).to_be_bytes().to_vec()
-                            }
+                            "putShort" | "putChar" => (i32v(v2) as u16).to_be_bytes().to_vec(),
                             _ => vec![i32v(v2) as u8],
                         }
                     } else {
@@ -1830,12 +3316,7 @@ fn nio_call(vm: &mut Vm, name: &str, args: &[V]) -> Option<Option<V>> {
                     };
                     put(vm, pos, &bytes);
                     if adv > 0 {
-                        pseudo_set(
-                            vm,
-                            this,
-                            P_BBUF_POS,
-                            V::I32((pos0 + bytes.len()) as i32),
-                        );
+                        pseudo_set(vm, this, P_BBUF_POS, V::I32((pos0 + adv) as i32));
                     }
                 }
             }
@@ -1849,13 +3330,15 @@ fn nio_call(vm: &mut Vm, name: &str, args: &[V]) -> Option<Option<V>> {
                 "getShort" | "getChar" => 2,
                 _ => 1,
             };
+            let es = esz(vm);
             let pos = if args.len() > 1 && matches!(args[1], V::I32(_) | V::I64(_)) {
-                i32v(args[1]).max(0) as usize
+                i32v(args[1]).max(0) as usize * es
             } else {
-                bpos(vm)
+                bpos(vm) * es
             };
             if name == "get" && args.len() > 1 && matches!(args[1], V::Ref(_)) {
-                // get(byte[], off, len) — bulk read.
+                // get(dst[], off, len) — bulk read; `len` is in
+                // elements for typed views.
                 let (dst, off, len) = (
                     args[1],
                     args.get(2).map(|v| i32v(*v).max(0) as usize).unwrap_or(0),
@@ -1863,47 +3346,95 @@ fn nio_call(vm: &mut Vm, name: &str, args: &[V]) -> Option<Option<V>> {
                         .map(|v| i32v(*v).max(0) as usize)
                         .unwrap_or(usize::MAX),
                 );
-                if let Some(bytes) = read_at(vm, pos, len.min(usize::MAX / 2).min(len)) {
+                let is_float = matches!(
+                    vm.heap.get(this),
+                    Some(Obj::Host { desc, .. }) if desc.contains("Float")
+                );
+                if let Some(bytes) = read_at(vm, pos, len.min(usize::MAX / 8).saturating_mul(es)) {
                     let n = bytes.len();
+                    let le = little(vm);
                     if let V::Ref(dh) = dst {
                         if let Some(Obj::Array { data, .. }) = vm.heap.get_mut(dh) {
-                            for (i, x) in bytes.iter().enumerate() {
-                                if let Some(slot) = data.get_mut(off + i) {
-                                    *slot = V::I32(*x as i8 as i32);
+                            for (i, slot) in data.iter_mut().enumerate().skip(off).take(len) {
+                                let at = (i - off) * es;
+                                let mut e = vec![0u8; es];
+                                if let Some(src) = bytes.get(at..at + es) {
+                                    e.copy_from_slice(src);
                                 }
+                                if le {
+                                    e.reverse();
+                                }
+                                *slot = match (es, is_float) {
+                                    (8, true) => V::F64(f64::from_be_bytes(
+                                        e[..8].try_into().unwrap_or([0; 8]),
+                                    )),
+                                    (8, false) => V::I64(i64::from_be_bytes(
+                                        e[..8].try_into().unwrap_or([0; 8]),
+                                    )),
+                                    (4, true) => V::F32(f32::from_be_bytes(
+                                        e[..4].try_into().unwrap_or([0; 4]),
+                                    )),
+                                    (4, false) => V::I32(i32::from_be_bytes(
+                                        e[..4].try_into().unwrap_or([0; 4]),
+                                    )),
+                                    (2, _) => V::I32(i16::from_be_bytes(
+                                        e[..2].try_into().unwrap_or([0; 2]),
+                                    ) as i32),
+                                    _ => V::I32(e[0] as i8 as i32),
+                                };
                             }
                         }
                     }
-                    pseudo_set(vm, this, P_BBUF_POS, V::I32((pos + n) as i32));
+                    pseudo_set(vm, this, P_BBUF_POS, V::I32((pos / es + n / es) as i32));
                 }
                 return Some(Some(args[0]));
             }
+            // A `get()`/`get(index)` on a typed view reads one element.
+            let size = if es > 1 && (name == "get" || name == "getByte") {
+                es
+            } else {
+                size
+            };
+            let is_float = matches!(
+                vm.heap.get(this),
+                Some(Obj::Host { desc, .. }) if desc.contains("Float")
+            );
             let mut bytes = read_at(vm, pos, size).unwrap_or_else(|| vec![0; size]);
             if little(vm) {
                 bytes.reverse();
             }
             if args.len() == 1 {
-                pseudo_set(vm, this, P_BBUF_POS, V::I32((pos + size) as i32));
+                pseudo_set(vm, this, P_BBUF_POS, V::I32((pos / es + size / es) as i32));
             }
             let v = match name {
-                "getInt" => V::I32(i32::from_be_bytes(
-                    bytes[..4].try_into().unwrap_or([0; 4]),
-                )),
-                "getLong" => V::I64(i64::from_be_bytes(
-                    bytes[..8].try_into().unwrap_or([0; 8]),
-                )),
-                "getDouble" => V::F64(f64::from_be_bytes(
-                    bytes[..8].try_into().unwrap_or([0; 8]),
-                )),
-                "getFloat" => V::F32(f32::from_be_bytes(
-                    bytes[..4].try_into().unwrap_or([0; 4]),
-                )),
-                "getShort" => V::I32(i16::from_be_bytes(
-                    bytes[..2].try_into().unwrap_or([0; 2]),
-                ) as i32),
-                "getChar" => V::I32(u16::from_be_bytes(
-                    bytes[..2].try_into().unwrap_or([0; 2]),
-                ) as i32),
+                "get" if es > 1 => match (es, is_float) {
+                    (8, true) => {
+                        V::F64(f64::from_be_bytes(bytes[..8].try_into().unwrap_or([0; 8])))
+                    }
+                    (8, false) => {
+                        V::I64(i64::from_be_bytes(bytes[..8].try_into().unwrap_or([0; 8])))
+                    }
+                    (4, true) => {
+                        V::F32(f32::from_be_bytes(bytes[..4].try_into().unwrap_or([0; 4])))
+                    }
+                    (4, false) => {
+                        V::I32(i32::from_be_bytes(bytes[..4].try_into().unwrap_or([0; 4])))
+                    }
+                    (2, _) => {
+                        V::I32(i16::from_be_bytes(bytes[..2].try_into().unwrap_or([0; 2])) as i32)
+                    }
+                    _ => V::I32(bytes[0] as i8 as i32),
+                },
+                "getInt" => V::I32(i32::from_be_bytes(bytes[..4].try_into().unwrap_or([0; 4]))),
+                "getLong" => V::I64(i64::from_be_bytes(bytes[..8].try_into().unwrap_or([0; 8]))),
+                "getDouble" => V::F64(f64::from_be_bytes(bytes[..8].try_into().unwrap_or([0; 8]))),
+                "getFloat" => V::F32(f32::from_be_bytes(bytes[..4].try_into().unwrap_or([0; 4]))),
+                "getShort" => {
+                    V::I32(i16::from_be_bytes(bytes[..2].try_into().unwrap_or([0; 2])) as i32)
+                }
+                "getChar" => {
+                    V::I32(u16::from_be_bytes(bytes[..2].try_into().unwrap_or([0; 2])) as i32)
+                }
                 _ => V::I32(bytes[0] as i8 as i32),
             };
             Some(Some(v))
@@ -2090,6 +3621,17 @@ fn misc_fmt(vm: &mut Vm, class: &str, name: &str, args: &[V]) -> Option<Option<V
         }
         .map(Some);
     }
+    if class == "Ljava/text/Normalizer;" {
+        return match name {
+            // NFC/NFD identity is wrong for real combining sequences,
+            // but OkHttp's host canonicalization only needs the ASCII
+            // fast path — return the input unchanged.
+            "normalize" => Some(args[0]),
+            "isNormalized" => Some(V::I32(1)),
+            _ => return None,
+        }
+        .map(Some);
+    }
     if class == "Ljava/text/MessageFormat;" {
         return match name {
             "format" => {
@@ -2116,8 +3658,7 @@ fn stream_arg_path(vm: &Vm, v: V) -> Option<String> {
     let raw = match vm.heap.get(h) {
         Some(Obj::Str(s)) => s.clone(),
         Some(Obj::Host {
-            state:
-                HostState::Path(s) | HostState::StrBuf(s) | HostState::Regex(s),
+            state: HostState::Path(s) | HostState::StrBuf(s) | HostState::Regex(s),
             ..
         }) => s.clone(),
         _ => return None,

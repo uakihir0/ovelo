@@ -118,11 +118,15 @@ mod tests {
             Length::Exact(30),
             Size { w: 1, h: 1 },
         )));
+        // AOSP `getDefaultSize`: a wrap_content plain View FILLS an
+        // AT_MOST spec (it doesn't clamp to desired) — child[0] measures
+        // 200 tall, so the group resolves its desired 230 down to the
+        // AtMost bound and the second child stacks below the first.
         let s = g.measure(MeasureSpec::Exactly(100), MeasureSpec::AtMost(200));
-        assert_eq!(s, Size { w: 100, h: 50 });
+        assert_eq!(s, Size { w: 100, h: 200 });
         g.layout(5, 7);
         assert_eq!(g.children[0].origin(), (5, 7));
-        assert_eq!(g.children[1].origin(), (5, 27));
+        assert_eq!(g.children[1].origin(), (5, 207));
         assert!(g.children[0].measured().w == 100);
     }
 

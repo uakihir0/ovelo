@@ -68,7 +68,16 @@ fn main() {
                     }
                     if let Some(ix) = ins.idx {
                         let n = ins.name;
-                        if n.starts_with("iget")
+                        if n == "instance-of"
+                            || n == "check-cast"
+                            || n == "new-instance"
+                            || n == "const-class"
+                            || n == "new-array"
+                        {
+                            if let Ok(td) = dex.type_descriptor(ix) {
+                                line += &format!(" -> type {td}");
+                            }
+                        } else if n.starts_with("iget")
                             || n.starts_with("iput")
                             || n.starts_with("sget")
                             || n.starts_with("sput")

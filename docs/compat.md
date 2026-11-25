@@ -23,12 +23,27 @@ Legend:
 | Fossify Gallery | `org.fossify.gallery` | 🟡 | **Renders real data**: grid cell shows the actual "Pictures" folder with item count and a real decoded PNG thumbnail (Glide fetch→decode→transform→draw chain works) |
 | Fossify Music Player | `org.fossify.musicplayer` | 🟡 | **Renders real data**: MediaStore scan → Room DB (tracks/albums/artists tables populated) → tab bar + track list bound with real `Lfu4` rows ("All 3" tab) |
 | Fossify Voice Recorder | `org.fossify.voicerecorder` | 🟡 | Recorder page renders; SAF walk (`DocumentFile`/`DocumentsContract`) lists real recordings — list rows materialize on the Player tab |
-| Fossify Calendar | `org.fossify.calendar` | 🟡 | **Renders real data**: month grid draws 7-column day cells with real locale strings, today marker, month name |
+| Fossify Calendar | `org.fossify.calendar` | 🟢 | **Renders real data**: clean month grid — November title, Sun–Sat headers, day cells with today circled, next-month days greyed; lifecycle crash-free after obfuscated-ring list fix |
+| Fossify Clock | `org.fossify.clock` | 🟢 | **Renders real data**: clock page shows live time + date, tab bar (Clock/Alarm/Stopwatch/Timer); alarm list RecyclerViews are legitimately empty |
 | Fossify Messages | `org.fossify.messages` | 🟡 | Lifecycle completes to correct end state: "No stored conversations" empty state + FAB render (DB is empty) |
-| Bouncy (pinball, libGDX) | `com.dozingcatsoftware.bouncy` | 🟡 | Full lifecycle; menu screen renders with real resource strings ("Cambiar tablero"/"INICIAR"); GL game surface not wired yet |
+| Fossify Paint | `org.fossify.paint` | 🟡 | Full lifecycle; toolbar + canvas render, brush strokes register (stroke position offset from touch point) |
+| Fossify Contacts | `org.fossify.contacts` | 🟡 | Lifecycle completes with zero crashes; contact grid with avatar placeholders + tab bar (Contacts/Favorites/Groups) renders |
+| Fossify Documents | `org.fossify.documents` | 🟡 | Lifecycle completes; UI is Compose (`ViewTreeLifecycleOwner`) — no render path yet |
+| Fossify Home (launcher) | `org.fossify.home` | 🟢 | Renders correct end state: "No items found." empty grid on a clean install |
+| BMI Calculator | `com.github.characterdog.bmicalculator` | 🟡 | Lifecycle completes and the ConstraintLayout form renders input labels + fields (inherited-static `getChildMeasureSpec` resolution fixed); layout rough |
+| Bouncy (pinball, libGDX) | `com.dozingcatsoftware.bouncy` | 🟡 | **Playable**: menu → table select → live pinball table with bumpers rendering; box2d `.so` physics runs via JNI. TLS self-heal in the segv handler patches kernel-rewritten TPIDR_EL0 per access (Darwin rewrites it at signal/exception boundaries). Text labels and ball rendering still rough |
+| Open Sudoku | `org.moire.opensudoku` | 🟢 | **Renders real data**: full 9×9 board drawn with given digits, pencil-mark notes and cell coloring; custom `View.onDraw` path works end to end |
 | Tiny Weather Forecast Germany | `de.kaffeemitkoffein.tinyweatherforecastgermany` | 🟡 | `WelcomeActivity` renders to the window (first real APK first frame) |
-| NewPipe | `org.schabi.newpipe` | 🟡 | `MainActivity` full lifecycle; WorkManager runs real SQLite queries; error screen renders (no network layer yet) |
-| F-Droid | `org.fdroid.fdroid` | 🟡 | Multi-dex + Hilt init runs without crashing; UI is Compose — no render path yet |
+| NewPipe | `org.schabi.newpipe` | 🟢 | **Renders real data**: kiosk "Live" tab lists actual Innertube-fetched videos with titles/channels and real image thumbnails (host-bridged Coil3 `enqueue` → HTTP → WebP decode → `setImageDrawable`). Feed tab empty is expected without subscriptions |
+| F-Droid | `org.fdroid.fdroid` | 🟡 | Lifecycle reaches `onCreate`; Compose initial composition does not terminate (>15B interpreted steps — recompose bookkeeping recycles scopes instead of converging) |
+| 2048 (AndStatus) | `org.andstatus.game2048` | 🟡 | Splash logo renders with correct textures (GLES2 pipeline works); help scene's text batcher runs but is very slow under interpretation |
+| Snakes (drugi) | `red.drugi.snakes` | 🟡 | Lifecycle completes (Godot engine); host `Lifecycle` throwable on onCreate, blank GL window |
+| Privacy Friendly Sudoku | `org.secuso.privacyfriendlysudoku` | 🟡 | SplashActivity → TutorialActivity transition runs fully in dex; Welcome screen renders real text (layout rough — overlapping strings). Unblocked by dex-enum `compareTo` fix (LifecycleRegistry sync) |
+| Aegis Authenticator | `com.beemdevelopment.aegis` | 🟢 | Intro wizard renders real content (Welcome slide + logo + import prompt); ViewPager2 page containers materialize. Layout rough (overlapping header) |
+| Markor | `net.gsantner.markor` | 🟢 | **Renders real UI**: Documents file list with real entries + dates, preview pane, FAB, bottom nav (Files/To-Do/QuickNote/LinkBox/More) |
+| Tasks.org | `org.tasks` | 🟡 | Sign-in screen renders (Add account / Continue without sync / Import backup); Hilt DI completes — taps don't navigate yet, layout placement rough |
+| Neumorphic Calculator | `com.neumorphic.calculator` | ⛔ | Flutter app — the entire UI runs in `libflutter.so`'s Dart VM, outside the dex runtime's scope |
+| AntennaPod | `de.danoeh.antennapod` | 🟢 | **Renders real UI**: welcome screen centered with app icon, "Welcome to AntennaPod!" text, hint arrow graphic. Splash→MainActivity works (RxJava subscribeOn→observeOn→Handler chain). Fixed: Callable-only drain dispatch, setTheme, generateViewId, foreign-LP wrap, sw600dp qualifier selection |
 
 ## Famous apps — assessment
 
@@ -53,7 +68,8 @@ by how much new work they imply.
 | Engine | Status | What's missing |
 |--------|--------|----------------|
 | libGDX | 🟡 | View-layer menu renders (Bouncy verified); GLES surface wiring (ANativeWindow → EGL) exists as object model, no live GL context yet |
-| Godot | ❌ | Same + native engine `.so` needs real JNI |
+| KorGE | 🟡 | GLES2 texture/vertex pipeline works (2048 splash renders); interpreter speed limits per-frame vertex batching |
+| Godot | 🟡 | Lifecycle completes (drugi snakes); needs GLES2 + engine `.so` JNI |
 | Unity | ❌ | Same + native engine `.so` needs real JNI |
 
 ## Methodology

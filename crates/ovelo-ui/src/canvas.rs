@@ -138,13 +138,11 @@ impl<'a> Canvas<'a> {
                 if dx * dx + dy * dy > 1.0 {
                     continue;
                 }
-                let in_inner = irx > 0.0
-                    && iry > 0.0
-                    && {
-                        let ix = (x as f32 + 0.5 - cx) / irx;
-                        let iy = (y as f32 + 0.5 - cy) / iry;
-                        ix * ix + iy * iy <= 1.0
-                    };
+                let in_inner = irx > 0.0 && iry > 0.0 && {
+                    let ix = (x as f32 + 0.5 - cx) / irx;
+                    let iy = (y as f32 + 0.5 - cy) / iry;
+                    ix * ix + iy * iy <= 1.0
+                };
                 if !in_inner {
                     self.surf.blend_pixel(x, y, p.color, 255);
                 }
@@ -162,6 +160,29 @@ impl<'a> Canvas<'a> {
             w,
             p.color,
         );
+    }
+
+    /// Fill a flat-color polygon; `pts` is x,y pairs in canvas space
+    /// (translated + clipped here).
+    pub fn fill_poly(&mut self, pts: &[i32], p: Paint) {
+        let pts: Vec<i32> = pts
+            .chunks(2)
+            .flat_map(|xy| [xy[0] + self.dx, xy[1] + self.dy])
+            .collect();
+        self.surf.fill_poly(&pts, p.color);
+    }
+
+    /// Fill multiple contours together, preserving holes.
+    pub fn fill_polys(&mut self, contours: &[Vec<i32>], even_odd: bool, inverse: bool, p: Paint) {
+        let contours: Vec<Vec<i32>> = contours
+            .iter()
+            .map(|pts| {
+                pts.chunks(2)
+                    .flat_map(|xy| [xy[0] + self.dx, xy[1] + self.dy])
+                    .collect()
+            })
+            .collect();
+        self.surf.fill_polys(&contours, even_odd, inverse, p.color);
     }
 
     /// `drawBitmap`-style blit: `src` (RGBA8, `src_w`×`src_h`) scaled
@@ -194,7 +215,7 @@ impl<'a> Canvas<'a> {
         if let Some(run) = self.fonts.shaped_run(text, p.text_size) {
             for g in run {
                 let gx = (pen + g.x_off).round() as i32 + g.bmp.xmin;
-                let gy = base - g.y_off.round() as i32 + g.bmp.ymin - g.bmp.h as i32;
+                let gy = base - g.y_off.round() as i32 - g.bmp.ymin - g.bmp.h as i32;
                 self.blit_glyph(&g.bmp, gx, gy, p.color);
                 pen += g.x_adv;
             }
@@ -209,7 +230,7 @@ impl<'a> Canvas<'a> {
                         .map(|f| f.advance_for(c, p.text_size).unwrap_or(0.0))
                         .unwrap_or(g.w as f32);
                     let gx = pen.round() as i32 + g.xmin;
-                    let gy = base + g.ymin - g.h as i32;
+                    let gy = base - g.ymin - g.h as i32;
                     self.blit_glyph(&g, gx, gy, p.color);
                     pen += adv;
                 }

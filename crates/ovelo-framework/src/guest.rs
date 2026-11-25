@@ -39,6 +39,15 @@ pub enum GuestView {
 
 impl GuestView {
     /// The `View` part shared by every widget.
+    fn view(&self) -> &View {
+        match self {
+            GuestView::Plain(v) => v,
+            GuestView::Text(t) => &t.view,
+            GuestView::Btn(b) => &b.tv.view,
+            GuestView::Group(g) => &g.view,
+        }
+    }
+    /// The `View` part shared by every widget.
     fn view_mut(&mut self) -> &mut View {
         match self {
             GuestView::Plain(v) => v,
@@ -60,7 +69,10 @@ impl GuestView {
 impl Drawable for GuestView {
     fn measure(&mut self, w: MeasureSpec, h: MeasureSpec) -> Size {
         match self {
-            GuestView::Plain(v) => v.measure(w, h),
+            // `v.measure` would resolve the inherent method (desired.min)
+            // — the leaf must fill the spec AOSP-style, so call the
+            // trait impl explicitly.
+            GuestView::Plain(v) => Drawable::measure(v, w, h),
             GuestView::Text(t) => t.measure(w, h),
             GuestView::Btn(b) => b.measure(w, h),
             GuestView::Group(g) => g.measure(w, h),
@@ -166,6 +178,9 @@ impl Drawable for SharedView {
     fn lp(&self) -> (Length, Length) {
         self.0.borrow().lp()
     }
+    fn as_any(&mut self) -> Option<&mut dyn std::any::Any> {
+        Some(self)
+    }
 }
 
 /// Wraps a materialized child whose dex `layout`/`setFrame` assigned a
@@ -196,8 +211,11 @@ impl Drawable for AbsView {
         s
     }
     fn layout(&mut self, left: i32, top: i32) {
-        if std::env::var_os("OVELO_POSDBG").is_some() {
-            eprintln!("[posdbg] AbsView layout left={left} top={top} rect={:?}", self.rect);
+        if dbg_flag("OVELO_POSDBG") {
+            eprintln!(
+                "[posdbg] AbsView layout left={left} top={top} rect={:?}",
+                self.rect
+            );
         }
         self.inner.layout(left, top);
     }
@@ -225,6 +243,23 @@ impl Drawable for AbsView {
     fn dispatch_touch(&mut self, down: bool, x: i32, y: i32) -> bool {
         self.inner.dispatch_touch(down, x, y)
     }
+    fn as_any(&mut self) -> Option<&mut dyn std::any::Any> {
+        Some(self)
+    }
+}
+
+/// Same-Rc check for a boxed child vs a dex handle's bound view —
+/// matches `SharedView` and `AbsView`-wrapped SharedViews; used by the
+/// removeView bridge and addView dedupe.
+fn child_matches(b: &mut Box<dyn Drawable>, cv: &Rc<RefCell<GuestView>>) -> bool {
+    let Some(a) = b.as_any() else { return false };
+    if let Some(sv) = a.downcast_ref::<SharedView>() {
+        return Rc::ptr_eq(&sv.0, cv);
+    }
+    if let Some(av) = a.downcast_ref::<AbsView>() {
+        return Rc::ptr_eq(&av.inner.0, cv);
+    }
+    false
 }
 
 /// Host-side state for guest UI: the view-object map plus the
@@ -244,6 +279,9 @@ pub struct GuestUi {
     /// Dex-view-tree handles → materialized host view. Persistent so
     /// per-view state (pressed, listeners) survives frame rebuilds.
     dex_views: HashMap<u32, Rc<RefCell<GuestView>>>,
+    /// Handles that belonged to the last materialized tree — the GL
+    /// frame pump must not drive renderers of detached views.
+    dex_live: HashSet<u32>,
     /// Last materialized child list per parent — (handle, dex frame)
     /// pairs. A changed set (removal, hide) or a late-arriving frame
     /// must dirty the group or stale pixels / misplaced children
@@ -325,11 +363,12 @@ fn make_dex_view(vm: &Vm, info: &ovelo_dexrt::DexViewInfo, fonts: &Rc<FontSet>) 
         // Ancestry, not name substring — a custom `MyLayout extends
         // LinearLayout` stacks its children even when its own name
         // doesn't say so.
-        let g = if STACK.iter().any(|s| vm.extends_named(&info.desc, s)) {
+        let mut g = if STACK.iter().any(|s| vm.extends_named(&info.desc, s)) {
             ViewGroup::new(lp.0, lp.1)
         } else {
             ViewGroup::overlay(lp.0, lp.1)
         };
+        g.clip_children = info.clip_children;
         GuestView::Group(g)
     } else if info.desc.contains("Button") {
         GuestView::Btn(Button::new("", 16.0, dark, fonts.clone()))
@@ -374,6 +413,12 @@ fn update_dex_view(g: &mut GuestView, info: &ovelo_dexrt::DexViewInfo) {
             changed = true;
         }
     }
+    if let GuestView::Group(gr) = g {
+        if gr.clip_children != info.clip_children {
+            gr.clip_children = info.clip_children;
+            gr.invalidate();
+        }
+    }
     if let Some(tv) = g.text_mut() {
         if let Some(t) = &info.text {
             if tv.text != *t {
@@ -397,6 +442,10 @@ fn update_dex_view(g: &mut GuestView, info: &ovelo_dexrt::DexViewInfo) {
             tv.gravity = info.gravity;
             tv.invalidate();
         }
+        if tv.max_lines != info.max_lines {
+            tv.max_lines = info.max_lines;
+            tv.invalidate();
+        }
     }
     if changed {
         g.invalidate();
@@ -413,6 +462,7 @@ impl GuestUi {
             clicks: Rc::new(RefCell::new(VecDeque::new())),
             click_listeners: HashMap::new(),
             dex_views: HashMap::new(),
+            dex_live: HashSet::new(),
             dex_kids: HashMap::new(),
             dex_root: 0,
             dex_mounted: None,
@@ -465,6 +515,19 @@ impl GuestUi {
     /// Register every bridged framework method on `vm`. Unreferenced
     /// methods simply don't register (the app never calls them).
     pub fn register(ui: &Rc<RefCell<Self>>, vm: &mut Vm) {
+        // Compose's InlineClassHelperKt.throwIllegalArgumentException is
+        // the require() inside DrawScope.inset — PainterNode can hand a
+        // painter an Unspecified/negative size (degenerate layout while
+        // the composition is still settling), and letting it throw
+        // aborts the ENTIRE dispatchDraw traversal, leaving a black
+        // screen. A silent return lets the frame finish; the offending
+        // painter just draws nothing.
+        let _ = vm.register_host(
+            "Landroidx/compose/ui/graphics/InlineClassHelperKt;",
+            "throwIllegalArgumentException",
+            "(Ljava/lang/String;)V",
+            Rc::new(RefCell::new(|_vm: &mut Vm, _a: &[V]| Ok(None))) as HostCall,
+        );
         // ---- constructors -------------------------------------------------
         Self::ctor(ui, vm, "Landroid/view/View;", |_ui| {
             GuestView::Plain(View::new(
@@ -494,52 +557,276 @@ impl GuestUi {
                 GuestView::Group(ViewGroup::new(Length::MatchParent, Length::WrapContent))
             });
         }
+        // Stacking groups — children overlap rather than flow.
+        for cls in [
+            "Landroid/widget/FrameLayout;",
+            "Landroid/widget/RelativeLayout;",
+            "Landroid/widget/AbsoluteLayout;",
+            "Landroid/widget/ScrollView;",
+        ] {
+            Self::ctor(ui, vm, cls, |_ui| {
+                GuestView::Group(ViewGroup::overlay(Length::MatchParent, Length::MatchParent))
+            });
+        }
 
-        // ---- ViewGroup.addView -------------------------------------------
+        // ---- ViewGroup.addView / removeView -------------------------------
+        // `addViewInLayout` shares the bridge: AOSP semantics differ
+        // only in skipping measure/layout, which our tree re-runs each
+        // pump anyway. Apps inflate children through it directly
+        // (fossify documents' ViewPager did) — an unregistered call
+        // attached children parent_att=0 and they never drew.
         for cls in ["Landroid/view/ViewGroup;", "Landroid/widget/LinearLayout;"] {
-            Self::on(
-                ui,
-                vm,
-                cls,
-                "addView",
-                "(Landroid/view/View;)V",
-                |ui, vm, a| {
+            for (name, sig) in [
+                ("addView", "(Landroid/view/View;)V"),
+                ("addView", "(Landroid/view/View;I)V"),
+                (
+                    "addView",
+                    "(Landroid/view/View;ILandroid/view/ViewGroup$LayoutParams;)V",
+                ),
+                (
+                    "addView",
+                    "(Landroid/view/View;Landroid/view/ViewGroup$LayoutParams;)V",
+                ),
+                (
+                    "addView",
+                    "(Landroid/view/View;ILandroid/view/ViewGroup$LayoutParams;Z)V",
+                ),
+                ("addViewInLayout", "(Landroid/view/View;)V"),
+                ("addViewInLayout", "(Landroid/view/View;I)V"),
+                (
+                    "addViewInLayout",
+                    "(Landroid/view/View;ILandroid/view/ViewGroup$LayoutParams;)V",
+                ),
+                (
+                    "addViewInLayout",
+                    "(Landroid/view/View;Landroid/view/ViewGroup$LayoutParams;)V",
+                ),
+                (
+                    "addViewInLayout",
+                    "(Landroid/view/View;ILandroid/view/ViewGroup$LayoutParams;Z)V",
+                ),
+                // Some androidx/internal helpers declare the boolean
+                // overload with a boolean return.
+                (
+                    "addView",
+                    "(Landroid/view/View;ILandroid/view/ViewGroup$LayoutParams;Z)Z",
+                ),
+                (
+                    "addViewInLayout",
+                    "(Landroid/view/View;ILandroid/view/ViewGroup$LayoutParams;Z)Z",
+                ),
+                // RecyclerView attaches every visible row through
+                // attachViewToParent — bridge it or bridged groups
+                // render empty lists. Transient scrap views that
+                // also pass through are re-removed by
+                // detachViewFromParent (registered below).
+                (
+                    "attachViewToParent",
+                    "(Landroid/view/View;ILandroid/view/ViewGroup$LayoutParams;)V",
+                ),
+            ] {
+                Self::on_rc(ui, vm, cls, name, sig, |ui, vm, a| {
                     let this = ref_arg(a, 0)?;
                     let child = ref_arg(a, 1)?;
-                    // Dex-inflated views (real Instances or view-tree stubs)
-                    // aren't GuestViews — attach them in the VM's view tree
-                    // instead of failing.
-                    let Some(cv) = ui.views.get(&child).cloned() else {
-                        vm.view_tree_add(this, child);
-                        return Ok(None);
+                    // Boolean-returning overloads must produce a value
+                    // — `Ok(None)` is void and aborts the caller with
+                    // dexrt.result.void.
+                    let z_ret = if sig.ends_with(")Z") {
+                        Some(V::I32(1))
+                    } else {
+                        None
                     };
-                    match ui.views.get(&this).cloned() {
-                        Some(rc) => {
-                            let mut g = rc.borrow_mut();
-                            match &mut *g {
-                                GuestView::Group(gr) => {
-                                    gr.children.push(Box::new(SharedView(cv)));
-                                    gr.view.invalidate();
-                                    Ok(None)
-                                }
-                                _ => {
-                                    drop(g);
-                                    vm.view_tree_add(this, child);
-                                    Ok(None)
-                                }
-                            }
+                    // Overloads differ after the child arg: LayoutParams is
+                    // the last Ref; the index is the first non-negative I32
+                    // (the dex arm parses them the same way).
+                    let lp = a[2.min(a.len())..]
+                        .iter()
+                        .rev()
+                        .find(|x| matches!(x, V::Ref(h) if *h != 0))
+                        .copied();
+                    // The index is the int right after the child — except
+                    // the (View,w,h) dimensions overload, which has two
+                    // ints and no LayoutParams. The (V,I,LP,Z) overload's
+                    // trailing boolean must not count as a second int.
+                    let ints = a[2.min(a.len())..]
+                        .iter()
+                        .filter(|x| matches!(x, V::I32(_)))
+                        .count();
+                    let idx = if lp.is_none() && ints >= 2 {
+                        None
+                    } else {
+                        match a.get(2) {
+                            Some(V::I32(i)) if *i >= 0 => Some(*i as usize),
+                            _ => None,
                         }
-                        None => {
-                            vm.view_tree_add(this, child);
-                            Ok(None)
-                        }
+                    };
+                    // Dex-side bookkeeping first: registered overloads
+                    // intercept the invoke, so `attach_at` never runs
+                    // unless the bridge does it — parent/attach mark,
+                    // LP resolution and onViewAdded all live there.
+                    // Runs outside the ui borrow: onViewAdded is guest
+                    // code and re-enters bridged methods.
+                    // A retried bridge call skips dex bookkeeping the
+                    // builtin fallback already did for this invocation:
+                    // re-running would re-fire onViewAdded and
+                    // re-append an indexless child, moving it past
+                    // siblings added meanwhile. Fresh calls (including
+                    // legit re-attaches that move the child) always run.
+                    if !(vm.host_retrying() && vm.view_parent_of(child) == Some(this)) {
+                        vm.view_tree_attach_at(this, child, idx, lp);
                     }
-                },
-            );
+                    // Bridged parents adopt dex-view-tree children too —
+                    // materialize them so e.g. ViewPager2's empty
+                    // FrameLayout still hosts inflated content.
+                    // Look up then materialize in two statements — the
+                    // `or_else` closure would run `borrow_mut` while the
+                    // `borrow` temporary is still live and panic.
+                    let mut cv = ui.borrow().views.get(&child).cloned();
+                    if cv.is_none() {
+                        cv = ui.borrow_mut().materialize_dex(vm, child);
+                    }
+                    let Some(cv) = cv else {
+                        return Ok(z_ret);
+                    };
+                    // Dex-materialized parents live in `dex_views`,
+                    // bridged `new` parents in `views` — a parent of
+                    // either kind must accept the child or rows added
+                    // to a dex group (RecyclerView's attachViewToParent)
+                    // orphan the whole subtree.
+                    let Some(rc) = ui
+                        .borrow()
+                        .views
+                        .get(&this)
+                        .cloned()
+                        .or_else(|| ui.borrow().dex_views.get(&this).cloned())
+                    else {
+                        return Ok(z_ret);
+                    };
+                    let mut g = rc.borrow_mut();
+                    let GuestView::Group(gr) = &mut *g else {
+                        return Ok(z_ret);
+                    };
+                    if let Some(V::Ref(lp)) = lp {
+                        let (w, h) = vm.layout_params_dims(lp);
+                        let mut c = cv.borrow_mut();
+                        let v = c.view_mut();
+                        if let Some(w) = w {
+                            v.lp_w = Length::from_aosp(w);
+                        }
+                        if let Some(h) = h {
+                            v.lp_h = Length::from_aosp(h);
+                        }
+                        drop(c);
+                    }
+                    // Dedupe a re-added child (move, not duplicate) — the
+                    // dex side does the same in attach_at.
+                    if let Some(old) = gr.children.iter_mut().position(|b| child_matches(b, &cv)) {
+                        gr.children.remove(old);
+                    }
+                    let boxed: Box<dyn Drawable> = match vm.dex_view(child).and_then(|i| i.frame) {
+                        Some((l, t, r, b)) => Box::new(AbsView {
+                            inner: SharedView(cv),
+                            rect: (l, t, r, b),
+                        }),
+                        None => Box::new(SharedView(cv)),
+                    };
+                    // Place at the dex child index when dex bookkeeping
+                    // already ran (fresh attach_at or a retried call the
+                    // builtin fallback handled): siblings added between
+                    // the original call and the retry would otherwise
+                    // shift this child past its dex position.
+                    match vm.view_child_index(this, child).or(idx) {
+                        Some(i) if i <= gr.children.len() => gr.children.insert(i, boxed),
+                        _ => gr.children.push(boxed),
+                    }
+                    gr.view.invalidate();
+                    Ok(z_ret)
+                });
+            }
+            for (name, notify, sigs) in [
+                ("removeView", true, vec!["(Landroid/view/View;)V", "(I)V"]),
+                ("removeViewInLayout", true, vec!["(Landroid/view/View;)V"]),
+                ("removeViewAt", true, vec!["(I)V"]),
+                (
+                    "detachViewFromParent",
+                    false,
+                    vec!["(Landroid/view/View;)V", "(I)V"],
+                ),
+            ] {
+                for sig in sigs {
+                    Self::on_rc(ui, vm, cls, name, sig, move |ui, vm, a| {
+                        let this = ref_arg(a, 0)?;
+                        // Child by ref arg, else by index into the dex
+                        // child list (it still reflects the pre-remove
+                        // state — the dex bookkeeping runs below).
+                        let child = match ref_arg(a, 1) {
+                            Ok(c) => Some(c),
+                            Err(_) => match a.get(1).copied() {
+                                Some(V::I32(i)) if i >= 0 => vm
+                                    .dex_view(this)
+                                    .and_then(|i0| i0.children.get(i as usize).copied()),
+                                _ => None,
+                            },
+                        };
+                        let Some(child) = child else {
+                            return Ok(None);
+                        };
+                        // Dex bookkeeping: registered overloads intercept
+                        // the invoke, so the bridge must run detach —
+                        // outside the ui borrow since onViewRemoved is
+                        // guest code re-entering bridged methods.
+                        vm.view_tree_detach(this, child, notify);
+                        let ui = ui.borrow();
+                        let Some(cv) = ui
+                            .views
+                            .get(&child)
+                            .cloned()
+                            .or_else(|| ui.dex_views.get(&child).cloned())
+                        else {
+                            return Ok(None);
+                        };
+                        let Some(rc) = ui
+                            .views
+                            .get(&this)
+                            .cloned()
+                            .or_else(|| ui.dex_views.get(&this).cloned())
+                        else {
+                            return Ok(None);
+                        };
+                        let mut g = rc.borrow_mut();
+                        let GuestView::Group(gr) = &mut *g else {
+                            return Ok(None);
+                        };
+                        if let Some(i) = gr.children.iter_mut().position(|b| child_matches(b, &cv))
+                        {
+                            gr.children.remove(i);
+                            gr.view.invalidate();
+                        }
+                        Ok(None)
+                    });
+                }
+            }
+            Self::on_rc(ui, vm, cls, "removeAllViews", "()V", |ui, vm, a| {
+                let this = ref_arg(a, 0)?;
+                for c in vm
+                    .dex_view(this)
+                    .map(|i| i.children.clone())
+                    .unwrap_or_default()
+                {
+                    vm.view_tree_detach(this, c, true);
+                }
+                if let Some(rc) = ui.borrow().views.get(&this).cloned() {
+                    if let GuestView::Group(gr) = &mut *rc.borrow_mut() {
+                        gr.children.clear();
+                        gr.view.invalidate();
+                    }
+                }
+                Ok(None)
+            });
         }
 
         // ---- Activity.setContentView -------------------------------------
-        Self::on(
+        Self::on_rc(
             ui,
             vm,
             "Landroid/app/Activity;",
@@ -547,14 +834,19 @@ impl GuestUi {
             "(Landroid/view/View;)V",
             |ui, vm, a| {
                 let v = ref_arg(a, 1)?;
-                match ui.views.get(&v).cloned() {
-                    Some(cv) => {
-                        ui.guest_content_set = true;
-                        ui.root.set_content_view(Box::new(SharedView(cv)));
+                let activity = ref_arg(a, 0)?;
+                // Dex-side bookkeeping (attach, content-frame registration)
+                // runs for bridged views too — the GL attach gate and the
+                // dex view tree both need it. Outside the ui borrow:
+                // inflation and onViewAdded are guest code.
+                vm.view_set_content(activity, v);
+                let mut ui = ui.borrow_mut();
+                if let Some(cv) = ui.views.get(&v).cloned() {
+                    ui.guest_content_set = true;
+                    if viewdbg() {
+                        eprintln!("[viewdbg] guest_content_set via bridged h{v}");
                     }
-                    None => {
-                        vm.view_set_content(ref_arg(a, 0)?, v);
-                    }
+                    ui.root.set_content_view(Box::new(SharedView(cv)));
                 }
                 Ok(None)
             },
@@ -568,16 +860,18 @@ impl GuestUi {
             "Landroid/widget/Button;",
             "Landroid/widget/LinearLayout;",
         ] {
-            Self::on(ui, vm, cls, "setBackgroundColor", "(I)V", |ui, _vm, a| {
+            Self::on(ui, vm, cls, "setBackgroundColor", "(I)V", |ui, vm, a| {
                 let this = ref_arg(a, 0)?;
-                let color = match a.get(1) {
-                    Some(V::I32(c)) => argb(*c),
+                let raw = match a.get(1) {
+                    Some(V::I32(c)) => *c,
                     _ => return Err(crate::err("guest.arg.type")),
                 };
                 let Some(rc) = ui.views.get(&this).cloned() else {
-                    // Not a GuestView (dex-inflated) — setters no-op.
+                    // Dex-inflated view — record so dex_view_info sees it.
+                    ovelo_dexrt::pseudo_set(vm, this, ovelo_dexrt::P_BGCOLOR, V::I32(raw));
                     return Ok(None);
                 };
+                let color = argb(raw);
                 rc.borrow_mut().view_mut().background = Some(color);
                 rc.borrow_mut().view_mut().invalidate();
                 Ok(None)
@@ -704,20 +998,27 @@ impl GuestUi {
     /// pressed state and listener closures survive rebuilds. Skipped
     /// once the guest bound a real `GuestView` as its content view.
     pub fn refresh_dex_tree(&mut self, vm: &mut Vm, activity: u32) -> bool {
+        // A bound GLSurfaceView.Renderer draws every frame in
+        // continuous mode — its output isn't triggered by view-tree
+        // changes, so pump it every tick: for materialized dex views
+        // AND for bridged `new` views (guest_content_set apps like
+        // 2048 whose whole UI is a bridged GLSurfaceView).
+        self.pump_gl_frames(vm);
         if self.guest_content_set {
             return false;
         }
         let Some(root) = vm.activity_content(activity) else {
+            if viewdbg() {
+                eprintln!("[viewdbg] refresh: no content for activity={activity}");
+            }
             return false;
         };
         // Tree unchanged since the mounted materialize — skip the
         // per-node info build (the per-frame dominant cost).
-        if self.dex_root == root
-            && self.dex_mounted.is_some()
-            && self.dex_gen_seen == vm.view_gen
-        {
+        if self.dex_root == root && self.dex_mounted.is_some() && self.dex_gen_seen == vm.view_gen {
             return true;
         }
+        self.dex_live.clear();
         let Some(rc) = self.materialize_dex(vm, root) else {
             // Content root went GONE/INVISIBLE: swap in an empty group
             // so the stale tree stops drawing and answering touches.
@@ -745,23 +1046,160 @@ impl GuestUi {
         if !mounted {
             self.dex_root = root;
             self.dex_mounted = Some(rc.clone());
+            if viewdbg() {
+                let kids = match &*rc.borrow() {
+                    GuestView::Group(g) => g.children.len(),
+                    _ => 0,
+                };
+                eprintln!(
+                    "[viewdbg] mount root h{root} kids={kids} gcs={}",
+                    self.guest_content_set
+                );
+            }
             self.root.set_content_view(Box::new(SharedView(rc)));
+        }
+        // The window's background comes from the theme's
+        // `windowBackground` attribute — app views only paint their own
+        // rect, so a dark themed window must show through everywhere a
+        // view doesn't cover. Applied on each pass; a theme switch
+        // (fossify's color settings) re-tints without a remount.
+        // `windowBackground` may point at a platform drawable the APK
+        // doesn't carry — fall back through the app's own color attrs.
+        let win_bg = ovelo_dexrt::theme_color(vm, 0x0101_0054)
+            .or_else(|| ovelo_dexrt::theme_color_named(vm, "colorSurface"))
+            .or_else(|| ovelo_dexrt::theme_color_named(vm, "colorBackground"))
+            .or_else(|| ovelo_dexrt::theme_color_named(vm, "colorPrimaryDark"));
+        if let Some(argb) = win_bg {
+            self.root.bg = Color::srgb((argb >> 16) as u8, (argb >> 8) as u8, argb as u8);
         }
         self.dex_gen_seen = vm.view_gen;
         true
     }
 
+    /// Run `onDrawFrame` for every view that has a bound GL renderer —
+    /// continuous renderers produce a new frame independent of
+    /// view-tree generation changes. Covers both the materialized dex
+    /// tree (`dex_views`) and bridged `new` views (`views`).
+    fn pump_gl_frames(&mut self, vm: &mut Vm) {
+        // Push host-computed bounds back onto the dex view objects:
+        // `getWidth()`/`getHeight()` read the dex-side frame, which the
+        // host layout engine never ran `layout()` to set (Korge's GL
+        // view builds its ortho matrix from these — 0x0 NaNs it).
+        // Host layout coords are window-absolute; dex frames are
+        // parent-relative (the hit test accumulates ancestors), so
+        // subtract the parent's absolute origin.
+        for (&h, rc) in self.views.iter() {
+            let (l, t, s) = {
+                let g = rc.borrow();
+                let v = g.view();
+                (v.left, v.top, v.measured)
+            };
+            if s.w > 0 && s.h > 0 && !vm.view_layout_done(h) {
+                let (pl, pt) = abs_origin(vm, &self.views, vm.dex_parent(h));
+                vm.view_set_frame(h, l - pl, t - pt, l - pl + s.w, t - pt + s.h);
+            }
+        }
+        // Window decor roots / content frames fill the window — they
+        // never pass through host layout either.
+        vm.sync_decor_frames(self.root.w, self.root.h);
+        if dbg_flag("OVELO_DRAWDBG") {
+            eprintln!(
+                "[gldbg] pump views={:?} dex_views={:?}",
+                self.views.keys().collect::<Vec<_>>(),
+                self.dex_views.keys().collect::<Vec<_>>()
+            );
+        }
+        for (&h, rc) in self.views.iter().chain(self.dex_views.iter()) {
+            if dbg_flag("OVELO_DRAWDBG") {
+                eprintln!(
+                    "[gldbg] cand h={h} gl={} att={} cls={} parent={:?} measured={:?}",
+                    vm.has_gl_renderer(h),
+                    vm.view_is_attached(h),
+                    vm.dbg_class_of(h),
+                    vm.dbg_view_parent(h),
+                    rc.borrow_mut().view_mut().measured
+                );
+            }
+            if !vm.has_gl_renderer(h) {
+                continue;
+            }
+            let (w, hh) = if self.dex_views.contains_key(&h) {
+                // Materialized node: must still be mounted, and its
+                // size comes from the dex-side frame.
+                if !self.dex_live.contains(&h) {
+                    continue;
+                }
+                let Some((l, t, r, b)) = vm.dex_view(h).and_then(|i| i.frame) else {
+                    continue;
+                };
+                (r - l, b - t)
+            } else {
+                // Bridged view: must still be attached to the dex tree —
+                // a removed SurfaceView (e.g. after a second
+                // setContentView) must stop pumping its renderer, or it
+                // keeps drawing over the new content view.
+                if !vm.view_is_attached(h) {
+                    continue;
+                }
+                // Laid out by the host tree — use its measured size
+                // (0 before the first traversal).
+                let s = rc.borrow_mut().view_mut().measured;
+                (s.w, s.h)
+            };
+            if w <= 0 || hh <= 0 {
+                continue;
+            }
+            let ops = vm.guest_draw_ops(h, w, hh);
+            if std::env::var_os("OVELO_OPSDBG").is_some() && !ops.is_empty() {
+                use std::collections::BTreeMap;
+                let mut hist: BTreeMap<&'static str, usize> = BTreeMap::new();
+                let mut texts = 0usize;
+                for o in &ops {
+                    *hist
+                        .entry(match o {
+                            ovelo_dexrt::CanvasOp::Text { .. } => {
+                                texts += 1;
+                                "Text"
+                            }
+                            ovelo_dexrt::CanvasOp::Bitmap { .. } => "Bitmap",
+                            ovelo_dexrt::CanvasOp::Rect { .. } => "Rect",
+                            ovelo_dexrt::CanvasOp::Circle { .. } => "Circle",
+                            ovelo_dexrt::CanvasOp::Line { .. } => "Line",
+                            _ => "other",
+                        })
+                        .or_default() += 1;
+                }
+                eprintln!(
+                    "[opsdbg] h{h} {w}x{hh} ops={} hist={hist:?} texts={texts}",
+                    ops.len()
+                );
+            }
+            let mut g = rc.borrow_mut();
+            let v = g.view_mut();
+            v.custom_ops = if ops.is_empty() {
+                None
+            } else {
+                Some(Rc::new(ops))
+            };
+            // New GL content must mark the view dirty or the next
+            // traversal skips the draw entirely.
+            v.invalidate();
+        }
+    }
+
     fn materialize_dex(&mut self, vm: &mut Vm, h: u32) -> Option<Rc<RefCell<GuestView>>> {
+        self.dex_live.insert(h);
         let info = vm.dex_view(h)?;
         if viewdbg() {
             eprintln!(
-                "[viewdbg] node {} h{h} vis={} kids={} text={:?} frame={:?} tc={:?} lp={}x{}",
+                "[viewdbg] node {} h{h} vis={} kids={} text={:?} frame={:?} tc={:?} bg={:?} lp={}x{}",
                 info.desc,
                 info.visible as u8,
                 info.children.len(),
                 info.text,
                 info.frame,
                 info.text_color,
+                info.bg_color,
                 info.lp_w,
                 info.lp_h,
             );
@@ -772,7 +1210,10 @@ impl GuestUi {
         // a hidden view that loads data on attach and then reveals
         // itself still gets its init. Queued: guest code re-enters
         // bridged calls that borrow GuestUi, which materialize holds.
-        if self.dex_attached.insert(h) {
+        // Skip views addView already notified (P_ATTACHED): dispatching
+        // attach again double-runs onAttachedToWindow — AbstractComposeView
+        // would register its observer twice.
+        if self.dex_attached.insert(h) && !vm.view_is_attached(h) {
             self.attach_pending.push(h);
         }
         if !info.visible {
@@ -801,8 +1242,17 @@ impl GuestUi {
         // canvas makes size-derived paint degenerate (every text at
         // x=0 — an overlapping pile at the parent origin), so keep
         // the last good ops until a frame lands.
+        vm.dump_node_tree(h);
         let ops = (ow > 0 && oh > 0).then(|| vm.guest_draw_ops(h, ow, oh));
         let mut g = rc.borrow_mut();
+        // The widget kind is chosen once, but `is_group` can arrive
+        // late: ViewPager2 builds its page container FrameLayout
+        // empty and adds the page inside onMeasure/populate, so a
+        // view materialized as Plain before children existed must be
+        // rebuilt as a Group or its kids stay dropped forever.
+        if info.is_group && !matches!(&*g, GuestView::Group(_)) {
+            *g = make_dex_view(vm, &info, &fonts);
+        }
         // `g` borrows the view object while `self.materialize_dex`
         // recurses into children — different cells, no aliasing.
         update_dex_view(&mut g, &info);
@@ -812,6 +1262,11 @@ impl GuestUi {
             } else {
                 Some(Rc::new(ops))
             };
+            // Ops captured after the last paint (a dex view's first
+            // onDraw runs during materialize, mid-traversal) must mark
+            // the view dirty or the frame that carries them never
+            // repaints — the window stays at its clear color.
+            g.view_mut().invalidate();
         }
         if let GuestView::Group(gr) = &mut *g {
             let mut kids: Vec<Box<dyn Drawable>> = Vec::new();
@@ -851,7 +1306,11 @@ impl GuestUi {
             }
             gr.children = kids;
         } else if !info.children.is_empty() && viewdbg() {
-            eprintln!("[viewdbg] KIDS DROPPED h{h} {} kids={} not-a-group", info.desc, info.children.len());
+            eprintln!(
+                "[viewdbg] KIDS DROPPED h{h} {} kids={} not-a-group",
+                info.desc,
+                info.children.len()
+            );
         }
         if info.listener != 0 {
             let listener = info.listener;
@@ -883,13 +1342,48 @@ impl GuestUi {
                 move |_vm: &mut Vm, a: &[V]| -> Result<Option<V>> {
                     let this = ref_arg(a, 0)?;
                     let mut g = ui2.borrow_mut();
-                    if !g.views.contains_key(&this) {
+                    // A subclass super-call can fire a LESS specific ctor
+                    // first (`View.<init>` binding Plain before
+                    // `ViewGroup.<init>` would bind Group) — Plain is the
+                    // weakest kind, so a later specific ctor upgrades it.
+                    let upgrade = g
+                        .views
+                        .get(&this)
+                        .map(|rc| matches!(*rc.borrow(), GuestView::Plain(_)))
+                        .unwrap_or(false);
+                    if upgrade || !g.views.contains_key(&this) {
                         let gv = make(&g);
                         g.views.insert(this, Rc::new(RefCell::new(gv)));
                     }
                     Ok(None)
                 },
             )) as HostCall,
+        );
+    }
+
+    /// `on` variant for handlers that dispatch guest code (attach and
+    /// detach bookkeeping invokes dex listeners like `onViewAdded`,
+    /// `setContentView` can inflate): the closure gets the `Rc` and
+    /// borrows only around view mutation, so guest code re-entering a
+    /// bridged method can't double-borrow the `GuestUi` RefCell.
+    fn on_rc(
+        ui: &Rc<RefCell<Self>>,
+        vm: &mut Vm,
+        class: &str,
+        name: &str,
+        proto: &str,
+        mut f: impl FnMut(&Rc<RefCell<Self>>, &mut Vm, &[V]) -> Result<Option<V>> + 'static,
+    ) {
+        let ui2 = ui.clone();
+        let class2 = class.to_string();
+        let name2 = name.to_string();
+        let _ = vm.register_host(
+            class,
+            name,
+            proto,
+            Rc::new(RefCell::new(move |vm2: &mut Vm, a: &[V]| {
+                f(&ui2, vm2, a).map_err(|e| e.with_detail(format!("{class2}.{name2}")))
+            })) as HostCall,
         );
     }
 
@@ -931,6 +1425,45 @@ impl GuestUi {
 fn viewdbg() -> bool {
     static V: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *V.get_or_init(|| std::env::var_os("OVELO_VIEWDBG").is_some())
+}
+
+/// Cached env flag — per-frame/per-view checks must not hit getenv.
+fn dbg_flag(name: &'static str) -> bool {
+    static CACHE: std::sync::OnceLock<std::sync::RwLock<HashMap<&'static str, bool>>> =
+        std::sync::OnceLock::new();
+    let cache = CACHE.get_or_init(|| std::sync::RwLock::new(HashMap::new()));
+    if let Some(v) = cache.read().unwrap().get(name) {
+        return *v;
+    }
+    let v = std::env::var_os(name).is_some();
+    cache.write().unwrap().insert(name, v);
+    v
+}
+
+/// Absolute (window) origin of a view handle: a bridged view answers
+/// with its host layout coords; a dex-only ancestor contributes its
+/// own parent-relative frame and the walk continues upward.
+fn abs_origin(vm: &Vm, views: &HashMap<u32, Rc<RefCell<GuestView>>>, mut cur: u32) -> (i32, i32) {
+    let mut acc = (0, 0);
+    for _ in 0..64 {
+        if cur == 0 {
+            return acc;
+        }
+        if let Some(rc) = views.get(&cur) {
+            let g = rc.borrow();
+            let v = g.view();
+            return (acc.0 + v.left, acc.1 + v.top);
+        }
+        let Some(info) = vm.dex_view(cur) else {
+            return acc;
+        };
+        if let Some((l, t, _, _)) = info.frame {
+            acc.0 += l;
+            acc.1 += t;
+        }
+        cur = vm.dex_parent(cur);
+    }
+    acc
 }
 
 /// `frame` is a render-cycle counter — the pass runs every 30th frame
@@ -982,8 +1515,7 @@ pub fn drive_dex_layout_pass(vm: &mut Vm, activity: u32, frame: u32, win_w: i32,
         // reports a dex parent (the `android.R.id.content` frame the
         // decor wraps it in), so `!parent_is_dex` alone would skip
         // every node and no frame would ever be set.
-        let parent_is_dex =
-            depth != 0 && info.parent != 0 && vm.is_dex_view(info.parent);
+        let parent_is_dex = depth != 0 && info.parent != 0 && vm.is_dex_view(info.parent);
         // Drive subtree roots regardless of group-ness: a leaf custom
         // view at the XML root has no dex parent to measure/layout it,
         // so without this its frame stays unset and `onDraw` ops never

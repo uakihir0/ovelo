@@ -307,6 +307,65 @@ fn config_name(b: &[u8], off: usize, size: usize) -> String {
             0xffff => parts.push("nodpi".into()),
             d => parts.push(format!("{d}dpi")),
         }
+        // Orientation shares the screenType field (byte +12).
+        match b[off + 12] {
+            1 => parts.push("port".into()),
+            2 => parts.push("land".into()),
+            3 => parts.push("square".into()),
+            _ => {} // 0=any
+        }
+    }
+    // ResTable_config +24 version: sdkVersion u16 → `v<N>` buckets.
+    if size >= 28 {
+        let sdk = u16::from_le_bytes(b[off + 24..off + 26].try_into().unwrap());
+        if sdk != 0 {
+            parts.push(format!("v{sdk}"));
+        }
+    }
+    // ResTable_config +28 screenConfig: screenLayout u8, uiMode u8,
+    // smallestScreenWidthDp u16 — distinguishing sw<N>dp / night /
+    // screen-size buckets is what keeps a sw600dp layout from being
+    // labeled "default" and clobbering the real phone layout.
+    if size >= 32 {
+        let screen_layout = b[off + 28];
+        let ui_mode = b[off + 29];
+        let sw = u16::from_le_bytes(b[off + 30..off + 32].try_into().unwrap());
+        if sw != 0 {
+            parts.push(format!("sw{sw}dp"));
+        }
+        match screen_layout & 0x0f {
+            1 => parts.push("small".into()),
+            3 => parts.push("large".into()),
+            4 => parts.push("xlarge".into()),
+            _ => {}
+        }
+        if screen_layout & 0x30 == 0x20 {
+            parts.push("long".into());
+        } else if screen_layout & 0x30 == 0x10 {
+            parts.push("notlong".into());
+        }
+        match ui_mode & 0x30 {
+            0x10 => parts.push("notnight".into()),
+            0x20 => parts.push("night".into()),
+            _ => {}
+        }
+        match ui_mode & 0x0f {
+            0x04 => parts.push("car".into()),
+            0x05 => parts.push("television".into()),
+            0x03 => parts.push("watch".into()),
+            _ => {}
+        }
+    }
+    // +32 screenSizeDp: w<N>dp / h<N>dp qualifiers.
+    if size >= 36 {
+        let w = u16::from_le_bytes(b[off + 32..off + 34].try_into().unwrap());
+        let h = u16::from_le_bytes(b[off + 34..off + 36].try_into().unwrap());
+        if w != 0 {
+            parts.push(format!("w{w}dp"));
+        }
+        if h != 0 {
+            parts.push(format!("h{h}dp"));
+        }
     }
     if parts.is_empty() {
         "default".to_string()

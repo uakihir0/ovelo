@@ -14,20 +14,20 @@
 //! * Java calls into native: dex `native` method → symbol lookup →
 //!   `jni_call` trampoline.
 
-use std::cell::Cell;
-use std::ffi::{c_void, CString};
+use std::ffi::c_void;
 
 use crate::jdk;
 use crate::proto_sig;
 use crate::value::{HostState, Obj, V};
-use crate::{gl, E, GIdx, Rt, Vm};
+use crate::{gl, GIdx, Rt, Vm};
 
-thread_local! {
-    static CUR_VM: Cell<*mut Vm> = const { Cell::new(std::ptr::null_mut()) };
-}
 // Guest `.so`s can spawn real pthreads (pthread_create resolves to
 // libsystem); JNI entry points reached from those threads have no
 // thread-local binding, so they read the last Vm bound anywhere.
+// No thread_local here: while `with_guest_tls` swaps TPIDR_EL0 to the
+// guest TCB, every #[thread_local] read resolves into *guest* memory —
+// a nonzero CUR_VM there would build `&mut Vm` at a wild address.
+static VM_DEPTH: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
 static FALLBACK_VM: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
 
 // All Vm access from JNI entry points serializes on a recursive mutex:
@@ -81,12 +81,9 @@ fn vm_mtx() -> *mut c_void {
 /// while the interpreter is inside `call_native` — where
 /// `without_vm_lock` releases all levels — or between dispatches.
 pub(crate) struct VmLock;
-thread_local! {
-    static VM_DEPTH: std::cell::Cell<u32> = const { std::cell::Cell::new(0) };
-}
 impl Drop for VmLock {
     fn drop(&mut self) {
-        VM_DEPTH.with(|d| d.set(d.get() - 1));
+        VM_DEPTH.fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
         unsafe {
             pthread_mutex_unlock(vm_mtx());
         }
@@ -99,7 +96,7 @@ pub(crate) fn vm_lock() -> VmLock {
             std::process::abort();
         }
     }
-    VM_DEPTH.with(|d| d.set(d.get() + 1));
+    VM_DEPTH.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     VmLock
 }
 
@@ -110,7 +107,10 @@ pub(crate) fn vm_lock() -> VmLock {
 /// during exactly that window.
 #[cfg_attr(not(target_arch = "aarch64"), allow(dead_code))]
 pub(crate) fn without_vm_lock<R>(f: impl FnOnce() -> R) -> R {
-    let n = VM_DEPTH.with(|d| d.replace(0));
+    // VM_DEPTH is a process-global counter, not per-thread — sound
+    // because the recursive pthread mutex serializes holders anyway:
+    // only one thread can have a nonzero depth at a time.
+    let n = VM_DEPTH.swap(0, std::sync::atomic::Ordering::Relaxed);
     let m = vm_mtx();
     for _ in 0..n {
         unsafe {
@@ -125,7 +125,7 @@ pub(crate) fn without_vm_lock<R>(f: impl FnOnce() -> R) -> R {
             }
         }
     }
-    VM_DEPTH.with(|d| d.set(n));
+    VM_DEPTH.fetch_add(n, std::sync::atomic::Ordering::Relaxed);
     r
 }
 
@@ -149,8 +149,16 @@ impl std::ops::DerefMut for VmGuard {
 
 // Track the last env-fn entry (set by `env_enter`); used to name the
 // caller whose preceding work corrupted the malloc zone.
-thread_local! {
-    static LAST_ENV: std::cell::Cell<&'static str> = const { std::cell::Cell::new("?") };
+// Mutex not thread_local: env fns run under the guest TCB where
+// thread_local storage resolves to guest memory.
+static LAST_ENV: std::sync::Mutex<&'static str> = std::sync::Mutex::new("?");
+fn last_env_get() -> &'static str {
+    LAST_ENV.lock().map(|g| *g).unwrap_or("?")
+}
+fn last_env_set(name: &'static str) {
+    if let Ok(mut g) = LAST_ENV.lock() {
+        *g = name;
+    }
 }
 
 /// Env-fn entry hook: `env_enter("FindClass")` at the top of each fn.
@@ -158,40 +166,58 @@ thread_local! {
 /// entry — the LAST_ENV name then identifies whichever env call ran
 /// just before the corruption was first observed.
 pub(crate) fn env_enter(name: &'static str) {
-    if std::env::var_os("OVELO_ENVCALL").is_some() {
+    if crate::dbg_flag("OVELO_ENVCALL") {
         eprintln!("[env>] {name}");
     }
     // malloc_zone_check is a Darwin-only API; keep the whole probe macOS-gated
     // so the Linux build neither links nor runs it.
     #[cfg(target_os = "macos")]
-    if std::env::var_os("OVELO_ZONECHECK").is_some() {
+    if crate::dbg_flag("OVELO_ZONECHECK") {
         unsafe {
             extern "C" {
                 fn malloc_default_zone() -> *mut std::ffi::c_void;
                 fn malloc_zone_check(zone: *mut std::ffi::c_void) -> bool;
+                fn malloc_get_all_zones(
+                    task: u32,
+                    reader: usize,
+                    zones: *mut *mut std::ffi::c_void,
+                    count: *mut u32,
+                ) -> i32;
+                fn mach_task_self() -> u32;
             }
-            for (zname, z) in [
-                ("default", malloc_default_zone()),
-                ("guest", crate::native::guest_zone()),
-            ] {
+            // Check EVERY zone the process knows about — Rust's own
+            // allocations live in a private zone that neither
+            // malloc_default_zone nor guest_zone names.
+            let mut zs: *mut std::ffi::c_void = std::ptr::null_mut();
+            let mut n: u32 = 0;
+            let nr = malloc_get_all_zones(mach_task_self(), 0, &mut zs, &mut n);
+            if nr != 0 {
+                eprintln!("[zonecheck] malloc_get_all_zones -> {nr}");
+            }
+            for i in 0..n as usize {
+                let z = *(zs as *mut *mut std::ffi::c_void).add(i);
                 if !malloc_zone_check(z) {
-                    eprintln!("[zonecheck] BAD {zname} ZONE on entry to {name}; previous env call: {}", LAST_ENV.get());
+                    eprintln!(
+                        "[zonecheck] BAD ZONE {z:?} on entry to {name}; previous env call: {}",
+                        last_env_get()
+                    );
                     std::process::abort();
                 }
             }
+            let _ = malloc_default_zone;
         }
     }
-    LAST_ENV.set(name);
+    check_buf_canaries(name);
+    #[cfg(target_os = "macos")]
+    crate::native::dbg_check_all(name);
+    last_env_set(name);
 }
 
 pub(crate) fn vm() -> VmGuard {
     let lock = vm_lock();
-    let p = CUR_VM.get() as usize;
-    let p = if p != 0 {
-        p
-    } else {
-        FALLBACK_VM.load(std::sync::atomic::Ordering::Acquire)
-    };
+    // FALLBACK_VM only: under the guest-TLS window any thread_local
+    // read is a read of guest-controlled memory.
+    let p = FALLBACK_VM.load(std::sync::atomic::Ordering::Acquire);
     VmGuard {
         vm: unsafe { &mut *(p as *mut Vm) },
         _lock: lock,
@@ -201,12 +227,8 @@ pub(crate) fn vm() -> VmGuard {
 /// Run `f` with the JNIEnv bound to `vm` — every native call holds this
 /// for the duration so env functions can reach the heap.
 pub(crate) fn with_vm<R>(vm: &mut Vm, f: impl FnOnce(&mut Vm) -> R) -> R {
-    let prev = CUR_VM.get();
-    CUR_VM.set(vm as *mut Vm);
     FALLBACK_VM.store(vm as *mut Vm as usize, std::sync::atomic::Ordering::Release);
-    let r = f(vm);
-    CUR_VM.set(prev);
-    r
+    f(vm)
 }
 
 // ---------- trampoline ----------
@@ -216,11 +238,30 @@ core::arch::global_asm!(
     ".global _ovelo_jni_call",
     ".p2align 2",
     "_ovelo_jni_call:",
-    // x0=fnptr, x1=iargs[8], x2=fargs[8], x3=out[2]
-    // x19 keeps `out` across the call (callee-saved); lr is clobbered
-    // by blr so it rides the stack beside it (sp stays 16-aligned).
-    "stp x19, lr, [sp, #-16]!",
+    // x0=fnptr, x1=iargs[8], x2=fargs[8], x3=out[2],
+    // x4=sargs[n] (AAPCS64 stack args, 8B slots), x5=n.
+    // x19-x21 keep `out`/sargs/n across the call (callee-saved); lr
+    // is clobbered by blr so it rides the stack beside them.
+    "stp x19, x20, [sp, #-32]!",
+    "stp x21, lr, [sp, #16]",
     "mov x19, x3",
+    "mov x20, x4",
+    "mov x21, x5",
+    // Stack-arg area: round_up(n*8, 16) to keep sp 16-aligned.
+    "lsl x9, x5, #3",
+    "add x9, x9, #15",
+    "and x9, x9, #-16",
+    "sub sp, sp, x9",
+    // Copy surplus args onto the stack in order.
+    "mov x10, #0",
+    "1:",
+    "cmp x10, x21",
+    "b.hs 2f",
+    "ldr x11, [x20, x10, lsl #3]",
+    "str x11, [sp, x10, lsl #3]",
+    "add x10, x10, #1",
+    "b 1b",
+    "2:",
     "mov x9, x0",
     "ldp d0, d1, [x2]",
     "ldp d2, d3, [x2, #16]",
@@ -233,32 +274,85 @@ core::arch::global_asm!(
     "blr x9",
     "str x0, [x19]",
     "str d0, [x19, #8]",
-    "ldp x19, lr, [sp], #16",
+    // Pop the stack-arg area and restore.
+    "lsl x9, x21, #3",
+    "add x9, x9, #15",
+    "and x9, x9, #-16",
+    "add sp, sp, x9",
+    "ldp x21, lr, [sp, #16]",
+    "ldp x19, x20, [sp], #32",
     "ret",
 );
 
 #[cfg(target_arch = "aarch64")]
 extern "C" {
-    /// fnptr(iargs as x0-x7, fargs as d0-d7) → out[0]=x0, out[1]=d0 bits.
-    fn ovelo_jni_call(fnptr: usize, iargs: *const u64, fargs: *const f64, out: *mut u64);
+    /// fnptr(iargs as x0-x7, fargs as d0-d7, sargs onto the stack)
+    /// → out[0]=x0, out[1]=d0 bits.
+    fn ovelo_jni_call(
+        fnptr: usize,
+        iargs: *const u64,
+        fargs: *const f64,
+        out: *mut u64,
+        sargs: *const u64,
+        snargs: u64,
+    );
 }
 
 /// Call a native function: int-class args in `iargs` (≤8), float-class
-/// args in `fargs` (≤8). Returns (x0, d0's bit pattern).
+/// args in `fargs` (≤8), surplus args (either class, in AAPCS64 order)
+/// as 8-byte slots in `sargs`. Returns (x0, d0's bit pattern).
 #[cfg(target_arch = "aarch64")]
-pub(crate) fn call_native(fnptr: usize, iargs: &[u64; 8], fargs: &[f64; 8]) -> (u64, u64) {
+pub(crate) fn call_native(
+    fnptr: usize,
+    iargs: &[u64; 8],
+    fargs: &[f64; 8],
+    sargs: &[u64],
+) -> (u64, u64) {
     let mut out = [0u64; 2];
-    if std::env::var_os("OVELO_ENVCALL").is_some() {
+    if crate::dbg_flag("OVELO_ENVCALL") {
         if let Some(m) = ENV_NAMES.get() {
             let name = m.get(&fnptr).copied().unwrap_or("?");
             eprintln!("[envcall] {name}({iargs:p})");
         }
     }
+    let ncall = crate::dbg_flag("OVELO_NCALL");
+    if ncall {
+        eprintln!(
+            "[ncall] -> {fnptr:#x} off={:#x?}",
+            crate::native::so_off(fnptr)
+        );
+    }
     without_vm_lock(|| {
-        crate::native::with_guest_tls(|| unsafe {
-            ovelo_jni_call(fnptr, iargs.as_ptr(), fargs.as_ptr(), out.as_mut_ptr())
+        crate::native::with_guest_tls_at("jni_call", || unsafe {
+            // Publish our thread's mach port so the watchdog can sample
+            // this thread's pc at high rate while guest code runs.
+            #[cfg(target_os = "macos")]
+            {
+                extern "C" {
+                    fn mach_thread_self() -> u32;
+                }
+                crate::native::excport::JNI_ACT_PORT
+                    .store(mach_thread_self(), std::sync::atomic::Ordering::Release);
+                crate::native::excport::JNI_ACT_TCB.store(
+                    crate::native::guest_tcb() as usize,
+                    std::sync::atomic::Ordering::Release,
+                );
+            }
+            ovelo_jni_call(
+                fnptr,
+                iargs.as_ptr(),
+                fargs.as_ptr(),
+                out.as_mut_ptr(),
+                sargs.as_ptr(),
+                sargs.len() as u64,
+            );
+            #[cfg(target_os = "macos")]
+            crate::native::excport::JNI_ACT_PORT.store(0, std::sync::atomic::Ordering::Release);
         });
     });
+    if ncall {
+        eprintln!("[ncall] <- {fnptr:#x} ok");
+    }
     (out[0], out[1])
 }
 
@@ -269,6 +363,7 @@ pub(crate) fn call_native(
     _fnptr: usize,
     _iargs: &[u64; 8],
     _fargs: &[f64; 8],
+    _sargs: &[u64],
 ) -> (u64, u64) {
     (0, 0)
 }
@@ -295,8 +390,21 @@ pub(crate) fn vm_ptr() -> usize {
 }
 
 extern "C" fn unimpl() -> u64 {
+    // Read the guest return address before env_enter's own call
+    // clobbers `lr`, so we can name the call site in the `.so`.
+    #[cfg(target_arch = "aarch64")]
+    let caller = {
+        let lr: usize;
+        unsafe { std::arch::asm!("mov {}, lr", out(reg) lr) };
+        lr
+    };
+    #[cfg(not(target_arch = "aarch64"))]
+    let caller = 0usize;
     env_enter("unimpl");
-    eprintln!("[jni] unimplemented env fn");
+    eprintln!(
+        "[jni] unimplemented env fn caller={caller:#x} so_off={:?}",
+        crate::native::so_off(caller)
+    );
     0
 }
 
@@ -397,6 +505,8 @@ pub(crate) fn init_tables() {
         t[162] = ef!(set_static_double_field as *const ());
         t[163] = ef!(new_string as *const ());
         t[164] = ef!(get_string_length as *const ());
+        t[165] = ef!(get_string_units as *const ());
+        t[166] = ef!(release_string_units as *const ());
         t[167] = ef!(new_string_utf as *const ());
         t[168] = ef!(get_string_utf_length as *const ());
         t[169] = ef!(get_string_utf_chars as *const ());
@@ -450,6 +560,14 @@ pub(crate) fn init_tables() {
         t[217] = ef!(ret0 as *const ());
         t[218] = ef!(ret0 as *const ());
         t[219] = ef!(get_java_vm as *const ());
+        t[220] = ef!(get_string_region as *const ());
+        t[221] = ef!(get_string_utf_region as *const ());
+        t[222] = ef!(get_primitive_array_critical as *const ());
+        t[223] = ef!(release_primitive_array_critical as *const ());
+        t[224] = ef!(get_string_units as *const ());
+        t[225] = ef!(release_string_units as *const ());
+        t[226] = ef!(new_ref as *const ());
+        t[227] = ef!(ret0 as *const ());
         t[228] = ef!(exception_check as *const ());
         t[229] = ef!(new_direct_byte_buffer as *const ());
         t[230] = ef!(get_direct_buffer_address as *const ());
@@ -464,29 +582,64 @@ pub(crate) fn init_tables() {
 
         let mut names = std::collections::HashMap::new();
         for (i, n) in [
-            (4, "GetVersion"), (6, "FindClass"), (13, "Throw"), (14, "ThrowNew"),
-            (15, "ExceptionOccurred"), (16, "ExceptionDescribe"), (17, "ExceptionClear"),
-            (20, "PopLocalFrame"), (21, "NewLocalRef"), (24, "IsSameObject"),
-            (25, "NewGlobalRef"), (27, "AllocObject"), (31, "GetObjectClass"),
-            (32, "IsInstanceOf"), (33, "GetMethodID"), (36, "CallObjectMethodA"),
-            (39, "CallBooleanMethodA"), (42, "CallByteMethodA"), (45, "CallCharMethodA"),
-            (48, "CallShortMethodA"), (51, "CallIntMethodA"), (54, "CallLongMethodA"),
-            (57, "CallFloatMethodA"), (60, "CallDoubleMethodA"), (63, "CallVoidMethodA"),
-            (94, "GetFieldID"), (95, "GetObjectField"), (100, "GetIntField"),
-            (104, "SetObjectField"), (113, "GetStaticMethodID"),
-            (116, "CallStaticObjectMethodA"), (143, "CallStaticVoidMethodA"),
-            (144, "GetStaticFieldID"), (145, "GetStaticObjectField"),
-            (154, "SetStaticObjectField"), (163, "NewString"), (164, "GetStringLength"),
-            (167, "NewStringUTF"), (168, "GetStringUTFLength"),
-            (169, "GetStringUTFChars"), (170, "ReleaseStringUTFChars"),
-            (171, "GetArrayLength"), (172, "NewObjectArray"),
-            (173, "GetObjectArrayElement"), (174, "SetObjectArrayElement"),
-            (184, "GetByteArrayElements"), (187, "GetIntArrayElements"),
-            (192, "ReleaseByteArrayElements"), (195, "ReleaseIntArrayElements"),
-            (200, "GetByteArrayRegion"), (203, "GetIntArrayRegion"),
-            (208, "SetByteArrayRegion"), (211, "SetIntArrayRegion"),
-            (215, "RegisterNatives"), (219, "GetJavaVM"), (228, "ExceptionCheck"),
-            (229, "NewDirectByteBuffer"), (230, "GetDirectBufferAddress"),
+            (4, "GetVersion"),
+            (6, "FindClass"),
+            (13, "Throw"),
+            (14, "ThrowNew"),
+            (15, "ExceptionOccurred"),
+            (16, "ExceptionDescribe"),
+            (17, "ExceptionClear"),
+            (20, "PopLocalFrame"),
+            (21, "NewLocalRef"),
+            (24, "IsSameObject"),
+            (25, "NewGlobalRef"),
+            (27, "AllocObject"),
+            (31, "GetObjectClass"),
+            (32, "IsInstanceOf"),
+            (33, "GetMethodID"),
+            (36, "CallObjectMethodA"),
+            (39, "CallBooleanMethodA"),
+            (42, "CallByteMethodA"),
+            (45, "CallCharMethodA"),
+            (48, "CallShortMethodA"),
+            (51, "CallIntMethodA"),
+            (54, "CallLongMethodA"),
+            (57, "CallFloatMethodA"),
+            (60, "CallDoubleMethodA"),
+            (63, "CallVoidMethodA"),
+            (94, "GetFieldID"),
+            (95, "GetObjectField"),
+            (100, "GetIntField"),
+            (104, "SetObjectField"),
+            (113, "GetStaticMethodID"),
+            (116, "CallStaticObjectMethodA"),
+            (143, "CallStaticVoidMethodA"),
+            (144, "GetStaticFieldID"),
+            (145, "GetStaticObjectField"),
+            (154, "SetStaticObjectField"),
+            (163, "NewString"),
+            (164, "GetStringLength"),
+            (167, "NewStringUTF"),
+            (168, "GetStringUTFLength"),
+            (169, "GetStringUTFChars"),
+            (170, "ReleaseStringUTFChars"),
+            (171, "GetArrayLength"),
+            (172, "NewObjectArray"),
+            (173, "GetObjectArrayElement"),
+            (174, "SetObjectArrayElement"),
+            (184, "GetByteArrayElements"),
+            (187, "GetIntArrayElements"),
+            (192, "ReleaseByteArrayElements"),
+            (195, "ReleaseIntArrayElements"),
+            (200, "GetByteArrayRegion"),
+            (203, "GetIntArrayRegion"),
+            (208, "SetByteArrayRegion"),
+            (211, "SetIntArrayRegion"),
+            (215, "RegisterNatives"),
+            (219, "GetJavaVM"),
+            (228, "ExceptionCheck"),
+            (229, "NewDirectByteBuffer"),
+            (230, "GetDirectBufferAddress"),
             (231, "GetDirectBufferCapacity"),
         ] {
             let p = JNI_TABLE[i] as usize;
@@ -495,6 +648,47 @@ pub(crate) fn init_tables() {
             }
         }
         let _ = ENV_NAMES.set(names);
+
+        // Every table entry is a host fn that guest code calls while
+        // TPIDR_EL0 points at the guest TCB — wrap each in a thunk
+        // that restores the host pthread block for the call's
+        // duration (libSystem's TPIDR-keyed per-thread state —
+        // malloc magazine, TSD, stack_chk_guard — faults on the
+        // guest TCB; observed as wild derefs inside the first call).
+        for s in JNI_TABLE.iter_mut().chain(JAVAVM_TABLE.iter_mut()) {
+            if *s != 0 {
+                *s = crate::native::host_thunk(*s as usize) as u64;
+            }
+        }
+
+        // Varargs entries (Call*Method, CallNonvirtual*Method,
+        // NewObject): each is a thunk → register-spill stub → Rust
+        // dispatcher. `va_thunk` already includes the outer TLS-swap
+        // thunk, so these are stored after the wrap loop.
+        let t = &mut JNI_TABLE;
+        for i in [34, 37, 40, 43, 46, 49, 52, 55, 58, 61] {
+            t[i] = crate::native::va_thunk(callv_dispatch as *const () as usize, 0) as u64;
+        }
+        for i in [35, 38, 41, 44, 47, 50, 53, 56, 59, 62] {
+            t[i] = crate::native::host_thunk(callv_v as *const () as usize) as u64;
+        }
+        for i in [64, 67, 70, 73, 76, 79, 82, 85, 88, 91] {
+            t[i] = crate::native::va_thunk(callv_dispatch as *const () as usize, 1) as u64;
+        }
+        for i in [65, 68, 71, 74, 77, 80, 83, 86, 89, 92] {
+            t[i] = crate::native::host_thunk(callnv_v as *const () as usize) as u64;
+        }
+        for i in [66, 69, 72, 75, 78, 81, 84, 87, 90, 93] {
+            t[i] = crate::native::host_thunk(callnv_a as *const () as usize) as u64;
+        }
+        t[28] = crate::native::va_thunk(callv_dispatch as *const () as usize, 2) as u64;
+        t[29] = crate::native::host_thunk(new_object_v as *const () as usize) as u64;
+        t[30] = crate::native::host_thunk(new_object_a as *const () as usize) as u64;
+        t[7] = crate::native::host_thunk(get_superclass as *const () as usize) as u64;
+        t[8] = crate::native::host_thunk(is_assignable_from as *const () as usize) as u64;
+        for i in [5, 9, 10, 11, 12, 18] {
+            t[i] = crate::native::host_thunk(ret0 as *const () as usize) as u64;
+        }
     });
 }
 
@@ -509,7 +703,7 @@ extern "C" fn ret1() -> u64 {
     1
 }
 
-fn cstr_ro(p: u64) -> String {
+pub(crate) fn cstr_ro(p: u64) -> String {
     if p == 0 {
         return String::new();
     }
@@ -534,6 +728,17 @@ fn cstr_ro(p: u64) -> String {
 /// decode a jmethodID / jfieldID
 fn mid_of(id: u64) -> Option<GIdx> {
     vm().jni_mids.get(id.checked_sub(1)? as usize).copied()
+}
+
+/// `jni_mids` entries with this tag index `jni_named` instead of the
+/// dex method table — `GetMethodID` on host/JDK classes whose methods
+/// only exist as builtins (Class.getDeclaredMethods, Field.get, …).
+pub(crate) const GX_NAMED: GIdx = 1 << 63;
+
+fn named_of(midx: GIdx) -> Option<(String, String, String)> {
+    (midx & GX_NAMED != 0)
+        .then(|| vm().jni_named.get((midx & !GX_NAMED) as usize).cloned())
+        .flatten()
 }
 fn fid_of(id: u64) -> Option<GIdx> {
     vm().jni_fids.get(id.checked_sub(1)? as usize).copied()
@@ -562,6 +767,9 @@ fn v_to_u64(v: V) -> u64 {
 
 /// Method proto params of a dex method id.
 fn method_params(midx: GIdx) -> (String, Vec<String>, String) {
+    if let Some((owner, _, sig)) = named_of(midx) {
+        return (owner, split_params(&sig), sig_return(&sig));
+    }
     let v = vm();
     let Some(d) = v.dex_of(midx) else {
         return (String::new(), Vec::new(), String::new());
@@ -607,6 +815,14 @@ fn sig_return(sig: &str) -> String {
 fn call_obj(obj: u64, mid: u64, args: &[V], is_static: bool) -> Option<V> {
     let g = mid_of(mid)?;
     let mut v = vm();
+    if let Some((owner, name, _)) = named_of(g) {
+        let res = if is_static {
+            v.call_static_named(&owner, &name, args.to_vec())
+        } else {
+            v.call_virtual(obj as u32, &name, args)
+        };
+        return res.ok().flatten();
+    }
     let kind = if is_static {
         crate::InvokeKind::Static
     } else {
@@ -620,43 +836,93 @@ fn call_obj(obj: u64, mid: u64, args: &[V], is_static: bool) -> Option<V> {
     v.invoke_pub(g, a, kind).ok().flatten()
 }
 
+/// `CallNonvirtual*Method`: invoke the exact method `mid` resolves to
+/// (found on the caller-supplied `clazz`) — the object's override must
+/// NOT win, or a `super.foo()` through JNI recurses forever.
+fn call_obj_direct(obj: u64, mid: u64, args: &[V]) -> Option<V> {
+    let g = mid_of(mid)?;
+    let mut v = vm();
+    if let Some((_, name, _)) = named_of(g) {
+        return v.call_virtual(obj as u32, &name, args).ok().flatten();
+    }
+    let mut a = Vec::with_capacity(args.len() + 1);
+    a.push(V::Ref(obj as u32));
+    a.extend_from_slice(args);
+    v.invoke_pub(g, a, crate::InvokeKind::Direct).ok().flatten()
+}
+
 /// Method-id registration: name+sig on `clazz` (a jclass handle) → id.
 fn find_method_id(clazz: u64, name_p: u64, sig_p: u64) -> u64 {
     let name = cstr_ro(name_p);
     let sig = cstr_ro(sig_p);
-    if std::env::var("OVELO_JNIDBG").is_ok() { eprintln!("[jni] GetMethodID {name}{sig} clazz={clazz:#x}"); }
+    if crate::dbg_flag("OVELO_JNIDBG") {
+        eprintln!("[jni] GetMethodID {name}{sig} clazz={clazz:#x}");
+    }
     let params = split_params(&sig);
     let pref: Vec<&str> = params.iter().map(String::as_str).collect();
     let mut v = vm();
-    let Some(ci) = (match clazz {
-        h if h != 0 => v.class_for_jclass(h as u32),
-        _ => None,
-    }) else {
-        return 0;
-    };
-    match v.find_method_on_chain_sig(ci, &name, &pref) {
-        Ok(Some(g)) => {
+    // A `class_obj` Host mirror (FindClass of a non-dex type) names its
+    // type by descriptor — resolve THAT, not the `java.lang.Class` box.
+    let desc = (clazz != 0)
+        .then(|| crate::jdk::class_desc_of(&v, clazz as u32))
+        .flatten();
+    let ci = desc
+        .as_deref()
+        .and_then(|d| v.type_index_of(d))
+        .or_else(|| {
+            (clazz != 0)
+                .then(|| v.class_for_jclass(clazz as u32))
+                .flatten()
+        });
+    match ci.and_then(|ci| v.find_method_on_chain_sig(ci, &name, &pref).ok().flatten()) {
+        Some(g) => {
             v.jni_mids.push(g);
             v.jni_mids.len() as u64
         }
         _ => {
-            eprintln!("[jni] GetMethodID miss {name}{sig}");
-            0
+            // Host/JDK class (java.lang.Class reflection and friends):
+            // the method isn't on a dex chain but the builtin surface
+            // can still answer it — register a by-name mid so the
+            // cached jmethodID stays usable (Godot's JNISingleton
+            // resolves its whole Java surface this way).
+            let owner = desc.unwrap_or_else(|| {
+                ci.and_then(|ci| v.type_desc_of(ci).ok())
+                    .unwrap_or_default()
+            });
+            v.jni_named.push((owner, name.clone(), sig.clone()));
+            let idx = (v.jni_named.len() - 1) as u64;
+            v.jni_mids.push(GX_NAMED | idx);
+            if crate::dbg_flag("OVELO_JNIDBG") {
+                eprintln!("[jni] GetMethodID named {name}{sig}");
+            }
+            v.jni_mids.len() as u64
         }
     }
 }
 
-fn find_field_id(clazz: u64, name_p: u64, _sig_p: u64, is_static: bool) -> u64 {
+fn find_field_id(clazz: u64, name_p: u64, sig_p: u64, is_static: bool) -> u64 {
     let name = cstr_ro(name_p);
-    if std::env::var("OVELO_JNIDBG").is_ok() { eprintln!("[jni] GetFieldID {name} clazz={clazz:#x}"); }
+    let sig = cstr_ro(sig_p);
+    if crate::dbg_flag("OVELO_JNIDBG") {
+        eprintln!("[jni] GetFieldID {name} clazz={clazz:#x}");
+    }
     let mut v = vm();
-    let Some(ci) = (match clazz {
-        h if h != 0 => v.class_for_jclass(h as u32),
-        _ => None,
-    }) else {
+    // Same as find_method_id: a Host class mirror names its type.
+    let desc = (clazz != 0)
+        .then(|| crate::jdk::class_desc_of(&v, clazz as u32))
+        .flatten();
+    let Some(ci) = desc
+        .as_deref()
+        .and_then(|d| v.type_index_of(d))
+        .or_else(|| {
+            (clazz != 0)
+                .then(|| v.class_for_jclass(clazz as u32))
+                .flatten()
+        })
+    else {
         return 0;
     };
-    if let Some(g) = v.find_field_by_name(ci, &name, is_static) {
+    if let Some(g) = v.find_field_by_name(ci, &name, is_static, Some(&sig)) {
         v.jni_fids.push(g);
         return v.jni_fids.len() as u64;
     }
@@ -674,22 +940,67 @@ extern "C" fn get_version(_e: u64) -> u64 {
 extern "C" fn find_class(_e: u64, name_p: u64) -> u64 {
     env_enter("find_class");
     let name = cstr_ro(name_p);
-    let dbg = std::env::var("OVELO_JNIDBG").is_ok();
-    if dbg { eprintln!("[jni] FindClass {name}"); }
-    let desc = format!("L{};", name.replace('.', "/"));
+    let dbg = crate::dbg_flag("OVELO_JNIDBG");
+    if dbg {
+        eprintln!("[jni] FindClass {name}");
+    }
+    // JNI accepts either binary names ("java/lang/String" or
+    // "java.lang.String") or type descriptors ("[B", "Ljava/lang/String;").
+    let desc = if name.starts_with('[')
+        || (name.starts_with('L') && name.ends_with(';'))
+        || (name.len() == 1 && "ZBCSIJFDV".contains(name.as_str()))
+    {
+        name.clone()
+    } else {
+        format!("L{};", name.replace('.', "/"))
+    };
     let mut v = vm();
-    if dbg { eprintln!("[jni]   type_index_of.."); }
+    if dbg {
+        eprintln!("[jni]   type_index_of..");
+    }
     let ci = v.type_index_of(&desc);
-    if dbg { eprintln!("[jni]   ci={ci:?} -> mirror.."); }
+    if dbg {
+        eprintln!("[jni]   ci={ci:?} -> mirror..");
+    }
     match ci {
         Some(ci) => {
             let h = v.class_mirror(ci) as u64;
-            if dbg { eprintln!("[jni]   mirror={h:#x}"); }
+            if dbg {
+                eprintln!("[jni]   mirror={h:#x}");
+            }
             h
         }
         None => {
-            eprintln!("[jni] FindClass miss {desc}");
-            0
+            // Descriptors with no dex type resolve as Class objects only
+            // for things that must exist (array types "[B", primitives)
+            // or prefixes the runtime hosts — the same whitelist
+            // `Class.forName` uses. Arbitrary names return null so a
+            // native library can detect a genuinely missing class
+            // (conscrypt et al. probe "[B"/"[C" unconditionally).
+            let host_known = desc.starts_with('[')
+                || (desc.len() == 1 && desc != "V")
+                || [
+                    "Ljava/",
+                    "Ljavax/",
+                    "Lsun/",
+                    "Lcom/sun/",
+                    "Landroid/",
+                    "Lkotlin/",
+                    "Lkotlinx/",
+                    "Lorg/json/",
+                    "Lorg/xmlpull/",
+                    "Lorg/apache/",
+                ]
+                .iter()
+                .any(|p| desc.starts_with(p));
+            if !host_known {
+                eprintln!("[jni] FindClass miss {desc}");
+                return 0;
+            }
+            let V::Ref(h) = crate::jdk::class_obj(&mut v, desc.clone()) else {
+                return 0;
+            };
+            h as u64
         }
     }
 }
@@ -717,7 +1028,10 @@ extern "C" fn exception_occurred(_e: u64) -> u64 {
 }
 extern "C" fn exception_describe(_e: u64) -> u64 {
     env_enter("exception_describe");
-    eprintln!("[jni] ExceptionDescribe: pending={:#x}", vm().jni_pending_exc);
+    eprintln!(
+        "[jni] ExceptionDescribe: pending={:#x}",
+        vm().jni_pending_exc
+    );
     0
 }
 extern "C" fn exception_clear(_e: u64) -> u64 {
@@ -791,7 +1105,12 @@ fn jargs(params: &[String], jvalues: u64) -> Vec<V> {
     params
         .iter()
         .enumerate()
-        .map(|(i, d)| jval(unsafe { ((jvalues + 8 * i as u64) as *const u64).read() }, d))
+        .map(|(i, d)| {
+            jval(
+                unsafe { ((jvalues + 8 * i as u64) as *const u64).read() },
+                d,
+            )
+        })
         .collect()
 }
 
@@ -844,8 +1163,279 @@ call_static_a!(call_static_float_method_a);
 call_static_a!(call_static_double_method_a);
 call_static_a!(call_static_void_method_a);
 
+// ---------- varargs Call*Method / NewObject ----------
+
+/// Arg streams for the register-spill stub: GP varargs land in saved
+/// x3-x7 then the caller stack; FP varargs in saved d0-d7, then the
+/// same stack stream (interleaved by argument order once registers
+/// run out — stack index is shared).
+struct VaRegs {
+    gp: [u64; 5],
+    gn: usize,
+    fp: [u64; 8],
+    stack: u64,
+    gi: usize,
+    fi: usize,
+    si: usize,
+}
+impl VaRegs {
+    unsafe fn next_gp(&mut self) -> u64 {
+        if self.gi < self.gn {
+            let v = self.gp[self.gi];
+            self.gi += 1;
+            v
+        } else {
+            let v = ((self.stack as *const u64).add(self.si)).read();
+            self.si += 1;
+            v
+        }
+    }
+    unsafe fn next_fp(&mut self) -> u64 {
+        if self.fi < 8 {
+            let v = self.fp[self.fi];
+            self.fi += 1;
+            v
+        } else {
+            let v = ((self.stack as *const u64).add(self.si)).read();
+            self.si += 1;
+            v
+        }
+    }
+}
+
+fn va_jargs(params: &[String], va: &mut VaRegs) -> Vec<V> {
+    params
+        .iter()
+        .map(|d| match d.as_str() {
+            "F" | "D" => jval(unsafe { va.next_fp() }, d),
+            _ => jval(unsafe { va.next_gp() }, d),
+        })
+        .collect()
+}
+
+/// Shared body for the varargs/`va_list`/`jvalue[]` call entries.
+/// kind: 0 = Call*Method(env,obj,mid,..), 1 = CallNonvirtual*Method
+/// (env,obj,clazz,mid,..), 2 = NewObject(env,clazz,mid,..).
+fn callv_run(obj: u64, mid: u64, args: &[V], new_obj: u64, nv: bool) -> u64 {
+    if mid_of(mid).is_none() {
+        eprintln!("[jni] callv: bad mid {mid:#x}");
+        return new_obj;
+    }
+    if new_obj != 0 {
+        // NewObject: <init> is a void instance method on the fresh object.
+        call_obj(new_obj, mid, args, false);
+        return new_obj;
+    }
+    if nv {
+        call_obj_direct(obj, mid, args).map(v_to_u64).unwrap_or(0)
+    } else {
+        call_obj(obj, mid, args, false).map(v_to_u64).unwrap_or(0)
+    }
+}
+
+/// Register-dump varargs dispatcher — called by the `emit_va` stub with
+/// a saved x0-x7 + d0-d7 buffer and the caller's stack-args pointer.
+extern "C" fn callv_dispatch(regs: u64, stack: u64, kind: u64) -> u64 {
+    env_enter("callv");
+    unsafe {
+        let r = regs as *const u64;
+        let (obj_or_clazz, mid, gn) = match kind {
+            1 => (r.add(1).read(), r.add(3).read(), 4usize), // env,obj,clazz,mid,...
+            _ => (r.add(1).read(), r.add(2).read(), 5usize), // env,obj/clazz,mid,...
+        };
+        let gp_start = 8 - gn;
+        let mut va = VaRegs {
+            gp: [0; 5],
+            gn,
+            fp: [0; 8],
+            stack,
+            gi: 0,
+            fi: 0,
+            si: 0,
+        };
+        for (i, slot) in va.gp.iter_mut().enumerate().take(gn) {
+            *slot = r.add(gp_start + i).read();
+        }
+        for (i, slot) in va.fp.iter_mut().enumerate() {
+            *slot = r.add(8 + i).read();
+        }
+        let Some(g) = mid_of(mid) else {
+            eprintln!("[jni] callv: bad mid {mid:#x}");
+            return 0;
+        };
+        let (_, params, _) = method_params(g);
+        let args = va_jargs(&params, &mut va);
+        if kind == 2 {
+            // NewObject: allocate, run <init>, return the object.
+            let mut v = vm();
+            let Some(ci) = v.class_for_jclass(obj_or_clazz as u32) else {
+                return 0;
+            };
+            let h = v.heap.alloc(Obj::Instance {
+                class_idx: ci,
+                fields: std::collections::HashMap::new(),
+            }) as u64;
+            drop(v);
+            callv_run(0, mid, &args, h, false)
+        } else {
+            callv_run(obj_or_clazz, mid, &args, 0, kind == 1)
+        }
+    }
+}
+
+/// Bionic aarch64 `va_list`: {stack, gr_top, vr_top, gr_offs, vr_offs}
+/// — 32 bytes, passed by reference. GP slots are 8B at gr_top+gr_offs
+/// (offs ≤ 0, +8 each); VR slots are 16B at vr_top+vr_offs (+16 each);
+/// past the end both streams continue on `stack` (8B each, sequential).
+struct VaList {
+    stack: u64,
+    gr_top: u64,
+    vr_top: u64,
+    gr_offs: i64,
+    vr_offs: i64,
+}
+impl VaList {
+    unsafe fn load(p: u64) -> Self {
+        let q = p as *const u64;
+        // gr_offs/vr_offs are 4-byte ints at byte offsets 24 and 28.
+        Self {
+            stack: q.read(),
+            gr_top: q.add(1).read(),
+            vr_top: q.add(2).read(),
+            gr_offs: ((p + 24) as *const i32).read() as i64,
+            vr_offs: ((p + 28) as *const i32).read() as i64,
+        }
+    }
+    unsafe fn next_gp(&mut self) -> u64 {
+        if self.gr_offs < 0 {
+            let v = ((self.gr_top as i64 + self.gr_offs) as *const u64).read();
+            self.gr_offs += 8;
+            v
+        } else {
+            let v = (self.stack as *const u64).read();
+            self.stack += 8;
+            v
+        }
+    }
+    unsafe fn next_fp(&mut self) -> u64 {
+        if self.vr_offs < 0 {
+            let v = ((self.vr_top as i64 + self.vr_offs) as *const u64).read();
+            self.vr_offs += 16;
+            v
+        } else {
+            let v = (self.stack as *const u64).read();
+            self.stack += 8;
+            v
+        }
+    }
+}
+
+fn valist_jargs(params: &[String], va: &mut VaList) -> Vec<V> {
+    params
+        .iter()
+        .map(|d| match d.as_str() {
+            "F" | "D" => jval(unsafe { va.next_fp() }, d),
+            _ => jval(unsafe { va.next_gp() }, d),
+        })
+        .collect()
+}
+
+extern "C" fn callv_v(_e: u64, obj: u64, mid: u64, va_p: u64) -> u64 {
+    env_enter("callv_v");
+    let Some(g) = mid_of(mid) else {
+        return 0;
+    };
+    let (_, params, _) = method_params(g);
+    let mut va = unsafe { VaList::load(va_p) };
+    let args = valist_jargs(&params, &mut va);
+    call_obj(obj, mid, &args, false).map(v_to_u64).unwrap_or(0)
+}
+extern "C" fn callnv_v(_e: u64, obj: u64, _clazz: u64, mid: u64, va_p: u64) -> u64 {
+    env_enter("callnv_v");
+    let Some(g) = mid_of(mid) else {
+        return 0;
+    };
+    let (_, params, _) = method_params(g);
+    let mut va = unsafe { VaList::load(va_p) };
+    let args = valist_jargs(&params, &mut va);
+    call_obj_direct(obj, mid, &args).map(v_to_u64).unwrap_or(0)
+}
+extern "C" fn callnv_a(_e: u64, obj: u64, _clazz: u64, mid: u64, jvalues: u64) -> u64 {
+    env_enter("callnv_a");
+    let Some(g) = mid_of(mid) else {
+        return 0;
+    };
+    let (_, params, _) = method_params(g);
+    let args = jargs(&params, jvalues);
+    call_obj_direct(obj, mid, &args).map(v_to_u64).unwrap_or(0)
+}
+
+fn new_object_body(clazz: u64, mid: u64, args: &[V]) -> u64 {
+    let mut v = vm();
+    let Some(ci) = v.class_for_jclass(clazz as u32) else {
+        return 0;
+    };
+    let h = v.heap.alloc(Obj::Instance {
+        class_idx: ci,
+        fields: std::collections::HashMap::new(),
+    }) as u64;
+    drop(v);
+    call_obj(h, mid, args, false);
+    h
+}
+extern "C" fn new_object_v(_e: u64, clazz: u64, mid: u64, va_p: u64) -> u64 {
+    env_enter("new_object_v");
+    let Some(g) = mid_of(mid) else {
+        return 0;
+    };
+    let (_, params, _) = method_params(g);
+    let mut va = unsafe { VaList::load(va_p) };
+    let args = valist_jargs(&params, &mut va);
+    new_object_body(clazz, mid, &args)
+}
+extern "C" fn new_object_a(_e: u64, clazz: u64, mid: u64, jvalues: u64) -> u64 {
+    env_enter("new_object_a");
+    let Some(g) = mid_of(mid) else {
+        return 0;
+    };
+    let (_, params, _) = method_params(g);
+    let args = jargs(&params, jvalues);
+    new_object_body(clazz, mid, &args)
+}
+
+extern "C" fn get_superclass(_e: u64, clazz: u64) -> u64 {
+    env_enter("get_superclass");
+    let mut v = vm();
+    let Some(ci) = v.class_for_jclass(clazz as u32) else {
+        return 0;
+    };
+    let Ok(own) = v.type_desc_of(ci) else {
+        return 0;
+    };
+    let Some(sd) = v.super_desc(&own) else {
+        return 0;
+    };
+    match v.type_index_of(&sd) {
+        Some(s) => v.class_mirror(s) as u64,
+        None => 0,
+    }
+}
+extern "C" fn is_assignable_from(_e: u64, sub: u64, sup: u64) -> u64 {
+    env_enter("is_assignable_from");
+    let v = vm();
+    match (
+        v.class_for_jclass(sub as u32),
+        v.class_for_jclass(sup as u32),
+    ) {
+        (Some(a), Some(b)) => u64::from(v.assignable(a, b)),
+        _ => 0,
+    }
+}
+
 fn field_get_v(obj: u64, id: u64) -> V {
-    let Some(g) = fid_of(id) else { return V::I32(0) };
+    let Some(g) = fid_of(id) else {
+        return V::I32(0);
+    };
     let v = vm();
     let f = v.canon_field(g);
     match v.heap.get(obj as u32) {
@@ -866,7 +1456,9 @@ fn field_set_v(obj: u64, id: u64, val: u64) {
     }
 }
 fn static_get_v(_clazz: u64, id: u64) -> V {
-    let Some(g) = fid_of(id) else { return V::I32(0) };
+    let Some(g) = fid_of(id) else {
+        return V::I32(0);
+    };
     vm().sget_pub(g).unwrap_or(V::I32(0))
 }
 fn static_set_v(_clazz: u64, id: u64, val: u64) {
@@ -962,22 +1554,123 @@ extern "C" fn get_string_length(_e: u64, s: u64) -> u64 {
 }
 extern "C" fn get_string_utf_length(_e: u64, s: u64) -> u64 {
     env_enter("get_string_utf_length");
-    vm().heap.str_val(s as u32).map(|x| x.len() as u64).unwrap_or(0)
+    let Some(x) = vm().heap.str_val(s as u32).map(|x| x.to_string()) else {
+        return 0;
+    };
+    // Modified UTF-8 byte count: NUL is 2 bytes and supplementary
+    // characters are two 3-byte units, so this is not `x.len()`.
+    x.encode_utf16()
+        .map(|u| match u {
+            0 => 2,
+            1..=0x7F => 1,
+            0x80..=0x7FF => 2,
+            _ => 3,
+        })
+        .sum()
 }
 extern "C" fn get_string_utf_chars(_e: u64, s: u64, _copy: u64) -> u64 {
     env_enter("get_string_utf_chars");
     let Some(x) = vm().heap.str_val(s as u32).map(|x| x.to_string()) else {
         return 0;
     };
-    let c = CString::new(x).unwrap_or_default();
-    c.into_raw() as u64
+    let mut out = Vec::with_capacity(x.len() + 1);
+    for u in x.encode_utf16() {
+        mutf8_unit(&mut out, u);
+    }
+    let buf = libc_malloc(out.len() + 1) as *mut u8;
+    if buf.is_null() {
+        return 0;
+    }
+    unsafe {
+        std::ptr::copy_nonoverlapping(out.as_ptr(), buf, out.len());
+        *buf.add(out.len()) = 0;
+    }
+    buf as u64
 }
 extern "C" fn release_string_utf_chars(_e: u64, _s: u64, p: u64) -> u64 {
     env_enter("release_string_utf_chars");
     if p != 0 {
-        unsafe { drop(CString::from_raw(p as *mut i8)) };
+        libc_free(p as usize);
     }
     0
+}
+
+/// `GetStringChars`/`GetStringCritical`: UTF-16 buffer, NUL-terminated.
+extern "C" fn get_string_units(_e: u64, s: u64, _copy: u64) -> u64 {
+    env_enter("get_string_units");
+    let Some(x) = vm().heap.str_val(s as u32).map(|x| x.to_string()) else {
+        return 0;
+    };
+    let u16s: Vec<u16> = x.encode_utf16().collect();
+    let buf = libc_malloc((u16s.len() + 1) * 2) as *mut u16;
+    if buf.is_null() {
+        return 0;
+    }
+    unsafe {
+        std::ptr::copy_nonoverlapping(u16s.as_ptr(), buf, u16s.len());
+        *buf.add(u16s.len()) = 0;
+    }
+    buf as u64
+}
+extern "C" fn release_string_units(_e: u64, _s: u64, p: u64) {
+    env_enter("release_string_units");
+    if p != 0 {
+        libc_free(p as usize);
+    }
+}
+extern "C" fn get_string_region(_e: u64, s: u64, start: u64, len: u64, buf: u64) {
+    env_enter("get_string_region");
+    let Some(x) = vm().heap.str_val(s as u32).map(|x| x.to_string()) else {
+        return;
+    };
+    let u16s: Vec<u16> = x.encode_utf16().collect();
+    if !crate::native::guest_dst_ok(buf as usize, len as usize * 2) {
+        eprintln!("[guestptr] get_string_region: write {buf:#x}+{len}*2 not guest/stack/image");
+        return;
+    }
+    for i in 0..len as usize {
+        let v = u16s.get(start as usize + i).copied().unwrap_or(0);
+        unsafe { *((buf + i as u64 * 2) as *mut u16) = v };
+    }
+}
+/// One UTF-16 code unit in modified UTF-8 — each unit encodes
+/// independently (surrogate pairs become two 3-byte sequences, never
+/// merged), and NUL is 0xC0 0x80.
+fn mutf8_unit(out: &mut Vec<u8>, u: u16) {
+    match u {
+        0 => out.extend_from_slice(&[0xC0, 0x80]),
+        1..=0x7F => out.push(u as u8),
+        0x80..=0x7FF => out.extend_from_slice(&[0xC0 | (u >> 6) as u8, 0x80 | (u & 0x3F) as u8]),
+        _ => out.extend_from_slice(&[
+            0xE0 | (u >> 12) as u8,
+            0x80 | ((u >> 6) & 0x3F) as u8,
+            0x80 | (u & 0x3F) as u8,
+        ]),
+    }
+}
+
+extern "C" fn get_string_utf_region(_e: u64, s: u64, start: u64, len: u64, buf: u64) {
+    env_enter("get_string_utf_region");
+    let Some(x) = vm().heap.str_val(s as u32).map(|x| x.to_string()) else {
+        return;
+    };
+    let u16s: Vec<u16> = x.encode_utf16().collect();
+    let lo = (start as usize).min(u16s.len());
+    let hi = (start as usize + len as usize).min(u16s.len());
+    let mut out = Vec::with_capacity((hi - lo) * 3);
+    for &u in &u16s[lo..hi] {
+        mutf8_unit(&mut out, u);
+    }
+    if !crate::native::guest_dst_ok(buf as usize, out.len()) {
+        eprintln!(
+            "[guestptr] get_string_utf_region: write {buf:#x}+{} not guest/stack/image",
+            out.len()
+        );
+        return;
+    }
+    unsafe {
+        std::ptr::copy_nonoverlapping(out.as_ptr(), buf as *mut u8, out.len());
+    }
 }
 
 // ---------- arrays ----------
@@ -1085,11 +1778,7 @@ fn get_elems(a: u64, _copy: u64) -> u64 {
         // the malloc'd block.
         unsafe {
             let bytes = elem_bits(*v, sz).to_le_bytes();
-            std::ptr::copy_nonoverlapping(
-                bytes.as_ptr(),
-                (buf + (i * sz) as u64) as *mut u8,
-                sz,
-            );
+            std::ptr::copy_nonoverlapping(bytes.as_ptr(), (buf + (i * sz) as u64) as *mut u8, sz);
         }
     }
     buf
@@ -1121,15 +1810,63 @@ fn release_elems(a: u64, buf: u64, mode: u64) {
     }
 }
 
-extern "C" {
-    fn malloc(n: usize) -> *mut c_void;
-    fn free(p: *mut c_void);
-}
+/// Buffers handed to guest code live in the guest zone — a guest-side
+/// overrun then damages guest metadata, not the Rust heap.
+/// Under OVELO_BUFDBG every allocation gets a magic tail that is
+/// verified on free and on every env entry, naming the env call that
+/// first saw an overrun.
 fn libc_malloc(n: usize) -> usize {
-    unsafe { malloc(n) as usize }
+    let dbg = crate::dbg_flag("OVELO_BUFDBG");
+    if !dbg {
+        return crate::native::guest_malloc(n);
+    }
+    let p = crate::native::guest_malloc(n + 8);
+    if p == 0 {
+        return 0;
+    }
+    // p+n isn't necessarily 8-aligned — use unaligned access.
+    unsafe { ((p + n) as *mut u64).write_unaligned(0xdead_beef_cafe_f00d) };
+    if let Ok(mut b) = bufs().lock() {
+        b.insert(p, n);
+    }
+    p
 }
 fn libc_free(p: usize) {
-    unsafe { free(p as *mut c_void) }
+    if p == 0 {
+        return;
+    }
+    let n = bufs().lock().ok().and_then(|mut b| b.remove(&p));
+    if let Some(n) = n {
+        let m = unsafe { ((p + n) as *const u64).read_unaligned() };
+        if m != 0xdead_beef_cafe_f00d {
+            eprintln!(
+                "[bufdbg] canary dead at {p:#x}+{n} on free; last env {}",
+                last_env_get()
+            );
+        }
+    }
+    crate::native::guest_free(p)
+}
+fn bufs() -> &'static std::sync::Mutex<std::collections::HashMap<usize, usize>> {
+    static B: std::sync::OnceLock<std::sync::Mutex<std::collections::HashMap<usize, usize>>> =
+        std::sync::OnceLock::new();
+    B.get_or_init(|| std::sync::Mutex::new(std::collections::HashMap::new()))
+}
+fn check_buf_canaries(name: &'static str) {
+    if std::env::var_os("OVELO_BUFDBG").is_none() {
+        return;
+    }
+    if let Ok(b) = bufs().lock() {
+        for (&p, &n) in b.iter() {
+            let m = unsafe { ((p + n) as *const u64).read_unaligned() };
+            if m != 0xdead_beef_cafe_f00d {
+                eprintln!(
+                    "[bufdbg] overrun: buf {p:#x}+{n} bad on entry to {name}; previous env {}",
+                    last_env_get()
+                );
+            }
+        }
+    }
 }
 
 macro_rules! ga {
@@ -1164,21 +1901,32 @@ ra!(release_long_array_elements);
 ra!(release_float_array_elements);
 ra!(release_double_array_elements);
 
+/// `GetPrimitiveArrayCritical` — same buffer contract as
+/// `Get*ArrayElements`; libgdx uses it for its scratch float arrays.
+extern "C" fn get_primitive_array_critical(_e: u64, a: u64, copy: u64) -> u64 {
+    env_enter("get_primitive_array_critical");
+    get_elems(a, copy)
+}
+extern "C" fn release_primitive_array_critical(_e: u64, a: u64, buf: u64, mode: u64) {
+    env_enter("release_primitive_array_critical");
+    release_elems(a, buf, mode)
+}
+
 fn get_region(a: u64, start: u64, len: u64, out: u64) {
     let h = a as u32;
     let Some(d) = arr_data(h) else { return };
     let sz = elem_size(h);
+    if !crate::native::guest_dst_ok(out as usize, len as usize * sz) {
+        eprintln!("[guestptr] get_region: write {out:#x}+{len}*{sz} not guest/stack/image");
+        return;
+    }
     for i in 0..len as usize {
         let v = d.get(start as usize + i).copied().unwrap_or(V::I32(0));
         // Write exactly `sz` bytes — a full u64 store at a narrower
         // stride spills into the caller's buffer past the last element.
         unsafe {
             let bytes = elem_bits(v, sz).to_le_bytes();
-            std::ptr::copy_nonoverlapping(
-                bytes.as_ptr(),
-                (out + (i * sz) as u64) as *mut u8,
-                sz,
-            );
+            std::ptr::copy_nonoverlapping(bytes.as_ptr(), (out + (i * sz) as u64) as *mut u8, sz);
         }
     }
 }
@@ -1240,7 +1988,9 @@ sr!(set_double_array_region);
 
 extern "C" fn register_natives(_e: u64, clazz: u64, methods: u64, n: u64) -> u64 {
     env_enter("register_natives");
-    if std::env::var("OVELO_JNIDBG").is_ok() { eprintln!("[jni] RegisterNatives clazz={clazz:#x} n={n}"); }
+    if crate::dbg_flag("OVELO_JNIDBG") {
+        eprintln!("[jni] RegisterNatives clazz={clazz:#x} n={n}");
+    }
     let mut v = vm();
     let desc = v
         .class_for_jclass(clazz as u32)
@@ -1261,7 +2011,8 @@ extern "C" fn register_natives(_e: u64, clazz: u64, methods: u64, n: u64) -> u64
         };
         let name = cstr_ro(name_p);
         let sig = cstr_ro(sig_p);
-        lib.registered.insert((desc.clone(), name, sig), fn_p as usize);
+        lib.registered
+            .insert((desc.clone(), name, sig), fn_p as usize);
     }
     0
 }
@@ -1293,8 +2044,13 @@ extern "C" fn vm_attach(_vm: u64, a: u64, _b: u64) -> u64 {
 
 extern "C" fn new_direct_byte_buffer(_e: u64, addr: u64, cap: u64) -> u64 {
     env_enter("new_direct_byte_buffer");
+    if !crate::native::guest_dst_ok(addr as usize, cap as usize) {
+        eprintln!("[guestptr] new_direct_byte_buffer: {addr:#x}+{cap} not guest/stack/image");
+    }
     let mut v = vm();
-    let ci = v.type_index_of("Ljava/nio/ByteBuffer;").unwrap_or(crate::GX_NONE);
+    let ci = v
+        .type_index_of("Ljava/nio/ByteBuffer;")
+        .unwrap_or(crate::GX_NONE);
     let mut fields = std::collections::HashMap::new();
     fields.insert(jdk::P_DATA as u64, V::I64(addr as i64));
     fields.insert(jdk::P_FLAGS as u64, V::I64(cap as i64));
@@ -1348,7 +2104,10 @@ pub(crate) fn native_addr(vm: &Vm, class: &str, name: &str, sig: &str) -> Option
         if let Some(&a) = lib.exports.get(&short).or_else(|| lib.exports.get(&long)) {
             return Some(a);
         }
-        if let Some(&a) = lib.registered.get(&(class.to_string(), name.to_string(), sig.to_string())) {
+        if let Some(&a) =
+            lib.registered
+                .get(&(class.to_string(), name.to_string(), sig.to_string()))
+        {
             return Some(a);
         }
     }
@@ -1393,7 +2152,7 @@ pub(crate) fn load_native_lib(vm: &mut Vm, arg: &str, absolute: bool) {
                 .collect()
         })
         .unwrap_or_default();
-    let denied = if std::env::var_os("OVELO_NO_SKIP_LIBS").is_some() {
+    let denied = if crate::dbg_flag("OVELO_NO_SKIP_LIBS") {
         skip.iter().any(|n| path.contains(n.as_str()))
     } else {
         path.contains("glide-webp") || skip.iter().any(|n| path.contains(n.as_str()))
@@ -1407,6 +2166,9 @@ pub(crate) fn load_native_lib(vm: &mut Vm, arg: &str, absolute: bool) {
     // global scope when the dependent relocates.
     let libs = {
         let res = vm.apk_res.as_ref();
+        if let Some(r) = res {
+            crate::native::set_apk_reader(&**r as *const _ as usize);
+        }
         let mut lookup = |soname: &str| -> Option<Vec<u8>> {
             res.and_then(|r| r.read(&format!("lib/arm64-v8a/{soname}")))
         };
@@ -1438,14 +2200,16 @@ pub(crate) fn load_native_lib(vm: &mut Vm, arg: &str, absolute: bool) {
     if let Some(addr) = onload {
         let iargs = [vm_ptr() as u64, 0, 0, 0, 0, 0, 0, 0];
         let fargs = [0f64; 8];
-        let (rc, _) = with_vm(vm, |_| call_native(addr, &iargs, &fargs));
+        let (rc, _) = with_vm(vm, |_| call_native(addr, &iargs, &fargs, &[]));
         eprintln!("[jni] JNI_OnLoad -> {rc:#x}");
     }
 }
 
 /// Marshal dex args and call the native function. `iargs[0..2]` are the
-/// env + receiver/class — params occupy int regs x2-x7 (≤6) and float
-/// regs d0-d7 (≤8). Long/double are single 64-bit slots each.
+/// env + receiver/class — params occupy int regs x2-x7 and float regs
+/// d0-d7; anything beyond rides the AAPCS64 stack area (`sargs`, in
+/// argument order). Long/double are single 64-bit slots each; a float
+/// stack arg keeps its value in the low half of its 8-byte slot.
 pub(crate) fn dispatch_native(
     vm: &mut Vm,
     addr: usize,
@@ -1454,8 +2218,11 @@ pub(crate) fn dispatch_native(
     is_static: bool,
     args: &[V],
 ) -> Rt<Option<V>> {
+    #[cfg(target_os = "macos")]
+    crate::native::check_all_zones("dispatch_native");
     let mut iargs = [0u64; 8];
     let mut fargs = [0f64; 8];
+    let mut sargs: Vec<u64> = Vec::new();
     iargs[0] = env_ptr() as u64;
     iargs[1] = if is_static {
         vm.type_index_of(class)
@@ -1469,42 +2236,40 @@ pub(crate) fn dispatch_native(
     };
     let mut ii = 2usize;
     let mut fi = 0usize;
-    let params = if is_static { args } else { &args[1.min(args.len())..] };
+    let params = if is_static {
+        args
+    } else {
+        &args[1.min(args.len())..]
+    };
     for v in params {
         match v {
             V::F32(f) => {
-                if fi >= 8 {
-                    return Err(E::Vm(crate::errd(
-                        "dexrt.jni.args",
-                        "float args > 8".to_string(),
-                    )));
+                if fi < 8 {
+                    fargs[fi] = *f as f64;
+                    fi += 1;
+                } else {
+                    sargs.push(f.to_bits() as u64);
                 }
-                fargs[fi] = *f as f64;
-                fi += 1;
             }
             V::F64(f) => {
-                if fi >= 8 {
-                    return Err(E::Vm(crate::errd(
-                        "dexrt.jni.args",
-                        "float args > 8".to_string(),
-                    )));
+                if fi < 8 {
+                    fargs[fi] = *f;
+                    fi += 1;
+                } else {
+                    sargs.push(f.to_bits());
                 }
-                fargs[fi] = *f;
-                fi += 1;
             }
             other => {
-                if ii >= 8 {
-                    return Err(E::Vm(crate::errd(
-                        "dexrt.jni.args",
-                        "int args > 6".to_string(),
-                    )));
+                if ii < 8 {
+                    iargs[ii] = v_to_u64(*other);
+                    ii += 1;
+                } else {
+                    sargs.push(v_to_u64(*other));
                 }
-                iargs[ii] = v_to_u64(*other);
-                ii += 1;
             }
         }
     }
-    let (x0, d0) = with_vm(vm, |_| call_native(addr, &iargs, &fargs));
+    let (x0, d0) = with_vm(vm, |_| call_native(addr, &iargs, &fargs, &sargs));
     Ok(Some(match ret {
         "V" => return Ok(None),
         "Z" | "B" | "C" | "S" | "I" => V::I32(x0 as u32 as i32),

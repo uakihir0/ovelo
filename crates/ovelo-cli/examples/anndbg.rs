@@ -97,9 +97,7 @@ fn main() {
                     for (ni, ev) in &it.elements {
                         let en = d.string(*ni).unwrap_or_default();
                         let txt = match ev {
-                            EncodedValue::Type(t) => {
-                                d.type_descriptor(*t).unwrap_or_default()
-                            }
+                            EncodedValue::Type(t) => d.type_descriptor(*t).unwrap_or_default(),
                             EncodedValue::Enum(fi) | EncodedValue::Field(fi) => d
                                 .field(*fi)
                                 .and_then(|f| d.string(f.name_idx))
@@ -116,6 +114,9 @@ fn main() {
                 }
             }
         }
-        println!("{}: {} dirs, {} method_anns, {} items, {} ann-classes", e.name, dirs, meths, items_n, anncls);
+        println!(
+            "{}: {} dirs, {} method_anns, {} items, {} ann-classes",
+            e.name, dirs, meths, items_n, anncls
+        );
     }
 }

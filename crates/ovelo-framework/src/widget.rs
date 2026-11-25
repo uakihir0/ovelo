@@ -44,6 +44,12 @@ pub trait Drawable {
         let _ = (down, x, y);
         false
     }
+    /// Downcast hook — the guest bridge needs the concrete wrapper
+    /// (`SharedView`/`AbsView`) to match a child box to its dex handle
+    /// for positional insert/remove.
+    fn as_any(&mut self) -> Option<&mut dyn std::any::Any> {
+        None
+    }
 }
 
 /// Whether `(x,y)` is inside the view's laid-out rect.
@@ -86,7 +92,24 @@ impl Drawable for View {
         }
     }
     fn measure(&mut self, w: MeasureSpec, h: MeasureSpec) -> Size {
-        self.measure(w, h)
+        // AOSP's default `onMeasure` is `getDefaultSize` — a plain View
+        // FILLS the spec under EXACTLY and AT_MOST (only UNSPECIFIED
+        // reports the desired size). Widgets that wrap content
+        // (TextView, Button, groups) bypass this via their own measure
+        // which computes `desired` first, so this fill only applies to
+        // the bare leaf — SurfaceView/custom canvases, which otherwise
+        // measured 0x0 and never drew (andstatus 2048's GLSurfaceView).
+        self.measured = Size {
+            w: match w {
+                MeasureSpec::Exactly(s) | MeasureSpec::AtMost(s) => s,
+                MeasureSpec::Unspecified => self.desired.w,
+            },
+            h: match h {
+                MeasureSpec::Exactly(s) | MeasureSpec::AtMost(s) => s,
+                MeasureSpec::Unspecified => self.desired.h,
+            },
+        };
+        self.measured
     }
     fn layout(&mut self, left: i32, top: i32) {
         self.layout(left, top)
@@ -109,7 +132,8 @@ impl Drawable for View {
         }
         if let Some(ops) = self.custom_ops.clone() {
             // Guest `onDraw` ops are view-local — translate into the
-            // view's absolute origin before replaying.
+            // view's absolute origin before replaying. Clipping to the
+            // view's bounds is the parent's job (clipChildren).
             c.save();
             c.translate(self.left, self.top);
             replay_guest_ops(c, &ops);
@@ -167,9 +191,32 @@ impl Drawable for ViewGroup {
                 Paint::color(bg),
             );
         }
-        // Children draw at their own laid-out origins (absolute coords).
+        // AOSP order: background → onDraw → children. A group whose
+        // dex class overrides onDraw still paints itself first —
+        // e.g. ViewPager2's page containers carrying recorded ops.
+        if let Some(ops) = self.view.custom_ops.clone() {
+            c.save();
+            c.translate(self.view.left, self.view.top);
+            replay_guest_ops(c, &ops);
+            c.restore();
+        }
+        // Children draw at their own laid-out origins (absolute
+        // coords), clipped to their bounds unless the app opted out
+        // with clipChildren=false (overflowing menus, FABs, …).
         for ch in &mut self.children {
-            ch.draw(c);
+            if self.clip_children {
+                let (cl, ct) = ch.origin();
+                let cs = ch.measured();
+                if dbg_flag("OVELO_CLIPDBG") {
+                    eprintln!("[clipdbg] kid clip {cl},{ct} {cs:?}");
+                }
+                c.save();
+                c.clip_rect(Rect::new(cl, ct, cs.w, cs.h));
+                ch.draw(c);
+                c.restore();
+            } else {
+                ch.draw(c);
+            }
         }
     }
     fn invalidate(&mut self) {
@@ -209,6 +256,8 @@ pub struct TextView {
     /// AOSP gravity flags (CENTER_HORIZONTAL=1, CENTER_VERTICAL=0x10,
     /// RIGHT/END=5, BOTTOM=0x50). 0 = top|start.
     pub gravity: i32,
+    /// `android:maxLines` — draws at most this many wrapped lines.
+    pub max_lines: Option<i32>,
 }
 
 impl TextView {
@@ -222,6 +271,7 @@ impl TextView {
             text_size,
             padding: 0,
             gravity: 0,
+            max_lines: None,
         };
         v.view.desired = v.measure_text(None);
         v
@@ -287,19 +337,23 @@ impl Drawable for TextView {
             Some((s.w - self.padding * 2).max(0)),
             false,
         );
-        if std::env::var_os("OVELO_POSDBG").is_some() && !self.text.is_empty() {
-            eprintln!("[posdbg] text {:?} at {},{} size {}", self.text, self.view.left, self.view.top, self.text_size);
-        }
         let lh = t.ascent + t.descent;
+        // `maxLines` truncates to the first n wrapped lines (AOSP
+        // ellipsizes the last one — hiding the overflow reads close
+        // enough for labels).
+        let lines: &[ovelo_ui::Line] = match self.max_lines {
+            Some(m) if m > 0 => &t.lines[..t.lines.len().min(m as usize)],
+            _ => &t.lines,
+        };
         // Vertical gravity: 0x10 center, 0x50 bottom, else top.
-        let text_h = lh * t.lines.len().max(1) as i32;
+        let text_h = lh * lines.len().max(1) as i32;
         let vy = match self.gravity & 0x70 {
             0x10 => self.view.top + (s.h - text_h) / 2,
             0x50 => self.view.top + s.h - self.padding - text_h,
             _ => self.view.top + self.padding,
         };
         let mut baseline = vy + t.ascent;
-        for line in &t.lines {
+        for line in lines {
             let seg = &self.text[line.range.0..line.range.1];
             // Horizontal gravity: 1 center, 5 right/end, else left.
             let tx = match self.gravity & 0x7 {
@@ -307,6 +361,20 @@ impl Drawable for TextView {
                 0x5 => self.view.left + s.w - self.padding - line.width,
                 _ => self.view.left + self.padding,
             };
+            if dbg_flag("OVELO_POSDBG") && !self.text.is_empty() {
+                eprintln!(
+                    "[posdbg] text {:?} view {},{} {:?} grav={:x} lines={} draw at {},{} size {}",
+                    self.text,
+                    self.view.left,
+                    self.view.top,
+                    s,
+                    self.gravity,
+                    lines.len(),
+                    tx,
+                    baseline,
+                    self.text_size
+                );
+            }
             c.draw_text(
                 seg,
                 tx,
@@ -441,6 +509,102 @@ impl Drawable for Button {
     }
 }
 
+/// Flatten absolute path commands into polylines, one per contour.
+/// Cubics use enough subdivisions for icon-sized curves; fill mode
+/// implicitly closes open contours during scan conversion.
+fn flatten_path(cmds: &[ovelo_dexrt::PathCmd]) -> Vec<Vec<f32>> {
+    use ovelo_dexrt::PathCmd as P;
+    let mut out = Vec::new();
+    let mut pts: Vec<f32> = Vec::new();
+    let mut cur = (0.0f32, 0.0f32);
+    let mut start = cur;
+    let mut open = false;
+    fn finish(out: &mut Vec<Vec<f32>>, pts: &mut Vec<f32>, open: &mut bool) {
+        if pts.len() >= 4 {
+            out.push(std::mem::take(pts));
+        } else {
+            pts.clear();
+        }
+        *open = false;
+    }
+    for cmd in cmds {
+        match *cmd {
+            P::MoveTo { x, y } => {
+                finish(&mut out, &mut pts, &mut open);
+                cur = (x, y);
+                start = cur;
+                pts.extend_from_slice(&[x, y]);
+                open = true;
+            }
+            P::LineTo { x, y } => {
+                if !open {
+                    pts.extend_from_slice(&[cur.0, cur.1]);
+                    start = cur;
+                    open = true;
+                }
+                pts.extend_from_slice(&[x, y]);
+                cur = (x, y);
+            }
+            P::QuadTo { cx, cy, x, y } => {
+                if !open {
+                    pts.extend_from_slice(&[cur.0, cur.1]);
+                    start = cur;
+                    open = true;
+                }
+                let (x0, y0) = cur;
+                for i in 1..=12 {
+                    let t = i as f32 / 12.0;
+                    let u = 1.0 - t;
+                    pts.extend_from_slice(&[
+                        u * u * x0 + 2.0 * u * t * cx + t * t * x,
+                        u * u * y0 + 2.0 * u * t * cy + t * t * y,
+                    ]);
+                }
+                cur = (x, y);
+            }
+            P::CubicTo {
+                cx1,
+                cy1,
+                cx2,
+                cy2,
+                x,
+                y,
+            } => {
+                if !open {
+                    pts.extend_from_slice(&[cur.0, cur.1]);
+                    start = cur;
+                    open = true;
+                }
+                let (x0, y0) = cur;
+                for i in 1..=16 {
+                    let t = i as f32 / 16.0;
+                    let u = 1.0 - t;
+                    pts.extend_from_slice(&[
+                        u * u * u * x0
+                            + 3.0 * u * u * t * cx1
+                            + 3.0 * u * t * t * cx2
+                            + t * t * t * x,
+                        u * u * u * y0
+                            + 3.0 * u * u * t * cy1
+                            + 3.0 * u * t * t * cy2
+                            + t * t * t * y,
+                    ]);
+                }
+                cur = (x, y);
+            }
+            P::Close => {
+                if open && cur != start {
+                    pts.extend_from_slice(&[start.0, start.1]);
+                    cur = start;
+                }
+                finish(&mut out, &mut pts, &mut open);
+            }
+        }
+    }
+    finish(&mut out, &mut pts, &mut open);
+    out
+}
+
 /// Replay a guest `onDraw` recording: each [`ovelo_dexrt::CanvasOp`]
 /// maps onto the `Canvas` subset (already translated to the view's
 /// absolute origin by the caller). Stroke-styled shapes approximate
@@ -489,7 +653,13 @@ fn replay_guest_ops(c: &mut Canvas, ops: &[ovelo_dexrt::CanvasOp]) {
                 *argb as u8,
                 (argb >> 24) as u8,
             )),
-            O::Rect { l, t, r, b, paint: p } => {
+            O::Rect {
+                l,
+                t,
+                r,
+                b,
+                paint: p,
+            } => {
                 let r = Rect::new(*l as i32, *t as i32, (*r - *l) as i32, (*b - *t) as i32);
                 stroke_or_fill(c, r, p, 0);
             }
@@ -505,7 +675,13 @@ fn replay_guest_ops(c: &mut Canvas, ops: &[ovelo_dexrt::CanvasOp]) {
                 let r = Rect::new(*l as i32, *t as i32, (*r - *l) as i32, (*b - *t) as i32);
                 stroke_or_fill(c, r, p, rx.max(*ry) as i32);
             }
-            O::Oval { l, t, r, b, paint: p } => {
+            O::Oval {
+                l,
+                t,
+                r,
+                b,
+                paint: p,
+            } => {
                 let r = Rect::new(*l as i32, *t as i32, (*r - *l) as i32, (*b - *t) as i32);
                 if p.style == 1 {
                     // STROKE — a real ring, not a rect outline.
@@ -533,6 +709,51 @@ fn replay_guest_ops(c: &mut Canvas, ops: &[ovelo_dexrt::CanvasOp]) {
                     stroke_or_fill(c, rect, p, *r as i32);
                 }
             }
+            O::Path {
+                cmds,
+                fill_type,
+                paint: p,
+            } => {
+                let contours = flatten_path(cmds);
+                let col = paint(p);
+                if p.style != 1 {
+                    let contours_i: Vec<Vec<i32>> = contours
+                        .iter()
+                        .map(|pts| pts.iter().map(|v| v.round() as i32).collect())
+                        .collect();
+                    c.fill_polys(&contours_i, fill_type % 2 == 1, *fill_type >= 2, col);
+                }
+                if p.style != 0 {
+                    let w = p.stroke_w.max(1.0) as i32;
+                    for pts in &contours {
+                        for xy in pts.chunks(2).zip(pts.chunks(2).skip(1)) {
+                            c.draw_line(
+                                xy.0[0] as i32,
+                                xy.0[1] as i32,
+                                xy.1[0] as i32,
+                                xy.1[1] as i32,
+                                w,
+                                col,
+                            );
+                        }
+                    }
+                }
+            }
+            O::FillPoly { pts, argb } => {
+                let ip: Vec<i32> = pts.iter().map(|f| *f as i32).collect();
+                c.fill_poly(
+                    &ip,
+                    Paint {
+                        color: Color::from_srgb8(
+                            (argb >> 16) as u8,
+                            (argb >> 8) as u8,
+                            *argb as u8,
+                            (argb >> 24) as u8,
+                        ),
+                        text_size: 12.0,
+                    },
+                );
+            }
             O::Line {
                 x0,
                 y0,
@@ -549,7 +770,12 @@ fn replay_guest_ops(c: &mut Canvas, ops: &[ovelo_dexrt::CanvasOp]) {
                     paint(p),
                 );
             }
-            O::Text { text, x, y, paint: p } => {
+            O::Text {
+                text,
+                x,
+                y,
+                paint: p,
+            } => {
                 let mut px = *x;
                 if p.align == 1 {
                     px -= c.measure(text, p.text_size.max(1.0)) / 2.0;
@@ -584,6 +810,23 @@ fn replay_guest_ops(c: &mut Canvas, ops: &[ovelo_dexrt::CanvasOp]) {
                     );
                 }
             }
+            // References are flattened inside the runtime before ops
+            // reach the framework — nothing to replay here.
+            O::Nested { .. } => {}
         }
     }
+}
+
+/// Cached env flag — per-frame checks must not hit getenv.
+fn dbg_flag(name: &'static str) -> bool {
+    static CACHE: std::sync::OnceLock<
+        std::sync::RwLock<std::collections::HashMap<&'static str, bool>>,
+    > = std::sync::OnceLock::new();
+    let cache = CACHE.get_or_init(|| std::sync::RwLock::new(std::collections::HashMap::new()));
+    if let Some(v) = cache.read().unwrap().get(name) {
+        return *v;
+    }
+    let v = std::env::var_os(name).is_some();
+    cache.write().unwrap().insert(name, v);
+    v
 }

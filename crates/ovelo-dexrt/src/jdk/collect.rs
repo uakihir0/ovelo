@@ -25,6 +25,89 @@ fn elem_eq(vm: &mut Vm, e: V, other: V) -> Rt<bool> {
 }
 use std::rc::Rc;
 
+/// Iterator bookkeeping: the collection handle it was minted from and
+/// the last index `next` returned (`-1` before/after a remove). Kept as
+/// pseudo fields so `HostState::Iter` can remain a cheap snapshot.
+const P_ITER_SOURCE: u32 = u32::MAX - 50;
+const P_ITER_LAST: u32 = u32::MAX - 51;
+const P_ITER_DESC: u32 = u32::MAX - 52;
+/// The value `next`/`previous` last returned — `remove` verifies the
+/// cursor index still holds it before trusting the index (a `poll()`
+/// mid-iteration shifts everything down).
+const P_ITER_LASTV: u32 = u32::MAX - 53;
+
+/// Copy-on-write collections iterate the array as of iterator
+/// creation — never the live list (Java spec: the snapshot does not
+/// reflect later adds/removes).
+fn is_cow_desc(desc: &str) -> bool {
+    matches!(
+        desc,
+        "Ljava/util/concurrent/CopyOnWriteArrayList;"
+            | "Ljava/util/concurrent/CopyOnWriteArraySet;"
+    )
+}
+
+/// Live backing-list length for a source-driven iterator — `None`
+/// when the iterated source isn't a `HostState::List` (set/map/array
+/// snapshot) or must not be read live (copy-on-write), in which case
+/// traversal falls back to the snapshot.
+fn live_list_len(vm: &Vm, h: u32) -> Option<usize> {
+    let src = match pseudo_get(vm, h, P_ITER_SOURCE) {
+        Some(V::Ref(s)) => s,
+        _ => return None,
+    };
+    match vm.heap.get(src) {
+        Some(Obj::Host {
+            state: HostState::List(l),
+            desc,
+            ..
+        }) if !is_cow_desc(desc) => Some(l.len()),
+        _ => None,
+    }
+}
+
+/// Element `at` of the iterator's live backing list (see
+/// [`live_list_len`]). Index-exact — duplicates included.
+fn live_list_get(vm: &Vm, h: u32, at: usize) -> Option<V> {
+    let src = match pseudo_get(vm, h, P_ITER_SOURCE) {
+        Some(V::Ref(s)) => s,
+        _ => return None,
+    };
+    match vm.heap.get(src) {
+        Some(Obj::Host {
+            state: HostState::List(l),
+            desc,
+            ..
+        }) if !is_cow_desc(desc) => l.get(at).copied(),
+        _ => None,
+    }
+}
+
+/// Iterator `remove` must throw UnsupportedOperationException on
+/// fixed-size / snapshot-mutating backing collections.
+fn iter_remove_unsupported(vm: &Vm, h: u32) -> bool {
+    let src = match pseudo_get(vm, h, P_ITER_SOURCE) {
+        Some(V::Ref(s)) => s,
+        _ => return true,
+    };
+    let fixed = [
+        "Ljava/util/Arrays$ArrayList;",
+        "Ljava/util/concurrent/CopyOnWriteArrayList;",
+        "Ljava/util/concurrent/CopyOnWriteArraySet;",
+        "Ljava/util/Collections$EmptyList;",
+        "Ljava/util/Collections$EmptySet;",
+        "Ljava/util/Collections$SingletonList;",
+        "Ljava/util/Collections$SingletonSet;",
+        "Ljava/util/Collections$UnmodifiableList;",
+        "Ljava/util/Collections$UnmodifiableSet;",
+        "Ljava/util/Collections$UnmodifiableCollection;",
+    ];
+    match vm.heap.get(src) {
+        Some(Obj::Host { desc, .. }) => fixed.contains(&desc.as_str()),
+        _ => false,
+    }
+}
+
 const LIST_CLASSES: &[&str] = &[
     "Ljava/util/ArrayList;",
     "Ljava/util/LinkedList;",
@@ -110,16 +193,26 @@ const ITER_CLASSES: &[&str] = &[
     "Ljava/util/HashMap$Entry;",
 ];
 
+/// `class` equals or descends from any of `kinds` — resolves the
+/// host ancestry once instead of re-scanning `host_supers` per kind.
+fn has_kind(class: &str, kinds: &[&str]) -> bool {
+    if kinds.contains(&class) {
+        return true;
+    }
+    let supers = host_supers(class);
+    kinds.iter().any(|k| supers.contains(k))
+}
+
 fn is_list(class: &str) -> bool {
-    LIST_CLASSES.iter().any(|c| desc_is_a(class, c))
+    has_kind(class, LIST_CLASSES)
 }
 
 fn is_map(class: &str) -> bool {
-    MAP_CLASSES.iter().any(|c| desc_is_a(class, c))
+    has_kind(class, MAP_CLASSES)
 }
 
 fn is_iter(class: &str) -> bool {
-    ITER_CLASSES.iter().any(|c| desc_is_a(class, c))
+    has_kind(class, ITER_CLASSES)
         || class.contains("$")
             && (class.starts_with("Ljava/util/") || class.starts_with("Landroid/util/"))
 }
@@ -128,9 +221,11 @@ fn is_iter(class: &str) -> bool {
 /// not the call site's declared type (guests declare `Collection`).
 fn is_set_obj(vm: &Vm, v: V) -> bool {
     match v {
-        V::Ref(h) if h != 0 => desc_is_a(&class_of(vm, v), "Ljava/util/Set;")
-            || desc_is_a(&class_of(vm, v), "Landroid/util/ArraySet;")
-            || class_of(vm, v).contains("$Set;"),
+        V::Ref(h) if h != 0 => {
+            desc_is_a(&class_of(vm, v), "Ljava/util/Set;")
+                || desc_is_a(&class_of(vm, v), "Landroid/util/ArraySet;")
+                || class_of(vm, v).contains("$Set;")
+        }
         _ => false,
     }
 }
@@ -159,7 +254,7 @@ pub(crate) fn call(
     } else if class == "Ljava/util/StringTokenizer;" {
         strtokenizer_call(vm, name, args)?
     } else if class == "Ljava/util/BitSet;" {
-        bitset_call(vm, name, args)
+        bitset_call(vm, name, sig, args)
     } else if class == "Ljava/util/StringJoiner;" {
         match name {
             "add" => {
@@ -186,7 +281,7 @@ pub(crate) fn call(
         || class == "Ljava/util/concurrent/atomic/AtomicIntegerFieldUpdater;"
         || class == "Ljava/util/concurrent/atomic/AtomicLongFieldUpdater;"
     {
-        fieldupdater_call(vm, name, args)?
+        fieldupdater_call(vm, class, name, args)?
     } else if class.starts_with("Ljava/util/concurrent/atomic/") {
         atomic_call(vm, class, name, args)
     } else if class == "Ljava/util/concurrent/CountDownLatch;" {
@@ -209,8 +304,30 @@ pub(crate) fn call(
         sparse_call(vm, class, name, args)?
     } else if class == "Ljava/util/concurrent/TimeUnit;" {
         match name {
-            "convert" | "toMillis" | "toNanos" | "toMicros" | "toSeconds" | "toMinutes"
-            | "toHours" | "toDays" => Some(Some(V::I64(i64v(*args.last().unwrap_or(&V::I64(0)))))),
+            // `dst.convert(d, src)` — real unit math (kotlin.time
+            // Duration builds its whole encoding on these; returning
+            // the raw arg turns Room's 30s pool timeout into 0).
+            "convert" => {
+                let dst = lang::enum_ordinal(vm, args[0]);
+                let src = lang::enum_ordinal(vm, *args.get(2).unwrap_or(&args[0]));
+                let d = i64v(args.get(1).copied().unwrap_or(V::I64(0)));
+                Some(Some(V::I64(timeunit_convert(dst, src, d))))
+            }
+            "toNanos" | "toMicros" | "toMillis" | "toSeconds" | "toMinutes" | "toHours"
+            | "toDays" => {
+                let dst = match name {
+                    "toNanos" => 0,
+                    "toMicros" => 1,
+                    "toSeconds" => 3,
+                    "toMinutes" => 4,
+                    "toHours" => 5,
+                    "toDays" => 6,
+                    _ => 2,
+                };
+                let src = lang::enum_ordinal(vm, args[0]);
+                let d = i64v(args.get(1).copied().unwrap_or(V::I64(0)));
+                Some(Some(V::I64(timeunit_convert(dst, src, d))))
+            }
             "sleep" | "timedWait" | "timedJoin" => Some(None),
             _ => None,
         }
@@ -263,10 +380,34 @@ pub(crate) fn call(
             "isDone" | "isCancelled" => Some(Some(V::I32(1))),
             "cancel" => Some(Some(V::I32(1))),
             "park" | "parkNanos" | "parkUntil" => {
-                // LockSupport.park* — run queued work inline so the
-                // waiter sees its completion (see `park_drain`); past
-                // the nesting cap it falls back to unwind+requeue.
+                // LockSupport.park* — a timed park records its wake
+                // deadline so an idling thread (kotlinx scheduler
+                // worker, ~60s keep-alive) sleeps in `delayed_runnables`
+                // instead of busy-cycling the drain; `due=now` requeues
+                // were the tasks.org 100%-CPU spin. parkNanos(0)/park
+                // keep the inline drain: queued work may complete the
+                // wait, and past the nesting cap it unwinds+requeues.
+                let due_ms = match name {
+                    "parkNanos" => match args.last().copied() {
+                        Some(v) => now_ms().saturating_add(i64v(v).max(0) / 1_000_000),
+                        None => now_ms(),
+                    },
+                    "parkUntil" => args.last().copied().map(i64v).unwrap_or_default(),
+                    _ => 0,
+                };
+                if due_ms > now_ms() && vm.cur_runnable != 0 {
+                    vm.sleep_until.insert(vm.cur_runnable, due_ms.max(0) as u64);
+                    vm.park_waiters.insert(vm.cur_runnable);
+                    return Err(crate::E::Vm(crate::err("ovelo.park")));
+                }
                 vm.park_drain()?;
+                Some(None)
+            }
+            "unpark" => {
+                // LockSupport.unpark — revive workers that parked out
+                // of the live queue, and cut delayed interruptible
+                // sleeps short (same coarse wake as Unsafe.unpark).
+                vm.wake_parked();
                 Some(None)
             }
             "offer" | "add" | "put" | "take" | "poll" | "remove" => {
@@ -392,7 +533,8 @@ fn list_call(vm: &mut Vm, name: &str, sig: &str, args: &[V]) -> Rt<Option<Option
             // on `add` reporting "already present" via false.
             let is_set = is_set_obj(vm, args[0]);
             let dup = is_set
-                && list_ref(vm, h).is_some_and(|l| l.iter().any(|e| value_eq(vm, *e, args[1])));
+                && list_snapshot(vm, h)
+                    .is_some_and(|l| l.iter().any(|e| value_eq(vm, *e, args[1])));
             let l = match list_mut(vm, h) {
                 Some(l) => l,
                 None => return Ok(None),
@@ -403,6 +545,9 @@ fn list_call(vm: &mut Vm, name: &str, sig: &str, args: &[V]) -> Rt<Option<Option
             } else if dup {
                 Some(Some(V::I32(0)))
             } else {
+                if crate::dbg_flag("OVELO_ITERDBG") && matches!(args[1], V::Ref(0)) {
+                    eprintln!("[iterdbg] add(null) on h{h} len={}", l.len());
+                }
                 l.push(args[1]);
                 Some(Some(V::I32(1)))
             }
@@ -416,8 +561,7 @@ fn list_call(vm: &mut Vm, name: &str, sig: &str, args: &[V]) -> Rt<Option<Option
             let src: Vec<V> = if is_set {
                 src.into_iter()
                     .filter(|v| {
-                        !list_ref(vm, h)
-                            .is_some_and(|l| l.iter().any(|e| value_eq(vm, *e, *v)))
+                        !list_ref(vm, h).is_some_and(|l| l.iter().any(|e| value_eq(vm, *e, *v)))
                     })
                     .collect()
             } else {
@@ -480,7 +624,12 @@ fn list_call(vm: &mut Vm, name: &str, sig: &str, args: &[V]) -> Rt<Option<Option
                 };
                 Some(Some(if i < l.len() { l.remove(i) } else { V::Ref(0) }))
             } else {
-                let items: Vec<V> = list_ref(vm, h).map(|l| l.to_vec()).unwrap_or_default();
+                // Guest-backed collections mutate themselves — without
+                // a host store this arm cannot remove, so defer to dex.
+                if list_mut(vm, h).is_none() {
+                    return Ok(None);
+                }
+                let items: Vec<V> = list_snapshot(vm, h).unwrap_or_default();
                 let mut pos = None;
                 for (i, e) in items.iter().enumerate() {
                     if elem_eq(vm, *e, args[1])? {
@@ -500,6 +649,10 @@ fn list_call(vm: &mut Vm, name: &str, sig: &str, args: &[V]) -> Rt<Option<Option
             }
         }
         "removeAll" | "removeIf" | "retainAll" => {
+            // Guest-backed collections mutate themselves.
+            if list_mut(vm, h).is_none() {
+                return Ok(None);
+            }
             if name == "removeIf" {
                 Some(Some(V::I32(0))) // predicate not run — keep contents
             } else {
@@ -514,7 +667,7 @@ fn list_call(vm: &mut Vm, name: &str, sig: &str, args: &[V]) -> Rt<Option<Option
                     },
                     _ => vec![],
                 };
-                let cur: Vec<V> = list_ref(vm, h).cloned().unwrap_or_default();
+                let cur: Vec<V> = list_snapshot(vm, h).unwrap_or_default();
                 let keep: Vec<bool> = cur
                     .iter()
                     .map(|e| {
@@ -537,54 +690,56 @@ fn list_call(vm: &mut Vm, name: &str, sig: &str, args: &[V]) -> Rt<Option<Option
             }
         }
         "get" => {
-            let l = match list_ref(vm, h) {
-                Some(l) => l,
-                None => return Ok(None),
-            };
+            if list_len(vm, h).is_none() {
+                return Ok(None);
+            }
             let i = i32v(args[1]) as usize;
-            match l.get(i) {
+            match list_get(vm, h, i) {
                 // Java throws, it does not return null — guests catch
                 // IndexOutOfBoundsException where a null would NPE
                 // later (NewPipe Tab.getTabName on the default tab
                 // list).
-                Some(v) => Some(Some(*v)),
+                Some(v) => Some(Some(v)),
                 None => {
                     return Err(vm.throw_builtin(
                         "Ljava/lang/IndexOutOfBoundsException;",
-                        &format!("List.get({i}) on size {}", l.len()),
+                        &format!("List.get({i}) on size {}", list_len(vm, h).unwrap_or(0)),
                     ));
                 }
             }
         }
-        "element" | "getFirst" | "getLast" => {
-            let l = match list_ref(vm, h) {
-                Some(l) => l,
-                None => return Ok(None),
-            };
-            let v = if name == "getLast" {
-                l.last()
+        "element" | "getFirst" | "getLast" | "first" | "last" => {
+            if list_len(vm, h).is_none() {
+                return Ok(None);
+            }
+            let i = if matches!(name, "getLast" | "last") {
+                list_len(vm, h).unwrap_or(0).wrapping_sub(1)
             } else {
-                l.first()
+                0
             };
-            match v {
-                Some(v) => Some(Some(*v)),
+            match list_get(vm, h, i) {
+                Some(v) => Some(Some(v)),
                 None => {
                     return Err(vm.throw_builtin("Ljava/util/NoSuchElementException;", name));
                 }
             }
         }
         "peek" | "peekFirst" | "peekLast" => {
-            let l = match list_ref(vm, h) {
-                Some(l) => l,
-                None => return Ok(None),
+            if list_len(vm, h).is_none() {
+                return Ok(None);
+            }
+            let i = if name == "peekLast" {
+                list_len(vm, h).unwrap_or(0).wrapping_sub(1)
+            } else {
+                0
             };
-            let v = match name {
-                "peekLast" => l.last().copied().unwrap_or(V::Ref(0)),
-                _ => l.first().copied().unwrap_or(V::Ref(0)),
-            };
-            Some(Some(v))
+            Some(Some(list_get(vm, h, i).unwrap_or(V::Ref(0))))
         }
         "set" => {
+            // Guest-backed collections mutate themselves.
+            if list_mut(vm, h).is_none() {
+                return Ok(None);
+            }
             let n = list_ref(vm, h).map(|l| l.len()).unwrap_or(0);
             let i = i32v(args[1]) as usize;
             if i >= n {
@@ -600,21 +755,25 @@ fn list_call(vm: &mut Vm, name: &str, sig: &str, args: &[V]) -> Rt<Option<Option
             Some(Some(std::mem::replace(&mut l[i], args[2])))
         }
         "size" => {
-            let n = list_ref(vm, h).map(|l| l.len()).unwrap_or(0);
+            let n = list_len(vm, h).unwrap_or(0);
             Some(Some(V::I32(n as i32)))
         }
         "isEmpty" => {
-            let e = list_ref(vm, h).map(|l| l.is_empty()).unwrap_or(true);
+            let e = list_len(vm, h).unwrap_or(0) == 0;
             Some(Some(V::I32(e as i32)))
         }
         "clear" => {
+            // Guest-backed collections mutate themselves.
+            if list_mut(vm, h).is_none() {
+                return Ok(None);
+            }
             if let Some(l) = list_mut(vm, h) {
                 l.clear();
             }
             Some(None)
         }
         "contains" => {
-            let items: Vec<V> = list_ref(vm, h).map(|l| l.to_vec()).unwrap_or_default();
+            let items: Vec<V> = list_snapshot(vm, h).unwrap_or_default();
             let mut c = false;
             for e in &items {
                 if elem_eq(vm, *e, args[1])? {
@@ -622,12 +781,39 @@ fn list_call(vm: &mut Vm, name: &str, sig: &str, args: &[V]) -> Rt<Option<Option
                     break;
                 }
             }
+            if crate::dbg_flag("OVELO_CONTAINSDBG") {
+                let kind = |e: &V| match e {
+                    V::Ref(eh) => {
+                        let k = match vm.heap.get(*eh) {
+                            Some(Obj::Str(_)) => "Str",
+                            Some(Obj::Instance { .. }) => "Inst",
+                            Some(Obj::Host { .. }) => "Host",
+                            Some(Obj::Array { .. }) => "Arr",
+                            Some(Obj::Class { .. }) => "Cls",
+                            _ => "?",
+                        };
+                        format!(
+                            "h{eh}:{}[{k}]sv={:?}",
+                            vm.dbg_class_of(*eh),
+                            super::sv(vm, *e)
+                        )
+                    }
+                    o => format!("{o:?}"),
+                };
+                let item0 = items.first().map(kind);
+                let arg = kind(&args[1]);
+                eprintln!(
+                    "[containsdbg] h{h} {} n={} item0={item0:?} arg={arg} -> {c}",
+                    vm.dbg_class_of(h),
+                    items.len()
+                );
+            }
             Some(Some(V::I32(c as i32)))
         }
         "containsAll" | "equals" => Some(Some(V::I32(1))),
         "indexOf" | "lastIndexOf" => {
-            let items: Vec<V> = match list_ref(vm, h) {
-                Some(l) => l.to_vec(),
+            let items: Vec<V> = match list_snapshot(vm, h) {
+                Some(l) => l,
                 None => return Ok(None),
             };
             let mut i = None;
@@ -649,19 +835,24 @@ fn list_call(vm: &mut Vm, name: &str, sig: &str, args: &[V]) -> Rt<Option<Option
             Some(Some(V::I32(i.map(|x| x as i32).unwrap_or(-1))))
         }
         "iterator" | "listIterator" | "descendingIterator" | "spliterator" => {
-            let items: Vec<V> = match list_ref(vm, h) {
+            // `list_snapshot`, not `list_ref`: guest collections backed
+            // by an `Obj::Array` (kotlin ArrayDeque's `elementData`
+            // ring) are invisible to `list_ref`, which only sees
+            // Host::List stores — they'd iterate empty (navigation
+            // `getBackStackEntry` found nothing and threw).
+            let items: Vec<V> = match list_snapshot(vm, h) {
                 Some(l) => {
-                    if std::env::var("OVELO_ITERDBG").is_ok() {
+                    if crate::dbg_flag("OVELO_ITERDBG") {
                         eprintln!(
                             "[iterdbg] iterator on h{h} {} len={}",
                             vm.dbg_class_of(h),
                             l.len()
                         );
                     }
-                    l.clone()
+                    l
                 }
                 None => {
-                    if std::env::var("OVELO_ITERDBG").is_ok() {
+                    if crate::dbg_flag("OVELO_ITERDBG") {
                         let cls = vm.dbg_class_of(h);
                         let kind = match vm.heap.get(h) {
                             Some(Obj::Host { state, .. }) => format!("host:{state:?}"),
@@ -671,22 +862,43 @@ fn list_call(vm: &mut Vm, name: &str, sig: &str, args: &[V]) -> Rt<Option<Option
                             Some(Obj::Array { data, .. }) => format!("arr:{}", data.len()),
                             other => format!("{other:?}"),
                         };
-                        eprintln!("[iterdbg] iterator on h{h} {cls} {kind} -> empty");
+                        eprintln!("[iterdbg] iterator on h{h} {cls} {kind} -> dex");
                     }
-                    vec![]
+                    return Ok(None);
                 }
             };
-            Some(Some(host(
+            // `listIterator(I)` starts positioned at `I` (navigation
+            // walks the back stack in reverse from the end) and
+            // `descendingIterator` yields last-to-first.
+            // The cursor is source-coordinate: a descending iterator
+            // starts at the end and walks down (flag-driven, not a
+            // reversed snapshot) so remove() can map the last-returned
+            // element to its exact source index.
+            let descending = name == "descendingIterator";
+            let pos = if descending {
+                items.len()
+            } else if name == "listIterator" {
+                i32v(args.get(1).copied().unwrap_or(V::I32(0))).max(0) as usize
+            } else {
+                0
+            };
+            let pos = pos.min(items.len());
+            let it = host(
                 vm,
                 "Ljava/util/Iterator;",
-                HostState::Iter(Rc::new(items), 0),
-            )))
+                HostState::Iter(Rc::new(items), pos),
+            );
+            if let V::Ref(ih) = it {
+                pseudo_set(vm, ih, P_ITER_SOURCE, V::Ref(h));
+                pseudo_set(vm, ih, P_ITER_LAST, V::I32(-1));
+                if descending {
+                    pseudo_set(vm, ih, P_ITER_DESC, V::I32(1));
+                }
+            }
+            Some(Some(it))
         }
         "toArray" => {
-            let items: Vec<V> = match list_ref(vm, h) {
-                Some(l) => l.clone(),
-                None => vec![],
-            };
+            let items: Vec<V> = list_snapshot(vm, h).unwrap_or_default();
             let elem = match args.get(1) {
                 Some(V::Ref(ah)) => match vm.heap.get(*ah) {
                     Some(Obj::Array { elem, .. }) => elem.clone(),
@@ -698,15 +910,12 @@ fn list_call(vm: &mut Vm, name: &str, sig: &str, args: &[V]) -> Rt<Option<Option
         }
         "subList" => {
             let (a, b) = (i32v(args[1]) as usize, i32v(args[2]) as usize);
-            let items: Vec<V> = match list_ref(vm, h) {
-                Some(l) => l
-                    .iter()
-                    .skip(a)
-                    .take(b.saturating_sub(a))
-                    .copied()
-                    .collect(),
-                None => vec![],
-            };
+            let items: Vec<V> = list_snapshot(vm, h)
+                .unwrap_or_default()
+                .into_iter()
+                .skip(a)
+                .take(b.saturating_sub(a))
+                .collect();
             Some(Some(host(vm, "Ljava/util/List;", HostState::List(items))))
         }
         "forEach" | "replaceAll" | "sort" | "stream" | "parallelStream" => {
@@ -723,7 +932,9 @@ fn list_call(vm: &mut Vm, name: &str, sig: &str, args: &[V]) -> Rt<Option<Option
             }
         }
         "hashCode" => {
-            let hc = list_ref(vm, h).map(|l| l.len() as i32 * 31).unwrap_or(1);
+            let hc = list_snapshot(vm, h)
+                .map(|l| l.len() as i32 * 31)
+                .unwrap_or(1);
             Some(Some(V::I32(hc)))
         }
         _ => None,
@@ -739,7 +950,35 @@ fn map_call(vm: &mut Vm, name: &str, sig: &str, args: &[V]) -> Rt<Option<Option<
     };
     let class = class_of(vm, args[0]);
     Ok(match name {
+        "<init>" => {
+            // Copy ctor HashMap(Map)/LinkedHashMap(Map) — kotlin
+            // `Map.toMap` materializes its copy through it; without a
+            // copy the destination starts empty and callers iterate
+            // nothing (navigation NavigatorProvider attach loop).
+            if let Some(V::Ref(sh)) = args.get(1).copied() {
+                for (k, v) in map_pairs_of(vm, sh) {
+                    map_put(vm, h, k, v);
+                }
+            }
+            Some(None)
+        }
         "put" => {
+            if crate::dbg_flag("OVELO_MAPDBG") {
+                let ks = s(
+                    vm,
+                    match args[1] {
+                        V::Ref(h2) => h2,
+                        _ => 0,
+                    },
+                )
+                .unwrap_or_else(|| format!("{:?}", args[1]));
+                let caller = vm
+                    .stack
+                    .last()
+                    .map(|&m| vm.describe_method(m).to_string())
+                    .unwrap_or_default();
+                eprintln!("[map] put h={h} key={ks} @{caller}");
+            }
             let prev = map_put(vm, h, args[1], args[2]);
             Some(Some(prev.unwrap_or(V::Ref(0))))
         }
@@ -796,6 +1035,23 @@ fn map_call(vm: &mut Vm, name: &str, sig: &str, args: &[V]) -> Rt<Option<Option<
             Some(None)
         }
         "get" | "getOrDefault" | "remove" | "removeObject" => {
+            if crate::dbg_flag("OVELO_MAPDBG") {
+                let ks = s(
+                    vm,
+                    match args[1] {
+                        V::Ref(h2) => h2,
+                        _ => 0,
+                    },
+                )
+                .unwrap_or_else(|| format!("{:?}", args[1]));
+                let hit = map_get(vm, h, args[1]).is_some();
+                let caller = vm
+                    .stack
+                    .last()
+                    .map(|&m| vm.describe_method(m).to_string())
+                    .unwrap_or_default();
+                eprintln!("[map] get h={h} key={ks} -> {hit} @{caller}");
+            }
             if name == "remove" || name == "removeObject" {
                 Some(Some(map_remove(vm, h, args[1]).unwrap_or(V::Ref(0))))
             } else {
@@ -854,7 +1110,10 @@ fn map_call(vm: &mut Vm, name: &str, sig: &str, args: &[V]) -> Rt<Option<Option<
         | "getCharSequenceArray"
         | "getClassLoader" => {
             Some(Some(
-                map_get(vm, h, args[1])
+                // `getClassLoader` takes no key arg — a zero-arg
+                // call must not index args[1].
+                args.get(1)
+                    .and_then(|k| map_get(vm, h, *k))
                     .or_else(|| match args.get(2) {
                         // `getParcelable(key, Class)` and friends take a type
                         // token as the last arg, not a default value — a miss
@@ -890,13 +1149,11 @@ fn map_call(vm: &mut Vm, name: &str, sig: &str, args: &[V]) -> Rt<Option<Option<
             Some(None)
         }
         "keySet" | "entrySet" | "values" => {
-            let pairs: Vec<(V, V)> = match vm.heap.get(h) {
-                Some(Obj::Host {
-                    state: HostState::Map(m),
-                    ..
-                }) => m.clone(),
-                _ => vec![],
-            };
+            // Guest Map subclasses (nanojson `JsonObject extends
+            // HashMap`) keep pairs in a lazily-minted backing — guest
+            // serializers iterate these views (JsonStringWriter
+            // emitted `{}` when they came back empty).
+            let pairs: Vec<(V, V)> = map_pairs_of(vm, h);
             let out: Vec<V> = match name {
                 "entrySet" => pairs
                     .into_iter()
@@ -1012,16 +1269,18 @@ fn map_call(vm: &mut Vm, name: &str, sig: &str, args: &[V]) -> Rt<Option<Option<
         | "lastEntry" => {
             let pairs = map_pairs(vm, h);
             let nm = nav_name(name, nav_desc(vm, h));
-            Some(Some(
-                match nav_pick(vm, &pairs, nm, args.get(1).copied()) {
-                    Some((k, v)) => entry_of(vm, k, v),
-                    None => V::Ref(0),
-                },
-            ))
+            Some(Some(match nav_pick(vm, &pairs, nm, args.get(1).copied()) {
+                Some((k, v)) => entry_of(vm, k, v),
+                None => V::Ref(0),
+            }))
         }
         "pollFirstEntry" | "pollLastEntry" => {
             let pairs = map_pairs(vm, h);
-            let op = if name == "pollFirstEntry" { "first" } else { "last" };
+            let op = if name == "pollFirstEntry" {
+                "first"
+            } else {
+                "last"
+            };
             let op = nav_name(op, nav_desc(vm, h));
             match nav_pick(vm, &pairs, op, None) {
                 Some((k, v)) => {
@@ -1073,25 +1332,14 @@ fn map_call(vm: &mut Vm, name: &str, sig: &str, args: &[V]) -> Rt<Option<Option<
                     args.get(1).copied(),
                     args.get(2).map(|v| i32v(*v) != 0).unwrap_or(true),
                 ),
-                (_, false) => (
-                    args.get(1).copied(),
-                    true,
-                    args.get(2).copied(),
-                    false,
-                ),
-                (_, true) => (
-                    args.get(2).copied(),
-                    true,
-                    args.get(1).copied(),
-                    false,
-                ),
+                (_, false) => (args.get(1).copied(), true, args.get(2).copied(), false),
+                (_, true) => (args.get(2).copied(), true, args.get(1).copied(), false),
             };
             let mut out = Vec::new();
             for &(k, v) in &pairs {
                 let lo_ok = lo.is_none_or(|p| {
                     let c = key_cmp(vm, k, p);
-                    c == std::cmp::Ordering::Greater
-                        || (lo_incl && c == std::cmp::Ordering::Equal)
+                    c == std::cmp::Ordering::Greater || (lo_incl && c == std::cmp::Ordering::Equal)
                 });
                 let hi_ok = hi.is_none_or(|p| {
                     let c = key_cmp(vm, k, p);
@@ -1113,7 +1361,11 @@ fn map_call(vm: &mut Vm, name: &str, sig: &str, args: &[V]) -> Rt<Option<Option<
             if (name == "descendingKeySet") != nav_desc(vm, h) {
                 keys.reverse();
             }
-            Some(Some(host(vm, "Ljava/util/NavigableSet;", HostState::List(keys))))
+            Some(Some(host(
+                vm,
+                "Ljava/util/NavigableSet;",
+                HostState::List(keys),
+            )))
         }
         "descendingMap" => {
             let mut pairs = map_pairs(vm, h);
@@ -1139,13 +1391,7 @@ fn map_call(vm: &mut Vm, name: &str, sig: &str, args: &[V]) -> Rt<Option<Option<
 
 /// Snapshot of a host map's pairs (empty for non-map receivers).
 fn map_pairs(vm: &Vm, h: u32) -> Vec<(V, V)> {
-    match vm.heap.get(h) {
-        Some(Obj::Host {
-            state: HostState::Map(m),
-            ..
-        }) => m.clone(),
-        _ => vec![],
-    }
+    map_pairs_of(vm, h)
 }
 
 /// Natural ordering for sorted-map keys: boxed numbers compare
@@ -1308,11 +1554,19 @@ fn iter_call(vm: &mut Vm, name: &str, args: &[V]) -> Rt<Option<Option<V>>> {
             Some(None)
         }
         "hasNext" | "hasMoreElements" => {
+            let desc = matches!(pseudo_get(vm, h, P_ITER_DESC), Some(V::I32(1)));
             let n = match vm.heap.get(h) {
                 Some(Obj::Host {
                     state: HostState::Iter(items, pos),
                     ..
-                }) => (*pos < items.len()) as i32,
+                }) => {
+                    let len = live_list_len(vm, h).unwrap_or(items.len());
+                    if desc {
+                        (*pos > 0) as i32
+                    } else {
+                        (*pos < len) as i32
+                    }
+                }
                 Some(Obj::Host {
                     state: HostState::List(l),
                     ..
@@ -1322,19 +1576,61 @@ fn iter_call(vm: &mut Vm, name: &str, args: &[V]) -> Rt<Option<Option<V>>> {
             Some(Some(V::I32(n)))
         }
         "next" | "nextElement" => {
-            let (v, ok) = match vm.heap.get_mut(h) {
+            if matches!(
+                vm.heap.get(h),
                 Some(Obj::Host {
-                    state: HostState::Iter(items, pos),
+                    state: HostState::Iter(..),
                     ..
-                }) => {
-                    if *pos < items.len() {
-                        let v = items[*pos];
-                        *pos += 1;
-                        (v, true)
+                })
+            ) {
+                let desc = matches!(pseudo_get(vm, h, P_ITER_DESC), Some(V::I32(1)));
+                let (pos, len) = match vm.heap.get(h) {
+                    Some(Obj::Host {
+                        state: HostState::Iter(items, pos),
+                        ..
+                    }) => (*pos, live_list_len(vm, h).unwrap_or(items.len())),
+                    _ => (0, 0),
+                };
+                let at = if desc {
+                    if pos == 0 {
+                        None
                     } else {
-                        (V::Ref(0), false)
+                        Some(pos - 1)
                     }
+                } else if pos < len {
+                    Some(pos)
+                } else {
+                    None
+                };
+                let Some(at) = at else {
+                    let e = vm
+                        .throw_builtin("Ljava/util/NoSuchElementException;", "iterator exhausted");
+                    return Err(e);
+                };
+                let v = live_list_get(vm, h, at)
+                    .or_else(|| match vm.heap.get(h) {
+                        Some(Obj::Host {
+                            state: HostState::Iter(items, _),
+                            ..
+                        }) => items.get(at).copied(),
+                        _ => None,
+                    })
+                    .unwrap_or(V::Ref(0));
+                if crate::dbg_flag("OVELO_ITERDBG") && matches!(v, V::Ref(0)) {
+                    eprintln!("[iterdbg] next on h{h} at={at} yields null");
                 }
+                if let Some(Obj::Host {
+                    state: HostState::Iter(_, pos),
+                    ..
+                }) = vm.heap.get_mut(h)
+                {
+                    *pos = if desc { at } else { at + 1 };
+                }
+                pseudo_set(vm, h, P_ITER_LAST, V::I32(at as i32));
+                pseudo_set(vm, h, P_ITER_LASTV, v);
+                return Ok(Some(Some(v)));
+            }
+            let (v, ok) = match vm.heap.get_mut(h) {
                 Some(Obj::Host {
                     state: HostState::List(l),
                     ..
@@ -1354,9 +1650,166 @@ fn iter_call(vm: &mut Vm, name: &str, args: &[V]) -> Rt<Option<Option<V>>> {
             }
             Some(Some(v))
         }
-        "hasPrevious" => Some(Some(V::I32(0))),
-        "previous" | "nextIndex" | "previousIndex" => Some(Some(V::I32(0))),
-        "remove" | "set" | "add" | "forEachRemaining" => Some(None),
+        "hasPrevious" => {
+            let desc = matches!(pseudo_get(vm, h, P_ITER_DESC), Some(V::I32(1)));
+            let n = match vm.heap.get(h) {
+                Some(Obj::Host {
+                    state: HostState::Iter(items, pos),
+                    ..
+                }) => {
+                    let len = live_list_len(vm, h).unwrap_or(items.len());
+                    if desc {
+                        (*pos < len) as i32
+                    } else {
+                        (*pos > 0) as i32
+                    }
+                }
+                _ => 0,
+            };
+            Some(Some(V::I32(n)))
+        }
+        "previous" => {
+            let desc = matches!(pseudo_get(vm, h, P_ITER_DESC), Some(V::I32(1)));
+            let (pos, len) = match vm.heap.get(h) {
+                Some(Obj::Host {
+                    state: HostState::Iter(items, pos),
+                    ..
+                }) => (*pos, live_list_len(vm, h).unwrap_or(items.len())),
+                _ => (0, 0),
+            };
+            let at = if desc {
+                if pos < len {
+                    Some(pos)
+                } else {
+                    None
+                }
+            } else if pos > 0 {
+                Some(pos - 1)
+            } else {
+                None
+            };
+            let Some(at) = at else {
+                let e = vm.throw_builtin("Ljava/util/NoSuchElementException;", "previous at start");
+                return Err(e);
+            };
+            let v = live_list_get(vm, h, at)
+                .or_else(|| match vm.heap.get(h) {
+                    Some(Obj::Host {
+                        state: HostState::Iter(items, _),
+                        ..
+                    }) => items.get(at).copied(),
+                    _ => None,
+                })
+                .unwrap_or(V::Ref(0));
+            if let Some(Obj::Host {
+                state: HostState::Iter(_, pos),
+                ..
+            }) = vm.heap.get_mut(h)
+            {
+                *pos = if desc { at + 1 } else { at };
+            }
+            pseudo_set(vm, h, P_ITER_LAST, V::I32(at as i32));
+            pseudo_set(vm, h, P_ITER_LASTV, v);
+            Some(Some(v))
+        }
+        "nextIndex" | "previousIndex" => {
+            let n = match vm.heap.get(h) {
+                Some(Obj::Host {
+                    state: HostState::Iter(items, pos),
+                    ..
+                }) => if name == "nextIndex" {
+                    *pos as i32
+                } else {
+                    *pos as i32 - 1
+                }
+                .clamp(-1, items.len() as i32),
+                _ => -1,
+            };
+            Some(Some(V::I32(n)))
+        }
+        "remove" => {
+            let last = match pseudo_get(vm, h, P_ITER_LAST) {
+                Some(V::I32(n)) => n,
+                _ => -1,
+            };
+            if last < 0 {
+                let e = vm.throw_builtin(
+                    "Ljava/lang/IllegalStateException;",
+                    "remove before next/previous",
+                );
+                return Err(e);
+            }
+            if iter_remove_unsupported(vm, h) {
+                let e = vm.throw_builtin(
+                    "Ljava/lang/UnsupportedOperationException;",
+                    "iterator remove",
+                );
+                return Err(e);
+            }
+            // Index-exact removal while the index still holds the
+            // returned element; if a `poll()`/direct removal shifted
+            // the list mid-iteration, re-locate the element by value
+            // (absent → it is already gone, nothing to remove).
+            let at = last as usize;
+            let item = pseudo_get(vm, h, P_ITER_LASTV).unwrap_or(V::Ref(0));
+            let mut removed_at = None;
+            if let Some(V::Ref(src)) = pseudo_get(vm, h, P_ITER_SOURCE) {
+                let live = matches!(
+                    vm.heap.get(src),
+                    Some(Obj::Host {
+                        state: HostState::List(_),
+                        desc,
+                        ..
+                    }) if !is_cow_desc(desc)
+                );
+                if live {
+                    let idx = {
+                        let hit = match vm.heap.get(src) {
+                            Some(Obj::Host {
+                                state: HostState::List(l),
+                                ..
+                            }) => {
+                                if at < l.len() && value_eq(vm, l[at], item) {
+                                    Some(at)
+                                } else {
+                                    l.iter().position(|e| value_eq(vm, *e, item))
+                                }
+                            }
+                            _ => None,
+                        };
+                        hit
+                    };
+                    if let Some(pos) = idx {
+                        if let Some(Obj::Host {
+                            state: HostState::List(l),
+                            ..
+                        }) = vm.heap.get_mut(src)
+                        {
+                            if pos < l.len() {
+                                l.remove(pos);
+                                removed_at = Some(pos);
+                            }
+                        }
+                    }
+                }
+            }
+            if let Some(rm) = removed_at {
+                // Everything at/after the removed index shifted down —
+                // rewind the cursor when it sat past the element.
+                if let Some(Obj::Host {
+                    state: HostState::Iter(_, pos),
+                    ..
+                }) = vm.heap.get_mut(h)
+                {
+                    if rm < *pos {
+                        *pos -= 1;
+                    }
+                }
+            }
+            pseudo_set(vm, h, P_ITER_LAST, V::I32(-1));
+            Some(None)
+        }
+        "set" | "add" | "forEachRemaining" => Some(None),
         "getKey" => Some(Some(
             slot_of(vm, h)
                 .or_else(|| pseudo_get(vm, h, P_COMPONENT))
@@ -1385,14 +1838,21 @@ fn collections_static(vm: &mut Vm, name: &str, args: &[V]) -> Option<Option<V>> 
                 ("Ljava/util/Map;", HostState::Map(vec![]))
             } else if name.contains("Iterator") || name.contains("Enumeration") {
                 ("Ljava/util/Iterator;", HostState::Iter(Rc::new(vec![]), 0))
+            } else if name.contains("Set") {
+                ("Ljava/util/Collections$EmptySet;", HostState::List(vec![]))
             } else {
-                ("Ljava/util/List;", HostState::List(vec![]))
+                ("Ljava/util/Collections$EmptyList;", HostState::List(vec![]))
             };
             Some(Some(host(vm, d, st)))
         }
-        "singletonList" | "singleton" => Some(Some(host(
+        "singletonList" => Some(Some(host(
             vm,
-            "Ljava/util/List;",
+            "Ljava/util/Collections$SingletonList;",
+            HostState::List(vec![args[0]]),
+        ))),
+        "singleton" => Some(Some(host(
+            vm,
+            "Ljava/util/Collections$SingletonSet;",
             HostState::List(vec![args[0]]),
         ))),
         "singletonMap" => Some(Some(host(
@@ -1504,10 +1964,21 @@ fn collections_static(vm: &mut Vm, name: &str, args: &[V]) -> Option<Option<V>> 
         }
         "disjoint" => Some(Some(V::I32(0))),
         "addAll" => {
+            // Collections.addAll(c, T... elements): the vararg arrives
+            // as a single T[] arg — push its elements, not the array
+            // itself, or `getAppDatabase`-style loops later field-read
+            // the array and crash.
             if let V::Ref(h) = args[0] {
                 for v in &args[1..] {
+                    let items: Vec<V> = match v {
+                        V::Ref(ah) => match vm.heap.get(*ah) {
+                            Some(Obj::Array { data, .. }) => data.clone(),
+                            _ => vec![*v],
+                        },
+                        _ => vec![*v],
+                    };
                     if let Some(l) = list_mut(vm, h) {
-                        l.push(*v);
+                        l.extend(items);
                     }
                 }
             }
@@ -1558,7 +2029,13 @@ fn arrays_static(vm: &mut Vm, name: &str, _sig: &str, args: &[V]) -> Rt<Option<O
                 },
                 _ => args.to_vec(),
             };
-            Some(Some(host(vm, "Ljava/util/List;", HostState::List(items))))
+            // Fixed-size per Arrays$ArrayList — the descriptor names it
+            // so iterator remove() can throw UOE like the JDK.
+            Some(Some(host(
+                vm,
+                "Ljava/util/Arrays$ArrayList;",
+                HostState::List(items),
+            )))
         }
         "toString" | "deepToString" => {
             let t = match args[0] {
@@ -1599,10 +2076,22 @@ fn arrays_static(vm: &mut Vm, name: &str, _sig: &str, args: &[V]) -> Rt<Option<O
                 },
                 _ => "Ljava/lang/Object;".into(),
             };
+            // The 3-arg `copyOf`/`copyOfRange` carries the target array
+            // type as a `Class` — `ArrayList.toArray(MemberScope[])` calls
+            // `copyOf(Object[], n, MemberScope[].class)` and must yield
+            // `MemberScope[]`, not `Object[]` (downstream check-cast).
+            let elem = args
+                .get(if name == "copyOf" { 2 } else { 3 })
+                .and_then(|v| match v {
+                    V::Ref(ch) => class_desc_of(vm, *ch),
+                    _ => None,
+                })
+                .and_then(|d| d.strip_prefix('[').map(str::to_string))
+                .unwrap_or(elem);
             let out = if name == "copyOf" {
                 let n = i32v(*args.get(1).unwrap_or(&V::I32(0))).max(0) as usize;
                 let mut d = data;
-                d.resize(n, V::I32(0));
+                d.resize(n, V::default_for(&elem));
                 d
             } else {
                 let (a, b) = (i32v(args[1]).max(0) as usize, i32v(args[2]).max(0) as usize);
@@ -1612,28 +2101,40 @@ fn arrays_static(vm: &mut Vm, name: &str, _sig: &str, args: &[V]) -> Rt<Option<O
                     .take(b.saturating_sub(a))
                     .copied()
                     .collect();
-                d.resize(b - a, V::I32(0));
+                d.resize(b - a, V::default_for(&elem));
                 d
             };
             Some(Some(arr(vm, &elem, out)))
         }
         "fill" | "setAll" => {
             if let V::Ref(h) = args[0] {
-                if let Some(Obj::Array { data, .. }) = vm.heap.get_mut(h) {
+                if let Some(Obj::Array { elem, data }) = vm.heap.get_mut(h) {
+                    // Same canonicalization as `aput-object`: a bare I32(0)
+                    // stored into an object-typed array is the null ref.
+                    let canon = |v: V| {
+                        if matches!(v, V::I32(0))
+                            && (elem.starts_with('L') || elem.starts_with('['))
+                        {
+                            V::Ref(0)
+                        } else {
+                            v
+                        }
+                    };
                     if args.len() >= 4 {
                         // fill(arr, fromIndex, toIndex, val)
                         let (a, b, v) = (
                             i32v(args[1]).max(0) as usize,
                             (i32v(args[2]).max(0) as usize).min(data.len()),
-                            args[3],
+                            canon(args[3]),
                         );
                         for e in data.iter_mut().take(b).skip(a) {
                             *e = v;
                         }
                     } else {
                         // fill(arr, val)
+                        let v = canon(args[1]);
                         for e in data.iter_mut() {
-                            *e = args[1];
+                            *e = v;
                         }
                     }
                 }
@@ -1739,7 +2240,7 @@ fn hash_of(vm: &Vm, v: V) -> V {
 }
 
 /// java.util.Comparator-like ordering on primitive/string values.
-pub(crate) fn natural_cmp(vm: &Vm, a: V, b: V) -> i32 {
+pub(crate) fn natural_cmp(vm: &mut Vm, a: V, b: V) -> i32 {
     match (a, b) {
         (V::Ref(0), V::Ref(0)) => 0,
         (V::Ref(0), _) => -1,
@@ -1750,11 +2251,21 @@ pub(crate) fn natural_cmp(vm: &Vm, a: V, b: V) -> i32 {
             match (sa, sb) {
                 (Some(pa), Some(pb)) => pa.cmp(&pb) as i32,
                 _ => {
-                    let (va, vb) = (
-                        slot_of(vm, x).unwrap_or(V::I32(0)),
-                        slot_of(vm, y).unwrap_or(V::I32(0)),
-                    );
-                    (f64v(va) - f64v(vb)).signum() as i32
+                    // Guest objects with a real `compareTo` (okio
+                    // ByteString, HttpUrl, …) must order by it —
+                    // `Collections.sort` + dex `binarySearch` agree on
+                    // the guest ordering, so host stubs can't invent
+                    // one. Guest throws just mean "no compareTo".
+                    match vm.call_virtual_rt(x, "compareTo", &[V::Ref(y)]) {
+                        Ok(Some(v)) => i64v(v).signum() as i32,
+                        _ => {
+                            let (va, vb) = (
+                                slot_of(vm, x).unwrap_or(V::I32(0)),
+                                slot_of(vm, y).unwrap_or(V::I32(0)),
+                            );
+                            (f64v(va) - f64v(vb)).signum() as i32
+                        }
+                    }
                 }
             }
         }
@@ -1964,27 +2475,51 @@ fn strtokenizer_call(vm: &mut Vm, name: &str, args: &[V]) -> Rt<Option<Option<V>
     })
 }
 
-fn bitset_call(vm: &mut Vm, name: &str, args: &[V]) -> Option<Option<V>> {
+fn bitset_call(vm: &mut Vm, name: &str, sig: &str, args: &[V]) -> Option<Option<V>> {
     let V::Ref(h) = args.first().copied().unwrap_or(V::Ref(0)) else {
         return None;
     };
+    let p = params(sig);
     match name {
         "set" | "clear" | "flip" => {
-            let b = i32v(args[1]);
-            let bit = 1i64 << (b % 64);
-            if let Some(Obj::Host {
-                state: HostState::Slot(v),
-                ..
-            }) = vm.heap.get_mut(h)
-            {
-                let mut w = i64v(*v);
+            // Two forms each: `(I)` / `(I,Z)` single-bit and `(II)` /
+            // `(IIZ)` range. The receiver's bit word lives in the
+            // slot — `Obj::Instance` BitSets (allocated via
+            // `new-instance`) keep it in P_SLOT via slot_of/slot_put,
+            // not just `Obj::Host`.
+            let p1 = p.get(1).copied();
+            let (lo, hi, on) = if p1 == Some("I") {
+                // range form: (from, to) with optional boolean
+                (
+                    i32v(args[1]),
+                    i32v(args[2]),
+                    if p.len() == 3 {
+                        i32v(args[3]) != 0
+                    } else {
+                        true
+                    },
+                )
+            } else if p1 == Some("Z") {
+                (i32v(args[1]), i32v(args[1]) + 1, i32v(args[2]) != 0)
+            } else {
+                (i32v(args[1]), i32v(args[1]) + 1, true)
+            };
+            let mut w = slot_of(vm, h).map(i64v).unwrap_or(0);
+            for b in lo.max(0)..hi.clamp(0, 64) {
+                let bit = 1i64 << (b % 64);
                 match name {
-                    "set" => w |= bit,
+                    "set" => {
+                        if on {
+                            w |= bit;
+                        } else {
+                            w &= !bit;
+                        }
+                    }
                     "clear" => w &= !bit,
                     _ => w ^= bit,
                 }
-                *v = V::I64(w);
             }
+            slot_put(vm, h, V::I64(w));
             None
         }
         "get" => {
@@ -1992,9 +2527,28 @@ fn bitset_call(vm: &mut Vm, name: &str, args: &[V]) -> Option<Option<V>> {
             let v = slot_of(vm, h).map(i64v).unwrap_or(0);
             Some(V::I32(((v >> (b % 64)) & 1) as i32))
         }
-        "cardinality" | "size" | "length" | "nextSetBit" | "nextClearBit" | "previousSetBit"
-        | "previousClearBit" => Some(V::I32(0)),
-        "isEmpty" => Some(V::I32(1)),
+        "isEmpty" => Some(V::I32((slot_of(vm, h).map(i64v).unwrap_or(0) == 0) as i32)),
+        "cardinality" => Some(V::I32(
+            slot_of(vm, h).map(i64v).unwrap_or(0).count_ones() as i32
+        )),
+        "length" => {
+            let w = slot_of(vm, h).map(i64v).unwrap_or(0) as u64;
+            Some(V::I32((64 - w.leading_zeros()) as i32))
+        }
+        "nextSetBit" | "nextClearBit" => {
+            let from = i32v(args[1]).max(0);
+            let w = slot_of(vm, h).map(i64v).unwrap_or(0) as u64;
+            let mut out = -1i32;
+            for b in from..64 {
+                let has = ((w >> b) & 1) == 1;
+                if (name == "nextSetBit") == has {
+                    out = b;
+                    break;
+                }
+            }
+            Some(V::I32(out))
+        }
+        "size" => Some(V::I32(64)),
         "toByteArray" | "toLongArray" => Some(arr(vm, "B", vec![])),
         _ => return None,
     }
@@ -2004,46 +2558,63 @@ fn bitset_call(vm: &mut Vm, name: &str, args: &[V]) -> Option<Option<V>> {
 // ---------------------------------------------------------------------
 // Atomics
 
+/// Coerce a slot value to the atomic class's natural width —
+/// `AtomicLong` reads/writes `J`, `AtomicInteger`/`AtomicBoolean` `I`.
+/// Reference-typed atomics pass values through unchanged.
+fn width_coerce(class: &str, v: V) -> V {
+    if class.contains("Long") {
+        match v {
+            V::Ref(_) => v,
+            _ => V::I64(i64v(v)),
+        }
+    } else if class.contains("Integer") || class.contains("Boolean") {
+        match v {
+            V::Ref(_) => v,
+            _ => V::I32(i64v(v) as i32),
+        }
+    } else {
+        v
+    }
+}
+
 fn atomic_call(vm: &mut Vm, class: &str, name: &str, args: &[V]) -> Option<Option<V>> {
     let V::Ref(h) = args.first().copied().unwrap_or(V::Ref(0)) else {
         return None;
     };
+    // AtomicXxxArray — the same ops with a leading index. Backed by a
+    // HostState::List so each element CASes independently; treating it
+    // as a scalar Slot made every indexed compareAndSet fail and CAS
+    // loops (RxJava ScheduledRunnable.setFuture) spin forever.
+    if class.contains("Array") {
+        return atomic_array_call(vm, class, h, name, args);
+    }
     match name {
         "<init>" => {
             // AtomicX(v): seed the slot — otherwise `get()` reads 0
-            // where the guest just stored an object.
-            if let Some(Obj::Host {
-                state: HostState::Slot(v),
-                ..
-            }) = vm.heap.get_mut(h)
-            {
-                *v = args.get(1).copied().unwrap_or(V::I32(0));
-            }
-            None
+            // where the guest just stored an object. Coerce to the
+            // class's natural width so `AtomicLong.get` (J) never
+            // surfaces an I32 to a move-result-wide.
+            slot_put(
+                vm,
+                h,
+                width_coerce(class, args.get(1).copied().unwrap_or(V::I32(0))),
+            );
+            // Some(null): the arm must return Some so the tail's
+            // .map(Some) marks it handled —  falls through to a
+            // stub placeholder mint even though the slot was seeded.
+            Some(V::Ref(0))
         }
         "get" | "getOpaque" | "getAcquire" | "getPlain" => {
-            Some(slot_of(vm, h).unwrap_or(V::I32(0)))
+            Some(width_coerce(class, slot_of(vm, h).unwrap_or(V::I32(0))))
         }
         "set" | "setOpaque" | "setRelease" | "setPlain" | "lazySet" => {
-            if let Some(Obj::Host {
-                state: HostState::Slot(v),
-                ..
-            }) = vm.heap.get_mut(h)
-            {
-                *v = args[1];
-            }
-            None
+            slot_put(vm, h, width_coerce(class, args[1]));
+            Some(V::Ref(0))
         }
         "getAndSet" => {
             let old = slot_of(vm, h).unwrap_or(V::I32(0));
-            if let Some(Obj::Host {
-                state: HostState::Slot(v),
-                ..
-            }) = vm.heap.get_mut(h)
-            {
-                *v = args[1];
-            }
-            Some(old)
+            slot_put(vm, h, width_coerce(class, args[1]));
+            Some(width_coerce(class, old))
         }
         "compareAndSet"
         | "weakCompareAndSet"
@@ -2051,18 +2622,16 @@ fn atomic_call(vm: &mut Vm, class: &str, name: &str, args: &[V]) -> Option<Optio
         | "compareAndExchangeAcquire"
         | "compareAndExchangeRelease" => {
             let cur = slot_of(vm, h).unwrap_or(V::I32(0));
-            let ok = value_eq(vm, cur, args[1]);
+            // `null` expectation vs an unset/Ref(0) slot — guest null
+            // arrives as I32(0) too, and both must compare equal or
+            // setOnce CAS loops spin (RxJava SubscriptionHelper).
+            let nullish = |v: V| matches!(v, V::I32(0) | V::Ref(0));
+            let ok = (nullish(cur) && nullish(args[1])) || value_eq(vm, cur, args[1]);
             if ok {
-                if let Some(Obj::Host {
-                    state: HostState::Slot(v),
-                    ..
-                }) = vm.heap.get_mut(h)
-                {
-                    *v = args[2];
-                }
+                slot_put(vm, h, width_coerce(class, args[2]));
             }
             Some(if name.starts_with("compareAndExchange") {
-                cur
+                width_coerce(class, cur)
             } else {
                 V::I32(ok as i32)
             })
@@ -2070,23 +2639,19 @@ fn atomic_call(vm: &mut Vm, class: &str, name: &str, args: &[V]) -> Option<Optio
         "incrementAndGet" | "getAndIncrement" | "decrementAndGet" | "getAndDecrement"
         | "addAndGet" | "getAndAdd" => {
             let cur = slot_of(vm, h).unwrap_or(V::I32(0));
-            let delta = if matches!(name, "addAndGet" | "getAndAdd") {
-                i64v(args[1])
-            } else {
-                1
+            let delta = match name {
+                "addAndGet" | "getAndAdd" => i64v(args[1]),
+                "decrementAndGet" | "getAndDecrement" => -1,
+                _ => 1,
             };
-            let long = class.contains("Long") || matches!(cur, V::I64(_));
             let nv = i64v(cur).wrapping_add(delta);
-            let next = if long { V::I64(nv) } else { V::I32(nv as i32) };
-            if let Some(Obj::Host {
-                state: HostState::Slot(v),
-                ..
-            }) = vm.heap.get_mut(h)
-            {
-                *v = next;
+            let next = width_coerce(class, V::I64(nv));
+            slot_put(vm, h, next);
+            if crate::dbg_flag("OVELO_ATOMICDBG") {
+                eprintln!("[atomic] {class}.{name} h={h} cur={cur:?} -> {next:?}");
             }
             Some(if name.starts_with("getAnd") {
-                cur
+                width_coerce(class, cur)
             } else {
                 next
             })
@@ -2101,6 +2666,151 @@ fn atomic_call(vm: &mut Vm, class: &str, name: &str, args: &[V]) -> Option<Optio
         _ => return None,
     }
     .map(Some)
+}
+
+/// `java.util.concurrent.atomic.Atomic{Reference,Integer,Long}Array`
+/// — index-first variants of the scalar atomic ops over a
+/// `HostState::List` of elements.
+fn atomic_array_call(
+    vm: &mut Vm,
+    class: &str,
+    h: u32,
+    name: &str,
+    args: &[V],
+) -> Option<Option<V>> {
+    let idx = i32v(args.get(1).copied().unwrap_or(V::I32(0))).max(0) as usize;
+    // The element store lives on `h` for our Host objects; a dex
+    // `Obj::Instance` subclass gets a lazily-minted backing list under
+    // P_LIST_BACKING (same scheme as guest collections) — previously
+    // init did nothing and CAS reported success without storing.
+    let sh = match vm.heap.get(h) {
+        Some(Obj::Host {
+            state: HostState::List(_),
+            ..
+        }) => h,
+        Some(Obj::Host { .. }) | Some(Obj::Instance { .. }) => {
+            match pseudo_get(vm, h, P_LIST_BACKING) {
+                Some(V::Ref(bh)) => bh,
+                _ => {
+                    let bh = vm.alloc_host(class, HostState::List(Vec::new()));
+                    pseudo_set(vm, h, P_LIST_BACKING, V::Ref(bh));
+                    bh
+                }
+            }
+        }
+        _ => return None,
+    };
+    let elem = |vm: &Vm| -> V {
+        match vm.heap.get(sh) {
+            Some(Obj::Host {
+                state: HostState::List(l),
+                ..
+            }) => l.get(idx).copied().unwrap_or(V::Ref(0)),
+            Some(Obj::Array { data, .. }) => data.get(idx).copied().unwrap_or(V::Ref(0)),
+            _ => V::Ref(0),
+        }
+    };
+    let set_elem = |vm: &mut Vm, v: V| match vm.heap.get_mut(sh) {
+        Some(Obj::Host {
+            state: HostState::List(l),
+            ..
+        }) => {
+            if idx < l.len() {
+                l[idx] = v;
+            }
+        }
+        Some(Obj::Array { data, .. }) if idx < data.len() => data[idx] = v,
+        _ => {}
+    };
+    let long = class.contains("Long") || matches!(elem(vm), V::I64(_));
+    let num = |name: &str, cur: V, delta: i64| {
+        let d = if matches!(name, "addAndGet" | "getAndAdd") {
+            delta
+        } else if name.starts_with("decrement") || name.starts_with("getAndDecrement") {
+            -1
+        } else {
+            1
+        };
+        let nv = i64v(cur).wrapping_add(d);
+        if long {
+            V::I64(nv)
+        } else {
+            V::I32(nv as i32)
+        }
+    };
+    let out = match name {
+        "<init>" => {
+            // (int) → that many null/zero elements; (T[]) → copy the
+            // array's elements (long/int arrays carry their values).
+            let l = match args.get(1).copied() {
+                Some(V::I32(n)) => {
+                    vec![if long { V::I64(0) } else { V::I32(0) }; n.max(0) as usize]
+                }
+                Some(V::Ref(ah)) => match vm.heap.get(ah) {
+                    Some(Obj::Array { data, .. }) => data.clone(),
+                    _ => Vec::new(),
+                },
+                _ => Vec::new(),
+            };
+            if let Some(Obj::Host { state, .. }) = vm.heap.get_mut(sh) {
+                *state = HostState::List(l);
+            }
+            return Some(None);
+        }
+        "get" | "getOpaque" | "getAcquire" | "getPlain" => elem(vm),
+        "set" | "setOpaque" | "setRelease" | "setPlain" | "lazySet" => {
+            let v = args.get(2).copied().unwrap_or(V::I32(0));
+            set_elem(vm, v);
+            return Some(None);
+        }
+        "getAndSet" => {
+            let old = elem(vm);
+            let v = args.get(2).copied().unwrap_or(V::I32(0));
+            set_elem(vm, v);
+            old
+        }
+        "compareAndSet"
+        | "weakCompareAndSet"
+        | "compareAndExchange"
+        | "compareAndExchangeAcquire"
+        | "compareAndExchangeRelease" => {
+            let cur = elem(vm);
+            let expect = args.get(2).copied().unwrap_or(V::I32(0));
+            let nullish = |v: V| matches!(v, V::I32(0) | V::Ref(0));
+            let ok = (nullish(cur) && nullish(expect)) || value_eq(vm, cur, expect);
+            if ok {
+                let nv = args.get(3).copied().unwrap_or(V::I32(0));
+                set_elem(vm, nv);
+            }
+            if name.starts_with("compareAndExchange") {
+                cur
+            } else {
+                V::I32(ok as i32)
+            }
+        }
+        "length" => match vm.heap.get(sh) {
+            Some(Obj::Host {
+                state: HostState::List(l),
+                ..
+            }) => V::I32(l.len() as i32),
+            Some(Obj::Array { data, .. }) => V::I32(data.len() as i32),
+            _ => V::I32(0),
+        },
+        "incrementAndGet" | "getAndIncrement" | "decrementAndGet" | "getAndDecrement"
+        | "addAndGet" | "getAndAdd" => {
+            let cur = elem(vm);
+            let delta = i64v(args.get(2).copied().unwrap_or(V::I64(0)));
+            let nv = num(name, cur, delta);
+            set_elem(vm, nv);
+            if name.starts_with("getAnd") {
+                cur
+            } else {
+                nv
+            }
+        }
+        _ => return None,
+    };
+    Some(Some(out))
 }
 
 fn latch_call(vm: &mut Vm, name: &str, args: &[V]) -> Option<Option<V>> {
@@ -2129,7 +2839,7 @@ fn latch_call(vm: &mut Vm, name: &str, args: &[V]) -> Option<Option<V>> {
     }
 }
 
-fn fieldupdater_call(vm: &mut Vm, name: &str, args: &[V]) -> Rt<Option<Option<V>>> {
+fn fieldupdater_call(vm: &mut Vm, class: &str, name: &str, args: &[V]) -> Rt<Option<Option<V>>> {
     Ok(match name {
         "newUpdater" | "newUpdaterWithImpl" => {
             let h = vm.alloc_host(
@@ -2180,22 +2890,37 @@ fn fieldupdater_call(vm: &mut Vm, name: &str, args: &[V]) -> Rt<Option<Option<V>
                     };
                     (u64::from(P_DATA) << 32) | u64::from(key)
                 });
+            // The default for a never-written field must match the
+            // field's stored width: `get` on a J field returning Ref(0)
+            // breaks the very next `and-long`/`cmp-long` consumer
+            // (kotlinx CoroutineScheduler.tryUnpark reads
+            // parkedWorkersStack before init), and CAS on an unset J
+            // slot must see I64(0) or it can never succeed.
+            let unset = if class == "Ljava/util/concurrent/atomic/AtomicLongFieldUpdater;"
+                || num_wide(vm, fid)
+            {
+                V::I64(0)
+            } else if class == "Ljava/util/concurrent/atomic/AtomicIntegerFieldUpdater;" {
+                V::I32(0)
+            } else {
+                V::Ref(0)
+            };
             match name {
                 "get" => {
                     let v = match vm.heap.get(obj) {
                         Some(Obj::Instance { fields, .. }) | Some(Obj::Host { fields, .. }) => {
-                            fields.get(&fid).copied().unwrap_or(V::Ref(0))
+                            fields.get(&fid).copied().unwrap_or(unset)
                         }
-                        _ => V::Ref(0),
+                        _ => unset,
                     };
                     Some(Some(v))
                 }
                 "compareAndSet" | "weakCompareAndSet" => {
                     let cur = match vm.heap.get(obj) {
                         Some(Obj::Instance { fields, .. }) | Some(Obj::Host { fields, .. }) => {
-                            fields.get(&fid).copied().unwrap_or(V::Ref(0))
+                            fields.get(&fid).copied().unwrap_or(unset)
                         }
-                        _ => V::Ref(0),
+                        _ => unset,
                     };
                     // Guest `null` arrives as `I32(0)` (const/4) while an
                     // unset slot holds `Ref(0)` — both count as null, or
@@ -2223,9 +2948,9 @@ fn fieldupdater_call(vm: &mut Vm, name: &str, args: &[V]) -> Rt<Option<Option<V>
                 | "getAndIncrement" | "decrementAndGet" | "getAndDecrement" => {
                     let cur = match vm.heap.get(obj) {
                         Some(Obj::Instance { fields, .. }) | Some(Obj::Host { fields, .. }) => {
-                            fields.get(&fid).copied().unwrap_or(V::Ref(0))
+                            fields.get(&fid).copied().unwrap_or(unset)
                         }
-                        _ => V::Ref(0),
+                        _ => unset,
                     };
                     // Keep the stored width: an AtomicLongFieldUpdater
                     // must not shrink a `J` field to I32 or a later
@@ -2258,9 +2983,9 @@ fn fieldupdater_call(vm: &mut Vm, name: &str, args: &[V]) -> Rt<Option<Option<V>
                     // `set`/`lazySet` — coerce to the stored width as in CAS.
                     let cur = match vm.heap.get(obj) {
                         Some(Obj::Instance { fields, .. }) | Some(Obj::Host { fields, .. }) => {
-                            fields.get(&fid).copied().unwrap_or(V::Ref(0))
+                            fields.get(&fid).copied().unwrap_or(unset)
                         }
-                        _ => V::Ref(0),
+                        _ => unset,
                     };
                     let nv = match (cur, args[2]) {
                         (V::I64(_), V::I32(i)) => V::I64(i as i64),
@@ -2277,6 +3002,24 @@ fn fieldupdater_call(vm: &mut Vm, name: &str, args: &[V]) -> Rt<Option<Option<V>
         }
         _ => None,
     })
+}
+
+/// `TimeUnit` unit math: ordinals run NANOSECONDS..DAYS; convert via
+/// the nanos scale with saturation (JDK truncates toward zero).
+fn timeunit_convert(dst_ord: i32, src_ord: i32, d: i64) -> i64 {
+    const R: [i64; 7] = [
+        1,
+        1_000,
+        1_000_000,
+        1_000_000_000,
+        60_000_000_000,
+        3_600_000_000_000,
+        86_400_000_000_000,
+    ];
+    let s = R.get(src_ord as usize).copied().unwrap_or(1);
+    let dd = R.get(dst_ord as usize).copied().unwrap_or(1);
+    let nanos = ((d as i128) * (s as i128)).clamp(i64::MIN as i128, i64::MAX as i128) as i64;
+    nanos / dd
 }
 
 /// Whether the resolved dex field is declared `J`/`D` — used to pick
