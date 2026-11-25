@@ -5276,6 +5276,13 @@ fn app_info(vm: &mut Vm) -> V {
     pseudo_set(vm, h, P_DATA, data);
     pseudo_set(vm, h, P_META, src);
     pseudo_set(vm, h, P_FLAGS, libs);
+    // ApplicationInfo.name is the Application subclass from the
+    // manifest (null when undeclared) — NOT the package name; guests
+    // Class.forName it to reach their app class.
+    if let Some(cls) = vm.guest_app_class.clone() {
+        let cv = jstr(vm, &cls);
+        pseudo_set(vm, h, crate::jdk::P_APPCLASS, cv);
+    }
     V::Ref(h)
 }
 

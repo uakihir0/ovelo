@@ -1488,6 +1488,7 @@ fn run_app(store: &InstallStore, package: &str) -> Result<(), OveloError> {
                 // SMS apps compare the two to decide they are the default
                 // handler (an empty answer sends them to a setup screen).
                 v.guest_package = Some(rec.app.package.clone());
+                v.guest_app_class = info.manifest.application_class.clone();
                 // Launcher queries (home screen) enumerate every
                 // installed app's launcher activity — parse each
                 // record's manifest once at startup.

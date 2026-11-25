@@ -194,6 +194,9 @@ pub struct Vm {
     /// Package name of the guest app, set by the launcher so
     /// `Context.getPackageName` etc. answer correctly.
     pub guest_package: Option<String>,
+    /// Manifest `application/@android:name` — ApplicationInfo.name
+    /// must answer this class (null when undeclared), not the package.
+    pub guest_app_class: Option<String>,
     /// Guest-visible filesystem root: `java.io.File` paths resolve
     /// under this directory, never onto the host fs directly.
     pub guest_root: std::path::PathBuf,
@@ -735,6 +738,7 @@ impl Vm {
             hosts_named: HashMap::new(),
             aot: None,
             guest_package: None,
+            guest_app_class: None,
             guest_root: std::env::temp_dir().join("ovelo-guest"),
             external_root: std::env::temp_dir()
                 .join("ovelo-guest")
