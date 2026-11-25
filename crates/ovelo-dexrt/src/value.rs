@@ -413,6 +413,20 @@ impl Heap {
                         HostState::Slot(v) => {
                             wl.extend(handle(v));
                         }
+                        // Display-list recordings reference RenderNode
+                        // handles — a node reachable only through a
+                        // parent's display list must survive or child
+                        // layers vanish after a GC.
+                        HostState::CanvasOps(ops) => {
+                            wl.extend(ops.iter().filter_map(|op| match op {
+                                CanvasOp::Nested { node }
+                                    if *node != 0 && (*node as usize) <= self.objs.len() =>
+                                {
+                                    Some(*node)
+                                }
+                                _ => None,
+                            }));
+                        }
                         _ => {}
                     }
                 }
