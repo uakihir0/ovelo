@@ -135,6 +135,9 @@ const P_LEFT: u32 = 0xFFFD_FFE9;
 const P_TOP: u32 = 0xFFFD_FFE8;
 const P_RIGHT: u32 = 0xFFFD_FFE7;
 const P_BOTTOM: u32 = 0xFFFD_FFE6;
+/// Set by the real `layout()` builtin — host size pushes must not
+/// overwrite frames the dex layout pass computed.
+const P_LAYOUT_DONE: u32 = u32::MAX - 52;
 const P_MEAS_W: u32 = 0xFFFD_FFE5;
 const P_MEAS_H: u32 = 0xFFFD_FFE4;
 /// `setMinimumWidth`/`setMinimumHeight` — feed `getMinimum*`/
@@ -480,6 +483,11 @@ fn pint(vm: &Vm, h: u32, key: u32) -> i32 {
         Some(V::I32(n)) => n,
         _ => 0,
     }
+}
+
+/// Whether the dex `layout()` builtin established this view's frame.
+pub(crate) fn layout_done(vm: &Vm, h: u32) -> bool {
+    pseudo_get(vm, h, P_LAYOUT_DONE).is_some()
 }
 
 /// Store a view frame; returns whether it changed (View.setFrame's
@@ -2104,6 +2112,7 @@ pub(crate) fn call(
             // AOSP clears PFLAG_LAYOUT_REQUESTED once the view is laid out.
             pseudo_set(vm, this, P_LAYOUT_REQ, V::I32(0));
             let changed = frame_set(vm, this, l, t, r, b);
+            pseudo_set(vm, this, P_LAYOUT_DONE, V::I32(1));
             if vm.has_dex_virtual(this, "onLayout", &["Z", "I", "I", "I", "I"]) {
                 if let Err(e) = vm.call_virtual_rt(
                     this,

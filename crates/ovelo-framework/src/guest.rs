@@ -1094,7 +1094,7 @@ impl GuestUi {
                 let v = g.view();
                 (v.left, v.top, v.measured)
             };
-            if s.w > 0 && s.h > 0 {
+            if s.w > 0 && s.h > 0 && !vm.view_layout_done(h) {
                 let (pl, pt) = abs_origin(vm, &self.views, vm.dex_parent(h));
                 vm.view_set_frame(h, l - pl, t - pt, l - pl + s.w, t - pt + s.h);
             }

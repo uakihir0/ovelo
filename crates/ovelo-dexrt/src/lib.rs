@@ -2560,6 +2560,12 @@ impl Vm {
         }
     }
 
+    /// Whether dex `layout()` owns this view's frame — host layout
+    /// size pushes must not stomp it.
+    pub fn view_layout_done(&self, h: u32) -> bool {
+        jdk::view::layout_done(self, h)
+    }
+
     /// Record the host window size — decor views created lazily take
     /// their initial bounds from it.
     pub fn set_window_size(&mut self, w: i32, h: i32) {
