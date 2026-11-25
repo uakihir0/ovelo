@@ -3495,7 +3495,7 @@ fn unsafe_call(vm: &mut Vm, name: &str, args: &[V]) -> Rt<Option<Option<V>>> {
             }))
         }
         "getInt" | "getIntVolatile" | "getAndSetInt" | "getAndAddInt" | "getLong"
-        | "getLongVolatile" | "getAndSetLong" | "getAndAddLong" => {
+        | "getLongVolatile" | "getAndSetLong" | "getAndAddLong" | "getByte" | "getByteVolatile" => {
             let wide = name.contains("Long");
             let (o, k) = unsafe_key(args).unwrap_or((0, 0));
             let old = unsafe_read(vm, o, k);
@@ -3528,7 +3528,8 @@ fn unsafe_call(vm: &mut Vm, name: &str, args: &[V]) -> Rt<Option<Option<V>>> {
             }
             Some(old)
         }
-        "putInt" | "putIntVolatile" | "putLong" | "putLongVolatile" => {
+        "putInt" | "putIntVolatile" | "putLong" | "putLongVolatile" | "putByte"
+        | "putByteVolatile" => {
             if let Some((o, k)) = unsafe_key(args) {
                 unsafe_write(vm, o, k, args.get(3).copied().unwrap_or(V::I32(0)));
             }
