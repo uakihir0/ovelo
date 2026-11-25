@@ -2645,6 +2645,7 @@ impl Vm {
     pub fn view_set_frame(&mut self, h: u32, l: i32, t: i32, r: i32, b: i32) {
         if h != 0 {
             jdk::view::frame_set(self, h, l, t, r, b);
+            jdk::view::clear_layout_requested(self, h);
         }
     }
 

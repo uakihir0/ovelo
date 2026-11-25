@@ -494,6 +494,13 @@ pub(crate) fn layout_done(vm: &Vm, h: u32) -> bool {
     pseudo_get(vm, h, P_LAYOUT_DONE).is_some()
 }
 
+/// Host-driven layout completes the same request cycle as View.layout:
+/// leaving the flag set makes every later requestLayout a no-op write,
+/// so host view-tree change detection never sees Compose re-layouts.
+pub(crate) fn clear_layout_requested(vm: &mut Vm, h: u32) {
+    pseudo_set(vm, h, P_LAYOUT_REQ, V::I32(0));
+}
+
 /// Store a view frame; returns whether it changed (View.setFrame's
 /// contract and `layout`'s `changed` argument).
 pub(crate) fn frame_set(vm: &mut Vm, h: u32, l: i32, t: i32, r: i32, b: i32) -> bool {
