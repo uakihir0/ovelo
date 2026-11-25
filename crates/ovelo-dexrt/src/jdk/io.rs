@@ -2569,13 +2569,21 @@ fn charbuf_string(vm: &Vm, h: u32) -> Option<String> {
         _ => return None,
     };
     match vm.heap.get(back) {
-        Some(Obj::Array { data, .. }) => Some(
-            data.iter()
-                .skip(base + pos)
-                .take(lim.saturating_sub(pos))
-                .map(|v| char::from_u32(i32v(*v) as u32).unwrap_or('\u{FFFD}'))
-                .collect(),
-        ),
+        Some(Obj::Array { data, .. }) => {
+            let mut units = Vec::new();
+            for v in data.iter().skip(base + pos).take(lim.saturating_sub(pos)) {
+                let x = i32v(*v) as u32;
+                if x <= 0xffff {
+                    units.push(x as u16);
+                } else if let Some(ch) = char::from_u32(x) {
+                    let mut pair = [0u16; 2];
+                    units.extend_from_slice(ch.encode_utf16(&mut pair));
+                } else {
+                    units.push(0xfffd);
+                }
+            }
+            Some(String::from_utf16_lossy(&units))
+        }
         _ => None,
     }
 }
