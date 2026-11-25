@@ -814,9 +814,9 @@ fn replay_guest_ops(c: &mut Canvas, ops: &[ovelo_dexrt::CanvasOp]) {
                     let mut out = rgba.as_ref().clone();
                     for px in out.chunks_exact_mut(4) {
                         let sa = px[3] as u32;
-                        px[0] = (tr * sa / 255) as u8;
-                        px[1] = (tg * sa / 255) as u8;
-                        px[2] = (tb * sa / 255) as u8;
+                        px[0] = tr as u8;
+                        px[1] = tg as u8;
+                        px[2] = tb as u8;
                         px[3] = (ta * sa / 255) as u8;
                     }
                     out
