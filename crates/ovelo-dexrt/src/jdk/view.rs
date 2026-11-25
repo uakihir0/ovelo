@@ -30,6 +30,7 @@ const P_INVALID_SEQ: u32 = u32::MAX - 49;
 /// (AbstractComposeView defers `ensureCompositionCreated` until it
 /// does; a hardcoded true composes a parentless view).
 pub(crate) const P_ATTACHED: u32 = u32::MAX - 48;
+const P_ATTACH_QUEUED: u32 = u32::MAX - 70;
 /// Live `setText`/`setHint` argument — read by `dex_view` before the
 /// inflated `android:text` attribute. `pub`: the guest bridge's setter
 /// overrides write it for dex-inflated (non-GuestView) receivers.
@@ -6042,7 +6043,28 @@ fn mark_attached(vm: &mut Vm, h: u32, depth: u32) {
     if h == 0 || depth > 128 {
         return;
     }
-    if pint(vm, h, P_ATTACHED) != 1 {
+    if pint(vm, h, P_ATTACHED) != 1 && pint(vm, h, P_ATTACH_QUEUED) != 1 {
+        pseudo_set(vm, h, P_ATTACH_QUEUED, V::I32(1));
+        vm.pending_attach_callbacks.push_back(h);
+    }
+    for c in children(vm, h) {
+        if let V::Ref(ch) = c {
+            mark_attached(vm, ch, depth + 1);
+        }
+    }
+}
+
+/// Deliver queued window attachment at a drain boundary. The attach
+/// flag becomes visible only here: Compose views created while a parent
+/// composition is active must still read `isAttachedToWindow=false`,
+/// defer their composition creation, and start it after that outer
+/// composition has finished.
+pub(crate) fn deliver_attach_callbacks(vm: &mut Vm) {
+    for h in std::mem::take(&mut vm.pending_attach_callbacks) {
+        pseudo_set(vm, h, P_ATTACH_QUEUED, V::I32(0));
+        if pint(vm, h, P_ATTACHED) == 1 {
+            continue;
+        }
         pseudo_set(vm, h, P_ATTACHED, V::I32(1));
         let r = vm.call_virtual(h, "onAttachedToWindow", &[]);
         if crate::dbg_flag("OVELO_VIEWDBG") {
@@ -6050,11 +6072,6 @@ fn mark_attached(vm: &mut Vm, h: u32, depth: u32) {
                 Ok(_) => eprintln!("[viewdbg] onAttachedToWindow h{h} ok"),
                 Err(e) => eprintln!("[viewdbg] onAttachedToWindow h{h} err {e}"),
             }
-        }
-    }
-    for c in children(vm, h) {
-        if let V::Ref(ch) = c {
-            mark_attached(vm, ch, depth + 1);
         }
     }
 }
@@ -6083,6 +6100,8 @@ fn clear_attached(vm: &mut Vm, h: u32, depth: u32) {
         return;
     }
     pseudo_set(vm, h, P_ATTACHED, V::I32(0));
+    pseudo_set(vm, h, P_ATTACH_QUEUED, V::I32(0));
+    vm.pending_attach_callbacks.retain(|v| *v != h);
     for c in children(vm, h) {
         if let V::Ref(ch) = c {
             clear_attached(vm, ch, depth + 1);
