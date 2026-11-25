@@ -4371,10 +4371,10 @@ fn res_misc(vm: &mut Vm, class: &str, name: &str, args: &[V]) -> Rt<Option<Optio
                         .unwrap_or("")
                         .to_ascii_lowercase()
                 };
-                let la = args.get(1).copied().map(lang).unwrap_or_default();
-                let lb = args.get(2).copied().map(lang).unwrap_or_default();
-                let sa = args.get(1).copied().map(script).unwrap_or_default();
-                let sb = args.get(2).copied().map(script).unwrap_or_default();
+                let la = lang(args.first().copied().unwrap_or(V::Ref(0)));
+                let lb = lang(args.get(1).copied().unwrap_or(V::Ref(0)));
+                let sa = script(args.first().copied().unwrap_or(V::Ref(0)));
+                let sb = script(args.get(1).copied().unwrap_or(V::Ref(0)));
                 Some(Some(V::I32(
                     ((la.is_empty() || lb.is_empty() || la == lb)
                         && (sa.is_empty() || sb.is_empty() || sa == sb)) as i32,
