@@ -4827,6 +4827,7 @@ fn graphics_call(
                         src_w: sw,
                         src_h: sh,
                         rgba,
+                        paint: crate::PaintState::default(),
                     },
                 );
             }

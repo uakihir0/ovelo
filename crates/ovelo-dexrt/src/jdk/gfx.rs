@@ -15,6 +15,9 @@ const PK_ALIGN: u32 = 0xFFFD_FF02;
 const PK_STYLE: u32 = 0xFFFD_FF03;
 const PK_SW: u32 = 0xFFFD_FF04;
 const PK_BOLD: u32 = 0xFFFD_FF05;
+/// Paint → ColorFilter handle; ColorFilter → packed ARGB tint.
+const PK_CFILTER: u32 = 0xFFFD_FF06;
+const PK_CFCOLOR: u32 = 0xFFFD_FF07;
 const PK_CW: u32 = 0xFFFD_FF10;
 const PK_CH: u32 = 0xFFFD_FF11;
 /// `new Canvas(bitmap)`: the backing bitmap handle — drawBitmap
@@ -82,8 +85,13 @@ pub(crate) fn paint_state(vm: &Vm, v: V) -> PaintState {
         Some(x) => f64v(x) as f32,
         None => d,
     };
+    let tint_argb = match pseudo_get(vm, h, PK_CFILTER) {
+        Some(V::Ref(cf)) if cf != 0 => pseudo_get(vm, cf, PK_CFCOLOR).map(i32v),
+        _ => None,
+    };
     PaintState {
         argb: gi(PK_COLOR, 0xFF00_0000u32 as i32),
+        tint_argb,
         text_size: gf(PK_TSIZE, 12.0),
         align: gi(PK_ALIGN, 0).clamp(0, 2) as u8,
         style: gi(PK_STYLE, 0).clamp(0, 2) as u8,
@@ -212,7 +220,8 @@ fn blend_px(out: &mut [u8], i: usize, argb: i32) {
     if a == 0 {
         return;
     }
-    let src = [(argb as u32) >> 16, (argb as u32) >> 8, argb as u32];
+    let px = argb as u32;
+    let src = [(px >> 16) & 0xff, (px >> 8) & 0xff, px & 0xff];
     if a == 255 {
         out[i] = src[0] as u8;
         out[i + 1] = src[1] as u8;
@@ -285,7 +294,7 @@ fn raster_path_to_bitmap(
             }
             let inside = if even_odd { parity } else { winding != 0 };
             if inside != inverse {
-                blend_px(&mut out, ((yy * bw + xx) * 4) as usize, paint.argb);
+                blend_px(&mut out, ((yy * bw + xx) * 4) as usize, paint.draw_argb());
             }
         }
     }
@@ -312,6 +321,7 @@ pub(crate) fn rec(vm: &mut Vm, canvas: V, op: CanvasOp) {
         src_w,
         src_h,
         rgba,
+        ..
     } = &op
     {
         if let Some(V::Ref(th)) = pseudo_get(vm, h, PK_TARGET) {
@@ -825,6 +835,7 @@ fn canvas_call(vm: &mut Vm, name: &str, sig: &str, args: &[V]) -> Rt<Option<Opti
                         src_w,
                         src_h,
                         rgba,
+                        paint: ps(vm, args),
                     },
                 ),
             }
@@ -903,7 +914,9 @@ fn paint_call(vm: &mut Vm, name: &str, _sig: &str, args: &[V]) -> Rt<Option<Opti
             // Paint(Paint src) copies the source's state; plain init gets
             // defaults. AOSP copies every field — we carry the pseudo set.
             if let Some(V::Ref(src)) = args.get(1).copied() {
-                for key in [PK_COLOR, PK_TSIZE, PK_ALIGN, PK_STYLE, PK_SW, PK_BOLD] {
+                for key in [
+                    PK_COLOR, PK_TSIZE, PK_ALIGN, PK_STYLE, PK_SW, PK_BOLD, PK_CFILTER,
+                ] {
                     if let Some(v) = pseudo_get(vm, src, key) {
                         pseudo_set(vm, h, key, v);
                     }
@@ -1190,7 +1203,6 @@ fn paint_call(vm: &mut Vm, name: &str, _sig: &str, args: &[V]) -> Rt<Option<Opti
         | "setMaskFilter"
         | "setPathEffect"
         | "setShader"
-        | "setColorFilter"
         | "setXfermode"
         | "setShadowLayer"
         | "setFlags"
@@ -1217,9 +1229,12 @@ fn paint_call(vm: &mut Vm, name: &str, _sig: &str, args: &[V]) -> Rt<Option<Opti
         }
         "getTypeface" => Some(Some(V::Ref(0))),
         "getStrokeMiter" => Some(Some(V::F32(1.0))),
-        "getShader" | "getColorFilter" | "getMaskFilter" | "getPathEffect" | "getXfermode" => {
-            Some(Some(V::Ref(0)))
+        "getShader" | "getMaskFilter" | "getPathEffect" | "getXfermode" => Some(Some(V::Ref(0))),
+        "setColorFilter" => {
+            pseudo_set(vm, h, PK_CFILTER, arg(args, 1));
+            Some(None)
         }
+        "getColorFilter" => Some(Some(pseudo_get(vm, h, PK_CFILTER).unwrap_or(V::Ref(0)))),
         // Compose's word-boundary selection calls `getTextLocale()` —
         // a null locale throws inside `BreakIterator`/`SelectionSegment`.
         "getTextLocale" => Some(Some(host(
@@ -1396,6 +1411,22 @@ fn mat_rectf_write(vm: &mut Vm, h: u32, l: f32, t: f32, r: f32, b: f32) {
             }
         }
     }
+}
+
+fn colorfilter_call(vm: &mut Vm, name: &str, args: &[V]) -> Rt<Option<Option<V>>> {
+    Ok(match name {
+        "<init>" => {
+            // BlendModeColorFilter/PorterDuffColorFilter both take the
+            // tint color as their first constructor argument. Compose
+            // uses SRC_IN/SRC_ATop-style filters to recolor otherwise
+            // black Material vector paths.
+            if let V::Ref(h) = arg(args, 0) {
+                pseudo_set(vm, h, PK_CFCOLOR, V::I32(i32v(arg(args, 1))));
+            }
+            Some(None)
+        }
+        _ => return Ok(None),
+    })
 }
 
 fn matrix_call(vm: &mut Vm, name: &str, _sig: &str, args: &[V]) -> Rt<Option<Option<V>>> {
@@ -2045,6 +2076,10 @@ pub(crate) fn call(
             rendernode_call(vm, name, args)
         }
         "Landroid/graphics/Paint;" | "Landroid/text/TextPaint;" => paint_call(vm, name, sig, args),
+        "Landroid/graphics/BlendModeColorFilter;"
+        | "Landroid/graphics/PorterDuffColorFilter;"
+        | "Landroid/graphics/LightingColorFilter;"
+        | "Landroid/graphics/ColorFilter;" => colorfilter_call(vm, name, args),
         "Landroid/graphics/Matrix;" => matrix_call(vm, name, sig, args),
         _ => Ok(None),
     }
@@ -2209,6 +2244,7 @@ pub(crate) fn guest_draw_ops(vm: &mut Vm, view: u32, w: i32, h: i32) -> Vec<Canv
                 src_w: sw,
                 src_h: sh,
                 rgba: std::rc::Rc::new(px),
+                paint: PaintState::default(),
             }];
         }
     }
@@ -2361,6 +2397,7 @@ impl Default for PaintState {
     fn default() -> Self {
         Self {
             argb: 0xFF00_0000u32 as i32,
+            tint_argb: None,
             text_size: 12.0,
             align: 0,
             style: 0,
