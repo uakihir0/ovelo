@@ -1597,33 +1597,44 @@ fn run_app(store: &InstallStore, package: &str) -> Result<(), OveloError> {
                                 state: ovelo_dexrt::HostState::Empty,
                             })
                         });
-                    // Android installs every manifest ContentProvider
-                    // before Application.onCreate. This includes
-                    // androidx.startup's InitializationProvider, but
-                    // also library utility providers such as Compose
-                    // Multiplatform's AndroidContextProvider (which
-                    // captures the application Context used for asset
-                    // reads). Run them in manifest order; startup's
-                    // success additionally gates the legacy direct
-                    // initializer fallback below.
-                    for provider in &info.manifest.providers {
+                    // Android installs enabled main-process
+                    // ContentProviders before Application.onCreate,
+                    // ordered by android:initOrder (higher first). This
+                    // includes androidx.startup's InitializationProvider
+                    // and library utility providers such as Compose
+                    // Multiplatform's AndroidContextProvider.
+                    let mut providers: Vec<_> = info
+                        .manifest
+                        .provider_details
+                        .iter()
+                        .filter(|p| {
+                            p.enabled
+                                && p.process
+                                    .as_deref()
+                                    .is_none_or(|proc| proc == info.manifest.package)
+                        })
+                        .collect();
+                    providers.sort_by_key(|p| -p.init_order);
+                    for entry in providers {
+                        let provider = entry.name.as_str();
+                        let startup = provider == "androidx.startup.InitializationProvider";
                         let desc = format!("L{};", provider.replace('.', "/"));
                         match v.instantiate(&desc) {
                             Ok(ph) => {
                                 v.set_provider_context(ph, ovelo_dexrt::V::Ref(app_h));
                                 match v.call_virtual(ph, "onCreate", &[]) {
                                     Ok(_) => {
-                                        if provider.ends_with("InitializationProvider") {
+                                        if startup {
                                             provider_ran.set(true);
                                         }
                                     }
-                                    Err(e) if provider.ends_with("InitializationProvider") => {
+                                    Err(e) if startup => {
                                         println!("startup provider onCreate failed: {e}")
                                     }
                                     _ => {}
                                 }
                             }
-                            Err(e) if provider.ends_with("InitializationProvider") => {
+                            Err(e) if startup => {
                                 println!("startup provider not instantiated: {e}")
                             }
                             _ => {}

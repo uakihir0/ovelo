@@ -459,6 +459,8 @@ pub struct ManifestInfo {
     pub receivers: Vec<String>,
     /// Declared providers.
     pub providers: Vec<String>,
+    /// Provider startup metadata in manifest order.
+    pub provider_details: Vec<ProviderEntry>,
     /// Activity name with MAIN action + LAUNCHER category, if any.
     pub launcher_activity: Option<String>,
     /// `split` attribute — `None` marks the base APK (§03 splits).
@@ -484,6 +486,19 @@ pub struct ManifestInfo {
     /// Android runs each Initializer's `create(context)` before
     /// `Application.onCreate`.
     pub startup_initializers: Vec<String>,
+}
+
+/// Manifest `<provider>` startup metadata.
+#[derive(Debug, Clone, PartialEq)]
+pub struct ProviderEntry {
+    /// Qualified provider class name.
+    pub name: String,
+    /// `android:enabled` (true when absent).
+    pub enabled: bool,
+    /// `android:process`, when declared.
+    pub process: Option<String>,
+    /// `android:initOrder` (zero when absent).
+    pub init_order: i64,
 }
 
 /// Parse a binary manifest into `ManifestInfo`.
@@ -642,6 +657,12 @@ pub fn parse_manifest(b: &[u8]) -> Result<ManifestInfo> {
                 if let Some(n) = el.android_str("name") {
                     let q = qualify(&info.package, n);
                     info.providers.push(q.clone());
+                    info.provider_details.push(ProviderEntry {
+                        name: q.clone(),
+                        enabled: !matches!(el.android("enabled"), Some(Value::Bool(false))),
+                        process: el.android_str("process").map(str::to_string),
+                        init_order: el.android_int("initOrder").unwrap_or(0),
+                    });
                     cur_provider = Some(q);
                 }
             }
