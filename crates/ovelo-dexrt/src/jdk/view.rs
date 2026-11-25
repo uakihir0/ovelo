@@ -171,6 +171,10 @@ const P_TOUCH_L: u32 = u32::MAX - 44;
 const P_ME_ACTION: u32 = u32::MAX - 45;
 const P_ME_X: u32 = u32::MAX - 46;
 const P_ME_Y: u32 = u32::MAX - 47;
+const P_ME_DOWN_TIME: u32 = u32::MAX - 60;
+const P_ME_EVENT_TIME: u32 = u32::MAX - 61;
+const P_ME_RAWX: u32 = u32::MAX - 62;
+const P_ME_RAWY: u32 = u32::MAX - 63;
 
 /// Lazily mint a per-view `ViewTreeObserver` — guests register
 /// `OnGlobalLayoutListener`s on it; `fire_global_layout` (called from
@@ -907,6 +911,64 @@ pub(crate) fn call(
         }
         "getY" if class == "Landroid/view/MotionEvent;" => {
             Some(Some(pseudo_get(vm, this, P_ME_Y).unwrap_or(V::F32(0.0))))
+        }
+        "getRawX" if class == "Landroid/view/MotionEvent;" => Some(Some(
+            pseudo_get(vm, this, P_ME_RAWX)
+                .or_else(|| pseudo_get(vm, this, P_ME_X))
+                .unwrap_or(V::F32(0.0)),
+        )),
+        "getRawY" if class == "Landroid/view/MotionEvent;" => Some(Some(
+            pseudo_get(vm, this, P_ME_RAWY)
+                .or_else(|| pseudo_get(vm, this, P_ME_Y))
+                .unwrap_or(V::F32(0.0)),
+        )),
+        "getPointerCount" if class == "Landroid/view/MotionEvent;" => Some(Some(V::I32(1))),
+        "getPointerId" | "findPointerIndex" | "getActionIndex"
+            if class == "Landroid/view/MotionEvent;" =>
+        {
+            Some(Some(V::I32(0)))
+        }
+        "getToolType" if class == "Landroid/view/MotionEvent;" => Some(Some(V::I32(1))),
+        "getSource" if class == "Landroid/view/MotionEvent;" => Some(Some(V::I32(0x1002))),
+        "getButtonState" | "getHistorySize" | "getMetaState"
+            if class == "Landroid/view/MotionEvent;" =>
+        {
+            Some(Some(V::I32(0)))
+        }
+        "getPressure" | "getSize" | "getTouchMajor" | "getTouchMinor"
+            if class == "Landroid/view/MotionEvent;" =>
+        {
+            Some(Some(V::F32(if name == "getPressure" { 1.0 } else { 0.0 })))
+        }
+        "getDownTime" if class == "Landroid/view/MotionEvent;" => Some(Some(
+            pseudo_get(vm, this, P_ME_DOWN_TIME).unwrap_or(V::I64(now_ms())),
+        )),
+        "getEventTime" if class == "Landroid/view/MotionEvent;" => Some(Some(
+            pseudo_get(vm, this, P_ME_EVENT_TIME).unwrap_or(V::I64(now_ms())),
+        )),
+        "setLocation" if class == "Landroid/view/MotionEvent;" => {
+            pseudo_set(
+                vm,
+                this,
+                P_ME_X,
+                args.get(1).copied().unwrap_or(V::F32(0.0)),
+            );
+            pseudo_set(
+                vm,
+                this,
+                P_ME_Y,
+                args.get(2).copied().unwrap_or(V::F32(0.0)),
+            );
+            Some(None)
+        }
+        "offsetLocation" if class == "Landroid/view/MotionEvent;" => {
+            let x = f64v(pseudo_get(vm, this, P_ME_X).unwrap_or(V::F32(0.0)))
+                + f64v(args.get(1).copied().unwrap_or(V::F32(0.0)));
+            let y = f64v(pseudo_get(vm, this, P_ME_Y).unwrap_or(V::F32(0.0)))
+                + f64v(args.get(2).copied().unwrap_or(V::F32(0.0)));
+            pseudo_set(vm, this, P_ME_X, V::F32(x as f32));
+            pseudo_set(vm, this, P_ME_Y, V::F32(y as f32));
+            Some(None)
         }
         "recycle" if class == "Landroid/view/MotionEvent;" => Some(None),
         // Dex-constructed views (`new PlayerFragment(ctx, attrs)` in an
@@ -5249,6 +5311,11 @@ pub(crate) fn dispatch_touch(
         return Ok(false);
     };
     pseudo_set(vm, evt, P_ME_ACTION, V::I32(action));
+    let now = now_ms();
+    pseudo_set(vm, evt, P_ME_DOWN_TIME, V::I64(now));
+    pseudo_set(vm, evt, P_ME_EVENT_TIME, V::I64(now));
+    pseudo_set(vm, evt, P_ME_RAWX, V::F32(x as f32));
+    pseudo_set(vm, evt, P_ME_RAWY, V::F32(y as f32));
     let mut v = target;
     for _ in 0..32 {
         if v == 0 {

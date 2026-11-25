@@ -3579,6 +3579,7 @@ impl Vm {
             | "Landroid/util/SparseArray;"
             | "Landroid/util/SparseIntArray;"
             | "Landroid/util/SparseBooleanArray;"
+            | "Landroid/util/SparseLongArray;"
             | "Landroid/util/LongSparseArray;"
             | "Landroid/util/LruCache;"
             | "Landroid/os/Bundle;"
