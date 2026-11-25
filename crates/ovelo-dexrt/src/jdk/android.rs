@@ -4328,7 +4328,8 @@ fn handler_call(vm: &mut Vm, name: &str, args: &[V]) -> Rt<Option<Option<V>>> {
         }
         "<init>" => {
             // <init>(Looper?, Callback?, boolean?) — remember the
-            // Handler.Callback so dispatch routes handleMessage there.
+            // bound looper and Handler.Callback so dispatch routes
+            // handleMessage there.
             if let Some(&V::Ref(this)) = args.first() {
                 for a in &args[1..] {
                     let V::Ref(h) = a else { continue };
@@ -4336,7 +4337,9 @@ fn handler_call(vm: &mut Vm, name: &str, args: &[V]) -> Rt<Option<Option<V>>> {
                         vm.heap.get(*h),
                         Some(Obj::Host { desc, .. }) if desc == "Landroid/os/Looper;"
                     );
-                    if !is_looper && *h != 0 {
+                    if is_looper {
+                        pseudo_set(vm, this, P_HANDLER_LOOPER, V::Ref(*h));
+                    } else if *h != 0 {
                         pseudo_set(vm, this, P_HANDLER_CB, V::Ref(*h));
                         break;
                     }
@@ -4344,7 +4347,17 @@ fn handler_call(vm: &mut Vm, name: &str, args: &[V]) -> Rt<Option<Option<V>>> {
             }
             Some(None)
         }
-        "getLooper" => Some(Some(main_looper(vm))),
+        "getLooper" => Some(Some(
+            args.first()
+                .and_then(|v| {
+                    if let V::Ref(h) = v {
+                        pseudo_get(vm, *h, P_HANDLER_LOOPER)
+                    } else {
+                        None
+                    }
+                })
+                .unwrap_or_else(|| main_looper(vm)),
+        )),
         "getMessageName" | "getTraceName" => Some(Some(jstr(vm, ""))),
         "createAsync" => Some(Some(args[0])),
         _ => None,

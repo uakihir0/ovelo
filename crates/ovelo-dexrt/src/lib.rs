@@ -232,6 +232,7 @@ pub struct Vm {
     /// Interned main `Looper` — `Looper.myLooper()` and
     /// `Handler.getLooper()` must return the same handle.
     pub(crate) main_looper_h: u32,
+    pub(crate) main_dispatcher_h: u32,
     /// Interned `Application` — `getApplication[Context]` must return a
     /// real Application-typed object (callers `check-cast` it).
     pub(crate) app_h: u32,
@@ -758,6 +759,7 @@ impl Vm {
             cur_thread: 0,
             worker_thread_h: 0,
             main_looper_h: 0,
+            main_dispatcher_h: 0,
             app_h: 0,
             unsafe_offsets: HashMap::new(),
             unsafe_next_offset: 0,
@@ -2133,6 +2135,7 @@ impl Vm {
             self.cur_thread,
             self.worker_thread_h,
             self.main_looper_h,
+            self.main_dispatcher_h,
             self.app_h,
             self.cur_activity,
         ]);
@@ -4332,6 +4335,10 @@ impl Vm {
         let class = d.type_descriptor(mid.class_idx as u32).map_err(E::Vm)?;
         let name = d.string(mid.name_idx).map_err(E::Vm)?;
         match (class.as_str(), name.as_str()) {
+            // ServiceLoader cannot discover kotlinx-coroutines-android's
+            // factory here; the dex getter otherwise degrades to a typed
+            // placeholder. Materialize the bundled HandlerContext instead.
+            ("Lkotlinx/coroutines/Dispatchers;", "getMain") => Ok(Some(jdk::main_dispatcher(self))),
             ("Ljava/lang/Object;", "<init>") => Ok(None),
             ("Ljava/lang/Object;", "getClass") => {
                 let this = args.first().copied().unwrap_or(V::Ref(0));
@@ -4713,6 +4720,20 @@ impl Vm {
         // heap access (recursive mutex — nested invoke/JNI re-enters
         // fine, call_native drops all levels while guest code runs).
         let _vmlock = jni::vm_lock();
+        if matches!(kind, InvokeKind::Static) {
+            let is_main_getter = self
+                .dex_of(midx)
+                .and_then(|d| {
+                    let mid = d.method(gl(midx)).ok()?;
+                    let class = d.type_descriptor(mid.class_idx as u32).ok()?;
+                    let name = d.string(mid.name_idx).ok()?;
+                    Some(class == "Lkotlinx/coroutines/Dispatchers;" && name == "getMain")
+                })
+                .unwrap_or(false);
+            if is_main_getter {
+                return Ok(Some(jdk::main_dispatcher(self)));
+            }
+        }
         if crate::dbg_flag("OVELO_HOTCALL") {
             thread_local! {
                 static HOT: std::cell::RefCell<HashMap<GIdx, u64>> =
@@ -5529,6 +5550,19 @@ impl Vm {
             .and_then(|d| d.field(gl(f)).ok())
             .map(|fi| self.canon(gx(gd(f), fi.class_idx as u32)))
             .unwrap_or(f);
+        // kotlinx's MainDispatcherLoader depends on ServiceLoader
+        // metadata that the runtime does not expose. Materialize the
+        // bundled Android HandlerContext directly instead of letting a
+        // failed `<clinit>` degrade the field to a type-only host stub.
+        let dbg_fname = self.dbg_field_name(f);
+        if dbg_fname == "Lkotlinx/coroutines/internal/MainDispatcherLoader;.dispatcher" {
+            if let Some(v) = self.classes.get(&owner).and_then(|c| c.statics.get(&f)) {
+                return Some(*v);
+            }
+            let v = jdk::main_dispatcher(self);
+            self.classes.entry(owner).or_default().statics.insert(f, v);
+            return Some(v);
+        }
         self.ensure_init(owner).ok()?;
         if let Some(v) = self.classes.get(&owner).and_then(|c| c.statics.get(&f)) {
             return Some(*v);

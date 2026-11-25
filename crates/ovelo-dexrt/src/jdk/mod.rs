@@ -107,6 +107,10 @@ pub(crate) const P_MSG_TARGET: u64 = 0xFFFD_FEE4;
 pub(crate) const P_MSG_OBJ: u64 = 0xFFFD_FEE5;
 pub(crate) const P_MSG_CALLBACK: u64 = 0xFFFD_FEE6;
 pub(crate) const P_HANDLER_CB: u64 = 0xFFFD_FEE7;
+/// `Handler`'s bound looper — kotlinx's real dex `HandlerContext`
+/// compares `Looper.myLooper()` with `handler.getLooper()` to decide
+/// whether a main-dispatch can run inline.
+pub(crate) const P_HANDLER_LOOPER: u64 = 0xFFFD_FEED;
 pub(crate) const P_MSG_WHAT: u64 = 0xFFFD_FEE8;
 /// A `LayerDrawable`/`TransitionDrawable`'s `Drawable[]` layers — kept as
 /// a fields entry so the renderer's bitmap field-walk reaches the
@@ -366,6 +370,45 @@ fn dispatch_task(vm: &mut Vm, r: u32) -> std::result::Result<Option<V>, ovelo_er
         }
     }
     vm.call_virtual(r, "run", &[])
+}
+
+/// Construct the real kotlinx-coroutines-android main dispatcher.
+/// ServiceLoader metadata is not available to the guest runtime, so
+/// `MainDispatcherLoader` otherwise falls into its missing-dispatcher
+/// path. The APK does ship `HandlerContext`; instantiate it with the
+/// runtime main handler and let its dex implementation provide the
+/// coroutine-context behavior (`plus`/`fold`/`getKey`) that a host
+/// placeholder cannot reproduce faithfully.
+pub(crate) fn main_dispatcher(vm: &mut Vm) -> V {
+    if vm.main_dispatcher_h != 0 {
+        return V::Ref(vm.main_dispatcher_h);
+    }
+    let looper = main_looper(vm);
+    let hh = vm.alloc_host("Landroid/os/Handler;", HostState::Empty);
+    pseudo_set(vm, hh, P_HANDLER_LOOPER, looper);
+    match vm.instantiate_with(
+        "Lkotlinx/coroutines/android/HandlerContext;",
+        &[V::Ref(hh), V::Ref(0), V::I32(1)],
+    ) {
+        Ok(h) => {
+            vm.main_dispatcher_h = h;
+            return V::Ref(h);
+        }
+        Err(e) => {
+            if crate::dbg_flag("OVELO_STUBDBG") {
+                eprintln!("[maindisp] HandlerContext failed: {e}");
+            }
+        }
+    }
+    let V::Ref(h) = host(
+        vm,
+        "Lkotlinx/coroutines/MainCoroutineDispatcher;",
+        HostState::Empty,
+    ) else {
+        unreachable!()
+    };
+    vm.main_dispatcher_h = h;
+    V::Ref(h)
 }
 
 pub(crate) fn run_on_worker(
