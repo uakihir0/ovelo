@@ -2066,7 +2066,10 @@ fn classloader_call(vm: &mut Vm, name: &str, args: &[V]) -> Option<Option<V>> {
             Some(Some(host(vm, "Ljava/lang/ClassLoader;", HostState::Empty)))
         }
         "loadClass" | "findClass" => {
-            let mut d = sv(vm, args[0]).unwrap_or_default();
+            // Instance ClassLoader methods carry the receiver in args[0];
+            // reading it as the class name loses the descriptor entirely
+            // (and reflective lookups then resolve methods on `L;`).
+            let mut d = args.get(1).and_then(|v| sv(vm, *v)).unwrap_or_default();
             if !d.starts_with('L') {
                 d = format!("L{};", d.replace('.', "/"));
             }
