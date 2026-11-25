@@ -582,6 +582,13 @@ impl Heap {
         self.objs.get_mut(h as usize - 1).and_then(|o| o.as_mut())
     }
 
+    /// Allocate a non-interned string value. Runtime-produced Java
+    /// strings are ordinary objects; only literals and explicit
+    /// `String.intern()` are identity-canonicalized.
+    pub fn alloc_str(&mut self, s: &str) -> u32 {
+        self.alloc(Obj::Str(s.to_string()))
+    }
+
     /// Intern a string value; the same `V::Ref` comes back for equal text.
     pub fn intern_str(&mut self, s: &str) -> u32 {
         if let Some(&h) = self.interned.get(s) {
