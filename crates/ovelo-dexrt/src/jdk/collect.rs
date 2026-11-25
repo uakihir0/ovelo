@@ -791,6 +791,7 @@ fn list_call(vm: &mut Vm, name: &str, sig: &str, args: &[V]) -> Rt<Option<Option
                         l.drain(a..end);
                     }
                 }
+                pseudo_set(vm, h, P_SUBLIST_END, V::I32(a as i32));
             }
             if let Some(l) = list_mut(vm, h) {
                 l.clear();
