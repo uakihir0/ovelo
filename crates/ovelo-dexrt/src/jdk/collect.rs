@@ -787,12 +787,6 @@ fn list_call(vm: &mut Vm, name: &str, sig: &str, args: &[V]) -> Rt<Option<Option
                     ),
                     _ => false,
                 };
-                if fixed_parent {
-                    return Err(vm.throw_builtin(
-                        "Ljava/lang/UnsupportedOperationException;",
-                        "clear on fixed-size subList",
-                    ));
-                }
                 let a = pseudo_get(vm, h, P_SUBLIST_START)
                     .map(i32v)
                     .unwrap_or_default()
@@ -801,6 +795,12 @@ fn list_call(vm: &mut Vm, name: &str, sig: &str, args: &[V]) -> Rt<Option<Option
                     .map(i32v)
                     .unwrap_or_default()
                     .max(0) as usize;
+                if fixed_parent && a < b {
+                    return Err(vm.throw_builtin(
+                        "Ljava/lang/UnsupportedOperationException;",
+                        "clear on fixed-size subList",
+                    ));
+                }
                 if let Some(l) = list_mut(vm, parent) {
                     let end = b.min(l.len());
                     if a < end {
