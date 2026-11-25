@@ -69,9 +69,7 @@ fn do_fetch(spec: HttpSpec) -> std::result::Result<HttpResp, String> {
         .method(spec.method.as_str())
         .uri(spec.url.as_str());
     for (k, v) in &spec.headers {
-        if !k.eq_ignore_ascii_case("accept-encoding") {
-            req = req.header(k.as_str(), v.as_str());
-        }
+        req = req.header(k.as_str(), v.as_str());
     }
     let mut resp =
         if spec.body.is_empty() && !matches!(spec.method.as_str(), "POST" | "PUT" | "PATCH") {
@@ -101,9 +99,9 @@ fn do_fetch(spec: HttpSpec) -> std::result::Result<HttpResp, String> {
             )
         })
         .collect();
-    // Apps routinely download multi-megabyte indexes and media. ureq's
-    // protective 10MiB default is far below Android's effective behavior,
-    // so keep a generous explicit cap instead.
+    // Apps routinely download multi-megabyte indexes and media. Keep a
+    // generous explicit cap; bodies may still be content-encoded here
+    // because the guest HTTP engine owns compression semantics.
     let body = resp
         .body_mut()
         .with_config()
@@ -424,11 +422,8 @@ fn static_sig(
 /// deprecated companion facade okhttp keeps for Java callers. OkHttp 5's
 /// R8 build drops it; fall back to `RealResponseBody(String, long,
 /// RealBufferedSource)` over a byte-backed `okio.Buffer`.
-fn response_body(vm: &mut Vm, content_type: &str, bytes: &[u8]) -> Result<u32> {
-    let arr = vm.heap.alloc(Obj::Array {
-        elem: "B".into(),
-        data: bytes.iter().map(|b| V::I32(*b as i8 as i32)).collect(),
-    });
+fn response_body(vm: &mut Vm, content_type: &str, bytes: Vec<u8>) -> Result<u32> {
+    let len = bytes.len();
     let mt = if content_type.is_empty() {
         V::Ref(0)
     } else {
@@ -444,6 +439,77 @@ fn response_body(vm: &mut Vm, content_type: &str, bytes: &[u8]) -> Result<u32> {
         }
         .unwrap_or(V::Ref(0))
     };
+
+    // Build the body over `Okio.source(InputStream)`. The stream keeps
+    // the wire bytes in one compact host buffer; okio then copies only
+    // the small chunks the app asks for. Materializing the whole body as
+    // a VM byte[] costs an order-of-magnitude more memory (V is a tagged
+    // value, not a byte) and stalls large index downloads.
+    let input = host(
+        vm,
+        "Ljava/io/ByteArrayInputStream;",
+        HostState::Bytes(std::rc::Rc::new(bytes), 0),
+    );
+    let source = static_sig(
+        vm,
+        "Lokio/Okio;",
+        "source",
+        &["Ljava/io/InputStream;"],
+        vec![input],
+    )?;
+    let buffered = source.and_then(|source| {
+        static_sig(
+            vm,
+            "Lokio/Okio;",
+            "buffer",
+            &["Lokio/Source;"],
+            vec![source],
+        )
+        .ok()
+        .flatten()
+    });
+    if httpdbg() {
+        eprintln!(
+            "[http] stream_body buffered={} len={len}",
+            buffered.is_some()
+        );
+    }
+    if let Some(buffered) = buffered {
+        let companion = vm
+            .type_index_of("Lokhttp3/ResponseBody;")
+            .and_then(|ci| vm.find_field_by_name(ci, "Companion", true, None))
+            .and_then(|f| vm.sget_pub(f));
+        if let Some(V::Ref(companion)) = companion {
+            if let Some(V::Ref(h)) = vm.call_virtual_sig(
+                companion,
+                "create",
+                &["Lokio/BufferedSource;", "Lokhttp3/MediaType;", "J"],
+                &[buffered, mt, V::I64(len as i64)],
+            )? {
+                return Ok(h);
+            }
+        }
+    }
+
+    if httpdbg() {
+        eprintln!("[http] stream_body fallback len={len}");
+    }
+    // Small/older-okhttp fallback: materialize through ResponseBody.create.
+    let empty: Vec<u8> = Vec::new();
+    let bytes = match vm.heap.get(match input {
+        V::Ref(h) => h,
+        _ => 0,
+    }) {
+        Some(Obj::Host {
+            state: HostState::Bytes(bytes, _),
+            ..
+        }) => bytes,
+        _ => &empty,
+    };
+    let arr = vm.heap.alloc(Obj::Array {
+        elem: "B".into(),
+        data: bytes.iter().map(|b| V::I32(*b as i8 as i32)).collect(),
+    });
     if let Some(V::Ref(h)) = static_sig(
         vm,
         "Lokhttp3/ResponseBody;",
@@ -470,7 +536,7 @@ fn response_body(vm: &mut Vm, content_type: &str, bytes: &[u8]) -> Result<u32> {
     };
     vm.instantiate_with(
         "Lokhttp3/internal/http/RealResponseBody;",
-        &[ct, V::I64(bytes.len() as i64), V::Ref(src)],
+        &[ct, V::I64(len as i64), V::Ref(src)],
     )
 }
 
@@ -491,7 +557,7 @@ fn build_response(vm: &mut Vm, req_h: u32, resp: HttpResp) -> Result<u32> {
         .find(|(k, _)| k.eq_ignore_ascii_case("content-type"))
         .map(|(_, v)| v.clone())
         .unwrap_or_default();
-    let body = response_body(vm, &ct, &resp.body)?;
+    let body = response_body(vm, &ct, resp.body)?;
 
     // OkHttp 5 rewrote Response.Builder as public fields; OkHttp 4
     // keeps setter methods. Pick by probing for the `code` field.
