@@ -1794,6 +1794,19 @@ fn class_call(vm: &mut Vm, name: &str, _sig: &str, args: &[V]) -> Rt<Option<Opti
             )
             .unwrap_or_default();
             let mname = sv(vm, args[1]).unwrap_or_default();
+            // AOSP's hidden SQLite session hooks are not part of this
+            // runtime's public database surface. Room probes them and
+            // deliberately falls back to direct transactions when the
+            // reflective lookup fails.
+            if (owner == "Landroid/database/sqlite/SQLiteDatabase;" && mname == "getThreadSession")
+                || (owner == "Landroid/database/sqlite/SQLiteSession;"
+                    && mname == "beginTransaction")
+            {
+                return Err(vm.throw_builtin(
+                    "Ljava/lang/NoSuchMethodException;",
+                    &format!("{owner}.{mname}"),
+                ));
+            }
             // Missing method → NoSuchMethodException: reflective
             // serializer lookup branches on the throw.
             if !mname.is_empty()
