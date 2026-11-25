@@ -427,6 +427,11 @@ pub struct Vm {
     /// as `doFrame(J)V`; the Compose Recomposer's frame clock and
     /// `View.postOnAnimation` both schedule through it.
     pub(crate) frame_callbacks: Vec<(u32, u64)>,
+    /// Cooperative single-thread scheduling alternates main and worker
+    /// queues when both have work. Real Android runs workers on parallel
+    /// threads; strict FIFO lets continuously re-posted Compose main-queue
+    /// work starve long-lived repository/parser workers forever.
+    sched_prefer_worker: bool,
     /// The one `Choreographer.getInstance()` handle — identity matters
     /// (dex code compares instances).
     pub(crate) choreographer_h: u32,
@@ -807,6 +812,7 @@ impl Vm {
             pending_activity: None,
             pending_runnables: std::collections::VecDeque::new(),
             frame_callbacks: Vec::new(),
+            sched_prefer_worker: false,
             choreographer_h: 0,
             byteorder_h: std::cell::Cell::new(0),
             activity_callbacks: Vec::new(),
@@ -2336,11 +2342,6 @@ impl Vm {
             }
         }
         if had_frame_work {
-            // Preserve 60 fps when frame work is cheap, but do not let
-            // an expensive interpreted UI monopolize the cooperative
-            // VM. Aim for at most ~25% frame-wall-clock occupancy:
-            // after a long Compose pass the next re-posted callback
-            // waits three times as long as the work itself.
             let frame_cost = (jdk::now_ms() - frame_work_start).max(1) as u64;
             let frame_gap = frame_cost.saturating_mul(3).clamp(16, 500);
             let min_next = jdk::now_ms() as u64 + frame_gap;
@@ -2352,9 +2353,31 @@ impl Vm {
         }
         let mut ran = 0usize;
         for _ in 0..max {
-            let Some((r, on_main)) = self.pending_runnables.pop_front() else {
+            // Android normally gives workers their own threads. On this
+            // cooperative VM strict FIFO is not fair: Compose re-posts
+            // enough main-queue work that a queued IO worker can remain
+            // behind it indefinitely. Alternate sides when both are
+            // present; fall back to whichever side has work.
+            let preferred = self.pending_runnables.iter().position(|(_, on_main)| {
+                if self.sched_prefer_worker {
+                    !on_main
+                } else {
+                    *on_main
+                }
+            });
+            let idx = preferred.or_else(|| {
+                self.pending_runnables.iter().position(|(_, on_main)| {
+                    if self.sched_prefer_worker {
+                        *on_main
+                    } else {
+                        !on_main
+                    }
+                })
+            });
+            let Some((r, on_main)) = idx.and_then(|i| self.pending_runnables.remove(i)) else {
                 break;
             };
+            self.sched_prefer_worker = on_main;
             let out = if on_main {
                 jdk::run_on_main(self, r)
             } else {
