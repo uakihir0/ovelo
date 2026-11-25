@@ -2126,6 +2126,14 @@ fn network_call(vm: &mut Vm, class: &str, name: &str, args: &[V]) -> Option<Opti
             "Landroid/net/NetworkInfo;",
             HostState::Empty,
         ))),
+        ("Landroid/net/ConnectivityManager;", "getAllNetworks") => {
+            let network = host(vm, "Landroid/net/Network;", HostState::Empty);
+            Some(Some(arr(vm, "Landroid/net/Network;", vec![network])))
+        }
+        ("Landroid/net/ConnectivityManager;", "getAllNetworkInfo") => {
+            let info = host(vm, "Landroid/net/NetworkInfo;", HostState::Empty);
+            Some(Some(arr(vm, "Landroid/net/NetworkInfo;", vec![info])))
+        }
         ("Landroid/net/ConnectivityManager;", "isActiveNetworkMetered") => Some(Some(V::I32(0))),
         ("Landroid/net/ConnectivityManager;", "registerDefaultNetworkCallback")
         | ("Landroid/net/ConnectivityManager;", "registerNetworkCallback")
