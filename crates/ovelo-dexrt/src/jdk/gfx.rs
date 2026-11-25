@@ -2166,11 +2166,7 @@ pub(crate) fn guest_draw_ops(vm: &mut Vm, view: u32, w: i32, h: i32) -> Vec<Canv
     // GLSurfaceView subclasses draw through a Renderer, not onDraw —
     // drive the GL10 path and flatten its recorded primitives.
     if pseudo_get(vm, view, super::gl::P_GLES_RENDERER).is_some() {
-        let ops = super::gl::gl_frame(vm, view, w, h);
-        if !ops.is_empty() {
-            vm.first_guest_draw = true;
-        }
-        return ops;
+        return super::gl::gl_frame(vm, view, w, h);
     }
     // A native-renderer surface (Godot's GLThread) swaps into the
     // readback stash — present those pixels on the surface's view.
@@ -2179,7 +2175,6 @@ pub(crate) fn guest_draw_ops(vm: &mut Vm, view: u32, w: i32, h: i32) -> Vec<Canv
         let glish =
             n.contains("GLSurfaceView") || n.contains("GLRenderView") || n.contains("SurfaceView");
         if glish {
-            vm.first_guest_draw = true;
             return vec![CanvasOp::Bitmap {
                 x: 0.0,
                 y: 0.0,
@@ -2283,17 +2278,13 @@ pub(crate) fn guest_draw_ops(vm: &mut Vm, view: u32, w: i32, h: i32) -> Vec<Canv
             }
         }
     }
-    let out = match vm.heap.get(canvas) {
+    match vm.heap.get(canvas) {
         Some(Obj::Host {
             state: HostState::CanvasOps(ops),
             ..
         }) => expand_nested(vm, &ops.clone(), &mut Vec::new()),
         _ => Vec::new(),
-    };
-    if !out.is_empty() {
-        vm.first_guest_draw = true;
     }
-    out
 }
 
 /// Flatten `CanvasOp::Nested` references against the live heap: the

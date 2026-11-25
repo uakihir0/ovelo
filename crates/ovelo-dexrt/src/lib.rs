@@ -439,10 +439,6 @@ pub struct Vm {
     /// threads; strict FIFO lets continuously re-posted Compose main-queue
     /// work starve long-lived repository/parser workers forever.
     sched_prefer_worker: bool,
-    /// Set once guest drawing records real ops; until then startup
-    /// main-queue work wins over workers so a long parse cannot keep
-    /// the first visible frame from ever being composed.
-    pub(crate) first_guest_draw: bool,
     /// The one `Choreographer.getInstance()` handle — identity matters
     /// (dex code compares instances).
     pub(crate) choreographer_h: u32,
@@ -828,7 +824,6 @@ impl Vm {
             pending_runnables: std::collections::VecDeque::new(),
             frame_callbacks: Vec::new(),
             sched_prefer_worker: false,
-            first_guest_draw: false,
             choreographer_h: 0,
             byteorder_h: std::cell::Cell::new(0),
             activity_callbacks: Vec::new(),
@@ -2420,12 +2415,8 @@ impl Vm {
             // enough main-queue work that a queued IO worker can remain
             // behind it indefinitely. Alternate sides when both are
             // present; fall back to whichever side has work.
-            let startup_main = !self.first_guest_draw
-                && self.pending_runnables.iter().any(|(_, on_main)| *on_main);
             let preferred = self.pending_runnables.iter().position(|(_, on_main)| {
-                if startup_main {
-                    *on_main
-                } else if self.sched_prefer_worker {
+                if self.sched_prefer_worker {
                     !on_main
                 } else {
                     *on_main
