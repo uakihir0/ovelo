@@ -568,6 +568,7 @@ fn register_compat_shims(
     // androidx menus (MenuBuilder/SubMenuBuilder/MenuInflater) share
     // the host menu model — see Vm::register_menu_overrides.
     v.register_menu_overrides();
+    v.register_library_fastpaths();
 
     let drawable = |vm: &mut ovelo_dexrt::Vm, res_id: i64| -> V {
         if res_id > 0 {

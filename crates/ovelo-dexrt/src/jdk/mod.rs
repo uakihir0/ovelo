@@ -12,6 +12,7 @@ pub(crate) mod gfx;
 pub(crate) mod gl;
 pub(crate) mod http;
 mod io;
+pub(crate) mod kser;
 mod lang;
 mod rx;
 mod text;

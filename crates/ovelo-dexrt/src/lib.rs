@@ -368,6 +368,10 @@ pub struct Vm {
     /// binary search per executed opcode is the interpreter's hottest
     /// fixed cost in large parser methods.
     pcmap_cache: std::cell::RefCell<HashMap<GIdx, std::rc::Rc<Vec<u32>>>>,
+    /// Reused register storage for completed interpreter frames —
+    /// lexer/parser code calls tiny methods millions of times, and a
+    /// fresh zeroed Vec per call dominates allocation traffic.
+    reg_pool: Vec<Vec<V>>,
     /// `midx` → display name `Lcls;.name(sig)ret` — `last_call` was
     /// formatting one per invoke.
     method_desc_cache: std::cell::RefCell<HashMap<GIdx, std::rc::Rc<str>>>,
@@ -844,6 +848,7 @@ impl Vm {
             code_cache: std::cell::RefCell::new(HashMap::new()),
             insn_cache: std::cell::RefCell::new(HashMap::new()),
             pcmap_cache: std::cell::RefCell::new(HashMap::new()),
+            reg_pool: Vec::new(),
             method_desc_cache: std::cell::RefCell::new(HashMap::new()),
             resolve_cache: std::cell::RefCell::new(HashMap::new()),
             canon_field_cache: std::cell::RefCell::new(HashMap::new()),
@@ -1345,6 +1350,13 @@ impl Vm {
             .or_default()
             .push((owner, class_desc.to_string(), f));
         Ok(found)
+    }
+
+    /// Register host fast paths for hot bundled Kotlin libraries.
+    /// These preserve the dex-visible object model while moving
+    /// byte-at-a-time JSON scanner loops out of the interpreter.
+    pub fn register_library_fastpaths(&mut self) {
+        jdk::kser::register(self);
     }
 
     /// Intern a string value — for host code and probes that need to
@@ -5794,8 +5806,11 @@ impl Vm {
             m
         };
         let nregs = code.registers_size as usize;
+        let mut regs = self.reg_pool.pop().unwrap_or_default();
+        regs.clear();
+        regs.resize(nregs, V::I32(0));
         let mut fr = Frame {
-            regs: vec![V::I32(0); nregs],
+            regs,
             result: None,
             last_call: "".into(),
             exc: None,
@@ -5830,6 +5845,16 @@ impl Vm {
                 };
             }
         }
+        let out = self.exec_frame_loop(&mut fr);
+        let mut regs = std::mem::take(&mut fr.regs);
+        if regs.capacity() <= 1024 && self.reg_pool.len() < 128 {
+            regs.clear();
+            self.reg_pool.push(regs);
+        }
+        out
+    }
+
+    fn exec_frame_loop(&mut self, fr: &mut Frame) -> Rt<Option<V>> {
         let mut pc: usize = 0;
         // Instruction budget — a guest (or stub-driven) loop that never
         // terminates must fail loudly, not hang the host process.
@@ -5874,7 +5899,7 @@ impl Vm {
                     &format!("instruction budget exceeded at +{pc:04x}"),
                 ));
             }
-            let res = self.step(&mut fr, pc);
+            let res = self.step(fr, pc);
             match res {
                 Ok(Out::Next(n)) => pc = n,
                 Ok(Out::Return(v)) => return Ok(v),
@@ -5887,7 +5912,7 @@ impl Vm {
                     }
                     return Err(E::Vm(e));
                 }
-                Err(E::Throw(r)) => match self.find_handler(&fr, pc, r) {
+                Err(E::Throw(r)) => match self.find_handler(fr, pc, r) {
                     _ if self.trace_throw => {
                         let d = self.describe_throw(r);
                         let method = self.describe_method(fr.loc.midx);
@@ -5903,7 +5928,7 @@ impl Vm {
                         if hit {
                             eprintln!("[throw] {method} +{pc:04x} -> {d}");
                         }
-                        match self.find_handler(&fr, pc, r) {
+                        match self.find_handler(fr, pc, r) {
                             Some(addr) => {
                                 pc = addr as usize;
                                 fr.exc = Some(r);
