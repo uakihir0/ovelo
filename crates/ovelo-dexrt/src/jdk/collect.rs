@@ -953,10 +953,16 @@ fn list_call(vm: &mut Vm, name: &str, sig: &str, args: &[V]) -> Rt<Option<Option
         "subList" => {
             let source = list_snapshot(vm, h).unwrap_or_default();
             let (a, b) = (i32v(args[1]), i32v(args[2]));
-            if a < 0 || b < a || b > source.len() as i32 {
+            if a < 0 || b > source.len() as i32 {
                 return Err(vm.throw_builtin(
                     "Ljava/lang/IndexOutOfBoundsException;",
                     &format!("subList({a}, {b}) on size {}", source.len()),
+                ));
+            }
+            if b < a {
+                return Err(vm.throw_builtin(
+                    "Ljava/lang/IllegalArgumentException;",
+                    &format!("subList({a}, {b})"),
                 ));
             }
             let (a, b) = (a as usize, b as usize);
