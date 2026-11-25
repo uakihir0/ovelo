@@ -5415,8 +5415,19 @@ pub(crate) fn dispatch_touch(
     };
     pseudo_set(vm, evt, P_ME_ACTION, V::I32(action));
     let now = now_ms();
-    pseudo_set(vm, evt, P_ME_DOWN_TIME, V::I64(now));
+    if action == 0 {
+        vm.touch_gesture_down_time = now;
+    }
+    let down_time = if vm.touch_gesture_down_time >= 0 {
+        vm.touch_gesture_down_time
+    } else {
+        now
+    };
+    pseudo_set(vm, evt, P_ME_DOWN_TIME, V::I64(down_time));
     pseudo_set(vm, evt, P_ME_EVENT_TIME, V::I64(now));
+    if action == 1 || action == 3 {
+        vm.touch_gesture_down_time = -1;
+    }
     pseudo_set(vm, evt, P_ME_RAWX, V::F32(x as f32));
     pseudo_set(vm, evt, P_ME_RAWY, V::F32(y as f32));
     let mut v = target;

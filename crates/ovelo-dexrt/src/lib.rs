@@ -282,6 +282,8 @@ pub struct Vm {
     /// inside guest calls and can't wait for the next layout pass to
     /// have bounds.
     pub(crate) window_size: (i32, i32),
+    /// Down time of the currently active single-pointer touch gesture.
+    pub(crate) touch_gesture_down_time: i64,
     /// Interned host enum constants, keyed (desc, ordinal) — so
     /// `Month.of(1) == Month.JANUARY` and `date.getMonth()` return the
     /// same handle the static constant did.
@@ -801,6 +803,7 @@ impl Vm {
             decor_roots: HashMap::new(),
             content_frames: HashMap::new(),
             window_size: (720, 1280),
+            touch_gesture_down_time: -1,
             enum_cache: HashMap::new(),
             enum_name_cache: HashMap::new(),
             clock_views: Vec::new(),
