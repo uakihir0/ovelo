@@ -6025,12 +6025,14 @@ impl Vm {
 
     /// One instruction at `pc` in `fr`.
     fn step(&mut self, fr: &mut Frame, pc: usize) -> Rt<Out> {
+        // The decoded table is ordered by code-unit offset. A linear
+        // scan here multiplies every executed instruction by the host
+        // method's length; hot parser loops sit in large methods.
         let pos = fr
             .table
-            .iter()
-            .position(|i| i.offset as usize == pc)
-            .ok_or_else(|| E::Vm(err("dexrt.pc.bounds")))?;
-        let ins = fr.table[pos].clone();
+            .binary_search_by_key(&(pc as u32), |i| i.offset)
+            .map_err(|_| E::Vm(err("dexrt.pc.bounds")))?;
+        let ins = &fr.table[pos];
         let next = fr
             .table
             .get(pos + 1)
@@ -6411,11 +6413,12 @@ impl Vm {
                                 && n as usize <= data.len()
                                 && data[i0 as usize..n as usize].iter().all(|v| *v == stored);
                             if uniform {
-                                Self::set(fr, ins.regs[0] as usize, V::I32(n));
+                                let counter_reg = ins.regs[0] as usize;
+                                let target =
+                                    ins.target.ok_or_else(|| E::Vm(err("dexrt.branch")))? as usize;
+                                Self::set(fr, counter_reg, V::I32(n));
                                 Self::set(fr, z, V::I32(c));
-                                return Ok(Out::Next(
-                                    ins.target.ok_or_else(|| E::Vm(err("dexrt.branch")))? as usize,
-                                ));
+                                return Ok(Out::Next(target));
                             }
                             // Non-uniform: the real loop runs — and a
                             // rescan on every head hit would be O(n²),
