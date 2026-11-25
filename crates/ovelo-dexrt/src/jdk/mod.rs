@@ -3665,10 +3665,12 @@ pub(crate) fn host_supers(d: &str) -> &'static [&'static str] {
         "Ljava/lang/ref/WeakReference;"
         | "Ljava/lang/ref/SoftReference;"
         | "Ljava/lang/ref/PhantomReference;" => &["Ljava/lang/ref/Reference;", OBJ],
+        "Ljava/security/cert/X509Certificate;" => &["Ljava/security/cert/Certificate;", OBJ],
+        "Ljava/security/cert/Certificate;" | "Ljava/security/cert/CertPath;" => &[OBJ],
+        "Ljava/security/CodeSigner;" => &["Ljava/io/Serializable;", OBJ],
         "Ljava/security/MessageDigest;"
         | "Ljava/security/KeyStore;"
         | "Ljava/security/Signature;"
-        | "Ljava/security/cert/Certificate;"
         | "Ljava/security/NoSuchAlgorithmException;"
         | "Ljavax/crypto/Cipher;"
         | "Ljavax/crypto/Mac;"
