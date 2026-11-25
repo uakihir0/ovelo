@@ -1529,7 +1529,7 @@ pub(crate) fn call(
 /// Methods that mean the same thing on every object.
 fn universal(vm: &mut Vm, class: &str, name: &str, sig: &str, args: &[V]) -> Rt<Option<Option<V>>> {
     Ok(match name {
-        "toString" if ret(sig) == STRING => {
+        "toString" if ret(sig) == STRING && class != STRING => {
             // JSON containers serialize through `json_dump_v`, not the
             // generic `[a, b]` list format — let io::call see them.
             let is_json = matches!(args[0], V::Ref(h) if matches!(
