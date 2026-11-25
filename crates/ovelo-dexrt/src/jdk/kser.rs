@@ -339,13 +339,11 @@ fn lexer_scan_index(vm: &mut Vm, h: u32, start: i32, needle: Option<i32>, whites
         };
         let len = seq_len(vm, source);
         if pos >= len {
-            // Preserve chunked-input semantics through the real dex
-            // prefetch path; it refills/compacts and may answer EOF.
-            match vm.call_virtual(h, "prefetchOrEof", &[V::I32(pos)]) {
-                Ok(Some(V::I32(next))) if next >= 0 => pos = next,
-                _ => return -1,
-            }
-            continue;
+            // ReaderJsonLexer.indexOf intentionally searches only the
+            // currently buffered sequence. consumeKeyString treats -1
+            // as the chunk-boundary/escape slow path and drives refills
+            // itself; prefetching here would skip that state machine.
+            return -1;
         }
         let ch = seq_char(vm, source, pos).map(i32v).unwrap_or(0);
         let hit = if let Some(n) = needle {
