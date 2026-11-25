@@ -35,13 +35,13 @@ Legend:
 | Open Sudoku | `org.moire.opensudoku` | 🟢 | **Renders real data**: full 9×9 board drawn with given digits, pencil-mark notes and cell coloring; custom `View.onDraw` path works end to end |
 | Tiny Weather Forecast Germany | `de.kaffeemitkoffein.tinyweatherforecastgermany` | 🟡 | `WelcomeActivity` renders to the window (first real APK first frame) |
 | NewPipe | `org.schabi.newpipe` | 🟢 | **Renders real data**: kiosk "Live" tab lists actual Innertube-fetched videos with titles/channels and real image thumbnails (host-bridged Coil3 `enqueue` → HTTP → WebP decode → `setImageDrawable`). Feed tab empty is expected without subscriptions |
-| F-Droid | `org.fdroid.fdroid` | 🟡 | Lifecycle reaches `onCreate`; Compose initial composition does not terminate (>15B interpreted steps — recompose bookkeeping recycles scopes instead of converging) |
+| F-Droid | `org.fdroid.fdroid` | 🟢 | **Renders real data + input works**: 75MB repository index sync completes (5k apps), Discover rows and Coil icons render, Search accepts keyboard input. Startup/sync and composition are still slow |
 | 2048 (AndStatus) | `org.andstatus.game2048` | 🟡 | Splash logo renders with correct textures (GLES2 pipeline works); help scene's text batcher runs but is very slow under interpretation |
 | Snakes (drugi) | `red.drugi.snakes` | 🟡 | Lifecycle completes (Godot engine); host `Lifecycle` throwable on onCreate, blank GL window |
 | Privacy Friendly Sudoku | `org.secuso.privacyfriendlysudoku` | 🟡 | SplashActivity → TutorialActivity transition runs fully in dex; Welcome screen renders real text (layout rough — overlapping strings). Unblocked by dex-enum `compareTo` fix (LifecycleRegistry sync) |
 | Aegis Authenticator | `com.beemdevelopment.aegis` | 🟢 | Intro wizard renders real content (Welcome slide + logo + import prompt); ViewPager2 page containers materialize. Layout rough (overlapping header) |
 | Markor | `net.gsantner.markor` | 🟢 | **Renders real UI**: Documents file list with real entries + dates, preview pane, FAB, bottom nav (Files/To-Do/QuickNote/LinkBox/More) |
-| Tasks.org | `org.tasks` | 🟡 | Sign-in screen renders (Add account / Continue without sync / Import backup); Hilt DI completes — taps don't navigate yet, layout placement rough |
+| Tasks.org | `org.tasks` | 🟡 | Lifecycle and window open; onboarding routing reaches the Welcome destination internally, but Navigation/AnimatedContent never lays it out (black window). Background coroutine work still loops heavily |
 | Neumorphic Calculator | `com.neumorphic.calculator` | ⛔ | Flutter app — the entire UI runs in `libflutter.so`'s Dart VM, outside the dex runtime's scope |
 | AntennaPod | `de.danoeh.antennapod` | 🟢 | **Renders real UI**: welcome screen centered with app icon, "Welcome to AntennaPod!" text, hint arrow graphic. Splash→MainActivity works (RxJava subscribeOn→observeOn→Handler chain). Fixed: Callable-only drain dispatch, setTheme, generateViewId, foreign-LP wrap, sw600dp qualifier selection |
 
