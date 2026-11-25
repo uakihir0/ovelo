@@ -1597,36 +1597,36 @@ fn run_app(store: &InstallStore, package: &str) -> Result<(), OveloError> {
                                 state: ovelo_dexrt::HostState::Empty,
                             })
                         });
-                    // Prefer the real ContentProvider path: run the
-                    // manifest's androidx.startup InitializationProvider
-                    // onCreate so `discoverAndInitialize` populates
-                    // AppInitializer's own discovered/initialized sets —
-                    // lazy `initializeComponent` callers (e.g.
-                    // ProcessLifecycleInitializer) depend on them, and
-                    // the fields are R8-obfuscated so host writes can't
-                    // reach them. Fall back to driving the initializers
-                    // directly when the provider path fails.
-                    if info
-                        .manifest
-                        .providers
-                        .iter()
-                        .any(|p| p.ends_with("InitializationProvider"))
-                    {
-                        match v.instantiate("Landroidx/startup/InitializationProvider;") {
+                    // Android installs every manifest ContentProvider
+                    // before Application.onCreate. This includes
+                    // androidx.startup's InitializationProvider, but
+                    // also library utility providers such as Compose
+                    // Multiplatform's AndroidContextProvider (which
+                    // captures the application Context used for asset
+                    // reads). Run them in manifest order; startup's
+                    // success additionally gates the legacy direct
+                    // initializer fallback below.
+                    for provider in &info.manifest.providers {
+                        let desc = format!("L{};", provider.replace('.', "/"));
+                        match v.instantiate(&desc) {
                             Ok(ph) => {
-                                let _ = v.call_virtual(
-                                    ph,
-                                    "attachInfo",
-                                    &[ovelo_dexrt::V::Ref(app_h), ovelo_dexrt::V::Ref(0)],
-                                );
+                                v.set_provider_context(ph, ovelo_dexrt::V::Ref(app_h));
                                 match v.call_virtual(ph, "onCreate", &[]) {
-                                    Ok(_) => provider_ran.set(true),
-                                    Err(e) => {
+                                    Ok(_) => {
+                                        if provider.ends_with("InitializationProvider") {
+                                            provider_ran.set(true);
+                                        }
+                                    }
+                                    Err(e) if provider.ends_with("InitializationProvider") => {
                                         println!("startup provider onCreate failed: {e}")
                                     }
+                                    _ => {}
                                 }
                             }
-                            Err(e) => println!("startup provider not instantiated: {e}"),
+                            Err(e) if provider.ends_with("InitializationProvider") => {
+                                println!("startup provider not instantiated: {e}")
+                            }
+                            _ => {}
                         }
                     }
                     if !provider_ran.get() {

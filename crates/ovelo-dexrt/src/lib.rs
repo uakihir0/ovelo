@@ -753,6 +753,15 @@ pub fn lock_vm() -> impl Drop {
 }
 
 impl Vm {
+    /// Attach a guest ContentProvider to its application Context for
+    /// runtime-driven provider startup. AOSP performs this inside
+    /// `attachInfo`; dex overrides can validate authority metadata the
+    /// runtime does not yet model, while the behavioral requirement
+    /// here is that `getContext()` answers the application.
+    pub fn set_provider_context(&mut self, provider: u32, context: V) {
+        jdk::pseudo_set(self, provider, jdk::view::P_CONTEXT, context);
+    }
+
     /// Static field value stored on class `class_idx` (`None` when the
     /// class is unloaded or the field unset). Used by `Enum.values()`.
     pub(crate) fn static_of(&self, class_idx: GIdx, field_idx: GIdx) -> Option<V> {
