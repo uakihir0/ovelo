@@ -388,7 +388,7 @@ pub(crate) fn main_dispatcher(vm: &mut Vm) -> V {
     pseudo_set(vm, hh, P_HANDLER_LOOPER, looper);
     match vm.instantiate_with(
         "Lkotlinx/coroutines/android/HandlerContext;",
-        &[V::Ref(hh), V::Ref(0), V::I32(1)],
+        &[V::Ref(hh), V::Ref(0), V::I32(0)],
     ) {
         Ok(h) => {
             vm.main_dispatcher_h = h;
