@@ -404,7 +404,15 @@ pub struct PaintState {
 impl PaintState {
     /// Color used for solid fills/strokes after color-filter tinting.
     pub fn draw_argb(&self) -> i32 {
-        self.tint_argb.unwrap_or(self.argb)
+        match self.tint_argb {
+            Some(tint) => {
+                let paint_a = (self.argb as u32) >> 24;
+                let tint_a = (tint as u32) >> 24;
+                let a = tint_a * paint_a / 255;
+                ((a << 24) | ((tint as u32) & 0x00ff_ffff)) as i32
+            }
+            None => self.argb,
+        }
     }
 }
 
