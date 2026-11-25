@@ -13,7 +13,7 @@ pub(crate) fn call(
     args: &[V],
 ) -> Rt<Option<Option<V>>> {
     Ok(if class.starts_with("Ljava/nio/file/") {
-        nio_file_call(vm, class, name, args)
+        nio_file_call(vm, class, name, args)?
     } else if desc_is_a(class, "Ljava/io/PrintStream;") || desc_is_a(class, "Ljava/io/PrintWriter;")
     {
         print_call(vm, name, sig, args)
@@ -1030,7 +1030,20 @@ fn file_millis(path: &std::path::Path) -> i64 {
         .unwrap_or(0)
 }
 
-fn nio_file_call(vm: &mut Vm, class: &str, name: &str, args: &[V]) -> Option<Option<V>> {
+fn options_include(vm: &mut Vm, args: &[V], idx: usize, needle: &str) -> bool {
+    let Some(V::Ref(h)) = args.get(idx) else {
+        return false;
+    };
+    let values = match vm.heap.get(*h) {
+        Some(Obj::Array { data, .. }) => data.clone(),
+        _ => return false,
+    };
+    values
+        .iter()
+        .any(|v| v_to_s(vm, *v).to_ascii_uppercase().contains(needle))
+}
+
+fn nio_file_call(vm: &mut Vm, class: &str, name: &str, args: &[V]) -> Rt<Option<Option<V>>> {
     if class == "Ljava/nio/file/Paths;" && name == "get" {
         let mut out = sv(vm, args.first().copied().unwrap_or(V::Ref(0))).unwrap_or_default();
         if let Some(V::Ref(more)) = args.get(1) {
@@ -1047,12 +1060,16 @@ fn nio_file_call(vm: &mut Vm, class: &str, name: &str, args: &[V]) -> Option<Opt
                 }
             }
         }
-        return Some(Some(host(vm, "Ljava/nio/file/Path;", HostState::Path(out))));
+        return Ok(Some(Some(host(
+            vm,
+            "Ljava/nio/file/Path;",
+            HostState::Path(out),
+        ))));
     }
     if class == "Ljava/nio/file/Path;" {
         let this = args.first().copied().unwrap_or(V::Ref(0));
         let path = path_text(vm, this).unwrap_or_default();
-        return Some(match name {
+        return Ok(Some(match name {
             "resolve" => {
                 let other = args.get(1).copied().unwrap_or(V::Ref(0));
                 let tail = path_text(vm, other)
@@ -1083,17 +1100,24 @@ fn nio_file_call(vm: &mut Vm, class: &str, name: &str, args: &[V]) -> Option<Opt
             }
             "toAbsolutePath" | "normalize" => Some(host(vm, class, HostState::Path(path))),
             "toFile" => Some(host(vm, "Ljava/io/File;", HostState::Path(path))),
-            _ => return None,
-        });
+            _ => return Ok(None),
+        }));
     }
     if class == "Ljava/nio/file/Files;" {
         let path_at = |idx: usize| args.get(idx).copied().and_then(|v| path_text(vm, v));
-        return Some(match name {
+        return Ok(Some(match name {
             "move" | "copy" => {
                 let (Some(from), Some(to)) = (path_at(0), path_at(1)) else {
-                    return Some(Some(V::Ref(0)));
+                    return Err(vm.throw_builtin("Ljava/io/IOException;", "missing path"));
                 };
                 let (from_h, to_h) = (fspath(vm, &from), fspath(vm, &to));
+                if !from_h.exists() {
+                    return Err(vm.throw_builtin("Ljava/nio/file/NoSuchFileException;", &from));
+                }
+                let replace = options_include(vm, args, 2, "REPLACE_EXISTING");
+                if to_h.exists() && !replace {
+                    return Err(vm.throw_builtin("Ljava/nio/file/FileAlreadyExistsException;", &to));
+                }
                 if let Some(parent) = to_h.parent() {
                     let _ = std::fs::create_dir_all(parent);
                 }
@@ -1105,7 +1129,7 @@ fn nio_file_call(vm: &mut Vm, class: &str, name: &str, args: &[V]) -> Option<Opt
                     std::fs::copy(&from_h, &to_h).is_ok()
                 };
                 if !ok {
-                    return Some(Some(V::Ref(0)));
+                    return Err(vm.throw_builtin("Ljava/io/IOException;", "file operation failed"));
                 }
                 Some(args.get(1).copied().unwrap_or(V::Ref(0)))
             }
@@ -1125,10 +1149,31 @@ fn nio_file_call(vm: &mut Vm, class: &str, name: &str, args: &[V]) -> Option<Opt
                 Some(args.first().copied().unwrap_or(V::Ref(0)))
             }
             "delete" | "deleteIfExists" => {
-                let p = path_at(0).map(|p| fspath(vm, &p)).unwrap_or_default();
-                let ok = std::fs::remove_file(&p).is_ok() || std::fs::remove_dir_all(&p).is_ok();
+                let guest = path_at(0).unwrap_or_default();
+                let p = fspath(vm, &guest);
+                if !p.exists() {
+                    if name == "deleteIfExists" {
+                        return Ok(Some(Some(V::I32(0))));
+                    }
+                    return Err(vm.throw_builtin("Ljava/nio/file/NoSuchFileException;", &guest));
+                }
+                let nonempty_dir =
+                    p.is_dir() && std::fs::read_dir(&p).is_ok_and(|mut d| d.next().is_some());
+                if nonempty_dir {
+                    return Err(
+                        vm.throw_builtin("Ljava/nio/file/DirectoryNotEmptyException;", &guest)
+                    );
+                }
+                let ok = if p.is_dir() {
+                    std::fs::remove_dir(&p).is_ok()
+                } else {
+                    std::fs::remove_file(&p).is_ok()
+                };
+                if !ok {
+                    return Err(vm.throw_builtin("Ljava/io/IOException;", "delete failed"));
+                }
                 Some(if name == "deleteIfExists" {
-                    V::I32(ok as i32)
+                    V::I32(1)
                 } else {
                     V::I32(0)
                 })
@@ -1149,17 +1194,19 @@ fn nio_file_call(vm: &mut Vm, class: &str, name: &str, args: &[V]) -> Option<Opt
                     if let Some(parent) = p.parent() {
                         let _ = std::fs::create_dir_all(parent);
                     }
+                    let append = options_include(vm, args, 1, "APPEND");
                     std::fs::OpenOptions::new()
                         .write(true)
                         .create(true)
-                        .truncate(true)
+                        .truncate(!append)
+                        .append(append)
                         .open(p)
                         .ok()
                 });
-                Some(match file {
-                    Some(f) => host(vm, "Ljava/io/FileOutputStream;", HostState::File(f)),
-                    None => V::Ref(0),
-                })
+                let Some(f) = file else {
+                    return Err(vm.throw_builtin("Ljava/io/IOException;", "open failed"));
+                };
+                Some(host(vm, "Ljava/io/FileOutputStream;", HostState::File(f)))
             }
             "readAttributes" => {
                 let p = path_at(0).unwrap_or_default();
@@ -1169,14 +1216,14 @@ fn nio_file_call(vm: &mut Vm, class: &str, name: &str, args: &[V]) -> Option<Opt
                     HostState::Path(p),
                 ))
             }
-            _ => return None,
-        });
+            _ => return Ok(None),
+        }));
     }
     if class == "Ljava/nio/file/attribute/BasicFileAttributes;" {
         let path = path_text(vm, args.first().copied().unwrap_or(V::Ref(0))).unwrap_or_default();
         let p = fspath(vm, &path);
         let ms = file_millis(&p);
-        return Some(Some(match name {
+        return Ok(Some(Some(match name {
             "size" => V::I64(p.metadata().map(|m| m.len() as i64).unwrap_or(0)),
             "isDirectory" => V::I32(p.is_dir() as i32),
             "isRegularFile" => V::I32(p.is_file() as i32),
@@ -1190,8 +1237,8 @@ fn nio_file_call(vm: &mut Vm, class: &str, name: &str, args: &[V]) -> Option<Opt
                 "Ljava/nio/file/attribute/FileTime;",
                 HostState::Millis(ms),
             ),
-            _ => return None,
-        }));
+            _ => return Ok(None),
+        })));
     }
     if class == "Ljava/nio/file/attribute/FileTime;" && name == "toMillis" {
         let ms = match args.first() {
@@ -1204,9 +1251,9 @@ fn nio_file_call(vm: &mut Vm, class: &str, name: &str, args: &[V]) -> Option<Opt
             },
             _ => 0,
         };
-        return Some(Some(V::I64(ms)));
+        return Ok(Some(Some(V::I64(ms))));
     }
-    None
+    Ok(None)
 }
 
 // ---------------------------------------------------------------------

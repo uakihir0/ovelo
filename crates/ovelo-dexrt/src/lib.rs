@@ -3563,6 +3563,10 @@ impl Vm {
             ],
             "Ljava/io/EOFException;"
             | "Ljava/io/FileNotFoundException;"
+            | "Ljava/nio/file/FileSystemException;"
+            | "Ljava/nio/file/FileAlreadyExistsException;"
+            | "Ljava/nio/file/NoSuchFileException;"
+            | "Ljava/nio/file/DirectoryNotEmptyException;"
             | "Ljava/io/InterruptedIOException;"
             | "Ljava/io/MalformedURLException;"
             | "Ljava/io/ObjectStreamException;"
