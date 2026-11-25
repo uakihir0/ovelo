@@ -30,6 +30,65 @@ use std::rc::Rc;
 /// pseudo fields so `HostState::Iter` can remain a cheap snapshot.
 const P_ITER_SOURCE: u32 = u32::MAX - 50;
 const P_ITER_LAST: u32 = u32::MAX - 51;
+const P_ITER_DESC: u32 = u32::MAX - 52;
+
+/// Live backing-list length for a source-driven iterator — `None`
+/// when the iterated source isn't a `HostState::List` (set/map/array
+/// snapshot), in which case traversal falls back to the snapshot.
+fn live_list_len(vm: &Vm, h: u32) -> Option<usize> {
+    let src = match pseudo_get(vm, h, P_ITER_SOURCE) {
+        Some(V::Ref(s)) => s,
+        _ => return None,
+    };
+    match vm.heap.get(src) {
+        Some(Obj::Host {
+            state: HostState::List(l),
+            ..
+        }) => Some(l.len()),
+        _ => None,
+    }
+}
+
+/// Element `at` of the iterator's live backing list (see
+/// [`live_list_len`]). Index-exact — duplicates included.
+fn live_list_get(vm: &Vm, h: u32, at: usize) -> Option<V> {
+    let src = match pseudo_get(vm, h, P_ITER_SOURCE) {
+        Some(V::Ref(s)) => s,
+        _ => return None,
+    };
+    match vm.heap.get(src) {
+        Some(Obj::Host {
+            state: HostState::List(l),
+            ..
+        }) => l.get(at).copied(),
+        _ => None,
+    }
+}
+
+/// Iterator `remove` must throw UnsupportedOperationException on
+/// fixed-size / snapshot-mutating backing collections.
+fn iter_remove_unsupported(vm: &Vm, h: u32) -> bool {
+    let src = match pseudo_get(vm, h, P_ITER_SOURCE) {
+        Some(V::Ref(s)) => s,
+        _ => return true,
+    };
+    let fixed = [
+        "Ljava/util/Arrays$ArrayList;",
+        "Ljava/util/concurrent/CopyOnWriteArrayList;",
+        "Ljava/util/concurrent/CopyOnWriteArraySet;",
+        "Ljava/util/Collections$EmptyList;",
+        "Ljava/util/Collections$EmptySet;",
+        "Ljava/util/Collections$SingletonList;",
+        "Ljava/util/Collections$SingletonSet;",
+        "Ljava/util/Collections$UnmodifiableList;",
+        "Ljava/util/Collections$UnmodifiableSet;",
+        "Ljava/util/Collections$UnmodifiableCollection;",
+    ];
+    match vm.heap.get(src) {
+        Some(Obj::Host { desc, .. }) => fixed.contains(&desc.as_str()),
+        _ => false,
+    }
+}
 
 const LIST_CLASSES: &[&str] = &[
     "Ljava/util/ArrayList;",
@@ -793,13 +852,17 @@ fn list_call(vm: &mut Vm, name: &str, sig: &str, args: &[V]) -> Rt<Option<Option
             // `listIterator(I)` starts positioned at `I` (navigation
             // walks the back stack in reverse from the end) and
             // `descendingIterator` yields last-to-first.
-            let (items, pos) = if name == "descendingIterator" {
-                (items.into_iter().rev().collect::<Vec<_>>(), 0)
+            // The cursor is source-coordinate: a descending iterator
+            // starts at the end and walks down (flag-driven, not a
+            // reversed snapshot) so remove() can map the last-returned
+            // element to its exact source index.
+            let descending = name == "descendingIterator";
+            let pos = if descending {
+                items.len()
             } else if name == "listIterator" {
-                let p = i32v(args.get(1).copied().unwrap_or(V::I32(0))).max(0) as usize;
-                (items, p)
+                i32v(args.get(1).copied().unwrap_or(V::I32(0))).max(0) as usize
             } else {
-                (items, 0)
+                0
             };
             let pos = pos.min(items.len());
             let it = host(
@@ -810,6 +873,9 @@ fn list_call(vm: &mut Vm, name: &str, sig: &str, args: &[V]) -> Rt<Option<Option
             if let V::Ref(ih) = it {
                 pseudo_set(vm, ih, P_ITER_SOURCE, V::Ref(h));
                 pseudo_set(vm, ih, P_ITER_LAST, V::I32(-1));
+                if descending {
+                    pseudo_set(vm, ih, P_ITER_DESC, V::I32(1));
+                }
             }
             Some(Some(it))
         }
@@ -1470,11 +1536,19 @@ fn iter_call(vm: &mut Vm, name: &str, args: &[V]) -> Rt<Option<Option<V>>> {
             Some(None)
         }
         "hasNext" | "hasMoreElements" => {
+            let desc = matches!(pseudo_get(vm, h, P_ITER_DESC), Some(V::I32(1)));
             let n = match vm.heap.get(h) {
                 Some(Obj::Host {
                     state: HostState::Iter(items, pos),
                     ..
-                }) => (*pos < items.len()) as i32,
+                }) => {
+                    let len = live_list_len(vm, h).unwrap_or(items.len());
+                    if desc {
+                        (*pos > 0) as i32
+                    } else {
+                        (*pos < len) as i32
+                    }
+                }
                 Some(Obj::Host {
                     state: HostState::List(l),
                     ..
@@ -1484,77 +1558,138 @@ fn iter_call(vm: &mut Vm, name: &str, args: &[V]) -> Rt<Option<Option<V>>> {
             Some(Some(V::I32(n)))
         }
         "next" | "nextElement" => {
-            let (v, ok, last) = match vm.heap.get_mut(h) {
+            if matches!(
+                vm.heap.get(h),
                 Some(Obj::Host {
-                    state: HostState::Iter(items, pos),
+                    state: HostState::Iter(..),
                     ..
-                }) => {
-                    if *pos < items.len() {
-                        let at = *pos;
-                        let v = items[at];
-                        if crate::dbg_flag("OVELO_ITERDBG") && matches!(v, V::Ref(0)) {
-                            eprintln!(
-                                "[iterdbg] next on h{h} pos={pos} yields null; items={:?}",
-                                items.iter().map(|x| format!("{x:?}")).collect::<Vec<_>>()
-                            );
-                        }
-                        *pos += 1;
-                        (v, true, at as i32)
+                })
+            ) {
+                let desc = matches!(pseudo_get(vm, h, P_ITER_DESC), Some(V::I32(1)));
+                let (pos, len) = match vm.heap.get(h) {
+                    Some(Obj::Host {
+                        state: HostState::Iter(items, pos),
+                        ..
+                    }) => (*pos, live_list_len(vm, h).unwrap_or(items.len())),
+                    _ => (0, 0),
+                };
+                let at = if desc {
+                    if pos == 0 {
+                        None
                     } else {
-                        (V::Ref(0), false, -1)
+                        Some(pos - 1)
                     }
+                } else if pos < len {
+                    Some(pos)
+                } else {
+                    None
+                };
+                let Some(at) = at else {
+                    let e = vm
+                        .throw_builtin("Ljava/util/NoSuchElementException;", "iterator exhausted");
+                    return Err(e);
+                };
+                let v = live_list_get(vm, h, at)
+                    .or_else(|| match vm.heap.get(h) {
+                        Some(Obj::Host {
+                            state: HostState::Iter(items, _),
+                            ..
+                        }) => items.get(at).copied(),
+                        _ => None,
+                    })
+                    .unwrap_or(V::Ref(0));
+                if crate::dbg_flag("OVELO_ITERDBG") && matches!(v, V::Ref(0)) {
+                    eprintln!("[iterdbg] next on h{h} at={at} yields null");
                 }
+                if let Some(Obj::Host {
+                    state: HostState::Iter(_, pos),
+                    ..
+                }) = vm.heap.get_mut(h)
+                {
+                    *pos = if desc { at } else { at + 1 };
+                }
+                pseudo_set(vm, h, P_ITER_LAST, V::I32(at as i32));
+                return Ok(Some(Some(v)));
+            }
+            let (v, ok) = match vm.heap.get_mut(h) {
                 Some(Obj::Host {
                     state: HostState::List(l),
                     ..
                 }) => {
                     if l.is_empty() {
-                        (V::Ref(0), false, -1)
+                        (V::Ref(0), false)
                     } else {
-                        (l.remove(0), true, -1)
+                        (l.remove(0), true)
                     }
                 }
-                _ => (V::Ref(0), false, -1),
+                _ => (V::Ref(0), false),
             };
             if !ok {
                 let e =
                     vm.throw_builtin("Ljava/util/NoSuchElementException;", "iterator exhausted");
                 return Err(e);
             }
-            if last >= 0 {
-                pseudo_set(vm, h, P_ITER_LAST, V::I32(last));
-            }
             Some(Some(v))
         }
         "hasPrevious" => {
+            let desc = matches!(pseudo_get(vm, h, P_ITER_DESC), Some(V::I32(1)));
             let n = match vm.heap.get(h) {
                 Some(Obj::Host {
-                    state: HostState::Iter(_, pos),
+                    state: HostState::Iter(items, pos),
                     ..
-                }) => (*pos > 0) as i32,
+                }) => {
+                    let len = live_list_len(vm, h).unwrap_or(items.len());
+                    if desc {
+                        (*pos < len) as i32
+                    } else {
+                        (*pos > 0) as i32
+                    }
+                }
                 _ => 0,
             };
             Some(Some(V::I32(n)))
         }
         "previous" => {
-            let (v, ok) = match vm.heap.get_mut(h) {
+            let desc = matches!(pseudo_get(vm, h, P_ITER_DESC), Some(V::I32(1)));
+            let (pos, len) = match vm.heap.get(h) {
                 Some(Obj::Host {
                     state: HostState::Iter(items, pos),
                     ..
-                }) => {
-                    if *pos > 0 {
-                        *pos -= 1;
-                        (items[*pos], true)
-                    } else {
-                        (V::Ref(0), false)
-                    }
-                }
-                _ => (V::Ref(0), false),
+                }) => (*pos, live_list_len(vm, h).unwrap_or(items.len())),
+                _ => (0, 0),
             };
-            if !ok {
+            let at = if desc {
+                if pos < len {
+                    Some(pos)
+                } else {
+                    None
+                }
+            } else if pos > 0 {
+                Some(pos - 1)
+            } else {
+                None
+            };
+            let Some(at) = at else {
                 let e = vm.throw_builtin("Ljava/util/NoSuchElementException;", "previous at start");
                 return Err(e);
+            };
+            let v = live_list_get(vm, h, at)
+                .or_else(|| match vm.heap.get(h) {
+                    Some(Obj::Host {
+                        state: HostState::Iter(items, _),
+                        ..
+                    }) => items.get(at).copied(),
+                    _ => None,
+                })
+                .unwrap_or(V::Ref(0));
+            if let Some(Obj::Host {
+                state: HostState::Iter(_, pos),
+                ..
+            }) = vm.heap.get_mut(h)
+            {
+                *pos = if desc { at + 1 } else { at };
             }
+            pseudo_set(vm, h, P_ITER_LAST, V::I32(at as i32));
             Some(Some(v))
         }
         "nextIndex" | "previousIndex" => {
@@ -1577,41 +1712,51 @@ fn iter_call(vm: &mut Vm, name: &str, args: &[V]) -> Rt<Option<Option<V>>> {
                 Some(V::I32(n)) => n,
                 _ => -1,
             };
-            if last >= 0 {
-                let at = last as usize;
-                let item = match vm.heap.get(h) {
-                    Some(Obj::Host {
-                        state: HostState::Iter(items, _),
-                        ..
-                    }) => items.get(at).copied(),
-                    _ => None,
-                };
-                if let (Some(item), Some(V::Ref(src))) = (item, pseudo_get(vm, h, P_ITER_SOURCE)) {
-                    let pos = match vm.heap.get(src) {
-                        Some(Obj::Host {
-                            state: HostState::List(l),
-                            ..
-                        }) => {
-                            if at < l.len() && value_eq(vm, l[at], item) {
-                                Some(at)
-                            } else {
-                                l.iter().position(|e| value_eq(vm, *e, item))
-                            }
-                        }
-                        _ => None,
-                    };
-                    if let Some(pos) = pos {
-                        if let Some(Obj::Host {
-                            state: HostState::List(l),
-                            ..
-                        }) = vm.heap.get_mut(src)
-                        {
-                            l.remove(pos);
-                        }
+            if last < 0 {
+                let e = vm.throw_builtin(
+                    "Ljava/lang/IllegalStateException;",
+                    "remove before next/previous",
+                );
+                return Err(e);
+            }
+            if iter_remove_unsupported(vm, h) {
+                let e = vm.throw_builtin(
+                    "Ljava/lang/UnsupportedOperationException;",
+                    "iterator remove",
+                );
+                return Err(e);
+            }
+            // Index-exact removal: traversal is source-coordinate, so
+            // `last` IS the element's index in the backing list — no
+            // value search that could hit a duplicate.
+            let at = last as usize;
+            let mut removed = false;
+            if let Some(V::Ref(src)) = pseudo_get(vm, h, P_ITER_SOURCE) {
+                if let Some(Obj::Host {
+                    state: HostState::List(l),
+                    ..
+                }) = vm.heap.get_mut(src)
+                {
+                    if at < l.len() {
+                        l.remove(at);
+                        removed = true;
                     }
                 }
-                pseudo_set(vm, h, P_ITER_LAST, V::I32(-1));
             }
+            if removed {
+                // Everything at/after the removed index shifted down —
+                // rewind the cursor when it sat past the element.
+                if let Some(Obj::Host {
+                    state: HostState::Iter(_, pos),
+                    ..
+                }) = vm.heap.get_mut(h)
+                {
+                    if at < *pos {
+                        *pos -= 1;
+                    }
+                }
+            }
+            pseudo_set(vm, h, P_ITER_LAST, V::I32(-1));
             Some(None)
         }
         "set" | "add" | "forEachRemaining" => Some(None),
@@ -1643,14 +1788,16 @@ fn collections_static(vm: &mut Vm, name: &str, args: &[V]) -> Option<Option<V>> 
                 ("Ljava/util/Map;", HostState::Map(vec![]))
             } else if name.contains("Iterator") || name.contains("Enumeration") {
                 ("Ljava/util/Iterator;", HostState::Iter(Rc::new(vec![]), 0))
+            } else if name.contains("Set") {
+                ("Ljava/util/Collections$EmptySet;", HostState::List(vec![]))
             } else {
-                ("Ljava/util/List;", HostState::List(vec![]))
+                ("Ljava/util/Collections$EmptyList;", HostState::List(vec![]))
             };
             Some(Some(host(vm, d, st)))
         }
         "singletonList" | "singleton" => Some(Some(host(
             vm,
-            "Ljava/util/List;",
+            "Ljava/util/Collections$SingletonList;",
             HostState::List(vec![args[0]]),
         ))),
         "singletonMap" => Some(Some(host(
@@ -1827,7 +1974,13 @@ fn arrays_static(vm: &mut Vm, name: &str, _sig: &str, args: &[V]) -> Rt<Option<O
                 },
                 _ => args.to_vec(),
             };
-            Some(Some(host(vm, "Ljava/util/List;", HostState::List(items))))
+            // Fixed-size per Arrays$ArrayList — the descriptor names it
+            // so iterator remove() can throw UOE like the JDK.
+            Some(Some(host(
+                vm,
+                "Ljava/util/Arrays$ArrayList;",
+                HostState::List(items),
+            )))
         }
         "toString" | "deepToString" => {
             let t = match args[0] {
