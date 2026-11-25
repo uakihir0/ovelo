@@ -5,7 +5,7 @@
 //! handled-void, `Ok(None)` not covered (caller stubs or reports
 //! `dexrt.invoke.unresolved`).
 
-mod android;
+pub(crate) mod android;
 mod collect;
 pub(crate) mod db;
 pub(crate) mod gfx;
@@ -3027,6 +3027,12 @@ pub(crate) fn host_supers(d: &str) -> &'static [&'static str] {
             OBJ,
         ],
         "Landroid/app/IntentService;" => &["Landroid/app/Service;", OBJ],
+        "Landroid/app/job/JobService;" => &[
+            "Landroid/app/Service;",
+            "Landroid/content/ContextWrapper;",
+            "Landroid/content/Context;",
+            OBJ,
+        ],
         "Landroid/content/Intent;" => &["Landroid/os/Parcelable;", "Ljava/lang/Cloneable;", OBJ],
         "Landroid/content/IntentFilter;" => &["Landroid/os/Parcelable;", OBJ],
         "Landroid/content/ComponentName;" => &[

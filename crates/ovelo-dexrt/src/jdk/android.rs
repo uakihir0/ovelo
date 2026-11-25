@@ -52,6 +52,8 @@ pub(crate) fn call(
         intent_call(vm, name, sig, args)?
     } else if class == "Landroid/content/ComponentName;" {
         component_call(vm, name, args)?
+    } else if class.starts_with("Landroid/app/job/") {
+        job_call(vm, class, name, args)?
     } else if class == "Landroid/provider/DocumentsContract;" {
         // SAF URI builders only mint content:// strings — like Uri.parse.
         match name {
@@ -1792,6 +1794,154 @@ fn dialog_call(vm: &mut Vm, name: &str, args: &[V]) -> Rt<Option<Option<V>>> {
         | "setOnActionModeFinished" => None,
         _ => return Ok(None),
     }))
+}
+
+fn copy_job_fields(vm: &mut Vm, from: u32, to: u32) {
+    for k in [P_COMPONENT, P_DATA, P_FLAGS, P_META as u32] {
+        if let Some(v) = pseudo_get(vm, from, k) {
+            pseudo_set(vm, to, k, v);
+        }
+    }
+}
+
+fn job_service_desc(vm: &Vm, component: u32) -> Option<String> {
+    let cls = pseudo_get(vm, component, P_DATA).and_then(|v| sv(vm, v))?;
+    if cls.is_empty() {
+        return None;
+    }
+    Some(if cls.starts_with('L') {
+        cls
+    } else {
+        format!("L{};", cls.replace('.', "/"))
+    })
+}
+
+fn job_call(vm: &mut Vm, class: &str, name: &str, args: &[V]) -> Rt<Option<Option<V>>> {
+    let this = match args.first() {
+        Some(V::Ref(h)) => *h,
+        _ => 0,
+    };
+    Ok(match (class, name) {
+        ("Landroid/app/job/JobInfo$Builder;", "<init>") => {
+            pseudo_set(vm, this, P_FLAGS, args.get(1).copied().unwrap_or(V::I32(0)));
+            pseudo_set(
+                vm,
+                this,
+                P_COMPONENT,
+                args.get(2).copied().unwrap_or(V::Ref(0)),
+            );
+            Some(None)
+        }
+        ("Landroid/app/job/JobInfo$Builder;", "setExtras") => {
+            pseudo_set(vm, this, P_DATA, args.get(1).copied().unwrap_or(V::Ref(0)));
+            Some(Some(args[0]))
+        }
+        ("Landroid/app/job/JobInfo$Builder;", "setMinimumLatency") => {
+            pseudo_set(vm, this, P_META, args.get(1).copied().unwrap_or(V::I64(0)));
+            Some(Some(args[0]))
+        }
+        ("Landroid/app/job/JobInfo$Builder;", "build") => {
+            let jh = vm.alloc_host("Landroid/app/job/JobInfo;", HostState::Map(Vec::new()));
+            copy_job_fields(vm, this, jh);
+            Some(Some(V::Ref(jh)))
+        }
+        ("Landroid/app/job/JobInfo$Builder;", n)
+            if n.starts_with("set") || n == "addTriggerContentUri" =>
+        {
+            // Constraint details decide *when* AOSP runs the job; the
+            // runtime's scheduler is best-effort and currently only needs
+            // extras/component/identity preserved. Every builder setter
+            // is chainable.
+            Some(Some(args[0]))
+        }
+        ("Landroid/app/job/JobInfo;", "getExtras") => {
+            Some(Some(pseudo_get(vm, this, P_DATA).unwrap_or(V::Ref(0))))
+        }
+        ("Landroid/app/job/JobInfo;", "getId") => {
+            Some(Some(pseudo_get(vm, this, P_FLAGS).unwrap_or(V::I32(0))))
+        }
+        ("Landroid/app/job/JobParameters;", "getExtras") => {
+            Some(Some(pseudo_get(vm, this, P_DATA).unwrap_or(V::Ref(0))))
+        }
+        ("Landroid/app/job/JobParameters;", "getJobId") => {
+            Some(Some(pseudo_get(vm, this, P_FLAGS).unwrap_or(V::I32(0))))
+        }
+        ("Landroid/app/job/JobParameters;", "getTriggeredContentUris")
+        | ("Landroid/app/job/JobParameters;", "getTriggeredContentAuthorities")
+        | ("Landroid/app/job/JobParameters;", "getNetwork") => Some(Some(V::Ref(0))),
+        ("Landroid/app/job/JobScheduler;", "schedule") => {
+            if let (V::Ref(jh), Some(V::Ref(ch))) = (
+                args.get(1).copied().unwrap_or(V::Ref(0)),
+                pseudo_get_optional_job_component(vm, args),
+            ) {
+                if jh != 0 && ch != 0 {
+                    // JobScheduler.replace semantics: another schedule for
+                    // the same job id supersedes the still-pending request.
+                    let id = pseudo_get(vm, jh, P_FLAGS).unwrap_or(V::I32(0));
+                    let keep: Vec<_> = vm
+                        .pending_jobs
+                        .iter()
+                        .filter(|(pj, _, _)| {
+                            pseudo_get(vm, *pj, P_FLAGS).unwrap_or(V::I32(0)) != id
+                        })
+                        .copied()
+                        .collect();
+                    vm.pending_jobs = keep;
+                    let latency = pseudo_get(vm, jh, P_META).map(i64v).unwrap_or(0);
+                    if crate::dbg_flag("OVELO_JOBDBG") {
+                        eprintln!("[job] schedule id={id:?} latency={latency}");
+                    }
+                    vm.pending_jobs.push((jh, ch, now_ms() + latency.max(0)));
+                }
+            }
+            Some(Some(V::I32(1)))
+        }
+        ("Landroid/app/job/JobScheduler;", "cancel")
+        | ("Landroid/app/job/JobScheduler;", "cancelAll") => Some(None),
+        ("Landroid/app/job/JobService;", "jobFinished") => Some(None),
+        _ => None,
+    })
+}
+
+fn pseudo_get_optional_job_component(vm: &Vm, args: &[V]) -> Option<V> {
+    match args.get(1).copied() {
+        Some(V::Ref(jh)) if jh != 0 => pseudo_get(vm, jh, P_COMPONENT),
+        _ => None,
+    }
+}
+
+/// Dispatch accepted JobScheduler jobs between guest activations. This
+/// is deliberately best-effort rather than a constraint scheduler: an
+/// Android runtime without system job infrastructure still must run
+/// WorkManager expedited/immediate work, or repository syncs never start.
+pub(crate) fn drain_jobs(vm: &mut Vm) {
+    let now = now_ms();
+    let (due, later): (Vec<_>, Vec<_>) = std::mem::take(&mut vm.pending_jobs)
+        .into_iter()
+        .partition(|(_, _, t)| *t <= now);
+    vm.pending_jobs = later;
+    for (jh, ch, _) in due {
+        let Some(desc) = job_service_desc(vm, ch) else {
+            continue;
+        };
+        let sh = match vm.services.get(&desc) {
+            Some(&h) => h,
+            None => {
+                let Ok(h) = vm.instantiate(&desc) else {
+                    continue;
+                };
+                let _ = vm.call_virtual(h, "onCreate", &[]);
+                vm.services.insert(desc.clone(), h);
+                h
+            }
+        };
+        let ph = vm.alloc_host(
+            "Landroid/app/job/JobParameters;",
+            HostState::Map(Vec::new()),
+        );
+        copy_job_fields(vm, jh, ph);
+        let _ = vm.call_virtual(sh, "onStartJob", &[V::Ref(ph)]);
+    }
 }
 
 fn component_call(vm: &mut Vm, name: &str, args: &[V]) -> Rt<Option<Option<V>>> {

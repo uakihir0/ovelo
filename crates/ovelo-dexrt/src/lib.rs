@@ -327,6 +327,9 @@ pub struct Vm {
     /// Services whose `onDestroy` is owed on the next drain — deferred
     /// so `onStartCommand`/`startService` finish before teardown runs.
     pub(crate) pending_destroy: Vec<u32>,
+    /// Accepted JobScheduler jobs `(JobInfo, ComponentName, due_ms)`
+    /// waiting for a between-callback service dispatch.
+    pub(crate) pending_jobs: Vec<(u32, u32, i64)>,
     /// The Activity/theme res id (`android:theme` from the manifest) that
     /// theme-scoped `obtainStyledAttributes` resolves attributes against.
     pub theme_id: u32,
@@ -785,6 +788,7 @@ impl Vm {
             service_seq: 0,
             service_stop_pending: std::collections::HashSet::new(),
             pending_destroy: Vec::new(),
+            pending_jobs: Vec::new(),
             theme_id: 0,
             total_steps: 0,
             pending_activity: None,
@@ -2153,6 +2157,7 @@ impl Vm {
         // the drain runs their onDestroy / attaches the drawable —
         // collecting either first silently drops the delivery.
         roots.extend(self.pending_destroy.iter().copied());
+        roots.extend(self.pending_jobs.iter().flat_map(|(a, b, _)| [*a, *b]));
         roots.extend(self.coil_jobs.iter().map(|(_, v)| *v));
         // obj_db/throw_sites/unsafe_offsets are NOT rooted: entries whose
         // owner object is dead are pruned after the sweep instead, so the
@@ -2216,6 +2221,7 @@ impl Vm {
         // set so a nested drain from a delivered callback early-returns
         // instead of running an unbounded inner pass.
         jdk::http::drain_coil(self);
+        jdk::android::drain_jobs(self);
         // Retry host calls that lost the borrow race during the last
         // pass — the outer callback has released by now, so the bridge
         // runs its host-side effects (GuestUi wiring etc.). attach_at
@@ -3585,6 +3591,9 @@ impl Vm {
             | "Landroid/os/Bundle;"
             | "Landroid/os/BaseBundle;"
             | "Landroid/os/PersistableBundle;"
+            | "Landroid/app/job/JobInfo;"
+            | "Landroid/app/job/JobInfo$Builder;"
+            | "Landroid/app/job/JobParameters;"
             | "Landroid/content/Intent;" => HostState::Map(Vec::new()),
             "Ljava/util/Calendar;"
             | "Ljava/util/GregorianCalendar;"
