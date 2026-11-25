@@ -5469,6 +5469,40 @@ fn app_info(vm: &mut Vm) -> V {
 /// `SharedPreferences` host object interned per file name — Android
 /// prefs are file-backed, so every getter for one file must share a
 /// map (a fresh empty map per call silently dropped every write).
+fn xml_unescape(s: &str) -> String {
+    s.replace("&#10;", "\n")
+        .replace("&#13;", "\r")
+        .replace("&lt;", "<")
+        .replace("&gt;", ">")
+        .replace("&quot;", "\"")
+        .replace("&apos;", "'")
+        .replace("&amp;", "&")
+}
+
+fn xml_escape(s: &str) -> String {
+    s.replace('&', "&amp;")
+        .replace('<', "&lt;")
+        .replace('>', "&gt;")
+        .replace('\"', "&quot;")
+        .replace('\n', "&#10;")
+        .replace('\r', "&#13;")
+}
+
+fn pref_name(line: &str) -> Option<String> {
+    line.split("name=\"")
+        .nth(1)
+        .and_then(|x| x.split('\"').next())
+        .map(xml_unescape)
+}
+
+fn pref_strings(line: &str) -> Vec<String> {
+    line.split("<string>")
+        .skip(1)
+        .filter_map(|x| x.split("</string>").next())
+        .map(xml_unescape)
+        .collect()
+}
+
 fn prefs_file(vm: &mut Vm, file: &str) -> V {
     if let Some(&h) = vm.prefs_files.get(file) {
         return V::Ref(h);
@@ -5476,15 +5510,11 @@ fn prefs_file(vm: &mut Vm, file: &str) -> V {
     let mut entries = Vec::new();
     let path = io::fspath(vm, &format!("/data/local/ovelo/shared_prefs/{file}.xml"));
     if let Ok(xml) = std::fs::read_to_string(&path) {
-        for line in xml.lines() {
-            let Some(name) = line
-                .split("name=\"")
-                .nth(1)
-                .and_then(|x| x.split('\"').next())
-            else {
+        for line in xml.lines().map(str::trim_start) {
+            let Some(name) = pref_name(line) else {
                 continue;
             };
-            let key = jstr(vm, name);
+            let key = jstr(vm, &name);
             let v = if line.starts_with("<boolean") {
                 line.contains("value=\"true\"")
                     .then_some(V::I32(1))
@@ -5508,18 +5538,7 @@ fn prefs_file(vm: &mut Vm, file: &str) -> V {
                     .and_then(|x| x.parse::<f32>().ok())
                     .map(V::F32)
             } else if line.starts_with("<string") {
-                line.split('>')
-                    .nth(1)
-                    .and_then(|x| x.split('<').next())
-                    .map(|x| {
-                        let x = x
-                            .replace("&lt;", "<")
-                            .replace("&gt;", ">")
-                            .replace("&quot;", "\"")
-                            .replace("&apos;", "'")
-                            .replace("&amp;", "&");
-                        jstr(vm, &x)
-                    })
+                pref_strings(line).first().map(|x| jstr(vm, x))
             } else {
                 None
             };
@@ -5550,21 +5569,17 @@ fn save_prefs(vm: &mut Vm, file: &str, h: u32) {
     let mut out = String::from("<?xml version='1.0' encoding='utf-8' standalone='yes' ?>\n<map>\n");
     for (k, v) in m.clone() {
         let Some(key) = sv(vm, k) else { continue };
-        let key = key
-            .replace('&', "&amp;")
-            .replace('<', "&lt;")
-            .replace('\"', "&quot;");
+        let key = xml_escape(&key);
         match v {
             V::I32(x) => out.push_str(&format!("<int name=\"{key}\" value=\"{x}\" />\n")),
             V::I64(x) => out.push_str(&format!("<long name=\"{key}\" value=\"{x}\" />\n")),
             V::F32(x) => out.push_str(&format!("<float name=\"{key}\" value=\"{x}\" />\n")),
             V::Ref(_) => {
                 if let Some(x) = sv(vm, v) {
-                    let x = x
-                        .replace('&', "&amp;")
-                        .replace('<', "&lt;")
-                        .replace('>', "&gt;");
-                    out.push_str(&format!("<string name=\"{key}\">{x}</string>\n"));
+                    out.push_str(&format!(
+                        "<string name=\"{key}\">{}</string>\n",
+                        xml_escape(&x)
+                    ));
                 }
             }
             _ => {}
