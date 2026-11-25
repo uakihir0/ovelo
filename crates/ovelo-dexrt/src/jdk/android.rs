@@ -203,9 +203,11 @@ pub(crate) fn call(
         // per file so writes are visible to later readers.
         match name {
             "getDefaultSharedPreferences" => {
-                // NUL can't appear in a real prefs file name — this
-                // key can never collide with a named file.
-                Some(Some(prefs_file(vm, "\u{0}default")))
+                let name = format!(
+                    "{}_preferences",
+                    vm.guest_package.as_deref().unwrap_or("app")
+                );
+                Some(Some(prefs_file(vm, &name)))
             }
             _ => None,
         }
