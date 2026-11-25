@@ -6590,6 +6590,12 @@ pub(crate) fn set_content_view(vm: &mut Vm, activity: u32, content: V) {
         return;
     }
     pseudo_set(vm, activity, P_CONTENT, cv);
+    if let V::Ref(h) = cv {
+        if h != 0 {
+            vm.view_roots.retain(|r| *r != h);
+            vm.view_roots.push(h);
+        }
+    }
     if let Some(w) = window_of(vm, activity) {
         if let Some(cf) = content_frame_of(vm, w) {
             // A second setContentView replaces the content view — the
