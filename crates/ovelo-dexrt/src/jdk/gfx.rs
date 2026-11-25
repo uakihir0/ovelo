@@ -2150,7 +2150,33 @@ pub(crate) fn dump_node_tree(vm: &mut Vm, view: u32) {
     }
 }
 
+pub(crate) fn compose_measure_active(vm: &mut Vm, view: u32) -> bool {
+    let Some(V::Ref(delegate)) = vm.get_object_field(
+        view,
+        "Landroidx/compose/ui/platform/AndroidComposeView;",
+        "measureAndLayoutDelegate",
+    ) else {
+        return false;
+    };
+    matches!(
+        vm.get_object_field(
+            delegate,
+            "Landroidx/compose/ui/node/MeasureAndLayoutDelegate;",
+            "duringMeasureLayout",
+        ),
+        Some(V::I32(1))
+    )
+}
+
 pub(crate) fn guest_draw_ops(vm: &mut Vm, view: u32, w: i32, h: i32) -> Vec<CanvasOp> {
+    // Host capture can be triggered from inside Compose's own measure
+    // pass when placement updates the host view frame. Re-entering
+    // dispatchDraw then violates MeasureAndLayoutDelegate's reentrancy
+    // guard; skip this capture and let the next host frame redraw the
+    // completed measurement instead.
+    if compose_measure_active(vm, view) {
+        return Vec::new();
+    }
     if crate::dbg_flag("OVELO_NODEDUMP") {
         if let Some(V::Ref(root)) = vm.get_object_field(
             view,

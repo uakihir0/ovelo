@@ -1243,7 +1243,8 @@ impl GuestUi {
         // x=0 — an overlapping pile at the parent origin), so keep
         // the last good ops until a frame lands.
         vm.dump_node_tree(h);
-        let ops = (ow > 0 && oh > 0).then(|| vm.guest_draw_ops(h, ow, oh));
+        let capture = ow > 0 && oh > 0 && !vm.compose_measure_active(h);
+        let ops = capture.then(|| vm.guest_draw_ops(h, ow, oh));
         let mut g = rc.borrow_mut();
         // The widget kind is chosen once, but `is_group` can arrive
         // late: ViewPager2 builds its page container FrameLayout

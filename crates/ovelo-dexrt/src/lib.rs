@@ -2761,6 +2761,11 @@ impl Vm {
         jdk::gfx::guest_draw_ops(self, view, w, h)
     }
 
+    /// Whether the view's Compose measure/layout pass is currently active.
+    pub fn compose_measure_active(&mut self, view: u32) -> bool {
+        jdk::gfx::compose_measure_active(self, view)
+    }
+
     /// Log the dex LayoutNode tree under `view` (OVELO_NODEDUMP).
     pub fn dump_node_tree(&mut self, view: u32) {
         jdk::gfx::dump_node_tree(self, view)
