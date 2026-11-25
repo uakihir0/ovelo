@@ -220,7 +220,8 @@ fn blend_px(out: &mut [u8], i: usize, argb: i32) {
     if a == 0 {
         return;
     }
-    let src = [(argb as u32) >> 16, (argb as u32) >> 8, argb as u32];
+    let px = argb as u32;
+    let src = [(px >> 16) & 0xff, (px >> 8) & 0xff, px & 0xff];
     if a == 255 {
         out[i] = src[0] as u8;
         out[i + 1] = src[1] as u8;
