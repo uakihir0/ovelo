@@ -2328,6 +2328,8 @@ impl Vm {
                 self.frame_callbacks.len()
             );
         }
+        let due_cb_handles: std::collections::HashSet<u32> =
+            due_cbs.iter().map(|(cb, _)| *cb).collect();
         for (cb, _) in due_cbs {
             let before_steps = self.total_steps;
             let out = self.call_virtual(cb, "doFrame", &[frame_nanos]);
@@ -2337,6 +2339,18 @@ impl Vm {
                     self.total_steps - before_steps,
                     out
                 );
+            }
+        }
+        // While worker traffic exists, throttle self-reposting frame
+        // callbacks (typically indeterminate Compose animations) rather
+        // than every independent render update. Real devices overlap the
+        // worker with the render thread; this cooperative VM cannot.
+        if self.pending_runnables.iter().any(|(_, on_main)| !on_main) {
+            let min_next = jdk::now_ms() as u64 + 120;
+            for (cb, due_at) in &mut self.frame_callbacks {
+                if due_cb_handles.contains(cb) && *due_at < min_next {
+                    *due_at = min_next;
+                }
             }
         }
         let mut ran = 0usize;
