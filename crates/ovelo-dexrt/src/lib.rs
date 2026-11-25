@@ -246,6 +246,8 @@ pub struct Vm {
     /// `OVELO_TRACE_THROW` — log every thrown/caught throwable with the
     /// throwing method and pc (debug aid for swallowed guest errors).
     trace_throw: bool,
+    /// `OVELO_THROWFILT` — optional comma-separated throw trace filter.
+    trace_throw_filter: Option<String>,
     /// `OVELO_TRACE_CALL` — log invoke sites whose resolved method name
     /// contains this substring (debug aid).
     trace_call: Option<String>,
@@ -765,6 +767,7 @@ impl Vm {
             unsafe_next_offset: 0,
             trace_field: std::env::var("OVELO_TRACE_FIELD").ok(),
             trace_throw: crate::dbg_flag("OVELO_TRACE_THROW"),
+            trace_throw_filter: std::env::var("OVELO_THROWFILT").ok(),
             trace_call: std::env::var("OVELO_TRACE_CALL").ok(),
             trace_from: std::env::var("OVELO_TRACE_FROM").ok(),
             view_roots: Vec::new(),
@@ -5862,10 +5865,19 @@ impl Vm {
                 Err(E::Throw(r)) => match self.find_handler(&fr, pc, r) {
                     _ if self.trace_throw => {
                         let d = self.describe_throw(r);
-                        eprintln!(
-                            "[throw] {} +{pc:04x} -> {d}",
-                            self.describe_method(fr.loc.midx)
-                        );
+                        let method = self.describe_method(fr.loc.midx);
+                        let hit = self
+                            .trace_throw_filter
+                            .as_deref()
+                            .map(|p| {
+                                p.split(',').any(|one| {
+                                    !one.is_empty() && (method.contains(one) || d.contains(one))
+                                })
+                            })
+                            .unwrap_or(true);
+                        if hit {
+                            eprintln!("[throw] {method} +{pc:04x} -> {d}");
+                        }
                         match self.find_handler(&fr, pc, r) {
                             Some(addr) => {
                                 pc = addr as usize;

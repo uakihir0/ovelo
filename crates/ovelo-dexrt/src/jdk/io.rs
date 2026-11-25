@@ -2569,13 +2569,21 @@ fn charbuf_string(vm: &Vm, h: u32) -> Option<String> {
         _ => return None,
     };
     match vm.heap.get(back) {
-        Some(Obj::Array { data, .. }) => Some(
-            data.iter()
-                .skip(base + pos)
-                .take(lim.saturating_sub(pos))
-                .map(|v| char::from_u32(i32v(*v) as u32).unwrap_or('\u{FFFD}'))
-                .collect(),
-        ),
+        Some(Obj::Array { data, .. }) => {
+            let mut units = Vec::new();
+            for v in data.iter().skip(base + pos).take(lim.saturating_sub(pos)) {
+                let x = i32v(*v) as u32;
+                if x <= 0xffff {
+                    units.push(x as u16);
+                } else if let Some(ch) = char::from_u32(x) {
+                    let mut pair = [0u16; 2];
+                    units.extend_from_slice(ch.encode_utf16(&mut pair));
+                } else {
+                    units.push(0xfffd);
+                }
+            }
+            Some(String::from_utf16_lossy(&units))
+        }
         _ => None,
     }
 }
@@ -2642,38 +2650,56 @@ fn charset_decode(vm: &mut Vm, args: &[V]) -> V {
                     .map(|v| i32v(v).max(0) as usize)
                     .unwrap_or(usize::MAX);
                 let cap = match vm.heap.get(*b) {
-                    Some(Obj::Array { data, .. }) => lim.min(data.len()).saturating_sub(base + pos),
+                    // Limits and positions are buffer-relative. In particular a
+                    // sliced buffer has both a nonzero backing base and a
+                    // limit relative to the slice; subtracting the base here
+                    // would shrink (or empty) the writable window twice.
+                    Some(Obj::Array { data, .. }) => lim
+                        .saturating_sub(pos)
+                        .min(data.len().saturating_sub(base + pos)),
                     _ => 0,
                 };
                 (*b, base, pos, cap)
             }
             _ => (0, 0, 0, 0),
         };
-        let chars: Vec<char> = text.chars().collect();
-        let wrote = chars.len().min(cap);
+        // Java CharBuffer storage is UTF-16. Supplementary scalars take
+        // two units and must never be split by an output-buffer boundary.
+        let units: Vec<u16> = text.encode_utf16().collect();
+        let mut wrote = units.len().min(cap);
+        if wrote < units.len() && wrote > 0 && (0xD800..0xDC00).contains(&units[wrote - 1]) {
+            wrote -= 1;
+        }
         if back != 0 {
             if let Some(Obj::Array { data, .. }) = vm.heap.get_mut(back) {
-                for (i, ch) in chars.iter().take(wrote).enumerate() {
+                for (i, unit) in units.iter().take(wrote).enumerate() {
                     if let Some(slot) = data.get_mut(base + pos + i) {
-                        *slot = V::I32(*ch as i32);
+                        *slot = V::I32(*unit as i32);
                     }
                 }
             }
         }
         pseudo_set(vm, out_h, P_BBUF_POS, V::I32((pos + wrote) as i32));
-        // Only the bytes backing the written chars are consumed —
+        // Only the bytes backing wholly written characters are consumed —
         // OVERFLOW leaves the rest for the next decode call.
-        let used = if wrote < chars.len() {
-            if cs.contains("88591") || cs.contains("LATIN1") || cs.contains("ASCII") {
-                wrote
-            } else {
-                chars[..wrote].iter().collect::<String>().len()
+        let used = if wrote < units.len() {
+            let single_byte = cs.contains("88591") || cs.contains("LATIN1") || cs.contains("ASCII");
+            let mut used_units = 0usize;
+            let mut used_bytes = 0usize;
+            for ch in text.chars() {
+                let char_units = ch.len_utf16();
+                if used_units + char_units > wrote {
+                    break;
+                }
+                used_units += char_units;
+                used_bytes += if single_byte { 1 } else { ch.len_utf8() };
             }
+            used_bytes
         } else {
             consumed
         };
         pseudo_set(vm, in_h, P_BBUF_POS, V::I32((in_pos + used) as i32));
-        let st = if wrote < chars.len() {
+        let st = if wrote < units.len() {
             "OVERFLOW"
         } else {
             "UNDERFLOW"
@@ -3077,6 +3103,9 @@ fn nio_call(vm: &mut Vm, class: &str, name: &str, args: &[V]) -> Option<Option<V
         "remaining" => Some(Some(V::I32(blim(vm).saturating_sub(bpos(vm)) as i32))),
         "position" => {
             if args.len() > 1 {
+                if crate::dbg_flag("OVELO_NIODBG") {
+                    eprintln!("[nio] position#{this} {} -> {}", bpos(vm), i32v(args[1]));
+                }
                 pseudo_set(vm, this, P_BBUF_POS, args[1]);
                 Some(Some(args[0]))
             } else {
@@ -3087,6 +3116,9 @@ fn nio_call(vm: &mut Vm, class: &str, name: &str, args: &[V]) -> Option<Option<V
             // limit = position, position = 0 — the written region
             // becomes the readable one.
             let pos = bpos(vm) as i32;
+            if crate::dbg_flag("OVELO_NIODBG") {
+                eprintln!("[nio] flip#{this} pos={pos} lim={}", blim(vm));
+            }
             pseudo_set(vm, this, P_BBUF_LIM, V::I32(pos));
             pseudo_set(vm, this, P_BBUF_POS, V::I32(0));
             Some(Some(args[0]))
@@ -3131,6 +3163,9 @@ fn nio_call(vm: &mut Vm, class: &str, name: &str, args: &[V]) -> Option<Option<V
             let es = esz(vm);
             let (pos, lim) = (bpos(vm), blim(vm));
             let cap = blim_capacity(vm);
+            if crate::dbg_flag("OVELO_NIODBG") {
+                eprintln!("[nio] compact#{this} pos={pos} lim={lim} cap={cap}");
+            }
             if let Some(bh) = backing(vm).filter(|_| lim > pos) {
                 let bb = base(vm);
                 if let Some(Obj::Array { data, .. }) = vm.heap.get_mut(bh) {
