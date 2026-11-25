@@ -30,8 +30,8 @@ pub trait GlyphSource {
     }
     /// Raster coverage for `c`, or `None` when the font can't rasterize
     /// or doesn't cover the char (triggers fallback).
-    /// `ymin`/`ymax` follow fontdue convention: distance from the baseline
-    /// to the bitmap's bottom edge (positive = below baseline).
+    /// `ymin` follows fontdue's font-coordinate convention: distance from
+    /// the baseline to the bitmap's bottom edge, positive above baseline.
     fn raster_for(&self, _c: char, _size_px: f32) -> Option<GlyphBmp> {
         None
     }
@@ -67,7 +67,7 @@ pub struct ShapedGlyph {
 pub struct GlyphBmp {
     /// Left edge offset from the pen origin (may be negative).
     pub xmin: i32,
-    /// Bottom edge offset from the baseline (positive = below).
+    /// Bottom edge offset from the baseline (positive = above).
     pub ymin: i32,
     /// Bitmap width px.
     pub w: usize,
@@ -306,6 +306,27 @@ impl FontSet {
     /// Register a font; earlier registrations win for shared glyphs.
     pub fn push(&mut self, f: Box<dyn GlyphSource>) {
         self.fonts.push(f);
+    }
+
+    /// Load one font file, registering every face of a collection.
+    /// Missing/unparseable files are skipped like directory entries.
+    pub fn load_file(&mut self, path: &str) -> usize {
+        let Ok(bytes) = std::fs::read(path) else {
+            return 0;
+        };
+        let faces = ttf_parser::fonts_in_collection(&bytes).unwrap_or(1).max(1);
+        let shared = std::sync::Arc::new(bytes);
+        let mut n = 0;
+        for i in 0..faces {
+            if let Ok(f) = TtfFont::from_arc(shared.clone(), i) {
+                if f.name.starts_with('.') {
+                    continue;
+                }
+                self.fonts.push(Box::new(f));
+                n += 1;
+            }
+        }
+        n
     }
 
     /// Scan directories for `.ttf`/`.otf`/`.ttc` files, registering

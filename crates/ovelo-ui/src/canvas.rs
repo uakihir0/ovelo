@@ -202,7 +202,7 @@ impl<'a> Canvas<'a> {
         if let Some(run) = self.fonts.shaped_run(text, p.text_size) {
             for g in run {
                 let gx = (pen + g.x_off).round() as i32 + g.bmp.xmin;
-                let gy = base - g.y_off.round() as i32 + g.bmp.ymin - g.bmp.h as i32;
+                let gy = base - g.y_off.round() as i32 - g.bmp.ymin - g.bmp.h as i32;
                 self.blit_glyph(&g.bmp, gx, gy, p.color);
                 pen += g.x_adv;
             }
@@ -217,7 +217,7 @@ impl<'a> Canvas<'a> {
                         .map(|f| f.advance_for(c, p.text_size).unwrap_or(0.0))
                         .unwrap_or(g.w as f32);
                     let gx = pen.round() as i32 + g.xmin;
-                    let gy = base + g.ymin - g.h as i32;
+                    let gy = base - g.ymin - g.h as i32;
                     self.blit_glyph(&g, gx, gy, p.color);
                     pen += adv;
                 }

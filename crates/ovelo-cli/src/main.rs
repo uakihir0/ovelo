@@ -1406,6 +1406,17 @@ fn run_app(store: &InstallStore, package: &str) -> Result<(), OveloError> {
     // into the VM. Registered BEFORE instantiate so a constructor that
     // builds views in <init>/onCreate hits live stubs.
     let mut fonts = ovelo_ui::FontSet::new();
+    // macOS directory order starts with specialist faces (numeric,
+    // Braille, symbols) that nevertheless claim Latin coverage. Pin
+    // normal text faces first; the directory scan remains fallback.
+    for f in [
+        "/System/Library/Fonts/Supplemental/Arial.ttf",
+        "/System/Library/Fonts/Helvetica.ttc",
+        "/System/Library/Fonts/HelveticaNeue.ttc",
+        "/System/Library/Fonts/Geneva.ttf",
+    ] {
+        fonts.load_file(f);
+    }
     fonts.load_dirs(&[
         "/System/Library/Fonts",
         "/System/Library/Fonts/Supplemental",
