@@ -418,27 +418,50 @@ fn static_sig(
     }
 }
 
+fn media_type(vm: &mut Vm, content_type: &str) -> Result<V> {
+    if content_type.is_empty() {
+        return Ok(V::Ref(0));
+    }
+    let s = jstr(vm, content_type);
+    // OkHttp 5 exposes `get`; OkHttp 3/4 exposed `parse` before the
+    // companion API was renamed. These are usually companion-object
+    // instance methods, though some builds keep static bridges.
+    if let Some(V::Ref(companion)) = vm
+        .type_index_of("Lokhttp3/MediaType;")
+        .and_then(|ci| vm.find_field_by_name(ci, "Companion", true, None))
+        .and_then(|f| vm.sget_pub(f))
+    {
+        for name in ["get", "parse"] {
+            if let Some(v) = vm.call_virtual_sig(companion, name, &["Ljava/lang/String;"], &[s])? {
+                if matches!(v, V::Ref(h) if h != 0) {
+                    return Ok(v);
+                }
+            }
+        }
+    }
+    for name in ["get", "parse"] {
+        if let Some(v) = static_sig(
+            vm,
+            "Lokhttp3/MediaType;",
+            name,
+            &["Ljava/lang/String;"],
+            vec![s],
+        )? {
+            if matches!(v, V::Ref(h) if h != 0) {
+                return Ok(v);
+            }
+        }
+    }
+    Ok(V::Ref(0))
+}
+
 /// `ResponseBody.create(MediaType?, byte[])` — the `@JvmStatic`
 /// deprecated companion facade okhttp keeps for Java callers. OkHttp 5's
 /// R8 build drops it; fall back to `RealResponseBody(String, long,
 /// RealBufferedSource)` over a byte-backed `okio.Buffer`.
 fn response_body(vm: &mut Vm, content_type: &str, bytes: Vec<u8>) -> Result<u32> {
     let len = bytes.len();
-    let mt = if content_type.is_empty() {
-        V::Ref(0)
-    } else {
-        {
-            let s = jstr(vm, content_type);
-            static_sig(
-                vm,
-                "Lokhttp3/MediaType;",
-                "get",
-                &["Ljava/lang/String;"],
-                vec![s],
-            )?
-        }
-        .unwrap_or(V::Ref(0))
-    };
+    let mt = media_type(vm, content_type)?;
 
     // Build the body over `Okio.source(InputStream)`. The stream keeps
     // the wire bytes in one compact host buffer; okio then copies only
