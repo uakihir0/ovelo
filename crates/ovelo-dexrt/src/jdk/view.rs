@@ -5574,6 +5574,14 @@ pub(crate) fn offer_input_connection(vm: &mut Vm, view: u32) -> ovelo_error::Res
     Ok(conn != 0)
 }
 
+fn key_scan_roots(vm: &Vm) -> Vec<u32> {
+    let mut roots: Vec<u32> = vm.decor_roots.values().copied().collect();
+    if roots.is_empty() {
+        roots = vm.view_roots.clone();
+    }
+    roots
+}
+
 /// Route a host key event into the top-most dex view root. Compose
 /// overrides `dispatchKeyEvent` and performs focus/key-input traversal
 /// internally; classic views can override the same method.
@@ -5709,7 +5717,7 @@ pub(crate) fn dispatch_key(
     pseudo_set(vm, evt, P_KE_REPEAT, V::I32(repeat as i32));
 
     let mut ime_view = 0;
-    for root in vm.view_roots.clone().iter().rev() {
+    for root in key_scan_roots(vm).iter().rev() {
         if matches!(pseudo_get(vm, *root, P_PARENT), Some(V::Ref(p)) if p != 0) {
             continue;
         }
@@ -5741,7 +5749,7 @@ pub(crate) fn dispatch_key(
         }
     }
 
-    for root in vm.view_roots.clone().iter().rev() {
+    for root in key_scan_roots(vm).iter().rev() {
         if matches!(pseudo_get(vm, *root, P_PARENT), Some(V::Ref(p)) if p != 0) {
             continue;
         }
@@ -6186,9 +6194,6 @@ pub(crate) fn decor_of(vm: &mut Vm, window: u32) -> Option<u32> {
     frame_set(vm, cf, 0, 0, ww, wh);
     vm.content_frames.insert(owner, cf);
     pseudo_set(vm, window, P_DECOR, V::Ref(d));
-    if !vm.view_roots.contains(&d) {
-        vm.view_roots.push(d);
-    }
     if crate::dbg_flag("OVELO_VIEWDBG") {
         eprintln!("[viewdbg] decor_of window=h{window} owner=h{owner} -> d=h{d} cf=h{cf}");
     }
