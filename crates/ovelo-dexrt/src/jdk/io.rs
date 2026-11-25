@@ -24,6 +24,23 @@ pub(crate) fn call(
             || class == "Ljava/security/cert/X509Certificate;"
         {
             cert_call(vm, class, name, args)
+        } else if class.ends_with("FileOutputStream;") && name == "<init>" {
+            let arg = args.get(1).copied().unwrap_or(V::Ref(0));
+            let append = args.get(2).is_some_and(|v| i32v(*v) != 0);
+            if let Some(path) = stream_arg_path(vm, arg) {
+                let path = fspath(vm, &path);
+                let file = std::fs::OpenOptions::new()
+                    .write(true)
+                    .create(true)
+                    .truncate(!append)
+                    .append(append)
+                    .open(path)
+                    .ok();
+                if let Some(file) = file {
+                    replace_host_state(vm, args[0], class, HostState::File(file));
+                }
+            }
+            Some(None)
         } else if class.ends_with("FileInputStream;") && name == "<init>" {
             // Open the real file: arg is a File (Path host), a String, or a
             // FileDescriptor already carrying bytes (`getFD`/ParcelFileDescriptor).
@@ -1162,11 +1179,36 @@ fn file_call(vm: &mut Vm, name: &str, args: &[V]) -> Option<Option<V>> {
                 .next()
                 .is_some_and(|n| n.starts_with('.')) as i32,
         )),
+        "createTempFile" => {
+            // Static method: args are (prefix, suffix, directory?) with no
+            // receiver. Android apps rely on unique, real files here; a
+            // shared placeholder makes downloads write outside the cache or
+            // overwrite one another.
+            let prefix = sv(vm, args[0]).unwrap_or_else(|| "tmp".to_string());
+            let suffix = sv(vm, args[1]).unwrap_or_else(|| ".tmp".to_string());
+            let dir = args
+                .get(2)
+                .and_then(|v| stream_arg_path(vm, *v))
+                .unwrap_or_else(|| "/data/local/ovelo/cache".to_string());
+            static NEXT: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+            let n = NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            let name = format!("{}-{}-{}{}", prefix, std::process::id(), n, suffix);
+            let safe = name.replace('/', "_");
+            let guest = format!("{dir}/{safe}");
+            let host_path = fspath(vm, &guest);
+            if let Some(parent) = host_path.parent() {
+                let _ = std::fs::create_dir_all(parent);
+            }
+            let _ = std::fs::OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .open(host_path);
+            Some(host(vm, "Ljava/io/File;", HostState::Path(guest)))
+        }
         "setReadable" | "setWritable" | "setExecutable" | "setReadOnly" | "setLastModified"
-        | "deleteOnExit" | "toPath" | "toURI" | "toURL" | "listRoots" | "createTempFile"
-        | "compareTo" => {
-            if name == "listRoots" || name == "createTempFile" {
-                Some(host(vm, "Ljava/io/File;", HostState::Path("/tmp/x".into())))
+        | "deleteOnExit" | "toPath" | "toURI" | "toURL" | "listRoots" | "compareTo" => {
+            if name == "listRoots" {
+                Some(host(vm, "Ljava/io/File;", HostState::Path("/".into())))
             } else if matches!(name, "toPath" | "toURI" | "toURL") {
                 Some(V::Ref(0))
             } else if name == "compareTo" {
@@ -3846,7 +3888,14 @@ fn zip_entry_call(vm: &mut Vm, name: &str, args: &[V]) -> Option<Option<V>> {
         "getCrc" => Some(Some(V::I64(entry.crc32 as i64))),
         "getMethod" => Some(Some(V::I32(entry.method as i32))),
         "isDirectory" => Some(Some(V::I32(entry.name.ends_with('/') as i32))),
-        "getAttributes" => Some(Some(V::Ref(0))),
+        // The archive signature has already been verified by ovelo-apk;
+        // expose an empty attribute map so callers can inspect digest names
+        // without treating signed entries as unsigned.
+        "getAttributes" => Some(Some(host(
+            vm,
+            "Ljava/util/HashMap;",
+            HostState::Map(vec![]),
+        ))),
         "getCodeSigners" => Some(Some(signer_arr(vm, cert_der))),
         "getCertificates" => {
             let cert = cert_der.map(|der| {
