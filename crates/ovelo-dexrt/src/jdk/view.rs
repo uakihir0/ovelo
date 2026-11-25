@@ -927,12 +927,26 @@ pub(crate) fn call(
                     .find(|a| matches!(a, V::Ref(h) if *h != 0))
                     .copied()
                 {
-                    for k in [P_ME_ACTION, P_ME_X, P_ME_Y] {
+                    for k in [
+                        P_ME_ACTION,
+                        P_ME_X,
+                        P_ME_Y,
+                        P_ME_DOWN_TIME,
+                        P_ME_EVENT_TIME,
+                        P_ME_RAWX,
+                        P_ME_RAWY,
+                    ] {
                         if let Some(v) = pseudo_get(vm, src, k) {
                             pseudo_set(vm, h, k, v);
                         }
                     }
                 } else {
+                    if let Some(V::I64(t)) = args.first().copied() {
+                        pseudo_set(vm, h, P_ME_DOWN_TIME, V::I64(t));
+                    }
+                    if let Some(V::I64(t)) = args.get(1).copied() {
+                        pseudo_set(vm, h, P_ME_EVENT_TIME, V::I64(t));
+                    }
                     if let Some(V::I32(a)) = args.get(2).copied() {
                         pseudo_set(vm, h, P_ME_ACTION, V::I32(a));
                     }

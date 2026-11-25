@@ -2237,12 +2237,56 @@ fn arrays_static(vm: &mut Vm, name: &str, _sig: &str, args: &[V]) -> Rt<Option<O
         }
         "sort" | "parallelSort" => {
             if let V::Ref(h) = args[0] {
-                if let Some(Obj::Array { data, .. }) = vm.heap.get_mut(h) {
-                    data.sort_by(|a, b| {
-                        f64v(*a)
-                            .partial_cmp(&f64v(*b))
-                            .unwrap_or(std::cmp::Ordering::Equal)
-                    });
+                let mut data = match vm.heap.get(h) {
+                    Some(Obj::Array { data, .. }) => data.clone(),
+                    _ => vec![],
+                };
+                let from = if args.len() >= 3 {
+                    i32v(args[1]).max(0) as usize
+                } else {
+                    0
+                };
+                let to = if args.len() >= 3 {
+                    (i32v(args[2]).max(0) as usize).min(data.len())
+                } else {
+                    data.len()
+                };
+                let comparator = match args.last() {
+                    Some(V::Ref(c)) if *c != 0 && (args.len() == 2 || args.len() == 4) => *c,
+                    _ => 0,
+                };
+                if from < to {
+                    let mut slice = data[from..to].to_vec();
+                    if comparator != 0 {
+                        // Compose relies on stable comparator ordering for
+                        // z-sorted hit testing (LayoutNode.ZComparator).
+                        // Insertion sort is stable and lets guest comparator
+                        // throws escape instead of inventing an ordering.
+                        for i in 1..slice.len() {
+                            let mut j = i;
+                            while j > 0 {
+                                let ord = vm
+                                    .call_virtual_rt(
+                                        comparator,
+                                        "compare",
+                                        &[slice[j - 1], slice[j]],
+                                    )?
+                                    .map(i32v)
+                                    .unwrap_or(0);
+                                if ord <= 0 {
+                                    break;
+                                }
+                                slice.swap(j - 1, j);
+                                j -= 1;
+                            }
+                        }
+                    } else {
+                        slice.sort_by(|a, b| natural_cmp(vm, *a, *b).cmp(&0));
+                    }
+                    data[from..to].copy_from_slice(&slice);
+                }
+                if let Some(Obj::Array { data: target, .. }) = vm.heap.get_mut(h) {
+                    *target = data;
                 }
             }
             Some(None)

@@ -57,7 +57,7 @@ pub(crate) fn call(
 /// for Obj::Instance receivers (Compose's `AnnotatedString` carries its
 /// text in dex fields `sv` can't reach — without this every paragraph
 /// is laid out with an empty string and no text ever draws).
-fn cs_arg(vm: &mut Vm, v: V) -> String {
+pub(crate) fn cs_arg(vm: &mut Vm, v: V) -> String {
     if let Some(t) = sv(vm, v) {
         return t;
     }
