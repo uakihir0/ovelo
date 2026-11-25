@@ -1903,15 +1903,25 @@ fn path_call(vm: &mut Vm, name: &str, args: &[V]) -> Rt<Option<Option<V>>> {
 fn rendernode_call(vm: &mut Vm, name: &str, args: &[V]) -> Rt<Option<Option<V>>> {
     Ok(match name {
         "<init>" => Some(None),
-        "beginRecording" => {
+        // android.view.RenderNode factory (Compose's GraphicsLayerV23)
+        "create" => Some(Some(host(
+            vm,
+            "Landroid/view/RenderNode;",
+            HostState::Empty,
+        ))),
+        // android.graphics.RenderNode uses begin/endRecording; the
+        // older android.view API uses start/end and names the recording
+        // surface DisplayListCanvas. Both record the same CanvasOps.
+        "beginRecording" | "start" => {
             let V::Ref(rh) = arg(args, 0) else {
                 return Ok(Some(Some(V::Ref(0))));
             };
-            let V::Ref(ch) = host(
-                vm,
-                "Landroid/graphics/RecordingCanvas;",
-                HostState::CanvasOps(Vec::new()),
-            ) else {
+            let canvas_desc = if name == "start" {
+                "Landroid/view/DisplayListCanvas;"
+            } else {
+                "Landroid/graphics/RecordingCanvas;"
+            };
+            let V::Ref(ch) = host(vm, canvas_desc, HostState::CanvasOps(Vec::new())) else {
                 return Ok(Some(Some(V::Ref(0))));
             };
             pseudo_set(vm, ch, PK_CW, arg(args, 1));
@@ -1919,8 +1929,8 @@ fn rendernode_call(vm: &mut Vm, name: &str, args: &[V]) -> Rt<Option<Option<V>>>
             pseudo_set(vm, rh, PK_RECCANVAS, V::Ref(ch));
             Some(Some(V::Ref(ch)))
         }
-        "endRecording" | "endRecordingAndDisplayList" => Some(None),
-        "hasDisplayList" => {
+        "endRecording" | "endRecordingAndDisplayList" | "end" => Some(None),
+        "hasDisplayList" | "isValid" => {
             // discardDisplayList drops the recording — answering
             // "valid" here would let Compose skip the re-record and
             // the layer would draw nothing.
@@ -1985,6 +1995,13 @@ fn rendernode_call(vm: &mut Vm, name: &str, args: &[V]) -> Rt<Option<Option<V>>>
         }
         // Remaining transform/outline/alpha mutations are visual
         // refinements we do not yet model.
+        "getScaleX" | "getScaleY" | "getAlpha" => Some(Some(V::F32(1.0))),
+        "getTranslationX" | "getTranslationY" | "getTranslationZ" | "getElevation"
+        | "getRotation" | "getRotationX" | "getRotationY" | "getPivotX" | "getPivotY" => {
+            Some(Some(V::F32(0.0)))
+        }
+        "getCameraDistance" => Some(Some(V::F32(1280.0))),
+        "getClipToBounds" | "getClipToOutline" | "hasOverlappingRendering" => Some(Some(V::I32(0))),
         "setRight"
         | "setBottom"
         | "setAlpha"
@@ -2005,6 +2022,7 @@ fn rendernode_call(vm: &mut Vm, name: &str, args: &[V]) -> Rt<Option<Option<V>>>
         | "setOutline"
         | "setRenderEffect"
         | "setUseCompositingLayer"
+        | "setLayerType"
         | "setHasOverlappingRendering" => Some(Some(V::I32(1))),
         _ => return Ok(None),
     })
@@ -2019,11 +2037,13 @@ pub(crate) fn call(
     args: &[V],
 ) -> Rt<Option<Option<V>>> {
     match class {
-        "Landroid/graphics/Canvas;" | "Landroid/graphics/RecordingCanvas;" => {
-            canvas_call(vm, name, sig, args)
-        }
+        "Landroid/graphics/Canvas;"
+        | "Landroid/graphics/RecordingCanvas;"
+        | "Landroid/view/DisplayListCanvas;" => canvas_call(vm, name, sig, args),
         "Landroid/graphics/Path;" => path_call(vm, name, args),
-        "Landroid/graphics/RenderNode;" => rendernode_call(vm, name, args),
+        "Landroid/graphics/RenderNode;" | "Landroid/view/RenderNode;" => {
+            rendernode_call(vm, name, args)
+        }
         "Landroid/graphics/Paint;" | "Landroid/text/TextPaint;" => paint_call(vm, name, sig, args),
         "Landroid/graphics/Matrix;" => matrix_call(vm, name, sig, args),
         _ => Ok(None),
