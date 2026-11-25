@@ -776,6 +776,39 @@ fn list_call(vm: &mut Vm, name: &str, sig: &str, args: &[V]) -> Rt<Option<Option
             if list_mut(vm, h).is_none() {
                 return Ok(None);
             }
+            if let Some(V::Ref(parent)) = pseudo_get(vm, h, P_SUBLIST_PARENT) {
+                let fixed_parent = match vm.heap.get(parent) {
+                    Some(Obj::Host { desc, .. }) => matches!(
+                        desc.as_str(),
+                        "Ljava/util/Arrays$ArrayList;"
+                            | "Ljava/util/Collections$EmptyList;"
+                            | "Ljava/util/Collections$SingletonList;"
+                            | "Ljava/util/Collections$UnmodifiableList;"
+                    ),
+                    _ => false,
+                };
+                let a = pseudo_get(vm, h, P_SUBLIST_START)
+                    .map(i32v)
+                    .unwrap_or_default()
+                    .max(0) as usize;
+                let b = pseudo_get(vm, h, P_SUBLIST_END)
+                    .map(i32v)
+                    .unwrap_or_default()
+                    .max(0) as usize;
+                if fixed_parent && a < b {
+                    return Err(vm.throw_builtin(
+                        "Ljava/lang/UnsupportedOperationException;",
+                        "clear on fixed-size subList",
+                    ));
+                }
+                if let Some(l) = list_mut(vm, parent) {
+                    let end = b.min(l.len());
+                    if a < end {
+                        l.drain(a..end);
+                    }
+                }
+                pseudo_set(vm, h, P_SUBLIST_END, V::I32(a as i32));
+            }
             if let Some(l) = list_mut(vm, h) {
                 l.clear();
             }
@@ -918,14 +951,31 @@ fn list_call(vm: &mut Vm, name: &str, sig: &str, args: &[V]) -> Rt<Option<Option
             Some(Some(arr(vm, &elem, items)))
         }
         "subList" => {
-            let (a, b) = (i32v(args[1]) as usize, i32v(args[2]) as usize);
-            let items: Vec<V> = list_snapshot(vm, h)
-                .unwrap_or_default()
+            let source = list_snapshot(vm, h).unwrap_or_default();
+            let (a, b) = (i32v(args[1]), i32v(args[2]));
+            if a < 0 || b > source.len() as i32 {
+                return Err(vm.throw_builtin(
+                    "Ljava/lang/IndexOutOfBoundsException;",
+                    &format!("subList({a}, {b}) on size {}", source.len()),
+                ));
+            }
+            if b < a {
+                return Err(vm.throw_builtin(
+                    "Ljava/lang/IllegalArgumentException;",
+                    &format!("subList({a}, {b})"),
+                ));
+            }
+            let (a, b) = (a as usize, b as usize);
+            let items: Vec<V> = source
                 .into_iter()
                 .skip(a)
                 .take(b.saturating_sub(a))
                 .collect();
-            Some(Some(host(vm, "Ljava/util/List;", HostState::List(items))))
+            let sub = vm.alloc_host("Ljava/util/List;", HostState::List(items));
+            pseudo_set(vm, sub, P_SUBLIST_PARENT, V::Ref(h));
+            pseudo_set(vm, sub, P_SUBLIST_START, V::I32(a as i32));
+            pseudo_set(vm, sub, P_SUBLIST_END, V::I32(b as i32));
+            Some(Some(V::Ref(sub)))
         }
         "forEach" | "replaceAll" | "sort" | "stream" | "parallelStream" => {
             if name == "sort" {

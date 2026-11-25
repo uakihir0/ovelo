@@ -144,6 +144,14 @@ pub const P_APPINFO: u64 = 0xFFFD_FEF3;
 /// `suspendingTransactionId` must read unset on every thread that
 /// isn't the transaction executor).
 pub(crate) const P_TLS: u64 = 0xFFFD_FEF4;
+/// `List.subList` snapshot views remember their backing list and range.
+/// Java sublists are live views; Compose's gap-buffer writer moves groups by
+/// copying anchors into their destination and clearing the source sublist.
+/// Treating that view as a copy leaves the original anchors in place with
+/// updated locations, so binary-search ownership lookups miss valid scopes.
+pub(crate) const P_SUBLIST_PARENT: u64 = 0xFFFD_FEF5;
+pub(crate) const P_SUBLIST_START: u64 = 0xFFFD_FEF6;
+pub(crate) const P_SUBLIST_END: u64 = 0xFFFD_FEF7;
 
 pub(crate) fn now_ms() -> i64 {
     std::time::SystemTime::now()
