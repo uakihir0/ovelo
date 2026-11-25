@@ -1845,9 +1845,14 @@ fn collections_static(vm: &mut Vm, name: &str, args: &[V]) -> Option<Option<V>> 
             };
             Some(Some(host(vm, d, st)))
         }
-        "singletonList" | "singleton" => Some(Some(host(
+        "singletonList" => Some(Some(host(
             vm,
             "Ljava/util/Collections$SingletonList;",
+            HostState::List(vec![args[0]]),
+        ))),
+        "singleton" => Some(Some(host(
+            vm,
+            "Ljava/util/Collections$SingletonSet;",
             HostState::List(vec![args[0]]),
         ))),
         "singletonMap" => Some(Some(host(
