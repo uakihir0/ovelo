@@ -4177,10 +4177,9 @@ fn res_misc(vm: &mut Vm, class: &str, name: &str, args: &[V]) -> Rt<Option<Optio
             }
             Some(Some(V::I32(1)))
         }
-        (
-            "Landroid/content/res/TypedArray;",
-            "recycle" | "extractThemeAttrs" | "getChangingConfigurations",
-        ) => Some(None),
+        ("Landroid/content/res/TypedArray;", "recycle") => Some(None),
+        ("Landroid/content/res/TypedArray;", "extractThemeAttrs") => Some(Some(V::Ref(0))),
+        ("Landroid/content/res/TypedArray;", "getChangingConfigurations") => Some(Some(V::I32(0))),
         (
             "Landroid/util/TypedValue;",
             "applyDimension"
