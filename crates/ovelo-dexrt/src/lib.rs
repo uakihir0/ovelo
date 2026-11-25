@@ -368,6 +368,10 @@ pub struct Vm {
     /// binary search per executed opcode is the interpreter's hottest
     /// fixed cost in large parser methods.
     pcmap_cache: std::cell::RefCell<HashMap<GIdx, std::rc::Rc<Vec<u32>>>>,
+    /// `midx` → canonical field for methods exactly shaped as a simple
+    /// instance getter (`iget* this; return*`). Compose/data classes
+    /// call these hundreds of thousands of times per frame.
+    simple_getter_cache: std::cell::RefCell<HashMap<GIdx, Option<GIdx>>>,
     /// Reused register storage for completed interpreter frames —
     /// lexer/parser code calls tiny methods millions of times, and a
     /// fresh zeroed Vec per call dominates allocation traffic.
@@ -862,6 +866,7 @@ impl Vm {
             code_cache: std::cell::RefCell::new(HashMap::new()),
             insn_cache: std::cell::RefCell::new(HashMap::new()),
             pcmap_cache: std::cell::RefCell::new(HashMap::new()),
+            simple_getter_cache: std::cell::RefCell::new(HashMap::new()),
             reg_pool: Vec::new(),
             method_desc_cache: std::cell::RefCell::new(HashMap::new()),
             main_getter_cache: std::cell::RefCell::new(HashMap::new()),
@@ -967,6 +972,43 @@ impl Vm {
 
     /// Canonical field identity: `(owner, name, type)` first-seen key,
     /// so a field written via dex M's ref reads back through dex N's.
+    /// Canonical field read by a method whose entire body is a simple
+    /// instance getter. The shape check mirrors the interpreter's normal
+    /// `iget`/`return` semantics, including receiver-register placement.
+    fn simple_getter_field(&self, loc: Loc) -> Option<GIdx> {
+        if let Some(hit) = self.simple_getter_cache.borrow().get(&loc.midx) {
+            return *hit;
+        }
+        let out = (|| {
+            let d = self.dex_of(loc.midx)?;
+            let code = d.code_item(loc.em.code_off).ok()??;
+            if code.ins_size != 1 || code.registers_size < code.ins_size {
+                return None;
+            }
+            let insns = decode_all(&code.insns).ok()?;
+            let [get, ret] = insns.as_slice() else {
+                return None;
+            };
+            let expected_ret = match get.opcode {
+                0x52 | 0x55..=0x58 => 0x0f,
+                0x53 => 0x10,
+                0x54 => 0x11,
+                _ => return None,
+            };
+            if ret.opcode != expected_ret
+                || get.regs.len() != 2
+                || ret.regs.first() != get.regs.first()
+                || usize::from(get.regs[1])
+                    != usize::from(code.registers_size) - usize::from(code.ins_size)
+            {
+                return None;
+            }
+            Some(self.canon_field(gx(gd(loc.midx), get.idx?)))
+        })();
+        self.simple_getter_cache.borrow_mut().insert(loc.midx, out);
+        out
+    }
+
     pub(crate) fn canon_field(&self, g: GIdx) -> GIdx {
         if let Some(hit) = self.canon_field_cache.borrow().get(&g) {
             return *hit;
@@ -4987,6 +5029,46 @@ impl Vm {
                     let args = self.compact_args(loc.midx, &args, has_recv);
                     self.pending_host_retry.push((loc.midx, args));
                 }
+            }
+        }
+        if !matches!(kind, InvokeKind::Static) {
+            if let Some(f) = self.simple_getter_field(loc) {
+                let h = match args.first() {
+                    Some(&V::Ref(h)) => h,
+                    _ => 0,
+                };
+                if h == 0 {
+                    return Err(self.throw_builtin(
+                        "Ljava/lang/NullPointerException;",
+                        &format!("null receiver calling {}", self.describe_method(midx)),
+                    ));
+                }
+                let stored = match self.heap.get(h) {
+                    Some(Obj::Instance { fields, .. }) | Some(Obj::Host { fields, .. }) => {
+                        fields.get(&f).copied()
+                    }
+                    other => {
+                        return Err(E::Vm(errd(
+                            "dexrt.type",
+                            format!(
+                                "fast iget h{h} field={} kind={:?}",
+                                self.describe_field(f),
+                                other.map(std::mem::discriminant),
+                            ),
+                        )));
+                    }
+                };
+                let v = match stored {
+                    Some(v) => v,
+                    None => match self.builtin_ifield(h, f) {
+                        Some(b) => b,
+                        None => match self.ref_field_stub(h, f) {
+                            Some(v) => v,
+                            None => self.field_default(f).unwrap_or(V::I32(0)),
+                        },
+                    },
+                };
+                return Ok(Some(v));
             }
         }
         if matches!(kind, InvokeKind::Static) {
