@@ -2059,7 +2059,7 @@ fn context_call(
     args: &[V],
 ) -> Rt<Option<Option<V>>> {
     Ok(match name {
-        "getPackageName" | "getOpPackageName" | "getAttributionTag" => {
+        "getPackageName" | "getOpPackageName" | "getAttributionTag" | "getProcessName" => {
             let p = vm.guest_package.clone().unwrap_or_else(|| "app".into());
             Some(Some(jstr(vm, &p)))
         }
@@ -5270,6 +5270,9 @@ fn app_info(vm: &mut Vm) -> V {
     let data = jstr(vm, &format!("/data/data/{pkg}"));
     let src = jstr(vm, &format!("/data/app/{pkg}/base.apk"));
     let libs = jstr(vm, &format!("/data/app/{pkg}/lib/arm64"));
+    let pkg_v = jstr(vm, &pkg);
+    pseudo_set(vm, h, P_COMPONENT, pkg_v);
+    pseudo_set(vm, h, P_PROCESS, pkg_v);
     pseudo_set(vm, h, P_DATA, data);
     pseudo_set(vm, h, P_META, src);
     pseudo_set(vm, h, P_FLAGS, libs);

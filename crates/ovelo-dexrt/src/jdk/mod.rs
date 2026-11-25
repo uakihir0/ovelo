@@ -56,6 +56,8 @@ pub(crate) const P_RECT_B: u32 = u32::MAX - 10;
 pub(crate) const P_BOUNDS: u32 = u32::MAX - 11;
 /// Thread was `start()`ed once — JVM forbids a second start.
 pub(crate) const P_STARTED: u32 = u32::MAX - 12;
+/// ApplicationInfo.processName (the package name for the default process).
+pub(crate) const P_PROCESS: u32 = u32::MAX - 53;
 /// A `BitmapDrawable`'s wrapped Bitmap — kept as a fields entry so the
 /// renderer's bitmap field-walk (and `getBitmap`) find it.
 pub(crate) const P_BITMAP_SLOT: u64 = 0xFFFD_FEE0;
@@ -2276,6 +2278,9 @@ pub(crate) fn ifield(vm: &Vm, h: u32, owner: &str, name: &str) -> Option<V> {
         ("Landroid/content/pm/ApplicationInfo;", "packageName")
         | ("Landroid/content/pm/ApplicationInfo;", "name") => {
             Some(pseudo_get(vm, h, P_COMPONENT).unwrap_or(V::Ref(0)))
+        }
+        ("Landroid/content/pm/ApplicationInfo;", "processName") => {
+            Some(pseudo_get(vm, h, P_PROCESS).unwrap_or(V::Ref(0)))
         }
         ("Landroid/content/pm/ServiceInfo;", "name")
         | ("Landroid/content/pm/ActivityInfo;", "name")
