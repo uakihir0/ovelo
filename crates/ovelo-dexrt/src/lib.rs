@@ -4769,6 +4769,17 @@ impl Vm {
         self.invoke_inner(midx, args, kind, false)
     }
 
+    /// Re-enter the dex implementation beneath a host fast path when
+    /// the fast path detects its uncommon slow case.
+    pub(crate) fn invoke_no_host(
+        &mut self,
+        midx: GIdx,
+        args: Vec<V>,
+        kind: InvokeKind,
+    ) -> Rt<Option<V>> {
+        self.invoke_inner(midx, args, kind, true)
+    }
+
     fn invoke_inner(
         &mut self,
         midx: GIdx,
