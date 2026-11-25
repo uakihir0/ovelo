@@ -4974,7 +4974,11 @@ impl Vm {
                 Ok(mut g) => {
                     let has_recv = !matches!(kind, InvokeKind::Static);
                     let args = self.compact_args(loc.midx, &args, has_recv);
-                    return g(self, &args).map_err(E::Vm);
+                    let r = g(self, &args).map_err(E::Vm);
+                    if let Some(h) = self.host_throw.take() {
+                        return Err(E::Throw(h));
+                    }
+                    return r;
                 }
                 Err(_) => {
                     // Queue the bridge for the next drain tick so its
