@@ -339,10 +339,20 @@ pub(crate) fn call(
     {
         match name {
             "execute" => {
-                if let V::Ref(r) = args[1] {
+                if let (V::Ref(ex), V::Ref(r)) = (args[0], args[1]) {
                     // Executor jobs are async — defer to the work queue
                     // (they run on a worker thread at the next drain).
-                    vm.enqueue_runnable(r, false);
+                    // A single-thread executor additionally serializes
+                    // those jobs instead of admitting them all at once.
+                    if vm.single_executors.contains(&ex) && vm.executor_active.contains_key(&ex) {
+                        vm.executor_queues.entry(ex).or_default().push_back(r);
+                    } else {
+                        if vm.single_executors.contains(&ex) {
+                            vm.executor_active.insert(ex, r);
+                            vm.runnable_executor.insert(r, ex);
+                        }
+                        vm.enqueue_runnable(r, false);
+                    }
                 }
                 Some(None)
             }
@@ -371,11 +381,19 @@ pub(crate) fn call(
             | "newFixedThreadPool"
             | "newScheduledThreadPool"
             | "unconfigurableExecutorService"
-            | "defaultThreadFactory" => Some(Some(host(
-                vm,
-                "Ljava/util/concurrent/ExecutorService;",
-                HostState::Empty,
-            ))),
+            | "defaultThreadFactory" => {
+                let v = host(
+                    vm,
+                    "Ljava/util/concurrent/ExecutorService;",
+                    HostState::Empty,
+                );
+                if name == "newSingleThreadExecutor" {
+                    if let V::Ref(h) = v {
+                        vm.single_executors.insert(h);
+                    }
+                }
+                Some(Some(v))
+            }
             "get" | "call" => Some(Some(V::Ref(0))),
             "isDone" | "isCancelled" => Some(Some(V::I32(1))),
             "cancel" => Some(Some(V::I32(1))),

@@ -431,6 +431,17 @@ pub struct Vm {
     /// deadlocks on self-rescheduling executors). Drained at the
     /// outermost `call_virtual` boundary.
     pub pending_runnables: std::collections::VecDeque<(u32, bool)>,
+    /// Executor objects created by `Executors.newSingleThreadExecutor`.
+    /// Their tasks must run one at a time; treating `execute` as an
+    /// unbounded global queue lets rate limiters (kotlinx/Tasks.org
+    /// `Throttle`) run every queued task concurrently.
+    pub(crate) single_executors: std::collections::HashSet<u32>,
+    /// executor handle -> FIFO tasks waiting for its active task.
+    pub(crate) executor_queues: HashMap<u32, std::collections::VecDeque<u32>>,
+    /// executor handle -> currently running runnable.
+    pub(crate) executor_active: HashMap<u32, u32>,
+    /// runnable handle -> owning single-thread executor.
+    pub(crate) runnable_executor: HashMap<u32, u32>,
     /// Views whose attach state changed while guest composition/layout
     /// work was active. `onAttachedToWindow` is delivered on a later
     /// drain boundary so nested Compose content cannot compose inside
@@ -839,6 +850,10 @@ impl Vm {
             total_steps: 0,
             pending_activity: None,
             pending_runnables: std::collections::VecDeque::new(),
+            single_executors: std::collections::HashSet::new(),
+            executor_queues: HashMap::new(),
+            executor_active: HashMap::new(),
+            runnable_executor: HashMap::new(),
             pending_attach_callbacks: std::collections::VecDeque::new(),
             frame_callbacks: Vec::new(),
             sched_prefer_worker: false,
@@ -2227,6 +2242,14 @@ impl Vm {
             }));
         }
         roots.extend(self.pending_runnables.iter().map(|(h, _)| *h));
+        roots.extend(self.single_executors.iter().copied());
+        roots.extend(self.executor_active.keys().copied());
+        roots.extend(self.executor_active.values().copied());
+        roots.extend(
+            self.executor_queues
+                .values()
+                .flat_map(|q| q.iter().copied()),
+        );
         roots.extend(self.pending_attach_callbacks.iter().copied());
         roots.extend(self.delayed_runnables.iter().map(|(h, _, _)| *h));
         // Callback registries are the only owners of their objects —
@@ -2612,6 +2635,22 @@ impl Vm {
                     self.deadline_woke.remove(&r);
                     self.deadline_park_cycles.remove(&r);
                     self.slept_once.remove(&r);
+                    if let Some(ex) = self.runnable_executor.remove(&r) {
+                        if self.executor_active.get(&ex) == Some(&r) {
+                            let next = self
+                                .executor_queues
+                                .get_mut(&ex)
+                                .and_then(|q| q.pop_front());
+                            if let Some(next) = next {
+                                self.executor_active.insert(ex, next);
+                                self.runnable_executor.insert(next, ex);
+                                self.pending_runnables.push_back((next, false));
+                            } else {
+                                self.executor_active.remove(&ex);
+                                self.executor_queues.remove(&ex);
+                            }
+                        }
+                    }
                 }
             }
         }
