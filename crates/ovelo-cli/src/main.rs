@@ -676,6 +676,24 @@ fn register_compat_shims(
             }))))
         })) as ovelo_dexrt::HostCall,
     );
+    // Compose 1.9 graphics layers normally record into RenderNode and
+    // then replay that display list. Our Canvas backend is software —
+    // declaring software support makes GraphicsLayer.draw invoke the
+    // recorded drawBlock directly instead, preserving content without
+    // implementing the Android display-list object graph.
+    for owner in [
+        "Landroidx/compose/ui/graphics/layer/GraphicsLayerImpl;",
+        "Landroidx/compose/ui/graphics/layer/GraphicsViewLayer;",
+    ] {
+        let _ = v.register_host(
+            owner,
+            "getSupportsSoftwareRendering",
+            "()Z",
+            Rc::new(RefCell::new(|_vm: &mut ovelo_dexrt::Vm, _a: &[V]| {
+                Ok(Some(V::I32(1)))
+            })) as ovelo_dexrt::HostCall,
+        );
+    }
     // androidx.profileinstaller: `ProfileInstallerInitializer` schedules
     // `writeProfile` on the first doFrame — under interpretation that
     // write churns for minutes while the window never opens. The

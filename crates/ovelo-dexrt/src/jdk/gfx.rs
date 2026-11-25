@@ -22,6 +22,8 @@ const PK_CH: u32 = 0xFFFD_FF11;
 /// transform path draws into a pooled Bitmap this way).
 const PK_TARGET: u32 = 0xFFFD_FF12;
 const PK_SAVECNT: u32 = 0xFFFD_FF13;
+/// RenderNode → the recording canvas produced by beginRecording.
+const PK_RECCANVAS: u32 = 0xFFFD_FF14;
 /// `android.graphics.Matrix` affine coefficients — Android's first
 /// six of nine values: x' = m0·x + m1·y + m2, y' = m3·x + m4·y + m5.
 /// Perspective row stays [0,0,1].
@@ -176,6 +178,9 @@ fn canvas_call(vm: &mut Vm, name: &str, sig: &str, args: &[V]) -> Rt<Option<Opti
             V::Ref(h) => i32v(pseudo_get(vm, h, PK_CH).unwrap_or(V::I32(0))),
             _ => 0,
         }))),
+        // RenderNode display lists are implemented below, so expose
+        // the ordinary accelerated Compose playback path.
+        "isHardwareAccelerated" => Some(Some(V::I32(1))),
         "save" | "saveLayer" | "saveLayerAlpha" => {
             rec(vm, this, CanvasOp::Save);
             if let V::Ref(h) = this {
@@ -271,6 +276,33 @@ fn canvas_call(vm: &mut Vm, name: &str, sig: &str, args: &[V]) -> Rt<Option<Opti
         "drawPaint" => {
             let p = ps(vm, args);
             rec(vm, this, CanvasOp::Color { argb: p.argb });
+            Some(None)
+        }
+        "drawRenderNode" => {
+            // Splice the node recording into this canvas in playback
+            // order. Nested layers flatten recursively because their
+            // own drawRenderNode already used this same path while
+            // recording the outer node.
+            if let (V::Ref(_), V::Ref(rh)) = (this, arg(args, 1)) {
+                if let Some(V::Ref(ch)) = pseudo_get(vm, rh, PK_RECCANVAS) {
+                    if let Some(Obj::Host {
+                        state: HostState::CanvasOps(ops),
+                        ..
+                    }) = vm.heap.get(ch)
+                    {
+                        if crate::dbg_flag("OVELO_RNDBG") {
+                            static N: std::sync::atomic::AtomicUsize =
+                                std::sync::atomic::AtomicUsize::new(0);
+                            if N.fetch_add(1, std::sync::atomic::Ordering::Relaxed) < 40 {
+                                eprintln!("[rndbg] drawRenderNode node h{rh} ops={}", ops.len());
+                            }
+                        }
+                        for op in ops.clone() {
+                            rec(vm, this, op);
+                        }
+                    }
+                }
+            }
             Some(None)
         }
         "drawRect" => {
@@ -617,7 +649,16 @@ fn paint_call(vm: &mut Vm, name: &str, _sig: &str, args: &[V]) -> Rt<Option<Opti
             Some(None)
         }
         "setColor" => {
-            pseudo_set(vm, h, PK_COLOR, arg(args, 1));
+            // API 34+/Compose pass a packed long Color. For ordinary
+            // sRGB colors the high 32 bits are exactly ARGB and the low
+            // word is zero (`Color(int).value << 32`); keeping the long
+            // itself made paint_state read the zero low word, so every
+            // Compose shape painted transparent black.
+            let c = match arg(args, 1) {
+                V::I64(x) if x as u64 & 0xffff_ffff == 0 => ((x as u64) >> 32) as u32 as i32,
+                v => i32v(v),
+            };
+            pseudo_set(vm, h, PK_COLOR, V::I32(c));
             Some(None)
         }
         "setARGB" => {
@@ -1349,6 +1390,71 @@ fn matrix_call(vm: &mut Vm, name: &str, _sig: &str, args: &[V]) -> Rt<Option<Opt
     })
 }
 
+/// `android.graphics.RenderNode` display-list shell. Recording draws
+/// into a host Canvas and drawRenderNode splices those recorded ops
+/// into the destination canvas at the point of playback.
+fn rendernode_call(vm: &mut Vm, name: &str, args: &[V]) -> Rt<Option<Option<V>>> {
+    Ok(match name {
+        "<init>" => Some(None),
+        "beginRecording" => {
+            let V::Ref(rh) = arg(args, 0) else {
+                return Ok(Some(Some(V::Ref(0))));
+            };
+            let V::Ref(ch) = host(
+                vm,
+                "Landroid/graphics/RecordingCanvas;",
+                HostState::CanvasOps(Vec::new()),
+            ) else {
+                return Ok(Some(Some(V::Ref(0))));
+            };
+            pseudo_set(vm, ch, PK_CW, arg(args, 1));
+            pseudo_set(vm, ch, PK_CH, arg(args, 2));
+            pseudo_set(vm, rh, PK_RECCANVAS, V::Ref(ch));
+            Some(Some(V::Ref(ch)))
+        }
+        "endRecording" | "endRecordingAndDisplayList" => Some(None),
+        "hasDisplayList" => Some(Some(V::I32(1))),
+        "discardDisplayList" | "clearDisplayList" => {
+            if let V::Ref(rh) = arg(args, 0) {
+                pseudo_set(vm, rh, PK_RECCANVAS, V::Ref(0));
+            }
+            Some(None)
+        }
+        // Transform/outline/alpha mutations configure the platform
+        // render node. NodeCoordinator has already applied the layout
+        // translation around drawLayer; the remaining effects are
+        // visual refinements we do not yet model.
+        "setPosition"
+        | "setLeftTopRightBottom"
+        | "setLeft"
+        | "setTop"
+        | "setRight"
+        | "setBottom"
+        | "offsetLeftAndRight"
+        | "offsetTopAndBottom"
+        | "setAlpha"
+        | "setTranslationX"
+        | "setTranslationY"
+        | "setTranslationZ"
+        | "setElevation"
+        | "setRotation"
+        | "setRotationX"
+        | "setRotationY"
+        | "setScaleX"
+        | "setScaleY"
+        | "setPivotX"
+        | "setPivotY"
+        | "setCameraDistance"
+        | "setClipToBounds"
+        | "setClipToOutline"
+        | "setOutline"
+        | "setRenderEffect"
+        | "setUseCompositingLayer"
+        | "setHasOverlappingRendering" => Some(Some(V::I32(1))),
+        _ => return Ok(None),
+    })
+}
+
 /// `Landroid/graphics/*` methods we model.
 pub(crate) fn call(
     vm: &mut Vm,
@@ -1358,7 +1464,10 @@ pub(crate) fn call(
     args: &[V],
 ) -> Rt<Option<Option<V>>> {
     match class {
-        "Landroid/graphics/Canvas;" => canvas_call(vm, name, sig, args),
+        "Landroid/graphics/Canvas;" | "Landroid/graphics/RecordingCanvas;" => {
+            canvas_call(vm, name, sig, args)
+        }
+        "Landroid/graphics/RenderNode;" => rendernode_call(vm, name, args),
         "Landroid/graphics/Paint;" | "Landroid/text/TextPaint;" => paint_call(vm, name, sig, args),
         "Landroid/graphics/Matrix;" => matrix_call(vm, name, sig, args),
         _ => Ok(None),
@@ -1577,13 +1686,18 @@ pub(crate) fn guest_draw_ops(vm: &mut Vm, view: u32, w: i32, h: i32) -> Vec<Canv
             r.is_err()
         );
         if crate::dbg_flag("OVELO_DRAWDBG_DUMP") {
-            if let Some(Obj::Host {
-                state: HostState::CanvasOps(ops),
-                ..
-            }) = vm.heap.get(canvas)
-            {
-                for (i, op) in ops.iter().enumerate() {
-                    eprintln!("[drawdbg]   op{i} {op:?}");
+            // Compose redraws the same view every frame — cap dumps or
+            // the diagnostic itself starves the interpreter.
+            static DUMPS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+            if DUMPS.fetch_add(1, std::sync::atomic::Ordering::Relaxed) < 3 {
+                if let Some(Obj::Host {
+                    state: HostState::CanvasOps(ops),
+                    ..
+                }) = vm.heap.get(canvas)
+                {
+                    for (i, op) in ops.iter().enumerate() {
+                        eprintln!("[drawdbg]   op{i} {op:?}");
+                    }
                 }
             }
         }

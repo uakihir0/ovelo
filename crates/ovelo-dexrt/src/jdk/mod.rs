@@ -3298,6 +3298,8 @@ pub(crate) fn host_supers(d: &str) -> &'static [&'static str] {
             OBJ,
         ],
         // ----- android.graphics
+        "Landroid/graphics/RenderNode;" => &[OBJ],
+        "Landroid/graphics/RecordingCanvas;" => &["Landroid/graphics/Canvas;", OBJ],
         "Landroid/graphics/Paint;"
         | "Landroid/graphics/Canvas;"
         | "Landroid/graphics/Bitmap;"
