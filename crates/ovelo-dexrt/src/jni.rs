@@ -1536,6 +1536,10 @@ sets!(set_static_double_field);
 
 // ---------- strings ----------
 
+fn jni_string(s: u64) -> Option<String> {
+    jdk::sv(&vm(), V::Ref(s as u32))
+}
+
 extern "C" fn new_string_utf(_e: u64, p: u64) -> u64 {
     env_enter("new_string_utf");
     let s = cstr_ro(p);
@@ -1547,14 +1551,11 @@ extern "C" fn new_string(_e: u64, _p: u64, _len: u64) -> u64 {
 }
 extern "C" fn get_string_length(_e: u64, s: u64) -> u64 {
     env_enter("get_string_length");
-    vm().heap
-        .str_val(s as u32)
-        .map(|x| x.chars().count() as u64)
-        .unwrap_or(0)
+    jni_string(s).map(|x| x.chars().count() as u64).unwrap_or(0)
 }
 extern "C" fn get_string_utf_length(_e: u64, s: u64) -> u64 {
     env_enter("get_string_utf_length");
-    let Some(x) = vm().heap.str_val(s as u32).map(|x| x.to_string()) else {
+    let Some(x) = jni_string(s) else {
         return 0;
     };
     // Modified UTF-8 byte count: NUL is 2 bytes and supplementary
@@ -1570,7 +1571,7 @@ extern "C" fn get_string_utf_length(_e: u64, s: u64) -> u64 {
 }
 extern "C" fn get_string_utf_chars(_e: u64, s: u64, _copy: u64) -> u64 {
     env_enter("get_string_utf_chars");
-    let Some(x) = vm().heap.str_val(s as u32).map(|x| x.to_string()) else {
+    let Some(x) = jni_string(s) else {
         return 0;
     };
     let mut out = Vec::with_capacity(x.len() + 1);
@@ -1598,7 +1599,7 @@ extern "C" fn release_string_utf_chars(_e: u64, _s: u64, p: u64) -> u64 {
 /// `GetStringChars`/`GetStringCritical`: UTF-16 buffer, NUL-terminated.
 extern "C" fn get_string_units(_e: u64, s: u64, _copy: u64) -> u64 {
     env_enter("get_string_units");
-    let Some(x) = vm().heap.str_val(s as u32).map(|x| x.to_string()) else {
+    let Some(x) = jni_string(s) else {
         return 0;
     };
     let u16s: Vec<u16> = x.encode_utf16().collect();
@@ -1620,7 +1621,7 @@ extern "C" fn release_string_units(_e: u64, _s: u64, p: u64) {
 }
 extern "C" fn get_string_region(_e: u64, s: u64, start: u64, len: u64, buf: u64) {
     env_enter("get_string_region");
-    let Some(x) = vm().heap.str_val(s as u32).map(|x| x.to_string()) else {
+    let Some(x) = jni_string(s) else {
         return;
     };
     let u16s: Vec<u16> = x.encode_utf16().collect();
@@ -1651,7 +1652,7 @@ fn mutf8_unit(out: &mut Vec<u8>, u: u16) {
 
 extern "C" fn get_string_utf_region(_e: u64, s: u64, start: u64, len: u64, buf: u64) {
     env_enter("get_string_utf_region");
-    let Some(x) = vm().heap.str_val(s as u32).map(|x| x.to_string()) else {
+    let Some(x) = jni_string(s) else {
         return;
     };
     let u16s: Vec<u16> = x.encode_utf16().collect();
