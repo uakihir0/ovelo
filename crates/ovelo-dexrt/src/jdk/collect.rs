@@ -31,10 +31,26 @@ use std::rc::Rc;
 const P_ITER_SOURCE: u32 = u32::MAX - 50;
 const P_ITER_LAST: u32 = u32::MAX - 51;
 const P_ITER_DESC: u32 = u32::MAX - 52;
+/// The value `next`/`previous` last returned — `remove` verifies the
+/// cursor index still holds it before trusting the index (a `poll()`
+/// mid-iteration shifts everything down).
+const P_ITER_LASTV: u32 = u32::MAX - 53;
+
+/// Copy-on-write collections iterate the array as of iterator
+/// creation — never the live list (Java spec: the snapshot does not
+/// reflect later adds/removes).
+fn is_cow_desc(desc: &str) -> bool {
+    matches!(
+        desc,
+        "Ljava/util/concurrent/CopyOnWriteArrayList;"
+            | "Ljava/util/concurrent/CopyOnWriteArraySet;"
+    )
+}
 
 /// Live backing-list length for a source-driven iterator — `None`
 /// when the iterated source isn't a `HostState::List` (set/map/array
-/// snapshot), in which case traversal falls back to the snapshot.
+/// snapshot) or must not be read live (copy-on-write), in which case
+/// traversal falls back to the snapshot.
 fn live_list_len(vm: &Vm, h: u32) -> Option<usize> {
     let src = match pseudo_get(vm, h, P_ITER_SOURCE) {
         Some(V::Ref(s)) => s,
@@ -43,8 +59,9 @@ fn live_list_len(vm: &Vm, h: u32) -> Option<usize> {
     match vm.heap.get(src) {
         Some(Obj::Host {
             state: HostState::List(l),
+            desc,
             ..
-        }) => Some(l.len()),
+        }) if !is_cow_desc(desc) => Some(l.len()),
         _ => None,
     }
 }
@@ -59,8 +76,9 @@ fn live_list_get(vm: &Vm, h: u32, at: usize) -> Option<V> {
     match vm.heap.get(src) {
         Some(Obj::Host {
             state: HostState::List(l),
+            desc,
             ..
-        }) => l.get(at).copied(),
+        }) if !is_cow_desc(desc) => l.get(at).copied(),
         _ => None,
     }
 }
@@ -1609,6 +1627,7 @@ fn iter_call(vm: &mut Vm, name: &str, args: &[V]) -> Rt<Option<Option<V>>> {
                     *pos = if desc { at } else { at + 1 };
                 }
                 pseudo_set(vm, h, P_ITER_LAST, V::I32(at as i32));
+                pseudo_set(vm, h, P_ITER_LASTV, v);
                 return Ok(Some(Some(v)));
             }
             let (v, ok) = match vm.heap.get_mut(h) {
@@ -1690,6 +1709,7 @@ fn iter_call(vm: &mut Vm, name: &str, args: &[V]) -> Rt<Option<Option<V>>> {
                 *pos = if desc { at + 1 } else { at };
             }
             pseudo_set(vm, h, P_ITER_LAST, V::I32(at as i32));
+            pseudo_set(vm, h, P_ITER_LASTV, v);
             Some(Some(v))
         }
         "nextIndex" | "previousIndex" => {
@@ -1726,24 +1746,54 @@ fn iter_call(vm: &mut Vm, name: &str, args: &[V]) -> Rt<Option<Option<V>>> {
                 );
                 return Err(e);
             }
-            // Index-exact removal: traversal is source-coordinate, so
-            // `last` IS the element's index in the backing list — no
-            // value search that could hit a duplicate.
+            // Index-exact removal while the index still holds the
+            // returned element; if a `poll()`/direct removal shifted
+            // the list mid-iteration, re-locate the element by value
+            // (absent → it is already gone, nothing to remove).
             let at = last as usize;
-            let mut removed = false;
+            let item = pseudo_get(vm, h, P_ITER_LASTV).unwrap_or(V::Ref(0));
+            let mut removed_at = None;
             if let Some(V::Ref(src)) = pseudo_get(vm, h, P_ITER_SOURCE) {
-                if let Some(Obj::Host {
-                    state: HostState::List(l),
-                    ..
-                }) = vm.heap.get_mut(src)
-                {
-                    if at < l.len() {
-                        l.remove(at);
-                        removed = true;
+                let live = matches!(
+                    vm.heap.get(src),
+                    Some(Obj::Host {
+                        state: HostState::List(_),
+                        desc,
+                        ..
+                    }) if !is_cow_desc(desc)
+                );
+                if live {
+                    let idx = {
+                        let hit = match vm.heap.get(src) {
+                            Some(Obj::Host {
+                                state: HostState::List(l),
+                                ..
+                            }) => {
+                                if at < l.len() && value_eq(vm, l[at], item) {
+                                    Some(at)
+                                } else {
+                                    l.iter().position(|e| value_eq(vm, *e, item))
+                                }
+                            }
+                            _ => None,
+                        };
+                        hit
+                    };
+                    if let Some(pos) = idx {
+                        if let Some(Obj::Host {
+                            state: HostState::List(l),
+                            ..
+                        }) = vm.heap.get_mut(src)
+                        {
+                            if pos < l.len() {
+                                l.remove(pos);
+                                removed_at = Some(pos);
+                            }
+                        }
                     }
                 }
             }
-            if removed {
+            if let Some(rm) = removed_at {
                 // Everything at/after the removed index shifted down —
                 // rewind the cursor when it sat past the element.
                 if let Some(Obj::Host {
@@ -1751,7 +1801,7 @@ fn iter_call(vm: &mut Vm, name: &str, args: &[V]) -> Rt<Option<Option<V>>> {
                     ..
                 }) = vm.heap.get_mut(h)
                 {
-                    if at < *pos {
+                    if rm < *pos {
                         *pos -= 1;
                     }
                 }
