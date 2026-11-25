@@ -3668,10 +3668,13 @@ pub(crate) fn host_supers(d: &str) -> &'static [&'static str] {
         "Ljava/security/cert/X509Certificate;" => &["Ljava/security/cert/Certificate;", OBJ],
         "Ljava/security/cert/Certificate;" | "Ljava/security/cert/CertPath;" => &[OBJ],
         "Ljava/security/CodeSigner;" => &["Ljava/io/Serializable;", OBJ],
+        "Ljava/security/DigestException;" | "Ljava/security/NoSuchAlgorithmException;" => {
+            &["Ljava/security/GeneralSecurityException;", OBJ]
+        }
+        "Ljava/security/GeneralSecurityException;" => &["Ljava/lang/Exception;", OBJ],
         "Ljava/security/MessageDigest;"
         | "Ljava/security/KeyStore;"
         | "Ljava/security/Signature;"
-        | "Ljava/security/NoSuchAlgorithmException;"
         | "Ljavax/crypto/Cipher;"
         | "Ljavax/crypto/Mac;"
         | "Ljavax/crypto/KeyGenerator;"

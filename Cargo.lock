@@ -1831,6 +1831,8 @@ dependencies = [
  "ovelo-dex",
  "ovelo-error",
  "rusqlite",
+ "sha1",
+ "sha2",
  "unicode-normalization",
  "ureq",
 ]

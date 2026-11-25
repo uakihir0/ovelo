@@ -2,7 +2,8 @@
 
 use super::rx::{full_match, Rx};
 use super::*;
-use crate::value::{HostState, Obj, V};
+use crate::value::{DigestState, HostState, Obj, V};
+use sha2::Digest as _;
 
 pub(crate) fn call(
     vm: &mut Vm,
@@ -14,6 +15,8 @@ pub(crate) fn call(
     Ok(
         if desc_is_a(class, "Ljava/io/PrintStream;") || desc_is_a(class, "Ljava/io/PrintWriter;") {
             print_call(vm, name, sig, args)
+        } else if class == "Ljava/security/MessageDigest;" {
+            digest_call(vm, name, args)?
         } else if class == "Ljava/util/jar/JarFile;" || class == "Ljava/util/zip/ZipFile;" {
             zip_file_call(vm, class, name, args)
         } else if class == "Ljava/util/jar/JarEntry;" || class == "Ljava/util/zip/ZipEntry;" {
@@ -3756,8 +3759,249 @@ fn replace_host_state(vm: &mut Vm, this: V, class: &str, state: HostState) {
     }
 }
 
+fn digest_new(algorithm: &str) -> Option<DigestState> {
+    let alg = algorithm.to_ascii_uppercase().replace('-', "");
+    match alg.as_str() {
+        "SHA1" => Some(DigestState::Sha1(sha1::Sha1::new())),
+        "SHA224" => None,
+        "SHA256" => Some(DigestState::Sha256(sha2::Sha256::new())),
+        "SHA384" => Some(DigestState::Sha384(sha2::Sha384::new())),
+        "SHA512" => Some(DigestState::Sha512(sha2::Sha512::new())),
+        _ => None,
+    }
+}
+
+fn digest_like(state: &DigestState) -> DigestState {
+    match state {
+        DigestState::Sha1(_) => DigestState::Sha1(sha1::Sha1::new()),
+        DigestState::Sha256(_) => DigestState::Sha256(sha2::Sha256::new()),
+        DigestState::Sha384(_) => DigestState::Sha384(sha2::Sha384::new()),
+        DigestState::Sha512(_) => DigestState::Sha512(sha2::Sha512::new()),
+    }
+}
+
+fn digest_algorithm(state: &DigestState) -> (&'static str, i32) {
+    match state {
+        DigestState::Sha1(_) => ("SHA-1", 20),
+        DigestState::Sha256(_) => ("SHA-256", 32),
+        DigestState::Sha384(_) => ("SHA-384", 48),
+        DigestState::Sha512(_) => ("SHA-512", 64),
+    }
+}
+
+fn digest_update(state: &mut DigestState, bytes: &[u8]) {
+    match state {
+        DigestState::Sha1(d) => d.update(bytes),
+        DigestState::Sha256(d) => d.update(bytes),
+        DigestState::Sha384(d) => d.update(bytes),
+        DigestState::Sha512(d) => d.update(bytes),
+    }
+}
+
+fn digest_finish(state: &mut DigestState) -> Vec<u8> {
+    match state {
+        DigestState::Sha1(d) => d.finalize_reset().to_vec(),
+        DigestState::Sha256(d) => d.finalize_reset().to_vec(),
+        DigestState::Sha384(d) => d.finalize_reset().to_vec(),
+        DigestState::Sha512(d) => d.finalize_reset().to_vec(),
+    }
+}
+
+fn array_bytes(vm: &Vm, array: V, offset: usize, len: Option<usize>) -> Vec<u8> {
+    let V::Ref(h) = array else {
+        return Vec::new();
+    };
+    let Some(Obj::Array { data, .. }) = vm.heap.get(h) else {
+        return Vec::new();
+    };
+    let start = offset.min(data.len());
+    let end = len
+        .map(|len| start.saturating_add(len).min(data.len()))
+        .unwrap_or(data.len());
+    data[start..end].iter().map(|v| i32v(*v) as u8).collect()
+}
+
+fn digest_call(vm: &mut Vm, name: &str, args: &[V]) -> Rt<Option<Option<V>>> {
+    if name == "digest" && args.len() == 4 {
+        let needed = match args.first() {
+            Some(V::Ref(h)) => match vm.heap.get(*h) {
+                Some(Obj::Host {
+                    state: HostState::Digest(state),
+                    ..
+                }) => digest_algorithm(state).1,
+                _ => 0,
+            },
+            _ => 0,
+        };
+        if i32v(args[3]) < needed {
+            return Err(vm.throw_builtin(
+                "Ljava/security/DigestException;",
+                "insufficient space in digest output buffer",
+            ));
+        }
+    }
+    Ok(digest_call_impl(vm, name, args))
+}
+
+fn digest_call_impl(vm: &mut Vm, name: &str, args: &[V]) -> Option<Option<V>> {
+    match name {
+        "getInstance" => {
+            let algorithm = args.first().and_then(|v| sv(vm, *v)).unwrap_or_default();
+            let state = digest_new(&algorithm)?;
+            Some(Some(host(
+                vm,
+                "Ljava/security/MessageDigest;",
+                HostState::Digest(Box::new(state)),
+            )))
+        }
+        "isEqual" => {
+            let a = array_bytes(vm, args.first().copied().unwrap_or(V::Ref(0)), 0, None);
+            let b = array_bytes(vm, args.get(1).copied().unwrap_or(V::Ref(0)), 0, None);
+            Some(Some(V::I32((a == b) as i32)))
+        }
+        "update" => {
+            let mut buffer_pos = None;
+            let bytes = match args.len() {
+                2 => match args.get(1).copied().unwrap_or(V::I32(0)) {
+                    v @ V::Ref(h) => match vm.heap.get(h) {
+                        Some(Obj::Host {
+                            state: HostState::Slot(V::Ref(_)),
+                            ..
+                        }) => {
+                            let (bytes, _pos) = bb_bytes(vm, h);
+                            if let Some(lim) = pseudo_get(vm, h, P_BBUF_LIM) {
+                                buffer_pos = Some((h, i32v(lim)));
+                            }
+                            bytes
+                        }
+                        _ => array_bytes(vm, v, 0, None),
+                    },
+                    v => vec![i32v(v) as u8],
+                },
+                4 => array_bytes(
+                    vm,
+                    args.get(1).copied().unwrap_or(V::Ref(0)),
+                    i32v(args[2]).max(0) as usize,
+                    Some(i32v(args[3]).max(0) as usize),
+                ),
+                _ => Vec::new(),
+            };
+            if let Some(V::Ref(h)) = args.first() {
+                if let Some(Obj::Host {
+                    state: HostState::Digest(state),
+                    ..
+                }) = vm.heap.get_mut(*h)
+                {
+                    digest_update(state, &bytes);
+                }
+            }
+            if let Some((h, pos)) = buffer_pos {
+                pseudo_set(vm, h, P_BBUF_POS, V::I32(pos));
+            }
+            Some(None)
+        }
+        "digest" => {
+            if args.len() == 2 {
+                let bytes = array_bytes(vm, args[1], 0, None);
+                if let Some(V::Ref(h)) = args.first() {
+                    if let Some(Obj::Host {
+                        state: HostState::Digest(state),
+                        ..
+                    }) = vm.heap.get_mut(*h)
+                    {
+                        digest_update(state, &bytes);
+                    }
+                }
+            }
+            let out = match args.first() {
+                Some(V::Ref(h)) => match vm.heap.get_mut(*h) {
+                    Some(Obj::Host {
+                        state: HostState::Digest(state),
+                        ..
+                    }) => digest_finish(state),
+                    _ => Vec::new(),
+                },
+                _ => Vec::new(),
+            };
+            if args.len() == 4 {
+                let offset = i32v(args[2]).max(0) as usize;
+                let len = i32v(args[3]).max(0) as usize;
+                let mut written = 0usize;
+                if let V::Ref(array_h) = args[1] {
+                    if let Some(Obj::Array { data, .. }) = vm.heap.get_mut(array_h) {
+                        for (i, byte) in out.iter().take(len).enumerate() {
+                            if let Some(slot) = data.get_mut(offset + i) {
+                                *slot = V::I32(*byte as i8 as i32);
+                                written += 1;
+                            }
+                        }
+                    }
+                }
+                return Some(Some(V::I32(written as i32)));
+            }
+            Some(Some(byte_arr(vm, &out)))
+        }
+        "reset" => {
+            if let Some(V::Ref(h)) = args.first() {
+                if let Some(Obj::Host {
+                    state: HostState::Digest(state),
+                    ..
+                }) = vm.heap.get_mut(*h)
+                {
+                    **state = digest_like(state);
+                }
+            }
+            Some(None)
+        }
+        "getAlgorithm" => {
+            let algorithm = match args.first() {
+                Some(V::Ref(h)) => match vm.heap.get(*h) {
+                    Some(Obj::Host {
+                        state: HostState::Digest(state),
+                        ..
+                    }) => digest_algorithm(state).0,
+                    _ => "",
+                },
+                _ => "",
+            };
+            Some(Some(jstr(vm, algorithm)))
+        }
+        "getDigestLength" => {
+            let len = match args.first() {
+                Some(V::Ref(h)) => match vm.heap.get(*h) {
+                    Some(Obj::Host {
+                        state: HostState::Digest(state),
+                        ..
+                    }) => digest_algorithm(state).1,
+                    _ => 0,
+                },
+                _ => 0,
+            };
+            Some(Some(V::I32(len)))
+        }
+        "toString" => {
+            let algorithm = match args.first() {
+                Some(V::Ref(h)) => match vm.heap.get(*h) {
+                    Some(Obj::Host {
+                        state: HostState::Digest(state),
+                        ..
+                    }) => digest_algorithm(state).0,
+                    _ => "",
+                },
+                _ => "",
+            };
+            Some(Some(jstr(vm, &format!("MessageDigest<{algorithm}>"))))
+        }
+        _ => None,
+    }
+}
+
 fn byte_arr(vm: &mut Vm, bytes: &[u8]) -> V {
-    arr(vm, "B", bytes.iter().map(|b| V::I32(*b as i32)).collect())
+    arr(
+        vm,
+        "B",
+        bytes.iter().map(|b| V::I32(*b as i8 as i32)).collect(),
+    )
 }
 
 fn zip_file_call(vm: &mut Vm, class: &str, name: &str, args: &[V]) -> Option<Option<V>> {

@@ -16,6 +16,8 @@ ovelo-dex = { path = "../ovelo-dex" }
 ovelo-error = { path = "../ovelo-error" }
 image = { version = "0.25", default-features = false, features = ["png", "jpeg", "webp"] }
 rusqlite = { version = "0.32", features = ["bundled", "hooks", "collation"] }
+sha1 = "0.10"
+sha2 = "0.10"
 unicode-normalization = "0.1"
 ureq = { version = "3", default-features = false, features = ["rustls", "gzip"] }
 
