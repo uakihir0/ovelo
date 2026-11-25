@@ -776,6 +776,22 @@ fn list_call(vm: &mut Vm, name: &str, sig: &str, args: &[V]) -> Rt<Option<Option
             if list_mut(vm, h).is_none() {
                 return Ok(None);
             }
+            if let Some(V::Ref(parent)) = pseudo_get(vm, h, P_SUBLIST_PARENT) {
+                let a = pseudo_get(vm, h, P_SUBLIST_START)
+                    .map(i32v)
+                    .unwrap_or_default()
+                    .max(0) as usize;
+                let b = pseudo_get(vm, h, P_SUBLIST_END)
+                    .map(i32v)
+                    .unwrap_or_default()
+                    .max(0) as usize;
+                if let Some(l) = list_mut(vm, parent) {
+                    let end = b.min(l.len());
+                    if a < end {
+                        l.drain(a..end);
+                    }
+                }
+            }
             if let Some(l) = list_mut(vm, h) {
                 l.clear();
             }
@@ -925,7 +941,11 @@ fn list_call(vm: &mut Vm, name: &str, sig: &str, args: &[V]) -> Rt<Option<Option
                 .skip(a)
                 .take(b.saturating_sub(a))
                 .collect();
-            Some(Some(host(vm, "Ljava/util/List;", HostState::List(items))))
+            let sub = vm.alloc_host("Ljava/util/List;", HostState::List(items));
+            pseudo_set(vm, sub, P_SUBLIST_PARENT, V::Ref(h));
+            pseudo_set(vm, sub, P_SUBLIST_START, V::I32(a as i32));
+            pseudo_set(vm, sub, P_SUBLIST_END, V::I32(b as i32));
+            Some(Some(V::Ref(sub)))
         }
         "forEach" | "replaceAll" | "sort" | "stream" | "parallelStream" => {
             if name == "sort" {
