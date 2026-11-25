@@ -310,6 +310,14 @@ fn raster_path_to_bitmap(
 /// Append an op to a recording canvas handle.
 pub(crate) fn rec(vm: &mut Vm, canvas: V, op: CanvasOp) {
     let V::Ref(h) = canvas else { return };
+    if crate::dbg_flag("OVELO_TEXTDBG") {
+        if let CanvasOp::Text { text, x, y, paint } = &op {
+            eprintln!(
+                "[textdbg] canvas h{h} xy={x:.1},{y:.1} size={:.1} color={:08x} text={text:?}",
+                paint.text_size, paint.argb
+            );
+        }
+    }
     // A canvas bound to a Bitmap (`new Canvas(bitmap)`) composites
     // pixel ops into the bitmap itself — recording only would leave
     // the target blank (Drawable.toBitmap, Glide transforms).
