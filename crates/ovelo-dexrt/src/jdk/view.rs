@@ -6084,6 +6084,17 @@ pub(crate) fn deliver_attach_callbacks(vm: &mut Vm) {
                 Err(e) => eprintln!("[viewdbg] onAttachedToWindow h{h} err {e}"),
             }
         }
+        // ViewGroup.dispatchAttachedToWindow reaches the children
+        // present when dispatch runs. A child added while an earlier
+        // parent callback was executing therefore joins attachment even
+        // though its container was still only attach-queued at addView
+        // time. Already-queued or already-attached children are ignored
+        // by mark_attached, so this preserves the original order.
+        for c in children(vm, h) {
+            if let V::Ref(ch) = c {
+                mark_attached(vm, ch, 0);
+            }
+        }
     }
 }
 
