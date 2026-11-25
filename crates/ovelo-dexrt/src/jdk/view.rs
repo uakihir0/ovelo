@@ -999,10 +999,13 @@ pub(crate) fn call(
             // immediate main-queue posts. Without a minimum frame
             // interval a re-posting Compose animation executes back-to-
             // back on this cooperative VM and starves background work.
+            // Interpreted Compose frames are orders of magnitude slower
+            // than hardware-backed Android frames. Keep animation frames
+            // alive but leave most of the cooperative VM for workers.
             let delay = if name == "postFrameCallback" {
-                16
+                120
             } else {
-                args.get(2).map(|v| i64v(*v)).unwrap_or(0).max(16)
+                args.get(2).map(|v| i64v(*v)).unwrap_or(0).max(120)
             };
             if let Some(V::Ref(cb)) = args.get(1).copied() {
                 if cb != 0 {
