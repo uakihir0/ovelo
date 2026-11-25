@@ -2322,6 +2322,8 @@ impl Vm {
                 self.frame_callbacks.len()
             );
         }
+        let frame_work_start = jdk::now_ms();
+        let had_frame_work = !due_cbs.is_empty();
         for (cb, _) in due_cbs {
             let before_steps = self.total_steps;
             let out = self.call_virtual(cb, "doFrame", &[frame_nanos]);
@@ -2331,6 +2333,21 @@ impl Vm {
                     self.total_steps - before_steps,
                     out
                 );
+            }
+        }
+        if had_frame_work {
+            // Preserve 60 fps when frame work is cheap, but do not let
+            // an expensive interpreted UI monopolize the cooperative
+            // VM. Aim for at most ~25% frame-wall-clock occupancy:
+            // after a long Compose pass the next re-posted callback
+            // waits three times as long as the work itself.
+            let frame_cost = (jdk::now_ms() - frame_work_start).max(1) as u64;
+            let frame_gap = frame_cost.saturating_mul(3).clamp(16, 500);
+            let min_next = jdk::now_ms() as u64 + frame_gap;
+            for (_, due_at) in &mut self.frame_callbacks {
+                if *due_at < min_next {
+                    *due_at = min_next;
+                }
             }
         }
         let mut ran = 0usize;
