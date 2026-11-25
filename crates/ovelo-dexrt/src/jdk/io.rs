@@ -2655,31 +2655,43 @@ fn charset_decode(vm: &mut Vm, args: &[V]) -> V {
             }
             _ => (0, 0, 0, 0),
         };
-        let chars: Vec<char> = text.chars().collect();
-        let wrote = chars.len().min(cap);
+        // Java CharBuffer storage is UTF-16. Supplementary scalars take
+        // two units and must never be split by an output-buffer boundary.
+        let units: Vec<u16> = text.encode_utf16().collect();
+        let mut wrote = units.len().min(cap);
+        if wrote < units.len() && wrote > 0 && (0xD800..0xDC00).contains(&units[wrote - 1]) {
+            wrote -= 1;
+        }
         if back != 0 {
             if let Some(Obj::Array { data, .. }) = vm.heap.get_mut(back) {
-                for (i, ch) in chars.iter().take(wrote).enumerate() {
+                for (i, unit) in units.iter().take(wrote).enumerate() {
                     if let Some(slot) = data.get_mut(base + pos + i) {
-                        *slot = V::I32(*ch as i32);
+                        *slot = V::I32(*unit as i32);
                     }
                 }
             }
         }
         pseudo_set(vm, out_h, P_BBUF_POS, V::I32((pos + wrote) as i32));
-        // Only the bytes backing the written chars are consumed —
+        // Only the bytes backing wholly written characters are consumed —
         // OVERFLOW leaves the rest for the next decode call.
-        let used = if wrote < chars.len() {
-            if cs.contains("88591") || cs.contains("LATIN1") || cs.contains("ASCII") {
-                wrote
-            } else {
-                chars[..wrote].iter().collect::<String>().len()
+        let used = if wrote < units.len() {
+            let single_byte = cs.contains("88591") || cs.contains("LATIN1") || cs.contains("ASCII");
+            let mut used_units = 0usize;
+            let mut used_bytes = 0usize;
+            for ch in text.chars() {
+                let char_units = ch.len_utf16();
+                if used_units + char_units > wrote {
+                    break;
+                }
+                used_units += char_units;
+                used_bytes += if single_byte { 1 } else { ch.len_utf8() };
             }
+            used_bytes
         } else {
             consumed
         };
         pseudo_set(vm, in_h, P_BBUF_POS, V::I32((in_pos + used) as i32));
-        let st = if wrote < chars.len() {
+        let st = if wrote < units.len() {
             "OVERFLOW"
         } else {
             "UNDERFLOW"
