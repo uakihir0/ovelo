@@ -430,6 +430,30 @@ pub(crate) fn call(
                     return Ok(Some(None));
                 }
                 if due_ms > now_ms() && vm.cur_runnable != 0 {
+                    let blocking_waiter = vm.cur_thread != 0
+                        && vm.cur_thread != vm.main_thread_h
+                        && vm
+                            .describe_stack()
+                            .last()
+                            .is_some_and(|m| m.contains("runBlocking"));
+                    if blocking_waiter {
+                        // `runBlocking` parks its own Java stack while a
+                        // child coroutine completes. Requeue-and-restart
+                        // semantics destroy that stack, so the child can
+                        // finish without the waiter ever observing it.
+                        // Drain what is runnable, then return from this
+                        // park and let the event loop poll again.
+                        let remain = due_ms.saturating_sub(now_ms()).max(1);
+                        let slice = remain.min(50) as u64;
+                        match vm.park_drain_within(slice) {
+                            Ok(()) => {}
+                            Err(crate::E::Vm(e)) if e.cause() == "ovelo.park" => {
+                                std::thread::sleep(std::time::Duration::from_millis(1));
+                            }
+                            Err(e) => return Err(e),
+                        }
+                        return Ok(Some(None));
+                    }
                     vm.sleep_until.insert(vm.cur_runnable, due_ms.max(0) as u64);
                     vm.park_waiters.insert(vm.cur_runnable);
                     return Err(crate::E::Vm(crate::err("ovelo.park")));
