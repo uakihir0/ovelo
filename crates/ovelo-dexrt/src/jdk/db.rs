@@ -1188,10 +1188,28 @@ fn sqlite_call(vm: &mut Vm, name: &str, args: &[V]) -> Rt<Option<Option<V>>> {
             }
             Some(Some(out))
         }
+        "getThreadSession" => {
+            // Room reflects this hidden AOSP method for read-only
+            // transactions. Model the session as a lightweight link back
+            // to its database; reflective SQLiteSession.beginTransaction
+            // delegates through it below.
+            let out = host(
+                vm,
+                "Landroid/database/sqlite/SQLiteSession;",
+                HostState::Empty,
+            );
+            if let (V::Ref(sh), V::Ref(dbh)) = (out, args[0]) {
+                pseudo_set(vm, sh, crate::P_META as u32, V::Ref(dbh));
+            }
+            Some(Some(out))
+        }
         "beginTransaction"
         | "beginTransactionNonExclusive"
         | "beginTransactionWithListener"
         | "beginTransactionWithListenerNonExclusive" => {
+            if let Some(V::Ref(dbh)) = pseudo_get(vm, this, crate::P_META as u32) {
+                return db_call(vm, name, &[V::Ref(dbh)]);
+            }
             let db = conn_of(vm, this)?;
             let mut d = db.borrow_mut();
             // Nested begins stack on one level each — only the
