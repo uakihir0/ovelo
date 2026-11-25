@@ -6090,9 +6090,11 @@ pub(crate) fn deliver_attach_callbacks(vm: &mut Vm) {
         // though its container was still only attach-queued at addView
         // time. Already-queued or already-attached children are ignored
         // by mark_attached, so this preserves the original order.
-        for c in children(vm, h) {
-            if let V::Ref(ch) = c {
-                mark_attached(vm, ch, 0);
+        if pint(vm, h, P_ATTACHED) == 1 {
+            for c in children(vm, h) {
+                if let V::Ref(ch) = c {
+                    mark_attached(vm, ch, 0);
+                }
             }
         }
     }
