@@ -11,6 +11,7 @@ use std::rc::Rc;
 const SEQ: &str = "Lkotlinx/serialization/json/internal/ArrayAsSequence;";
 const WRITER: &str = "Lkotlinx/serialization/json/internal/JsonToStringWriter;";
 const LEXER: &str = "Lkotlinx/serialization/json/internal/ReaderJsonLexer;";
+const ALEXER: &str = "Lkotlinx/serialization/json/internal/AbstractJsonLexer;";
 
 fn this(args: &[V]) -> u32 {
     match args.first() {
@@ -339,13 +340,11 @@ fn lexer_scan_index(vm: &mut Vm, h: u32, start: i32, needle: Option<i32>, whites
         };
         let len = seq_len(vm, source);
         if pos >= len {
-            // Preserve chunked-input semantics through the real dex
-            // prefetch path; it refills/compacts and may answer EOF.
-            match vm.call_virtual(h, "prefetchOrEof", &[V::I32(pos)]) {
-                Ok(Some(V::I32(next))) if next >= 0 => pos = next,
-                _ => return -1,
-            }
-            continue;
+            // ReaderJsonLexer.indexOf intentionally searches only the
+            // currently buffered sequence. consumeKeyString treats -1
+            // as the chunk-boundary/escape slow path and drives refills
+            // itself; prefetching here would skip that state machine.
+            return -1;
         }
         let ch = seq_char(vm, source, pos).map(i32v).unwrap_or(0);
         let hit = if let Some(n) = needle {
@@ -366,7 +365,166 @@ fn lexer_scan_index(vm: &mut Vm, h: u32, start: i32, needle: Option<i32>, whites
     }
 }
 
+fn lexer_pos(vm: &Vm, h: u32) -> i32 {
+    field(vm, h, ALEXER, "currentPosition")
+        .map(i32v)
+        .unwrap_or(0)
+}
+
+fn set_lexer_pos(vm: &mut Vm, h: u32, pos: i32) {
+    vm.set_object_field(h, ALEXER, "currentPosition", V::I32(pos));
+}
+
+/// Fast simple-key case for consumeKeyString: an opening quote followed
+/// by a quote-terminated, escape-free key inside the current chunk.
+/// Anything else restores the entry position and re-enters the dex
+/// implementation (which owns chunked input and escape handling).
+fn call_int(vm: &mut Vm, h: u32, name: &str, args: &[V]) -> Option<i32> {
+    match vm.call_virtual(h, name, args) {
+        Ok(Some(v)) => Some(i32v(v)),
+        _ => None,
+    }
+}
+
+fn invoke_lexer_exact(vm: &mut Vm, name: &str, params: &[&str], args: Vec<V>) -> bool {
+    let Some(midx) = vm.find_method_by_sig(LEXER, name, params).ok().flatten() else {
+        return false;
+    };
+    vm.invoke_no_host(midx, args, crate::InvokeKind::Virtual)
+        .is_ok()
+}
+
+/// Full consumeKeyString state machine, with the character scanning loop
+/// in Rust and escape/refill primitives delegated to the dex lexer. The
+/// dex fast path only scans one chunk; long localized descriptions in
+/// F-Droid routinely cross chunks, so falling back for them re-scans the
+/// whole string one interpreted character at a time.
+fn consume_key_string_fast(vm: &mut Vm, args: &[V]) -> V {
+    let h = this(args);
+    if !invoke_lexer_exact(vm, "consumeNextToken", &["C"], vec![V::Ref(h), V::I32(34)]) {
+        return consume_key_string_dex(vm, args).unwrap_or(V::Ref(0));
+    }
+    let start = lexer_pos(vm, h);
+    let Some(source) = lexer_source(vm, h) else {
+        return consume_key_string_dex(vm, args).unwrap_or(V::Ref(0));
+    };
+    let len = seq_len(vm, source);
+    let mut closing = -1;
+    let mut escaped = false;
+    let mut pos = start;
+    while pos >= 0 && pos < len {
+        match seq_char(vm, source, pos).map(i32v).unwrap_or(0) {
+            34 => {
+                closing = pos;
+                break;
+            }
+            92 => escaped = true,
+            _ => {}
+        }
+        pos += 1;
+    }
+
+    let (string_start, mut current) = if closing >= 0 && !escaped {
+        let out = seq_substring(vm, source, start, closing);
+        set_lexer_pos(vm, h, closing + 1);
+        return out;
+    } else if closing >= 0 {
+        // An escaped quote may be the first quote in the chunk. The
+        // general scanner decides whether it really terminates.
+        (start, start)
+    } else {
+        // No closing quote in this chunk. prefetchOrEof compacts and
+        // resets positions; the general scanner continues from the new
+        // buffer position just like the dex implementation.
+        match call_int(vm, h, "prefetchOrEof", &[V::I32(start)]) {
+            Some(next) if next >= 0 => (lexer_pos(vm, h), next),
+            _ => return consume_key_string_dex(vm, args).unwrap_or(V::Ref(0)),
+        }
+    };
+
+    // consumeString(source, string_start, current): scan until the real
+    // closing quote, copying chunk prefixes/escaped sections into the
+    // lexer's escapedString only when needed.
+    let mut last = string_start;
+    let mut used_append = closing >= 0 && escaped;
+    loop {
+        let Some(source) = lexer_source(vm, h) else {
+            return consume_key_string_dex(vm, args).unwrap_or(V::Ref(0));
+        };
+        let len = seq_len(vm, source);
+        if current < 0 || current >= len {
+            return consume_key_string_dex(vm, args).unwrap_or(V::Ref(0));
+        }
+        let ch = seq_char(vm, source, current).map(i32v).unwrap_or(0);
+        if ch == 34 {
+            let out = if used_append {
+                match vm.call_virtual(h, "decodedString", &[V::I32(last), V::I32(current)]) {
+                    Ok(Some(v)) => v,
+                    _ => return consume_key_string_dex(vm, args).unwrap_or(V::Ref(0)),
+                }
+            } else {
+                seq_substring(vm, source, last, current)
+            };
+            set_lexer_pos(vm, h, current + 1);
+            return out;
+        }
+        if ch == 92 {
+            used_append = true;
+            let Some(after_escape) =
+                call_int(vm, h, "appendEscape", &[V::I32(last), V::I32(current)])
+            else {
+                return consume_key_string_dex(vm, args).unwrap_or(V::Ref(0));
+            };
+            let Some(next) = call_int(vm, h, "prefetchOrEof", &[V::I32(after_escape)]) else {
+                return consume_key_string_dex(vm, args).unwrap_or(V::Ref(0));
+            };
+            if next < 0 {
+                return consume_key_string_dex(vm, args).unwrap_or(V::Ref(0));
+            }
+            current = next;
+            last = current;
+        } else {
+            current += 1;
+            if current >= len {
+                used_append = true;
+                if vm
+                    .call_virtual(h, "appendRange", &[V::I32(last), V::I32(current)])
+                    .is_err()
+                {
+                    return consume_key_string_dex(vm, args).unwrap_or(V::Ref(0));
+                }
+                let Some(next) = call_int(vm, h, "prefetchOrEof", &[V::I32(current)]) else {
+                    return consume_key_string_dex(vm, args).unwrap_or(V::Ref(0));
+                };
+                if next < 0 {
+                    return consume_key_string_dex(vm, args).unwrap_or(V::Ref(0));
+                }
+                current = next;
+                last = current;
+            }
+        }
+    }
+}
+
+fn consume_key_string_dex(vm: &mut Vm, args: &[V]) -> Option<V> {
+    let midx = vm
+        .find_method_by_sig(LEXER, "consumeKeyString", &[])
+        .ok()
+        .flatten()?;
+    vm.invoke_no_host(midx, args.to_vec(), crate::InvokeKind::Virtual)
+        .ok()
+        .flatten()
+}
+
 fn register_lexer(vm: &mut Vm) {
+    let _ = vm.register_host(
+        LEXER,
+        "consumeKeyString",
+        "()Ljava/lang/String;",
+        Rc::new(RefCell::new(|vm: &mut Vm, a: &[V]| {
+            Ok(Some(consume_key_string_fast(vm, a)))
+        })) as crate::HostCall,
+    );
     let _ = vm.register_host(
         LEXER,
         "indexOf",
