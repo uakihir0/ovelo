@@ -914,7 +914,8 @@ fn fdroid_coil_fetch(vm: &mut Vm, a: &[V]) -> Result<Option<V>> {
             }
         }
     }
-    if bases.is_empty() {
+    let using_fallback_mirror = bases.is_empty();
+    if using_fallback_mirror {
         bases.push("https://f-droid.org/repo".into());
     }
     bases.sort_by_key(|b| !b.starts_with("https://"));
@@ -923,12 +924,14 @@ fn fdroid_coil_fetch(vm: &mut Vm, a: &[V]) -> Result<Option<V>> {
     let username = member_str(vm, req, "getUsername");
     let password = member_str(vm, req, "getPassword").unwrap_or_default();
     let mut headers = vec![("User-Agent".into(), "F-Droid/2.0".into())];
-    if let Some(username) = username.filter(|u| !u.is_empty()) {
-        let raw = format!("{username}:{password}");
-        headers.push((
-            "Authorization".into(),
-            format!("Basic {}", b64(raw.as_bytes(), false, true)),
-        ));
+    if !using_fallback_mirror {
+        if let Some(username) = username.filter(|u| !u.is_empty()) {
+            let raw = format!("{username}:{password}");
+            headers.push((
+                "Authorization".into(),
+                format!("Basic {}", b64(raw.as_bytes(), false, true)),
+            ));
+        }
     }
 
     let mut resp = None;
