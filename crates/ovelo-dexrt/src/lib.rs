@@ -431,6 +431,11 @@ pub struct Vm {
     /// deadlocks on self-rescheduling executors). Drained at the
     /// outermost `call_virtual` boundary.
     pub pending_runnables: std::collections::VecDeque<(u32, bool)>,
+    /// Views whose attach state changed while guest composition/layout
+    /// work was active. `onAttachedToWindow` is delivered on a later
+    /// drain boundary so nested Compose content cannot compose inside
+    /// the composition that materialized its view.
+    pub(crate) pending_attach_callbacks: std::collections::VecDeque<u32>,
     /// `Choreographer.postFrameCallback*` — `(callback handle, due_ms)`.
     /// Drained once per `drain_runnables` pass (= once per frame tick)
     /// as `doFrame(J)V`; the Compose Recomposer's frame clock and
@@ -825,6 +830,7 @@ impl Vm {
             total_steps: 0,
             pending_activity: None,
             pending_runnables: std::collections::VecDeque::new(),
+            pending_attach_callbacks: std::collections::VecDeque::new(),
             frame_callbacks: Vec::new(),
             sched_prefer_worker: false,
             choreographer_h: 0,
@@ -2212,6 +2218,7 @@ impl Vm {
             }));
         }
         roots.extend(self.pending_runnables.iter().map(|(h, _)| *h));
+        roots.extend(self.pending_attach_callbacks.iter().copied());
         roots.extend(self.delayed_runnables.iter().map(|(h, _, _)| *h));
         // Callback registries are the only owners of their objects —
         // ReportFragment's ALC, Choreographer frame callbacks and the
@@ -2395,6 +2402,7 @@ impl Vm {
         for h in std::mem::take(&mut self.pending_destroy) {
             let _ = self.call_virtual(h, "onDestroy", &[]);
         }
+        jdk::view::deliver_attach_callbacks(self);
         // Choreographer frame callbacks — `drain_runnables` runs once
         // per frame tick, so a due callback fires on the next pass; one
         // that reposts itself lands in `frame_callbacks` again (the

@@ -30,6 +30,7 @@ const P_INVALID_SEQ: u32 = u32::MAX - 49;
 /// (AbstractComposeView defers `ensureCompositionCreated` until it
 /// does; a hardcoded true composes a parentless view).
 pub(crate) const P_ATTACHED: u32 = u32::MAX - 48;
+const P_ATTACH_QUEUED: u32 = u32::MAX - 70;
 /// Live `setText`/`setHint` argument — read by `dex_view` before the
 /// inflated `android:text` attribute. `pub`: the guest bridge's setter
 /// overrides write it for dex-inflated (non-GuestView) receivers.
@@ -5270,7 +5271,11 @@ fn el_id(vm: &Vm, el: &Element) -> Option<i32> {
 // tree storage
 
 fn tag_key(id: i32) -> u64 {
-    (u32::MAX as u64 - 20) - (id as u64 & 0xffff)
+    // Keyed tags share the pseudo-field map with host bookkeeping.
+    // Keep them in a separate u64 namespace: view pseudo keys live in
+    // the low u32 range, while Android tag ids are arbitrary signed
+    // 32-bit values whose low bits otherwise collide with those keys.
+    (1u64 << 32) | (id as u32 as u64)
 }
 
 fn children_arr(vm: &mut Vm, h: u32) -> Option<u32> {
@@ -6042,7 +6047,35 @@ fn mark_attached(vm: &mut Vm, h: u32, depth: u32) {
     if h == 0 || depth > 128 {
         return;
     }
-    if pint(vm, h, P_ATTACHED) != 1 {
+    if pint(vm, h, P_ATTACHED) != 1 && pint(vm, h, P_ATTACH_QUEUED) != 1 {
+        pseudo_set(vm, h, P_ATTACH_QUEUED, V::I32(1));
+        vm.pending_attach_callbacks.push_back(h);
+    }
+    for c in children(vm, h) {
+        if let V::Ref(ch) = c {
+            mark_attached(vm, ch, depth + 1);
+        }
+    }
+}
+
+/// Deliver queued window attachment at a drain boundary. The attach
+/// flag becomes visible only here: Compose views created while a parent
+/// composition is active must still read `isAttachedToWindow=false`,
+/// defer their composition creation, and start it after that outer
+/// composition has finished.
+pub(crate) fn deliver_attach_callbacks(vm: &mut Vm) {
+    for h in std::mem::take(&mut vm.pending_attach_callbacks) {
+        // The batch is detached from the queue before delivery starts:
+        // a parent callback can remove a later child, which clears the
+        // child's queued marker but cannot remove it from this local
+        // batch. Honor that cleared marker before attaching it.
+        if pint(vm, h, P_ATTACH_QUEUED) != 1 {
+            continue;
+        }
+        pseudo_set(vm, h, P_ATTACH_QUEUED, V::I32(0));
+        if pint(vm, h, P_ATTACHED) == 1 {
+            continue;
+        }
         pseudo_set(vm, h, P_ATTACHED, V::I32(1));
         let r = vm.call_virtual(h, "onAttachedToWindow", &[]);
         if crate::dbg_flag("OVELO_VIEWDBG") {
@@ -6051,10 +6084,18 @@ fn mark_attached(vm: &mut Vm, h: u32, depth: u32) {
                 Err(e) => eprintln!("[viewdbg] onAttachedToWindow h{h} err {e}"),
             }
         }
-    }
-    for c in children(vm, h) {
-        if let V::Ref(ch) = c {
-            mark_attached(vm, ch, depth + 1);
+        // ViewGroup.dispatchAttachedToWindow reaches the children
+        // present when dispatch runs. A child added while an earlier
+        // parent callback was executing therefore joins attachment even
+        // though its container was still only attach-queued at addView
+        // time. Already-queued or already-attached children are ignored
+        // by mark_attached, so this preserves the original order.
+        if pint(vm, h, P_ATTACHED) == 1 {
+            for c in children(vm, h) {
+                if let V::Ref(ch) = c {
+                    mark_attached(vm, ch, 0);
+                }
+            }
         }
     }
 }
@@ -6083,6 +6124,8 @@ fn clear_attached(vm: &mut Vm, h: u32, depth: u32) {
         return;
     }
     pseudo_set(vm, h, P_ATTACHED, V::I32(0));
+    pseudo_set(vm, h, P_ATTACH_QUEUED, V::I32(0));
+    vm.pending_attach_callbacks.retain(|v| *v != h);
     for c in children(vm, h) {
         if let V::Ref(ch) = c {
             clear_attached(vm, ch, depth + 1);
