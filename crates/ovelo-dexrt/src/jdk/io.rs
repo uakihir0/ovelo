@@ -3838,9 +3838,22 @@ fn digest_call(vm: &mut Vm, name: &str, args: &[V]) -> Option<Option<V>> {
             Some(Some(V::I32((a == b) as i32)))
         }
         "update" => {
+            let mut buffer_pos = None;
             let bytes = match args.len() {
                 2 => match args.get(1).copied().unwrap_or(V::I32(0)) {
-                    v @ V::Ref(_) => array_bytes(vm, v, 0, None),
+                    v @ V::Ref(h) => match vm.heap.get(h) {
+                        Some(Obj::Host {
+                            state: HostState::Slot(V::Ref(_)),
+                            ..
+                        }) => {
+                            let (bytes, _pos) = bb_bytes(vm, h);
+                            if let Some(lim) = pseudo_get(vm, h, P_BBUF_LIM) {
+                                buffer_pos = Some((h, i32v(lim)));
+                            }
+                            bytes
+                        }
+                        _ => array_bytes(vm, v, 0, None),
+                    },
                     v => vec![i32v(v) as u8],
                 },
                 4 => array_bytes(
@@ -3860,10 +3873,13 @@ fn digest_call(vm: &mut Vm, name: &str, args: &[V]) -> Option<Option<V>> {
                     digest_update(state, &bytes);
                 }
             }
+            if let Some((h, pos)) = buffer_pos {
+                pseudo_set(vm, h, P_BBUF_POS, V::I32(pos));
+            }
             Some(None)
         }
         "digest" => {
-            if args.len() > 1 {
+            if args.len() == 2 {
                 let bytes = array_bytes(vm, args[1], 0, None);
                 if let Some(V::Ref(h)) = args.first() {
                     if let Some(Obj::Host {
@@ -3885,6 +3901,22 @@ fn digest_call(vm: &mut Vm, name: &str, args: &[V]) -> Option<Option<V>> {
                 },
                 _ => Vec::new(),
             };
+            if args.len() == 4 {
+                let offset = i32v(args[2]).max(0) as usize;
+                let len = i32v(args[3]).max(0) as usize;
+                let mut written = 0usize;
+                if let V::Ref(array_h) = args[1] {
+                    if let Some(Obj::Array { data, .. }) = vm.heap.get_mut(array_h) {
+                        for (i, byte) in out.iter().take(len).enumerate() {
+                            if let Some(slot) = data.get_mut(offset + i) {
+                                *slot = V::I32(*byte as i8 as i32);
+                                written += 1;
+                            }
+                        }
+                    }
+                }
+                return Some(Some(V::I32(written as i32)));
+            }
             Some(Some(byte_arr(vm, &out)))
         }
         "reset" => {
@@ -3943,7 +3975,11 @@ fn digest_call(vm: &mut Vm, name: &str, args: &[V]) -> Option<Option<V>> {
 }
 
 fn byte_arr(vm: &mut Vm, bytes: &[u8]) -> V {
-    arr(vm, "B", bytes.iter().map(|b| V::I32(*b as i32)).collect())
+    arr(
+        vm,
+        "B",
+        bytes.iter().map(|b| V::I32(*b as i8 as i32)).collect(),
+    )
 }
 
 fn zip_file_call(vm: &mut Vm, class: &str, name: &str, args: &[V]) -> Option<Option<V>> {
