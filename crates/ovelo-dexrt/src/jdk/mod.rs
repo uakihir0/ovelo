@@ -1540,7 +1540,7 @@ fn universal(vm: &mut Vm, class: &str, name: &str, sig: &str, args: &[V]) -> Rt<
                 None
             } else {
                 let t = v_to_s(vm, args[0]);
-                Some(Some(jstr(vm, &t)))
+                Some(Some(jdynstr(vm, &t)))
             }
         }
         "hashCode" => Some(Some(lang::hashcode(vm, args))),
