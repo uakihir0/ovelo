@@ -1888,7 +1888,15 @@ fn class_call(vm: &mut Vm, name: &str, _sig: &str, args: &[V]) -> Rt<Option<Opti
             }
             // Missing method → NoSuchMethodException: reflective
             // serializer lookup branches on the throw.
-            if !mname.is_empty()
+            // savedstate-compose 1.3 reflectively probes the pre-1.7
+            // Compose UI owner API. R8/inlined newer Compose UI only
+            // exposes the fields now, but the compatibility probe is
+            // still answerable with a distinct composition-local key.
+            let compat_savedstate_owner = owner
+                == "Landroidx/compose/ui/platform/AndroidCompositionLocals_androidKt;"
+                && mname == "getLocalSavedStateRegistryOwner";
+            if !compat_savedstate_owner
+                && !mname.is_empty()
                 && !mname.starts_with('<')
                 && vm.is_dex_class(&owner)
                 && !vm.has_method_named(&owner, &mname)
@@ -3098,6 +3106,29 @@ fn reflect_call(
             Some(Some(jstr(vm, &format!("{}.{}", dotted(&owner), member))))
         }
         "invoke" if class.contains("Method") => {
+            // savedstate-compose's compatibility probe targets a getter
+            // that newer Compose UI optimized away. Answer it with a
+            // shallow copy of another static composition local: identity
+            // is the key, while its default supplier is never consulted
+            // when LocalOwnersProvider supplies the owner explicitly.
+            if owner == "Landroidx/compose/ui/platform/AndroidCompositionLocals_androidKt;"
+                && member == "getLocalSavedStateRegistryOwner"
+            {
+                if let Some(V::Ref(base)) = vm.get_static_named(&owner, "LocalView") {
+                    let copy = match vm.heap.get(base) {
+                        Some(Obj::Instance { class_idx, fields }) => Some(Obj::Instance {
+                            class_idx: *class_idx,
+                            fields: fields.clone(),
+                        }),
+                        _ => None,
+                    };
+                    if let Some(obj) = copy {
+                        let nh = vm.heap.alloc(obj);
+                        return Ok(Some(Some(V::Ref(nh))));
+                    }
+                }
+                return Ok(Some(Some(V::Ref(0))));
+            }
             // args: [method_mirror, obj, args_array]
             let target = match args.get(1) {
                 Some(V::Ref(t)) => *t,
