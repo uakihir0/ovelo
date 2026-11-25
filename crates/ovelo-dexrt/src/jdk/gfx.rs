@@ -729,16 +729,18 @@ fn canvas_call(vm: &mut Vm, name: &str, sig: &str, args: &[V]) -> Rt<Option<Opti
             // int pair on bounded overloads.
             let bounded = sig.contains("IIFF") || is_char_arr;
             let (xi, yi) = if bounded { (4, 5) } else { (2, 3) };
-            let full = sv(vm, text_arg).unwrap_or_else(|| match text_arg {
-                V::Ref(h) => match vm.heap.get(h) {
-                    Some(Obj::Array { data, .. }) => data
-                        .iter()
-                        .filter_map(|v| char::from_u32(i32v(*v) as u32))
-                        .collect(),
-                    _ => String::new(),
-                },
-                _ => String::new(),
-            });
+            let full = match text_arg {
+                V::Ref(h) if matches!(vm.heap.get(h), Some(Obj::Array { .. })) => {
+                    match vm.heap.get(h) {
+                        Some(Obj::Array { data, .. }) => data
+                            .iter()
+                            .filter_map(|v| char::from_u32(i32v(*v) as u32))
+                            .collect(),
+                        _ => String::new(),
+                    }
+                }
+                _ => super::text::cs_arg(vm, text_arg),
+            };
             let text = if bounded && !is_char_arr {
                 let st = i32v(arg(args, 2)).max(0) as usize;
                 let en = i32v(arg(args, 3)).max(0) as usize;
