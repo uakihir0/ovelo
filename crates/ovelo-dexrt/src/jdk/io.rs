@@ -16,7 +16,7 @@ pub(crate) fn call(
         if desc_is_a(class, "Ljava/io/PrintStream;") || desc_is_a(class, "Ljava/io/PrintWriter;") {
             print_call(vm, name, sig, args)
         } else if class == "Ljava/security/MessageDigest;" {
-            digest_call(vm, name, args)
+            digest_call(vm, name, args)?
         } else if class == "Ljava/util/jar/JarFile;" || class == "Ljava/util/zip/ZipFile;" {
             zip_file_call(vm, class, name, args)
         } else if class == "Ljava/util/jar/JarEntry;" || class == "Ljava/util/zip/ZipEntry;" {
@@ -3821,7 +3821,29 @@ fn array_bytes(vm: &Vm, array: V, offset: usize, len: Option<usize>) -> Vec<u8> 
     data[start..end].iter().map(|v| i32v(*v) as u8).collect()
 }
 
-fn digest_call(vm: &mut Vm, name: &str, args: &[V]) -> Option<Option<V>> {
+fn digest_call(vm: &mut Vm, name: &str, args: &[V]) -> Rt<Option<Option<V>>> {
+    if name == "digest" && args.len() == 4 {
+        let needed = match args.first() {
+            Some(V::Ref(h)) => match vm.heap.get(*h) {
+                Some(Obj::Host {
+                    state: HostState::Digest(state),
+                    ..
+                }) => digest_algorithm(state).1,
+                _ => 0,
+            },
+            _ => 0,
+        };
+        if i32v(args[3]) < needed {
+            return Err(vm.throw_builtin(
+                "Ljava/security/DigestException;",
+                "insufficient space in digest output buffer",
+            ));
+        }
+    }
+    Ok(digest_call_impl(vm, name, args))
+}
+
+fn digest_call_impl(vm: &mut Vm, name: &str, args: &[V]) -> Option<Option<V>> {
     match name {
         "getInstance" => {
             let algorithm = args.first().and_then(|v| sv(vm, *v)).unwrap_or_default();
