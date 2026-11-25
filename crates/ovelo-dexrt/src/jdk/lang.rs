@@ -399,7 +399,13 @@ fn string_call(vm: &mut Vm, name: &str, sig: &str, args: &[V]) -> Option<Option<
                 .collect();
             Some(arr(vm, STRING, parts))
         }
-        "intern" => Some(jstr(vm, &t)),
+        "intern" => {
+            let h = match args[0] {
+                V::Ref(h) if h != 0 => vm.heap.intern_handle(&t, h),
+                _ => vm.heap.intern_str(&t),
+            };
+            Some(V::Ref(h))
+        }
         "toString" => Some(args[0]),
         "valueOf" => {
             // static: valueOf(x) → string of arg. `valueOf(char)` must

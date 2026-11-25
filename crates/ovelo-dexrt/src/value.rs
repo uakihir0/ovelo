@@ -589,6 +589,18 @@ impl Heap {
         self.alloc(Obj::Str(s.to_string()))
     }
 
+    /// Intern an existing string object, returning the pooled handle.
+    /// Unlike `intern_str`, first-time interning keeps the receiver as
+    /// the canonical object, preserving Java's `s.intern() == s` for a
+    /// newly pooled runtime string.
+    pub fn intern_handle(&mut self, s: &str, h: u32) -> u32 {
+        if let Some(&existing) = self.interned.get(s) {
+            return existing;
+        }
+        self.interned.insert(s.to_string(), h);
+        h
+    }
+
     /// Intern a string value; the same `V::Ref` comes back for equal text.
     pub fn intern_str(&mut self, s: &str) -> u32 {
         if let Some(&h) = self.interned.get(s) {
