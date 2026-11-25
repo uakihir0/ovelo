@@ -446,6 +446,21 @@ impl ApkResources {
         None
     }
 
+    /// res_id → its integer value, chasing `TYPE_REFERENCE` aliases.
+    /// Android integer resources use TYPE_INT_DEC/TYPE_INT_HEX payloads.
+    pub fn integer_of(&self, res_id: u32) -> Option<i64> {
+        let mut cur = res_id;
+        for _ in 0..8 {
+            let v = self.entry_value(cur)?;
+            match v.data_type {
+                0x01 => cur = v.data,
+                0x10 | 0x11 => return Some((v.data as i32) as i64),
+                _ => return None,
+            }
+        }
+        None
+    }
+
     /// `attr_id` inside `style_id` or any style in its parent chain —
     /// the theme-resolution walk `obtainStyledAttributes` performs.
     /// A style whose parent isn't a complex entry stops the walk rather

@@ -1597,36 +1597,54 @@ fn run_app(store: &InstallStore, package: &str) -> Result<(), OveloError> {
                                 state: ovelo_dexrt::HostState::Empty,
                             })
                         });
-                    // Prefer the real ContentProvider path: run the
-                    // manifest's androidx.startup InitializationProvider
-                    // onCreate so `discoverAndInitialize` populates
-                    // AppInitializer's own discovered/initialized sets —
-                    // lazy `initializeComponent` callers (e.g.
-                    // ProcessLifecycleInitializer) depend on them, and
-                    // the fields are R8-obfuscated so host writes can't
-                    // reach them. Fall back to driving the initializers
-                    // directly when the provider path fails.
-                    if info
+                    // Android installs enabled main-process
+                    // ContentProviders before Application.onCreate,
+                    // ordered by android:initOrder (higher first). This
+                    // includes androidx.startup's InitializationProvider
+                    // and library utility providers such as Compose
+                    // Multiplatform's AndroidContextProvider.
+                    let mut providers: Vec<_> = info
                         .manifest
-                        .providers
+                        .provider_details
                         .iter()
-                        .any(|p| p.ends_with("InitializationProvider"))
-                    {
-                        match v.instantiate("Landroidx/startup/InitializationProvider;") {
+                        .filter(|p| {
+                            p.enabled
+                                && p.process
+                                    .as_deref()
+                                    .is_none_or(|proc| proc == info.manifest.package)
+                        })
+                        .map(|p| {
+                            let order = p
+                                .init_order_ref
+                                .and_then(|id| v.apk_res.as_ref().and_then(|r| r.integer_of(id)))
+                                .unwrap_or(p.init_order);
+                            (p, order)
+                        })
+                        .collect();
+                    providers.sort_by_key(|(_, order)| -*order);
+                    for (entry, _) in providers {
+                        let provider = entry.name.as_str();
+                        let startup = provider == "androidx.startup.InitializationProvider";
+                        let desc = format!("L{};", provider.replace('.', "/"));
+                        match v.instantiate(&desc) {
                             Ok(ph) => {
-                                let _ = v.call_virtual(
-                                    ph,
-                                    "attachInfo",
-                                    &[ovelo_dexrt::V::Ref(app_h), ovelo_dexrt::V::Ref(0)],
-                                );
+                                v.set_provider_context(ph, ovelo_dexrt::V::Ref(app_h));
                                 match v.call_virtual(ph, "onCreate", &[]) {
-                                    Ok(_) => provider_ran.set(true),
-                                    Err(e) => {
+                                    Ok(_) => {
+                                        if startup {
+                                            provider_ran.set(true);
+                                        }
+                                    }
+                                    Err(e) if startup => {
                                         println!("startup provider onCreate failed: {e}")
                                     }
+                                    _ => {}
                                 }
                             }
-                            Err(e) => println!("startup provider not instantiated: {e}"),
+                            Err(e) if startup => {
+                                println!("startup provider not instantiated: {e}")
+                            }
+                            _ => {}
                         }
                     }
                     if !provider_ran.get() {
