@@ -1344,6 +1344,14 @@ fn file_call(vm: &mut Vm, name: &str, args: &[V]) -> Option<Option<V>> {
             };
             Some(jstr(vm, &p))
         }
+        "getAbsoluteFile" | "getCanonicalFile" => {
+            let p = if path.starts_with('/') {
+                path.clone()
+            } else {
+                format!("/data/local/ovelo/{path}")
+            };
+            Some(host(vm, "Ljava/io/File;", HostState::Path(p)))
+        }
         "getName" => {
             let n = std::path::Path::new(&path)
                 .file_name()
