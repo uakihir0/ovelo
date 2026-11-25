@@ -1751,7 +1751,7 @@ pub(crate) fn guest_draw_ops(vm: &mut Vm, view: u32, w: i32, h: i32) -> Vec<Canv
         Some(Obj::Host {
             state: HostState::CanvasOps(ops),
             ..
-        }) => expand_nested(vm, &ops.clone(), 0),
+        }) => expand_nested(vm, &ops.clone(), &mut Vec::new()),
         _ => Vec::new(),
     }
 }
@@ -1760,15 +1760,17 @@ pub(crate) fn guest_draw_ops(vm: &mut Vm, view: u32, w: i32, h: i32) -> Vec<Canv
 /// referenced node's *current* recording is spliced in at its
 /// `setPosition` origin, so re-recording a child layer shows through
 /// without the parent re-recording (AOSP display-list semantics).
-/// Depth-capped — a recursive layer cycle would never terminate.
-fn expand_nested(vm: &Vm, ops: &[CanvasOp], depth: usize) -> Vec<CanvasOp> {
+/// `path` carries the expansion chain — a node already on it means a
+/// recording cycle, whose recursion is cut; legitimate deep nesting
+/// expands fully.
+fn expand_nested(vm: &Vm, ops: &[CanvasOp], path: &mut Vec<u32>) -> Vec<CanvasOp> {
     let mut out = Vec::with_capacity(ops.len());
     for op in ops {
         let CanvasOp::Nested { node } = op else {
             out.push(op.clone());
             continue;
         };
-        if depth >= 8 {
+        if path.contains(node) {
             continue;
         }
         let inner = match pseudo_get(vm, *node, PK_RECCANVAS) {
@@ -1790,7 +1792,9 @@ fn expand_nested(vm: &Vm, ops: &[CanvasOp], depth: usize) -> Vec<CanvasOp> {
         if dx != 0.0 || dy != 0.0 {
             out.push(CanvasOp::Translate { dx, dy });
         }
-        out.extend(expand_nested(vm, &inner, depth + 1));
+        path.push(*node);
+        out.extend(expand_nested(vm, &inner, path));
+        path.pop();
         out.push(CanvasOp::Restore);
     }
     out
