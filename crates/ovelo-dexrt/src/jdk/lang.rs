@@ -803,6 +803,20 @@ fn boxed_call(
     args: &[V],
 ) -> Rt<Option<Option<V>>> {
     Ok(match name {
+        "getLong" => {
+            // System-property backed box factory. ovelo does not expose
+            // host system properties to guests, so the two-arg overload
+            // deterministically returns its default; the one-arg overload
+            // is null when absent. kotlinx's DefaultExecutor reads its
+            // keep-alive this way — a stub object here makes it zero and
+            // the event-loop thread restart-spins.
+            if args.len() < 2 {
+                Some(Some(V::Ref(0)))
+            } else {
+                let v = V::I64(i64v(args[1]));
+                Some(Some(host(vm, class, HostState::Slot(v))))
+            }
+        }
         "<init>" => {
             // `new Integer(1)` allocates a dex `Obj::Instance` — without
             // this the boxed value never lands and intValue() reads 0.

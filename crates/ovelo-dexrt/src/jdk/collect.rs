@@ -385,11 +385,20 @@ pub(crate) fn call(
                 // worker, ~60s keep-alive) sleeps in `delayed_runnables`
                 // instead of busy-cycling the drain; `due=now` requeues
                 // were the tasks.org 100%-CPU spin. parkNanos(0)/park
-                // keep the inline drain: queued work may complete the
-                // wait, and past the nesting cap it unwinds+requeues.
+                // keep the inline drain; positive sub-millisecond waits
+                // round up so event loops cannot busy-spin below the VM's
+                // millisecond clock resolution.
                 let due_ms = match name {
                     "parkNanos" => match args.last().copied() {
-                        Some(v) => now_ms().saturating_add(i64v(v).max(0) / 1_000_000),
+                        Some(v) => {
+                            let nanos = i64v(v).max(0);
+                            let millis = if nanos == 0 {
+                                0
+                            } else {
+                                nanos / 1_000_000 + i64::from(nanos % 1_000_000 != 0)
+                            };
+                            now_ms().saturating_add(millis)
+                        }
                         None => now_ms(),
                     },
                     "parkUntil" => args.last().copied().map(i64v).unwrap_or_default(),
