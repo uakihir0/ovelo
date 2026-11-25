@@ -995,10 +995,14 @@ pub(crate) fn call(
         "getInstance" if class == CHOR => Some(Some(choreographer(vm))),
         "postFrameCallback" | "postFrameCallbackDelayed" | "postVsyncCallback" if class == CHOR => {
             // (FrameCallback [, long delayMillis])
+            // Choreographer callbacks wait for a vsync; they are not
+            // immediate main-queue posts. Without a minimum frame
+            // interval a re-posting Compose animation executes back-to-
+            // back on this cooperative VM and starves background work.
             let delay = if name == "postFrameCallback" {
-                0
+                16
             } else {
-                args.get(2).map(|v| i64v(*v)).unwrap_or(0)
+                args.get(2).map(|v| i64v(*v)).unwrap_or(0).max(16)
             };
             if let Some(V::Ref(cb)) = args.get(1).copied() {
                 if cb != 0 {

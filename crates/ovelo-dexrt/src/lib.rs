@@ -364,6 +364,10 @@ pub struct Vm {
     /// `midx` → decoded instruction table — `exec_frame` re-decoded
     /// every instruction of a method on every call into it.
     insn_cache: std::cell::RefCell<HashMap<GIdx, std::rc::Rc<Vec<Insn>>>>,
+    /// `midx` → dense code-unit offset → instruction-index map. A
+    /// binary search per executed opcode is the interpreter's hottest
+    /// fixed cost in large parser methods.
+    pcmap_cache: std::cell::RefCell<HashMap<GIdx, std::rc::Rc<Vec<u32>>>>,
     /// `midx` → display name `Lcls;.name(sig)ret` — `last_call` was
     /// formatting one per invoke.
     method_desc_cache: std::cell::RefCell<HashMap<GIdx, std::rc::Rc<str>>>,
@@ -839,6 +843,7 @@ impl Vm {
             method_sig_cache: std::cell::RefCell::new(HashMap::new()),
             code_cache: std::cell::RefCell::new(HashMap::new()),
             insn_cache: std::cell::RefCell::new(HashMap::new()),
+            pcmap_cache: std::cell::RefCell::new(HashMap::new()),
             method_desc_cache: std::cell::RefCell::new(HashMap::new()),
             resolve_cache: std::cell::RefCell::new(HashMap::new()),
             canon_field_cache: std::cell::RefCell::new(HashMap::new()),
@@ -880,6 +885,7 @@ impl Vm {
         self.method_sig_cache.borrow_mut().clear();
         self.code_cache.borrow_mut().clear();
         self.insn_cache.borrow_mut().clear();
+        self.pcmap_cache.borrow_mut().clear();
         self.method_desc_cache.borrow_mut().clear();
         self.resolve_cache.borrow_mut().clear();
         self.canon_field_cache.borrow_mut().clear();
@@ -2305,10 +2311,14 @@ impl Vm {
             );
         }
         for (cb, _) in due_cbs {
-            match self.call_virtual(cb, "doFrame", &[frame_nanos]) {
-                Err(e) if dbg => eprintln!("[drain] doFrame h{cb} err={e:?}"),
-                Ok(v) if dbg => eprintln!("[drain] doFrame h{cb} ok={v:?}"),
-                _ => {}
+            let before_steps = self.total_steps;
+            let out = self.call_virtual(cb, "doFrame", &[frame_nanos]);
+            if dbg {
+                eprintln!(
+                    "[drain] doFrame h{cb} steps={} out={:?}",
+                    self.total_steps - before_steps,
+                    out
+                );
             }
         }
         let mut ran = 0usize;
@@ -5769,6 +5779,20 @@ impl Vm {
             self.insn_cache.borrow_mut().insert(loc.midx, t.clone());
             t
         };
+        let pcmap_hit = self.pcmap_cache.borrow().get(&loc.midx).cloned();
+        let pcmap = if let Some(m) = pcmap_hit {
+            m
+        } else {
+            let mut m = vec![0u32; code.insns.len().saturating_add(1)];
+            for (pos, insn) in table.iter().enumerate() {
+                if let Some(slot) = m.get_mut(insn.offset as usize) {
+                    *slot = pos as u32 + 1;
+                }
+            }
+            let m = std::rc::Rc::new(m);
+            self.pcmap_cache.borrow_mut().insert(loc.midx, m.clone());
+            m
+        };
         let nregs = code.registers_size as usize;
         let mut fr = Frame {
             regs: vec![V::I32(0); nregs],
@@ -5776,6 +5800,7 @@ impl Vm {
             last_call: "".into(),
             exc: None,
             table,
+            pcmap,
             loc,
             code,
         };
@@ -5945,6 +5970,8 @@ struct Frame {
     code: std::rc::Rc<ovelo_dex::CodeItem>,
     /// Decoded instructions (payloads included), in offset order.
     table: std::rc::Rc<Vec<Insn>>,
+    /// Dense code-unit offset → table position + 1 (0 = invalid).
+    pcmap: std::rc::Rc<Vec<u32>>,
 }
 
 #[derive(Clone, Copy)]
@@ -6029,9 +6056,12 @@ impl Vm {
         // scan here multiplies every executed instruction by the host
         // method's length; hot parser loops sit in large methods.
         let pos = fr
-            .table
-            .binary_search_by_key(&(pc as u32), |i| i.offset)
-            .map_err(|_| E::Vm(err("dexrt.pc.bounds")))?;
+            .pcmap
+            .get(pc)
+            .copied()
+            .filter(|p| *p != 0)
+            .map(|p| p as usize - 1)
+            .ok_or_else(|| E::Vm(err("dexrt.pc.bounds")))?;
         let ins = &fr.table[pos];
         let next = fr
             .table
