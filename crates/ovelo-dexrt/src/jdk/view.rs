@@ -5710,6 +5710,9 @@ pub(crate) fn dispatch_key(
 
     let mut ime_view = 0;
     for root in vm.view_roots.clone().iter().rev() {
+        if matches!(pseudo_get(vm, *root, P_PARENT), Some(V::Ref(p)) if p != 0) {
+            continue;
+        }
         if let Some(v) = input_view(vm, *root, 0) {
             ime_view = v;
             break;
@@ -5739,6 +5742,9 @@ pub(crate) fn dispatch_key(
     }
 
     for root in vm.view_roots.clone().iter().rev() {
+        if matches!(pseudo_get(vm, *root, P_PARENT), Some(V::Ref(p)) if p != 0) {
+            continue;
+        }
         if crate::dbg_flag("OVELO_KEYDBG") {
             eprintln!(
                 "[keydbg] root h{root} {} a{action} code{keycode} u{unicode}",
@@ -6180,6 +6186,9 @@ pub(crate) fn decor_of(vm: &mut Vm, window: u32) -> Option<u32> {
     frame_set(vm, cf, 0, 0, ww, wh);
     vm.content_frames.insert(owner, cf);
     pseudo_set(vm, window, P_DECOR, V::Ref(d));
+    if !vm.view_roots.contains(&d) {
+        vm.view_roots.push(d);
+    }
     if crate::dbg_flag("OVELO_VIEWDBG") {
         eprintln!("[viewdbg] decor_of window=h{window} owner=h{owner} -> d=h{d} cf=h{cf}");
     }
