@@ -386,11 +386,12 @@ fn call_int(vm: &mut Vm, h: u32, name: &str, args: &[V]) -> Option<i32> {
     }
 }
 
-fn invoke_lexer_exact(vm: &mut Vm, name: &str, params: &[&str], args: Vec<V>) -> Option<V> {
-    let midx = vm.find_method_by_sig(LEXER, name, params).ok().flatten()?;
+fn invoke_lexer_exact(vm: &mut Vm, name: &str, params: &[&str], args: Vec<V>) -> bool {
+    let Some(midx) = vm.find_method_by_sig(LEXER, name, params).ok().flatten() else {
+        return false;
+    };
     vm.invoke_no_host(midx, args, crate::InvokeKind::Virtual)
-        .ok()
-        .flatten()
+        .is_ok()
 }
 
 /// Full consumeKeyString state machine, with the character scanning loop
@@ -400,7 +401,7 @@ fn invoke_lexer_exact(vm: &mut Vm, name: &str, params: &[&str], args: Vec<V>) ->
 /// whole string one interpreted character at a time.
 fn consume_key_string_fast(vm: &mut Vm, args: &[V]) -> V {
     let h = this(args);
-    if invoke_lexer_exact(vm, "consumeNextToken", &["C"], vec![V::Ref(h), V::I32(34)]).is_none() {
+    if !invoke_lexer_exact(vm, "consumeNextToken", &["C"], vec![V::Ref(h), V::I32(34)]) {
         return consume_key_string_dex(vm, args).unwrap_or(V::Ref(0));
     }
     let start = lexer_pos(vm, h);
