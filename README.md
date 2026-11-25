@@ -60,7 +60,11 @@ games — cannot run yet; see [docs/compat.md](docs/compat.md).
 | `ovelo-host` | macOS host: windowing, Metal presentation, input/IME translation, `.app` launchers | 02, 08 |
 | `ovelo-cli` | `inspect` / `install` / `run` / `diagnose` CLI and compatibility ledger | 12, 14 |
 
-## Build
+## Install / build
+
+Tagged `v*` releases publish an ad-hoc-signed `Ovelo.app.zip` asset
+through GitHub Releases. Because it is not notarized yet, the CLI build
+below is currently the most reliable way to run development builds.
 
 ```sh
 cargo build --workspace
