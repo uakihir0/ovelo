@@ -328,22 +328,30 @@ fn string_call(vm: &mut Vm, name: &str, sig: &str, args: &[V]) -> Option<Option<
             } else {
                 t.chars().count()
             };
-            let sub: String = t.chars().skip(b).take(e.saturating_sub(b)).collect();
-            Some(jstr(vm, &sub))
+            if b == 0 && e == t.chars().count() {
+                Some(args[0])
+            } else {
+                let sub: String = t.chars().skip(b).take(e.saturating_sub(b)).collect();
+                Some(jdynstr(vm, &sub))
+            }
         }
         "concat" => {
             let n = sv(vm, args[1]).unwrap_or_default();
-            Some(jstr(vm, &format!("{t}{n}")))
+            if n.is_empty() {
+                Some(args[0])
+            } else {
+                Some(jdynstr(vm, &format!("{t}{n}")))
+            }
         }
         "replace" => {
             if p.first() == Some(&"Ljava/lang/CharSequence;") {
                 let a = sv(vm, args[1]).unwrap_or_default();
                 let b = sv(vm, args[2]).unwrap_or_default();
-                Some(jstr(vm, &t.replace(&a, &b)))
+                Some(jdynstr(vm, &t.replace(&a, &b)))
             } else {
                 let a = char::from_u32(i32v(args[1]) as u32).unwrap_or('\0');
                 let b = char::from_u32(i32v(args[2]) as u32).unwrap_or('\0');
-                Some(jstr(vm, &t.replace(a, &b.to_string())))
+                Some(jdynstr(vm, &t.replace(a, &b.to_string())))
             }
         }
         "replaceAll" | "replaceFirst" => {
@@ -360,7 +368,7 @@ fn string_call(vm: &mut Vm, name: &str, sig: &str, args: &[V]) -> Option<Option<
             } else {
                 t.replace(&pat, &rep)
             };
-            Some(jstr(vm, &out))
+            Some(jdynstr(vm, &out))
         }
         "toUpperCase" | "toLowerCase" => {
             let out = if name == "toUpperCase" {
@@ -368,11 +376,22 @@ fn string_call(vm: &mut Vm, name: &str, sig: &str, args: &[V]) -> Option<Option<
             } else {
                 t.to_lowercase()
             };
-            Some(jstr(vm, &out))
+            if out == t {
+                Some(args[0])
+            } else {
+                Some(jdynstr(vm, &out))
+            }
         }
-        "trim" | "strip" => Some(jstr(vm, t.trim())),
+        "trim" | "strip" => {
+            let out = t.trim();
+            if out == t {
+                Some(args[0])
+            } else {
+                Some(jdynstr(vm, out))
+            }
+        }
         "isBlank" => Some(V::I32(t.trim().is_empty() as i32)),
-        "repeat" => Some(jstr(vm, &t.repeat(i32v(args[1]).max(0) as usize))),
+        "repeat" => Some(jdynstr(vm, &t.repeat(i32v(args[1]).max(0) as usize))),
         "getBytes" => {
             let bs: Vec<V> = t.bytes().map(|b| V::I32(b as i8 as i32)).collect();
             Some(arr(vm, "B", bs))
@@ -395,11 +414,17 @@ fn string_call(vm: &mut Vm, name: &str, sig: &str, args: &[V]) -> Option<Option<
             let lim = args.get(2).map(|v| i32v(*v)).unwrap_or(0);
             let parts: Vec<V> = super::rx::regex_split(&pat, &t, lim)
                 .into_iter()
-                .map(|x| jstr(vm, &x))
+                .map(|x| jdynstr(vm, &x))
                 .collect();
             Some(arr(vm, STRING, parts))
         }
-        "intern" => Some(args[0]),
+        "intern" => {
+            let h = match args[0] {
+                V::Ref(h) if h != 0 => vm.heap.intern_handle(&t, h),
+                _ => vm.heap.intern_str(&t),
+            };
+            Some(V::Ref(h))
+        }
         "toString" => Some(args[0]),
         "valueOf" => {
             // static: valueOf(x) → string of arg. `valueOf(char)` must
@@ -426,7 +451,7 @@ fn string_call(vm: &mut Vm, name: &str, sig: &str, args: &[V]) -> Option<Option<
                 },
                 _ => v_to_s(vm, args[0]),
             };
-            Some(jstr(vm, &s))
+            Some(jdynstr(vm, &s))
         }
         "format" => {
             // format(fmt, args...) or format(locale, fmt, args...)
@@ -444,7 +469,7 @@ fn string_call(vm: &mut Vm, name: &str, sig: &str, args: &[V]) -> Option<Option<
                 _ => rest.to_vec(),
             };
             let out = io::simple_format(vm, &fmt, &flat);
-            Some(jstr(vm, &out))
+            Some(jdynstr(vm, &out))
         }
         "join" => {
             let d = sv(vm, args[0]).unwrap_or_default();
@@ -465,11 +490,11 @@ fn string_call(vm: &mut Vm, name: &str, sig: &str, args: &[V]) -> Option<Option<
                 },
                 _ => vec![],
             };
-            Some(jstr(vm, &parts.join(&d)))
+            Some(jdynstr(vm, &parts.join(&d)))
         }
         "copyValueOf" | "valueOf0" => {
             let s = v_to_s(vm, args[0]);
-            Some(jstr(vm, &s))
+            Some(jdynstr(vm, &s))
         }
         "chars" | "codePoints" => {
             let cs: Vec<V> = t.chars().map(|c| V::I32(c as u32 as i32)).collect();
@@ -661,7 +686,7 @@ fn strbuf(vm: &mut Vm, name: &str, sig: &str, args: &[V]) -> Rt<Option<Option<V>
         }
         "toString" => {
             let t = s(vm, h).unwrap_or_default();
-            Some(Some(jstr(vm, &t)))
+            Some(Some(jdynstr(vm, &t)))
         }
         "length" => {
             let n = s(vm, h).map(|t| t.chars().count() as i32).unwrap_or(0);
@@ -691,7 +716,7 @@ fn strbuf(vm: &mut Vm, name: &str, sig: &str, args: &[V]) -> Rt<Option<Option<V>
                 t.chars().count()
             };
             let sub: String = t.chars().skip(b).take(e.saturating_sub(b)).collect();
-            Some(Some(jstr(vm, &sub)))
+            Some(Some(jdynstr(vm, &sub)))
         }
         "indexOf" | "lastIndexOf" => {
             let t = s(vm, h).unwrap_or_default();
@@ -1045,7 +1070,7 @@ fn boxed_call(
                 V::Ref(0) => "false".into(),
                 _ => fmt_v(v),
             };
-            Some(Some(jstr(vm, &t)))
+            Some(Some(jdynstr(vm, &t)))
         }
         "toString" => {
             // toString(int, radix)
@@ -2333,7 +2358,7 @@ fn package_call(vm: &mut Vm, name: &str, sig: &str, args: &[V]) -> Option<Option
                 },
             )
             .unwrap_or_default();
-            Some(Some(jstr(vm, &t)))
+            Some(Some(jdynstr(vm, &t)))
         }
         _ => Some(Some(stub_ret(vm, sig))),
     }

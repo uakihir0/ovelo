@@ -251,6 +251,12 @@ pub(crate) fn jstr(vm: &mut Vm, t: &str) -> V {
     V::Ref(vm.heap.intern_str(t))
 }
 
+/// Runtime-produced string result — unlike literals, these are not
+/// canonicalized or retained by the intern table.
+pub(crate) fn jdynstr(vm: &mut Vm, t: &str) -> V {
+    V::Ref(vm.heap.alloc_str(t))
+}
+
 pub(crate) fn arr(vm: &mut Vm, elem: &str, data: Vec<V>) -> V {
     V::Ref(vm.heap.alloc(Obj::Array {
         elem: elem.to_string(),
@@ -1523,7 +1529,7 @@ pub(crate) fn call(
 /// Methods that mean the same thing on every object.
 fn universal(vm: &mut Vm, class: &str, name: &str, sig: &str, args: &[V]) -> Rt<Option<Option<V>>> {
     Ok(match name {
-        "toString" if ret(sig) == STRING => {
+        "toString" if ret(sig) == STRING && class != STRING => {
             // JSON containers serialize through `json_dump_v`, not the
             // generic `[a, b]` list format — let io::call see them.
             let is_json = matches!(args[0], V::Ref(h) if matches!(
@@ -1534,7 +1540,7 @@ fn universal(vm: &mut Vm, class: &str, name: &str, sig: &str, args: &[V]) -> Rt<
                 None
             } else {
                 let t = v_to_s(vm, args[0]);
-                Some(Some(jstr(vm, &t)))
+                Some(Some(jdynstr(vm, &t)))
             }
         }
         "hashCode" => Some(Some(lang::hashcode(vm, args))),
