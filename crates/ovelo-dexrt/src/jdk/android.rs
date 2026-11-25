@@ -2107,10 +2107,23 @@ fn resolve_color_id(vm: &mut Vm, res_id: u32) -> u32 {
     data
 }
 
+fn active_network(vm: &mut Vm, connectivity: V) -> V {
+    let h = match connectivity {
+        V::Ref(h) => h,
+        _ => return host(vm, "Landroid/net/Network;", HostState::Empty),
+    };
+    if let Some(network @ V::Ref(_)) = pseudo_get(vm, h, P_DATA) {
+        return network;
+    }
+    let network = host(vm, "Landroid/net/Network;", HostState::Empty);
+    pseudo_set(vm, h, P_DATA, network);
+    network
+}
+
 fn network_call(vm: &mut Vm, class: &str, name: &str, args: &[V]) -> Option<Option<V>> {
     match (class, name) {
         ("Landroid/net/ConnectivityManager;", "getActiveNetwork") => {
-            Some(Some(host(vm, "Landroid/net/Network;", HostState::Empty)))
+            Some(Some(active_network(vm, args[0])))
         }
         ("Landroid/net/ConnectivityManager;", "getNetworkCapabilities") => match args.get(1) {
             Some(V::Ref(0)) => Some(Some(V::Ref(0))),
@@ -2127,7 +2140,7 @@ fn network_call(vm: &mut Vm, class: &str, name: &str, args: &[V]) -> Option<Opti
             HostState::Empty,
         ))),
         ("Landroid/net/ConnectivityManager;", "getAllNetworks") => {
-            let network = host(vm, "Landroid/net/Network;", HostState::Empty);
+            let network = active_network(vm, args[0]);
             Some(Some(arr(vm, "Landroid/net/Network;", vec![network])))
         }
         ("Landroid/net/ConnectivityManager;", "getAllNetworkInfo") => {
