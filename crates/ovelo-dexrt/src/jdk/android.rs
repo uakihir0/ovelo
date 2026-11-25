@@ -69,6 +69,15 @@ pub(crate) fn call(
             "isLowRamDevice" => Some(Some(V::I32(0))),
             _ => None,
         }
+    } else if class == "Landroid/os/UserManager;" {
+        match name {
+            // Ordinary interactive users are unlocked; WorkManager
+            // distinguishes direct-boot from normal startup with this.
+            "isUserUnlocked" => Some(Some(V::I32(1))),
+            "isSystemUser" | "isPrimaryUser" => Some(Some(V::I32(1))),
+            "isGuestUser" | "isRestrictedProfile" | "isUserAGoat" => Some(Some(V::I32(0))),
+            _ => None,
+        }
     } else if class == "Landroid/view/inputmethod/InputMethodManager;" {
         match name {
             "showSoftInput" => {
@@ -2765,6 +2774,7 @@ fn context_call(
         | "getDisplayId"
         | "isRestricted"
         | "getAttributionSource"
+        | "isDeviceProtectedStorage"
         | "createDeviceProtectedStorageContext"
         | "createPackageContext"
         | "createContextForSplit"
@@ -2794,6 +2804,7 @@ fn context_call(
             } else if matches!(
                 name,
                 "isRestricted"
+                    | "isDeviceProtectedStorage"
                     | "createDeviceProtectedStorageContext"
                     | "moveResources"
                     | "reloadResources"
