@@ -11,6 +11,7 @@ use std::rc::Rc;
 const SEQ: &str = "Lkotlinx/serialization/json/internal/ArrayAsSequence;";
 const WRITER: &str = "Lkotlinx/serialization/json/internal/JsonToStringWriter;";
 const LEXER: &str = "Lkotlinx/serialization/json/internal/ReaderJsonLexer;";
+const SLEXER: &str = "Lkotlinx/serialization/json/internal/StringJsonLexer;";
 const ALEXER: &str = "Lkotlinx/serialization/json/internal/AbstractJsonLexer;";
 
 fn this(args: &[V]) -> u32 {
@@ -558,8 +559,27 @@ fn register_lexer(vm: &mut Vm) {
     );
 }
 
+fn register_string_lexer(vm: &mut Vm) {
+    // StringJsonLexer.getSource is a one-field getter, but the dex body is
+    // invoked once for every scanned character in consumeKeyString. Keep the
+    // exact field semantics while avoiding two nested virtual invocations.
+    for sig in ["()Ljava/lang/String;", "()Ljava/lang/CharSequence;"] {
+        let _ = vm.register_host(
+            SLEXER,
+            "getSource",
+            sig,
+            Rc::new(RefCell::new(|vm: &mut Vm, a: &[V]| {
+                Ok(Some(
+                    field(vm, this(a), SLEXER, "source").unwrap_or(V::Ref(0)),
+                ))
+            })) as crate::HostCall,
+        );
+    }
+}
+
 pub(crate) fn register(vm: &mut Vm) {
     register_seq(vm);
     register_writer(vm);
     register_lexer(vm);
+    register_string_lexer(vm);
 }
