@@ -386,6 +386,13 @@ fn call_int(vm: &mut Vm, h: u32, name: &str, args: &[V]) -> Option<i32> {
     }
 }
 
+fn invoke_lexer_exact(vm: &mut Vm, name: &str, params: &[&str], args: Vec<V>) -> Option<V> {
+    let midx = vm.find_method_by_sig(LEXER, name, params).ok().flatten()?;
+    vm.invoke_no_host(midx, args, crate::InvokeKind::Virtual)
+        .ok()
+        .flatten()
+}
+
 /// Full consumeKeyString state machine, with the character scanning loop
 /// in Rust and escape/refill primitives delegated to the dex lexer. The
 /// dex fast path only scans one chunk; long localized descriptions in
@@ -393,10 +400,7 @@ fn call_int(vm: &mut Vm, h: u32, name: &str, args: &[V]) -> Option<i32> {
 /// whole string one interpreted character at a time.
 fn consume_key_string_fast(vm: &mut Vm, args: &[V]) -> V {
     let h = this(args);
-    if vm
-        .call_virtual(h, "consumeNextToken", &[V::I32(34)])
-        .is_err()
-    {
+    if invoke_lexer_exact(vm, "consumeNextToken", &["C"], vec![V::Ref(h), V::I32(34)]).is_none() {
         return consume_key_string_dex(vm, args).unwrap_or(V::Ref(0));
     }
     let start = lexer_pos(vm, h);
