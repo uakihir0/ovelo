@@ -2044,48 +2044,59 @@ fn json_dump_d(vm: &Vm, v: V, depth: u32) -> String {
     }
     match v {
         V::Ref(0) => "null".into(),
-        V::Ref(h) => match vm.heap.get(h) {
-            Some(Obj::Str(s)) => format!("\"{}\"", json_escape(s)),
-            Some(Obj::Host {
-                desc,
-                state: HostState::Slot(v),
-                ..
-            }) if desc == "Ljava/lang/Boolean;" => {
-                if matches!(v, V::I32(0)) {
-                    "false".into()
-                } else {
-                    "true".into()
-                }
+        V::Ref(h) => {
+            // Mirrored java.lang.String instances are not Obj::Str, but
+            // they are still JSON string values.
+            let as_string = match vm.heap.get(h) {
+                Some(Obj::Str(s)) => Some(s.clone()),
+                Some(Obj::Host { desc, .. }) if desc == "Ljava/lang/String;" => sv(vm, V::Ref(h)),
+                _ => None,
+            };
+            if let Some(text) = as_string {
+                return format!("\"{}\"", json_escape(&text));
             }
-            Some(Obj::Host {
-                state: HostState::Map(m),
-                ..
-            }) => format!(
-                "{{{}}}",
-                m.iter()
-                    .map(|(k, v)| {
-                        let ks = sv(vm, *k).unwrap_or_default();
-                        format!(
-                            "\"{}\":{}",
-                            json_escape(&ks),
-                            json_dump_d(vm, *v, depth + 1)
-                        )
-                    })
-                    .collect::<Vec<_>>()
-                    .join(",")
-            ),
-            Some(Obj::Host {
-                state: HostState::List(l),
-                ..
-            }) => format!(
-                "[{}]",
-                l.iter()
-                    .map(|v| json_dump_d(vm, *v, depth + 1))
-                    .collect::<Vec<_>>()
-                    .join(",")
-            ),
-            _ => "null".into(),
-        },
+            match vm.heap.get(h) {
+                Some(Obj::Host {
+                    desc,
+                    state: HostState::Slot(v),
+                    ..
+                }) if desc == "Ljava/lang/Boolean;" => {
+                    if matches!(v, V::I32(0)) {
+                        "false".into()
+                    } else {
+                        "true".into()
+                    }
+                }
+                Some(Obj::Host {
+                    state: HostState::Map(m),
+                    ..
+                }) => format!(
+                    "{{{}}}",
+                    m.iter()
+                        .map(|(k, v)| {
+                            let ks = sv(vm, *k).unwrap_or_default();
+                            format!(
+                                "\"{}\":{}",
+                                json_escape(&ks),
+                                json_dump_d(vm, *v, depth + 1)
+                            )
+                        })
+                        .collect::<Vec<_>>()
+                        .join(",")
+                ),
+                Some(Obj::Host {
+                    state: HostState::List(l),
+                    ..
+                }) => format!(
+                    "[{}]",
+                    l.iter()
+                        .map(|v| json_dump_d(vm, *v, depth + 1))
+                        .collect::<Vec<_>>()
+                        .join(",")
+                ),
+                _ => "null".into(),
+            }
+        }
         x => fmt_v(x),
     }
 }
