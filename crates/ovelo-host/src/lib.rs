@@ -31,7 +31,9 @@ mod window;
 pub use event_loop::{run, HostWindow};
 pub use frame::{ColorSpace, Frame, SurfaceRegistry};
 pub use ime::{map_winit as map_ime_event, ImeEvent, InputConnection};
-pub use input::{MotionAction, MotionEvent, PointerState, Translator};
+pub use input::{
+    android_keycode, map_key_input, KeyInput, MotionAction, MotionEvent, PointerState, Translator,
+};
 pub use launch::{bundle_layout, LaunchRecord};
 pub use present::{Layer, Presenter};
 pub use window::{map_host_key, HostApp, HostKey};

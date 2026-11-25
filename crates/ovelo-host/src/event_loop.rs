@@ -51,6 +51,7 @@ pub struct HostWindow {
     cursor: (f64, f64),
     /// Translated motion events waiting for the driver.
     input_q: VecDeque<MotionEvent>,
+    key_q: VecDeque<crate::KeyInput>,
     /// Whether the primary pointer is currently down.
     pointer_down: bool,
 }
@@ -68,6 +69,7 @@ impl HostWindow {
             vsync_hook: None,
             cursor: (0.0, 0.0),
             input_q: VecDeque::new(),
+            key_q: VecDeque::new(),
             pointer_down: false,
         }
     }
@@ -80,6 +82,11 @@ impl HostWindow {
     /// Drain queued motion events (surface px, top-left origin).
     pub fn take_input(&mut self) -> Vec<MotionEvent> {
         self.input_q.drain(..).collect()
+    }
+
+    /// Drain queued key events.
+    pub fn take_keys(&mut self) -> Vec<crate::KeyInput> {
+        self.key_q.drain(..).collect()
     }
 
     /// One-pointer motion event at `cursor`.
@@ -122,6 +129,9 @@ impl ApplicationHandler for HostWindow {
             }
             WindowEvent::CursorMoved { position, .. } => {
                 self.cursor = (position.x, position.y);
+            }
+            WindowEvent::KeyboardInput { event, .. } => {
+                self.key_q.push_back(crate::map_key_input(&event));
             }
             WindowEvent::MouseInput {
                 state: ElementState::Pressed,

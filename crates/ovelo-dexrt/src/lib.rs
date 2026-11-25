@@ -1866,6 +1866,17 @@ impl Vm {
         jdk::view::dispatch_touch(self, x, y, action)
     }
 
+    /// Dispatch a hardware-key event into the dex view hierarchy.
+    pub fn dispatch_key(
+        &mut self,
+        action: i32,
+        keycode: i32,
+        unicode: i32,
+        repeat: bool,
+    ) -> Result<bool> {
+        jdk::view::dispatch_key(self, action, keycode, unicode, repeat)
+    }
+
     /// Invoke `name` on the object at `this` — resolves the method on
     /// its class chain by name and arg count. `Ok(None)` when the
     /// object's class doesn't declare it — the platform base class

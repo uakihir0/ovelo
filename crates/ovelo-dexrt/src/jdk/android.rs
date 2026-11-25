@@ -69,6 +69,39 @@ pub(crate) fn call(
             "isLowRamDevice" => Some(Some(V::I32(0))),
             _ => None,
         }
+    } else if class == "Landroid/view/inputmethod/InputMethodManager;" {
+        match name {
+            "showSoftInput" => {
+                let view = match args.get(1) {
+                    Some(V::Ref(h)) => *h,
+                    _ => 0,
+                };
+                Some(Some(V::I32(
+                    view::offer_input_connection(vm, view).map_err(crate::E::Vm)? as i32,
+                )))
+            }
+            "restartInput" => {
+                let view = match args.get(1) {
+                    Some(V::Ref(h)) => *h,
+                    _ => 0,
+                };
+                let _ = view::offer_input_connection(vm, view).map_err(crate::E::Vm)?;
+                Some(None)
+            }
+            "isActive" => {
+                let active = match args.get(1) {
+                    Some(V::Ref(h)) => view::has_input_connection(vm, *h),
+                    _ => false,
+                };
+                Some(Some(V::I32(active as i32)))
+            }
+            "hideSoftInputFromWindow"
+            | "hideSoftInputFromInputMethod"
+            | "toggleSoftInput"
+            | "showInputMethodPicker"
+            | "showInputMethodPickerFromSystem" => Some(None),
+            _ => None,
+        }
     } else if class.starts_with("Landroid/app/job/") {
         job_call(vm, class, name, args)?
     } else if class == "Landroid/provider/DocumentsContract;" {

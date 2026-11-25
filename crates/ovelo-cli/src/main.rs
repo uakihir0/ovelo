@@ -1748,6 +1748,18 @@ fn run_app(store: &InstallStore, package: &str) -> Result<(), OveloError> {
     let mut dex_grab = false;
     ovelo_host::run(win, move |w| {
         let mut dead = false;
+        for key in w.take_keys() {
+            if let Some((vm, _)) = &mut guest {
+                let (action, keycode, unicode, repeat) =
+                    (key.action, key.keycode, key.unicode, key.repeat);
+                if std::env::var_os("OVELO_KEYDBG").is_some() {
+                    eprintln!("[keydbg] host a{action} code{keycode} u{unicode} repeat{repeat}");
+                }
+                let _ = sup.supervise("key", move || {
+                    vm.dispatch_key(action, keycode, unicode, repeat)
+                });
+            }
+        }
         for ev in w.take_input() {
             let Some(pt) = ev.pointers.get(ev.action_index) else {
                 continue;
