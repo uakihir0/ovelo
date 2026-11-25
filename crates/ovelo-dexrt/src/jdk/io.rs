@@ -12,334 +12,329 @@ pub(crate) fn call(
     sig: &str,
     args: &[V],
 ) -> Rt<Option<Option<V>>> {
-    Ok(
-        if desc_is_a(class, "Ljava/io/PrintStream;") || desc_is_a(class, "Ljava/io/PrintWriter;") {
-            print_call(vm, name, sig, args)
-        } else if class == "Ljava/security/MessageDigest;" {
-            digest_call(vm, name, args)?
-        } else if class == "Ljava/util/jar/JarFile;" || class == "Ljava/util/zip/ZipFile;" {
-            zip_file_call(vm, class, name, args)
-        } else if class == "Ljava/util/jar/JarEntry;" || class == "Ljava/util/zip/ZipEntry;" {
-            zip_entry_call(vm, name, args)
-        } else if class == "Ljava/security/CodeSigner;"
-            || class == "Ljava/security/cert/CertPath;"
-            || class == "Ljava/security/cert/Certificate;"
-            || class == "Ljava/security/cert/X509Certificate;"
-        {
-            cert_call(vm, class, name, args)
-        } else if class.ends_with("FileOutputStream;") && name == "<init>" {
-            let arg = args.get(1).copied().unwrap_or(V::Ref(0));
-            let append = args.get(2).is_some_and(|v| i32v(*v) != 0);
-            if let Some(path) = stream_arg_path(vm, arg) {
-                let path = fspath(vm, &path);
-                let file = std::fs::OpenOptions::new()
-                    .write(true)
-                    .create(true)
-                    .truncate(!append)
-                    .append(append)
-                    .open(path)
-                    .ok();
-                if let Some(file) = file {
-                    replace_host_state(vm, args[0], class, HostState::File(file));
-                }
+    Ok(if class.starts_with("Ljava/nio/file/") {
+        nio_file_call(vm, class, name, args)
+    } else if desc_is_a(class, "Ljava/io/PrintStream;") || desc_is_a(class, "Ljava/io/PrintWriter;")
+    {
+        print_call(vm, name, sig, args)
+    } else if class == "Ljava/security/MessageDigest;" {
+        digest_call(vm, name, args)?
+    } else if class == "Ljava/util/jar/JarFile;" || class == "Ljava/util/zip/ZipFile;" {
+        zip_file_call(vm, class, name, args)
+    } else if class == "Ljava/util/jar/JarEntry;" || class == "Ljava/util/zip/ZipEntry;" {
+        zip_entry_call(vm, name, args)
+    } else if class == "Ljava/security/CodeSigner;"
+        || class == "Ljava/security/cert/CertPath;"
+        || class == "Ljava/security/cert/Certificate;"
+        || class == "Ljava/security/cert/X509Certificate;"
+    {
+        cert_call(vm, class, name, args)
+    } else if class.ends_with("FileOutputStream;") && name == "<init>" {
+        let arg = args.get(1).copied().unwrap_or(V::Ref(0));
+        let append = args.get(2).is_some_and(|v| i32v(*v) != 0);
+        if let Some(path) = stream_arg_path(vm, arg) {
+            let path = fspath(vm, &path);
+            let file = std::fs::OpenOptions::new()
+                .write(true)
+                .create(true)
+                .truncate(!append)
+                .append(append)
+                .open(path)
+                .ok();
+            if let Some(file) = file {
+                replace_host_state(vm, args[0], class, HostState::File(file));
             }
-            Some(None)
-        } else if class.ends_with("FileInputStream;") && name == "<init>" {
-            // Open the real file: arg is a File (Path host), a String, or a
-            // FileDescriptor already carrying bytes (`getFD`/ParcelFileDescriptor).
-            let arg = args.get(1).copied().unwrap_or(V::Ref(0));
-            let fd_bytes = match arg {
-                V::Ref(h) => match vm.heap.get(h) {
-                    Some(Obj::Host {
-                        state: HostState::Bytes(b, p),
-                        ..
-                    }) => Some(b[*p..].to_vec()),
-                    _ => None,
-                },
+        }
+        Some(None)
+    } else if class.ends_with("FileInputStream;") && name == "<init>" {
+        // Open the real file: arg is a File (Path host), a String, or a
+        // FileDescriptor already carrying bytes (`getFD`/ParcelFileDescriptor).
+        let arg = args.get(1).copied().unwrap_or(V::Ref(0));
+        let fd_bytes = match arg {
+            V::Ref(h) => match vm.heap.get(h) {
+                Some(Obj::Host {
+                    state: HostState::Bytes(b, p),
+                    ..
+                }) => Some(b[*p..].to_vec()),
                 _ => None,
-            };
-            let bytes = fd_bytes.unwrap_or_else(|| {
-                stream_arg_path(vm, arg)
-                    .and_then(|p| std::fs::read(fspath(vm, &p)).ok())
-                    .unwrap_or_default()
-            });
-            if let Some(V::Ref(this)) = args.first() {
-                let (ci, d, fs) = match vm.heap.get(*this) {
-                    Some(Obj::Host {
-                        class_idx,
-                        desc,
-                        fields,
-                        ..
-                    }) => (*class_idx, desc.clone(), fields.clone()),
-                    Some(Obj::Instance { class_idx, fields }) => {
-                        (*class_idx, class.to_string(), fields.clone())
-                    }
-                    _ => (u64::MAX, class.to_string(), Default::default()),
-                };
-                if let Some(o) = vm.heap.get_mut(*this) {
-                    *o = Obj::Host {
-                        class_idx: ci,
-                        desc: d,
-                        fields: fs,
-                        state: HostState::Bytes(std::rc::Rc::new(bytes), 0),
-                    };
+            },
+            _ => None,
+        };
+        let bytes = fd_bytes.unwrap_or_else(|| {
+            stream_arg_path(vm, arg)
+                .and_then(|p| std::fs::read(fspath(vm, &p)).ok())
+                .unwrap_or_default()
+        });
+        if let Some(V::Ref(this)) = args.first() {
+            let (ci, d, fs) = match vm.heap.get(*this) {
+                Some(Obj::Host {
+                    class_idx,
+                    desc,
+                    fields,
+                    ..
+                }) => (*class_idx, desc.clone(), fields.clone()),
+                Some(Obj::Instance { class_idx, fields }) => {
+                    (*class_idx, class.to_string(), fields.clone())
                 }
+                _ => (u64::MAX, class.to_string(), Default::default()),
+            };
+            if let Some(o) = vm.heap.get_mut(*this) {
+                *o = Obj::Host {
+                    class_idx: ci,
+                    desc: d,
+                    fields: fs,
+                    state: HostState::Bytes(std::rc::Rc::new(bytes), 0),
+                };
             }
-            Some(None)
-        } else if class == "Ljava/io/ByteArrayInputStream;" && name == "<init>" {
-            // ByteArrayInputStream(byte[]) / (byte[], off, len): store the
-            // payload so reads serve the real bytes.
-            let arg = args.get(1).copied().unwrap_or(V::Ref(0));
-            let mut bytes: Vec<u8> = match arg {
-                V::Ref(h) => match vm.heap.get(h) {
-                    Some(Obj::Array { data, .. }) => data.iter().map(|v| i32v(*v) as u8).collect(),
-                    _ => Vec::new(),
-                },
+        }
+        Some(None)
+    } else if class == "Ljava/io/ByteArrayInputStream;" && name == "<init>" {
+        // ByteArrayInputStream(byte[]) / (byte[], off, len): store the
+        // payload so reads serve the real bytes.
+        let arg = args.get(1).copied().unwrap_or(V::Ref(0));
+        let mut bytes: Vec<u8> = match arg {
+            V::Ref(h) => match vm.heap.get(h) {
+                Some(Obj::Array { data, .. }) => data.iter().map(|v| i32v(*v) as u8).collect(),
                 _ => Vec::new(),
-            };
-            if args.len() > 3 {
-                let off = i64v(args[2]).max(0) as usize;
-                let len = i64v(args[3]).max(0) as usize;
-                bytes = bytes.into_iter().skip(off).take(len).collect();
+            },
+            _ => Vec::new(),
+        };
+        if args.len() > 3 {
+            let off = i64v(args[2]).max(0) as usize;
+            let len = i64v(args[3]).max(0) as usize;
+            bytes = bytes.into_iter().skip(off).take(len).collect();
+        }
+        if let Some(V::Ref(this)) = args.first() {
+            if let Some(Obj::Host { state, .. }) = vm.heap.get_mut(*this) {
+                *state = HostState::Bytes(std::rc::Rc::new(bytes), 0);
             }
-            if let Some(V::Ref(this)) = args.first() {
-                if let Some(Obj::Host { state, .. }) = vm.heap.get_mut(*this) {
-                    *state = HostState::Bytes(std::rc::Rc::new(bytes), 0);
+        }
+        Some(None)
+    } else if name == "<init>" && class.ends_with("Reader;") {
+        // Char-stream constructors: materialize the source into a
+        // `Chars` payload (StringReader/CharArrayReader), eagerly
+        // decode a byte-backed stream (InputStreamReader), or keep
+        // the wrapped reader in `in` for delegation (wrapper readers
+        // like BufferedReader/FilterReader).
+        if let Some(V::Ref(this)) = args.first() {
+            let this = *this;
+            let arg = args.get(1).copied().unwrap_or(V::Ref(0));
+            let chars: Option<Vec<u16>> = if class == "Ljava/io/StringReader;" {
+                let s = sv(vm, arg).unwrap_or_default();
+                if let Some(p) = std::env::var_os("OVELO_DUMP_READER") {
+                    use std::io::Write as _;
+                    let _ = std::fs::OpenOptions::new()
+                        .create(true)
+                        .append(true)
+                        .open(&p)
+                        .map(|mut f| {
+                            let _ = write!(
+                                f,
+                                "=== StringReader #{} len={} tail={:?}\n{}\n",
+                                this,
+                                s.chars().count(),
+                                s.chars().rev().take(80).collect::<String>(),
+                                s
+                            );
+                        });
                 }
-            }
-            Some(None)
-        } else if name == "<init>" && class.ends_with("Reader;") {
-            // Char-stream constructors: materialize the source into a
-            // `Chars` payload (StringReader/CharArrayReader), eagerly
-            // decode a byte-backed stream (InputStreamReader), or keep
-            // the wrapped reader in `in` for delegation (wrapper readers
-            // like BufferedReader/FilterReader).
-            if let Some(V::Ref(this)) = args.first() {
-                let this = *this;
-                let arg = args.get(1).copied().unwrap_or(V::Ref(0));
-                let chars: Option<Vec<u16>> = if class == "Ljava/io/StringReader;" {
-                    let s = sv(vm, arg).unwrap_or_default();
-                    if let Some(p) = std::env::var_os("OVELO_DUMP_READER") {
-                        use std::io::Write as _;
-                        let _ = std::fs::OpenOptions::new()
-                            .create(true)
-                            .append(true)
-                            .open(&p)
-                            .map(|mut f| {
-                                let _ = write!(
-                                    f,
-                                    "=== StringReader #{} len={} tail={:?}\n{}\n",
-                                    this,
-                                    s.chars().count(),
-                                    s.chars().rev().take(80).collect::<String>(),
-                                    s
-                                );
-                            });
-                    }
-                    Some(s.encode_utf16().collect())
-                } else if class == "Ljava/io/CharArrayReader;" {
-                    match arg {
-                        V::Ref(h) => match vm.heap.get(h) {
-                            Some(Obj::Array { data, .. }) => {
-                                Some(data.iter().map(|v| i32v(*v) as u16).collect())
-                            }
-                            _ => Some(Vec::new()),
-                        },
+                Some(s.encode_utf16().collect())
+            } else if class == "Ljava/io/CharArrayReader;" {
+                match arg {
+                    V::Ref(h) => match vm.heap.get(h) {
+                        Some(Obj::Array { data, .. }) => {
+                            Some(data.iter().map(|v| i32v(*v) as u16).collect())
+                        }
                         _ => Some(Vec::new()),
-                    }
-                } else if class == "Ljava/io/InputStreamReader;" {
-                    match arg {
-                        V::Ref(h) => match vm.heap.get(h) {
-                            Some(Obj::Host {
-                                state: HostState::Bytes(b, p),
-                                ..
-                            }) => {
-                                let s = String::from_utf8_lossy(&b[*p..]).into_owned();
-                                Some(s.encode_utf16().collect())
-                            }
-                            _ => None,
-                        },
+                    },
+                    _ => Some(Vec::new()),
+                }
+            } else if class == "Ljava/io/InputStreamReader;" {
+                match arg {
+                    V::Ref(h) => match vm.heap.get(h) {
+                        Some(Obj::Host {
+                            state: HostState::Bytes(b, p),
+                            ..
+                        }) => {
+                            let s = String::from_utf8_lossy(&b[*p..]).into_owned();
+                            Some(s.encode_utf16().collect())
+                        }
                         _ => None,
-                    }
-                } else {
-                    None
-                };
-                match chars {
-                    Some(c) => {
-                        if let Some(Obj::Host { state, .. }) = vm.heap.get_mut(this) {
-                            *state = HostState::Chars(std::rc::Rc::new(c), 0, 0);
-                        }
-                    }
-                    None => {
-                        // Wrapper reader: remember the delegate.
-                        for owner in ["Ljava/io/FilterReader;", "Ljava/io/Reader;"] {
-                            field_set(vm, this, owner, "in", arg);
-                        }
-                    }
+                    },
+                    _ => None,
                 }
-            }
-            Some(None)
-        } else if class == "Ljava/io/ByteArrayOutputStream;" && name == "<init>" {
-            // The output side of the Bytes payload: writes append.
-            if let Some(V::Ref(this)) = args.first() {
-                if let Some(Obj::Host { state, .. }) = vm.heap.get_mut(*this) {
-                    *state = HostState::Bytes(std::rc::Rc::new(Vec::new()), 0);
-                }
-            }
-            Some(None)
-        } else if desc_is_a(class, "Ljava/io/FilterInputStream;") && name == "<init>" {
-            // Guest subclasses read the wrapped stream straight out of the
-            // `in` field — the java ctor would have stored it.
-            if let Some(V::Ref(this)) = args.first() {
-                let wrapped = args.get(1).copied().unwrap_or(V::Ref(0));
-                field_set(vm, *this, "Ljava/io/FilterInputStream;", "in", wrapped);
-            }
-            Some(None)
-        } else if class.ends_with("FileInputStream;") && name == "getFD" {
-            // The descriptor keeps the byte payload so decodeFileDescriptor
-            // can read it without a second open.
-            let (bytes, pos) = match args.first() {
-                Some(V::Ref(h)) => match vm.heap.get(*h) {
-                    Some(Obj::Host {
-                        state: HostState::Bytes(b, p),
-                        ..
-                    }) => (b.clone(), *p),
-                    _ => (std::rc::Rc::new(vec![]), 0),
-                },
-                _ => (std::rc::Rc::new(vec![]), 0),
+            } else {
+                None
             };
-            Some(Some(host(
+            match chars {
+                Some(c) => {
+                    if let Some(Obj::Host { state, .. }) = vm.heap.get_mut(this) {
+                        *state = HostState::Chars(std::rc::Rc::new(c), 0, 0);
+                    }
+                }
+                None => {
+                    // Wrapper reader: remember the delegate.
+                    for owner in ["Ljava/io/FilterReader;", "Ljava/io/Reader;"] {
+                        field_set(vm, this, owner, "in", arg);
+                    }
+                }
+            }
+        }
+        Some(None)
+    } else if class == "Ljava/io/ByteArrayOutputStream;" && name == "<init>" {
+        // The output side of the Bytes payload: writes append.
+        if let Some(V::Ref(this)) = args.first() {
+            if let Some(Obj::Host { state, .. }) = vm.heap.get_mut(*this) {
+                *state = HostState::Bytes(std::rc::Rc::new(Vec::new()), 0);
+            }
+        }
+        Some(None)
+    } else if desc_is_a(class, "Ljava/io/FilterInputStream;") && name == "<init>" {
+        // Guest subclasses read the wrapped stream straight out of the
+        // `in` field — the java ctor would have stored it.
+        if let Some(V::Ref(this)) = args.first() {
+            let wrapped = args.get(1).copied().unwrap_or(V::Ref(0));
+            field_set(vm, *this, "Ljava/io/FilterInputStream;", "in", wrapped);
+        }
+        Some(None)
+    } else if class.ends_with("FileInputStream;") && name == "getFD" {
+        // The descriptor keeps the byte payload so decodeFileDescriptor
+        // can read it without a second open.
+        let (bytes, pos) = match args.first() {
+            Some(V::Ref(h)) => match vm.heap.get(*h) {
+                Some(Obj::Host {
+                    state: HostState::Bytes(b, p),
+                    ..
+                }) => (b.clone(), *p),
+                _ => (std::rc::Rc::new(vec![]), 0),
+            },
+            _ => (std::rc::Rc::new(vec![]), 0),
+        };
+        Some(Some(host(
+            vm,
+            "Ljava/io/FileDescriptor;",
+            HostState::Bytes(bytes, pos),
+        )))
+    } else if desc_is_a(class, "Ljava/io/InputStream;")
+        || class.ends_with("InputStream;")
+        || class.ends_with("Reader;")
+        || class.ends_with("OutputStream;")
+        || class.ends_with("Writer;")
+    {
+        stream_call(vm, name, args)?
+    } else if class == "Ljava/io/File;" {
+        file_call(vm, name, args)
+    } else if class == "Ljava/util/regex/Pattern;" {
+        pattern_call(vm, name, args)
+    } else if class == "Ljava/util/regex/Matcher;" {
+        matcher_call(vm, name, args)?
+    } else if desc_is_a(class, "Ljava/text/SimpleDateFormat;")
+        || desc_is_a(class, "Ljava/text/DateFormat;")
+        || class == "Ljava/text/NumberFormat;"
+        || class == "Ljava/text/DecimalFormat;"
+    {
+        format_call(vm, name, args)
+    } else if class == "Lorg/json/JSONObject;" {
+        json_obj(vm, name, args)
+    } else if class == "Lorg/json/JSONArray;" {
+        json_arr(vm, name, args)
+    } else if class == "Ljavax/net/ssl/TrustManagerFactory;" {
+        match name {
+            // OkHttp's Platform requires exactly one default trust
+            // manager — answer a single X509TrustManager placeholder.
+            "getTrustManagers" => {
+                let tm = host(vm, "Ljavax/net/ssl/X509TrustManager;", HostState::Empty);
+                Some(Some(arr(vm, "Ljavax/net/ssl/TrustManager;", vec![tm])))
+            }
+            "getDefaultAlgorithm" => Some(Some(jstr(vm, "PKIX"))),
+            _ => Some(Some(stub_ret(vm, sig))),
+        }
+    } else if class == "Ljavax/net/ssl/X509TrustManager;"
+        || class == "Ljavax/net/ssl/TrustManager;"
+        || class == "Ljavax/net/ssl/SSLSocketFactory;"
+        || class == "Ljavax/net/ssl/SSLContext;"
+    {
+        match name {
+            "getAcceptedIssuers" => Some(Some(arr(
                 vm,
-                "Ljava/io/FileDescriptor;",
-                HostState::Bytes(bytes, pos),
-            )))
-        } else if desc_is_a(class, "Ljava/io/InputStream;")
-            || class.ends_with("InputStream;")
-            || class.ends_with("Reader;")
-            || class.ends_with("OutputStream;")
-            || class.ends_with("Writer;")
-        {
-            stream_call(vm, name, args)?
-        } else if class == "Ljava/io/File;" {
-            file_call(vm, name, args)
-        } else if class == "Ljava/util/regex/Pattern;" {
-            pattern_call(vm, name, args)
-        } else if class == "Ljava/util/regex/Matcher;" {
-            matcher_call(vm, name, args)?
-        } else if desc_is_a(class, "Ljava/text/SimpleDateFormat;")
-            || desc_is_a(class, "Ljava/text/DateFormat;")
-            || class == "Ljava/text/NumberFormat;"
-            || class == "Ljava/text/DecimalFormat;"
-        {
-            format_call(vm, name, args)
-        } else if class == "Lorg/json/JSONObject;" {
-            json_obj(vm, name, args)
-        } else if class == "Lorg/json/JSONArray;" {
-            json_arr(vm, name, args)
-        } else if class == "Ljavax/net/ssl/TrustManagerFactory;" {
-            match name {
-                // OkHttp's Platform requires exactly one default trust
-                // manager — answer a single X509TrustManager placeholder.
-                "getTrustManagers" => {
-                    let tm = host(vm, "Ljavax/net/ssl/X509TrustManager;", HostState::Empty);
-                    Some(Some(arr(vm, "Ljavax/net/ssl/TrustManager;", vec![tm])))
-                }
-                "getDefaultAlgorithm" => Some(Some(jstr(vm, "PKIX"))),
-                _ => Some(Some(stub_ret(vm, sig))),
-            }
-        } else if class == "Ljavax/net/ssl/X509TrustManager;"
-            || class == "Ljavax/net/ssl/TrustManager;"
-            || class == "Ljavax/net/ssl/SSLSocketFactory;"
-            || class == "Ljavax/net/ssl/SSLContext;"
-        {
-            match name {
-                "getAcceptedIssuers" => Some(Some(arr(
-                    vm,
-                    "Ljava/security/cert/X509Certificate;",
-                    vec![],
-                ))),
-                "init" | "checkClientTrusted" | "checkServerTrusted" => Some(None),
-                "getSocketFactory" | "getDefault" => Some(Some(host(
-                    vm,
-                    "Ljavax/net/ssl/SSLSocketFactory;",
-                    HostState::Empty,
-                ))),
-                "getInstance" => Some(Some(host(vm, class, HostState::Empty))),
-                _ => Some(Some(stub_ret(vm, sig))),
-            }
-        } else if class == "Ljava/net/URLEncoder;" || class == "Ljava/net/URLDecoder;" {
-            url_codec(vm, name, args)
-        } else if class == "Ljava/net/IDN;" {
-            match name {
-                // IDN.toASCII: ASCII input passes through unchanged; the
-                // punycode path only matters for non-ASCII domains.
-                "toASCII" | "toUnicode" => Some(args.first().copied().unwrap_or(V::Ref(0))),
-                _ => return Ok(None),
-            }
-            .map(Some)
-        } else if class == "Ljava/net/URL;" || class == "Ljava/net/URI;" {
-            url_call(vm, name, args)?
-        } else if class == "Ljava/net/URLConnection;"
-            || desc_is_a(class, "Ljava/net/URLConnection;")
-        {
-            match name {
-                "connect"
-                | "disconnect"
-                | "setRequestProperty"
-                | "setDoInput"
-                | "setDoOutput"
-                | "setConnectTimeout"
-                | "setReadTimeout"
-                | "setRequestMethod"
-                | "setChunkedStreamingMode"
-                | "setFixedLengthStreamingMode"
-                | "setInstanceFollowRedirects" => Some(None),
-                "getResponseCode" => Some(Some(V::I32(200))),
-                "getResponseMessage" | "getContentType" | "getContentEncoding"
-                | "getHeaderField" | "getRequestProperty" | "getURL" => Some(Some(V::Ref(0))),
-                "getContentLength"
-                | "getContentLengthLong"
-                | "getDate"
-                | "getExpiration"
-                | "getLastModified"
-                | "getHeaderFieldInt"
-                | "getHeaderFieldLong" => Some(Some(V::I64(0))),
-                "getInputStream" => Some(Some(host(vm, "Ljava/io/InputStream;", HostState::Empty))),
-                "getOutputStream" => {
-                    Some(Some(host(vm, "Ljava/io/OutputStream;", HostState::Empty)))
-                }
-                "getHeaderFields" => {
-                    Some(Some(host(vm, "Ljava/util/Map;", HostState::Map(vec![]))))
-                }
-                _ => None,
-            }
-        } else if desc_is_a(class, "Ljava/nio/charset/Charset;")
-            || class == "Ljava/nio/charset/StandardCharsets;"
-            || class == "Ljava/nio/charset/CharsetDecoder;"
-            || class == "Ljava/nio/charset/CharsetEncoder;"
-            || class == "Ljava/nio/charset/CoderResult;"
-            || class == "Ljava/nio/charset/CodingErrorAction;"
-        {
-            charset_call(vm, class, name, args)
-        } else if desc_is_a(class, "Ljava/nio/Buffer;") || class.starts_with("Ljava/nio/") {
-            nio_call(vm, class, name, args)
-        } else if class == "Ljava/util/Base64;"
-            || class == "Ljava/util/Base64$Encoder;"
-            || class == "Ljava/util/Base64$Decoder;"
-            || class == "Landroid/util/Base64;"
-        {
-            base64_call(vm, name, args)
-        } else if class == "Ljava/util/Formatter;"
-            || class == "Ljava/util/Scanner;"
-            || class == "Ljava/util/Locale;"
-            || class == "Ljava/text/MessageFormat;"
-            || class.starts_with("Ljava/text/")
-        {
-            misc_fmt(vm, class, name, args)
-        } else {
-            return Ok(None);
-        },
-    )
+                "Ljava/security/cert/X509Certificate;",
+                vec![],
+            ))),
+            "init" | "checkClientTrusted" | "checkServerTrusted" => Some(None),
+            "getSocketFactory" | "getDefault" => Some(Some(host(
+                vm,
+                "Ljavax/net/ssl/SSLSocketFactory;",
+                HostState::Empty,
+            ))),
+            "getInstance" => Some(Some(host(vm, class, HostState::Empty))),
+            _ => Some(Some(stub_ret(vm, sig))),
+        }
+    } else if class == "Ljava/net/URLEncoder;" || class == "Ljava/net/URLDecoder;" {
+        url_codec(vm, name, args)
+    } else if class == "Ljava/net/IDN;" {
+        match name {
+            // IDN.toASCII: ASCII input passes through unchanged; the
+            // punycode path only matters for non-ASCII domains.
+            "toASCII" | "toUnicode" => Some(args.first().copied().unwrap_or(V::Ref(0))),
+            _ => return Ok(None),
+        }
+        .map(Some)
+    } else if class == "Ljava/net/URL;" || class == "Ljava/net/URI;" {
+        url_call(vm, name, args)?
+    } else if class == "Ljava/net/URLConnection;" || desc_is_a(class, "Ljava/net/URLConnection;") {
+        match name {
+            "connect"
+            | "disconnect"
+            | "setRequestProperty"
+            | "setDoInput"
+            | "setDoOutput"
+            | "setConnectTimeout"
+            | "setReadTimeout"
+            | "setRequestMethod"
+            | "setChunkedStreamingMode"
+            | "setFixedLengthStreamingMode"
+            | "setInstanceFollowRedirects" => Some(None),
+            "getResponseCode" => Some(Some(V::I32(200))),
+            "getResponseMessage" | "getContentType" | "getContentEncoding" | "getHeaderField"
+            | "getRequestProperty" | "getURL" => Some(Some(V::Ref(0))),
+            "getContentLength"
+            | "getContentLengthLong"
+            | "getDate"
+            | "getExpiration"
+            | "getLastModified"
+            | "getHeaderFieldInt"
+            | "getHeaderFieldLong" => Some(Some(V::I64(0))),
+            "getInputStream" => Some(Some(host(vm, "Ljava/io/InputStream;", HostState::Empty))),
+            "getOutputStream" => Some(Some(host(vm, "Ljava/io/OutputStream;", HostState::Empty))),
+            "getHeaderFields" => Some(Some(host(vm, "Ljava/util/Map;", HostState::Map(vec![])))),
+            _ => None,
+        }
+    } else if desc_is_a(class, "Ljava/nio/charset/Charset;")
+        || class == "Ljava/nio/charset/StandardCharsets;"
+        || class == "Ljava/nio/charset/CharsetDecoder;"
+        || class == "Ljava/nio/charset/CharsetEncoder;"
+        || class == "Ljava/nio/charset/CoderResult;"
+        || class == "Ljava/nio/charset/CodingErrorAction;"
+    {
+        charset_call(vm, class, name, args)
+    } else if desc_is_a(class, "Ljava/nio/Buffer;") || class.starts_with("Ljava/nio/") {
+        nio_call(vm, class, name, args)
+    } else if class == "Ljava/util/Base64;"
+        || class == "Ljava/util/Base64$Encoder;"
+        || class == "Ljava/util/Base64$Decoder;"
+        || class == "Landroid/util/Base64;"
+    {
+        base64_call(vm, name, args)
+    } else if class == "Ljava/util/Formatter;"
+        || class == "Ljava/util/Scanner;"
+        || class == "Ljava/util/Locale;"
+        || class == "Ljava/text/MessageFormat;"
+        || class.starts_with("Ljava/text/")
+    {
+        misc_fmt(vm, class, name, args)
+    } else {
+        return Ok(None);
+    })
 }
 
 // ---------------------------------------------------------------------
@@ -992,6 +987,229 @@ fn stream_call(vm: &mut Vm, name: &str, args: &[V]) -> Rt<Option<Option<V>>> {
 }
 
 // ---------------------------------------------------------------------
+// java.nio.file paths used by Okio/DataStore atomic writes.
+
+fn path_text(vm: &Vm, v: V) -> Option<String> {
+    fn scan(vm: &Vm, v: V, depth: u8) -> Option<String> {
+        if depth > 4 {
+            return None;
+        }
+        if let Some(p) = stream_arg_path(vm, v) {
+            return Some(p);
+        }
+        let V::Ref(h) = v else { return None };
+        let fields = match vm.heap.get(h) {
+            Some(Obj::Instance { fields, .. }) | Some(Obj::Host { fields, .. }) => {
+                fields.values().copied().collect::<Vec<_>>()
+            }
+            _ => Vec::new(),
+        };
+        // Okio Path wrappers are dex objects around a java.nio.file.Path
+        // (or its string form). Prefer absolute-looking text, then any
+        // nested path value.
+        let mut relative = None;
+        for f in fields {
+            if let Some(p) = scan(vm, f, depth + 1) {
+                if p.starts_with('/') {
+                    return Some(p);
+                }
+                relative.get_or_insert(p);
+            }
+        }
+        relative
+    }
+    scan(vm, v, 0)
+}
+
+fn file_millis(path: &std::path::Path) -> i64 {
+    path.metadata()
+        .ok()
+        .and_then(|m| m.modified().ok())
+        .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+        .map(|d| d.as_millis() as i64)
+        .unwrap_or(0)
+}
+
+fn nio_file_call(vm: &mut Vm, class: &str, name: &str, args: &[V]) -> Option<Option<V>> {
+    if class == "Ljava/nio/file/Paths;" && name == "get" {
+        let mut out = sv(vm, args.first().copied().unwrap_or(V::Ref(0))).unwrap_or_default();
+        if let Some(V::Ref(more)) = args.get(1) {
+            if let Some(Obj::Array { data, .. }) = vm.heap.get(*more) {
+                for part in data {
+                    if let Some(p) = sv(vm, *part) {
+                        if !p.is_empty() {
+                            if !out.is_empty() && !out.ends_with('/') {
+                                out.push('/');
+                            }
+                            out.push_str(p.trim_start_matches('/'));
+                        }
+                    }
+                }
+            }
+        }
+        return Some(Some(host(vm, "Ljava/nio/file/Path;", HostState::Path(out))));
+    }
+    if class == "Ljava/nio/file/Path;" {
+        let this = args.first().copied().unwrap_or(V::Ref(0));
+        let path = path_text(vm, this).unwrap_or_default();
+        return Some(match name {
+            "resolve" => {
+                let other = args.get(1).copied().unwrap_or(V::Ref(0));
+                let tail = path_text(vm, other)
+                    .or_else(|| sv(vm, other))
+                    .unwrap_or_default();
+                let joined = if tail.starts_with('/') || path.is_empty() {
+                    tail
+                } else {
+                    format!("{}/{}", path.trim_end_matches('/'), tail)
+                };
+                Some(host(vm, class, HostState::Path(joined)))
+            }
+            "getParent" => {
+                let p = std::path::Path::new(&path)
+                    .parent()
+                    .map(|p| p.to_string_lossy().to_string());
+                Some(match p {
+                    Some(p) => host(vm, class, HostState::Path(p)),
+                    None => V::Ref(0),
+                })
+            }
+            "getFileName" => {
+                let n = std::path::Path::new(&path)
+                    .file_name()
+                    .map(|n| n.to_string_lossy().to_string())
+                    .unwrap_or_default();
+                Some(host(vm, class, HostState::Path(n)))
+            }
+            "toAbsolutePath" | "normalize" => Some(host(vm, class, HostState::Path(path))),
+            "toFile" => Some(host(vm, "Ljava/io/File;", HostState::Path(path))),
+            _ => return None,
+        });
+    }
+    if class == "Ljava/nio/file/Files;" {
+        let path_at = |idx: usize| args.get(idx).copied().and_then(|v| path_text(vm, v));
+        return Some(match name {
+            "move" | "copy" => {
+                let (Some(from), Some(to)) = (path_at(0), path_at(1)) else {
+                    return Some(Some(V::Ref(0)));
+                };
+                let (from_h, to_h) = (fspath(vm, &from), fspath(vm, &to));
+                if let Some(parent) = to_h.parent() {
+                    let _ = std::fs::create_dir_all(parent);
+                }
+                let ok = if name == "move" {
+                    std::fs::rename(&from_h, &to_h).is_ok()
+                        || (std::fs::copy(&from_h, &to_h).is_ok()
+                            && std::fs::remove_file(&from_h).is_ok())
+                } else {
+                    std::fs::copy(&from_h, &to_h).is_ok()
+                };
+                if !ok {
+                    return Some(Some(V::Ref(0)));
+                }
+                Some(args.get(1).copied().unwrap_or(V::Ref(0)))
+            }
+            "exists" | "notExists" | "isDirectory" | "isRegularFile" => {
+                let p = path_at(0).map(|p| fspath(vm, &p)).unwrap_or_default();
+                let yes = match name {
+                    "exists" => p.exists(),
+                    "notExists" => !p.exists(),
+                    "isDirectory" => p.is_dir(),
+                    _ => p.is_file(),
+                };
+                Some(V::I32(yes as i32))
+            }
+            "createDirectory" | "createDirectories" => {
+                let p = path_at(0).map(|p| fspath(vm, &p)).unwrap_or_default();
+                let _ = std::fs::create_dir_all(p);
+                Some(args.first().copied().unwrap_or(V::Ref(0)))
+            }
+            "delete" | "deleteIfExists" => {
+                let p = path_at(0).map(|p| fspath(vm, &p)).unwrap_or_default();
+                let ok = std::fs::remove_file(&p).is_ok() || std::fs::remove_dir_all(&p).is_ok();
+                Some(if name == "deleteIfExists" {
+                    V::I32(ok as i32)
+                } else {
+                    V::I32(0)
+                })
+            }
+            "newInputStream" => {
+                let bytes = path_at(0)
+                    .and_then(|p| std::fs::read(fspath(vm, &p)).ok())
+                    .unwrap_or_default();
+                Some(host(
+                    vm,
+                    "Ljava/io/FileInputStream;",
+                    HostState::Bytes(std::rc::Rc::new(bytes), 0),
+                ))
+            }
+            "newOutputStream" => {
+                let file = path_at(0).and_then(|p| {
+                    let p = fspath(vm, &p);
+                    if let Some(parent) = p.parent() {
+                        let _ = std::fs::create_dir_all(parent);
+                    }
+                    std::fs::OpenOptions::new()
+                        .write(true)
+                        .create(true)
+                        .truncate(true)
+                        .open(p)
+                        .ok()
+                });
+                Some(match file {
+                    Some(f) => host(vm, "Ljava/io/FileOutputStream;", HostState::File(f)),
+                    None => V::Ref(0),
+                })
+            }
+            "readAttributes" => {
+                let p = path_at(0).unwrap_or_default();
+                Some(host(
+                    vm,
+                    "Ljava/nio/file/attribute/BasicFileAttributes;",
+                    HostState::Path(p),
+                ))
+            }
+            _ => return None,
+        });
+    }
+    if class == "Ljava/nio/file/attribute/BasicFileAttributes;" {
+        let path = path_text(vm, args.first().copied().unwrap_or(V::Ref(0))).unwrap_or_default();
+        let p = fspath(vm, &path);
+        let ms = file_millis(&p);
+        return Some(Some(match name {
+            "size" => V::I64(p.metadata().map(|m| m.len() as i64).unwrap_or(0)),
+            "isDirectory" => V::I32(p.is_dir() as i32),
+            "isRegularFile" => V::I32(p.is_file() as i32),
+            "isSymbolicLink" => V::I32(
+                p.symlink_metadata()
+                    .map(|m| m.file_type().is_symlink())
+                    .unwrap_or(false) as i32,
+            ),
+            "lastModifiedTime" | "lastAccessTime" | "creationTime" => host(
+                vm,
+                "Ljava/nio/file/attribute/FileTime;",
+                HostState::Millis(ms),
+            ),
+            _ => return None,
+        }));
+    }
+    if class == "Ljava/nio/file/attribute/FileTime;" && name == "toMillis" {
+        let ms = match args.first() {
+            Some(V::Ref(h)) => match vm.heap.get(*h) {
+                Some(Obj::Host {
+                    state: HostState::Millis(ms),
+                    ..
+                }) => *ms,
+                _ => 0,
+            },
+            _ => 0,
+        };
+        return Some(Some(V::I64(ms)));
+    }
+    None
+}
+
+// ---------------------------------------------------------------------
 // File
 
 /// Guest-visible path -> host path under `vm.guest_root`. Absolute
@@ -1212,7 +1430,9 @@ fn file_call(vm: &mut Vm, name: &str, args: &[V]) -> Option<Option<V>> {
         | "deleteOnExit" | "toPath" | "toURI" | "toURL" | "listRoots" | "compareTo" => {
             if name == "listRoots" {
                 Some(host(vm, "Ljava/io/File;", HostState::Path("/".into())))
-            } else if matches!(name, "toPath" | "toURI" | "toURL") {
+            } else if name == "toPath" {
+                Some(host(vm, "Ljava/nio/file/Path;", HostState::Path(path)))
+            } else if matches!(name, "toURI" | "toURL") {
                 Some(V::Ref(0))
             } else if name == "compareTo" {
                 Some(V::I32(0))
