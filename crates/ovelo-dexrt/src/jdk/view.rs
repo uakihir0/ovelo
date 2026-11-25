@@ -6065,6 +6065,13 @@ fn mark_attached(vm: &mut Vm, h: u32, depth: u32) {
 /// composition has finished.
 pub(crate) fn deliver_attach_callbacks(vm: &mut Vm) {
     for h in std::mem::take(&mut vm.pending_attach_callbacks) {
+        // The batch is detached from the queue before delivery starts:
+        // a parent callback can remove a later child, which clears the
+        // child's queued marker but cannot remove it from this local
+        // batch. Honor that cleared marker before attaching it.
+        if pint(vm, h, P_ATTACH_QUEUED) != 1 {
+            continue;
+        }
         pseudo_set(vm, h, P_ATTACH_QUEUED, V::I32(0));
         if pint(vm, h, P_ATTACHED) == 1 {
             continue;
