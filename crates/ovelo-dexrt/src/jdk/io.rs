@@ -3666,26 +3666,110 @@ fn base64_call(vm: &mut Vm, name: &str, args: &[V]) -> Option<Option<V>> {
     }
 }
 
+const PK_LOCALE_TAG: u32 = 0xFFFD_FF80;
+
+pub(crate) fn locale_tag(vm: &Vm, h: u32) -> String {
+    if let Some(v) = pseudo_get(vm, h, PK_LOCALE_TAG) {
+        if let Some(t) = sv(vm, v) {
+            return t;
+        }
+    }
+    s(vm, h).unwrap_or_else(|| "en-US".into())
+}
+
+fn locale_piece(tag: &str, want_script: bool) -> String {
+    let parts: Vec<&str> = tag.split(['-', '_']).filter(|p| !p.is_empty()).collect();
+    if want_script {
+        return parts
+            .iter()
+            .skip(1)
+            .find(|p| p.len() == 4 && p.chars().all(|c| c.is_ascii_alphabetic()))
+            .map(|p| p.to_string())
+            .unwrap_or_default();
+    }
+    parts
+        .first()
+        .map(|p| p.to_ascii_lowercase())
+        .unwrap_or_default()
+}
+
+fn locale_construct(vm: &mut Vm, args: &[V]) -> Option<V> {
+    let V::Ref(h) = args.first().copied()? else {
+        return None;
+    };
+    let mut parts = Vec::new();
+    for v in &args[1..] {
+        if let Some(t) = sv(vm, *v) {
+            if !t.is_empty() {
+                parts.push(t);
+            }
+        }
+    }
+    let tag = if parts.is_empty() {
+        "en-US".into()
+    } else {
+        parts.join("-")
+    };
+    let tv = jstr(vm, &tag);
+    pseudo_set(vm, h, PK_LOCALE_TAG, tv);
+    None
+}
+
 fn misc_fmt(vm: &mut Vm, class: &str, name: &str, args: &[V]) -> Option<Option<V>> {
     if class == "Ljava/util/Locale;" {
         return match name {
-            "getDefault" | "getDefault0" | "forLanguageTag" | "ROOT" => Some(host(
+            "<init>" => return Some(locale_construct(vm, args)),
+            "getDefault" | "getDefault0" | "ROOT" => Some(host(
                 vm,
                 "Ljava/util/Locale;",
                 HostState::StrBuf("en-US".into()),
             )),
-            "getLanguage" => Some(jstr(vm, "en")),
-            "getCountry" | "getVariant" | "getScript" => Some(jstr(vm, "US")),
+            "forLanguageTag" => {
+                let tag = args
+                    .get(1)
+                    .and_then(|v| sv(vm, *v))
+                    .unwrap_or_else(|| "en-US".into());
+                let h = host(vm, "Ljava/util/Locale;", HostState::StrBuf(tag.clone()));
+                if let V::Ref(hh) = h {
+                    let tv = jstr(vm, &tag);
+                    pseudo_set(vm, hh, PK_LOCALE_TAG, tv);
+                }
+                Some(h)
+            }
+            "getLanguage" => {
+                let h = match args[0] {
+                    V::Ref(h) => h,
+                    _ => 0,
+                };
+                Some(jstr(vm, &locale_piece(&locale_tag(vm, h), false)))
+            }
+            "getScript" => {
+                let h = match args[0] {
+                    V::Ref(h) => h,
+                    _ => 0,
+                };
+                Some(jstr(vm, &locale_piece(&locale_tag(vm, h), true)))
+            }
+            "getCountry" | "getVariant" => {
+                let h = match args[0] {
+                    V::Ref(h) => h,
+                    _ => 0,
+                };
+                let tag = locale_tag(vm, h);
+                let part = tag
+                    .split(['-', '_'])
+                    .filter(|p| !p.is_empty())
+                    .nth(1)
+                    .unwrap_or("");
+                Some(jstr(vm, part))
+            }
             "toString" | "toLanguageTag" | "getDisplayName" | "getDisplayLanguage"
             | "getDisplayCountry" => {
-                let t = s(
-                    vm,
-                    match args[0] {
-                        V::Ref(h) => h,
-                        _ => 0,
-                    },
-                )
-                .unwrap_or_else(|| "en-US".into());
+                let h = match args[0] {
+                    V::Ref(h) => h,
+                    _ => 0,
+                };
+                let t = locale_tag(vm, h);
                 Some(jstr(vm, &t))
             }
             "getAvailableLocales" | "getISOCountries" | "getISOLanguages" => {

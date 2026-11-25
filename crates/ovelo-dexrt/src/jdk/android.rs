@@ -4349,6 +4349,23 @@ fn res_misc(vm: &mut Vm, class: &str, name: &str, args: &[V]) -> Rt<Option<Optio
                 Some(Some(host(vm, "Landroid/os/LocaleList;", HostState::Empty)))
             }
             "toString" | "toLanguageTags" => Some(Some(jstr(vm, "en-US"))),
+            "matchesLanguageAndScript" => {
+                let lang = |v: V| {
+                    let V::Ref(h) = v else {
+                        return String::new();
+                    };
+                    super::io::locale_tag(vm, h)
+                        .split(['-', '_'])
+                        .next()
+                        .unwrap_or("")
+                        .to_ascii_lowercase()
+                };
+                let a = args.get(1).copied().map(lang).unwrap_or_default();
+                let b = args.get(2).copied().map(lang).unwrap_or_default();
+                Some(Some(V::I32(
+                    (a.is_empty() || b.is_empty() || a == b) as i32,
+                )))
+            }
             _ => Some(None),
         },
         _ => None,
