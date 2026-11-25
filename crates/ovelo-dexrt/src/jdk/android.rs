@@ -2542,11 +2542,11 @@ fn context_call(
         "getDatabasePath" => {
             let name = sv(vm, args.get(1).copied().unwrap_or(V::Ref(0)))
                 .unwrap_or_else(|| "db".to_string());
-            Some(Some(host(
-                vm,
-                "Ljava/io/File;",
-                HostState::Path(format!("/data/local/ovelo/databases/{name}")),
-            )))
+            let logical = format!("/data/local/ovelo/databases/{name}");
+            if let Some(parent) = io::fspath(vm, &logical).parent() {
+                let _ = std::fs::create_dir_all(parent);
+            }
+            Some(Some(host(vm, "Ljava/io/File;", HostState::Path(logical))))
         }
         "getExternalFilesDir"
         | "getExternalCacheDir"
@@ -2558,11 +2558,9 @@ fn context_call(
             if name == "getExternalMediaDir" {
                 Some(Some(V::Ref(0)))
             } else {
-                Some(Some(host(
-                    vm,
-                    "Ljava/io/File;",
-                    HostState::Path(format!("/data/local/ovelo/{name}")),
-                )))
+                let logical = format!("/data/local/ovelo/{name}");
+                let _ = std::fs::create_dir_all(io::fspath(vm, &logical));
+                Some(Some(host(vm, "Ljava/io/File;", HostState::Path(logical))))
             }
         }
         "getExternalFilesDirs" | "getExternalCacheDirs" | "getExternalMediaDirs" | "getObbDirs" => {
