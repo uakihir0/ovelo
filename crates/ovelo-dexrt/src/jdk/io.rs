@@ -1111,11 +1111,11 @@ fn nio_file_call(vm: &mut Vm, class: &str, name: &str, args: &[V]) -> Rt<Option<
                     return Err(vm.throw_builtin("Ljava/io/IOException;", "missing path"));
                 };
                 let (from_h, to_h) = (fspath(vm, &from), fspath(vm, &to));
-                if !from_h.exists() {
+                if std::fs::symlink_metadata(&from_h).is_err() {
                     return Err(vm.throw_builtin("Ljava/nio/file/NoSuchFileException;", &from));
                 }
                 let replace = options_include(vm, args, 2, "REPLACE_EXISTING");
-                if to_h.exists() && !replace {
+                if std::fs::symlink_metadata(&to_h).is_ok() && !replace {
                     return Err(vm.throw_builtin("Ljava/nio/file/FileAlreadyExistsException;", &to));
                 }
                 if let Some(parent) = to_h.parent() {
@@ -1151,20 +1151,22 @@ fn nio_file_call(vm: &mut Vm, class: &str, name: &str, args: &[V]) -> Rt<Option<
             "delete" | "deleteIfExists" => {
                 let guest = path_at(0).unwrap_or_default();
                 let p = fspath(vm, &guest);
-                if !p.exists() {
+                let Ok(meta) = std::fs::symlink_metadata(&p) else {
                     if name == "deleteIfExists" {
                         return Ok(Some(Some(V::I32(0))));
                     }
                     return Err(vm.throw_builtin("Ljava/nio/file/NoSuchFileException;", &guest));
-                }
-                let nonempty_dir =
-                    p.is_dir() && std::fs::read_dir(&p).is_ok_and(|mut d| d.next().is_some());
+                };
+                let is_link = meta.file_type().is_symlink();
+                let nonempty_dir = !is_link
+                    && meta.is_dir()
+                    && std::fs::read_dir(&p).is_ok_and(|mut d| d.next().is_some());
                 if nonempty_dir {
                     return Err(
                         vm.throw_builtin("Ljava/nio/file/DirectoryNotEmptyException;", &guest)
                     );
                 }
-                let ok = if p.is_dir() {
+                let ok = if !is_link && meta.is_dir() {
                     std::fs::remove_dir(&p).is_ok()
                 } else {
                     std::fs::remove_file(&p).is_ok()
