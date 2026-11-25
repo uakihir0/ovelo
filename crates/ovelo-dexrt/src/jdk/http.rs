@@ -101,7 +101,15 @@ fn do_fetch(spec: HttpSpec) -> std::result::Result<HttpResp, String> {
             )
         })
         .collect();
-    let body = resp.body_mut().read_to_vec().map_err(|e| e.to_string())?;
+    // Apps routinely download multi-megabyte indexes and media. ureq's
+    // protective 10MiB default is far below Android's effective behavior,
+    // so keep a generous explicit cap instead.
+    let body = resp
+        .body_mut()
+        .with_config()
+        .limit(256 * 1024 * 1024)
+        .read_to_vec()
+        .map_err(|e| e.to_string())?;
     Ok(HttpResp {
         code,
         message,
