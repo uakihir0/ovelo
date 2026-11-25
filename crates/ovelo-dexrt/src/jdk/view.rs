@@ -169,6 +169,12 @@ const P_MEND: u32 = u32::MAX - 43;
 const P_TOUCH_L: u32 = u32::MAX - 44;
 /// MotionEvent pseudo fields (host-bridged pointer events).
 const P_ME_ACTION: u32 = u32::MAX - 45;
+const P_KE_ACTION: u32 = u32::MAX - 64;
+const P_KE_CODE: u32 = u32::MAX - 65;
+const P_KE_UNICODE: u32 = u32::MAX - 66;
+const P_KE_REPEAT: u32 = u32::MAX - 67;
+const P_INPUT_CONN: u32 = u32::MAX - 68;
+const P_FOCUSED: u32 = u32::MAX - 69;
 const P_ME_X: u32 = u32::MAX - 46;
 const P_ME_Y: u32 = u32::MAX - 47;
 const P_ME_DOWN_TIME: u32 = u32::MAX - 60;
@@ -831,6 +837,7 @@ pub(crate) fn is_viewish(vm: &Vm, class: &str, args: &[V]) -> bool {
             | "Landroidx/appcompat/view/menu/MenuItemImpl;"
             | "Landroid/view/ViewTreeObserver;"
             | "Landroid/view/MotionEvent;"
+            | "Landroid/view/KeyEvent;"
             | "Landroid/view/WindowManager;"
             | "Landroid/view/SurfaceHolder;"
             | "Landroid/view/WindowMetrics;"
@@ -877,7 +884,36 @@ pub(crate) fn call(
             Some(None)
         }
         // ---------- MotionEvent ----------
-        "<init>" if class == "Landroid/view/MotionEvent;" => Some(None),
+        "<init>" if class == "Landroid/view/MotionEvent;" || class == "Landroid/view/KeyEvent;" => {
+            Some(None)
+        }
+        // ---------- KeyEvent ----------
+        "getAction" if class == "Landroid/view/KeyEvent;" => {
+            Some(Some(V::I32(pint(vm, this, P_KE_ACTION))))
+        }
+        "getKeyCode" if class == "Landroid/view/KeyEvent;" => {
+            Some(Some(V::I32(pint(vm, this, P_KE_CODE))))
+        }
+        "getUnicodeChar" if class == "Landroid/view/KeyEvent;" => {
+            Some(Some(V::I32(pint(vm, this, P_KE_UNICODE))))
+        }
+        "getRepeatCount" if class == "Landroid/view/KeyEvent;" => {
+            Some(Some(V::I32(pint(vm, this, P_KE_REPEAT))))
+        }
+        "getDownTime" | "getEventTime" if class == "Landroid/view/KeyEvent;" => {
+            Some(Some(V::I64(now_ms())))
+        }
+        "getMetaState" | "getModifiers" | "getScanCode" | "getDeviceId"
+            if class == "Landroid/view/KeyEvent;" =>
+        {
+            Some(Some(V::I32(0)))
+        }
+        "isShiftPressed" | "isCtrlPressed" | "isAltPressed" | "isMetaPressed"
+            if class == "Landroid/view/KeyEvent;" =>
+        {
+            Some(Some(V::I32(0)))
+        }
+        "recycle" if class == "Landroid/view/KeyEvent;" => Some(None),
         "obtain" if class == "Landroid/view/MotionEvent;" => {
             let V::Ref(h) = host(vm, "Landroid/view/MotionEvent;", HostState::Empty) else {
                 return Ok(Some(Some(V::Ref(0))));
@@ -2021,11 +2057,20 @@ pub(crate) fn call(
         | "hasFocusable"
         | "isImportantForAccessibility" => Some(Some(V::I32(1))),
         "isAttachedToWindow" => Some(Some(V::I32(pint(vm, this, P_ATTACHED)))),
+        "isFocused" => Some(Some(V::I32(pint(vm, this, P_FOCUSED)))),
+        "hasFocus" => {
+            fn any_focused(vm: &Vm, h: u32, depth: usize) -> bool {
+                depth <= 32
+                    && (pint(vm, h, P_FOCUSED) != 0
+                        || children(vm, h).iter().any(|c| {
+                            matches!(c, V::Ref(ch) if *ch != 0 && any_focused(vm, *ch, depth + 1))
+                        }))
+            }
+            Some(Some(V::I32(any_focused(vm, this, 0) as i32)))
+        }
         "isSelected"
         | "isActivated"
         | "isPressed"
-        | "isFocused"
-        | "hasFocus"
         | "isDirty"
         | "isOpaque"
         | "isInEditMode"
@@ -2036,8 +2081,28 @@ pub(crate) fn call(
         // onLayoutChildren's anchor pass and immediately reads
         // getLayoutParams().mViewHolder on whatever comes back — a
         // fresh host View has neither and NPEs inside dex code.
-        "getFocusedChild" | "getFocus" | "findFocus" | "getFocused" | "getHoveredChild" => {
-            Some(Some(V::Ref(0)))
+        "getFocusedChild" | "getFocus" | "getFocused" | "getHoveredChild" => Some(Some(V::Ref(0))),
+        "findFocus" => {
+            fn find_focus(vm: &Vm, h: u32, depth: usize) -> u32 {
+                if depth > 32 {
+                    return 0;
+                }
+                if pint(vm, h, P_FOCUSED) != 0 {
+                    return h;
+                }
+                for c in children(vm, h) {
+                    if let V::Ref(ch) = c {
+                        if ch != 0 {
+                            let f = find_focus(vm, ch, depth + 1);
+                            if f != 0 {
+                                return f;
+                            }
+                        }
+                    }
+                }
+                0
+            }
+            Some(Some(V::Ref(find_focus(vm, this, 0))))
         }
         "getResources" => Some(Some(host(
             vm,
@@ -2260,6 +2325,26 @@ pub(crate) fn call(
         "getTop" => Some(Some(V::I32(pint(vm, this, P_TOP)))),
         "getRight" => Some(Some(V::I32(pint(vm, this, P_RIGHT)))),
         "getBottom" => Some(Some(V::I32(pint(vm, this, P_BOTTOM)))),
+        "setLeft" => {
+            pseudo_set(vm, this, P_LEFT, V::I32(vint(args.get(1))));
+            pseudo_set(vm, this, P_LAYOUT_DONE, V::I32(1));
+            Some(None)
+        }
+        "setTop" => {
+            pseudo_set(vm, this, P_TOP, V::I32(vint(args.get(1))));
+            pseudo_set(vm, this, P_LAYOUT_DONE, V::I32(1));
+            Some(None)
+        }
+        "setRight" => {
+            pseudo_set(vm, this, P_RIGHT, V::I32(vint(args.get(1))));
+            pseudo_set(vm, this, P_LAYOUT_DONE, V::I32(1));
+            Some(None)
+        }
+        "setBottom" => {
+            pseudo_set(vm, this, P_BOTTOM, V::I32(vint(args.get(1))));
+            pseudo_set(vm, this, P_LAYOUT_DONE, V::I32(1));
+            Some(None)
+        }
         "getX" => Some(Some(V::F32(pint(vm, this, P_LEFT) as f32))),
         "getY" => Some(Some(V::F32(pint(vm, this, P_TOP) as f32))),
         "getWidth" => Some(Some(V::I32(
@@ -2362,9 +2447,16 @@ pub(crate) fn call(
             pseudo_set(vm, this, P_BGRES, args.get(1).cloned().unwrap_or(V::I32(0)));
             Some(None)
         }
-        "requestFocus"
-        | "clearFocus"
-        | "setAlpha"
+        "requestFocus" => {
+            clear_window_focus(vm);
+            pseudo_set(vm, this, P_FOCUSED, V::I32(1));
+            Some(Some(V::I32(1)))
+        }
+        "clearFocus" => {
+            pseudo_set(vm, this, P_FOCUSED, V::I32(0));
+            Some(None)
+        }
+        "setAlpha"
         | "setPadding"
         | "setElevation"
         | "setShowDividers"
@@ -5323,8 +5415,19 @@ pub(crate) fn dispatch_touch(
     };
     pseudo_set(vm, evt, P_ME_ACTION, V::I32(action));
     let now = now_ms();
-    pseudo_set(vm, evt, P_ME_DOWN_TIME, V::I64(now));
+    if action == 0 {
+        vm.touch_gesture_down_time = now;
+    }
+    let down_time = if vm.touch_gesture_down_time >= 0 {
+        vm.touch_gesture_down_time
+    } else {
+        now
+    };
+    pseudo_set(vm, evt, P_ME_DOWN_TIME, V::I64(down_time));
     pseudo_set(vm, evt, P_ME_EVENT_TIME, V::I64(now));
+    if action == 1 || action == 3 {
+        vm.touch_gesture_down_time = -1;
+    }
     pseudo_set(vm, evt, P_ME_RAWX, V::F32(x as f32));
     pseudo_set(vm, evt, P_ME_RAWY, V::F32(y as f32));
     let mut v = target;
@@ -5424,6 +5527,263 @@ pub(crate) fn dispatch_touch(
     // listener, and no activity hook — the host tree may hold the
     // handler (host-materialized views keep listeners host-side).
     Ok(false)
+}
+
+pub(crate) fn has_input_connection(vm: &Vm, view: u32) -> bool {
+    matches!(pseudo_get(vm, view, P_INPUT_CONN), Some(V::Ref(h)) if h != 0)
+}
+
+fn clear_focus_tree(vm: &mut Vm, h: u32, depth: usize) {
+    if h == 0 || depth > 40 {
+        return;
+    }
+    pseudo_set(vm, h, P_FOCUSED, V::I32(0));
+    for c in children(vm, h) {
+        if let V::Ref(ch) = c {
+            if ch != h {
+                clear_focus_tree(vm, ch, depth + 1);
+            }
+        }
+    }
+}
+
+fn clear_window_focus(vm: &mut Vm) {
+    for root in key_scan_roots(vm) {
+        clear_focus_tree(vm, root, 0);
+    }
+}
+
+/// Ask a view for the InputConnection the system IME would use and keep
+/// it for later key/IME delivery. Android's real InputMethodManager
+/// performs this handshake when soft input is shown; without it Compose's
+/// text-input session exists but no connection ever reaches the runtime.
+pub(crate) fn offer_input_connection(vm: &mut Vm, view: u32) -> ovelo_error::Result<bool> {
+    if view == 0 {
+        return Ok(false);
+    }
+    let editor = host(
+        vm,
+        "Landroid/view/inputmethod/EditorInfo;",
+        HostState::Empty,
+    );
+    let out = vm.call_virtual_sig(
+        view,
+        "onCreateInputConnection",
+        &["Landroid/view/inputmethod/EditorInfo;"],
+        &[editor],
+    )?;
+    let conn = match out {
+        Some(V::Ref(h)) => h,
+        _ => 0,
+    };
+    if conn != 0 {
+        pseudo_set(vm, view, P_INPUT_CONN, V::Ref(conn));
+    }
+    if crate::dbg_flag("OVELO_KEYDBG") {
+        eprintln!("[keydbg] ime offer conn h{conn} view h{view}");
+    }
+    Ok(conn != 0)
+}
+
+fn key_scan_roots(vm: &Vm) -> Vec<u32> {
+    let mut roots: Vec<u32> = vm.decor_roots.values().copied().collect();
+    if roots.is_empty() {
+        roots = vm.view_roots.clone();
+    }
+    roots
+}
+
+/// Route a host key event into the top-most dex view root. Compose
+/// overrides `dispatchKeyEvent` and performs focus/key-input traversal
+/// internally; classic views can override the same method.
+pub(crate) fn dispatch_key(
+    vm: &mut Vm,
+    action: i32,
+    keycode: i32,
+    unicode: i32,
+    repeat: bool,
+) -> ovelo_error::Result<bool> {
+    fn dispatch_node(vm: &mut Vm, h: u32, evt: u32, depth: usize) -> ovelo_error::Result<bool> {
+        if depth > 40 {
+            return Ok(false);
+        }
+        for c in children(vm, h) {
+            if let V::Ref(ch) = c {
+                if ch != 0 && ch != h && dispatch_node(vm, ch, evt, depth + 1)? {
+                    return Ok(true);
+                }
+            }
+        }
+        if !vm.has_dex_virtual(h, "dispatchKeyEvent", &["Landroid/view/KeyEvent;"]) {
+            return Ok(false);
+        }
+        if crate::dbg_flag("OVELO_KEYDBG") {
+            eprintln!("[keydbg] dispatch h{h} {}", vm.dbg_class_of(h));
+        }
+        Ok(vm
+            .call_virtual_sig(
+                h,
+                "dispatchKeyEvent",
+                &["Landroid/view/KeyEvent;"],
+                &[V::Ref(evt)],
+            )?
+            .map(|v| i32v(v) != 0)
+            .unwrap_or(false))
+    }
+
+    fn input_view(vm: &mut Vm, h: u32, depth: usize) -> Option<u32> {
+        if depth > 40 {
+            return None;
+        }
+        if vm.has_dex_virtual(
+            h,
+            "onCreateInputConnection",
+            &["Landroid/view/inputmethod/EditorInfo;"],
+        ) {
+            return Some(h);
+        }
+        for c in children(vm, h) {
+            if let V::Ref(ch) = c {
+                if ch != 0 && ch != h {
+                    if let Some(v) = input_view(vm, ch, depth + 1) {
+                        return Some(v);
+                    }
+                }
+            }
+        }
+        None
+    }
+
+    fn create_input_connection(vm: &mut Vm, view: u32) -> ovelo_error::Result<u32> {
+        let editor = host(
+            vm,
+            "Landroid/view/inputmethod/EditorInfo;",
+            HostState::Empty,
+        );
+        let out = vm.call_virtual_sig(
+            view,
+            "onCreateInputConnection",
+            &["Landroid/view/inputmethod/EditorInfo;"],
+            &[editor],
+        )?;
+        let conn = match out {
+            Some(V::Ref(h)) => h,
+            _ => 0,
+        };
+        if conn != 0 {
+            pseudo_set(vm, view, P_INPUT_CONN, V::Ref(conn));
+        }
+        if crate::dbg_flag("OVELO_KEYDBG") {
+            eprintln!("[keydbg] input conn h{conn} view h{view}");
+        }
+        Ok(conn)
+    }
+
+    fn input_connection(vm: &mut Vm, view: u32, refresh: bool) -> ovelo_error::Result<u32> {
+        if !refresh {
+            if let Some(V::Ref(conn)) = pseudo_get(vm, view, P_INPUT_CONN) {
+                if conn != 0 {
+                    return Ok(conn);
+                }
+            }
+        }
+        create_input_connection(vm, view)
+    }
+
+    fn call_input(
+        vm: &mut Vm,
+        view: u32,
+        method: &str,
+        params: &[&str],
+        args: &[V],
+    ) -> ovelo_error::Result<bool> {
+        for attempt in 0..2 {
+            let conn = input_connection(vm, view, attempt == 1)?;
+            if conn == 0 {
+                return Ok(false);
+            }
+            let mut a = Vec::with_capacity(args.len() + 1);
+            a.extend_from_slice(args);
+            let handled = vm
+                .call_virtual_sig(conn, method, params, &a)?
+                .map(|v| i32v(v) != 0)
+                .unwrap_or(false);
+            if crate::dbg_flag("OVELO_KEYDBG") {
+                eprintln!("[keydbg] input {method} conn h{conn} handled={handled}");
+            }
+            if handled {
+                return Ok(true);
+            }
+            pseudo_set(vm, view, P_INPUT_CONN, V::Ref(0));
+        }
+        Ok(false)
+    }
+
+    let V::Ref(evt) = host(vm, "Landroid/view/KeyEvent;", HostState::Empty) else {
+        return Ok(false);
+    };
+    pseudo_set(vm, evt, P_KE_ACTION, V::I32(action));
+    pseudo_set(vm, evt, P_KE_CODE, V::I32(keycode));
+    pseudo_set(vm, evt, P_KE_UNICODE, V::I32(unicode));
+    pseudo_set(vm, evt, P_KE_REPEAT, V::I32(repeat as i32));
+
+    let mut ime_view = 0;
+    for root in key_scan_roots(vm).iter().rev() {
+        if matches!(pseudo_get(vm, *root, P_PARENT), Some(V::Ref(p)) if p != 0) {
+            continue;
+        }
+        if let Some(v) = input_view(vm, *root, 0) {
+            ime_view = v;
+            break;
+        }
+    }
+    if ime_view != 0 {
+        // Android text input normally reaches a focused field through
+        // its InputConnection, not as a direct View key insertion. ASCII
+        // host keys become commitText; editing/navigation keys stay
+        // KeyEvents so Compose's key-input node can consume them.
+        if action == 0 && unicode != 0 {
+            if let Some(ch) = char::from_u32(unicode as u32) {
+                if !ch.is_control() {
+                    let text = jstr(vm, &ch.to_string());
+                    if call_input(
+                        vm,
+                        ime_view,
+                        "commitText",
+                        &["Ljava/lang/CharSequence;", "I"],
+                        &[text, V::I32(1)],
+                    )? {
+                        return Ok(true);
+                    }
+                }
+            }
+        }
+    }
+
+    for root in key_scan_roots(vm).iter().rev() {
+        if matches!(pseudo_get(vm, *root, P_PARENT), Some(V::Ref(p)) if p != 0) {
+            continue;
+        }
+        if crate::dbg_flag("OVELO_KEYDBG") {
+            eprintln!(
+                "[keydbg] root h{root} {} a{action} code{keycode} u{unicode}",
+                vm.dbg_class_of(*root)
+            );
+        }
+        if dispatch_node(vm, *root, evt, 0)? {
+            return Ok(true);
+        }
+    }
+    Ok(vm.cur_activity != 0
+        && vm
+            .call_virtual_sig(
+                vm.cur_activity,
+                "dispatchKeyEvent",
+                &["Landroid/view/KeyEvent;"],
+                &[V::Ref(evt)],
+            )?
+            .map(|v| i32v(v) != 0)
+            .unwrap_or(false))
 }
 
 pub(crate) fn attach(vm: &mut Vm, parent: u32, child: V) {
@@ -6243,6 +6603,12 @@ pub(crate) fn set_content_view(vm: &mut Vm, activity: u32, content: V) {
         return;
     }
     pseudo_set(vm, activity, P_CONTENT, cv);
+    if let V::Ref(h) = cv {
+        if h != 0 {
+            vm.view_roots.retain(|r| *r != h);
+            vm.view_roots.push(h);
+        }
+    }
     if let Some(w) = window_of(vm, activity) {
         if let Some(cf) = content_frame_of(vm, w) {
             // A second setContentView replaces the content view — the

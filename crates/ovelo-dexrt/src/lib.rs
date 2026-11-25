@@ -282,6 +282,8 @@ pub struct Vm {
     /// inside guest calls and can't wait for the next layout pass to
     /// have bounds.
     pub(crate) window_size: (i32, i32),
+    /// Down time of the currently active single-pointer touch gesture.
+    pub(crate) touch_gesture_down_time: i64,
     /// Interned host enum constants, keyed (desc, ordinal) — so
     /// `Month.of(1) == Month.JANUARY` and `date.getMonth()` return the
     /// same handle the static constant did.
@@ -801,6 +803,7 @@ impl Vm {
             decor_roots: HashMap::new(),
             content_frames: HashMap::new(),
             window_size: (720, 1280),
+            touch_gesture_down_time: -1,
             enum_cache: HashMap::new(),
             enum_name_cache: HashMap::new(),
             clock_views: Vec::new(),
@@ -1864,6 +1867,17 @@ impl Vm {
     /// in both trees never fires its listener twice.
     pub fn dispatch_touch(&mut self, x: i32, y: i32, action: i32) -> Result<bool> {
         jdk::view::dispatch_touch(self, x, y, action)
+    }
+
+    /// Dispatch a hardware-key event into the dex view hierarchy.
+    pub fn dispatch_key(
+        &mut self,
+        action: i32,
+        keycode: i32,
+        unicode: i32,
+        repeat: bool,
+    ) -> Result<bool> {
+        jdk::view::dispatch_key(self, action, keycode, unicode, repeat)
     }
 
     /// Invoke `name` on the object at `this` — resolves the method on
