@@ -4349,6 +4349,37 @@ fn res_misc(vm: &mut Vm, class: &str, name: &str, args: &[V]) -> Rt<Option<Optio
                 Some(Some(host(vm, "Landroid/os/LocaleList;", HostState::Empty)))
             }
             "toString" | "toLanguageTags" => Some(Some(jstr(vm, "en-US"))),
+            "matchesLanguageAndScript" => {
+                let lang = |v: V| {
+                    let V::Ref(h) = v else {
+                        return String::new();
+                    };
+                    super::io::locale_tag(vm, h)
+                        .split(['-', '_'])
+                        .next()
+                        .unwrap_or("")
+                        .to_ascii_lowercase()
+                };
+                let script = |v: V| {
+                    let V::Ref(h) = v else {
+                        return String::new();
+                    };
+                    super::io::locale_tag(vm, h)
+                        .split(['-', '_'])
+                        .skip(1)
+                        .find(|p| p.len() == 4 && p.chars().all(|c| c.is_ascii_alphabetic()))
+                        .unwrap_or("")
+                        .to_ascii_lowercase()
+                };
+                let la = lang(args.first().copied().unwrap_or(V::Ref(0)));
+                let lb = lang(args.get(1).copied().unwrap_or(V::Ref(0)));
+                let sa = script(args.first().copied().unwrap_or(V::Ref(0)));
+                let sb = script(args.get(1).copied().unwrap_or(V::Ref(0)));
+                Some(Some(V::I32(
+                    ((la.is_empty() || lb.is_empty() || la == lb)
+                        && (sa.is_empty() || sb.is_empty() || sa == sb)) as i32,
+                )))
+            }
             _ => Some(None),
         },
         _ => None,
