@@ -1613,9 +1613,16 @@ fn run_app(store: &InstallStore, package: &str) -> Result<(), OveloError> {
                                     .as_deref()
                                     .is_none_or(|proc| proc == info.manifest.package)
                         })
+                        .map(|p| {
+                            let order = p
+                                .init_order_ref
+                                .and_then(|id| v.apk_res.as_ref().and_then(|r| r.integer_of(id)))
+                                .unwrap_or(p.init_order);
+                            (p, order)
+                        })
                         .collect();
-                    providers.sort_by_key(|p| -p.init_order);
-                    for entry in providers {
+                    providers.sort_by_key(|(_, order)| -*order);
+                    for (entry, _) in providers {
                         let provider = entry.name.as_str();
                         let startup = provider == "androidx.startup.InitializationProvider";
                         let desc = format!("L{};", provider.replace('.', "/"));

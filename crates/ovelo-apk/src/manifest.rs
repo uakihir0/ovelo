@@ -497,8 +497,10 @@ pub struct ProviderEntry {
     pub enabled: bool,
     /// `android:process`, when declared.
     pub process: Option<String>,
-    /// `android:initOrder` (zero when absent).
+    /// `android:initOrder` (zero when absent or resource-backed).
     pub init_order: i64,
+    /// `android:initOrder` as a resource reference, when used.
+    pub init_order_ref: Option<u32>,
 }
 
 /// Parse a binary manifest into `ManifestInfo`.
@@ -662,6 +664,10 @@ pub fn parse_manifest(b: &[u8]) -> Result<ManifestInfo> {
                         enabled: !matches!(el.android("enabled"), Some(Value::Bool(false))),
                         process: el.android_str("process").map(str::to_string),
                         init_order: el.android_int("initOrder").unwrap_or(0),
+                        init_order_ref: match el.android("initOrder") {
+                            Some(Value::Reference(r)) => Some(*r),
+                            _ => None,
+                        },
                     });
                     cur_provider = Some(q);
                 }
