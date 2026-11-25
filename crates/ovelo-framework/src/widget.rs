@@ -612,14 +612,17 @@ fn flatten_path(cmds: &[ovelo_dexrt::PathCmd]) -> Vec<Vec<f32>> {
 /// alignment using the shared font metrics.
 fn replay_guest_ops(c: &mut Canvas, ops: &[ovelo_dexrt::CanvasOp]) {
     use ovelo_dexrt::CanvasOp as O;
-    let paint = |p: &ovelo_dexrt::PaintState| Paint {
-        color: Color::from_srgb8(
-            (p.argb >> 16) as u8,
-            (p.argb >> 8) as u8,
-            p.argb as u8,
-            (p.argb >> 24) as u8,
-        ),
-        text_size: p.text_size.max(1.0),
+    let paint = |p: &ovelo_dexrt::PaintState| {
+        let argb = p.draw_argb();
+        Paint {
+            color: Color::from_srgb8(
+                (argb >> 16) as u8,
+                (argb >> 8) as u8,
+                argb as u8,
+                (argb >> 24) as u8,
+            ),
+            text_size: p.text_size.max(1.0),
+        }
     };
     let stroke_or_fill = |c: &mut Canvas, r: Rect, p: &ovelo_dexrt::PaintState, rad: i32| {
         let col = paint(p);
@@ -792,13 +795,34 @@ fn replay_guest_ops(c: &mut Canvas, ops: &[ovelo_dexrt::CanvasOp]) {
                 src_w,
                 src_h,
                 rgba,
+                paint: p,
             } => {
                 let (dw, dh) = if *w == 0 || *h == 0 {
                     (*src_w as usize, *src_h as usize)
                 } else {
                     (*w as usize, *h as usize)
                 };
-                if dw > 0 && dh > 0 && !rgba.is_empty() {
+                // Compose vector drawables are cached as alpha-mask
+                // bitmaps and recolored by a SRC_IN color filter when
+                // the mask is drawn. Model that filter by recoloring
+                // the source copy before host blitting.
+                let tinted = p.tint_argb.map(|tint| {
+                    let tr = ((tint >> 16) & 0xff) as u32;
+                    let tg = ((tint >> 8) & 0xff) as u32;
+                    let tb = (tint & 0xff) as u32;
+                    let ta = ((tint >> 24) & 0xff) as u32;
+                    let mut out = rgba.as_ref().clone();
+                    for px in out.chunks_exact_mut(4) {
+                        let sa = px[3] as u32;
+                        px[0] = (tr * sa / 255) as u8;
+                        px[1] = (tg * sa / 255) as u8;
+                        px[2] = (tb * sa / 255) as u8;
+                        px[3] = (ta * sa / 255) as u8;
+                    }
+                    out
+                });
+                let pixels: &[u8] = tinted.as_deref().unwrap_or(rgba.as_ref());
+                if dw > 0 && dh > 0 && !pixels.is_empty() {
                     c.draw_image(
                         *x as i32,
                         *y as i32,
@@ -806,7 +830,7 @@ fn replay_guest_ops(c: &mut Canvas, ops: &[ovelo_dexrt::CanvasOp]) {
                         dh,
                         *src_w as usize,
                         *src_h as usize,
-                        rgba,
+                        pixels,
                     );
                 }
             }

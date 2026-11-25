@@ -580,6 +580,7 @@ fn tex_quad_op(_st: &GlState, p: &Prim, i: usize) -> Option<CanvasOp> {
         src_w: (sx1 - sx0) as u32,
         src_h: (sy1 - sy0) as u32,
         rgba: std::rc::Rc::new(rgba),
+        paint: PaintState::default(),
     })
 }
 
@@ -596,6 +597,7 @@ fn to_ops(st: &GlState) -> Vec<CanvasOp> {
         let col = |i: usize| *p.colors.get(i).or(p.colors.last()).unwrap_or(&0) as i32;
         let paint = |i: usize| PaintState {
             argb: col(i),
+            tint_argb: None,
             text_size: 0.0,
             align: 0,
             style: 0,
@@ -782,6 +784,7 @@ pub(crate) fn gl_frame(vm: &mut Vm, view: u32, w: i32, h: i32) -> Vec<CanvasOp> 
                 src_w: rw as u32,
                 src_h: rh as u32,
                 rgba: std::rc::Rc::new(px),
+                paint: PaintState::default(),
             });
         }
     }

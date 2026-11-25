@@ -368,6 +368,8 @@ pub enum CanvasOp {
         src_h: u32,
         /// Straight RGBA8 pixels (`src_w` × `src_h`).
         rgba: std::rc::Rc<Vec<u8>>,
+        /// Paint at call time (color filters tint bitmap draws).
+        paint: PaintState,
     },
     /// `drawRenderNode` — a *reference* to the node's recording, not a
     /// copy: a re-recorded child layer must show through without the
@@ -385,6 +387,8 @@ pub enum CanvasOp {
 pub struct PaintState {
     /// `setColor` ARGB.
     pub argb: i32,
+    /// SRC_IN-style color-filter tint, when one is installed.
+    pub tint_argb: Option<i32>,
     /// `setTextSize` px (0 = unset).
     pub text_size: f32,
     /// `setTextAlign`: 0 LEFT, 1 CENTER, 2 RIGHT.
@@ -395,6 +399,13 @@ pub struct PaintState {
     pub stroke_w: f32,
     /// `setFakeBoldText`.
     pub fake_bold: bool,
+}
+
+impl PaintState {
+    /// Color used for solid fills/strokes after color-filter tinting.
+    pub fn draw_argb(&self) -> i32 {
+        self.tint_argb.unwrap_or(self.argb)
+    }
 }
 
 /// One `XmlPullParser` event inside an [`HostState::Xml`] stream.
