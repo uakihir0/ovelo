@@ -3726,7 +3726,7 @@ fn misc_fmt(vm: &mut Vm, class: &str, name: &str, args: &[V]) -> Option<Option<V
             )),
             "forLanguageTag" => {
                 let tag = args
-                    .get(1)
+                    .first()
                     .and_then(|v| sv(vm, *v))
                     .unwrap_or_else(|| "en-US".into());
                 let h = host(vm, "Ljava/util/Locale;", HostState::StrBuf(tag.clone()));
@@ -3759,7 +3759,8 @@ fn misc_fmt(vm: &mut Vm, class: &str, name: &str, args: &[V]) -> Option<Option<V
                 let part = tag
                     .split(['-', '_'])
                     .filter(|p| !p.is_empty())
-                    .nth(1)
+                    .skip(1)
+                    .find(|p| !(p.len() == 4 && p.chars().all(|c| c.is_ascii_alphabetic())))
                     .unwrap_or("");
                 Some(jstr(vm, part))
             }

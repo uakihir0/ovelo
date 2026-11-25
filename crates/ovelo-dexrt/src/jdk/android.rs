@@ -4360,10 +4360,24 @@ fn res_misc(vm: &mut Vm, class: &str, name: &str, args: &[V]) -> Rt<Option<Optio
                         .unwrap_or("")
                         .to_ascii_lowercase()
                 };
-                let a = args.get(1).copied().map(lang).unwrap_or_default();
-                let b = args.get(2).copied().map(lang).unwrap_or_default();
+                let script = |v: V| {
+                    let V::Ref(h) = v else {
+                        return String::new();
+                    };
+                    super::io::locale_tag(vm, h)
+                        .split(['-', '_'])
+                        .skip(1)
+                        .find(|p| p.len() == 4 && p.chars().all(|c| c.is_ascii_alphabetic()))
+                        .unwrap_or("")
+                        .to_ascii_lowercase()
+                };
+                let la = args.get(1).copied().map(lang).unwrap_or_default();
+                let lb = args.get(2).copied().map(lang).unwrap_or_default();
+                let sa = args.get(1).copied().map(script).unwrap_or_default();
+                let sb = args.get(2).copied().map(script).unwrap_or_default();
                 Some(Some(V::I32(
-                    (a.is_empty() || b.is_empty() || a == b) as i32,
+                    ((la.is_empty() || lb.is_empty() || la == lb)
+                        && (sa.is_empty() || sb.is_empty() || sa == sb)) as i32,
                 )))
             }
             _ => Some(None),
