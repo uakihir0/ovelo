@@ -512,7 +512,7 @@ pub(crate) fn clear_layout_requested(vm: &mut Vm, h: u32) {
 
 /// Mark a view and its ancestors as layout-requested, matching
 /// `View.requestLayout`'s upward propagation through the parent chain.
-fn mark_layout_requested(vm: &mut Vm, h: u32) {
+pub fn mark_layout_requested(vm: &mut Vm, h: u32) {
     let mut cur = h;
     for _ in 0..64 {
         if cur == 0 || pseudo_get(vm, cur, P_IS_VIEW).is_none() {
@@ -1979,6 +1979,7 @@ pub(crate) fn call(
         "setText" | "setTitle" | "setTextScaleX" => {
             if name != "setTextScaleX" {
                 pseudo_set(vm, this, P_TEXT, args.get(1).copied().unwrap_or(V::Ref(0)));
+                mark_layout_requested(vm, this);
                 if crate::dbg_flag("OVELO_VIEWDBG") {
                     eprintln!(
                         "[viewdbg] setText h{this} arg={:?} stored={:?}",

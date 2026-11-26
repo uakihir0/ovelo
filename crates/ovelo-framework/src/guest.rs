@@ -933,6 +933,7 @@ impl GuestUi {
                             ovelo_dexrt::P_TEXT,
                             a.get(1).copied().unwrap_or(V::Ref(0)),
                         );
+                        ovelo_dexrt::mark_layout_requested(vm, this);
                         return Ok(None);
                     };
                     let text = match a.get(1) {
@@ -945,6 +946,7 @@ impl GuestUi {
                         .text_mut()
                         .ok_or_else(|| crate::err("guest.setText.not_text"))?;
                     tv.set_text(text);
+                    ovelo_dexrt::mark_layout_requested(vm, this);
                     Ok(None)
                 },
             );
@@ -959,6 +961,7 @@ impl GuestUi {
                 };
                 let Some(rc) = ui.views.get(&this).cloned() else {
                     ovelo_dexrt::pseudo_set(vm, this, ovelo_dexrt::P_TSIZE, V::F32(size));
+                    ovelo_dexrt::mark_layout_requested(vm, this);
                     return Ok(None);
                 };
                 let mut g = rc.borrow_mut();
@@ -967,6 +970,7 @@ impl GuestUi {
                     .ok_or_else(|| crate::err("guest.setTextSize.not_text"))?;
                 tv.text_size = size;
                 tv.set_text(tv.text.clone());
+                ovelo_dexrt::mark_layout_requested(vm, this);
                 Ok(None)
             });
             Self::on(ui, vm, cls, "setTextColor", "(I)V", |ui, vm, a| {
@@ -1485,20 +1489,6 @@ pub fn drive_dex_layout_pass(vm: &mut Vm, activity: u32, frame: u32, win_w: i32,
     // DrawerLayout throw unless both specs are EXACTLY, so
     // UNSPECIFIED/0 would leave them unmeasured forever.
     const MS_EXACTLY: i32 = 1 << 30;
-    fn subtree_needs_layout(vm: &Vm, h: u32, depth: u32) -> bool {
-        if depth > 64 {
-            return false;
-        }
-        let Some(info) = vm.dex_view(h) else {
-            return false;
-        };
-        if info.frame.is_none() || info.layout_requested {
-            return true;
-        }
-        info.children
-            .iter()
-            .any(|ch| subtree_needs_layout(vm, *ch, depth + 1))
-    }
     fn walk(vm: &mut Vm, h: u32, depth: u32, win_w: i32, win_h: i32) {
         if depth > 64 {
             return;
@@ -1535,7 +1525,7 @@ pub fn drive_dex_layout_pass(vm: &mut Vm, activity: u32, frame: u32, win_w: i32,
             && info
                 .frame
                 .is_some_and(|f| (f.2 - f.0, f.3 - f.1) != (win_w, win_h));
-        let needs_layout = root_size_changed || subtree_needs_layout(vm, h, 0);
+        let needs_layout = root_size_changed || info.frame.is_none() || info.layout_requested;
         // Drive subtree roots regardless of group-ness: a leaf custom
         // view at the XML root has no dex parent to measure/layout it,
         // so without this its frame stays unset and `onDraw` ops never
