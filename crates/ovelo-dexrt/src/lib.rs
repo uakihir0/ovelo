@@ -16,7 +16,9 @@ mod res_attrs;
 mod value;
 
 pub use aot::Aot;
-pub use jdk::view::{fire_global_layout, DexViewInfo, P_BGCOLOR, P_TCOLOR, P_TEXT, P_TSIZE};
+pub use jdk::view::{
+    fire_global_layout, mark_layout_requested, DexViewInfo, P_BGCOLOR, P_TCOLOR, P_TEXT, P_TSIZE,
+};
 pub use jdk::{pseudo_get, pseudo_set, P_ACTION, P_APPINFO, P_COMPONENT, P_DATA, P_META, P_TARGET};
 pub use value::{CanvasOp, PaintState, PathCmd};
 pub use value::{Heap, HostState, Obj, V};
@@ -2355,11 +2357,10 @@ impl Vm {
         }
         native::check_all_zones("drain");
         let now = jdk::now_ms() as u64;
-        let (due, later): (Vec<_>, Vec<_>) = self
+        let due: Vec<_> = self
             .delayed_runnables
-            .drain(..)
-            .partition(|(_, _, t)| *t <= now);
-        self.delayed_runnables = later;
+            .extract_if(.., |(_, _, t)| *t <= now)
+            .collect();
         for (r, on_main, _) in due {
             self.unparkable_delayed.remove(&r);
             self.deadline_woke.insert(r);
@@ -2440,9 +2441,10 @@ impl Vm {
         // that reposts itself lands in `frame_callbacks` again (the
         // Recomposer's loop works exactly that way).
         let frame_nanos = V::I64(jdk::now_ms() * 1_000_000);
-        let (due_cbs, pending_cbs): (Vec<_>, Vec<_>) =
-            self.frame_callbacks.drain(..).partition(|(_, t)| *t <= now);
-        self.frame_callbacks = pending_cbs;
+        let due_cbs: Vec<_> = self
+            .frame_callbacks
+            .extract_if(.., |(_, t)| *t <= now)
+            .collect();
         let dbg = crate::dbg_flag("OVELO_DRAINDBG");
         if dbg && !due_cbs.is_empty() {
             eprintln!(
