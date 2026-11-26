@@ -2457,7 +2457,7 @@ impl Vm {
         // per frame tick, so a due callback fires on the next pass; one
         // that reposts itself lands in `frame_callbacks` again (the
         // Recomposer's loop works exactly that way).
-        let frame_nanos = V::I64(jdk::now_ms() * 1_000_000);
+        let frame_nanos = V::I64(jdk::now_nanos());
         let due_cbs: Vec<_> = self
             .frame_callbacks
             .extract_if(.., |(_, t)| *t <= now)

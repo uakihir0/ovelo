@@ -160,6 +160,13 @@ pub(crate) fn now_ms() -> i64 {
         .unwrap_or(0)
 }
 
+pub(crate) fn now_nanos() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_nanos().min(i64::MAX as u128) as i64)
+        .unwrap_or(0)
+}
+
 pub(crate) fn is_null(v: V) -> bool {
     matches!(v, V::Ref(0))
 }

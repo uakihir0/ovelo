@@ -1457,7 +1457,7 @@ fn math_call(name: &str, args: &[V]) -> Option<Option<V>> {
 fn system_call(vm: &mut Vm, name: &str, _sig: &str, args: &[V]) -> Rt<Option<Option<V>>> {
     Ok(match name {
         "currentTimeMillis" => Some(Some(V::I64(now_ms()))),
-        "nanoTime" => Some(Some(V::I64(now_ms() * 1_000_000))),
+        "nanoTime" => Some(Some(V::I64(now_nanos()))),
         "arraycopy" => {
             let (V::Ref(src), V::Ref(dst)) = (args[0], args[2]) else {
                 return Ok(Some(None));
