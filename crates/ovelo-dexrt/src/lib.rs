@@ -2475,6 +2475,7 @@ impl Vm {
             .retain(|(h, _), _| self.heap.get(*h).is_some());
         self.obj_db.retain(|h, _| self.heap.get(*h).is_some());
         self.throw_sites.retain(|h, _| self.heap.get(*h).is_some());
+        self.unpark_permits.retain(|h| self.heap.get(*h).is_some());
         // Next collection when the heap grows another ~50%.
         self.gc_mark = (self.heap.len() * 3 / 2).max(65_536);
         if crate::dbg_flag("OVELO_MEMDBG") {
