@@ -12,6 +12,128 @@ use crate::value::{HostState, Obj, V};
 /// `equals` that throws propagates — swallowing it would let a
 /// `remove` succeed where Java surfaces the exception.
 fn elem_eq(vm: &mut Vm, e: V, other: V) -> Rt<bool> {
+    elem_eq_depth(vm, e, other, 0)
+}
+
+fn collection_desc(vm: &Vm, h: u32) -> String {
+    match vm.heap.get(h) {
+        Some(Obj::Host { desc, .. }) => desc.clone(),
+        _ => class_of(vm, V::Ref(h)),
+    }
+}
+
+fn collection_is_set(vm: &Vm, h: u32) -> bool {
+    collection_desc(vm, h).contains("Set;")
+}
+
+fn collection_snapshot(vm: &Vm, h: u32) -> Option<Vec<V>> {
+    if matches!(vm.heap.get(h), Some(Obj::Array { .. })) {
+        return None;
+    }
+    if collection_desc(vm, h) == "Lkotlin/collections/EmptyList;" {
+        return Some(Vec::new());
+    }
+    list_snapshot(vm, h)
+}
+
+fn collections_eq(vm: &mut Vm, a: u32, b: u32, depth: u8) -> Rt<Option<bool>> {
+    if a == b {
+        return Ok(Some(true));
+    }
+    if depth >= 16 {
+        return Ok(None);
+    }
+    let (av, bv) = match (collection_snapshot(vm, a), collection_snapshot(vm, b)) {
+        (Some(av), Some(bv)) => (av, bv),
+        _ => return Ok(None),
+    };
+    if av.len() != bv.len() {
+        return Ok(Some(false));
+    }
+    let set_a = collection_is_set(vm, a);
+    let set_b = collection_is_set(vm, b);
+    if set_a != set_b {
+        return Ok(Some(false));
+    }
+    if set_a {
+        let mut used = vec![false; bv.len()];
+        'outer: for x in av {
+            for (i, y) in bv.iter().enumerate() {
+                if !used[i] && elem_eq_depth(vm, x, *y, depth + 1)? {
+                    used[i] = true;
+                    continue 'outer;
+                }
+            }
+            return Ok(Some(false));
+        }
+        return Ok(Some(true));
+    }
+    for (x, y) in av.iter().zip(bv.iter()) {
+        if !elem_eq_depth(vm, *x, *y, depth + 1)? {
+            return Ok(Some(false));
+        }
+    }
+    Ok(Some(true))
+}
+
+fn arrays_deep_eq(vm: &mut Vm, a: u32, b: u32, depth: u8) -> Rt<bool> {
+    if a == b {
+        return Ok(true);
+    }
+    if depth >= 16 {
+        return Ok(false);
+    }
+    let (elem, av, bv) = match (vm.heap.get(a), vm.heap.get(b)) {
+        (
+            Some(Obj::Array { elem, data: av }),
+            Some(Obj::Array {
+                elem: belem,
+                data: bv,
+            }),
+        ) if elem == belem
+            || ((elem.starts_with('L') || elem.starts_with('['))
+                && (belem.starts_with('L') || belem.starts_with('['))) =>
+        {
+            (elem.clone(), av.clone(), bv.clone())
+        }
+        _ => return Ok(false),
+    };
+    if av.len() != bv.len() {
+        return Ok(false);
+    }
+    for (x, y) in av.iter().zip(bv.iter()) {
+        let eq = match (elem.as_str(), *x, *y) {
+            ("F", V::F32(x), V::F32(y)) => x.to_bits() == y.to_bits() || (x.is_nan() && y.is_nan()),
+            ("D", V::F64(x), V::F64(y)) => x.to_bits() == y.to_bits() || (x.is_nan() && y.is_nan()),
+            ("B", V::I32(x), V::I32(y)) => x as u8 == y as u8,
+            (_, V::Ref(xh), V::Ref(yh)) if elem.starts_with('L') || elem.starts_with('[') => {
+                if xh != 0
+                    && yh != 0
+                    && matches!(vm.heap.get(xh), Some(Obj::Array { .. }))
+                    && matches!(vm.heap.get(yh), Some(Obj::Array { .. }))
+                {
+                    arrays_deep_eq(vm, xh, yh, depth + 1)?
+                } else {
+                    elem_eq_depth(vm, *x, *y, depth + 1)?
+                }
+            }
+            _ => x == y,
+        };
+        if !eq {
+            return Ok(false);
+        }
+    }
+    Ok(true)
+}
+
+fn elem_eq_depth(vm: &mut Vm, e: V, other: V, depth: u8) -> Rt<bool> {
+    if let (V::Ref(a), V::Ref(b)) = (e, other) {
+        if a != 0 && b != 0 {
+            if let Some(eq) = collections_eq(vm, a, b, depth)? {
+                return Ok(eq);
+            }
+        }
+    }
     match e {
         V::Ref(h) if h != 0 && matches!(vm.heap.get(h), Some(Obj::Instance { .. })) => {
             match vm.call_virtual_rt(h, "equals", &[other]) {
@@ -901,7 +1023,16 @@ fn list_call(vm: &mut Vm, name: &str, sig: &str, args: &[V]) -> Rt<Option<Option
             }
             Some(Some(V::I32(c as i32)))
         }
-        "containsAll" | "equals" => Some(Some(V::I32(1))),
+        "containsAll" => Some(Some(V::I32(1))),
+        "equals" => {
+            let other = match args.get(1).copied() {
+                Some(V::Ref(oh)) if oh == h => return Ok(Some(Some(V::I32(1)))),
+                Some(V::Ref(oh)) => oh,
+                _ => return Ok(Some(Some(V::I32(0)))),
+            };
+            let eq = collections_eq(vm, h, other, 0)?.unwrap_or(false);
+            Some(Some(V::I32(eq as i32)))
+        }
         "indexOf" | "lastIndexOf" => {
             let items: Vec<V> = match list_snapshot(vm, h) {
                 Some(l) => l,
@@ -2170,7 +2301,12 @@ fn arrays_static(vm: &mut Vm, name: &str, _sig: &str, args: &[V]) -> Rt<Option<O
                 },
                 _ => None,
             };
-            let eq = if let Some((ex, x, _ey, y)) = arrays {
+            let eq = if name == "deepEquals" {
+                match (args[0], args[1]) {
+                    (V::Ref(a), V::Ref(b)) => arrays_deep_eq(vm, a, b, 0)?,
+                    _ => args[0] == args[1],
+                }
+            } else if let Some((ex, x, _ey, y)) = arrays {
                 if x.len() != y.len() {
                     false
                 } else {
