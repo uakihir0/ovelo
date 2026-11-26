@@ -90,7 +90,12 @@ fn arrays_deep_eq(vm: &mut Vm, a: u32, b: u32, depth: u8) -> Rt<bool> {
                 elem: belem,
                 data: bv,
             }),
-        ) if elem == belem => (elem.clone(), av.clone(), bv.clone()),
+        ) if elem == belem
+            || ((elem.starts_with('L') || elem.starts_with('['))
+                && (belem.starts_with('L') || belem.starts_with('['))) =>
+        {
+            (elem.clone(), av.clone(), bv.clone())
+        }
         _ => return Ok(false),
     };
     if av.len() != bv.len() {
