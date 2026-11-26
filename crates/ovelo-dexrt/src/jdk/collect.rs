@@ -901,7 +901,27 @@ fn list_call(vm: &mut Vm, name: &str, sig: &str, args: &[V]) -> Rt<Option<Option
             }
             Some(Some(V::I32(c as i32)))
         }
-        "containsAll" | "equals" => Some(Some(V::I32(1))),
+        "containsAll" => Some(Some(V::I32(1))),
+        "equals" => {
+            let other = match args.get(1).copied() {
+                Some(V::Ref(oh)) if oh == h => return Ok(Some(Some(V::I32(1)))),
+                Some(V::Ref(oh)) => oh,
+                _ => return Ok(Some(Some(V::I32(0)))),
+            };
+            let (a, b) = match (list_snapshot(vm, h), list_snapshot(vm, other)) {
+                (Some(a), Some(b)) => (a, b),
+                _ => return Ok(Some(Some(V::I32(0)))),
+            };
+            if a.len() != b.len() {
+                return Ok(Some(Some(V::I32(0))));
+            }
+            for (x, y) in a.iter().zip(b.iter()) {
+                if !elem_eq(vm, *x, *y)? {
+                    return Ok(Some(Some(V::I32(0))));
+                }
+            }
+            Some(Some(V::I32(1)))
+        }
         "indexOf" | "lastIndexOf" => {
             let items: Vec<V> = match list_snapshot(vm, h) {
                 Some(l) => l,
