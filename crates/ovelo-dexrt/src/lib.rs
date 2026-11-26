@@ -4999,11 +4999,6 @@ impl Vm {
         }
     }
 
-    /// Invoke `midx` per `kind`; `args` includes the receiver for non-static.
-    /// `call_virtual` that bypasses registered host overrides on the
-    /// ROOT method only — compat shims delegate to the real dex body
-    /// through this once the genuine path is known to work (nested
-    /// invokes inside the dex body still honor host overrides).
     /// Invoke the exact dex method body for `(class, name, sig)`, bypassing
     /// both virtual overrides and the registered host shim on that root
     /// method. Compat shims registered on a base library method use this to
@@ -5034,6 +5029,10 @@ impl Vm {
         }
     }
 
+    /// `call_virtual` that bypasses registered host overrides on the
+    /// ROOT method only — compat shims delegate to the real dex body
+    /// through this once the genuine path is known to work (nested
+    /// invokes inside the dex body still honor host overrides).
     pub fn call_virtual_direct(&mut self, this: u32, name: &str, args: &[V]) -> Result<Option<V>> {
         let ci = self
             .heap
