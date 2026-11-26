@@ -161,10 +161,17 @@ pub(crate) fn now_ms() -> i64 {
 }
 
 pub(crate) fn now_nanos() -> i64 {
-    std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_nanos().min(i64::MAX as u128) as i64)
-        .unwrap_or(0)
+    // java.lang.System.nanoTime is monotonic with an arbitrary origin.
+    // Keeping that origin near process start matters: Compose animation
+    // math converts timestamps through narrow float/int paths, and a
+    // wall-clock epoch nanosecond value is large enough to lose the
+    // frame-to-frame differences entirely.
+    static START: std::sync::OnceLock<std::time::Instant> = std::sync::OnceLock::new();
+    START
+        .get_or_init(std::time::Instant::now)
+        .elapsed()
+        .as_nanos()
+        .min(i64::MAX as u128) as i64
 }
 
 pub(crate) fn is_null(v: V) -> bool {
