@@ -582,6 +582,10 @@ pub struct Vm {
     /// Nesting depth of inline drains issued from `park` — bounds the
     /// recursion when a task inside such a drain parks again.
     pub(crate) park_depth: u32,
+    /// Active Compose measure/layout calls. The runtime's cooperative
+    /// scheduling can otherwise re-enter these methods in orders that
+    /// cannot occur on Android's serialized UI thread.
+    pub(crate) compose_measure_depth: u32,
     /// Runnables that re-parked inside a drain — when the queue holds
     /// only these, draining them again just makes two waiting workers
     /// hand the slot back and forth until the instruction budget
@@ -911,6 +915,7 @@ impl Vm {
             vto_predraw: HashMap::new(),
             draining: false,
             park_depth: 0,
+            compose_measure_depth: 0,
             reparked: hashbrown::HashSet::new(),
             fill_bad: hashbrown::HashSet::new(),
             park_spins: 0,
@@ -5270,153 +5275,188 @@ impl Vm {
                 }
             }
         };
-        // A registered host override short-circuits even a dex-defined
-        // method — used for compat shims on library code that can't run
-        // here (e.g. appcompat's vector-drawable path).
-        let host = if skip_host {
-            None
-        } else {
-            self.hosts.get(&loc.midx).cloned()
+        let compose_measure = {
+            let md = self.dex_of(loc.midx).and_then(|d| {
+                let m = d.method(gl(loc.midx)).ok()?;
+                d.string(m.name_idx).ok()
+            });
+            matches!(md.as_deref(), Some("measureAndLayout"))
         };
-        if let Some(f) = host {
-            // A re-entrant call into an already-borrowed host callback
-            // falls through to dex/builtin execution — the outer call
-            // dispatching guest code (attach → onAttachedToWindow →
-            // addView) is a legitimate AOSP flow, not an error.
-            match f.try_borrow_mut() {
-                Ok(mut g) => {
-                    let has_recv = !matches!(kind, InvokeKind::Static);
-                    let args = self.compact_args(loc.midx, &args, has_recv);
-                    let r = g(self, &args).map_err(E::Vm);
-                    if let Some(h) = self.host_throw.take() {
-                        return Err(E::Throw(h));
-                    }
-                    return r;
-                }
-                Err(_) => {
-                    // Queue the bridge for the next drain tick so its
-                    // host-side wiring still runs once the borrow frees.
-                    let has_recv = !matches!(kind, InvokeKind::Static);
-                    let args = self.compact_args(loc.midx, &args, has_recv);
-                    self.pending_host_retry.push((loc.midx, args));
-                }
-            }
-        }
-        if !matches!(kind, InvokeKind::Static) {
-            if let Some(f) = self.simple_getter_field(loc) {
-                let h = match args.first() {
-                    Some(&V::Ref(h)) => h,
-                    _ => 0,
-                };
-                if h == 0 {
-                    return Err(self.throw_builtin(
-                        "Ljava/lang/NullPointerException;",
-                        &format!("null receiver calling {}", self.describe_method(midx)),
-                    ));
-                }
-                let stored = match self.heap.get(h) {
-                    Some(Obj::Instance { fields, .. }) | Some(Obj::Host { fields, .. }) => {
-                        fields.get(&f).copied()
-                    }
-                    other => {
-                        return Err(E::Vm(errd(
-                            "dexrt.type",
-                            format!(
-                                "fast iget h{h} field={} kind={:?}",
-                                self.describe_field(f),
-                                other.map(std::mem::discriminant),
-                            ),
-                        )));
-                    }
-                };
-                let v = match stored {
-                    Some(v) => v,
-                    None => match self.builtin_ifield(h, f) {
-                        Some(b) => b,
-                        None => match self.ref_field_stub(h, f) {
-                            Some(v) => v,
-                            None => self.field_default(f).unwrap_or(V::I32(0)),
-                        },
-                    },
-                };
-                return Ok(Some(v));
-            }
-        }
-        if matches!(kind, InvokeKind::Static) {
-            self.ensure_init(loc.class_idx)?;
-        }
-        if loc.em.code_off == 0 {
-            // Bodiless declaration (native / external / abstract decl):
-            // jdk shims may still answer it; otherwise a typed
-            // placeholder keeps a compat run moving — real JNI bridging
-            // arrives with the native stack.
-            let (class, name, sig, ret_desc) = {
-                let d = self
-                    .dex_of(loc.midx)
-                    .ok_or_else(|| E::Vm(err("dexrt.dex.idx")))?;
-                let mid = *d.method(gl(loc.midx)).map_err(E::Vm)?;
-                (
-                    d.type_descriptor(mid.class_idx as u32).map_err(E::Vm)?,
-                    d.string(mid.name_idx).map_err(E::Vm)?,
-                    self.proto_sig_of(loc.midx)?,
-                    d.proto(mid.proto_idx as u32)
+        if compose_measure && self.compose_measure_depth != 0 {
+            let ret_desc = self
+                .dex_of(loc.midx)
+                .and_then(|d| {
+                    let m = d.method(gl(loc.midx)).ok()?;
+                    d.proto(m.proto_idx as u32)
                         .and_then(|p| d.type_descriptor(p.return_type_idx))
-                        .map_err(E::Vm)?,
-                )
+                        .ok()
+                })
+                .unwrap_or_else(|| "V".into());
+            return Ok(match ret_desc.as_str() {
+                "V" => None,
+                "Z" | "B" | "C" | "S" | "I" => Some(V::I32(0)),
+                "J" => Some(V::I64(0)),
+                "F" => Some(V::F32(0.0)),
+                "D" => Some(V::F64(0.0)),
+                _ => Some(V::Ref(0)),
+            });
+        }
+        if compose_measure {
+            self.compose_measure_depth = self.compose_measure_depth.saturating_add(1);
+        }
+        let invoke_out = (|| {
+            // A registered host override short-circuits even a dex-defined
+            // method — used for compat shims on library code that can't run
+            // here (e.g. appcompat's vector-drawable path).
+            let host = if skip_host {
+                None
+            } else {
+                self.hosts.get(&loc.midx).cloned()
             };
-            let args = self.compact_args(loc.midx, &args, !matches!(kind, InvokeKind::Static));
-            if let Some(r) = jdk::call(self, &class, &name, &sig, &args)? {
-                return Ok(r);
+            if let Some(f) = host {
+                // A re-entrant call into an already-borrowed host callback
+                // falls through to dex/builtin execution — the outer call
+                // dispatching guest code (attach → onAttachedToWindow →
+                // addView) is a legitimate AOSP flow, not an error.
+                match f.try_borrow_mut() {
+                    Ok(mut g) => {
+                        let has_recv = !matches!(kind, InvokeKind::Static);
+                        let args = self.compact_args(loc.midx, &args, has_recv);
+                        let r = g(self, &args).map_err(E::Vm);
+                        if let Some(h) = self.host_throw.take() {
+                            return Err(E::Throw(h));
+                        }
+                        return r;
+                    }
+                    Err(_) => {
+                        // Queue the bridge for the next drain tick so its
+                        // host-side wiring still runs once the borrow frees.
+                        let has_recv = !matches!(kind, InvokeKind::Static);
+                        let args = self.compact_args(loc.midx, &args, has_recv);
+                        self.pending_host_retry.push((loc.midx, args));
+                    }
+                }
             }
-            // Annotation-interface calls (`Navigator.Name.value()`,
-            // `Subscribe.threadMode()`) are bodiless decls too — answer
-            // from the receiver mirror's elements (or declared
-            // AnnotationDefault) before falling to the stub path.
-            if let Some(v) = self.annotation_method_value(loc.midx, &args) {
-                return Ok(Some(v));
+            if !matches!(kind, InvokeKind::Static) {
+                if let Some(f) = self.simple_getter_field(loc) {
+                    let h = match args.first() {
+                        Some(&V::Ref(h)) => h,
+                        _ => 0,
+                    };
+                    if h == 0 {
+                        return Err(self.throw_builtin(
+                            "Ljava/lang/NullPointerException;",
+                            &format!("null receiver calling {}", self.describe_method(midx)),
+                        ));
+                    }
+                    let stored = match self.heap.get(h) {
+                        Some(Obj::Instance { fields, .. }) | Some(Obj::Host { fields, .. }) => {
+                            fields.get(&f).copied()
+                        }
+                        other => {
+                            return Err(E::Vm(errd(
+                                "dexrt.type",
+                                format!(
+                                    "fast iget h{h} field={} kind={:?}",
+                                    self.describe_field(f),
+                                    other.map(std::mem::discriminant),
+                                ),
+                            )));
+                        }
+                    };
+                    let v = match stored {
+                        Some(v) => v,
+                        None => match self.builtin_ifield(h, f) {
+                            Some(b) => b,
+                            None => match self.ref_field_stub(h, f) {
+                                Some(v) => v,
+                                None => self.field_default(f).unwrap_or(V::I32(0)),
+                            },
+                        },
+                    };
+                    return Ok(Some(v));
+                }
             }
-            // Debug bisection: OVELO_STUB_NATIVE=<substring> skips the
-            // native call entirely, returning a zero value for its
-            // return type — used to isolate which guest `.so` entry
-            // point's execution corrupts state.
-            static STUB_PAT: std::sync::OnceLock<Option<String>> = std::sync::OnceLock::new();
-            let stub = STUB_PAT
-                .get_or_init(|| std::env::var("OVELO_STUB_NATIVE").ok())
-                .as_deref();
-            if stub.is_some_and(|p| name.contains(p)) {
-                eprintln!("[stubnative] {class}.{name}{sig} skipped");
-                return Ok(void_resolved(match ret_desc.as_str() {
-                    "V" => None,
-                    "Z" | "B" | "C" | "S" | "I" => Some(V::I32(0)),
-                    "J" => Some(V::I64(0)),
-                    "F" => Some(V::F32(0.0)),
-                    "D" => Some(V::F64(0.0)),
-                    _ => Some(V::Ref(0)),
-                }));
+            if matches!(kind, InvokeKind::Static) {
+                self.ensure_init(loc.class_idx)?;
             }
-            // A dex `native` method resolves to a loaded `.so`: the
-            // `Java_<cls>_<name>` symbol or a RegisterNatives binding.
-            if let Some(addr) = jni::native_addr(self, &class, &name, &sig) {
-                return jni::dispatch_native(
-                    self,
-                    addr,
-                    &class,
-                    &ret_desc,
-                    matches!(kind, InvokeKind::Static),
-                    &args,
-                )
-                .map(void_resolved);
+            if loc.em.code_off == 0 {
+                // Bodiless declaration (native / external / abstract decl):
+                // jdk shims may still answer it; otherwise a typed
+                // placeholder keeps a compat run moving — real JNI bridging
+                // arrives with the native stack.
+                let (class, name, sig, ret_desc) = {
+                    let d = self
+                        .dex_of(loc.midx)
+                        .ok_or_else(|| E::Vm(err("dexrt.dex.idx")))?;
+                    let mid = *d.method(gl(loc.midx)).map_err(E::Vm)?;
+                    (
+                        d.type_descriptor(mid.class_idx as u32).map_err(E::Vm)?,
+                        d.string(mid.name_idx).map_err(E::Vm)?,
+                        self.proto_sig_of(loc.midx)?,
+                        d.proto(mid.proto_idx as u32)
+                            .and_then(|p| d.type_descriptor(p.return_type_idx))
+                            .map_err(E::Vm)?,
+                    )
+                };
+                let args = self.compact_args(loc.midx, &args, !matches!(kind, InvokeKind::Static));
+                if let Some(r) = jdk::call(self, &class, &name, &sig, &args)? {
+                    return Ok(r);
+                }
+                // Annotation-interface calls (`Navigator.Name.value()`,
+                // `Subscribe.threadMode()`) are bodiless decls too — answer
+                // from the receiver mirror's elements (or declared
+                // AnnotationDefault) before falling to the stub path.
+                if let Some(v) = self.annotation_method_value(loc.midx, &args) {
+                    return Ok(Some(v));
+                }
+                // Debug bisection: OVELO_STUB_NATIVE=<substring> skips the
+                // native call entirely, returning a zero value for its
+                // return type — used to isolate which guest `.so` entry
+                // point's execution corrupts state.
+                static STUB_PAT: std::sync::OnceLock<Option<String>> = std::sync::OnceLock::new();
+                let stub = STUB_PAT
+                    .get_or_init(|| std::env::var("OVELO_STUB_NATIVE").ok())
+                    .as_deref();
+                if stub.is_some_and(|p| name.contains(p)) {
+                    eprintln!("[stubnative] {class}.{name}{sig} skipped");
+                    return Ok(void_resolved(match ret_desc.as_str() {
+                        "V" => None,
+                        "Z" | "B" | "C" | "S" | "I" => Some(V::I32(0)),
+                        "J" => Some(V::I64(0)),
+                        "F" => Some(V::F32(0.0)),
+                        "D" => Some(V::F64(0.0)),
+                        _ => Some(V::Ref(0)),
+                    }));
+                }
+                // A dex `native` method resolves to a loaded `.so`: the
+                // `Java_<cls>_<name>` symbol or a RegisterNatives binding.
+                if let Some(addr) = jni::native_addr(self, &class, &name, &sig) {
+                    return jni::dispatch_native(
+                        self,
+                        addr,
+                        &class,
+                        &ret_desc,
+                        matches!(kind, InvokeKind::Static),
+                        &args,
+                    )
+                    .map(void_resolved);
+                }
+                return self
+                    .stub_placeholder(loc.midx, &ret_desc, &name, &class, &args)
+                    .map(void_resolved);
             }
-            return self
-                .stub_placeholder(loc.midx, &ret_desc, &name, &class, &args)
-                .map(void_resolved);
+            if let Some(f) = self.aot.as_ref().and_then(|a| a.get(loc.midx)) {
+                return self
+                    .run_native(f, loc.midx, loc.em.code_off, args)
+                    .map(void_resolved);
+            }
+            self.exec(loc, args).map(void_resolved)
+        })();
+        if compose_measure {
+            self.compose_measure_depth = self.compose_measure_depth.saturating_sub(1);
         }
-        if let Some(f) = self.aot.as_ref().and_then(|a| a.get(loc.midx)) {
-            return self
-                .run_native(f, loc.midx, loc.em.code_off, args)
-                .map(void_resolved);
-        }
-        self.exec(loc, args).map(void_resolved)
+        invoke_out
     }
 
     /// JNI-facing wrappers — the `jni` module sits outside `Vm` but

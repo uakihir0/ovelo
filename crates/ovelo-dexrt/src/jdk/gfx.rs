@@ -2386,6 +2386,14 @@ fn expand_nested(vm: &Vm, ops: &[CanvasOp], path: &mut Vec<u32>) -> Vec<CanvasOp
             },
             _ => Vec::new(),
         };
+        if crate::dbg_flag("OVELO_DRAWDBG_DUMP") {
+            eprintln!(
+                "[drawdbg] nested node{node} inner={} left={:?} top={:?}",
+                inner.len(),
+                pseudo_get(vm, *node, PK_RN_LEFT),
+                pseudo_get(vm, *node, PK_RN_TOP)
+            );
+        }
         if inner.is_empty() {
             continue;
         }

@@ -1008,9 +1008,7 @@ impl GuestUi {
         // AND for bridged `new` views (guest_content_set apps like
         // 2048 whose whole UI is a bridged GLSurfaceView).
         vm.sync_decor_frames(self.root.w, self.root.h);
-        if vm.any_gl_renderer() {
-            self.pump_gl_frames(vm);
-        }
+        self.pump_gl_frames(vm);
         if self.guest_content_set {
             return false;
         }
@@ -1124,7 +1122,8 @@ impl GuestUi {
                     rc.borrow_mut().view_mut().measured
                 );
             }
-            if !vm.has_gl_renderer(h) {
+            let compose_view = vm.dbg_class_of(h).contains("/compose/ui/platform/");
+            if !vm.has_gl_renderer(h) && !compose_view {
                 continue;
             }
             let (w, hh) = if self.dex_views.contains_key(&h) {

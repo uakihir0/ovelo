@@ -2306,12 +2306,13 @@ pub(crate) fn call(
             if crate::dbg_flag("OVELO_VIEWDBG") {
                 eprintln!("[viewdbg] builtin layout h{this} {l},{t},{r},{b}");
             }
-            // AOSP clears PFLAG_LAYOUT_REQUESTED once the view is laid out.
-            pseudo_set(vm, this, P_LAYOUT_REQ, V::I32(0));
+            // Keep the request flag through guest onLayout: an exception
+            // here leaves the tree unlaid-out, and clearing first makes the
+            // host scheduler treat the failed pass as final.
             let changed = frame_set(vm, this, l, t, r, b);
             pseudo_set(vm, this, P_LAYOUT_DONE, V::I32(1));
             if vm.has_dex_virtual(this, "onLayout", &["Z", "I", "I", "I", "I"]) {
-                if let Err(e) = vm.call_virtual_rt(
+                let out = vm.call_virtual_rt(
                     this,
                     "onLayout",
                     &[
@@ -2321,7 +2322,8 @@ pub(crate) fn call(
                         V::I32(r),
                         V::I32(b),
                     ],
-                ) {
+                );
+                if let Err(e) = out {
                     if crate::dbg_flag("OVELO_VIEWDBG") {
                         match &e {
                             crate::E::Vm(oe) => {
@@ -2334,10 +2336,13 @@ pub(crate) fn call(
                     }
                     return Err(e);
                 }
+                // AOSP clears PFLAG_LAYOUT_REQUESTED once the view is laid out.
+                pseudo_set(vm, this, P_LAYOUT_REQ, V::I32(0));
             } else {
                 // Framework skeleton container — position children
                 // generically or they keep their 0×0 frames.
                 group_layout_fallback(vm, this, l, t, r, b);
+                pseudo_set(vm, this, P_LAYOUT_REQ, V::I32(0));
             }
             Some(None)
         }
