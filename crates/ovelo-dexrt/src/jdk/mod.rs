@@ -24,7 +24,7 @@ pub(crate) mod xml;
 
 use crate::value::{HostState, Obj, V};
 use crate::{Rt, Vm};
-use std::collections::HashMap;
+use hashbrown::HashMap;
 
 pub(crate) const OBJ: &str = "Ljava/lang/Object;";
 pub(crate) const THROWABLE: &str = "Ljava/lang/Throwable;";

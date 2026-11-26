@@ -5,7 +5,7 @@
 //! load real binary XML, and the `id` entries resolve `@+id/name`
 //! references found in that XML.
 
-use std::collections::HashMap;
+use hashbrown::HashMap;
 
 use ovelo_apk::arsc::{parse_arsc, EntryValue};
 use ovelo_apk::manifest::{parse_axml, Element};

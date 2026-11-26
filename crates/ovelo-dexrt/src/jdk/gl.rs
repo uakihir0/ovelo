@@ -4,7 +4,7 @@
 //! host 2D pipeline presents real GL content (line/fan meshes — the
 //! Vector Pinball table — without a GPU or EGL context).
 
-use std::collections::HashMap;
+use hashbrown::HashMap;
 use std::sync::Arc;
 use std::sync::Mutex;
 

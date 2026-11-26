@@ -1,6 +1,6 @@
 //! Runtime value model and object heap (design §04 "Heap and threads").
 
-use std::collections::HashMap;
+use hashbrown::HashMap;
 
 /// A register / field value. Wide values (`I64`, `F64`) are stored whole in
 /// one slot; the DEX pair-register convention is handled by the VM mirroring

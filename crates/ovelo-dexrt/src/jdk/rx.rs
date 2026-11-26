@@ -505,7 +505,7 @@ impl Rx {
     fn add(
         &self,
         list: &mut Vec<(usize, Saves)>,
-        seen: &mut std::collections::HashSet<usize>,
+        seen: &mut hashbrown::HashSet<usize>,
         pc: usize,
         sp: usize,
         saves: &Saves,
@@ -575,11 +575,11 @@ impl Rx {
             if !seeded && matched.is_none() {
                 // New lowest-priority thread starting at sp. Anchored
                 // searches seed once; find() seeds each position.
-                let mut seen = std::collections::HashSet::new();
+                let mut seen = hashbrown::HashSet::new();
                 self.add(&mut clist, &mut seen, 0, sp, &init, lo, hi, text);
                 seeded = anchored;
             }
-            let mut seen_n = std::collections::HashSet::new();
+            let mut seen_n = hashbrown::HashSet::new();
             for (pc, saves) in clist.drain(..) {
                 let ok = match &self.insts[pc] {
                     Inst::Match => {

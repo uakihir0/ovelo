@@ -26,9 +26,9 @@ use cranelift_codegen::settings::{self, Configurable};
 use cranelift_frontend::{FunctionBuilder, FunctionBuilderContext, Variable};
 use cranelift_jit::{JITBuilder, JITModule};
 use cranelift_module::{Linkage, Module};
+use hashbrown::HashMap;
 use ovelo_dex::CodeItem;
 use ovelo_dex::{decode_all, Insn};
-use std::collections::HashMap;
 
 /// Compiled method: `(regs, trap) -> i64`.
 pub type AotFn = unsafe extern "C" fn(*mut i64, *mut u8) -> i64;

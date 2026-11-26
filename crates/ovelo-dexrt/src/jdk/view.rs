@@ -1733,6 +1733,7 @@ pub(crate) fn call(
                         eprintln!("[gldbg] setRenderer view={this} r={r} class={class}");
                     }
                     pseudo_set(vm, this, crate::jdk::gl::P_GLES_RENDERER, V::Ref(r));
+                    vm.gl_renderer_active = true;
                 }
             }
             Some(None)
@@ -4867,7 +4868,7 @@ fn lp_ctor(vm: &mut Vm, class: &str, sig: &str, args: &[V]) {
     // name — but only owners inside THIS object's own class hierarchy:
     // an unrelated class declaring its own `width` must not get a
     // LayoutParams value.
-    let mut hier = std::collections::HashSet::new();
+    let mut hier = hashbrown::HashSet::new();
     let mut d = class_of(vm, V::Ref(this));
     for _ in 0..32 {
         if !hier.insert(d.clone()) {

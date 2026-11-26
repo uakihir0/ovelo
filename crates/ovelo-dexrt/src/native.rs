@@ -8,7 +8,7 @@
 // code. Safety invariants are documented at each site.
 #![allow(unsafe_code)]
 
-use std::collections::{HashMap, HashSet};
+use hashbrown::{HashMap, HashSet};
 use std::ffi::{c_void, CString};
 #[cfg(target_os = "macos")]
 use std::sync::OnceLock;
@@ -277,7 +277,7 @@ const TCB_WORDS: usize = 8192;
 #[cfg(target_arch = "aarch64")]
 const SLOT_HOST_TPIDR: usize = 4095;
 #[cfg(target_arch = "aarch64")]
-static TCB_MAP: std::sync::Mutex<Option<std::collections::HashMap<u64, usize>>> =
+static TCB_MAP: std::sync::Mutex<Option<hashbrown::HashMap<u64, usize>>> =
     std::sync::Mutex::new(None);
 
 /// This thread's guest TCB block — created on first use, leaked
@@ -287,7 +287,7 @@ static TCB_MAP: std::sync::Mutex<Option<std::collections::HashMap<u64, usize>>> 
 pub(crate) fn guest_tcb() -> *mut u64 {
     let tid = unsafe { mach_thread_id() };
     let mut g = TCB_MAP.lock().unwrap();
-    let m = g.get_or_insert_with(std::collections::HashMap::new);
+    let m = g.get_or_insert_with(hashbrown::HashMap::new);
     if let Some(&p) = m.get(&tid) {
         return p as *mut u64;
     }
@@ -609,7 +609,7 @@ pub(crate) fn with_guest_tls_at<R>(_site: &'static str, f: impl FnOnce() -> R) -
 /// Emitted lazily into a MAP_JIT page.
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 mod thunk {
-    use std::collections::HashMap;
+    use hashbrown::HashMap;
     use std::ffi::c_void;
     use std::sync::Mutex;
 
@@ -2243,7 +2243,7 @@ fn guestptr_log(tag: &str, d: *mut c_void, n: usize) {
 /// Probe one byte per page via Mach and cache the verdict per page.
 #[cfg(target_os = "macos")]
 fn src_readable(p: *const c_void, n: usize) -> bool {
-    use std::collections::HashSet;
+    use hashbrown::HashSet;
     static GOOD: std::sync::LazyLock<Mutex<HashSet<usize>>> =
         std::sync::LazyLock::new(|| Mutex::new(HashSet::new()));
     static BAD: std::sync::LazyLock<Mutex<HashSet<usize>>> =
@@ -2915,16 +2915,15 @@ pub(crate) fn guest_free(p: usize) {
 }
 
 #[cfg(target_os = "macos")]
-static LIVE_ALLOCS: std::sync::LazyLock<std::sync::Mutex<std::collections::HashMap<usize, usize>>> =
-    std::sync::LazyLock::new(|| std::sync::Mutex::new(std::collections::HashMap::new()));
+static LIVE_ALLOCS: std::sync::LazyLock<std::sync::Mutex<hashbrown::HashMap<usize, usize>>> =
+    std::sync::LazyLock::new(|| std::sync::Mutex::new(hashbrown::HashMap::new()));
 /// ptr -> poisoned region length. Under OVELO_FREEDBG frees are
 /// quarantined: the block is poisoned and STAYS allocated, so a
 /// use-after-free write lands in memory malloc no longer manages and
 /// shows up as a poison violation instead of freelist damage.
 #[cfg(target_os = "macos")]
-static FREED_ALLOCS: std::sync::LazyLock<
-    std::sync::Mutex<std::collections::HashMap<usize, usize>>,
-> = std::sync::LazyLock::new(|| std::sync::Mutex::new(std::collections::HashMap::new()));
+static FREED_ALLOCS: std::sync::LazyLock<std::sync::Mutex<hashbrown::HashMap<usize, usize>>> =
+    std::sync::LazyLock::new(|| std::sync::Mutex::new(hashbrown::HashMap::new()));
 #[cfg(target_os = "macos")]
 const GDB_CANARY: u64 = 0x0e10_dead_c0de_f00d;
 /// Bytes the guest may legally write — the real usable size of the
@@ -4172,7 +4171,7 @@ extern "C" fn sh_setname(_t: usize, _name: usize) -> usize {
 // ----------------------------------------------------------------
 #[cfg(target_os = "macos")]
 mod bsync {
-    use std::collections::HashMap;
+    use hashbrown::HashMap;
     use std::sync::{Condvar, LazyLock, Mutex};
 
     pub enum Obj {
@@ -4877,7 +4876,7 @@ extern "C" fn sh_sigaction(sig: i32, act: usize, oact: usize) -> i32 {
 /// Guest-requested signal handlers we declined to install (sig ->
 /// sa_handler address), kept for diagnostics/chaining.
 #[cfg(target_os = "macos")]
-static GUEST_SIG_HANDLERS: std::sync::Mutex<Option<std::collections::HashMap<i32, usize>>> =
+static GUEST_SIG_HANDLERS: std::sync::Mutex<Option<hashbrown::HashMap<i32, usize>>> =
     std::sync::Mutex::new(None);
 
 /// Task-level Mach exception port: the kernel consults it before BSD

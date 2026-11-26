@@ -25,9 +25,9 @@ pub use value::{Heap, HostState, Obj, V};
 
 use aot::{AotFn, TRAP_DIV_ZERO, TRAP_REM_ZERO};
 
+use hashbrown::HashMap;
 use ovelo_dex::{decode_all, ClassData, ClassDef, DexFile, EncodedMethod, Insn, TryItem};
 use ovelo_error::{ErrorCategory, OveloError, Phase, Result};
-use std::collections::HashMap;
 
 fn err(cause: &str) -> OveloError {
     OveloError::new(ErrorCategory::DexUnsupported, Phase::DexExec, cause)
@@ -330,7 +330,7 @@ pub struct Vm {
     /// Services that called `stopSelf` before `startService` finished
     /// registering them (self-stop inside `onCreate`) — the starter
     /// must not insert or start them.
-    pub(crate) service_stop_pending: std::collections::HashSet<u32>,
+    pub(crate) service_stop_pending: hashbrown::HashSet<u32>,
     /// Services whose `onDestroy` is owed on the next drain — deferred
     /// so `onStartCommand`/`startService` finish before teardown runs.
     pub(crate) pending_destroy: Vec<u32>,
@@ -437,7 +437,7 @@ pub struct Vm {
     /// Their tasks must run one at a time; treating `execute` as an
     /// unbounded global queue lets rate limiters (kotlinx/Tasks.org
     /// `Throttle`) run every queued task concurrently.
-    pub(crate) single_executors: std::collections::HashSet<u32>,
+    pub(crate) single_executors: hashbrown::HashSet<u32>,
     /// executor handle -> FIFO tasks waiting for its active task.
     pub(crate) executor_queues: HashMap<u32, std::collections::VecDeque<u32>>,
     /// executor handle -> currently running runnable.
@@ -459,6 +459,9 @@ pub struct Vm {
     /// threads; strict FIFO lets continuously re-posted Compose main-queue
     /// work starve long-lived repository/parser workers forever.
     sched_prefer_worker: bool,
+    /// Any `GLSurfaceView.setRenderer` has been bound. Non-GL apps
+    /// must not scan every view every frame looking for renderers.
+    pub(crate) gl_renderer_active: bool,
     /// The one `Choreographer.getInstance()` handle — identity matters
     /// (dex code compares instances).
     pub(crate) choreographer_h: u32,
@@ -508,10 +511,10 @@ pub struct Vm {
     /// legitimately park/reschedule forever (game loops like bouncy's
     /// FieldDriver), unlike executor workers which the repark budget
     /// exists to stop. Keyed by runnable handle.
-    pub(crate) thread_runnables: std::collections::HashSet<u32>,
+    pub(crate) thread_runnables: hashbrown::HashSet<u32>,
     /// Runnable handle → the Thread that `start()`ed it, so isAlive
     /// distinguishes which Thread a shared Runnable runs on.
-    pub(crate) runnable_thread: std::collections::HashMap<u32, u32>,
+    pub(crate) runnable_thread: hashbrown::HashMap<u32, u32>,
     /// The runnable `run_on_worker` is executing right now — lets
     /// `Thread.sleep(ms)` record a wake deadline against it.
     pub(crate) cur_runnable: u32,
@@ -522,16 +525,16 @@ pub struct Vm {
     /// Runnables whose `sleep_until` deadline came from
     /// `LockSupport.park*`/`Object.wait(ms)` — interruptible waits an
     /// `unpark`/`notify` may cut short, unlike `Thread.sleep`.
-    pub(crate) park_waiters: std::collections::HashSet<u32>,
+    pub(crate) park_waiters: hashbrown::HashSet<u32>,
     /// Handles currently sitting in `delayed_runnables` whose deadline
     /// is interruptible — `wake_parked` promotes these early.
-    pub(crate) unparkable_delayed: std::collections::HashSet<u32>,
+    pub(crate) unparkable_delayed: hashbrown::HashSet<u32>,
     /// Runnables whose latest promotion out of `delayed_runnables` was
     /// their own deadline expiring — not an `unpark`. An interruptible
     /// parker that re-parks straight after a deadline wake ticks
     /// `deadline_park_cycles` (a kotlinx surplus worker re-parks here
     /// when its keep-alive check should have retired it).
-    pub(crate) deadline_woke: std::collections::HashSet<u32>,
+    pub(crate) deadline_woke: hashbrown::HashSet<u32>,
     /// Consecutive deadline-expiry wake→re-park cycles per runnable —
     /// at the cap the runnable is retired into `parked_runnables`
     /// (still revivable by `unpark`/`enqueue_runnable`), approximating
@@ -542,7 +545,7 @@ pub struct Vm {
     /// so without the flag a one-shot task that sleeps mid-body
     /// (`load(); sleep(200); post()`) re-parks at the same call on
     /// every drain and never finishes.
-    pub(crate) slept_once: std::collections::HashSet<u32>,
+    pub(crate) slept_once: hashbrown::HashSet<u32>,
     /// ViewTreeObserver handle -> registered onGlobalLayout listeners.
     pub(crate) vto_listeners: HashMap<u32, Vec<u32>>,
     /// ViewTreeObserver handle -> `OnPreDrawListener` handles — Glide's
@@ -559,12 +562,12 @@ pub struct Vm {
     /// hand the slot back and forth until the instruction budget
     /// kills one (and its task is lost). Cleared whenever fresh work
     /// is enqueued — it may target those workers' internal queues.
-    reparked: std::collections::HashSet<u32>,
+    reparked: hashbrown::HashSet<u32>,
     /// Array handles whose fill-loop peephole scan found a non-uniform
     /// range — re-scanning every loop iteration is O(n²), so a failed
     /// handle is remembered and the check skipped from then on. A handle
     /// that later becomes uniform just loses a skip (perf only).
-    fill_bad: std::collections::HashSet<u32>,
+    fill_bad: hashbrown::HashSet<u32>,
     /// Consecutive `park_drain` calls that drained only re-parked
     /// workers — bounded so mutual waiters yield to the outer drain
     /// (which re-runs them with a fresh budget) instead of spinning
@@ -612,7 +615,7 @@ pub struct Vm {
     /// Permission names currently granted to the guest package —
     /// seeded from the manifest's normal-level `<uses-permission>`
     /// entries and grown by `requestPermissions` (user grants all).
-    pub granted_permissions: std::collections::HashSet<String>,
+    pub granted_permissions: hashbrown::HashSet<String>,
 }
 
 /// Permissions Android grants automatically at install time
@@ -845,20 +848,21 @@ impl Vm {
             coil_jobs: Vec::new(),
             service_start_id: HashMap::new(),
             service_seq: 0,
-            service_stop_pending: std::collections::HashSet::new(),
+            service_stop_pending: hashbrown::HashSet::new(),
             pending_destroy: Vec::new(),
             pending_jobs: Vec::new(),
             theme_id: 0,
             total_steps: 0,
             pending_activity: None,
             pending_runnables: std::collections::VecDeque::new(),
-            single_executors: std::collections::HashSet::new(),
+            single_executors: hashbrown::HashSet::new(),
             executor_queues: HashMap::new(),
             executor_active: HashMap::new(),
             runnable_executor: HashMap::new(),
             pending_attach_callbacks: std::collections::VecDeque::new(),
             frame_callbacks: Vec::new(),
             sched_prefer_worker: false,
+            gl_renderer_active: false,
             choreographer_h: 0,
             byteorder_h: std::cell::Cell::new(0),
             activity_callbacks: Vec::new(),
@@ -869,23 +873,23 @@ impl Vm {
             host_throw: None,
             in_host_retry: false,
             surface_sizes: HashMap::new(),
-            thread_runnables: std::collections::HashSet::new(),
-            runnable_thread: std::collections::HashMap::new(),
+            thread_runnables: hashbrown::HashSet::new(),
+            runnable_thread: hashbrown::HashMap::new(),
             cur_runnable: 0,
             sleep_until: HashMap::new(),
-            slept_once: std::collections::HashSet::new(),
+            slept_once: hashbrown::HashSet::new(),
             vto_listeners: HashMap::new(),
             vto_predraw: HashMap::new(),
             draining: false,
             park_depth: 0,
-            reparked: std::collections::HashSet::new(),
-            fill_bad: std::collections::HashSet::new(),
+            reparked: hashbrown::HashSet::new(),
+            fill_bad: hashbrown::HashSet::new(),
             park_spins: 0,
             repark_counts: HashMap::new(),
             parked_runnables: HashMap::new(),
-            park_waiters: std::collections::HashSet::new(),
-            unparkable_delayed: std::collections::HashSet::new(),
-            deadline_woke: std::collections::HashSet::new(),
+            park_waiters: hashbrown::HashSet::new(),
+            unparkable_delayed: hashbrown::HashSet::new(),
+            deadline_woke: hashbrown::HashSet::new(),
             deadline_park_cycles: HashMap::new(),
             media_ids: HashMap::new(),
             next_media_id: 0,
@@ -918,7 +922,7 @@ impl Vm {
             layout_gen_done: std::cell::Cell::new(u64::MAX),
             gc_mark: 65_536,
             class_mirrors: HashMap::new(),
-            granted_permissions: std::collections::HashSet::new(),
+            granted_permissions: hashbrown::HashSet::new(),
         };
         v.add_dex(dex)?;
         Ok(v)
@@ -2850,6 +2854,11 @@ impl Vm {
         jdk::pseudo_get(self, view, jdk::gl::P_GLES_RENDERER).is_some()
     }
 
+    /// Whether any view ever bound a GL renderer.
+    pub fn any_gl_renderer(&self) -> bool {
+        self.gl_renderer_active
+    }
+
     /// Cheap P_IS_VIEW probe — `dex_view` builds full node info
     /// (attrs, children, strings) and costs far more than callers
     /// that only need to know whether a handle is a view.
@@ -2921,10 +2930,10 @@ impl Vm {
     }
 
     fn describe_throw(&self, h: u32) -> String {
-        self.describe_throw_inner(h, &mut std::collections::HashSet::new())
+        self.describe_throw_inner(h, &mut hashbrown::HashSet::new())
     }
 
-    fn describe_throw_inner(&self, h: u32, seen: &mut std::collections::HashSet<u32>) -> String {
+    fn describe_throw_inner(&self, h: u32, seen: &mut hashbrown::HashSet<u32>) -> String {
         // Guest exceptions sometimes store themselves (or a cycle of
         // wrappers) as their own cause — bound the walk.
         if !seen.insert(h) {
@@ -4265,7 +4274,7 @@ impl Vm {
     /// through the whole class/interface hierarchy — where JVM dispatch
     /// lands after the superclass chain misses (default methods).
     fn find_interface_method(&self, start: GIdx, name: &str, sig: &str) -> Option<Loc> {
-        let mut seen = std::collections::HashSet::new();
+        let mut seen = hashbrown::HashSet::new();
         let mut stack = vec![start];
         while let Some(ci) = stack.pop() {
             if !seen.insert(ci) {
@@ -5782,7 +5791,7 @@ impl Vm {
             // In-progress or already-failed: probing more is wrong.
             _ if self.classes.contains_key(&owner_idx) => return None,
             _ => {
-                let prev3: std::collections::HashSet<GIdx> = self
+                let prev3: hashbrown::HashSet<GIdx> = self
                     .classes
                     .iter()
                     .filter(|(_, c)| c.clinit == 3)
