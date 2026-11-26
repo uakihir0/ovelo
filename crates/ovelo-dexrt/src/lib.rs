@@ -2167,7 +2167,7 @@ impl Vm {
                 .iter()
                 .position(|(h, _, due)| *h == r && *due == park_due)
             {
-                self.delayed_runnables.swap_remove(i);
+                self.delayed_runnables.remove(i);
             }
             self.unparkable_delayed.remove(&r);
             self.unparkable_delayed_due.remove(&r);
@@ -2244,7 +2244,7 @@ impl Vm {
                 .iter()
                 .position(|(h, _, due)| *h == r && *due == park_due)
             {
-                self.delayed_runnables.swap_remove(i);
+                self.delayed_runnables.remove(i);
             }
             self.unparkable_delayed.remove(&r);
             self.unparkable_delayed_due.remove(&r);
