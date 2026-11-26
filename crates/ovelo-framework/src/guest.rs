@@ -1526,6 +1526,12 @@ pub fn drive_dex_layout_pass(vm: &mut Vm, activity: u32, frame: u32, win_w: i32,
                 .frame
                 .is_some_and(|f| (f.2 - f.0, f.3 - f.1) != (win_w, win_h));
         let needs_layout = root_size_changed || info.frame.is_none() || info.layout_requested;
+        if viewdbg() && !parent_is_dex {
+            eprintln!(
+                "[viewdbg] layout? h{h} {} need={} frame={:?} req={} rootchg={}",
+                info.desc, needs_layout, info.frame, info.layout_requested, root_size_changed
+            );
+        }
         // Drive subtree roots regardless of group-ness: a leaf custom
         // view at the XML root has no dex parent to measure/layout it,
         // so without this its frame stays unset and `onDraw` ops never
