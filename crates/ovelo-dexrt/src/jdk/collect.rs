@@ -76,6 +76,47 @@ fn collections_eq(vm: &mut Vm, a: u32, b: u32, depth: u8) -> Rt<Option<bool>> {
     Ok(Some(true))
 }
 
+fn arrays_deep_eq(vm: &mut Vm, a: u32, b: u32, depth: u8) -> Rt<bool> {
+    if a == b {
+        return Ok(true);
+    }
+    if depth >= 16 {
+        return Ok(false);
+    }
+    let (elem, av, bv) = match (vm.heap.get(a), vm.heap.get(b)) {
+        (Some(Obj::Array { elem, data: av }), Some(Obj::Array { data: bv, .. })) => {
+            (elem.clone(), av.clone(), bv.clone())
+        }
+        _ => return Ok(false),
+    };
+    if av.len() != bv.len() {
+        return Ok(false);
+    }
+    for (x, y) in av.iter().zip(bv.iter()) {
+        let eq = match (elem.as_str(), *x, *y) {
+            ("F", V::F32(x), V::F32(y)) => x.to_bits() == y.to_bits() || (x.is_nan() && y.is_nan()),
+            ("D", V::F64(x), V::F64(y)) => x.to_bits() == y.to_bits() || (x.is_nan() && y.is_nan()),
+            ("B", V::I32(x), V::I32(y)) => x as u8 == y as u8,
+            (_, V::Ref(xh), V::Ref(yh)) if elem.starts_with('L') || elem.starts_with('[') => {
+                if xh != 0
+                    && yh != 0
+                    && matches!(vm.heap.get(xh), Some(Obj::Array { .. }))
+                    && matches!(vm.heap.get(yh), Some(Obj::Array { .. }))
+                {
+                    arrays_deep_eq(vm, xh, yh, depth + 1)?
+                } else {
+                    elem_eq_depth(vm, *x, *y, depth + 1)?
+                }
+            }
+            _ => x == y,
+        };
+        if !eq {
+            return Ok(false);
+        }
+    }
+    Ok(true)
+}
+
 fn elem_eq_depth(vm: &mut Vm, e: V, other: V, depth: u8) -> Rt<bool> {
     if let (V::Ref(a), V::Ref(b)) = (e, other) {
         if a != 0 && b != 0 {
@@ -2251,7 +2292,12 @@ fn arrays_static(vm: &mut Vm, name: &str, _sig: &str, args: &[V]) -> Rt<Option<O
                 },
                 _ => None,
             };
-            let eq = if let Some((ex, x, _ey, y)) = arrays {
+            let eq = if name == "deepEquals" {
+                match (args[0], args[1]) {
+                    (V::Ref(a), V::Ref(b)) => arrays_deep_eq(vm, a, b, 0)?,
+                    _ => args[0] == args[1],
+                }
+            } else if let Some((ex, x, _ey, y)) = arrays {
                 if x.len() != y.len() {
                     false
                 } else {
