@@ -461,11 +461,22 @@ pub(crate) fn run_on_worker(
     // LockSupport.unpark targets it. The shared worker placeholder is
     // only a fallback for executor runnables without a Thread owner.
     worker_thread(vm);
-    vm.cur_thread = vm
-        .runnable_thread
-        .get(&r)
-        .copied()
-        .unwrap_or(vm.worker_thread_h);
+    vm.cur_thread = vm.runnable_thread.get(&r).copied().unwrap_or_else(|| {
+        // Executor/dispatcher tasks have no Thread.start owner, but
+        // code can capture Thread.currentThread() while the task runs
+        // and later unpark exactly that object. Give each such task a
+        // distinct worker-thread object instead of aliasing every task
+        // to the shared fallback.
+        let V::Ref(t) = host(
+            vm,
+            "Ljava/lang/Thread;",
+            HostState::StrBuf("worker-task".into()),
+        ) else {
+            unreachable!()
+        };
+        vm.runnable_thread.insert(r, t);
+        t
+    });
     vm.cur_runnable = r;
     let v = if is_message(vm, r) {
         dispatch_message(vm, r)

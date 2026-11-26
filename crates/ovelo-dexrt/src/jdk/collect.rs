@@ -618,6 +618,10 @@ pub(crate) fn call(
                     }
                     vm.sleep_until.insert(vm.cur_runnable, due_ms.max(0) as u64);
                     vm.park_waiters.insert(vm.cur_runnable);
+                    if vm.cur_thread != 0 {
+                        vm.parked_thread_runnable
+                            .insert(vm.cur_thread, vm.cur_runnable);
+                    }
                     return Err(crate::E::Vm(crate::err("ovelo.park")));
                 }
                 vm.park_drain()?;

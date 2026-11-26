@@ -523,6 +523,11 @@ pub struct Vm {
     /// Runnable handle → the Thread that `start()`ed it, so isAlive
     /// distinguishes which Thread a shared Runnable runs on.
     pub(crate) runnable_thread: hashbrown::HashMap<u32, u32>,
+    /// Thread object that an interruptibly parked runnable was
+    /// executing on — `LockSupport.unpark(thread)` uses this when the
+    /// thread has no permanent `Thread.start` owner (main callbacks and
+    /// executor tasks).
+    pub(crate) parked_thread_runnable: hashbrown::HashMap<u32, u32>,
     /// The runnable `run_on_worker` is executing right now — lets
     /// `Thread.sleep(ms)` record a wake deadline against it.
     pub(crate) cur_runnable: u32,
@@ -884,6 +889,7 @@ impl Vm {
             surface_sizes: HashMap::new(),
             thread_runnables: hashbrown::HashSet::new(),
             runnable_thread: hashbrown::HashMap::new(),
+            parked_thread_runnable: hashbrown::HashMap::new(),
             cur_runnable: 0,
             sleep_until: HashMap::new(),
             slept_once: hashbrown::HashSet::new(),
@@ -2193,6 +2199,7 @@ impl Vm {
         self.unparkable_delayed.remove(&r);
         self.deadline_woke.remove(&r);
         self.deadline_park_cycles.remove(&r);
+        self.parked_thread_runnable.retain(|_, parked| *parked != r);
         self.frame_callbacks.retain(|(h, _)| *h != r);
     }
 
@@ -2250,10 +2257,15 @@ impl Vm {
     /// keep the previous broad wake as a compatibility fallback.
     pub(crate) fn unpark_thread(&mut self, thread: u32) {
         let target = self
-            .runnable_thread
-            .iter()
-            .find(|(_, t)| **t == thread)
-            .map(|(r, _)| *r);
+            .parked_thread_runnable
+            .get(&thread)
+            .copied()
+            .or_else(|| {
+                self.runnable_thread
+                    .iter()
+                    .find(|(_, t)| **t == thread)
+                    .map(|(r, _)| *r)
+            });
         if let Some(r) = target {
             self.wake_runnable(r);
         }
@@ -2323,6 +2335,8 @@ impl Vm {
         roots.extend(self.parked_runnables.keys().copied());
         roots.extend(self.thread_runnables.iter().copied());
         roots.extend(self.runnable_thread.values().copied());
+        roots.extend(self.parked_thread_runnable.keys().copied());
+        roots.extend(self.parked_thread_runnable.values().copied());
         roots.extend(jdk::gl::live_handles());
         roots.extend(self.sleep_until.keys().copied());
         roots.extend(self.reparked.iter().copied());
@@ -2705,6 +2719,7 @@ impl Vm {
                     // captured references.
                     self.thread_runnables.remove(&r);
                     self.runnable_thread.remove(&r);
+                    self.parked_thread_runnable.retain(|_, parked| *parked != r);
                     self.sleep_until.remove(&r);
                     self.park_waiters.remove(&r);
                     self.unparkable_delayed.remove(&r);
