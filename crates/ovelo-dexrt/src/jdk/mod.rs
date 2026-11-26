@@ -273,6 +273,22 @@ pub(crate) fn arr(vm: &mut Vm, elem: &str, data: Vec<V>) -> V {
     }))
 }
 
+pub(crate) fn boxed_boolean(vm: &mut Vm, value: bool) -> V {
+    let idx = value as usize;
+    if vm.bool_cache[idx] != 0 {
+        return V::Ref(vm.bool_cache[idx]);
+    }
+    let v = host(
+        vm,
+        "Ljava/lang/Boolean;",
+        HostState::Slot(V::I32(value as i32)),
+    );
+    if let V::Ref(h) = v {
+        vm.bool_cache[idx] = h;
+    }
+    v
+}
+
 pub(crate) fn host(vm: &mut Vm, desc: &str, state: HostState) -> V {
     V::Ref(vm.alloc_host(desc, state))
 }
@@ -1887,12 +1903,8 @@ pub(crate) fn sfield(vm: &mut Vm, owner: &str, name: &str, ftype: &str) -> Optio
         ("Landroid/os/Environment;", "DIRECTORY_AUDIOBOOKS") => {
             return Some(jstr(vm, "Audiobooks"));
         }
-        ("Ljava/lang/Boolean;", "TRUE") => {
-            return Some(host(vm, "Ljava/lang/Boolean;", HostState::Slot(V::I32(1))))
-        }
-        ("Ljava/lang/Boolean;", "FALSE") => {
-            return Some(host(vm, "Ljava/lang/Boolean;", HostState::Slot(V::I32(0))))
-        }
+        ("Ljava/lang/Boolean;", "TRUE") => return Some(boxed_boolean(vm, true)),
+        ("Ljava/lang/Boolean;", "FALSE") => return Some(boxed_boolean(vm, false)),
         (o, "TYPE") if lang::primitive_type(o) => {
             // `Integer.TYPE` is `int.class` — the primitive descriptor,
             // not the boxed class.

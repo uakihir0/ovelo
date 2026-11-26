@@ -296,6 +296,10 @@ pub struct Vm {
     /// `values()`, `valueOf` and static-field mints share handles so
     /// `Paint.Cap.valueOf("ROUND") == Paint.Cap.ROUND` holds.
     pub(crate) enum_name_cache: HashMap<(String, String), u32>,
+    /// Canonical boxed Boolean objects — Boolean.valueOf and the TRUE/FALSE
+    /// constants must be identity-stable because bytecode uses reference
+    /// comparisons for sentinel/control-flow checks.
+    pub(crate) bool_cache: [u32; 2],
     /// Attached `TextClock` views that tick — refreshed once per
     /// `drain_runnables` pass (AOSP ticks them per postDelayed).
     pub clock_views: Vec<u32>,
@@ -840,6 +844,7 @@ impl Vm {
             touch_gesture_down_time: -1,
             enum_cache: HashMap::new(),
             enum_name_cache: HashMap::new(),
+            bool_cache: [0, 0],
             clock_views: Vec::new(),
             apk_res: None,
             dbs: HashMap::new(),
@@ -2309,6 +2314,7 @@ impl Vm {
         // object entirely.
         roots.extend(self.enum_cache.values().copied());
         roots.extend(self.enum_name_cache.values().copied());
+        roots.extend(self.bool_cache.into_iter().filter(|h| *h != 0));
         roots.extend(self.content_views.keys().copied());
         roots.extend(self.content_views.values().copied());
         roots.extend(self.decor_roots.keys().copied());
@@ -4533,7 +4539,7 @@ impl Vm {
         for i in z_params {
             let ai = i + has_receiver as usize;
             if let Some(V::I32(b)) = args.get(ai).copied() {
-                args[ai] = jdk::host(self, "Ljava/lang/Boolean;", HostState::Slot(V::I32(b)));
+                args[ai] = jdk::boxed_boolean(self, b != 0);
             }
         }
         let args = args.as_slice();

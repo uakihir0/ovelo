@@ -926,6 +926,8 @@ fn boxed_call(
                         return Err(e);
                     }
                 }
+            } else if class == "Ljava/lang/Boolean;" {
+                Some(Some(super::boxed_boolean(vm, i32v(args[0]) != 0)))
             } else {
                 Some(Some(host(vm, class, HostState::Slot(args[0]))))
             }
