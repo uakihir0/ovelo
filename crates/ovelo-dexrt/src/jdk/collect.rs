@@ -591,14 +591,14 @@ pub(crate) fn call(
                 if name == "parkNanos" && args.last().map(|v| i64v(*v)) == Some(0) {
                     return Ok(Some(None));
                 }
+                if vm.cur_thread != 0 && vm.unpark_permits.remove(&vm.cur_thread) {
+                    // LockSupport unparks are permits, not just wakeups
+                    // of an already-parked thread. A permit arriving
+                    // before this park lets the first subsequent park
+                    // return immediately — including indefinite park().
+                    return Ok(Some(None));
+                }
                 if due_ms > now_ms() && vm.cur_runnable != 0 {
-                    if vm.cur_thread != 0 && vm.unpark_permits.remove(&vm.cur_thread) {
-                        // LockSupport unparks are permits, not just
-                        // wakeups of an already-parked thread. A permit
-                        // arriving before this park lets the first
-                        // subsequent park return immediately.
-                        return Ok(Some(None));
-                    }
                     let blocking_waiter = vm.cur_thread != 0
                         && vm.cur_thread != vm.main_thread_h
                         && vm.describe_stack().last().is_some_and(|m| {
