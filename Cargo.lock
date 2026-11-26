@@ -1801,6 +1801,7 @@ dependencies = [
 name = "ovelo-cli"
 version = "0.1.0"
 dependencies = [
+ "hashbrown 0.15.5",
  "ovelo-apk",
  "ovelo-dex",
  "ovelo-dexrt",
@@ -1826,6 +1827,7 @@ dependencies = [
  "cranelift-jit",
  "cranelift-module",
  "cranelift-native",
+ "hashbrown 0.15.5",
  "image",
  "ovelo-apk",
  "ovelo-dex",

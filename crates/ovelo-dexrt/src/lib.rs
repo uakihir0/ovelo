@@ -17,7 +17,8 @@ mod value;
 
 pub use aot::Aot;
 pub use jdk::view::{
-    fire_global_layout, mark_layout_requested, DexViewInfo, P_BGCOLOR, P_TCOLOR, P_TEXT, P_TSIZE,
+    fire_global_layout, fire_pre_draw, mark_layout_requested, DexViewInfo, P_BGCOLOR, P_TCOLOR,
+    P_TEXT, P_TSIZE,
 };
 pub use jdk::{pseudo_get, pseudo_set, P_ACTION, P_APPINFO, P_COMPONENT, P_DATA, P_META, P_TARGET};
 pub use value::{CanvasOp, PaintState, PathCmd};
@@ -25,9 +26,9 @@ pub use value::{Heap, HostState, Obj, V};
 
 use aot::{AotFn, TRAP_DIV_ZERO, TRAP_REM_ZERO};
 
+use hashbrown::HashMap;
 use ovelo_dex::{decode_all, ClassData, ClassDef, DexFile, EncodedMethod, Insn, TryItem};
 use ovelo_error::{ErrorCategory, OveloError, Phase, Result};
-use std::collections::HashMap;
 
 fn err(cause: &str) -> OveloError {
     OveloError::new(ErrorCategory::DexUnsupported, Phase::DexExec, cause)
@@ -114,6 +115,7 @@ fn proto_sig(d: &DexFile, pidx: u32) -> Result<String> {
 /// are per-DEX; the VM merges all loaded dexes into one index space so a
 /// class defined in classes2.dex resolves from an invoke in classes.dex.
 pub(crate) type GIdx = u64;
+type MethodSigRc = std::rc::Rc<(String, String, String)>;
 
 /// `(field_name, type_desc)` → `(owner_desc, canon key)` for every
 /// field across loaded dexes (owners differ under R8; the name+type is
@@ -294,6 +296,10 @@ pub struct Vm {
     /// `values()`, `valueOf` and static-field mints share handles so
     /// `Paint.Cap.valueOf("ROUND") == Paint.Cap.ROUND` holds.
     pub(crate) enum_name_cache: HashMap<(String, String), u32>,
+    /// Canonical boxed Boolean objects — Boolean.valueOf and the TRUE/FALSE
+    /// constants must be identity-stable because bytecode uses reference
+    /// comparisons for sentinel/control-flow checks.
+    pub(crate) bool_cache: [u32; 2],
     /// Attached `TextClock` views that tick — refreshed once per
     /// `drain_runnables` pass (AOSP ticks them per postDelayed).
     pub clock_views: Vec<u32>,
@@ -330,7 +336,7 @@ pub struct Vm {
     /// Services that called `stopSelf` before `startService` finished
     /// registering them (self-stop inside `onCreate`) — the starter
     /// must not insert or start them.
-    pub(crate) service_stop_pending: std::collections::HashSet<u32>,
+    pub(crate) service_stop_pending: hashbrown::HashSet<u32>,
     /// Services whose `onDestroy` is owed on the next drain — deferred
     /// so `onStartCommand`/`startService` finish before teardown runs.
     pub(crate) pending_destroy: Vec<u32>,
@@ -361,7 +367,7 @@ pub struct Vm {
     /// `midx` → `(class, name, proto_sig)` — decoding the proto string
     /// re-reads half the dex tables per call; layout/measure passes
     /// issue it tens of thousands of times on the same methods.
-    method_sig_cache: std::cell::RefCell<HashMap<GIdx, (String, String, String)>>,
+    method_sig_cache: std::cell::RefCell<HashMap<GIdx, MethodSigRc>>,
     /// `midx` → parsed `code_item` — `exec_frame` re-parsed registers,
     /// tries and handlers on every single call of a method.
     code_cache: std::cell::RefCell<HashMap<GIdx, std::rc::Rc<ovelo_dex::CodeItem>>>,
@@ -418,6 +424,8 @@ pub struct Vm {
     /// `midx` → `(params)ret` signature — the unresolved/builtin dispatch
     /// path re-decoded the proto's full param list on every invoke.
     proto_sig_cache: std::cell::RefCell<HashMap<GIdx, String>>,
+    /// const-string handle by global dex-local string index.
+    str_const_cache: std::cell::RefCell<HashMap<GIdx, u32>>,
     /// Bumped by every `pseudo_set` — lets the host render/layout
     /// passes skip rebuilding the dex-view tree when nothing changed.
     pub view_gen: u64,
@@ -437,13 +445,15 @@ pub struct Vm {
     /// Their tasks must run one at a time; treating `execute` as an
     /// unbounded global queue lets rate limiters (kotlinx/Tasks.org
     /// `Throttle`) run every queued task concurrently.
-    pub(crate) single_executors: std::collections::HashSet<u32>,
+    pub(crate) single_executors: hashbrown::HashSet<u32>,
     /// executor handle -> FIFO tasks waiting for its active task.
     pub(crate) executor_queues: HashMap<u32, std::collections::VecDeque<u32>>,
     /// executor handle -> currently running runnable.
     pub(crate) executor_active: HashMap<u32, u32>,
     /// runnable handle -> owning single-thread executor.
     pub(crate) runnable_executor: HashMap<u32, u32>,
+    /// Single-thread executor handle → its long-lived worker Thread.
+    pub(crate) executor_thread: HashMap<u32, u32>,
     /// Views whose attach state changed while guest composition/layout
     /// work was active. `onAttachedToWindow` is delivered on a later
     /// drain boundary so nested Compose content cannot compose inside
@@ -459,6 +469,9 @@ pub struct Vm {
     /// threads; strict FIFO lets continuously re-posted Compose main-queue
     /// work starve long-lived repository/parser workers forever.
     sched_prefer_worker: bool,
+    /// Any `GLSurfaceView.setRenderer` has been bound. Non-GL apps
+    /// must not scan every view every frame looking for renderers.
+    pub(crate) gl_renderer_active: bool,
     /// The one `Choreographer.getInstance()` handle — identity matters
     /// (dex code compares instances).
     pub(crate) choreographer_h: u32,
@@ -508,10 +521,15 @@ pub struct Vm {
     /// legitimately park/reschedule forever (game loops like bouncy's
     /// FieldDriver), unlike executor workers which the repark budget
     /// exists to stop. Keyed by runnable handle.
-    pub(crate) thread_runnables: std::collections::HashSet<u32>,
+    pub(crate) thread_runnables: hashbrown::HashSet<u32>,
     /// Runnable handle → the Thread that `start()`ed it, so isAlive
     /// distinguishes which Thread a shared Runnable runs on.
-    pub(crate) runnable_thread: std::collections::HashMap<u32, u32>,
+    pub(crate) runnable_thread: hashbrown::HashMap<u32, u32>,
+    /// Thread object that an interruptibly parked runnable was
+    /// executing on — `LockSupport.unpark(thread)` uses this when the
+    /// thread has no permanent `Thread.start` owner (main callbacks and
+    /// executor tasks).
+    pub(crate) parked_thread_runnable: hashbrown::HashMap<u32, u32>,
     /// The runnable `run_on_worker` is executing right now — lets
     /// `Thread.sleep(ms)` record a wake deadline against it.
     pub(crate) cur_runnable: u32,
@@ -522,16 +540,20 @@ pub struct Vm {
     /// Runnables whose `sleep_until` deadline came from
     /// `LockSupport.park*`/`Object.wait(ms)` — interruptible waits an
     /// `unpark`/`notify` may cut short, unlike `Thread.sleep`.
-    pub(crate) park_waiters: std::collections::HashSet<u32>,
+    pub(crate) park_waiters: hashbrown::HashSet<u32>,
     /// Handles currently sitting in `delayed_runnables` whose deadline
     /// is interruptible — `wake_parked` promotes these early.
-    pub(crate) unparkable_delayed: std::collections::HashSet<u32>,
+    pub(crate) unparkable_delayed: hashbrown::HashSet<u32>,
+    /// Runnable → the due timestamp of its interruptible-park delayed
+    /// slot, so a repost removes that slot rather than independent
+    /// delayed posts of the same Runnable object.
+    pub(crate) unparkable_delayed_due: HashMap<u32, u64>,
     /// Runnables whose latest promotion out of `delayed_runnables` was
     /// their own deadline expiring — not an `unpark`. An interruptible
     /// parker that re-parks straight after a deadline wake ticks
     /// `deadline_park_cycles` (a kotlinx surplus worker re-parks here
     /// when its keep-alive check should have retired it).
-    pub(crate) deadline_woke: std::collections::HashSet<u32>,
+    pub(crate) deadline_woke: hashbrown::HashSet<u32>,
     /// Consecutive deadline-expiry wake→re-park cycles per runnable —
     /// at the cap the runnable is retired into `parked_runnables`
     /// (still revivable by `unpark`/`enqueue_runnable`), approximating
@@ -542,7 +564,7 @@ pub struct Vm {
     /// so without the flag a one-shot task that sleeps mid-body
     /// (`load(); sleep(200); post()`) re-parks at the same call on
     /// every drain and never finishes.
-    pub(crate) slept_once: std::collections::HashSet<u32>,
+    pub(crate) slept_once: hashbrown::HashSet<u32>,
     /// ViewTreeObserver handle -> registered onGlobalLayout listeners.
     pub(crate) vto_listeners: HashMap<u32, Vec<u32>>,
     /// ViewTreeObserver handle -> `OnPreDrawListener` handles — Glide's
@@ -559,12 +581,12 @@ pub struct Vm {
     /// hand the slot back and forth until the instruction budget
     /// kills one (and its task is lost). Cleared whenever fresh work
     /// is enqueued — it may target those workers' internal queues.
-    reparked: std::collections::HashSet<u32>,
+    reparked: hashbrown::HashSet<u32>,
     /// Array handles whose fill-loop peephole scan found a non-uniform
     /// range — re-scanning every loop iteration is O(n²), so a failed
     /// handle is remembered and the check skipped from then on. A handle
     /// that later becomes uniform just loses a skip (perf only).
-    fill_bad: std::collections::HashSet<u32>,
+    fill_bad: hashbrown::HashSet<u32>,
     /// Consecutive `park_drain` calls that drained only re-parked
     /// workers — bounded so mutual waiters yield to the outer drain
     /// (which re-runs them with a fresh budget) instead of spinning
@@ -612,7 +634,7 @@ pub struct Vm {
     /// Permission names currently granted to the guest package —
     /// seeded from the manifest's normal-level `<uses-permission>`
     /// entries and grown by `requestPermissions` (user grants all).
-    pub granted_permissions: std::collections::HashSet<String>,
+    pub granted_permissions: hashbrown::HashSet<String>,
 }
 
 /// Permissions Android grants automatically at install time
@@ -833,6 +855,7 @@ impl Vm {
             touch_gesture_down_time: -1,
             enum_cache: HashMap::new(),
             enum_name_cache: HashMap::new(),
+            bool_cache: [0, 0],
             clock_views: Vec::new(),
             apk_res: None,
             dbs: HashMap::new(),
@@ -845,20 +868,22 @@ impl Vm {
             coil_jobs: Vec::new(),
             service_start_id: HashMap::new(),
             service_seq: 0,
-            service_stop_pending: std::collections::HashSet::new(),
+            service_stop_pending: hashbrown::HashSet::new(),
             pending_destroy: Vec::new(),
             pending_jobs: Vec::new(),
             theme_id: 0,
             total_steps: 0,
             pending_activity: None,
             pending_runnables: std::collections::VecDeque::new(),
-            single_executors: std::collections::HashSet::new(),
+            single_executors: hashbrown::HashSet::new(),
             executor_queues: HashMap::new(),
             executor_active: HashMap::new(),
             runnable_executor: HashMap::new(),
+            executor_thread: HashMap::new(),
             pending_attach_callbacks: std::collections::VecDeque::new(),
             frame_callbacks: Vec::new(),
             sched_prefer_worker: false,
+            gl_renderer_active: false,
             choreographer_h: 0,
             byteorder_h: std::cell::Cell::new(0),
             activity_callbacks: Vec::new(),
@@ -869,23 +894,25 @@ impl Vm {
             host_throw: None,
             in_host_retry: false,
             surface_sizes: HashMap::new(),
-            thread_runnables: std::collections::HashSet::new(),
-            runnable_thread: std::collections::HashMap::new(),
+            thread_runnables: hashbrown::HashSet::new(),
+            runnable_thread: hashbrown::HashMap::new(),
+            parked_thread_runnable: hashbrown::HashMap::new(),
             cur_runnable: 0,
             sleep_until: HashMap::new(),
-            slept_once: std::collections::HashSet::new(),
+            slept_once: hashbrown::HashSet::new(),
             vto_listeners: HashMap::new(),
             vto_predraw: HashMap::new(),
             draining: false,
             park_depth: 0,
-            reparked: std::collections::HashSet::new(),
-            fill_bad: std::collections::HashSet::new(),
+            reparked: hashbrown::HashSet::new(),
+            fill_bad: hashbrown::HashSet::new(),
             park_spins: 0,
             repark_counts: HashMap::new(),
             parked_runnables: HashMap::new(),
-            park_waiters: std::collections::HashSet::new(),
-            unparkable_delayed: std::collections::HashSet::new(),
-            deadline_woke: std::collections::HashSet::new(),
+            park_waiters: hashbrown::HashSet::new(),
+            unparkable_delayed: hashbrown::HashSet::new(),
+            unparkable_delayed_due: HashMap::new(),
+            deadline_woke: hashbrown::HashSet::new(),
             deadline_park_cycles: HashMap::new(),
             media_ids: HashMap::new(),
             next_media_id: 0,
@@ -914,11 +941,12 @@ impl Vm {
             super_desc_cache: std::cell::RefCell::new(HashMap::new()),
             assignable_desc_cache: std::cell::RefCell::new(HashMap::new()),
             proto_sig_cache: std::cell::RefCell::new(HashMap::new()),
+            str_const_cache: std::cell::RefCell::new(HashMap::new()),
             view_gen: 0,
             layout_gen_done: std::cell::Cell::new(u64::MAX),
             gc_mark: 65_536,
             class_mirrors: HashMap::new(),
-            granted_permissions: std::collections::HashSet::new(),
+            granted_permissions: hashbrown::HashSet::new(),
         };
         v.add_dex(dex)?;
         Ok(v)
@@ -957,6 +985,7 @@ impl Vm {
         self.super_desc_cache.borrow_mut().clear();
         self.assignable_desc_cache.borrow_mut().clear();
         self.proto_sig_cache.borrow_mut().clear();
+        self.str_const_cache.borrow_mut().clear();
         let di = self.dexes.len();
         for (class_idx, em) in dex.methods()? {
             self.defined
@@ -1156,32 +1185,29 @@ impl Vm {
     /// (R8-)named owner references. Each entry carries its declaring
     /// owner so callers can filter to a receiver's own hierarchy.
     pub(crate) fn field_keys_named(&self, name: &str, ty: &str) -> Vec<(String, GIdx)> {
-        if let Some(m) = self.fields_named_cache.borrow().as_ref() {
-            return m
-                .get(&(name.to_string(), ty.to_string()))
-                .cloned()
-                .unwrap_or_default();
+        let key = (name.to_string(), ty.to_string());
+        if let Some(hit) = self
+            .fields_named_cache
+            .borrow()
+            .as_ref()
+            .and_then(|m| m.get(&key))
+        {
+            return hit.clone();
         }
-        let mut m: FieldsByName = HashMap::new();
-        for (di, d) in self.dexes.iter().enumerate() {
-            for i in 0..d.field_ids_len() {
-                let Ok(f) = d.field(i as u32) else { continue };
-                let (Ok(n), Ok(t), Ok(owner)) = (
-                    d.string(f.name_idx),
-                    d.type_descriptor(f.type_idx as u32),
-                    d.type_descriptor(f.class_idx as u32),
-                ) else {
-                    continue;
-                };
-                let g = self.canon_field(gx(di, i as u32));
-                m.entry((n, t)).or_default().push((owner, g));
+        // Resolve canonical keys only for fields with the requested
+        // name/type. Canonicalizing every field up front walks each
+        // field's class hierarchy and can take seconds on large apps.
+        let mut out = Vec::new();
+        for ((owner, n, t), g) in &self.fields_by_sig {
+            if n == name && t == ty {
+                out.push((owner.clone(), self.canon_field(*g)));
             }
         }
-        let out = m
-            .get(&(name.to_string(), ty.to_string()))
-            .cloned()
-            .unwrap_or_default();
-        *self.fields_named_cache.borrow_mut() = Some(m);
+        out.sort_by(|a, b| a.0.cmp(&b.0).then(a.1.cmp(&b.1)));
+        self.fields_named_cache
+            .borrow_mut()
+            .get_or_insert_with(HashMap::new)
+            .insert(key, out.clone());
         out
     }
 
@@ -1364,7 +1390,7 @@ impl Vm {
         is
     }
 
-    fn method_sig(&self, midx: GIdx) -> Result<(String, String, String)> {
+    fn method_sig(&self, midx: GIdx) -> Result<MethodSigRc> {
         if let Some(hit) = self.method_sig_cache.borrow().get(&midx) {
             return Ok(hit.clone());
         }
@@ -1380,7 +1406,7 @@ impl Vm {
         sig.push(')');
         let ret = d.type_descriptor(p.return_type_idx)?;
         sig.push_str(&ret);
-        let out = (class, name, sig);
+        let out = std::rc::Rc::new((class, name, sig));
         self.method_sig_cache.borrow_mut().insert(midx, out.clone());
         Ok(out)
     }
@@ -2056,6 +2082,7 @@ impl Vm {
             if self.delayed_runnables[i].2 <= now {
                 let (r, on_main, _) = self.delayed_runnables.swap_remove(i);
                 self.unparkable_delayed.remove(&r);
+                self.unparkable_delayed_due.remove(&r);
                 self.deadline_woke.insert(r);
                 self.pending_runnables.push_back((r, on_main));
             } else {
@@ -2082,6 +2109,7 @@ impl Vm {
                     if self.delayed_runnables[i].2 <= now3 {
                         let (r, on_main, _) = self.delayed_runnables.swap_remove(i);
                         self.unparkable_delayed.remove(&r);
+                        self.unparkable_delayed_due.remove(&r);
                         self.deadline_woke.insert(r);
                         self.pending_runnables.push_back((r, on_main));
                     } else {
@@ -2129,10 +2157,28 @@ impl Vm {
             eprintln!("[drain] enqueue h{} main={}", r, on_main);
         }
         self.reparked.clear();
-        // The newly posted work may feed a worker that parked out of
-        // the live queue — re-arm dropped parkers so they rescan.
-        self.parked_runnables.remove(&r);
-        self.wake_parked();
+        // A delayed slot that represents this runnable's interrupted
+        // park is not an independent post. Drop it when the same
+        // callback is posted again, or both copies restart from the
+        // top; ordinary delayed posts remain duplicate-capable.
+        if let Some(park_due) = self.unparkable_delayed_due.get(&r).copied() {
+            if let Some(i) = self
+                .delayed_runnables
+                .iter()
+                .position(|(h, _, due)| *h == r && *due == park_due)
+            {
+                self.delayed_runnables.remove(i);
+            }
+            self.unparkable_delayed.remove(&r);
+            self.unparkable_delayed_due.remove(&r);
+        }
+        // Retired parkers are outside the queue only because this VM
+        // cannot resume their original Java stack; fresh work may feed
+        // their internal queues, so give them another scan. Timed
+        // parkers are different: waking every one for an unrelated post
+        // makes idle kotlinx workers repark continuously and hides
+        // whether LockSupport.unpark reached its target.
+        self.wake_retired();
         self.pending_runnables.push_back((r, on_main));
     }
 
@@ -2176,8 +2222,10 @@ impl Vm {
         self.pending_runnables.retain(|(h, _)| *h != r);
         self.delayed_runnables.retain(|(h, _, _)| *h != r);
         self.unparkable_delayed.remove(&r);
+        self.unparkable_delayed_due.remove(&r);
         self.deadline_woke.remove(&r);
         self.deadline_park_cycles.remove(&r);
+        self.parked_thread_runnable.retain(|_, parked| *parked != r);
         self.frame_callbacks.retain(|(h, _)| *h != r);
     }
 
@@ -2186,36 +2234,114 @@ impl Vm {
     pub(crate) fn enqueue_runnable_delayed(&mut self, r: u32, on_main: bool, delay_ms: i64) {
         self.reparked.clear();
         self.parked_runnables.remove(&r);
-        self.wake_parked();
+        // A delayed slot that represents this runnable's interrupted
+        // park is not an independent post. Leaving it beside the fresh
+        // post restarts the same callback twice once both deadlines
+        // expire; ordinary delayed posts remain duplicate-capable.
+        if let Some(park_due) = self.unparkable_delayed_due.get(&r).copied() {
+            if let Some(i) = self
+                .delayed_runnables
+                .iter()
+                .position(|(h, _, due)| *h == r && *due == park_due)
+            {
+                self.delayed_runnables.remove(i);
+            }
+            self.unparkable_delayed.remove(&r);
+            self.unparkable_delayed_due.remove(&r);
+        }
+        self.wake_retired();
         let due = jdk::now_ms().saturating_add(delay_ms.max(0)) as u64;
         self.delayed_runnables.push((r, on_main, due));
     }
 
-    /// Re-arm runnables that parked out of the live queue — called
-    /// from `enqueue_runnable` (fresh work may feed a dropped worker's
-    /// internal queue) and `LockSupport.unpark`. Delayed sleepers
-    /// whose deadline came from `LockSupport.park*` (not `Thread.sleep`)
-    /// are also promoted early — a permit cuts the wait short.
-    pub(crate) fn wake_parked(&mut self) {
-        for (r, on_main) in self.parked_runnables.drain() {
-            self.repark_counts.remove(&r);
-            self.reparked.remove(&r);
-            self.deadline_woke.remove(&r);
-            self.deadline_park_cycles.remove(&r);
-            self.pending_runnables.push_back((r, on_main));
+    fn clear_park_marks(&mut self, r: u32) {
+        self.repark_counts.remove(&r);
+        self.reparked.remove(&r);
+        self.deadline_woke.remove(&r);
+        self.deadline_park_cycles.remove(&r);
+    }
+
+    fn queue_woken_runnable(&mut self, r: u32, on_main: bool) {
+        self.clear_park_marks(r);
+        self.pending_runnables.push_back((r, on_main));
+    }
+
+    /// Re-arm runnables that were retired after repeated deadline-only
+    /// parks. Unlike `wake_parked`, this does not promote timed sleepers:
+    /// unrelated posts must not cut a `parkNanos` wait short.
+    pub(crate) fn wake_retired(&mut self) {
+        let retired: Vec<_> = self.parked_runnables.drain().collect();
+        for (r, on_main) in retired {
+            self.queue_woken_runnable(r, on_main);
         }
+    }
+
+    /// Wake one runnable after its owning thread received `unpark`.
+    pub(crate) fn wake_runnable(&mut self, target: u32) {
+        if let Some(on_main) = self.parked_runnables.remove(&target) {
+            self.queue_woken_runnable(target, on_main);
+            return;
+        }
+        if let Some(i) = self
+            .delayed_runnables
+            .iter()
+            .position(|(r, _, _)| *r == target && self.unparkable_delayed.contains(r))
+        {
+            let (r, on_main, _) = self.delayed_runnables.swap_remove(i);
+            self.unparkable_delayed.remove(&r);
+            self.unparkable_delayed_due.remove(&r);
+            self.queue_woken_runnable(r, on_main);
+        }
+    }
+
+    /// Drop every ThreadLocal value owned by a retired worker thread.
+    /// ThreadLocals store per-thread entries in their own tables, so
+    /// replacing a failed executor worker must explicitly evict the old
+    /// thread key or values accumulate for the process lifetime.
+    pub(crate) fn drop_threadlocal_values(&mut self, thread: u32) {
+        for h in self.heap.live_handles() {
+            let table = jdk::pseudo_get(self, h, jdk::P_TLS);
+            if let Some(V::Ref(m)) = table {
+                jdk::map_remove(self, m, V::Ref(thread));
+            }
+        }
+    }
+
+    /// `LockSupport.unpark(thread)` — map the guest Thread object back
+    /// to the runnable whose execution represents it. Unknown threads
+    /// keep the previous broad wake as a compatibility fallback.
+    pub(crate) fn unpark_thread(&mut self, thread: u32) {
+        let target = self
+            .parked_thread_runnable
+            .get(&thread)
+            .copied()
+            .or_else(|| {
+                self.runnable_thread
+                    .iter()
+                    .find(|(_, t)| **t == thread)
+                    .map(|(r, _)| *r)
+            });
+        if let Some(r) = target {
+            self.wake_runnable(r);
+        }
+        // Unknown targets (notably the main thread) are not parked in
+        // this scheduler model. Waking every worker there turns each
+        // main-event-loop enqueue into a spurious broadcast.
+    }
+
+    /// Re-arm every parked runnable. Used by untargeted wakes
+    /// (`Object.notify`) and as a fallback when an unpark target cannot
+    /// be mapped back to a runnable.
+    pub(crate) fn wake_parked(&mut self) {
+        self.wake_retired();
         let mut i = 0;
         while i < self.delayed_runnables.len() {
             let (r, on_main, _) = self.delayed_runnables[i];
             if self.unparkable_delayed.contains(&r) {
                 self.delayed_runnables.swap_remove(i);
                 self.unparkable_delayed.remove(&r);
-                // An unpark-driven promotion — not a deadline expiry.
-                self.deadline_woke.remove(&r);
-                self.deadline_park_cycles.remove(&r);
-                self.repark_counts.remove(&r);
-                self.reparked.remove(&r);
-                self.pending_runnables.push_back((r, on_main));
+                self.unparkable_delayed_due.remove(&r);
+                self.queue_woken_runnable(r, on_main);
             } else {
                 i += 1;
             }
@@ -2247,6 +2373,7 @@ impl Vm {
         roots.extend(self.single_executors.iter().copied());
         roots.extend(self.executor_active.keys().copied());
         roots.extend(self.executor_active.values().copied());
+        roots.extend(self.executor_thread.values().copied());
         roots.extend(
             self.executor_queues
                 .values()
@@ -2264,6 +2391,9 @@ impl Vm {
         roots.push(self.byteorder_h.get());
         roots.extend(self.parked_runnables.keys().copied());
         roots.extend(self.thread_runnables.iter().copied());
+        roots.extend(self.runnable_thread.values().copied());
+        roots.extend(self.parked_thread_runnable.keys().copied());
+        roots.extend(self.parked_thread_runnable.values().copied());
         roots.extend(jdk::gl::live_handles());
         roots.extend(self.sleep_until.keys().copied());
         roots.extend(self.reparked.iter().copied());
@@ -2299,6 +2429,7 @@ impl Vm {
         // object entirely.
         roots.extend(self.enum_cache.values().copied());
         roots.extend(self.enum_name_cache.values().copied());
+        roots.extend(self.bool_cache.into_iter().filter(|h| *h != 0));
         roots.extend(self.content_views.keys().copied());
         roots.extend(self.content_views.values().copied());
         roots.extend(self.decor_roots.keys().copied());
@@ -2363,6 +2494,7 @@ impl Vm {
             .collect();
         for (r, on_main, _) in due {
             self.unparkable_delayed.remove(&r);
+            self.unparkable_delayed_due.remove(&r);
             self.deadline_woke.insert(r);
             self.pending_runnables.push_back((r, on_main));
         }
@@ -2440,7 +2572,7 @@ impl Vm {
         // per frame tick, so a due callback fires on the next pass; one
         // that reposts itself lands in `frame_callbacks` again (the
         // Recomposer's loop works exactly that way).
-        let frame_nanos = V::I64(jdk::now_ms() * 1_000_000);
+        let frame_nanos = V::I64(jdk::now_nanos());
         let due_cbs: Vec<_> = self
             .frame_callbacks
             .extract_if(.., |(_, t)| *t <= now)
@@ -2516,7 +2648,14 @@ impl Vm {
                         && self.sleep_until.contains_key(&r) =>
                 {
                     if dbg {
-                        eprintln!("[drain] h={r} park -> delayed(thread)");
+                        eprintln!(
+                            "[drain] h={r} park -> delayed(thread) wait={}",
+                            self.sleep_until
+                                .get(&r)
+                                .copied()
+                                .unwrap_or(now)
+                                .saturating_sub(now)
+                        );
                     }
                     // A `Thread` runnable that parked on Thread.sleep
                     // waits out its requested deadline, then re-runs —
@@ -2559,12 +2698,20 @@ impl Vm {
                     }
                     if unparkable {
                         self.unparkable_delayed.insert(r);
+                        self.unparkable_delayed_due.insert(r, due);
                     }
                     self.delayed_runnables.push((r, on_main, due));
                 }
                 Err(e) if e.cause() == "ovelo.park" && self.sleep_until.contains_key(&r) => {
                     if dbg {
-                        eprintln!("[drain] h={r} park -> delayed(sleep)");
+                        eprintln!(
+                            "[drain] h={r} park -> delayed(sleep) wait={}",
+                            self.sleep_until
+                                .get(&r)
+                                .copied()
+                                .unwrap_or(now)
+                                .saturating_sub(now)
+                        );
                     }
                     // A non-thread runnable parked with a recorded
                     // deadline (e.g. RealCall.execute polling a host
@@ -2590,6 +2737,7 @@ impl Vm {
                     }
                     if unparkable {
                         self.unparkable_delayed.insert(r);
+                        self.unparkable_delayed_due.insert(r, due);
                     }
                     self.delayed_runnables.push((r, on_main, due));
                 }
@@ -2622,6 +2770,7 @@ impl Vm {
                     }
                 }
                 _ => {
+                    let task_failed = out.is_err();
                     ran += 1;
                     self.reparked.remove(&r);
                     self.repark_counts.remove(&r);
@@ -2631,13 +2780,24 @@ impl Vm {
                     // captured references.
                     self.thread_runnables.remove(&r);
                     self.runnable_thread.remove(&r);
+                    self.parked_thread_runnable.retain(|_, parked| *parked != r);
                     self.sleep_until.remove(&r);
                     self.park_waiters.remove(&r);
                     self.unparkable_delayed.remove(&r);
+                    self.unparkable_delayed_due.remove(&r);
                     self.deadline_woke.remove(&r);
                     self.deadline_park_cycles.remove(&r);
                     self.slept_once.remove(&r);
                     if let Some(ex) = self.runnable_executor.remove(&r) {
+                        if task_failed {
+                            // ThreadPoolExecutor replaces a worker whose
+                            // task escapes with an uncaught exception;
+                            // its ThreadLocal state must not leak into
+                            // the next task on this executor.
+                            if let Some(thread) = self.executor_thread.remove(&ex) {
+                                self.drop_threadlocal_values(thread);
+                            }
+                        }
                         if self.executor_active.get(&ex) == Some(&r) {
                             let next = self
                                 .executor_queues
@@ -2850,6 +3010,11 @@ impl Vm {
         jdk::pseudo_get(self, view, jdk::gl::P_GLES_RENDERER).is_some()
     }
 
+    /// Whether any view ever bound a GL renderer.
+    pub fn any_gl_renderer(&self) -> bool {
+        self.gl_renderer_active
+    }
+
     /// Cheap P_IS_VIEW probe — `dex_view` builds full node info
     /// (attrs, children, strings) and costs far more than callers
     /// that only need to know whether a handle is a view.
@@ -2921,10 +3086,10 @@ impl Vm {
     }
 
     fn describe_throw(&self, h: u32) -> String {
-        self.describe_throw_inner(h, &mut std::collections::HashSet::new())
+        self.describe_throw_inner(h, &mut hashbrown::HashSet::new())
     }
 
-    fn describe_throw_inner(&self, h: u32, seen: &mut std::collections::HashSet<u32>) -> String {
+    fn describe_throw_inner(&self, h: u32, seen: &mut hashbrown::HashSet<u32>) -> String {
         // Guest exceptions sometimes store themselves (or a cycle of
         // wrappers) as their own cause — bound the walk.
         if !seen.insert(h) {
@@ -2997,7 +3162,7 @@ impl Vm {
         }
         let s: std::rc::Rc<str> = self
             .method_sig(midx)
-            .map(|(class, name, sig)| format!("{class}.{name}{sig}"))
+            .map(|ms| format!("{}.{}{}", ms.0, ms.1, ms.2))
             .unwrap_or_else(|_| format!("method@{midx}"))
             .into();
         self.method_desc_cache.borrow_mut().insert(midx, s.clone());
@@ -4164,12 +4329,13 @@ impl Vm {
                 em,
             });
         }
-        if let Ok((class, name, sig)) = self.method_sig(midx) {
+        if let Ok(ms) = self.method_sig(midx) {
+            let (_, name, sig) = &*ms;
             // Static/direct refs may name a subclass of the actual
             // declarer — ART resolves them walking the superclass
             // chain (`V3/g.b` declared on `V3/i` etc.), so do the
             // same on a direct-table miss.
-            let mut cur = Some(class);
+            let mut cur = Some(ms.0.clone());
             for _ in 0..64 {
                 let Some(desc) = cur else { break };
                 if let Some(&g) =
@@ -4217,9 +4383,10 @@ impl Vm {
     }
 
     fn resolve_virtual_uncached(&self, midx: GIdx, start_class: GIdx, fallback: bool) -> Rt<Loc> {
-        let Ok((_, name, sig)) = self.method_sig(midx) else {
+        let Ok(ms) = self.method_sig(midx) else {
             return Err(E::Vm(err("dexrt.invoke.unresolved")));
         };
+        let (_, name, sig) = &*ms;
         let mut cur = Some(start_class);
         for _ in 0..64 {
             let Some(ci) = cur else { break };
@@ -4233,7 +4400,8 @@ impl Vm {
                         continue;
                     };
                     let oname = d.string(om.name_idx).unwrap_or_default();
-                    if oname == name && proto_sig(d, om.proto_idx as u32).unwrap_or_default() == sig
+                    if oname.as_str() == name.as_str()
+                        && proto_sig(d, om.proto_idx as u32).unwrap_or_default() == sig.as_str()
                     {
                         return Ok(Loc {
                             class_idx: cg,
@@ -4249,7 +4417,7 @@ impl Vm {
         // defaults onto the interface def with a real body, and a class
         // implements the interface without declaring the method — the
         // superclass-only walk above then misses it and the call stubs.
-        if let Some(hit) = self.find_interface_method(start_class, &name, &sig) {
+        if let Some(hit) = self.find_interface_method(start_class, name, sig) {
             return Ok(hit);
         }
         // Fall back to the declared method itself (e.g. dispatch target is the
@@ -4265,7 +4433,7 @@ impl Vm {
     /// through the whole class/interface hierarchy — where JVM dispatch
     /// lands after the superclass chain misses (default methods).
     fn find_interface_method(&self, start: GIdx, name: &str, sig: &str) -> Option<Loc> {
-        let mut seen = std::collections::HashSet::new();
+        let mut seen = hashbrown::HashSet::new();
         let mut stack = vec![start];
         while let Some(ci) = stack.pop() {
             if !seen.insert(ci) {
@@ -4501,7 +4669,7 @@ impl Vm {
         for i in z_params {
             let ai = i + has_receiver as usize;
             if let Some(V::I32(b)) = args.get(ai).copied() {
-                args[ai] = jdk::host(self, "Ljava/lang/Boolean;", HostState::Slot(V::I32(b)));
+                args[ai] = jdk::boxed_boolean(self, b != 0);
             }
         }
         let args = args.as_slice();
@@ -5073,12 +5241,12 @@ impl Vm {
                                 self.def_loc_of(caller_class).and_then(|(cg, d)| {
                                     let dex = self.dex_of(cg)?;
                                     let types = dex.type_list(d.interfaces_off).ok()?;
-                                    let (_, name, sig) = self.method_sig(midx).ok()?;
+                                    let ms = self.method_sig(midx).ok()?;
                                     types.iter().find_map(|&t| {
                                         self.find_interface_method(
                                             gx(gd(cg), t as u32),
-                                            &name,
-                                            &sig,
+                                            &ms.1,
+                                            &ms.2,
                                         )
                                     })
                                 })
@@ -5782,7 +5950,7 @@ impl Vm {
             // In-progress or already-failed: probing more is wrong.
             _ if self.classes.contains_key(&owner_idx) => return None,
             _ => {
-                let prev3: std::collections::HashSet<GIdx> = self
+                let prev3: hashbrown::HashSet<GIdx> = self
                     .classes
                     .iter()
                     .filter(|(_, c)| c.clinit == 3)
@@ -6386,8 +6554,16 @@ impl Vm {
             0x16..=0x18 => set!(regs[0], V::I64(ins.lit.unwrap_or(0))),
             0x19 => set!(regs[0], V::I64(ins.lit.unwrap_or(0) << 48)),
             0x1a | 0x1b => {
-                let s = self.dexes[di].string(ins.idx.unwrap_or(0)).map_err(E::Vm)?;
-                let h = self.heap.intern_str(&s);
+                let sg = gi(ins.idx.unwrap_or(0));
+                let hit = self.str_const_cache.borrow().get(&sg).copied();
+                let h = if let Some(h) = hit {
+                    h
+                } else {
+                    let s = self.dexes[di].string(ins.idx.unwrap_or(0)).map_err(E::Vm)?;
+                    let h = self.heap.intern_str(&s);
+                    self.str_const_cache.borrow_mut().insert(sg, h);
+                    h
+                };
                 set!(regs[0], V::Ref(h));
             }
             0x1c => {

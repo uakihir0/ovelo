@@ -9,7 +9,7 @@
 //! `Response.Builder`, `Headers.of` and `ResponseBody.create` —
 //! downstream guest code sees ordinary okhttp objects.
 
-use std::collections::HashMap;
+use hashbrown::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Mutex, OnceLock};
 use std::time::{Duration, Instant};

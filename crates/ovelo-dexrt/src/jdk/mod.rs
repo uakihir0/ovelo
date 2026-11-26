@@ -24,7 +24,7 @@ pub(crate) mod xml;
 
 use crate::value::{HostState, Obj, V};
 use crate::{Rt, Vm};
-use std::collections::HashMap;
+use hashbrown::HashMap;
 
 pub(crate) const OBJ: &str = "Ljava/lang/Object;";
 pub(crate) const THROWABLE: &str = "Ljava/lang/Throwable;";
@@ -160,6 +160,24 @@ pub(crate) fn now_ms() -> i64 {
         .unwrap_or(0)
 }
 
+pub(crate) fn now_mono_ms() -> i64 {
+    now_nanos() / 1_000_000
+}
+
+pub(crate) fn now_nanos() -> i64 {
+    // java.lang.System.nanoTime is monotonic with an arbitrary origin.
+    // Keeping that origin near process start matters: Compose animation
+    // math converts timestamps through narrow float/int paths, and a
+    // wall-clock epoch nanosecond value is large enough to lose the
+    // frame-to-frame differences entirely.
+    static START: std::sync::OnceLock<std::time::Instant> = std::sync::OnceLock::new();
+    START
+        .get_or_init(std::time::Instant::now)
+        .elapsed()
+        .as_nanos()
+        .min(i64::MAX as u128) as i64
+}
+
 pub(crate) fn is_null(v: V) -> bool {
     matches!(v, V::Ref(0))
 }
@@ -271,6 +289,22 @@ pub(crate) fn arr(vm: &mut Vm, elem: &str, data: Vec<V>) -> V {
         elem: elem.to_string(),
         data,
     }))
+}
+
+pub(crate) fn boxed_boolean(vm: &mut Vm, value: bool) -> V {
+    let idx = value as usize;
+    if vm.bool_cache[idx] != 0 {
+        return V::Ref(vm.bool_cache[idx]);
+    }
+    let v = host(
+        vm,
+        "Ljava/lang/Boolean;",
+        HostState::Slot(V::I32(value as i32)),
+    );
+    if let V::Ref(h) = v {
+        vm.bool_cache[idx] = h;
+    }
+    v
 }
 
 pub(crate) fn host(vm: &mut Vm, desc: &str, state: HostState) -> V {
@@ -432,8 +466,37 @@ pub(crate) fn run_on_worker(
 ) -> std::result::Result<Option<V>, ovelo_error::OveloError> {
     let prev = vm.cur_thread;
     let prev_r = vm.cur_runnable;
+    // Thread.start created a distinct guest Thread object for this
+    // runnable. currentThread() must expose that object — kotlinx's
+    // scheduler workers compare it with their own Worker identity and
+    // LockSupport.unpark targets it. The shared worker placeholder is
+    // only a fallback for executor runnables without a Thread owner.
     worker_thread(vm);
-    vm.cur_thread = vm.worker_thread_h;
+    vm.cur_thread = vm.runnable_thread.get(&r).copied().unwrap_or_else(|| {
+        // Executor/dispatcher tasks have no Thread.start owner, but
+        // code can capture Thread.currentThread() while the task runs
+        // and later unpark exactly that object. A single-thread
+        // executor reuses one long-lived worker identity across tasks
+        // (ThreadLocal semantics); other dispatcher tasks get their
+        // own worker object rather than aliasing the shared fallback.
+        let owner = vm.runnable_executor.get(&r).copied();
+        if let Some(t) = owner.and_then(|ex| vm.executor_thread.get(&ex).copied()) {
+            vm.runnable_thread.insert(r, t);
+            return t;
+        }
+        let V::Ref(t) = host(
+            vm,
+            "Ljava/lang/Thread;",
+            HostState::StrBuf("worker-task".into()),
+        ) else {
+            unreachable!()
+        };
+        if let Some(ex) = owner {
+            vm.executor_thread.insert(ex, t);
+        }
+        vm.runnable_thread.insert(r, t);
+        t
+    });
     vm.cur_runnable = r;
     let v = if is_message(vm, r) {
         dispatch_message(vm, r)
@@ -1887,12 +1950,8 @@ pub(crate) fn sfield(vm: &mut Vm, owner: &str, name: &str, ftype: &str) -> Optio
         ("Landroid/os/Environment;", "DIRECTORY_AUDIOBOOKS") => {
             return Some(jstr(vm, "Audiobooks"));
         }
-        ("Ljava/lang/Boolean;", "TRUE") => {
-            return Some(host(vm, "Ljava/lang/Boolean;", HostState::Slot(V::I32(1))))
-        }
-        ("Ljava/lang/Boolean;", "FALSE") => {
-            return Some(host(vm, "Ljava/lang/Boolean;", HostState::Slot(V::I32(0))))
-        }
+        ("Ljava/lang/Boolean;", "TRUE") => return Some(boxed_boolean(vm, true)),
+        ("Ljava/lang/Boolean;", "FALSE") => return Some(boxed_boolean(vm, false)),
         (o, "TYPE") if lang::primitive_type(o) => {
             // `Integer.TYPE` is `int.class` — the primitive descriptor,
             // not the boxed class.

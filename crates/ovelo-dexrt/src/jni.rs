@@ -373,7 +373,7 @@ pub(crate) fn call_native(
 static mut JNI_TABLE: [u64; 240] = [0; 240];
 static mut JAVAVM_TABLE: [u64; 8] = [0; 8];
 /// fnptr → env-fn name for OVELO_ENVCALL tracing.
-static ENV_NAMES: std::sync::OnceLock<std::collections::HashMap<usize, &'static str>> =
+static ENV_NAMES: std::sync::OnceLock<hashbrown::HashMap<usize, &'static str>> =
     std::sync::OnceLock::new();
 // JNIEnv*/JavaVM* are one more level of indirection: the guest
 // dereferences the handle to get the function table address, so the
@@ -580,7 +580,7 @@ pub(crate) fn init_tables() {
         JAVAVM_TABLE[6] = ef!(vm_get_env as *const ());
         JAVAVM_TABLE[7] = ef!(vm_attach as *const ());
 
-        let mut names = std::collections::HashMap::new();
+        let mut names = hashbrown::HashMap::new();
         for (i, n) in [
             (4, "GetVersion"),
             (6, "FindClass"),
@@ -1063,7 +1063,7 @@ extern "C" fn alloc_object(_e: u64, clazz: u64) -> u64 {
     let ci = v.heap.class_of(clazz as u32).unwrap_or(crate::GX_NONE);
     let h = v.heap.alloc(Obj::Instance {
         class_idx: ci,
-        fields: std::collections::HashMap::new(),
+        fields: hashbrown::HashMap::new(),
     });
     h as u64
 }
@@ -1273,7 +1273,7 @@ extern "C" fn callv_dispatch(regs: u64, stack: u64, kind: u64) -> u64 {
             };
             let h = v.heap.alloc(Obj::Instance {
                 class_idx: ci,
-                fields: std::collections::HashMap::new(),
+                fields: hashbrown::HashMap::new(),
             }) as u64;
             drop(v);
             callv_run(0, mid, &args, h, false)
@@ -1377,7 +1377,7 @@ fn new_object_body(clazz: u64, mid: u64, args: &[V]) -> u64 {
     };
     let h = v.heap.alloc(Obj::Instance {
         class_idx: ci,
-        fields: std::collections::HashMap::new(),
+        fields: hashbrown::HashMap::new(),
     }) as u64;
     drop(v);
     call_obj(h, mid, args, false);
@@ -1848,10 +1848,10 @@ fn libc_free(p: usize) {
     }
     crate::native::guest_free(p)
 }
-fn bufs() -> &'static std::sync::Mutex<std::collections::HashMap<usize, usize>> {
-    static B: std::sync::OnceLock<std::sync::Mutex<std::collections::HashMap<usize, usize>>> =
+fn bufs() -> &'static std::sync::Mutex<hashbrown::HashMap<usize, usize>> {
+    static B: std::sync::OnceLock<std::sync::Mutex<hashbrown::HashMap<usize, usize>>> =
         std::sync::OnceLock::new();
-    B.get_or_init(|| std::sync::Mutex::new(std::collections::HashMap::new()))
+    B.get_or_init(|| std::sync::Mutex::new(hashbrown::HashMap::new()))
 }
 fn check_buf_canaries(name: &'static str) {
     if std::env::var_os("OVELO_BUFDBG").is_none() {
@@ -2052,7 +2052,7 @@ extern "C" fn new_direct_byte_buffer(_e: u64, addr: u64, cap: u64) -> u64 {
     let ci = v
         .type_index_of("Ljava/nio/ByteBuffer;")
         .unwrap_or(crate::GX_NONE);
-    let mut fields = std::collections::HashMap::new();
+    let mut fields = hashbrown::HashMap::new();
     fields.insert(jdk::P_DATA as u64, V::I64(addr as i64));
     fields.insert(jdk::P_FLAGS as u64, V::I64(cap as i64));
     let h = v.heap.alloc(Obj::Host {

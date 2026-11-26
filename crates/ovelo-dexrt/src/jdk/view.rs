@@ -202,7 +202,7 @@ fn vto_of(vm: &mut Vm, view: u32) -> V {
 /// listeners on detached views or a previous screen's views must not
 /// see a layout that never reached them (one-shot init would fire
 /// early and consume itself without an actual layout).
-pub fn fire_global_layout(vm: &mut Vm, root: u32) {
+fn fire_vto(vm: &mut Vm, root: u32, fire_pre: bool, fire_layout: bool) {
     // Listeners hang on ancestors of the laid-out content too (decor,
     // android.R.id.content frames) — normalize root to its topmost
     // ancestor before testing membership.
@@ -238,11 +238,16 @@ pub fn fire_global_layout(vm: &mut Vm, root: u32) {
         })
         .flat_map(|(_, ls)| ls.iter().copied())
         .collect();
-    for l in predraw {
-        if crate::dbg_flag("OVELO_VIEWDBG") {
-            eprintln!("[viewdbg] onPreDraw h{l} {}", vm.dbg_class_of(l));
+    if fire_pre {
+        for l in predraw {
+            if crate::dbg_flag("OVELO_VIEWDBG") {
+                eprintln!("[viewdbg] onPreDraw h{l} {}", vm.dbg_class_of(l));
+            }
+            let _ = vm.call_virtual(l, "onPreDraw", &[]);
         }
-        let _ = vm.call_virtual(l, "onPreDraw", &[]);
+    }
+    if !fire_layout {
+        return;
     }
     let all: Vec<u32> = vm
         .vto_listeners
@@ -266,6 +271,17 @@ pub fn fire_global_layout(vm: &mut Vm, root: u32) {
             }
         }
     }
+}
+
+/// Fire `OnPreDrawListener`s for `root`'s tree. Android sends this
+/// before every drawn frame, including redraws that did not layout.
+pub fn fire_pre_draw(vm: &mut Vm, root: u32) {
+    fire_vto(vm, root, true, false);
+}
+
+/// Fire `OnGlobalLayoutListener`s for `root`'s tree after a real layout.
+pub fn fire_global_layout(vm: &mut Vm, root: u32) {
+    fire_vto(vm, root, false, true);
 }
 
 /// Re-exported for `context_call` — Activity.findViewById searches the
@@ -538,10 +554,12 @@ pub(crate) fn frame_set(vm: &mut Vm, h: u32, l: i32, t: i32, r: i32, b: i32) -> 
         || pint(vm, h, P_RIGHT) != r
         || pint(vm, h, P_BOTTOM) != b
         || pseudo_get(vm, h, P_RIGHT).is_none();
-    pseudo_set(vm, h, P_LEFT, V::I32(l));
-    pseudo_set(vm, h, P_TOP, V::I32(t));
-    pseudo_set(vm, h, P_RIGHT, V::I32(r));
-    pseudo_set(vm, h, P_BOTTOM, V::I32(b));
+    if changed {
+        pseudo_set(vm, h, P_LEFT, V::I32(l));
+        pseudo_set(vm, h, P_TOP, V::I32(t));
+        pseudo_set(vm, h, P_RIGHT, V::I32(r));
+        pseudo_set(vm, h, P_BOTTOM, V::I32(b));
+    }
     changed
 }
 
@@ -1733,6 +1751,7 @@ pub(crate) fn call(
                         eprintln!("[gldbg] setRenderer view={this} r={r} class={class}");
                     }
                     pseudo_set(vm, this, crate::jdk::gl::P_GLES_RENDERER, V::Ref(r));
+                    vm.gl_renderer_active = true;
                 }
             }
             Some(None)
@@ -3773,9 +3792,24 @@ fn lp_field_t(vm: &Vm, lp: u32, name: &str, ty: &str) -> Option<V> {
         Some(Obj::Instance { fields, .. }) | Some(Obj::Host { fields, .. }) => fields,
         _ => return None,
     };
-    vm.field_keys_named(name, ty)
-        .iter()
+    let keys = vm.field_keys_named(name, ty);
+    // Prefer fields declared on this object's own hierarchy. The global
+    // name scan also knows unrelated LayoutParams classes (and hash-map
+    // order is unstable), so a first-hit fallback can keep reading the
+    // initial aliased value after the real field is updated.
+    let mut hier = hashbrown::HashSet::new();
+    let mut d = class_of(vm, V::Ref(lp));
+    for _ in 0..32 {
+        if !hier.insert(d.clone()) {
+            break;
+        }
+        let Some(next) = vm.super_desc(&d) else { break };
+        d = next;
+    }
+    keys.iter()
+        .filter(|(owner, _)| hier.contains(owner))
         .find_map(|(_, g)| fields.get(g).copied())
+        .or_else(|| keys.iter().find_map(|(_, g)| fields.get(g).copied()))
 }
 
 fn lp_px(vm: &Vm, v: V) -> Option<i32> {
@@ -4867,7 +4901,7 @@ fn lp_ctor(vm: &mut Vm, class: &str, sig: &str, args: &[V]) {
     // name — but only owners inside THIS object's own class hierarchy:
     // an unrelated class declaring its own `width` must not get a
     // LayoutParams value.
-    let mut hier = std::collections::HashSet::new();
+    let mut hier = hashbrown::HashSet::new();
     let mut d = class_of(vm, V::Ref(this));
     for _ in 0..32 {
         if !hier.insert(d.clone()) {

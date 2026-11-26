@@ -1007,7 +1007,10 @@ impl GuestUi {
         // changes, so pump it every tick: for materialized dex views
         // AND for bridged `new` views (guest_content_set apps like
         // 2048 whose whole UI is a bridged GLSurfaceView).
-        self.pump_gl_frames(vm);
+        vm.sync_decor_frames(self.root.w, self.root.h);
+        if vm.any_gl_renderer() {
+            self.pump_gl_frames(vm);
+        }
         if self.guest_content_set {
             return false;
         }
@@ -1103,9 +1106,6 @@ impl GuestUi {
                 vm.view_set_frame(h, l - pl, t - pt, l - pl + s.w, t - pt + s.h);
             }
         }
-        // Window decor roots / content frames fill the window — they
-        // never pass through host layout either.
-        vm.sync_decor_frames(self.root.w, self.root.h);
         if dbg_flag("OVELO_DRAWDBG") {
             eprintln!(
                 "[gldbg] pump views={:?} dex_views={:?}",
@@ -1489,7 +1489,7 @@ pub fn drive_dex_layout_pass(vm: &mut Vm, activity: u32, frame: u32, win_w: i32,
     // DrawerLayout throw unless both specs are EXACTLY, so
     // UNSPECIFIED/0 would leave them unmeasured forever.
     const MS_EXACTLY: i32 = 1 << 30;
-    fn walk(vm: &mut Vm, h: u32, depth: u32, win_w: i32, win_h: i32) {
+    fn walk(vm: &mut Vm, h: u32, depth: u32, win_w: i32, win_h: i32, drove: &mut bool) {
         if depth > 64 {
             return;
         }
@@ -1539,6 +1539,7 @@ pub fn drive_dex_layout_pass(vm: &mut Vm, activity: u32, frame: u32, win_w: i32,
         // request, leave its dex-computed frames alone instead of
         // re-running the whole solver twice a second.
         if !parent_is_dex && needs_layout {
+            *drove = true;
             // The root tracks the window: after a resize its stored
             // frame is stale, so re-measure at the new extent — the
             // stored frame only wins for deeper subtree roots whose
@@ -1665,14 +1666,18 @@ pub fn drive_dex_layout_pass(vm: &mut Vm, activity: u32, frame: u32, win_w: i32,
         // Re-snapshot: the layout pass may have attached children.
         let kids = vm.dex_view(h).map(|i| i.children).unwrap_or_default();
         for ch in kids {
-            walk(vm, ch, depth + 1, win_w, win_h);
+            walk(vm, ch, depth + 1, win_w, win_h, drove);
         }
     }
-    walk(vm, root, 0, win_w, win_h);
-    // Android fires OnGlobalLayoutListener after each layout pass —
-    // guests defer init work there (fossify's initFileManager runs its
-    // first openPath inside one).
-    ovelo_dexrt::fire_global_layout(vm, root);
+    let mut drove = false;
+    walk(vm, root, 0, win_w, win_h, &mut drove);
+    // Android fires OnGlobalLayoutListener after an actual layout pass.
+    // Firing it for a skipped clean-tree walk just re-enters guest code
+    // every frame; adapter fills still get the real pass that lays them out.
+    ovelo_dexrt::fire_pre_draw(vm, root);
+    if drove {
+        ovelo_dexrt::fire_global_layout(vm, root);
+    }
     vm.layout_gen_done.set(vm.view_gen);
 }
 

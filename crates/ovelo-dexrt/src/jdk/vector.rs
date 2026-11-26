@@ -48,8 +48,8 @@ thread_local! {
     /// image we can make). Colors resolve through the current theme and
     /// res-ids repeat across packages, so both must be in the key.
     static DRAW_CACHE: std::cell::RefCell<
-        std::collections::HashMap<(u32, u32, String), CachedDrawable>,
-    > = std::cell::RefCell::new(std::collections::HashMap::new());
+        hashbrown::HashMap<(u32, u32, String), CachedDrawable>,
+    > = std::cell::RefCell::new(hashbrown::HashMap::new());
 }
 
 /// Pixels for a `res/drawable` id: `<vector>` rasterized,

@@ -1,6 +1,6 @@
 //! Runtime value model and object heap (design §04 "Heap and threads").
 
-use std::collections::HashMap;
+use hashbrown::HashMap;
 
 /// A register / field value. Wide values (`I64`, `F64`) are stored whole in
 /// one slot; the DEX pair-register convention is handled by the VM mirroring
@@ -479,6 +479,15 @@ impl Heap {
     /// True when no objects were ever allocated.
     pub fn is_empty(&self) -> bool {
         self.objs.is_empty()
+    }
+
+    /// Live object handles, for rare whole-heap maintenance scans.
+    pub fn live_handles(&self) -> Vec<u32> {
+        self.objs
+            .iter()
+            .enumerate()
+            .filter_map(|(i, o)| o.as_ref().map(|_| i as u32 + 1))
+            .collect()
     }
 
     /// Stop-the-world mark-sweep: `roots` plus every interned string

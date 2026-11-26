@@ -556,13 +556,13 @@ fn find_record(store: &InstallStore, package: &str) -> Result<InstallRecord, Ove
 fn register_compat_shims(
     v: &mut ovelo_dexrt::Vm,
     initializers: &[String],
-    components: std::rc::Rc<std::cell::RefCell<std::collections::HashMap<String, ovelo_dexrt::V>>>,
+    components: std::rc::Rc<std::cell::RefCell<hashbrown::HashMap<String, ovelo_dexrt::V>>>,
     provider_ran: std::rc::Rc<std::cell::Cell<bool>>,
     manifest: &ovelo_apk::manifest::ManifestInfo,
 ) {
+    use hashbrown::HashMap;
     use ovelo_dexrt::{HostState, Obj, V};
     use std::cell::RefCell;
-    use std::collections::HashMap;
     use std::rc::Rc;
 
     // androidx menus (MenuBuilder/SubMenuBuilder/MenuInflater) share
@@ -1305,8 +1305,8 @@ fn run_initializer(
     v: &mut ovelo_dexrt::Vm,
     desc: &str,
     ctx: ovelo_dexrt::V,
-    seen: &mut std::collections::HashSet<String>,
-    components: &std::rc::Rc<std::cell::RefCell<std::collections::HashMap<String, ovelo_dexrt::V>>>,
+    seen: &mut hashbrown::HashSet<String>,
+    components: &std::rc::Rc<std::cell::RefCell<hashbrown::HashMap<String, ovelo_dexrt::V>>>,
 ) {
     if !seen.insert(desc.to_string()) {
         return;
@@ -1443,11 +1443,10 @@ fn run_app(store: &InstallStore, package: &str) -> Result<(), OveloError> {
             // Components returned by initializer `create()` — shared
             // between the startup pass and `initializeComponent` so a
             // component initializes once per run.
-            let components =
-                std::rc::Rc::new(std::cell::RefCell::new(std::collections::HashMap::<
-                    String,
-                    ovelo_dexrt::V,
-                >::new()));
+            let components = std::rc::Rc::new(std::cell::RefCell::new(hashbrown::HashMap::<
+                String,
+                ovelo_dexrt::V,
+            >::new()));
             // Set when the real androidx.startup InitializationProvider
             // ran — the AppInitializer shims then delegate to dex code
             // (the guest singletons carry the discovered state).
@@ -1593,7 +1592,7 @@ fn run_app(store: &InstallStore, package: &str) -> Result<(), OveloError> {
                             v.heap.alloc(ovelo_dexrt::Obj::Host {
                                 class_idx: u64::MAX,
                                 desc: "Landroid/app/Application;".to_string(),
-                                fields: std::collections::HashMap::new(),
+                                fields: hashbrown::HashMap::new(),
                                 state: ovelo_dexrt::HostState::Empty,
                             })
                         });
@@ -1648,7 +1647,7 @@ fn run_app(store: &InstallStore, package: &str) -> Result<(), OveloError> {
                         }
                     }
                     if !provider_ran.get() {
-                        let mut seen = std::collections::HashSet::new();
+                        let mut seen = hashbrown::HashSet::new();
                         for init in &info.manifest.startup_initializers {
                             run_initializer(
                                 &mut v,
@@ -1706,7 +1705,7 @@ fn run_app(store: &InstallStore, package: &str) -> Result<(), OveloError> {
                 let ih = vm.heap.alloc(ovelo_dexrt::Obj::Host {
                     class_idx: u64::MAX,
                     desc: "Landroid/content/Intent;".into(),
-                    fields: std::collections::HashMap::new(),
+                    fields: hashbrown::HashMap::new(),
                     state: ovelo_dexrt::HostState::Empty,
                 });
                 ovelo_dexrt::V::Ref(ih)

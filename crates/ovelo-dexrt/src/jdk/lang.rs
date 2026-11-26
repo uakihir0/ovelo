@@ -926,6 +926,8 @@ fn boxed_call(
                         return Err(e);
                     }
                 }
+            } else if class == "Ljava/lang/Boolean;" {
+                Some(Some(super::boxed_boolean(vm, i32v(args[0]) != 0)))
             } else {
                 Some(Some(host(vm, class, HostState::Slot(args[0]))))
             }
@@ -1455,7 +1457,7 @@ fn math_call(name: &str, args: &[V]) -> Option<Option<V>> {
 fn system_call(vm: &mut Vm, name: &str, _sig: &str, args: &[V]) -> Rt<Option<Option<V>>> {
     Ok(match name {
         "currentTimeMillis" => Some(Some(V::I64(now_ms()))),
-        "nanoTime" => Some(Some(V::I64(now_ms() * 1_000_000))),
+        "nanoTime" => Some(Some(V::I64(now_nanos()))),
         "arraycopy" => {
             let (V::Ref(src), V::Ref(dst)) = (args[0], args[2]) else {
                 return Ok(Some(None));
@@ -3647,7 +3649,11 @@ fn unsafe_call(vm: &mut Vm, name: &str, args: &[V]) -> Rt<Option<Option<V>>> {
         // `unpark` may target a worker that parked out of the live
         // queue — re-arm dropped parkers so they rescan their queues.
         "unpark" => {
-            vm.wake_parked();
+            if let Some(V::Ref(thread)) = args.get(1).copied() {
+                vm.unpark_thread(thread);
+            } else {
+                vm.wake_parked();
+            }
             None
         }
         "loadFence" | "storeFence" | "fullFence" | "monitorEnter" | "monitorExit" => None,

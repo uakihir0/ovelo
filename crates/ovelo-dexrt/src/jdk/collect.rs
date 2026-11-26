@@ -26,6 +26,46 @@ fn collection_is_set(vm: &Vm, h: u32) -> bool {
     collection_desc(vm, h).contains("Set;")
 }
 
+fn collection_elements_rt(vm: &mut Vm, h: u32) -> Rt<Option<Vec<V>>> {
+    if let Some(items) = collection_snapshot(vm, h) {
+        return Ok(Some(items));
+    }
+    let it = match vm.call_virtual_rt(h, "iterator", &[]) {
+        Ok(Some(V::Ref(it))) if it != 0 => it,
+        Ok(_) => return Ok(None),
+        Err(e) => return Err(e),
+    };
+    let host_iter = matches!(
+        vm.heap.get(it),
+        Some(Obj::Host {
+            state: HostState::Iter(..) | HostState::List(..),
+            ..
+        })
+    );
+    let call_iter = |vm: &mut Vm, name: &str| -> Rt<Option<V>> {
+        if host_iter {
+            if let Some(v) = iter_call(vm, name, &[V::Ref(it)])? {
+                return Ok(v);
+            }
+        }
+        vm.call_virtual_rt(it, name, &[])
+    };
+    let mut out = Vec::new();
+    for _ in 0..100_000 {
+        let more = call_iter(vm, "hasNext")?
+            .map(|v| i32v(v) != 0)
+            .unwrap_or(false);
+        if !more {
+            break;
+        }
+        let Some(v) = call_iter(vm, "next")? else {
+            break;
+        };
+        out.push(v);
+    }
+    Ok(Some(out))
+}
+
 fn collection_snapshot(vm: &Vm, h: u32) -> Option<Vec<V>> {
     if matches!(vm.heap.get(h), Some(Obj::Array { .. })) {
         return None;
@@ -578,16 +618,21 @@ pub(crate) fn call(
                     }
                     vm.sleep_until.insert(vm.cur_runnable, due_ms.max(0) as u64);
                     vm.park_waiters.insert(vm.cur_runnable);
+                    if vm.cur_thread != 0 {
+                        vm.parked_thread_runnable
+                            .insert(vm.cur_thread, vm.cur_runnable);
+                    }
                     return Err(crate::E::Vm(crate::err("ovelo.park")));
                 }
                 vm.park_drain()?;
                 Some(None)
             }
             "unpark" => {
-                // LockSupport.unpark — revive workers that parked out
-                // of the live queue, and cut delayed interruptible
-                // sleeps short (same coarse wake as Unsafe.unpark).
-                vm.wake_parked();
+                if let Some(V::Ref(thread)) = args.first().copied() {
+                    vm.unpark_thread(thread);
+                } else {
+                    vm.wake_parked();
+                }
                 Some(None)
             }
             "offer" | "add" | "put" | "take" | "poll" | "remove" => {
@@ -1023,7 +1068,33 @@ fn list_call(vm: &mut Vm, name: &str, sig: &str, args: &[V]) -> Rt<Option<Option
             }
             Some(Some(V::I32(c as i32)))
         }
-        "containsAll" => Some(Some(V::I32(1))),
+        "containsAll" => {
+            if matches!(args.get(1), Some(V::Ref(0)) | None) {
+                return Err(
+                    vm.throw_builtin("Ljava/lang/NullPointerException;", "containsAll(null)")
+                );
+            }
+            let mine = collection_elements_rt(vm, h)?.unwrap_or_default();
+            let want = match args.get(1).copied() {
+                Some(V::Ref(w)) => collection_elements_rt(vm, w)?.unwrap_or_default(),
+                _ => Vec::new(),
+            };
+            let mut all = true;
+            for w in want {
+                let mut hit = false;
+                for e in &mine {
+                    if elem_eq(vm, *e, w)? {
+                        hit = true;
+                        break;
+                    }
+                }
+                if !hit {
+                    all = false;
+                    break;
+                }
+            }
+            Some(Some(V::I32(all as i32)))
+        }
         "equals" => {
             let other = match args.get(1).copied() {
                 Some(V::Ref(oh)) if oh == h => return Ok(Some(Some(V::I32(1)))),
