@@ -554,10 +554,12 @@ pub(crate) fn frame_set(vm: &mut Vm, h: u32, l: i32, t: i32, r: i32, b: i32) -> 
         || pint(vm, h, P_RIGHT) != r
         || pint(vm, h, P_BOTTOM) != b
         || pseudo_get(vm, h, P_RIGHT).is_none();
-    pseudo_set(vm, h, P_LEFT, V::I32(l));
-    pseudo_set(vm, h, P_TOP, V::I32(t));
-    pseudo_set(vm, h, P_RIGHT, V::I32(r));
-    pseudo_set(vm, h, P_BOTTOM, V::I32(b));
+    if changed {
+        pseudo_set(vm, h, P_LEFT, V::I32(l));
+        pseudo_set(vm, h, P_TOP, V::I32(t));
+        pseudo_set(vm, h, P_RIGHT, V::I32(r));
+        pseudo_set(vm, h, P_BOTTOM, V::I32(b));
+    }
     changed
 }
 

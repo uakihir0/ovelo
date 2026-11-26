@@ -1007,6 +1007,7 @@ impl GuestUi {
         // changes, so pump it every tick: for materialized dex views
         // AND for bridged `new` views (guest_content_set apps like
         // 2048 whose whole UI is a bridged GLSurfaceView).
+        vm.sync_decor_frames(self.root.w, self.root.h);
         if vm.any_gl_renderer() {
             self.pump_gl_frames(vm);
         }
@@ -1105,9 +1106,6 @@ impl GuestUi {
                 vm.view_set_frame(h, l - pl, t - pt, l - pl + s.w, t - pt + s.h);
             }
         }
-        // Window decor roots / content frames fill the window — they
-        // never pass through host layout either.
-        vm.sync_decor_frames(self.root.w, self.root.h);
         if dbg_flag("OVELO_DRAWDBG") {
             eprintln!(
                 "[gldbg] pump views={:?} dex_views={:?}",
