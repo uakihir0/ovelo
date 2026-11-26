@@ -582,10 +582,12 @@ pub struct Vm {
     /// Nesting depth of inline drains issued from `park` — bounds the
     /// recursion when a task inside such a drain parks again.
     pub(crate) park_depth: u32,
-    /// Active Compose measure/layout calls. The runtime's cooperative
-    /// scheduling can otherwise re-enter these methods in orders that
-    /// cannot occur on Android's serialized UI thread.
-    pub(crate) compose_measure_depth: u32,
+    /// Active Compose measure/layout calls, keyed by receiver and method.
+    /// The runtime's cooperative scheduling can otherwise re-enter the
+    /// same measure pass in orders that cannot occur on Android's
+    /// serialized UI thread; ordinary owner→delegate delegation uses a
+    /// different receiver/method pair and must still run.
+    pub(crate) compose_measure_active: Vec<(u32, GIdx)>,
     /// Runnables that re-parked inside a drain — when the queue holds
     /// only these, draining them again just makes two waiting workers
     /// hand the slot back and forth until the instruction budget
@@ -915,7 +917,7 @@ impl Vm {
             vto_predraw: HashMap::new(),
             draining: false,
             park_depth: 0,
-            compose_measure_depth: 0,
+            compose_measure_active: Vec::new(),
             reparked: hashbrown::HashSet::new(),
             fill_bad: hashbrown::HashSet::new(),
             park_spins: 0,
@@ -5282,7 +5284,15 @@ impl Vm {
             });
             matches!(md.as_deref(), Some("measureAndLayout"))
         };
-        if compose_measure && self.compose_measure_depth != 0 {
+        let compose_key = if compose_measure && !matches!(kind, InvokeKind::Static) {
+            match args.first() {
+                Some(V::Ref(h)) if *h != 0 => Some((*h, loc.midx)),
+                _ => None,
+            }
+        } else {
+            None
+        };
+        if compose_key.is_some_and(|key| self.compose_measure_active.contains(&key)) {
             let ret_desc = self
                 .dex_of(loc.midx)
                 .and_then(|d| {
@@ -5301,8 +5311,8 @@ impl Vm {
                 _ => Some(V::Ref(0)),
             });
         }
-        if compose_measure {
-            self.compose_measure_depth = self.compose_measure_depth.saturating_add(1);
+        if let Some(key) = compose_key {
+            self.compose_measure_active.push(key);
         }
         let invoke_out = (|| {
             // A registered host override short-circuits even a dex-defined
@@ -5453,8 +5463,10 @@ impl Vm {
             }
             self.exec(loc, args).map(void_resolved)
         })();
-        if compose_measure {
-            self.compose_measure_depth = self.compose_measure_depth.saturating_sub(1);
+        if let Some(key) = compose_key {
+            if let Some(pos) = self.compose_measure_active.iter().rposition(|k| *k == key) {
+                self.compose_measure_active.remove(pos);
+            }
         }
         invoke_out
     }
