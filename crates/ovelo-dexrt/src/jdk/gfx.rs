@@ -2213,7 +2213,7 @@ pub(crate) fn compose_measure_active(vm: &mut Vm, view: u32) -> bool {
     )
 }
 
-pub(crate) fn guest_draw_ops(vm: &mut Vm, view: u32, w: i32, h: i32) -> Vec<CanvasOp> {
+fn guest_draw_ops_impl(vm: &mut Vm, view: u32, w: i32, h: i32, expand: bool) -> Vec<CanvasOp> {
     // Host capture can be triggered from inside Compose's own measure
     // pass when placement updates the host view frame. Re-entering
     // dispatchDraw then violates MeasureAndLayoutDelegate's reentrancy
@@ -2354,9 +2354,28 @@ pub(crate) fn guest_draw_ops(vm: &mut Vm, view: u32, w: i32, h: i32) -> Vec<Canv
         Some(Obj::Host {
             state: HostState::CanvasOps(ops),
             ..
-        }) => expand_nested(vm, &ops.clone(), &mut Vec::new()),
+        }) => {
+            let raw = ops.clone();
+            if expand {
+                expand_nested(vm, &raw, &mut Vec::new())
+            } else {
+                raw
+            }
+        }
         _ => Vec::new(),
     }
+}
+
+pub(crate) fn guest_draw_ops(vm: &mut Vm, view: u32, w: i32, h: i32) -> Vec<CanvasOp> {
+    guest_draw_ops_impl(vm, view, w, h, true)
+}
+
+pub(crate) fn guest_draw_ops_raw(vm: &mut Vm, view: u32, w: i32, h: i32) -> Vec<CanvasOp> {
+    guest_draw_ops_impl(vm, view, w, h, false)
+}
+
+pub(crate) fn expand_display_list_ops(vm: &Vm, ops: &[CanvasOp]) -> Vec<CanvasOp> {
+    expand_nested(vm, ops, &mut Vec::new())
 }
 
 /// Flatten `CanvasOp::Nested` references against the live heap: the

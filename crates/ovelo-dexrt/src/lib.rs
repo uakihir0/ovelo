@@ -3011,6 +3011,23 @@ impl Vm {
         jdk::gfx::guest_draw_ops(self, view, w, h)
     }
 
+    /// Record guest draw ops without resolving nested RenderNode
+    /// references — Compose child layers can be re-recorded after the
+    /// parent capture, so the framework re-expands the references each
+    /// frame instead of re-running guest dispatchDraw.
+    pub fn guest_draw_ops_raw(&mut self, view: u32, w: i32, h: i32) -> Vec<crate::value::CanvasOp> {
+        jdk::gfx::guest_draw_ops_raw(self, view, w, h)
+    }
+
+    /// Resolve nested RenderNode references against their current
+    /// recordings.
+    pub fn expand_display_list_ops(
+        &self,
+        ops: &[crate::value::CanvasOp],
+    ) -> Vec<crate::value::CanvasOp> {
+        jdk::gfx::expand_display_list_ops(self, ops)
+    }
+
     /// Whether the view's Compose measure/layout pass is currently active.
     pub fn compose_measure_active(&mut self, view: u32) -> bool {
         jdk::gfx::compose_measure_active(self, view)
