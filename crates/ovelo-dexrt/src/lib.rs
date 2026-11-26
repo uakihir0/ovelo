@@ -1189,6 +1189,7 @@ impl Vm {
                 out.push((owner.clone(), self.canon_field(*g)));
             }
         }
+        out.sort_by(|a, b| a.0.cmp(&b.0).then(a.1.cmp(&b.1)));
         self.fields_named_cache
             .borrow_mut()
             .get_or_insert_with(HashMap::new)

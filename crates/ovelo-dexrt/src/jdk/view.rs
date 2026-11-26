@@ -3792,9 +3792,24 @@ fn lp_field_t(vm: &Vm, lp: u32, name: &str, ty: &str) -> Option<V> {
         Some(Obj::Instance { fields, .. }) | Some(Obj::Host { fields, .. }) => fields,
         _ => return None,
     };
-    vm.field_keys_named(name, ty)
-        .iter()
+    let keys = vm.field_keys_named(name, ty);
+    // Prefer fields declared on this object's own hierarchy. The global
+    // name scan also knows unrelated LayoutParams classes (and hash-map
+    // order is unstable), so a first-hit fallback can keep reading the
+    // initial aliased value after the real field is updated.
+    let mut hier = hashbrown::HashSet::new();
+    let mut d = class_of(vm, V::Ref(lp));
+    for _ in 0..32 {
+        if !hier.insert(d.clone()) {
+            break;
+        }
+        let Some(next) = vm.super_desc(&d) else { break };
+        d = next;
+    }
+    keys.iter()
+        .filter(|(owner, _)| hier.contains(owner))
         .find_map(|(_, g)| fields.get(g).copied())
+        .or_else(|| keys.iter().find_map(|(_, g)| fields.get(g).copied()))
 }
 
 fn lp_px(vm: &Vm, v: V) -> Option<i32> {
