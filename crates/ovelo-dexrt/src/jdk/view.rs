@@ -6045,6 +6045,7 @@ pub(crate) fn detach(vm: &mut Vm, parent: u32, child: V, notify: bool) {
         if let Some(Obj::Array { data, .. }) = vm.heap.get_mut(a) {
             data.remove(i);
         }
+        mark_layout_requested(vm, parent);
         if let V::Ref(ch) = child {
             pseudo_set(vm, ch, P_PARENT, V::Ref(0));
             // Mirror onViewAdded: dex parents unregister the child here
