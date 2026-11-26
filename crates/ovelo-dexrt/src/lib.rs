@@ -1941,12 +1941,6 @@ impl Vm {
         jdk::view::inflater(self, ctx)
     }
 
-    /// A host object typed as `desc` for framework widgets whose
-    /// dex-side state is not materialized by the inflater bridge.
-    pub fn typed_host(&mut self, desc: &str) -> V {
-        V::Ref(self.alloc_host(desc, crate::value::HostState::Empty))
-    }
-
     /// Deliver a host pointer event into the dex view tree
     /// (action: 0=down, 1=up, 2=move). Dex-materialized views —
     /// including games' input views — only see input through this

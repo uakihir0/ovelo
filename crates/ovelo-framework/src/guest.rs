@@ -561,29 +561,6 @@ impl GuestUi {
         if std::env::var_os("OVELO_VIEWDBG").is_some() {
             eprintln!("[viewdbg] fragment inflater host={fragment_inflater_registered:?}");
         }
-        // Inflated androidx views are host objects, so dex-side widget
-        // fields such as RecyclerView.mItemAnimator never exist. The
-        // concrete animator is still a dex type; a typed host object is
-        // enough for null checks and the change-animation flag writes.
-        let item_animators = Rc::new(RefCell::new(std::collections::HashMap::<u32, V>::new()));
-        let item_animators_for_host = item_animators.clone();
-        let _ = vm.register_host(
-            "Landroidx/recyclerview/widget/RecyclerView;",
-            "getItemAnimator",
-            "()Landroidx/recyclerview/widget/RecyclerView$ItemAnimator;",
-            Rc::new(RefCell::new(move |vm: &mut Vm, a: &[V]| {
-                let rv = match a.first() {
-                    Some(V::Ref(h)) => *h,
-                    _ => 0,
-                };
-                if let Some(v) = item_animators_for_host.borrow().get(&rv) {
-                    return Ok(Some(*v));
-                }
-                let v = vm.typed_host("Landroidx/recyclerview/widget/DefaultItemAnimator;");
-                item_animators_for_host.borrow_mut().insert(rv, v);
-                Ok(Some(v))
-            })) as HostCall,
-        );
         // ---- constructors -------------------------------------------------
         Self::ctor(ui, vm, "Landroid/view/View;", |_ui| {
             GuestView::Plain(View::new(

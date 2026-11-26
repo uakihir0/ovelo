@@ -2385,8 +2385,37 @@ fn context_call(
         "getPackageCodePath" | "getPackageResourcePath" => {
             Some(Some(jstr(vm, "/data/app/base.apk")))
         }
+        "<init>" => {
+            // ContextWrapper(Context base): the framework class itself is
+            // absent from app dexes, so its field never initializes unless
+            // the builtin constructor records it. Hilt's
+            // FragmentContextWrapper depends on getBaseContext delegating
+            // to the fragment host context rather than to itself.
+            if class == "Landroid/content/ContextWrapper;" {
+                if let (Some(V::Ref(this)), Some(base)) =
+                    (args.first().copied(), args.get(1).copied())
+                {
+                    pseudo_set(vm, this, view::P_CONTEXT, base);
+                }
+            }
+            Some(None)
+        }
+        "attachBaseContext" => {
+            if let (Some(V::Ref(this)), Some(base)) = (args.first().copied(), args.get(1).copied())
+            {
+                pseudo_set(vm, this, view::P_CONTEXT, base);
+            }
+            Some(None)
+        }
         "getApplicationContext" | "getApplication" => Some(Some(app_object(vm))),
-        "getBaseContext" => Some(Some(args[0])),
+        "getBaseContext" => Some(Some(
+            args.first()
+                .and_then(|a| match a {
+                    V::Ref(h) => pseudo_get(vm, *h, view::P_CONTEXT),
+                    _ => None,
+                })
+                .unwrap_or(args[0]),
+        )),
         "getApplicationInfo" | "getActivityInfo" => Some(Some(app_info(vm))),
         "getContentResolver" => Some(Some(host(
             vm,
