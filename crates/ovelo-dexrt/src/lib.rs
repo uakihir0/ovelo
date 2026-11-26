@@ -2279,6 +2279,7 @@ impl Vm {
         roots.push(self.byteorder_h.get());
         roots.extend(self.parked_runnables.keys().copied());
         roots.extend(self.thread_runnables.iter().copied());
+        roots.extend(self.runnable_thread.values().copied());
         roots.extend(jdk::gl::live_handles());
         roots.extend(self.sleep_until.keys().copied());
         roots.extend(self.reparked.iter().copied());
