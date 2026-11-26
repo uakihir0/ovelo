@@ -84,9 +84,13 @@ fn arrays_deep_eq(vm: &mut Vm, a: u32, b: u32, depth: u8) -> Rt<bool> {
         return Ok(false);
     }
     let (elem, av, bv) = match (vm.heap.get(a), vm.heap.get(b)) {
-        (Some(Obj::Array { elem, data: av }), Some(Obj::Array { data: bv, .. })) => {
-            (elem.clone(), av.clone(), bv.clone())
-        }
+        (
+            Some(Obj::Array { elem, data: av }),
+            Some(Obj::Array {
+                elem: belem,
+                data: bv,
+            }),
+        ) if elem == belem => (elem.clone(), av.clone(), bv.clone()),
         _ => return Ok(false),
     };
     if av.len() != bv.len() {
