@@ -536,9 +536,20 @@ impl GuestUi {
             "Landroidx/fragment/app/Fragment;",
             "onGetLayoutInflater",
             "(Landroid/os/Bundle;)Landroid/view/LayoutInflater;",
-            Rc::new(RefCell::new(|vm: &mut Vm, _a: &[V]| {
-                if std::env::var_os("OVELO_VIEWDBG").is_some() {
-                    eprintln!("[viewdbg] fragment inflater host hit");
+            Rc::new(RefCell::new(|vm: &mut Vm, a: &[V]| {
+                let fragment = match a.first() {
+                    Some(V::Ref(h)) => *h,
+                    _ => 0,
+                };
+                if fragment != 0 {
+                    let real = vm.call_virtual_direct(
+                        fragment,
+                        "onGetLayoutInflater",
+                        a.get(1).copied().as_slice(),
+                    )?;
+                    if !matches!(real, Some(V::Ref(0)) | None) {
+                        return Ok(real);
+                    }
                 }
                 let activity = vm.current_activity();
                 let ctx = (activity != 0).then(|| V::Ref(activity));
