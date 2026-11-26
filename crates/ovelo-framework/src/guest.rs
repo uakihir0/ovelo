@@ -1152,7 +1152,15 @@ impl GuestUi {
             if w <= 0 || hh <= 0 {
                 continue;
             }
-            let ops = vm.guest_draw_ops(h, w, hh);
+            let ops = if compose_view {
+                let raw = rc.borrow().view().raw_custom_ops.clone();
+                let Some(raw) = raw else {
+                    continue;
+                };
+                vm.expand_display_list_ops(&raw)
+            } else {
+                vm.guest_draw_ops(h, w, hh)
+            };
             if std::env::var_os("OVELO_OPSDBG").is_some() && !ops.is_empty() {
                 use std::collections::BTreeMap;
                 let mut hist: BTreeMap<&'static str, usize> = BTreeMap::new();
@@ -1172,8 +1180,21 @@ impl GuestUi {
                         })
                         .or_default() += 1;
                 }
+                let details: Vec<String> = ops
+                    .iter()
+                    .filter_map(|o| match o {
+                        ovelo_dexrt::CanvasOp::Text { text, x, y, .. } => {
+                            Some(format!("T({x:.0},{y:.0},{text})"))
+                        }
+                        ovelo_dexrt::CanvasOp::Rect { l, t, r, b, .. } => {
+                            Some(format!("R({l:.0},{t:.0},{r:.0},{b:.0})"))
+                        }
+                        _ => None,
+                    })
+                    .take(12)
+                    .collect();
                 eprintln!(
-                    "[opsdbg] h{h} {w}x{hh} ops={} hist={hist:?} texts={texts}",
+                    "[opsdbg] h{h} {w}x{hh} ops={} hist={hist:?} texts={texts} {details:?}",
                     ops.len()
                 );
             }
@@ -1247,7 +1268,10 @@ impl GuestUi {
         // the last good ops until a frame lands.
         vm.dump_node_tree(h);
         let capture = ow > 0 && oh > 0 && !vm.compose_measure_active(h);
-        let ops = capture.then(|| vm.guest_draw_ops(h, ow, oh));
+        let ops = capture.then(|| {
+            let raw = vm.guest_draw_ops_raw(h, ow, oh);
+            (raw.clone(), vm.expand_display_list_ops(&raw))
+        });
         let mut g = rc.borrow_mut();
         // The widget kind is chosen once, but `is_group` can arrive
         // late: ViewPager2 builds its page container FrameLayout
@@ -1260,7 +1284,12 @@ impl GuestUi {
         // `g` borrows the view object while `self.materialize_dex`
         // recurses into children — different cells, no aliasing.
         update_dex_view(&mut g, &info);
-        if let Some(ops) = ops {
+        if let Some((raw_ops, ops)) = ops {
+            g.view_mut().raw_custom_ops = if raw_ops.is_empty() {
+                None
+            } else {
+                Some(Rc::new(raw_ops))
+            };
             g.view_mut().custom_ops = if ops.is_empty() {
                 None
             } else {
@@ -1345,7 +1374,14 @@ impl GuestUi {
             Rc::new(RefCell::new(
                 move |_vm: &mut Vm, a: &[V]| -> Result<Option<V>> {
                     let this = ref_arg(a, 0)?;
-                    let mut g = ui2.borrow_mut();
+                    let Ok(mut g) = ui2.try_borrow_mut() else {
+                        // Guest draw/measure callbacks can construct views
+                        // while the UI bridge is already borrowed. The dex
+                        // tree materialization path can recreate the host
+                        // object later; crashing the process here loses the
+                        // whole frame instead.
+                        return Ok(None);
+                    };
                     // A subclass super-call can fire a LESS specific ctor
                     // first (`View.<init>` binding Plain before
                     // `ViewGroup.<init>` would bind Group) — Plain is the
