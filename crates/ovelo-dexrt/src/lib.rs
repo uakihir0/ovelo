@@ -115,6 +115,7 @@ fn proto_sig(d: &DexFile, pidx: u32) -> Result<String> {
 /// are per-DEX; the VM merges all loaded dexes into one index space so a
 /// class defined in classes2.dex resolves from an invoke in classes.dex.
 pub(crate) type GIdx = u64;
+type MethodSigRc = std::rc::Rc<(String, String, String)>;
 
 /// `(field_name, type_desc)` → `(owner_desc, canon key)` for every
 /// field across loaded dexes (owners differ under R8; the name+type is
@@ -362,7 +363,7 @@ pub struct Vm {
     /// `midx` → `(class, name, proto_sig)` — decoding the proto string
     /// re-reads half the dex tables per call; layout/measure passes
     /// issue it tens of thousands of times on the same methods.
-    method_sig_cache: std::cell::RefCell<HashMap<GIdx, (String, String, String)>>,
+    method_sig_cache: std::cell::RefCell<HashMap<GIdx, MethodSigRc>>,
     /// `midx` → parsed `code_item` — `exec_frame` re-parsed registers,
     /// tries and handlers on every single call of a method.
     code_cache: std::cell::RefCell<HashMap<GIdx, std::rc::Rc<ovelo_dex::CodeItem>>>,
@@ -419,6 +420,8 @@ pub struct Vm {
     /// `midx` → `(params)ret` signature — the unresolved/builtin dispatch
     /// path re-decoded the proto's full param list on every invoke.
     proto_sig_cache: std::cell::RefCell<HashMap<GIdx, String>>,
+    /// const-string handle by global dex-local string index.
+    str_const_cache: std::cell::RefCell<HashMap<GIdx, u32>>,
     /// Bumped by every `pseudo_set` — lets the host render/layout
     /// passes skip rebuilding the dex-view tree when nothing changed.
     pub view_gen: u64,
@@ -919,6 +922,7 @@ impl Vm {
             super_desc_cache: std::cell::RefCell::new(HashMap::new()),
             assignable_desc_cache: std::cell::RefCell::new(HashMap::new()),
             proto_sig_cache: std::cell::RefCell::new(HashMap::new()),
+            str_const_cache: std::cell::RefCell::new(HashMap::new()),
             view_gen: 0,
             layout_gen_done: std::cell::Cell::new(u64::MAX),
             gc_mark: 65_536,
@@ -962,6 +966,7 @@ impl Vm {
         self.super_desc_cache.borrow_mut().clear();
         self.assignable_desc_cache.borrow_mut().clear();
         self.proto_sig_cache.borrow_mut().clear();
+        self.str_const_cache.borrow_mut().clear();
         let di = self.dexes.len();
         for (class_idx, em) in dex.methods()? {
             self.defined
@@ -1369,7 +1374,7 @@ impl Vm {
         is
     }
 
-    fn method_sig(&self, midx: GIdx) -> Result<(String, String, String)> {
+    fn method_sig(&self, midx: GIdx) -> Result<MethodSigRc> {
         if let Some(hit) = self.method_sig_cache.borrow().get(&midx) {
             return Ok(hit.clone());
         }
@@ -1385,7 +1390,7 @@ impl Vm {
         sig.push(')');
         let ret = d.type_descriptor(p.return_type_idx)?;
         sig.push_str(&ret);
-        let out = (class, name, sig);
+        let out = std::rc::Rc::new((class, name, sig));
         self.method_sig_cache.borrow_mut().insert(midx, out.clone());
         Ok(out)
     }
@@ -2137,7 +2142,6 @@ impl Vm {
         // The newly posted work may feed a worker that parked out of
         // the live queue — re-arm dropped parkers so they rescan.
         self.parked_runnables.remove(&r);
-        self.wake_parked();
         self.pending_runnables.push_back((r, on_main));
     }
 
@@ -2191,7 +2195,6 @@ impl Vm {
     pub(crate) fn enqueue_runnable_delayed(&mut self, r: u32, on_main: bool, delay_ms: i64) {
         self.reparked.clear();
         self.parked_runnables.remove(&r);
-        self.wake_parked();
         let due = jdk::now_ms().saturating_add(delay_ms.max(0)) as u64;
         self.delayed_runnables.push((r, on_main, due));
     }
@@ -2224,6 +2227,34 @@ impl Vm {
             } else {
                 i += 1;
             }
+        }
+    }
+
+    /// Wake only the worker runnable owned by `thread` — LockSupport.unpark
+    /// is targeted, and waking every scheduler worker makes each enqueue a
+    /// thundering herd of full worker-loop restarts.
+    pub(crate) fn wake_parked_thread(&mut self, thread: u32) {
+        let Some(r) = self
+            .runnable_thread
+            .iter()
+            .find(|(_, &t)| t == thread)
+            .map(|(&r, _)| r)
+        else {
+            return;
+        };
+        if let Some(i) = self.delayed_runnables.iter().position(|(h, _, _)| *h == r) {
+            let (_, on_main, _) = self.delayed_runnables.swap_remove(i);
+            self.unparkable_delayed.remove(&r);
+            self.deadline_woke.remove(&r);
+            self.deadline_park_cycles.remove(&r);
+            self.repark_counts.remove(&r);
+            self.reparked.remove(&r);
+            self.pending_runnables.push_back((r, on_main));
+        }
+        if let Some(on_main) = self.parked_runnables.remove(&r) {
+            self.repark_counts.remove(&r);
+            self.reparked.remove(&r);
+            self.pending_runnables.push_back((r, on_main));
         }
     }
 
@@ -2521,7 +2552,14 @@ impl Vm {
                         && self.sleep_until.contains_key(&r) =>
                 {
                     if dbg {
-                        eprintln!("[drain] h={r} park -> delayed(thread)");
+                        eprintln!(
+                            "[drain] h={r} park -> delayed(thread) wait={}",
+                            self.sleep_until
+                                .get(&r)
+                                .copied()
+                                .unwrap_or(now)
+                                .saturating_sub(now)
+                        );
                     }
                     // A `Thread` runnable that parked on Thread.sleep
                     // waits out its requested deadline, then re-runs —
@@ -2569,7 +2607,14 @@ impl Vm {
                 }
                 Err(e) if e.cause() == "ovelo.park" && self.sleep_until.contains_key(&r) => {
                     if dbg {
-                        eprintln!("[drain] h={r} park -> delayed(sleep)");
+                        eprintln!(
+                            "[drain] h={r} park -> delayed(sleep) wait={}",
+                            self.sleep_until
+                                .get(&r)
+                                .copied()
+                                .unwrap_or(now)
+                                .saturating_sub(now)
+                        );
                     }
                     // A non-thread runnable parked with a recorded
                     // deadline (e.g. RealCall.execute polling a host
@@ -3007,7 +3052,7 @@ impl Vm {
         }
         let s: std::rc::Rc<str> = self
             .method_sig(midx)
-            .map(|(class, name, sig)| format!("{class}.{name}{sig}"))
+            .map(|ms| format!("{}.{}{}", ms.0, ms.1, ms.2))
             .unwrap_or_else(|_| format!("method@{midx}"))
             .into();
         self.method_desc_cache.borrow_mut().insert(midx, s.clone());
@@ -4174,12 +4219,13 @@ impl Vm {
                 em,
             });
         }
-        if let Ok((class, name, sig)) = self.method_sig(midx) {
+        if let Ok(ms) = self.method_sig(midx) {
+            let (_, name, sig) = &*ms;
             // Static/direct refs may name a subclass of the actual
             // declarer — ART resolves them walking the superclass
             // chain (`V3/g.b` declared on `V3/i` etc.), so do the
             // same on a direct-table miss.
-            let mut cur = Some(class);
+            let mut cur = Some(ms.0.clone());
             for _ in 0..64 {
                 let Some(desc) = cur else { break };
                 if let Some(&g) =
@@ -4227,9 +4273,10 @@ impl Vm {
     }
 
     fn resolve_virtual_uncached(&self, midx: GIdx, start_class: GIdx, fallback: bool) -> Rt<Loc> {
-        let Ok((_, name, sig)) = self.method_sig(midx) else {
+        let Ok(ms) = self.method_sig(midx) else {
             return Err(E::Vm(err("dexrt.invoke.unresolved")));
         };
+        let (_, name, sig) = &*ms;
         let mut cur = Some(start_class);
         for _ in 0..64 {
             let Some(ci) = cur else { break };
@@ -4243,7 +4290,8 @@ impl Vm {
                         continue;
                     };
                     let oname = d.string(om.name_idx).unwrap_or_default();
-                    if oname == name && proto_sig(d, om.proto_idx as u32).unwrap_or_default() == sig
+                    if oname.as_str() == name.as_str()
+                        && proto_sig(d, om.proto_idx as u32).unwrap_or_default() == sig.as_str()
                     {
                         return Ok(Loc {
                             class_idx: cg,
@@ -4259,7 +4307,7 @@ impl Vm {
         // defaults onto the interface def with a real body, and a class
         // implements the interface without declaring the method — the
         // superclass-only walk above then misses it and the call stubs.
-        if let Some(hit) = self.find_interface_method(start_class, &name, &sig) {
+        if let Some(hit) = self.find_interface_method(start_class, name, sig) {
             return Ok(hit);
         }
         // Fall back to the declared method itself (e.g. dispatch target is the
@@ -5083,12 +5131,12 @@ impl Vm {
                                 self.def_loc_of(caller_class).and_then(|(cg, d)| {
                                     let dex = self.dex_of(cg)?;
                                     let types = dex.type_list(d.interfaces_off).ok()?;
-                                    let (_, name, sig) = self.method_sig(midx).ok()?;
+                                    let ms = self.method_sig(midx).ok()?;
                                     types.iter().find_map(|&t| {
                                         self.find_interface_method(
                                             gx(gd(cg), t as u32),
-                                            &name,
-                                            &sig,
+                                            &ms.1,
+                                            &ms.2,
                                         )
                                     })
                                 })
@@ -6396,8 +6444,16 @@ impl Vm {
             0x16..=0x18 => set!(regs[0], V::I64(ins.lit.unwrap_or(0))),
             0x19 => set!(regs[0], V::I64(ins.lit.unwrap_or(0) << 48)),
             0x1a | 0x1b => {
-                let s = self.dexes[di].string(ins.idx.unwrap_or(0)).map_err(E::Vm)?;
-                let h = self.heap.intern_str(&s);
+                let sg = gi(ins.idx.unwrap_or(0));
+                let hit = self.str_const_cache.borrow().get(&sg).copied();
+                let h = if let Some(h) = hit {
+                    h
+                } else {
+                    let s = self.dexes[di].string(ins.idx.unwrap_or(0)).map_err(E::Vm)?;
+                    let h = self.heap.intern_str(&s);
+                    self.str_const_cache.borrow_mut().insert(sg, h);
+                    h
+                };
                 set!(regs[0], V::Ref(h));
             }
             0x1c => {
