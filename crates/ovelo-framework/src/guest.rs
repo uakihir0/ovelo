@@ -1153,13 +1153,19 @@ impl GuestUi {
                 continue;
             }
             let mut captured_raw = None;
+            let mut captured_seq = -1;
             let ops = if compose_view {
-                let existing = rc.borrow().view().raw_custom_ops.clone();
-                let Some(raw) = existing.or_else(|| {
+                let (existing, existing_seq) = {
+                    let g = rc.borrow();
+                    (g.view().raw_custom_ops.clone(), g.view().raw_custom_ops_seq)
+                };
+                let valid = existing.is_some() && existing_seq == vm.view_invalid_seq(h);
+                let Some(raw) = (if valid { existing } else { None }).or_else(|| {
                     let captured = vm.guest_draw_ops_raw(h, w, hh);
                     (!captured.is_empty()).then(|| {
                         let raw = Rc::new(captured);
-                        captured_raw = Some(raw.clone());
+                        captured_seq = vm.view_invalid_seq(h);
+                        captured_raw = Some((raw.clone(), captured_seq));
                         raw
                     })
                 }) else {
@@ -1208,8 +1214,9 @@ impl GuestUi {
             }
             let mut g = rc.borrow_mut();
             let v = g.view_mut();
-            if let Some(raw) = captured_raw {
+            if let Some((raw, seq)) = captured_raw {
                 v.raw_custom_ops = Some(raw);
+                v.raw_custom_ops_seq = seq;
             }
             v.custom_ops = if ops.is_empty() {
                 None

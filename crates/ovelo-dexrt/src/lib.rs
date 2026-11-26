@@ -3019,6 +3019,12 @@ impl Vm {
         jdk::gfx::guest_draw_ops_raw(self, view, w, h)
     }
 
+    /// Per-view guest invalidate sequence used to decide when a cached
+    /// display-list recording is stale.
+    pub fn view_invalid_seq(&self, view: u32) -> i32 {
+        jdk::view::invalid_seq(self, view)
+    }
+
     /// Resolve nested RenderNode references against their current
     /// recordings.
     pub fn expand_display_list_ops(

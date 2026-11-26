@@ -542,6 +542,10 @@ pub fn mark_layout_requested(vm: &mut Vm, h: u32) {
     }
 }
 
+pub(crate) fn invalid_seq(vm: &Vm, h: u32) -> i32 {
+    pint(vm, h, P_INVALID_SEQ)
+}
+
 pub(crate) fn layout_requested(vm: &Vm, h: u32) -> bool {
     pint(vm, h, P_LAYOUT_REQ) != 0
 }

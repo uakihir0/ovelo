@@ -94,6 +94,8 @@ pub struct View {
     /// Unflattened guest ops retained when they contain RenderNode
     /// references; child display lists are re-resolved from these.
     pub raw_custom_ops: Option<Rc<Vec<ovelo_dexrt::CanvasOp>>>,
+    /// Guest invalidate sequence at which `raw_custom_ops` was recorded.
+    pub raw_custom_ops_seq: i32,
     /// Pressed while the pointer that went down on this view is still
     /// down; a click only fires when the release also lands inside.
     pub pressed: bool,
@@ -115,6 +117,7 @@ impl View {
             on_click: None,
             custom_ops: None,
             raw_custom_ops: None,
+            raw_custom_ops_seq: -1,
             pressed: false,
             dirty: true,
         }
