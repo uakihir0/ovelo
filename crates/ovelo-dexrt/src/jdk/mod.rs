@@ -778,8 +778,19 @@ pub fn pseudo_set(vm: &mut Vm, h: u32, key: impl Into<u64>, v: V) {
         if f.get(&key) == Some(&v) {
             return;
         }
+        if crate::dbg_flag("OVELO_PSEUDODBG") {
+            eprintln!("[pseudo] h{h} key={key:#x} v={v:?}");
+        }
+        // Most pseudo state belongs to non-view infrastructure objects
+        // (intents, buffers, drawables, reflection mirrors). Treating all
+        // of it as a view-tree change makes every coroutine/IO mutation
+        // re-materialize the whole UI tree each frame.
+        let affects_view =
+            key == view::P_IS_VIEW as u64 || f.contains_key(&(view::P_IS_VIEW as u64));
         f.insert(key, v);
-        vm.view_gen = vm.view_gen.wrapping_add(1);
+        if affects_view {
+            vm.view_gen = vm.view_gen.wrapping_add(1);
+        }
     }
 }
 

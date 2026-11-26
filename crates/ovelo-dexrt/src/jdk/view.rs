@@ -2470,6 +2470,9 @@ pub(crate) fn call(
             // the next traversal re-runs guest_draw_ops for this tree.
             let n = pint(vm, this, P_INVALID_SEQ);
             pseudo_set(vm, this, P_INVALID_SEQ, V::I32(n.wrapping_add(1)));
+            if crate::dbg_flag("OVELO_VIEWDBG") {
+                eprintln!("[viewdbg] invalidate h{this} seq={}", n + 1);
+            }
             Some(None)
         }
         "setBackgroundColor" => {
