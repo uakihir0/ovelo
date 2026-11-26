@@ -12,6 +12,75 @@ use crate::value::{HostState, Obj, V};
 /// `equals` that throws propagates — swallowing it would let a
 /// `remove` succeed where Java surfaces the exception.
 fn elem_eq(vm: &mut Vm, e: V, other: V) -> Rt<bool> {
+    elem_eq_depth(vm, e, other, 0)
+}
+
+fn collection_desc(vm: &Vm, h: u32) -> String {
+    match vm.heap.get(h) {
+        Some(Obj::Host { desc, .. }) => desc.clone(),
+        _ => class_of(vm, V::Ref(h)),
+    }
+}
+
+fn collection_is_set(vm: &Vm, h: u32) -> bool {
+    collection_desc(vm, h).contains("Set;")
+}
+
+fn collection_snapshot(vm: &Vm, h: u32) -> Option<Vec<V>> {
+    if collection_desc(vm, h) == "Lkotlin/collections/EmptyList;" {
+        return Some(Vec::new());
+    }
+    list_snapshot(vm, h)
+}
+
+fn collections_eq(vm: &mut Vm, a: u32, b: u32, depth: u8) -> Rt<Option<bool>> {
+    if a == b {
+        return Ok(Some(true));
+    }
+    if depth >= 16 {
+        return Ok(None);
+    }
+    let (av, bv) = match (collection_snapshot(vm, a), collection_snapshot(vm, b)) {
+        (Some(av), Some(bv)) => (av, bv),
+        _ => return Ok(None),
+    };
+    if av.len() != bv.len() {
+        return Ok(Some(false));
+    }
+    let set_a = collection_is_set(vm, a);
+    let set_b = collection_is_set(vm, b);
+    if set_a != set_b {
+        return Ok(Some(false));
+    }
+    if set_a {
+        let mut used = vec![false; bv.len()];
+        'outer: for x in av {
+            for (i, y) in bv.iter().enumerate() {
+                if !used[i] && elem_eq_depth(vm, x, *y, depth + 1)? {
+                    used[i] = true;
+                    continue 'outer;
+                }
+            }
+            return Ok(Some(false));
+        }
+        return Ok(Some(true));
+    }
+    for (x, y) in av.iter().zip(bv.iter()) {
+        if !elem_eq_depth(vm, *x, *y, depth + 1)? {
+            return Ok(Some(false));
+        }
+    }
+    Ok(Some(true))
+}
+
+fn elem_eq_depth(vm: &mut Vm, e: V, other: V, depth: u8) -> Rt<bool> {
+    if let (V::Ref(a), V::Ref(b)) = (e, other) {
+        if a != 0 && b != 0 {
+            if let Some(eq) = collections_eq(vm, a, b, depth)? {
+                return Ok(eq);
+            }
+        }
+    }
     match e {
         V::Ref(h) if h != 0 && matches!(vm.heap.get(h), Some(Obj::Instance { .. })) => {
             match vm.call_virtual_rt(h, "equals", &[other]) {
@@ -908,19 +977,8 @@ fn list_call(vm: &mut Vm, name: &str, sig: &str, args: &[V]) -> Rt<Option<Option
                 Some(V::Ref(oh)) => oh,
                 _ => return Ok(Some(Some(V::I32(0)))),
             };
-            let (a, b) = match (list_snapshot(vm, h), list_snapshot(vm, other)) {
-                (Some(a), Some(b)) => (a, b),
-                _ => return Ok(Some(Some(V::I32(0)))),
-            };
-            if a.len() != b.len() {
-                return Ok(Some(Some(V::I32(0))));
-            }
-            for (x, y) in a.iter().zip(b.iter()) {
-                if !elem_eq(vm, *x, *y)? {
-                    return Ok(Some(Some(V::I32(0))));
-                }
-            }
-            Some(Some(V::I32(1)))
+            let eq = collections_eq(vm, h, other, 0)?.unwrap_or(false);
+            Some(Some(V::I32(eq as i32)))
         }
         "indexOf" | "lastIndexOf" => {
             let items: Vec<V> = match list_snapshot(vm, h) {
