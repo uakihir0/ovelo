@@ -26,6 +26,32 @@ fn collection_is_set(vm: &Vm, h: u32) -> bool {
     collection_desc(vm, h).contains("Set;")
 }
 
+fn collection_elements_rt(vm: &mut Vm, h: u32) -> Rt<Option<Vec<V>>> {
+    if let Some(items) = collection_snapshot(vm, h) {
+        return Ok(Some(items));
+    }
+    let it = match vm.call_virtual_rt(h, "iterator", &[]) {
+        Ok(Some(V::Ref(it))) if it != 0 => it,
+        Ok(_) => return Ok(None),
+        Err(e) => return Err(e),
+    };
+    let mut out = Vec::new();
+    for _ in 0..100_000 {
+        let more = vm
+            .call_virtual_rt(it, "hasNext", &[])?
+            .map(|v| i32v(v) != 0)
+            .unwrap_or(false);
+        if !more {
+            break;
+        }
+        let Some(v) = vm.call_virtual_rt(it, "next", &[])? else {
+            break;
+        };
+        out.push(v);
+    }
+    Ok(Some(out))
+}
+
 fn collection_snapshot(vm: &Vm, h: u32) -> Option<Vec<V>> {
     if matches!(vm.heap.get(h), Some(Obj::Array { .. })) {
         return None;
@@ -1024,9 +1050,9 @@ fn list_call(vm: &mut Vm, name: &str, sig: &str, args: &[V]) -> Rt<Option<Option
             Some(Some(V::I32(c as i32)))
         }
         "containsAll" => {
-            let mine: Vec<V> = list_snapshot(vm, h).unwrap_or_default();
+            let mine = collection_elements_rt(vm, h)?.unwrap_or_default();
             let want = match args.get(1).copied() {
-                Some(V::Ref(w)) => list_snapshot(vm, w).unwrap_or_default(),
+                Some(V::Ref(w)) => collection_elements_rt(vm, w)?.unwrap_or_default(),
                 _ => Vec::new(),
             };
             let mut all = true;
