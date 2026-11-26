@@ -2558,7 +2558,16 @@ fn context_call(
             if name == "getExternalMediaDir" {
                 Some(Some(V::Ref(0)))
             } else {
-                let logical = format!("/data/local/ovelo/{name}");
+                let leaf = match name {
+                    "getExternalFilesDir" => "external/files",
+                    "getExternalCacheDir" => "external/cache",
+                    "getObbDir" => "obb",
+                    "getCodeCacheDir" => "code_cache",
+                    "getDataDir" => "data",
+                    "getNoBackupFilesDir" => "no_backup",
+                    _ => name,
+                };
+                let logical = format!("/data/local/ovelo/{leaf}");
                 let _ = std::fs::create_dir_all(io::fspath(vm, &logical));
                 Some(Some(host(vm, "Ljava/io/File;", HostState::Path(logical))))
             }
