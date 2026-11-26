@@ -2294,6 +2294,19 @@ impl Vm {
         }
     }
 
+    /// Drop every ThreadLocal value owned by a retired worker thread.
+    /// ThreadLocals store per-thread entries in their own tables, so
+    /// replacing a failed executor worker must explicitly evict the old
+    /// thread key or values accumulate for the process lifetime.
+    pub(crate) fn drop_threadlocal_values(&mut self, thread: u32) {
+        for h in self.heap.live_handles() {
+            let table = jdk::pseudo_get(self, h, jdk::P_TLS);
+            if let Some(V::Ref(m)) = table {
+                jdk::map_remove(self, m, V::Ref(thread));
+            }
+        }
+    }
+
     /// `LockSupport.unpark(thread)` — map the guest Thread object back
     /// to the runnable whose execution represents it. Unknown threads
     /// keep the previous broad wake as a compatibility fallback.
@@ -2781,7 +2794,9 @@ impl Vm {
                             // task escapes with an uncaught exception;
                             // its ThreadLocal state must not leak into
                             // the next task on this executor.
-                            self.executor_thread.remove(&ex);
+                            if let Some(thread) = self.executor_thread.remove(&ex) {
+                                self.drop_threadlocal_values(thread);
+                            }
                         }
                         if self.executor_active.get(&ex) == Some(&r) {
                             let next = self

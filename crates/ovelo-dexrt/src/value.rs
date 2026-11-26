@@ -481,6 +481,15 @@ impl Heap {
         self.objs.is_empty()
     }
 
+    /// Live object handles, for rare whole-heap maintenance scans.
+    pub fn live_handles(&self) -> Vec<u32> {
+        self.objs
+            .iter()
+            .enumerate()
+            .filter_map(|(i, o)| o.as_ref().map(|_| i as u32 + 1))
+            .collect()
+    }
+
     /// Stop-the-world mark-sweep: `roots` plus every interned string
     /// are kept; unmarked slots are freed and their handles recycled.
     /// Returns the number of freed objects.
