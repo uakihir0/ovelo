@@ -2147,6 +2147,14 @@ impl Vm {
             eprintln!("[drain] enqueue h{} main={}", r, on_main);
         }
         self.reparked.clear();
+        // A delayed slot that represents this runnable's interrupted
+        // park is not an independent post. Drop it when the same
+        // callback is posted again, or both copies restart from the
+        // top; ordinary delayed posts remain duplicate-capable.
+        if self.unparkable_delayed.contains(&r) {
+            self.delayed_runnables.retain(|(h, _, _)| *h != r);
+            self.unparkable_delayed.remove(&r);
+        }
         // Retired parkers are outside the queue only because this VM
         // cannot resume their original Java stack; fresh work may feed
         // their internal queues, so give them another scan. Timed
@@ -2208,6 +2216,14 @@ impl Vm {
     pub(crate) fn enqueue_runnable_delayed(&mut self, r: u32, on_main: bool, delay_ms: i64) {
         self.reparked.clear();
         self.parked_runnables.remove(&r);
+        // A delayed slot that represents this runnable's interrupted
+        // park is not an independent post. Leaving it beside the fresh
+        // post restarts the same callback twice once both deadlines
+        // expire; ordinary delayed posts remain duplicate-capable.
+        if self.unparkable_delayed.contains(&r) {
+            self.delayed_runnables.retain(|(h, _, _)| *h != r);
+            self.unparkable_delayed.remove(&r);
+        }
         self.wake_retired();
         let due = jdk::now_ms().saturating_add(delay_ms.max(0)) as u64;
         self.delayed_runnables.push((r, on_main, due));
