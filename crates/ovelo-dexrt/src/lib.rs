@@ -452,6 +452,8 @@ pub struct Vm {
     pub(crate) executor_active: HashMap<u32, u32>,
     /// runnable handle -> owning single-thread executor.
     pub(crate) runnable_executor: HashMap<u32, u32>,
+    /// Single-thread executor handle → its long-lived worker Thread.
+    pub(crate) executor_thread: HashMap<u32, u32>,
     /// Views whose attach state changed while guest composition/layout
     /// work was active. `onAttachedToWindow` is delivered on a later
     /// drain boundary so nested Compose content cannot compose inside
@@ -542,6 +544,10 @@ pub struct Vm {
     /// Handles currently sitting in `delayed_runnables` whose deadline
     /// is interruptible — `wake_parked` promotes these early.
     pub(crate) unparkable_delayed: hashbrown::HashSet<u32>,
+    /// Runnable → the due timestamp of its interruptible-park delayed
+    /// slot, so a repost removes that slot rather than independent
+    /// delayed posts of the same Runnable object.
+    pub(crate) unparkable_delayed_due: HashMap<u32, u64>,
     /// Runnables whose latest promotion out of `delayed_runnables` was
     /// their own deadline expiring — not an `unpark`. An interruptible
     /// parker that re-parks straight after a deadline wake ticks
@@ -873,6 +879,7 @@ impl Vm {
             executor_queues: HashMap::new(),
             executor_active: HashMap::new(),
             runnable_executor: HashMap::new(),
+            executor_thread: HashMap::new(),
             pending_attach_callbacks: std::collections::VecDeque::new(),
             frame_callbacks: Vec::new(),
             sched_prefer_worker: false,
@@ -904,6 +911,7 @@ impl Vm {
             parked_runnables: HashMap::new(),
             park_waiters: hashbrown::HashSet::new(),
             unparkable_delayed: hashbrown::HashSet::new(),
+            unparkable_delayed_due: HashMap::new(),
             deadline_woke: hashbrown::HashSet::new(),
             deadline_park_cycles: HashMap::new(),
             media_ids: HashMap::new(),
@@ -2074,6 +2082,7 @@ impl Vm {
             if self.delayed_runnables[i].2 <= now {
                 let (r, on_main, _) = self.delayed_runnables.swap_remove(i);
                 self.unparkable_delayed.remove(&r);
+                self.unparkable_delayed_due.remove(&r);
                 self.deadline_woke.insert(r);
                 self.pending_runnables.push_back((r, on_main));
             } else {
@@ -2100,6 +2109,7 @@ impl Vm {
                     if self.delayed_runnables[i].2 <= now3 {
                         let (r, on_main, _) = self.delayed_runnables.swap_remove(i);
                         self.unparkable_delayed.remove(&r);
+                        self.unparkable_delayed_due.remove(&r);
                         self.deadline_woke.insert(r);
                         self.pending_runnables.push_back((r, on_main));
                     } else {
@@ -2151,9 +2161,16 @@ impl Vm {
         // park is not an independent post. Drop it when the same
         // callback is posted again, or both copies restart from the
         // top; ordinary delayed posts remain duplicate-capable.
-        if self.unparkable_delayed.contains(&r) {
-            self.delayed_runnables.retain(|(h, _, _)| *h != r);
+        if let Some(park_due) = self.unparkable_delayed_due.get(&r).copied() {
+            if let Some(i) = self
+                .delayed_runnables
+                .iter()
+                .position(|(h, _, due)| *h == r && *due == park_due)
+            {
+                self.delayed_runnables.swap_remove(i);
+            }
             self.unparkable_delayed.remove(&r);
+            self.unparkable_delayed_due.remove(&r);
         }
         // Retired parkers are outside the queue only because this VM
         // cannot resume their original Java stack; fresh work may feed
@@ -2205,6 +2222,7 @@ impl Vm {
         self.pending_runnables.retain(|(h, _)| *h != r);
         self.delayed_runnables.retain(|(h, _, _)| *h != r);
         self.unparkable_delayed.remove(&r);
+        self.unparkable_delayed_due.remove(&r);
         self.deadline_woke.remove(&r);
         self.deadline_park_cycles.remove(&r);
         self.parked_thread_runnable.retain(|_, parked| *parked != r);
@@ -2220,9 +2238,16 @@ impl Vm {
         // park is not an independent post. Leaving it beside the fresh
         // post restarts the same callback twice once both deadlines
         // expire; ordinary delayed posts remain duplicate-capable.
-        if self.unparkable_delayed.contains(&r) {
-            self.delayed_runnables.retain(|(h, _, _)| *h != r);
+        if let Some(park_due) = self.unparkable_delayed_due.get(&r).copied() {
+            if let Some(i) = self
+                .delayed_runnables
+                .iter()
+                .position(|(h, _, due)| *h == r && *due == park_due)
+            {
+                self.delayed_runnables.swap_remove(i);
+            }
             self.unparkable_delayed.remove(&r);
+            self.unparkable_delayed_due.remove(&r);
         }
         self.wake_retired();
         let due = jdk::now_ms().saturating_add(delay_ms.max(0)) as u64;
@@ -2264,6 +2289,7 @@ impl Vm {
         {
             let (r, on_main, _) = self.delayed_runnables.swap_remove(i);
             self.unparkable_delayed.remove(&r);
+            self.unparkable_delayed_due.remove(&r);
             self.queue_woken_runnable(r, on_main);
         }
     }
@@ -2301,6 +2327,7 @@ impl Vm {
             if self.unparkable_delayed.contains(&r) {
                 self.delayed_runnables.swap_remove(i);
                 self.unparkable_delayed.remove(&r);
+                self.unparkable_delayed_due.remove(&r);
                 self.queue_woken_runnable(r, on_main);
             } else {
                 i += 1;
@@ -2333,6 +2360,7 @@ impl Vm {
         roots.extend(self.single_executors.iter().copied());
         roots.extend(self.executor_active.keys().copied());
         roots.extend(self.executor_active.values().copied());
+        roots.extend(self.executor_thread.values().copied());
         roots.extend(
             self.executor_queues
                 .values()
@@ -2453,6 +2481,7 @@ impl Vm {
             .collect();
         for (r, on_main, _) in due {
             self.unparkable_delayed.remove(&r);
+            self.unparkable_delayed_due.remove(&r);
             self.deadline_woke.insert(r);
             self.pending_runnables.push_back((r, on_main));
         }
@@ -2656,6 +2685,7 @@ impl Vm {
                     }
                     if unparkable {
                         self.unparkable_delayed.insert(r);
+                        self.unparkable_delayed_due.insert(r, due);
                     }
                     self.delayed_runnables.push((r, on_main, due));
                 }
@@ -2694,6 +2724,7 @@ impl Vm {
                     }
                     if unparkable {
                         self.unparkable_delayed.insert(r);
+                        self.unparkable_delayed_due.insert(r, due);
                     }
                     self.delayed_runnables.push((r, on_main, due));
                 }
@@ -2739,6 +2770,7 @@ impl Vm {
                     self.sleep_until.remove(&r);
                     self.park_waiters.remove(&r);
                     self.unparkable_delayed.remove(&r);
+                    self.unparkable_delayed_due.remove(&r);
                     self.deadline_woke.remove(&r);
                     self.deadline_park_cycles.remove(&r);
                     self.slept_once.remove(&r);

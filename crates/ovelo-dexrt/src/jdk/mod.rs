@@ -464,9 +464,15 @@ pub(crate) fn run_on_worker(
     vm.cur_thread = vm.runnable_thread.get(&r).copied().unwrap_or_else(|| {
         // Executor/dispatcher tasks have no Thread.start owner, but
         // code can capture Thread.currentThread() while the task runs
-        // and later unpark exactly that object. Give each such task a
-        // distinct worker-thread object instead of aliasing every task
-        // to the shared fallback.
+        // and later unpark exactly that object. A single-thread
+        // executor reuses one long-lived worker identity across tasks
+        // (ThreadLocal semantics); other dispatcher tasks get their
+        // own worker object rather than aliasing the shared fallback.
+        let owner = vm.runnable_executor.get(&r).copied();
+        if let Some(t) = owner.and_then(|ex| vm.executor_thread.get(&ex).copied()) {
+            vm.runnable_thread.insert(r, t);
+            return t;
+        }
         let V::Ref(t) = host(
             vm,
             "Ljava/lang/Thread;",
@@ -474,6 +480,9 @@ pub(crate) fn run_on_worker(
         ) else {
             unreachable!()
         };
+        if let Some(ex) = owner {
+            vm.executor_thread.insert(ex, t);
+        }
         vm.runnable_thread.insert(r, t);
         t
     });
