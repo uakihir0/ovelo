@@ -400,7 +400,7 @@ pub(crate) fn call(
     args: &[V],
 ) -> Rt<Option<Option<V>>> {
     Ok(if class == "Ljava/util/Collections;" {
-        collections_static(vm, name, args)
+        collections_static(vm, name, args)?
     } else if class == "Ljava/util/Arrays;" {
         arrays_static(vm, name, sig, args)?
     } else if class == "Ljava/util/Objects;" {
@@ -742,6 +742,58 @@ fn enum_set_call(vm: &mut Vm, name: &str, sig: &str, args: &[V]) -> Rt<Option<Op
 
 // ---------------------------------------------------------------------
 // List
+
+fn write_sorted_list(vm: &mut Vm, h: u32, items: Vec<V>) {
+    if matches!(
+        vm.heap.get(h),
+        Some(Obj::Host {
+            state: HostState::List(_),
+            ..
+        })
+    ) {
+        if let Some(l) = list_mut(vm, h) {
+            *l = items;
+        }
+        return;
+    }
+    let Some((backing, off, size, ring)) = super::guest_list_backing(vm, h, 8) else {
+        return;
+    };
+    match vm.heap.get_mut(backing) {
+        Some(Obj::Host {
+            state: HostState::List(l),
+            ..
+        }) => {
+            if !ring && off == 0 && size.is_none_or(|n| n >= l.len()) {
+                *l = items;
+            } else {
+                for (i, v) in items.into_iter().enumerate() {
+                    let at = if ring && !l.is_empty() {
+                        (off + i) % l.len()
+                    } else {
+                        off + i
+                    };
+                    if at < l.len() {
+                        l[at] = v;
+                    }
+                }
+            }
+        }
+        Some(Obj::Array { data, .. }) => {
+            for (i, v) in items.into_iter().enumerate() {
+                let at = if ring && !data.is_empty() {
+                    (off + i) % data.len()
+                } else {
+                    off + i
+                };
+                if at < data.len() {
+                    data[at] = v;
+                }
+            }
+        }
+        _ => {}
+    }
+}
 
 fn list_call(vm: &mut Vm, name: &str, sig: &str, args: &[V]) -> Rt<Option<Option<V>>> {
     let V::Ref(h) = args.first().copied().unwrap_or(V::Ref(0)) else {
@@ -1241,7 +1293,7 @@ fn list_call(vm: &mut Vm, name: &str, sig: &str, args: &[V]) -> Rt<Option<Option
                     Some(V::Ref(c)) if *c != 0 => *c,
                     _ => 0,
                 };
-                let mut items = list_ref(vm, h).cloned().unwrap_or_default();
+                let mut items = list_snapshot(vm, h).unwrap_or_default();
                 if comparator != 0 {
                     // `sortWith` feeds Compose's invalidation list into a
                     // binary search. Keep the sort stable and propagate
@@ -1264,9 +1316,7 @@ fn list_call(vm: &mut Vm, name: &str, sig: &str, args: &[V]) -> Rt<Option<Option
                 } else {
                     items.sort_by(|a, b| natural_cmp(vm, *a, *b).cmp(&0));
                 }
-                if let Some(l) = list_mut(vm, h) {
-                    *l = items;
-                }
+                write_sorted_list(vm, h, items);
                 Some(None)
             } else if name.ends_with("stream") || name.ends_with("Stream") {
                 Some(Some(host(
@@ -2176,8 +2226,8 @@ fn iter_call(vm: &mut Vm, name: &str, args: &[V]) -> Rt<Option<Option<V>>> {
 // ---------------------------------------------------------------------
 // Collections / Arrays / Objects statics
 
-fn collections_static(vm: &mut Vm, name: &str, args: &[V]) -> Option<Option<V>> {
-    match name {
+fn collections_static(vm: &mut Vm, name: &str, args: &[V]) -> Rt<Option<Option<V>>> {
+    Ok(match name {
         "emptyList" | "emptySet" | "emptyMap" | "emptyIterator" | "emptyEnumeration"
         | "emptyListIterator" | "emptyNavigableSet" | "emptySortedSet" | "emptyNavigableMap"
         | "emptySortedMap" => {
@@ -2247,15 +2297,13 @@ fn collections_static(vm: &mut Vm, name: &str, args: &[V]) -> Option<Option<V>> 
                     Some(V::Ref(c)) if *c != 0 => *c,
                     _ => 0,
                 };
-                let mut items = list_ref(vm, h).cloned().unwrap_or_default();
+                let mut items = list_snapshot(vm, h).unwrap_or_default();
                 if comparator != 0 {
                     for i in 1..items.len() {
                         let mut j = i;
                         while j > 0 {
                             let ord = vm
-                                .call_virtual_rt(comparator, "compare", &[items[j - 1], items[j]])
-                                .ok()
-                                .flatten()
+                                .call_virtual_rt(comparator, "compare", &[items[j - 1], items[j]])?
                                 .map(i32v)
                                 .unwrap_or(0);
                             if ord <= 0 {
@@ -2268,9 +2316,7 @@ fn collections_static(vm: &mut Vm, name: &str, args: &[V]) -> Option<Option<V>> 
                 } else {
                     items.sort_by(|a, b| natural_cmp(vm, *a, *b).cmp(&0));
                 }
-                if let Some(l) = list_mut(vm, h) {
-                    *l = items;
-                }
+                write_sorted_list(vm, h, items);
             }
             Some(None)
         }
@@ -2381,12 +2427,22 @@ fn collections_static(vm: &mut Vm, name: &str, args: &[V]) -> Option<Option<V>> 
                 HostState::Iter(Rc::new(items), 0),
             )))
         }
-        "reverseOrder" | "comparing" | "comparingInt" | "comparingLong" | "comparingDouble"
-        | "naturalOrder" => Some(Some(host(vm, "Ljava/util/Comparator;", HostState::Empty))),
+        "reverseOrder" => Some(Some(host(
+            vm,
+            "Ljava/util/Comparator;",
+            HostState::Slot(V::I32(1)),
+        ))),
+        "naturalOrder" | "comparing" | "comparingInt" | "comparingLong" | "comparingDouble" => {
+            Some(Some(host(
+                vm,
+                "Ljava/util/Comparator;",
+                HostState::Slot(V::I32(0)),
+            )))
+        }
         "newSetFromMap" => Some(Some(host(vm, "Ljava/util/Set;", HostState::List(vec![])))),
         "synchronizedCollection0" | "unmodifiableCollection0" => Some(Some(V::Ref(0))),
         _ => None,
-    }
+    })
 }
 
 fn arrays_static(vm: &mut Vm, name: &str, _sig: &str, args: &[V]) -> Rt<Option<Option<V>>> {

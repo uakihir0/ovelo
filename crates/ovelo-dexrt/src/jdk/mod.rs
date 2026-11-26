@@ -1073,7 +1073,11 @@ pub(crate) fn list_len(vm: &Vm, h: u32) -> Option<usize> {
 /// Collection` so arbitrary guest objects holding collection fields
 /// are not misread; direct backing fields are preferred over nested
 /// delegates, and the depth budget ends reference cycles.
-fn guest_list_backing(vm: &Vm, h: u32, depth: u8) -> Option<(u32, usize, Option<usize>, bool)> {
+pub(crate) fn guest_list_backing(
+    vm: &Vm,
+    h: u32,
+    depth: u8,
+) -> Option<(u32, usize, Option<usize>, bool)> {
     if depth == 0 || !vm.is_guest_collection(h) {
         return None;
     }
@@ -1653,6 +1657,29 @@ fn universal(vm: &mut Vm, class: &str, name: &str, sig: &str, args: &[V]) -> Rt<
         "equals" if class != "Ljava/util/Arrays;" && !lang::primitive_type(class) => Some(Some(
             V::I32((args.len() > 1 && value_eq(vm, args[0], args[1])) as i32),
         )),
+        "compare" if class == "Ljava/util/Comparator;" => {
+            let mode = match args.first().copied().unwrap_or(V::Ref(0)) {
+                V::Ref(h) => slot_of(vm, h).unwrap_or(V::I32(0)),
+                _ => V::I32(0),
+            };
+            let cmp = if matches!(mode, V::I32(2)) {
+                let a = sv(vm, args[1])
+                    .unwrap_or_else(|| v_to_s(vm, args[1]))
+                    .to_lowercase();
+                let b = sv(vm, args[2])
+                    .unwrap_or_else(|| v_to_s(vm, args[2]))
+                    .to_lowercase();
+                a.cmp(&b) as i32
+            } else {
+                let c = collect::natural_cmp(vm, args[1], args[2]);
+                if matches!(mode, V::I32(1)) {
+                    -c
+                } else {
+                    c
+                }
+            };
+            Some(Some(V::I32(cmp)))
+        }
         "getClass" => {
             let d = class_of(vm, args[0]);
             Some(Some(class_obj(vm, d)))
@@ -1997,7 +2024,11 @@ pub(crate) fn sfield(vm: &mut Vm, owner: &str, name: &str, ftype: &str) -> Optio
         }
         ("Ljava/lang/Void;", "TYPE") => return Some(class_obj(vm, "V".into())),
         ("Ljava/lang/String;", "CASE_INSENSITIVE_ORDER") => {
-            return Some(host(vm, "Ljava/util/Comparator;", HostState::Empty))
+            return Some(host(
+                vm,
+                "Ljava/util/Comparator;",
+                HostState::Slot(V::I32(2)),
+            ))
         }
         ("Ljava/nio/charset/StandardCharsets;", n) => {
             return Some(host(
