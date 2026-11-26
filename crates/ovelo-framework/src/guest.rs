@@ -528,6 +528,26 @@ impl GuestUi {
             "(Ljava/lang/String;)V",
             Rc::new(RefCell::new(|_vm: &mut Vm, _a: &[V]| Ok(None))) as HostCall,
         );
+        // Fragment host callbacks are only partially modeled; once a
+        // fragment transaction reaches onGetLayoutInflater, returning
+        // null makes every fragment onCreateView fault before it can
+        // inflate even though the activity's inflater works.
+        let fragment_inflater_registered = vm.register_host(
+            "Landroidx/fragment/app/Fragment;",
+            "onGetLayoutInflater",
+            "(Landroid/os/Bundle;)Landroid/view/LayoutInflater;",
+            Rc::new(RefCell::new(|vm: &mut Vm, _a: &[V]| {
+                if std::env::var_os("OVELO_VIEWDBG").is_some() {
+                    eprintln!("[viewdbg] fragment inflater host hit");
+                }
+                let activity = vm.current_activity();
+                let ctx = (activity != 0).then(|| V::Ref(activity));
+                Ok(Some(vm.layout_inflater(ctx)))
+            })) as HostCall,
+        );
+        if std::env::var_os("OVELO_VIEWDBG").is_some() {
+            eprintln!("[viewdbg] fragment inflater host={fragment_inflater_registered:?}");
+        }
         // ---- constructors -------------------------------------------------
         Self::ctor(ui, vm, "Landroid/view/View;", |_ui| {
             GuestView::Plain(View::new(

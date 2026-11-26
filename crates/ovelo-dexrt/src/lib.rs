@@ -1931,6 +1931,16 @@ impl Vm {
         self.cur_activity = activity;
     }
 
+    /// Activity currently dispatching guest code, or zero outside one.
+    pub fn current_activity(&self) -> u32 {
+        self.cur_activity
+    }
+
+    /// A host LayoutInflater carrying the supplied Context.
+    pub fn layout_inflater(&mut self, ctx: Option<V>) -> V {
+        jdk::view::inflater(self, ctx)
+    }
+
     /// Deliver a host pointer event into the dex view tree
     /// (action: 0=down, 1=up, 2=move). Dex-materialized views —
     /// including games' input views — only see input through this
