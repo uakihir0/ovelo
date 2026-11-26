@@ -2074,6 +2074,7 @@ pub(crate) fn call(
         }
         "setVisibility" => {
             pseudo_set(vm, this, P_VIS, args.get(1).copied().unwrap_or(V::I32(0)));
+            mark_layout_requested(vm, this);
             Some(None)
         }
         "getVisibility" => Some(Some(pseudo_get(vm, this, P_VIS).unwrap_or(V::I32(0)))),
