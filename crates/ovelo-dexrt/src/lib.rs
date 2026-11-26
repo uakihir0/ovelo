@@ -2142,6 +2142,7 @@ impl Vm {
         // The newly posted work may feed a worker that parked out of
         // the live queue — re-arm dropped parkers so they rescan.
         self.parked_runnables.remove(&r);
+        self.wake_parked();
         self.pending_runnables.push_back((r, on_main));
     }
 
@@ -2195,6 +2196,7 @@ impl Vm {
     pub(crate) fn enqueue_runnable_delayed(&mut self, r: u32, on_main: bool, delay_ms: i64) {
         self.reparked.clear();
         self.parked_runnables.remove(&r);
+        self.wake_parked();
         let due = jdk::now_ms().saturating_add(delay_ms.max(0)) as u64;
         self.delayed_runnables.push((r, on_main, due));
     }
@@ -2227,34 +2229,6 @@ impl Vm {
             } else {
                 i += 1;
             }
-        }
-    }
-
-    /// Wake only the worker runnable owned by `thread` — LockSupport.unpark
-    /// is targeted, and waking every scheduler worker makes each enqueue a
-    /// thundering herd of full worker-loop restarts.
-    pub(crate) fn wake_parked_thread(&mut self, thread: u32) {
-        let Some(r) = self
-            .runnable_thread
-            .iter()
-            .find(|(_, &t)| t == thread)
-            .map(|(&r, _)| r)
-        else {
-            return;
-        };
-        if let Some(i) = self.delayed_runnables.iter().position(|(h, _, _)| *h == r) {
-            let (_, on_main, _) = self.delayed_runnables.swap_remove(i);
-            self.unparkable_delayed.remove(&r);
-            self.deadline_woke.remove(&r);
-            self.deadline_park_cycles.remove(&r);
-            self.repark_counts.remove(&r);
-            self.reparked.remove(&r);
-            self.pending_runnables.push_back((r, on_main));
-        }
-        if let Some(on_main) = self.parked_runnables.remove(&r) {
-            self.repark_counts.remove(&r);
-            self.reparked.remove(&r);
-            self.pending_runnables.push_back((r, on_main));
         }
     }
 
