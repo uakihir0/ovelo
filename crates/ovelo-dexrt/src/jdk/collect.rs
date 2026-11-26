@@ -3027,7 +3027,20 @@ fn atomic_call(vm: &mut Vm, class: &str, name: &str, args: &[V]) -> Option<Optio
             // arrives as I32(0) too, and both must compare equal or
             // setOnce CAS loops spin (RxJava SubscriptionHelper).
             let nullish = |v: V| matches!(v, V::I32(0) | V::Ref(0));
-            let ok = (nullish(cur) && nullish(args[1])) || value_eq(vm, cur, args[1]);
+            // AtomicReference uses reference identity, unlike the
+            // primitive atomic values. Structural equality here makes
+            // distinct-but-equal keys share one pending-modification
+            // slot in Compose's AtomicReference CAS loop.
+            let identity = |a: V, b: V| match (a, b) {
+                (V::Ref(x), V::Ref(y)) => x == y,
+                _ => value_eq(vm, a, b),
+            };
+            let eq = if class == "Ljava/util/concurrent/atomic/AtomicReference;" {
+                identity(cur, args[1])
+            } else {
+                value_eq(vm, cur, args[1])
+            };
+            let ok = (nullish(cur) && nullish(args[1])) || eq;
             if ok {
                 slot_put(vm, h, width_coerce(class, args[2]));
             }
