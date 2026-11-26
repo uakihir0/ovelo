@@ -448,8 +448,17 @@ pub(crate) fn run_on_worker(
 ) -> std::result::Result<Option<V>, ovelo_error::OveloError> {
     let prev = vm.cur_thread;
     let prev_r = vm.cur_runnable;
+    // Thread.start created a distinct guest Thread object for this
+    // runnable. currentThread() must expose that object — kotlinx's
+    // scheduler workers compare it with their own Worker identity and
+    // LockSupport.unpark targets it. The shared worker placeholder is
+    // only a fallback for executor runnables without a Thread owner.
     worker_thread(vm);
-    vm.cur_thread = vm.worker_thread_h;
+    vm.cur_thread = vm
+        .runnable_thread
+        .get(&r)
+        .copied()
+        .unwrap_or(vm.worker_thread_h);
     vm.cur_runnable = r;
     let v = if is_message(vm, r) {
         dispatch_message(vm, r)
