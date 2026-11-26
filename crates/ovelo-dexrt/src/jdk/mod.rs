@@ -1670,6 +1670,11 @@ fn universal(vm: &mut Vm, class: &str, name: &str, sig: &str, args: &[V]) -> Rt<
                     .unwrap_or_else(|| v_to_s(vm, args[2]))
                     .to_lowercase();
                 a.cmp(&b) as i32
+            } else if let V::Ref(cmp) = mode {
+                let v = vm
+                    .call_virtual_rt(cmp, "compare", &[args[2], args[1]])?
+                    .unwrap_or(V::I32(0));
+                i32v(v)
             } else {
                 let c = collect::natural_cmp(vm, args[1], args[2]);
                 if matches!(mode, V::I32(1)) {

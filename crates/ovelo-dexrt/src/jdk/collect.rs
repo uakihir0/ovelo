@@ -2427,11 +2427,17 @@ fn collections_static(vm: &mut Vm, name: &str, args: &[V]) -> Rt<Option<Option<V
                 HostState::Iter(Rc::new(items), 0),
             )))
         }
-        "reverseOrder" => Some(Some(host(
-            vm,
-            "Ljava/util/Comparator;",
-            HostState::Slot(V::I32(1)),
-        ))),
+        "reverseOrder" => {
+            let mode = match args.first().copied().unwrap_or(V::Ref(0)) {
+                V::Ref(c) if c != 0 => V::Ref(c),
+                _ => V::I32(1),
+            };
+            Some(Some(host(
+                vm,
+                "Ljava/util/Comparator;",
+                HostState::Slot(mode),
+            )))
+        }
         "naturalOrder" | "comparing" | "comparingInt" | "comparingLong" | "comparingDouble" => {
             Some(Some(host(
                 vm,
