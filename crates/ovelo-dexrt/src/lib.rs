@@ -1171,32 +1171,28 @@ impl Vm {
     /// (R8-)named owner references. Each entry carries its declaring
     /// owner so callers can filter to a receiver's own hierarchy.
     pub(crate) fn field_keys_named(&self, name: &str, ty: &str) -> Vec<(String, GIdx)> {
-        if let Some(m) = self.fields_named_cache.borrow().as_ref() {
-            return m
-                .get(&(name.to_string(), ty.to_string()))
-                .cloned()
-                .unwrap_or_default();
+        let key = (name.to_string(), ty.to_string());
+        if let Some(hit) = self
+            .fields_named_cache
+            .borrow()
+            .as_ref()
+            .and_then(|m| m.get(&key))
+        {
+            return hit.clone();
         }
-        let mut m: FieldsByName = HashMap::new();
-        for (di, d) in self.dexes.iter().enumerate() {
-            for i in 0..d.field_ids_len() {
-                let Ok(f) = d.field(i as u32) else { continue };
-                let (Ok(n), Ok(t), Ok(owner)) = (
-                    d.string(f.name_idx),
-                    d.type_descriptor(f.type_idx as u32),
-                    d.type_descriptor(f.class_idx as u32),
-                ) else {
-                    continue;
-                };
-                let g = self.canon_field(gx(di, i as u32));
-                m.entry((n, t)).or_default().push((owner, g));
+        // Resolve canonical keys only for fields with the requested
+        // name/type. Canonicalizing every field up front walks each
+        // field's class hierarchy and can take seconds on large apps.
+        let mut out = Vec::new();
+        for ((owner, n, t), g) in &self.fields_by_sig {
+            if n == name && t == ty {
+                out.push((owner.clone(), self.canon_field(*g)));
             }
         }
-        let out = m
-            .get(&(name.to_string(), ty.to_string()))
-            .cloned()
-            .unwrap_or_default();
-        *self.fields_named_cache.borrow_mut() = Some(m);
+        self.fields_named_cache
+            .borrow_mut()
+            .get_or_insert_with(HashMap::new)
+            .insert(key, out.clone());
         out
     }
 
