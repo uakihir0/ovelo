@@ -202,7 +202,7 @@ fn vto_of(vm: &mut Vm, view: u32) -> V {
 /// listeners on detached views or a previous screen's views must not
 /// see a layout that never reached them (one-shot init would fire
 /// early and consume itself without an actual layout).
-pub fn fire_global_layout(vm: &mut Vm, root: u32) {
+fn fire_vto(vm: &mut Vm, root: u32, fire_pre: bool, fire_layout: bool) {
     // Listeners hang on ancestors of the laid-out content too (decor,
     // android.R.id.content frames) — normalize root to its topmost
     // ancestor before testing membership.
@@ -238,11 +238,16 @@ pub fn fire_global_layout(vm: &mut Vm, root: u32) {
         })
         .flat_map(|(_, ls)| ls.iter().copied())
         .collect();
-    for l in predraw {
-        if crate::dbg_flag("OVELO_VIEWDBG") {
-            eprintln!("[viewdbg] onPreDraw h{l} {}", vm.dbg_class_of(l));
+    if fire_pre {
+        for l in predraw {
+            if crate::dbg_flag("OVELO_VIEWDBG") {
+                eprintln!("[viewdbg] onPreDraw h{l} {}", vm.dbg_class_of(l));
+            }
+            let _ = vm.call_virtual(l, "onPreDraw", &[]);
         }
-        let _ = vm.call_virtual(l, "onPreDraw", &[]);
+    }
+    if !fire_layout {
+        return;
     }
     let all: Vec<u32> = vm
         .vto_listeners
@@ -266,6 +271,17 @@ pub fn fire_global_layout(vm: &mut Vm, root: u32) {
             }
         }
     }
+}
+
+/// Fire `OnPreDrawListener`s for `root`'s tree. Android sends this
+/// before every drawn frame, including redraws that did not layout.
+pub fn fire_pre_draw(vm: &mut Vm, root: u32) {
+    fire_vto(vm, root, true, false);
+}
+
+/// Fire `OnGlobalLayoutListener`s for `root`'s tree after a real layout.
+pub fn fire_global_layout(vm: &mut Vm, root: u32) {
+    fire_vto(vm, root, false, true);
 }
 
 /// Re-exported for `context_call` — Activity.findViewById searches the

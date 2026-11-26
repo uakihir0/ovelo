@@ -1676,6 +1676,7 @@ pub fn drive_dex_layout_pass(vm: &mut Vm, activity: u32, frame: u32, win_w: i32,
     // Android fires OnGlobalLayoutListener after an actual layout pass.
     // Firing it for a skipped clean-tree walk just re-enters guest code
     // every frame; adapter fills still get the real pass that lays them out.
+    ovelo_dexrt::fire_pre_draw(vm, root);
     if drove {
         ovelo_dexrt::fire_global_layout(vm, root);
     }
