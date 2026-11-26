@@ -35,16 +35,30 @@ fn collection_elements_rt(vm: &mut Vm, h: u32) -> Rt<Option<Vec<V>>> {
         Ok(_) => return Ok(None),
         Err(e) => return Err(e),
     };
+    let host_iter = matches!(
+        vm.heap.get(it),
+        Some(Obj::Host {
+            state: HostState::Iter(..) | HostState::List(..),
+            ..
+        })
+    );
+    let call_iter = |vm: &mut Vm, name: &str| -> Rt<Option<V>> {
+        if host_iter {
+            if let Some(v) = iter_call(vm, name, &[V::Ref(it)])? {
+                return Ok(v);
+            }
+        }
+        vm.call_virtual_rt(it, name, &[])
+    };
     let mut out = Vec::new();
     for _ in 0..100_000 {
-        let more = vm
-            .call_virtual_rt(it, "hasNext", &[])?
+        let more = call_iter(vm, "hasNext")?
             .map(|v| i32v(v) != 0)
             .unwrap_or(false);
         if !more {
             break;
         }
-        let Some(v) = vm.call_virtual_rt(it, "next", &[])? else {
+        let Some(v) = call_iter(vm, "next")? else {
             break;
         };
         out.push(v);
@@ -1050,6 +1064,11 @@ fn list_call(vm: &mut Vm, name: &str, sig: &str, args: &[V]) -> Rt<Option<Option
             Some(Some(V::I32(c as i32)))
         }
         "containsAll" => {
+            if matches!(args.get(1), Some(V::Ref(0)) | None) {
+                return Err(
+                    vm.throw_builtin("Ljava/lang/NullPointerException;", "containsAll(null)")
+                );
+            }
             let mine = collection_elements_rt(vm, h)?.unwrap_or_default();
             let want = match args.get(1).copied() {
                 Some(V::Ref(w)) => collection_elements_rt(vm, w)?.unwrap_or_default(),
