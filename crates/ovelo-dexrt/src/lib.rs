@@ -2757,6 +2757,7 @@ impl Vm {
                     }
                 }
                 _ => {
+                    let task_failed = out.is_err();
                     ran += 1;
                     self.reparked.remove(&r);
                     self.repark_counts.remove(&r);
@@ -2775,6 +2776,13 @@ impl Vm {
                     self.deadline_park_cycles.remove(&r);
                     self.slept_once.remove(&r);
                     if let Some(ex) = self.runnable_executor.remove(&r) {
+                        if task_failed {
+                            // ThreadPoolExecutor replaces a worker whose
+                            // task escapes with an uncaught exception;
+                            // its ThreadLocal state must not leak into
+                            // the next task on this executor.
+                            self.executor_thread.remove(&ex);
+                        }
                         if self.executor_active.get(&ex) == Some(&r) {
                             let next = self
                                 .executor_queues
