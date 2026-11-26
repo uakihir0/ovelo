@@ -1941,6 +1941,12 @@ impl Vm {
         jdk::view::inflater(self, ctx)
     }
 
+    /// A host object typed as `desc` for framework widgets whose
+    /// dex-side state is not materialized by the inflater bridge.
+    pub fn typed_host(&mut self, desc: &str) -> V {
+        V::Ref(self.alloc_host(desc, crate::value::HostState::Empty))
+    }
+
     /// Deliver a host pointer event into the dex view tree
     /// (action: 0=down, 1=up, 2=move). Dex-materialized views —
     /// including games' input views — only see input through this
@@ -4998,6 +5004,36 @@ impl Vm {
     /// ROOT method only — compat shims delegate to the real dex body
     /// through this once the genuine path is known to work (nested
     /// invokes inside the dex body still honor host overrides).
+    /// Invoke the exact dex method body for `(class, name, sig)`, bypassing
+    /// both virtual overrides and the registered host shim on that root
+    /// method. Compat shims registered on a base library method use this to
+    /// delegate to the base implementation without re-entering themselves.
+    pub fn call_exact_direct(
+        &mut self,
+        this: u32,
+        class: &str,
+        name: &str,
+        sig: &str,
+        args: &[V],
+    ) -> Result<Option<V>> {
+        let midx = self
+            .methods_by_sig
+            .get(&(class.to_string(), name.to_string(), sig.to_string()))
+            .copied()
+            .ok_or_else(|| errd("dexrt.invoke.unresolved", format!("{class}.{name}{sig}")))?;
+        let mut a = Vec::with_capacity(args.len() + 1);
+        a.push(V::Ref(this));
+        a.extend_from_slice(args);
+        match self.invoke_inner(midx, a, InvokeKind::Direct, true) {
+            Ok(v) => Ok(v),
+            Err(E::Vm(e)) => Err(e),
+            Err(E::Throw(r)) => {
+                let d = self.describe_throw(r);
+                Err(errd("dexrt.exception.uncaught", d))
+            }
+        }
+    }
+
     pub fn call_virtual_direct(&mut self, this: u32, name: &str, args: &[V]) -> Result<Option<V>> {
         let ci = self
             .heap
