@@ -160,6 +160,10 @@ pub(crate) fn now_ms() -> i64 {
         .unwrap_or(0)
 }
 
+pub(crate) fn now_mono_ms() -> i64 {
+    now_nanos() / 1_000_000
+}
+
 pub(crate) fn now_nanos() -> i64 {
     // java.lang.System.nanoTime is monotonic with an arbitrary origin.
     // Keeping that origin near process start matters: Compose animation

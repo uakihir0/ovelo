@@ -583,15 +583,15 @@ pub(crate) fn call(
     } else if class == "Landroid/os/SystemClock;" {
         match name {
             "uptimeMillis" | "elapsedRealtime" | "currentThreadTimeMillis" => {
-                Some(Some(V::I64(now_ms())))
+                Some(Some(V::I64(crate::jdk::now_mono_ms())))
             }
-            "elapsedRealtimeNanos" | "nanoTime" => Some(Some(V::I64(now_ms() * 1_000_000))),
+            "elapsedRealtimeNanos" | "nanoTime" => Some(Some(V::I64(crate::jdk::now_nanos()))),
             "sleep" | "setCurrentTimeMillis" => Some(None),
             _ => None,
         }
     } else if class == "Landroid/view/animation/AnimationUtils;" {
         match name {
-            "currentAnimationTimeMillis" => Some(Some(V::I64(now_ms()))),
+            "currentAnimationTimeMillis" => Some(Some(V::I64(crate::jdk::now_mono_ms()))),
             _ => None,
         }
     } else if class == "Landroid/os/Process;" {
