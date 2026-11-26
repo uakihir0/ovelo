@@ -1023,7 +1023,28 @@ fn list_call(vm: &mut Vm, name: &str, sig: &str, args: &[V]) -> Rt<Option<Option
             }
             Some(Some(V::I32(c as i32)))
         }
-        "containsAll" => Some(Some(V::I32(1))),
+        "containsAll" => {
+            let mine: Vec<V> = list_snapshot(vm, h).unwrap_or_default();
+            let want = match args.get(1).copied() {
+                Some(V::Ref(w)) => list_snapshot(vm, w).unwrap_or_default(),
+                _ => Vec::new(),
+            };
+            let mut all = true;
+            for w in want {
+                let mut hit = false;
+                for e in &mine {
+                    if elem_eq(vm, *e, w)? {
+                        hit = true;
+                        break;
+                    }
+                }
+                if !hit {
+                    all = false;
+                    break;
+                }
+            }
+            Some(Some(V::I32(all as i32)))
+        }
         "equals" => {
             let other = match args.get(1).copied() {
                 Some(V::Ref(oh)) if oh == h => return Ok(Some(Some(V::I32(1)))),
