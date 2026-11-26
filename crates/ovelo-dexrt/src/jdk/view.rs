@@ -308,6 +308,8 @@ pub struct DexViewInfo {
     /// Dex-assigned frame `(l, t, r, b)` relative to the parent, once
     /// `layout`/`setFrame` ran (None before first layout pass).
     pub frame: Option<(i32, i32, i32, i32)>,
+    /// `View.requestLayout` is pending for this view.
+    pub layout_requested: bool,
     /// `setImage*`-attached pixels (`w`, `h`, RGBA8) after resolving
     /// Bitmap hosts, drawable field chains, res-ids and file/Uri paths.
     pub image: Option<(u32, u32, std::rc::Rc<Vec<u8>>)>,
@@ -508,6 +510,26 @@ pub(crate) fn clear_layout_requested(vm: &mut Vm, h: u32) {
     pseudo_set(vm, h, P_LAYOUT_REQ, V::I32(0));
 }
 
+/// Mark a view and its ancestors as layout-requested, matching
+/// `View.requestLayout`'s upward propagation through the parent chain.
+pub fn mark_layout_requested(vm: &mut Vm, h: u32) {
+    let mut cur = h;
+    for _ in 0..64 {
+        if cur == 0 || pseudo_get(vm, cur, P_IS_VIEW).is_none() {
+            break;
+        }
+        pseudo_set(vm, cur, P_LAYOUT_REQ, V::I32(1));
+        cur = match pseudo_get(vm, cur, P_PARENT) {
+            Some(V::Ref(p)) => p,
+            _ => 0,
+        };
+    }
+}
+
+pub(crate) fn layout_requested(vm: &Vm, h: u32) -> bool {
+    pint(vm, h, P_LAYOUT_REQ) != 0
+}
+
 /// Store a view frame; returns whether it changed (View.setFrame's
 /// contract and `layout`'s `changed` argument).
 pub(crate) fn frame_set(vm: &mut Vm, h: u32, l: i32, t: i32, r: i32, b: i32) -> bool {
@@ -672,6 +694,7 @@ pub(crate) fn dex_view_info(vm: &Vm, h: u32) -> Option<DexViewInfo> {
         visible,
         listener,
         frame,
+        layout_requested: layout_requested(vm, h),
         image: pseudo_get(vm, h, P_IMAGE).and_then(|v| image_pixels(vm, v)),
         parent: match pseudo_get(vm, h, P_PARENT) {
             Some(V::Ref(p)) => p,
@@ -1956,6 +1979,7 @@ pub(crate) fn call(
         "setText" | "setTitle" | "setTextScaleX" => {
             if name != "setTextScaleX" {
                 pseudo_set(vm, this, P_TEXT, args.get(1).copied().unwrap_or(V::Ref(0)));
+                mark_layout_requested(vm, this);
                 if crate::dbg_flag("OVELO_VIEWDBG") {
                     eprintln!(
                         "[viewdbg] setText h{this} arg={:?} stored={:?}",
@@ -2050,6 +2074,7 @@ pub(crate) fn call(
         }
         "setVisibility" => {
             pseudo_set(vm, this, P_VIS, args.get(1).copied().unwrap_or(V::I32(0)));
+            mark_layout_requested(vm, this);
             Some(None)
         }
         "getVisibility" => Some(Some(pseudo_get(vm, this, P_VIS).unwrap_or(V::I32(0)))),
@@ -2195,7 +2220,7 @@ pub(crate) fn call(
             // AOSP View.setLayoutParams ends in requestLayout() —
             // ConstraintLayout only rebuilds its widget list while a
             // child reports isLayoutRequested.
-            pseudo_set(vm, this, P_LAYOUT_REQ, V::I32(1));
+            mark_layout_requested(vm, this);
             Some(None)
         }
         "measure" => {
@@ -2422,7 +2447,7 @@ pub(crate) fn call(
         // so a permanent 0 leaves adapter-driven re-layouts impossible.
         "isLayoutRequested" => Some(Some(V::I32(pint(vm, this, P_LAYOUT_REQ)))),
         "requestLayout" | "forceLayout" => {
-            pseudo_set(vm, this, P_LAYOUT_REQ, V::I32(1));
+            mark_layout_requested(vm, this);
             Some(None)
         }
         "setMinimumWidth" => {
@@ -5892,7 +5917,7 @@ pub(crate) fn attach_at(
         // the child must report isLayoutRequested or dex parents
         // (ConstraintLayout.updateHierarchy) skip rebuilding the
         // widget list, leaving the solver with no children at 0,0,0,0.
-        pseudo_set(vm, ch, P_LAYOUT_REQ, V::I32(1));
+        mark_layout_requested(vm, ch);
         // A passed-in LP wins — dex callers (RecyclerView's
         // attachViewToParent) already built the real params.
         if let Some(v @ V::Ref(lph)) = lp {
@@ -6021,6 +6046,7 @@ pub(crate) fn detach(vm: &mut Vm, parent: u32, child: V, notify: bool) {
         if let Some(Obj::Array { data, .. }) = vm.heap.get_mut(a) {
             data.remove(i);
         }
+        mark_layout_requested(vm, parent);
         if let V::Ref(ch) = child {
             pseudo_set(vm, ch, P_PARENT, V::Ref(0));
             // Mirror onViewAdded: dex parents unregister the child here

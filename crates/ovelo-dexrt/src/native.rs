@@ -2812,7 +2812,7 @@ pub(crate) fn guest_dst_ok(_p: usize, _len: usize) -> bool {
 /// milestone". OVELO_ZONECHECK-gated.
 #[cfg(target_os = "macos")]
 pub(crate) fn check_all_zones(tag: &str) {
-    if std::env::var_os("OVELO_ZONECHECK").is_none() {
+    if !crate::dbg_flag("OVELO_ZONECHECK") {
         return;
     }
     unsafe {
