@@ -307,6 +307,22 @@ pub(crate) fn boxed_boolean(vm: &mut Vm, value: bool) -> V {
     v
 }
 
+pub(crate) fn boxed_integer(vm: &mut Vm, value: i32) -> V {
+    if (-128..=127).contains(&value) {
+        let idx = (value + 128) as usize;
+        if vm.int_cache[idx] != 0 {
+            return V::Ref(vm.int_cache[idx]);
+        }
+        let v = host(vm, "Ljava/lang/Integer;", HostState::Slot(V::I32(value)));
+        if let V::Ref(h) = v {
+            vm.int_cache[idx] = h;
+        }
+        v
+    } else {
+        host(vm, "Ljava/lang/Integer;", HostState::Slot(V::I32(value)))
+    }
+}
+
 pub(crate) fn host(vm: &mut Vm, desc: &str, state: HostState) -> V {
     V::Ref(vm.alloc_host(desc, state))
 }

@@ -300,6 +300,7 @@ pub struct Vm {
     /// constants must be identity-stable because bytecode uses reference
     /// comparisons for sentinel/control-flow checks.
     pub(crate) bool_cache: [u32; 2],
+    pub(crate) int_cache: [u32; 256],
     /// Attached `TextClock` views that tick — refreshed once per
     /// `drain_runnables` pass (AOSP ticks them per postDelayed).
     pub clock_views: Vec<u32>,
@@ -861,6 +862,7 @@ impl Vm {
             enum_cache: HashMap::new(),
             enum_name_cache: HashMap::new(),
             bool_cache: [0, 0],
+            int_cache: [0; 256],
             clock_views: Vec::new(),
             apk_res: None,
             dbs: HashMap::new(),
@@ -2437,6 +2439,7 @@ impl Vm {
         roots.extend(self.enum_cache.values().copied());
         roots.extend(self.enum_name_cache.values().copied());
         roots.extend(self.bool_cache.into_iter().filter(|h| *h != 0));
+        roots.extend(self.int_cache.into_iter().filter(|h| *h != 0));
         roots.extend(self.content_views.keys().copied());
         roots.extend(self.content_views.values().copied());
         roots.extend(self.decor_roots.keys().copied());
