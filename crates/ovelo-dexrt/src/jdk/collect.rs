@@ -27,6 +27,9 @@ fn collection_is_set(vm: &Vm, h: u32) -> bool {
 }
 
 fn collection_snapshot(vm: &Vm, h: u32) -> Option<Vec<V>> {
+    if matches!(vm.heap.get(h), Some(Obj::Array { .. })) {
+        return None;
+    }
     if collection_desc(vm, h) == "Lkotlin/collections/EmptyList;" {
         return Some(Vec::new());
     }
