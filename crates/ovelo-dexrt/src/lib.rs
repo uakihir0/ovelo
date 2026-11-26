@@ -541,6 +541,11 @@ pub struct Vm {
     /// `LockSupport.park*`/`Object.wait(ms)` — interruptible waits an
     /// `unpark`/`notify` may cut short, unlike `Thread.sleep`.
     pub(crate) park_waiters: hashbrown::HashSet<u32>,
+    /// Thread objects with a pending LockSupport permit. Java permits
+    /// an unpark to arrive before the matching park; without this the
+    /// cooperative scheduler loses wakeups when a producer unparks a
+    /// worker just before that worker parks.
+    pub(crate) unpark_permits: hashbrown::HashSet<u32>,
     /// Handles currently sitting in `delayed_runnables` whose deadline
     /// is interruptible — `wake_parked` promotes these early.
     pub(crate) unparkable_delayed: hashbrown::HashSet<u32>,
@@ -910,6 +915,7 @@ impl Vm {
             repark_counts: HashMap::new(),
             parked_runnables: HashMap::new(),
             park_waiters: hashbrown::HashSet::new(),
+            unpark_permits: hashbrown::HashSet::new(),
             unparkable_delayed: hashbrown::HashSet::new(),
             unparkable_delayed_due: HashMap::new(),
             deadline_woke: hashbrown::HashSet::new(),
@@ -2311,6 +2317,7 @@ impl Vm {
     /// to the runnable whose execution represents it. Unknown threads
     /// keep the previous broad wake as a compatibility fallback.
     pub(crate) fn unpark_thread(&mut self, thread: u32) {
+        self.unpark_permits.insert(thread);
         let target = self
             .parked_thread_runnable
             .get(&thread)
