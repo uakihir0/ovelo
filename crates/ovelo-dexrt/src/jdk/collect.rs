@@ -624,10 +624,11 @@ pub(crate) fn call(
                 Some(None)
             }
             "unpark" => {
-                // LockSupport.unpark — revive workers that parked out
-                // of the live queue, and cut delayed interruptible
-                // sleeps short (same coarse wake as Unsafe.unpark).
-                vm.wake_parked();
+                if let Some(V::Ref(thread)) = args.first().copied() {
+                    vm.unpark_thread(thread);
+                } else {
+                    vm.wake_parked();
+                }
                 Some(None)
             }
             "offer" | "add" | "put" | "take" | "poll" | "remove" => {

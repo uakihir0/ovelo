@@ -3649,7 +3649,11 @@ fn unsafe_call(vm: &mut Vm, name: &str, args: &[V]) -> Rt<Option<Option<V>>> {
         // `unpark` may target a worker that parked out of the live
         // queue — re-arm dropped parkers so they rescan their queues.
         "unpark" => {
-            vm.wake_parked();
+            if let Some(V::Ref(thread)) = args.get(1).copied() {
+                vm.unpark_thread(thread);
+            } else {
+                vm.wake_parked();
+            }
             None
         }
         "loadFence" | "storeFence" | "fullFence" | "monitorEnter" | "monitorExit" => None,

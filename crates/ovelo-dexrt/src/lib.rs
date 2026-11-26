@@ -2141,10 +2141,13 @@ impl Vm {
             eprintln!("[drain] enqueue h{} main={}", r, on_main);
         }
         self.reparked.clear();
-        // The newly posted work may feed a worker that parked out of
-        // the live queue — re-arm dropped parkers so they rescan.
-        self.parked_runnables.remove(&r);
-        self.wake_parked();
+        // Retired parkers are outside the queue only because this VM
+        // cannot resume their original Java stack; fresh work may feed
+        // their internal queues, so give them another scan. Timed
+        // parkers are different: waking every one for an unrelated post
+        // makes idle kotlinx workers repark continuously and hides
+        // whether LockSupport.unpark reached its target.
+        self.wake_retired();
         self.pending_runnables.push_back((r, on_main));
     }
 
@@ -2198,36 +2201,79 @@ impl Vm {
     pub(crate) fn enqueue_runnable_delayed(&mut self, r: u32, on_main: bool, delay_ms: i64) {
         self.reparked.clear();
         self.parked_runnables.remove(&r);
-        self.wake_parked();
+        self.wake_retired();
         let due = jdk::now_ms().saturating_add(delay_ms.max(0)) as u64;
         self.delayed_runnables.push((r, on_main, due));
     }
 
-    /// Re-arm runnables that parked out of the live queue — called
-    /// from `enqueue_runnable` (fresh work may feed a dropped worker's
-    /// internal queue) and `LockSupport.unpark`. Delayed sleepers
-    /// whose deadline came from `LockSupport.park*` (not `Thread.sleep`)
-    /// are also promoted early — a permit cuts the wait short.
-    pub(crate) fn wake_parked(&mut self) {
-        for (r, on_main) in self.parked_runnables.drain() {
-            self.repark_counts.remove(&r);
-            self.reparked.remove(&r);
-            self.deadline_woke.remove(&r);
-            self.deadline_park_cycles.remove(&r);
-            self.pending_runnables.push_back((r, on_main));
+    fn clear_park_marks(&mut self, r: u32) {
+        self.repark_counts.remove(&r);
+        self.reparked.remove(&r);
+        self.deadline_woke.remove(&r);
+        self.deadline_park_cycles.remove(&r);
+    }
+
+    fn queue_woken_runnable(&mut self, r: u32, on_main: bool) {
+        self.clear_park_marks(r);
+        self.pending_runnables.push_back((r, on_main));
+    }
+
+    /// Re-arm runnables that were retired after repeated deadline-only
+    /// parks. Unlike `wake_parked`, this does not promote timed sleepers:
+    /// unrelated posts must not cut a `parkNanos` wait short.
+    pub(crate) fn wake_retired(&mut self) {
+        let retired: Vec<_> = self.parked_runnables.drain().collect();
+        for (r, on_main) in retired {
+            self.queue_woken_runnable(r, on_main);
         }
+    }
+
+    /// Wake one runnable after its owning thread received `unpark`.
+    pub(crate) fn wake_runnable(&mut self, target: u32) {
+        if let Some(on_main) = self.parked_runnables.remove(&target) {
+            self.queue_woken_runnable(target, on_main);
+            return;
+        }
+        if let Some(i) = self
+            .delayed_runnables
+            .iter()
+            .position(|(r, _, _)| *r == target && self.unparkable_delayed.contains(r))
+        {
+            let (r, on_main, _) = self.delayed_runnables.swap_remove(i);
+            self.unparkable_delayed.remove(&r);
+            self.queue_woken_runnable(r, on_main);
+        }
+    }
+
+    /// `LockSupport.unpark(thread)` — map the guest Thread object back
+    /// to the runnable whose execution represents it. Unknown threads
+    /// keep the previous broad wake as a compatibility fallback.
+    pub(crate) fn unpark_thread(&mut self, thread: u32) {
+        let target = self
+            .runnable_thread
+            .iter()
+            .find(|(_, t)| **t == thread)
+            .map(|(r, _)| *r);
+        if let Some(r) = target {
+            self.wake_runnable(r);
+        }
+        // Unknown targets (notably the main thread) are not parked in
+        // this scheduler model. Waking every worker there turns each
+        // main-event-loop enqueue into a spurious broadcast.
+    }
+
+    /// Re-arm every parked runnable. Used by untargeted wakes
+    /// (`Object.notify`) and as a fallback when an unpark target cannot
+    /// be mapped back to a runnable.
+    pub(crate) fn wake_parked(&mut self) {
+        self.wake_retired();
         let mut i = 0;
         while i < self.delayed_runnables.len() {
             let (r, on_main, _) = self.delayed_runnables[i];
             if self.unparkable_delayed.contains(&r) {
                 self.delayed_runnables.swap_remove(i);
                 self.unparkable_delayed.remove(&r);
-                // An unpark-driven promotion — not a deadline expiry.
-                self.deadline_woke.remove(&r);
-                self.deadline_park_cycles.remove(&r);
-                self.repark_counts.remove(&r);
-                self.reparked.remove(&r);
-                self.pending_runnables.push_back((r, on_main));
+                self.queue_woken_runnable(r, on_main);
             } else {
                 i += 1;
             }
