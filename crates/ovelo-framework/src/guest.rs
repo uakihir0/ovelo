@@ -1152,9 +1152,17 @@ impl GuestUi {
             if w <= 0 || hh <= 0 {
                 continue;
             }
+            let mut captured_raw = None;
             let ops = if compose_view {
-                let raw = rc.borrow().view().raw_custom_ops.clone();
-                let Some(raw) = raw else {
+                let existing = rc.borrow().view().raw_custom_ops.clone();
+                let Some(raw) = existing.or_else(|| {
+                    let captured = vm.guest_draw_ops_raw(h, w, hh);
+                    (!captured.is_empty()).then(|| {
+                        let raw = Rc::new(captured);
+                        captured_raw = Some(raw.clone());
+                        raw
+                    })
+                }) else {
                     continue;
                 };
                 vm.expand_display_list_ops(&raw)
@@ -1200,6 +1208,9 @@ impl GuestUi {
             }
             let mut g = rc.borrow_mut();
             let v = g.view_mut();
+            if let Some(raw) = captured_raw {
+                v.raw_custom_ops = Some(raw);
+            }
             v.custom_ops = if ops.is_empty() {
                 None
             } else {
