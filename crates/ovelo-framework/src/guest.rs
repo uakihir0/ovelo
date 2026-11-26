@@ -1485,6 +1485,20 @@ pub fn drive_dex_layout_pass(vm: &mut Vm, activity: u32, frame: u32, win_w: i32,
     // DrawerLayout throw unless both specs are EXACTLY, so
     // UNSPECIFIED/0 would leave them unmeasured forever.
     const MS_EXACTLY: i32 = 1 << 30;
+    fn subtree_needs_layout(vm: &Vm, h: u32, depth: u32) -> bool {
+        if depth > 64 {
+            return false;
+        }
+        let Some(info) = vm.dex_view(h) else {
+            return false;
+        };
+        if info.frame.is_none() || info.layout_requested {
+            return true;
+        }
+        info.children
+            .iter()
+            .any(|ch| subtree_needs_layout(vm, *ch, depth + 1))
+    }
     fn walk(vm: &mut Vm, h: u32, depth: u32, win_w: i32, win_h: i32) {
         if depth > 64 {
             return;
@@ -1517,11 +1531,18 @@ pub fn drive_dex_layout_pass(vm: &mut Vm, activity: u32, frame: u32, win_w: i32,
         // decor wraps it in), so `!parent_is_dex` alone would skip
         // every node and no frame would ever be set.
         let parent_is_dex = depth != 0 && info.parent != 0 && vm.is_dex_view(info.parent);
+        let root_size_changed = depth == 0
+            && info
+                .frame
+                .is_some_and(|f| (f.2 - f.0, f.3 - f.1) != (win_w, win_h));
+        let needs_layout = root_size_changed || subtree_needs_layout(vm, h, 0);
         // Drive subtree roots regardless of group-ness: a leaf custom
         // view at the XML root has no dex parent to measure/layout it,
         // so without this its frame stays unset and `onDraw` ops never
-        // capture (blank screen).
-        if !parent_is_dex {
+        // capture (blank screen). Once a stable tree reports no layout
+        // request, leave its dex-computed frames alone instead of
+        // re-running the whole solver twice a second.
+        if !parent_is_dex && needs_layout {
             // The root tracks the window: after a resize its stored
             // frame is stale, so re-measure at the new extent — the
             // stored frame only wins for deeper subtree roots whose
