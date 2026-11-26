@@ -1237,6 +1237,36 @@ fn list_call(vm: &mut Vm, name: &str, sig: &str, args: &[V]) -> Rt<Option<Option
         }
         "forEach" | "replaceAll" | "sort" | "stream" | "parallelStream" => {
             if name == "sort" {
+                let comparator = match args.get(1) {
+                    Some(V::Ref(c)) if *c != 0 => *c,
+                    _ => 0,
+                };
+                let mut items = list_ref(vm, h).cloned().unwrap_or_default();
+                if comparator != 0 {
+                    // `sortWith` feeds Compose's invalidation list into a
+                    // binary search. Keep the sort stable and propagate
+                    // guest comparator failures rather than silently
+                    // leaving the list unordered.
+                    for i in 1..items.len() {
+                        let mut j = i;
+                        while j > 0 {
+                            let ord = vm
+                                .call_virtual_rt(comparator, "compare", &[items[j - 1], items[j]])?
+                                .map(i32v)
+                                .unwrap_or(0);
+                            if ord <= 0 {
+                                break;
+                            }
+                            items.swap(j - 1, j);
+                            j -= 1;
+                        }
+                    }
+                } else {
+                    items.sort_by(|a, b| natural_cmp(vm, *a, *b).cmp(&0));
+                }
+                if let Some(l) = list_mut(vm, h) {
+                    *l = items;
+                }
                 Some(None)
             } else if name.ends_with("stream") || name.ends_with("Stream") {
                 Some(Some(host(
@@ -2213,8 +2243,31 @@ fn collections_static(vm: &mut Vm, name: &str, args: &[V]) -> Option<Option<V>> 
         }
         "sort" => {
             if let V::Ref(h) = args[0] {
+                let comparator = match args.get(1) {
+                    Some(V::Ref(c)) if *c != 0 => *c,
+                    _ => 0,
+                };
                 let mut items = list_ref(vm, h).cloned().unwrap_or_default();
-                items.sort_by(|a, b| natural_cmp(vm, *a, *b).cmp(&0));
+                if comparator != 0 {
+                    for i in 1..items.len() {
+                        let mut j = i;
+                        while j > 0 {
+                            let ord = vm
+                                .call_virtual_rt(comparator, "compare", &[items[j - 1], items[j]])
+                                .ok()
+                                .flatten()
+                                .map(i32v)
+                                .unwrap_or(0);
+                            if ord <= 0 {
+                                break;
+                            }
+                            items.swap(j - 1, j);
+                            j -= 1;
+                        }
+                    }
+                } else {
+                    items.sort_by(|a, b| natural_cmp(vm, *a, *b).cmp(&0));
+                }
                 if let Some(l) = list_mut(vm, h) {
                     *l = items;
                 }
