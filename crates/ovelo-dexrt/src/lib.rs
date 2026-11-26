@@ -5344,7 +5344,7 @@ impl Vm {
                 let m = d.method(gl(loc.midx)).ok()?;
                 d.string(m.name_idx).ok()
             });
-            matches!(md.as_deref(), Some("measureAndLayout"))
+            matches!(md.as_deref(), Some("measureAndLayout" | "applyChanges"))
         };
         let compose_key = if compose_measure && !matches!(kind, InvokeKind::Static) {
             match args.first() {
@@ -5355,6 +5355,9 @@ impl Vm {
             None
         };
         if compose_key.is_some_and(|key| self.compose_measure_active.contains(&key)) {
+            if crate::dbg_flag("OVELO_COMPOSEDBG") {
+                eprintln!("[composedbg] reenter skip key={compose_key:?}");
+            }
             let ret_desc = self
                 .dex_of(loc.midx)
                 .and_then(|d| {
@@ -5374,6 +5377,9 @@ impl Vm {
             });
         }
         if let Some(key) = compose_key {
+            if crate::dbg_flag("OVELO_COMPOSEDBG") {
+                eprintln!("[composedbg] push key={key:?}");
+            }
             self.compose_measure_active.push(key);
         }
         let invoke_out = (|| {

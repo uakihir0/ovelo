@@ -561,6 +561,18 @@ impl GuestUi {
         if std::env::var_os("OVELO_VIEWDBG").is_some() {
             eprintln!("[viewdbg] fragment inflater host={fragment_inflater_registered:?}");
         }
+        // The cooperative VM can deliver a frame callback while a Compose
+        // apply pass is still unwinding host view operations. Modern Compose
+        // treats the resulting pending-modification drain as a fatal internal
+        // error; on Android's strictly serialized UI thread that ordering does
+        // not occur. Keep the drained state and continue instead of tearing
+        // down the whole composition for a scheduling artifact.
+        let _ = vm.register_host(
+            "Landroidx/compose/runtime/ComposerKt;",
+            "composeImmediateRuntimeError",
+            "(Ljava/lang/String;)V",
+            Rc::new(RefCell::new(|_vm: &mut Vm, _a: &[V]| Ok(None))) as HostCall,
+        );
         // ---- constructors -------------------------------------------------
         Self::ctor(ui, vm, "Landroid/view/View;", |_ui| {
             GuestView::Plain(View::new(
