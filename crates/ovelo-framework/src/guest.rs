@@ -1308,6 +1308,7 @@ impl GuestUi {
             } else {
                 Some(Rc::new(raw_ops))
             };
+            g.view_mut().raw_custom_ops_seq = vm.view_invalid_seq(h);
             g.view_mut().custom_ops = if ops.is_empty() {
                 None
             } else {
