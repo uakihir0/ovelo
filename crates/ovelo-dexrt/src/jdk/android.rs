@@ -3562,6 +3562,25 @@ fn context_call(
                         h
                     }
                 };
+                let conn = args.iter().skip(2).find_map(|v| match v {
+                    V::Ref(h)
+                        if *h != 0
+                            && vm.has_dex_virtual(
+                                *h,
+                                "onServiceConnected",
+                                &["Landroid/content/ComponentName;", "Landroid/os/IBinder;"],
+                            ) =>
+                    {
+                        Some(*h)
+                    }
+                    _ => None,
+                })?;
+                if !vm.service_bindings.contains_key(&conn) {
+                    vm.service_bindings.insert(conn, sh);
+                    *vm.service_bind_counts.entry(sh).or_insert(0) += 1;
+                    let bind_intent = clone_intent(vm, ih);
+                    vm.service_bind_intents.insert(conn, bind_intent);
+                }
                 let rebind_intent = match vm.service_rebind.get(&sh).copied() {
                     Some(ri @ V::Ref(rh)) if intents_match(vm, rh, ih) => {
                         vm.service_rebind.remove(&sh);
@@ -3581,19 +3600,6 @@ fn context_call(
                     vm.service_binders.insert(sh, binder);
                     binder
                 };
-                let conn = args.iter().skip(2).find_map(|v| match v {
-                    V::Ref(h)
-                        if *h != 0
-                            && vm.has_dex_virtual(
-                                *h,
-                                "onServiceConnected",
-                                &["Landroid/content/ComponentName;", "Landroid/os/IBinder;"],
-                            ) =>
-                    {
-                        Some(*h)
-                    }
-                    _ => None,
-                })?;
                 let component = if vm
                     .class_descriptor_of(ch)
                     .is_some_and(|d| d == "Landroid/content/ComponentName;")
@@ -3614,12 +3620,6 @@ fn context_call(
                     }
                     cn
                 };
-                if !vm.service_bindings.contains_key(&conn) {
-                    vm.service_bindings.insert(conn, sh);
-                    *vm.service_bind_counts.entry(sh).or_insert(0) += 1;
-                    let bind_intent = clone_intent(vm, ih);
-                    vm.service_bind_intents.insert(conn, bind_intent);
-                }
                 let connected = if binder == V::Ref(0) {
                     vm.call_virtual(conn, "onNullBinding", &[component])
                 } else {
