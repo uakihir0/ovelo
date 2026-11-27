@@ -2548,11 +2548,12 @@ fn context_call(
                 super::vector::drawable_for_res(vm, res_id)
             } else {
                 [
-                    "Landroidx/vectordrawable/graphics/drawable/VectorDrawableCompat;",
-                    "Landroid/support/graphics/drawable/VectorDrawableCompat;",
+                    "Landroidx/vectordrawable/graphics/drawable/VectorDrawableCompat;".to_string(),
+                    "Landroid/support/graphics/drawable/VectorDrawableCompat;".to_string(),
                 ]
-                .iter()
-                .find_map(|c| vm.instantiate(c).ok().map(V::Ref))
+                .into_iter()
+                .chain(vm.vector_compat_class())
+                .find_map(|c| vm.instantiate(&c).ok().map(V::Ref))
                 .unwrap_or_else(|| {
                     host(
                         vm,
@@ -3852,11 +3853,12 @@ fn resources_call(vm: &mut Vm, name: &str, args: &[V]) -> Rt<Option<Option<V>>> 
                 super::vector::drawable_for_res(vm, res_id)
             } else {
                 [
-                    "Landroidx/vectordrawable/graphics/drawable/VectorDrawableCompat;",
-                    "Landroid/support/graphics/drawable/VectorDrawableCompat;",
+                    "Landroidx/vectordrawable/graphics/drawable/VectorDrawableCompat;".to_string(),
+                    "Landroid/support/graphics/drawable/VectorDrawableCompat;".to_string(),
                 ]
-                .iter()
-                .find_map(|c| vm.instantiate(c).ok().map(V::Ref))
+                .into_iter()
+                .chain(vm.vector_compat_class())
+                .find_map(|c| vm.instantiate(&c).ok().map(V::Ref))
                 .unwrap_or_else(|| {
                     host(
                         vm,

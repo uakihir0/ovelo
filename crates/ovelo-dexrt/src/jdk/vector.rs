@@ -186,7 +186,7 @@ pub(crate) fn package_icon_drawable(vm: &mut Vm, pkg: &str) -> Option<V> {
 /// else a bare `Drawable` placeholder so callers keep flowing.
 pub(crate) fn drawable_for_res(vm: &mut Vm, res_id: u32) -> V {
     // All `&vm.apk_res` reads finish before any `&mut vm` host alloc.
-    let (bitmap, color) = match rctx(vm) {
+    let (bitmap, color, is_vector) = match rctx(vm) {
         Some(rv) => (
             drawable_bitmap(rv, res_id),
             // Not gated on type "color": a `drawable-night` bucket may
@@ -194,16 +194,34 @@ pub(crate) fn drawable_for_res(vm: &mut Vm, res_id: u32) -> V {
             // walks the winning value's reference chain and only yields
             // a color when the chain actually ends at one.
             resolve_ref_color(rv, res_id),
+            render_vector(rv, res_id).is_some(),
         ),
-        None => (None, None),
+        None => (None, None, false),
     };
     match bitmap {
         Some((w, h, rgba)) => {
-            let d = host(
-                vm,
-                "Landroid/graphics/drawable/BitmapDrawable;",
-                HostState::Empty,
-            );
+            let d = if is_vector {
+                [
+                    "Landroidx/vectordrawable/graphics/drawable/VectorDrawableCompat;".to_string(),
+                    "Landroid/support/graphics/drawable/VectorDrawableCompat;".to_string(),
+                ]
+                .into_iter()
+                .chain(vm.vector_compat_class())
+                .find_map(|c| vm.instantiate(&c).ok().map(V::Ref))
+                .unwrap_or_else(|| {
+                    host(
+                        vm,
+                        "Landroid/graphics/drawable/BitmapDrawable;",
+                        HostState::Empty,
+                    )
+                })
+            } else {
+                host(
+                    vm,
+                    "Landroid/graphics/drawable/BitmapDrawable;",
+                    HostState::Empty,
+                )
+            };
             if let V::Ref(dh) = d {
                 let bmp = vm.alloc_host(
                     "Landroid/graphics/Bitmap;",

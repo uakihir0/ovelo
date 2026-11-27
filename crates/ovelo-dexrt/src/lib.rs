@@ -1880,6 +1880,43 @@ impl Vm {
         false
     }
 
+    /// Locate an R8-renamed VectorDrawableCompat implementation. The
+    /// canonical class name is often obfuscated away, but AppCompat still
+    /// probes the concrete class when validating its vector support.
+    pub(crate) fn vector_compat_class(&self) -> Option<String> {
+        for d in &self.dexes {
+            for def in d.class_defs() {
+                let Ok(desc) = d.type_descriptor(def.class_idx) else {
+                    continue;
+                };
+                if !self.extends_named(desc.as_str(), "Drawable") {
+                    continue;
+                }
+                let Ok(cd) = d.class_data_rc(def) else {
+                    continue;
+                };
+                let mut inflate = false;
+                let mut mirrored = false;
+                let mut theme = false;
+                for m in cd.direct_methods.iter().chain(cd.virtual_methods.iter()) {
+                    let Ok(mid) = d.method(m.method_idx) else {
+                        continue;
+                    };
+                    match d.string(mid.name_idx) {
+                        Ok(n) if n == "inflate" => inflate = true,
+                        Ok(n) if n == "isAutoMirrored" => mirrored = true,
+                        Ok(n) if n == "canApplyTheme" => theme = true,
+                        _ => {}
+                    }
+                }
+                if inflate && mirrored && theme {
+                    return Some(desc.to_string());
+                }
+            }
+        }
+        None
+    }
+
     /// Allocate an instance without running its `<init>` — for
     /// `Unsafe.allocateInstance`, which must not execute constructors.
     pub(crate) fn alloc_instance_raw(&mut self, class_desc: &str) -> Result<u32> {
