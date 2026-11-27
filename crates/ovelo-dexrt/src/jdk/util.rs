@@ -284,6 +284,15 @@ pub(crate) fn call(
                         Some(Some(V::I32(matches!(name, "isDone") as i32)))
                     } else if name == "complete" {
                         Some(Some(V::I32(1)))
+                    } else if matches!(name, "get" | "join" | "getNow") {
+                        if let Some(v) = args.first().and_then(|v| match v {
+                            V::Ref(h) => slot_of(vm, *h),
+                            _ => None,
+                        }) {
+                            Some(Some(v))
+                        } else {
+                            Some(Some(args[0]))
+                        }
                     } else {
                         Some(Some(args[0]))
                     }
