@@ -2187,12 +2187,17 @@ pub(crate) fn call(
             match pseudo_get(vm, this, P_LISTENER) {
                 Some(V::Ref(l)) if l != 0 => {
                     let down_target = vm.touch_gesture_target;
+                    if crate::dbg_flag("OVELO_TOUCHDBG") {
+                        eprintln!(
+                            "[touchdbg] base-ote h{this} action={action} listener={l} down={down_target} within={}",
+                            view_or_descendant(vm, this, down_target)
+                        );
+                    }
                     if action == 1 && down_target != 0 && view_or_descendant(vm, this, down_target)
                     {
-                        if let Err(e) = vm.call_virtual(l, "onClick", &[V::Ref(this)]) {
-                            if crate::dbg_flag("OVELO_TOUCHDBG") {
-                                eprintln!("[touchdbg] onClick error: {e:?}");
-                            }
+                        let cr = vm.call_virtual(l, "onClick", &[V::Ref(this)]);
+                        if crate::dbg_flag("OVELO_TOUCHDBG") {
+                            eprintln!("[touchdbg] onClick result: {cr:?}");
                         }
                         vm.touch_gesture_target = 0;
                     }
@@ -7398,6 +7403,117 @@ fn ov_popup_dismiss(vm: &mut Vm, a: &[V]) -> ovelo_error::Result<Option<V>> {
         list_popup_dismiss(vm, popup);
     }
     Ok(None)
+}
+
+fn dialog_view_scan(
+    vm: &Vm,
+    h: u32,
+    depth: usize,
+    seen: &mut std::collections::HashSet<u32>,
+) -> Option<(u32, i32)> {
+    if h == 0 || depth > 5 || !seen.insert(h) {
+        return None;
+    }
+    let desc = class_of(vm, V::Ref(h));
+    // Contexts/windows lead back to the activity content tree; a dialog
+    // scan must not adopt the main UI as its own content.
+    if depth > 0
+        && (desc == WINDOW
+            || desc.ends_with("Context;")
+            || desc.ends_with("Activity;")
+            || vm.assignable_desc(&desc, "Landroid/content/Context;"))
+    {
+        return None;
+    }
+    let mut best = if pseudo_get(vm, h, P_IS_VIEW).is_some() {
+        let mut score = 1;
+        if pseudo_get(vm, h, P_IS_GROUP).is_some() || desc.contains("Layout") {
+            score += 4;
+        }
+        if pseudo_get(vm, h, P_PARENT).is_none() {
+            score += 2;
+        }
+        Some((h, score))
+    } else {
+        None
+    };
+    let vals: Vec<V> = match vm.heap.get(h) {
+        Some(Obj::Instance { fields, .. }) | Some(Obj::Host { fields, .. }) => {
+            fields.values().copied().collect()
+        }
+        _ => Vec::new(),
+    };
+    for v in vals {
+        if let V::Ref(ch) = v {
+            if let Some(cand) = dialog_view_scan(vm, ch, depth + 1, seen) {
+                if best.is_none_or(|b| cand.1 > b.1) {
+                    best = Some(cand);
+                }
+            }
+        }
+    }
+    best
+}
+
+/// Show a framework/appcompat dialog as a host overlay. Dex AlertDialog
+/// keeps its custom view inside the obfuscated AlertController fields
+/// rather than calling Dialog.setContentView, so scan the dialog object
+/// for the detached view it built and attach that as a centered layer.
+pub(crate) fn dialog_show(vm: &mut Vm, dialog: u32) {
+    dialog_dismiss(vm, dialog);
+    let explicit = match pseudo_get(vm, dialog, P_CONTENT) {
+        Some(V::Ref(h)) if h != 0 => Some(h),
+        _ => None,
+    };
+    let mut seen = std::collections::HashSet::new();
+    let Some(root) = explicit.or_else(|| dialog_view_scan(vm, dialog, 0, &mut seen).map(|x| x.0))
+    else {
+        return;
+    };
+    let parent = activity_content(vm, vm.cur_activity).unwrap_or(0);
+    if parent == 0 {
+        return;
+    }
+    let (ww, wh) = vm.window_size;
+    let width = (ww * 4 / 5).clamp(360, 680);
+    let height = (wh * 3 / 5).clamp(260, 460);
+    let spec_w = 0x4000_0000i32 | width;
+    let spec_h = 0x4000_0000i32 | height;
+    let _ = vm.call_virtual(root, "measure", &[V::I32(spec_w), V::I32(spec_h)]);
+    let _ = vm.call_virtual(
+        root,
+        "layout",
+        &[V::I32(0), V::I32(0), V::I32(width), V::I32(height)],
+    );
+    let x = ((ww - width) / 2).max(0);
+    let y = ((wh - height) / 2).max(0);
+    let pl = pint(vm, parent, P_LEFT);
+    let pt = pint(vm, parent, P_TOP);
+    frame_set(vm, root, x - pl, y - pt, x - pl + width, y - pt + height);
+    if pseudo_get(vm, root, P_PARENT).is_none() {
+        attach_at(vm, parent, V::Ref(root), None, false, None);
+    }
+    vm.view_roots.retain(|r| *r != root);
+    vm.view_roots.push(root);
+    pseudo_set(vm, root, P_POPUP_ROOT, V::Ref(dialog));
+    pseudo_set(vm, dialog, P_POPUP_ROOT, V::Ref(root));
+    mark_layout_requested(vm, root);
+}
+
+/// Remove the overlay attached by `dialog_show`.
+pub(crate) fn dialog_dismiss(vm: &mut Vm, dialog: u32) {
+    let Some(V::Ref(root)) = pseudo_get(vm, dialog, P_POPUP_ROOT) else {
+        return;
+    };
+    if root == 0 {
+        return;
+    }
+    if let Some(V::Ref(parent)) = pseudo_get(vm, root, P_PARENT) {
+        detach(vm, parent, V::Ref(root), false);
+    }
+    vm.view_roots.retain(|r| *r != root);
+    pseudo_set(vm, dialog, P_POPUP_ROOT, V::Ref(0));
+    mark_layout_requested(vm, root);
 }
 
 fn ov_menu_inflate(vm: &mut Vm, a: &[V]) -> ovelo_error::Result<Option<V>> {

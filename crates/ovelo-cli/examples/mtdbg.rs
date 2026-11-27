@@ -43,7 +43,24 @@ fn main() {
                 if !hit {
                     continue;
                 }
-                println!("== {owner}.{mn} proto={}", m.method_idx);
+                let sig = dex
+                    .proto(mm.proto_idx.into())
+                    .ok()
+                    .and_then(|p| {
+                        let params = dex.proto_params(p).ok()?;
+                        let ps: Vec<String> = params
+                            .iter()
+                            .map(|t| {
+                                dex.type_descriptor((*t).into())
+                                    .unwrap_or_default()
+                                    .to_string()
+                            })
+                            .collect();
+                        let r = dex.type_descriptor(p.return_type_idx).unwrap_or_default();
+                        Some(format!("({}){}", ps.join(""), r))
+                    })
+                    .unwrap_or_default();
+                println!("== {owner}.{mn}{sig} proto={}", m.method_idx);
                 let Ok(Some(code)) = dex.code_item(m.code_off) else {
                     continue;
                 };

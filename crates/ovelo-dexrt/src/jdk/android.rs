@@ -1822,10 +1822,19 @@ fn dialog_call(vm: &mut Vm, name: &str, args: &[V]) -> Rt<Option<Option<V>>> {
             Some(V::Ref(hit))
         }
         "isShowing" | "isCancelable" => Some(V::I32(1)),
-        "show"
-        | "dismiss"
-        | "cancel"
-        | "hide"
+        "show" => {
+            if let Some(V::Ref(this)) = args.first().copied() {
+                view::dialog_show(vm, this);
+            }
+            None
+        }
+        "dismiss" | "cancel" => {
+            if let Some(V::Ref(this)) = args.first().copied() {
+                view::dialog_dismiss(vm, this);
+            }
+            None
+        }
+        "hide"
         | "create"
         | "onCreate"
         | "onStart"
