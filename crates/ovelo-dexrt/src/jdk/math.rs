@@ -5,7 +5,7 @@
 use crate::value::{HostState, Obj, V};
 use crate::{Rt, Vm};
 
-use super::{host, jdynstr};
+use super::{host, jdynstr, sv};
 
 pub(crate) fn bd_of(vm: &Vm, h: u32) -> Option<f64> {
     match vm.heap.get(h) {
@@ -39,8 +39,7 @@ fn new_bd(vm: &mut Vm, f: f64) -> V {
 }
 
 fn value_string(vm: &Vm, v: V) -> Option<String> {
-    let V::Ref(h) = v else { return None };
-    vm.heap.str_val(h).map(str::to_owned)
+    sv(vm, v)
 }
 
 fn num(vm: &Vm, v: V) -> f64 {
@@ -145,15 +144,28 @@ pub(crate) fn call(
             }
             Some(None)
         }
-        "valueOf" => Some(Some(new_bd(
-            vm,
-            num(vm, args.first().copied().unwrap_or(V::I32(0))),
-        ))),
+        "valueOf" => {
+            let unscaled = num(vm, args.first().copied().unwrap_or(V::I32(0)));
+            let scale = args.get(1).map(|v| i32v(*v)).unwrap_or(0);
+            Some(Some(new_bd(vm, unscaled / 10f64.powi(scale))))
+        }
         "add" => Some(Some(new_bd(vm, tf + num(vm, args[1])))),
         "subtract" => Some(Some(new_bd(vm, tf - num(vm, args[1])))),
         "multiply" => Some(Some(new_bd(vm, tf * num(vm, args[1])))),
-        "divide" => Some(Some(new_bd(vm, tf / num(vm, args[1])))),
-        "remainder" => Some(Some(new_bd(vm, tf % num(vm, args[1])))),
+        "divide" => {
+            let d = num(vm, args[1]);
+            if d == 0.0 {
+                return Err(vm.throw_builtin("Ljava/lang/ArithmeticException;", "Division by zero"));
+            }
+            Some(Some(new_bd(vm, tf / d)))
+        }
+        "remainder" => {
+            let d = num(vm, args[1]);
+            if d == 0.0 {
+                return Err(vm.throw_builtin("Ljava/lang/ArithmeticException;", "Division by zero"));
+            }
+            Some(Some(new_bd(vm, tf % d)))
+        }
         "divideToIntegralValue" => Some(Some(new_bd(vm, (tf / num(vm, args[1])).trunc()))),
         "pow" => Some(Some(new_bd(
             vm,
@@ -205,9 +217,15 @@ pub(crate) fn call(
                 0
             })))
         }
-        "equals" => Some(Some(V::I32(
-            (tf == num(vm, args.get(1).copied().unwrap_or(V::I32(0)))) as i32,
-        ))),
+        "equals" => {
+            let other = args.get(1).copied().unwrap_or(V::Ref(0));
+            let eq = match other {
+                V::Ref(0) => false,
+                V::Ref(h) => bd_of(vm, h).is_some_and(|f| f == tf),
+                _ => false,
+            };
+            Some(Some(V::I32(eq as i32)))
+        }
         "hashCode" => Some(Some(V::I32((tf.to_bits() ^ (tf.to_bits() >> 32)) as i32))),
         "toString" | "toPlainString" | "toEngineeringString" => {
             Some(Some(jdynstr(vm, &fmt_bd(tf))))
