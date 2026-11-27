@@ -337,7 +337,7 @@ fn blend_px(dst: &mut [u8], x: usize, y: usize, w: usize, argb: u32) {
     // preserves the source alpha instead of squaring it.
     for (k, sc) in [sr, sg, sb].into_iter().enumerate() {
         let dc = dst[idx + k] as u32;
-        dst[idx + k] = ((sc * sa + dc * da * inv / 255) / out_a) as u8;
+        dst[idx + k] = ((sc * sa + dc * da * inv / 255) / out_a).min(255) as u8;
     }
     dst[idx + 3] = out_a as u8;
 }
