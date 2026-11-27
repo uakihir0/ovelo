@@ -1761,7 +1761,7 @@ fn run_app(store: &InstallStore, package: &str) -> Result<(), OveloError> {
             ovelo_ui::Color::srgb(0x20, 0x20, 0x20),
             fonts2.clone(),
         );
-        title.padding = 16;
+        title.view.padding = (16, 16, 16, 16);
         col.children.push(Box::new(title));
         let taps = std::rc::Rc::new(std::cell::Cell::new(0u32));
         let mut ok = ovelo_framework::Button::new(
