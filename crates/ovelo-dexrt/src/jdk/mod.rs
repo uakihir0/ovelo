@@ -2453,12 +2453,12 @@ fn context_service_name(n: &str) -> &'static str {
 /// `DisplayMetrics.density`, `Point.x`…).
 pub(crate) fn ifield(vm: &Vm, h: u32, owner: &str, name: &str) -> Option<V> {
     match (owner, name) {
-        ("Landroid/util/DisplayMetrics;", "density") => Some(V::F32(2.0)),
-        ("Landroid/util/DisplayMetrics;", "densityDpi") => Some(V::I32(320)),
-        ("Landroid/util/DisplayMetrics;", "scaledDensity") => Some(V::F32(2.0)),
+        ("Landroid/util/DisplayMetrics;", "density") => Some(V::F32(1.0)),
+        ("Landroid/util/DisplayMetrics;", "densityDpi") => Some(V::I32(160)),
+        ("Landroid/util/DisplayMetrics;", "scaledDensity") => Some(V::F32(1.0)),
         ("Landroid/util/DisplayMetrics;", "widthPixels") => Some(V::I32(1080)),
         ("Landroid/util/DisplayMetrics;", "heightPixels") => Some(V::I32(1920)),
-        ("Landroid/util/DisplayMetrics;", "xdpi" | "ydpi") => Some(V::F32(320.0)),
+        ("Landroid/util/DisplayMetrics;", "xdpi" | "ydpi") => Some(V::F32(160.0)),
         // androidx.startup reads `getProviderInfo(...).metaData` for the
         // manifest <meta-data> bundle — the handle our CLI attaches.
         ("Landroid/content/pm/ProviderInfo;", "metaData") => {
