@@ -2835,6 +2835,22 @@ pub(crate) fn call(
                         pint(vm, this, P_MEAS_H) & 0x00FF_FFFF,
                     );
                 }
+                // ActionMenuView's overflow accounting depends on a
+                // large slice of View/LinearLayout machinery. When that
+                // dex path collapses every action item to zero, fall
+                // back to the ordinary horizontal LinearLayout pass so
+                // presenter-created buttons remain visible/clickable.
+                if class_of(vm, V::Ref(this)).contains("ActionMenuView")
+                    && pint(vm, this, P_MEAS_W) & 0x00FF_FFFF == 0
+                    && !children(vm, this).is_empty()
+                {
+                    group_measure_fallback(
+                        vm,
+                        this,
+                        i32v(args.get(1).copied().unwrap_or(V::I32(0))),
+                        i32v(args.get(2).copied().unwrap_or(V::I32(0))),
+                    );
+                }
             } else {
                 // Framework skeleton container — no dex onMeasure
                 // exists, so measure the children generically or they
@@ -8092,13 +8108,53 @@ pub(crate) fn activity_intent(vm: &Vm, h: u32) -> Option<V> {
     pseudo_get(vm, h, P_INTENT)
 }
 
+fn find_toolbar(vm: &Vm, h: u32, depth: usize) -> Option<u32> {
+    if h == 0 || depth > 24 {
+        return None;
+    }
+    let desc = class_of(vm, V::Ref(h));
+    if desc.contains("Toolbar") || vm.extends_named(&desc, "Toolbar") {
+        return Some(h);
+    }
+    for c in children(vm, h) {
+        if let V::Ref(ch) = c {
+            if let Some(hit) = find_toolbar(vm, ch, depth + 1) {
+                return Some(hit);
+            }
+        }
+    }
+    None
+}
+
 pub(crate) fn menu_of(vm: &mut Vm, view_h: u32) -> V {
     if let Some(v @ V::Ref(h)) = pseudo_get(vm, view_h, P_MENU) {
         if h != 0 {
             return v;
         }
     }
-    let m = host(vm, "Landroid/view/Menu;", HostState::Map(vec![]));
+    // AppCompat toolbars present the options menu through the
+    // MenuBuilder owned by their ActionMenuView. Reuse that exact object
+    // when the content tree already exists; a separate MenuBuilder would
+    // inflate successfully but never notify the toolbar presenter.
+    let toolbar = match pseudo_get(vm, view_h, P_CONTENT) {
+        Some(V::Ref(root)) => find_toolbar(vm, root, 0),
+        _ => None,
+    };
+    let toolbar_menu = toolbar.and_then(|tb| {
+        vm.call_virtual_direct(tb, "getMenu", &[])
+            .ok()
+            .flatten()
+            .filter(|v| matches!(v, V::Ref(h) if *h != 0))
+    });
+    let m = toolbar_menu.unwrap_or_else(|| {
+        vm.instantiate_with(
+            "Landroidx/appcompat/view/menu/MenuBuilder;",
+            &[V::Ref(view_h)],
+        )
+        .ok()
+        .map(V::Ref)
+        .unwrap_or_else(|| host(vm, "Landroid/view/Menu;", HostState::Map(vec![])))
+    });
     if crate::dbg_flag("OVELO_TRACE_MENU") {
         eprintln!("[menu_of] view={view_h} menu={m:?}");
     }
@@ -8431,12 +8487,19 @@ fn menu_add_entry(
     if matches!(vm.heap.get(menu_h), Some(Obj::Instance { .. })) {
         let title_v = menu_title(vm, title);
         let m = if sub { "addSubMenu" } else { "add" };
-        match vm.call_virtual(
+        // Bypass the host compatibility surface: MenuBuilder.add is the
+        // callback point through which ActionMenuPresenter materializes
+        // toolbar items. Mirror the resulting item into the host backing
+        // store only for compatibility queries (`findItem`, `size`).
+        match vm.call_virtual_direct(
             menu_h,
             m,
             &[V::I32(group), V::I32(id), V::I32(order), title_v],
         ) {
-            Ok(Some(it)) => return it,
+            Ok(Some(it)) => {
+                menu_push(vm, menu_h, id, it);
+                return it;
+            }
             r => {
                 if crate::dbg_flag("OVELO_TRACE_MENU") {
                     eprintln!("[menu_add] dex {m} failed: {r:?}");
