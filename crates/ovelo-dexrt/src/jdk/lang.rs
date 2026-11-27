@@ -2830,6 +2830,16 @@ pub(crate) fn platform_enum_ordinal(class: &str, name: &str) -> Option<i32> {
 /// `ordinal()`/`compareTo`/`when` tables read them.
 pub(crate) fn platform_enum_consts(class: &str) -> Option<&'static [&'static str]> {
     Some(match class {
+        "Ljava/math/RoundingMode;" => &[
+            "UP",
+            "DOWN",
+            "CEILING",
+            "FLOOR",
+            "HALF_UP",
+            "HALF_DOWN",
+            "HALF_EVEN",
+            "UNNECESSARY",
+        ],
         "Ljava/util/concurrent/TimeUnit;" => &[
             "NANOSECONDS",
             "MICROSECONDS",
