@@ -151,7 +151,7 @@ fn mat_point(m: [f32; 6], x: f32, y: f32) -> (f32, f32) {
 
 fn inv_mat_point(m: [f32; 6], x: f32, y: f32) -> (f32, f32) {
     let det = m[0] * m[4] - m[1] * m[3];
-    if det.abs() <= f32::EPSILON {
+    if det == 0.0 {
         return (f32::INFINITY, f32::INFINITY);
     }
     let x = x - m[2];
