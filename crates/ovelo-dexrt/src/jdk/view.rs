@@ -5124,7 +5124,7 @@ fn group_measure_fallback(vm: &mut Vm, this: u32, pw: i32, ph: i32) {
         // child (FrameLayout semantics).
         if linear_v {
             chh += hh + mv;
-            cw = cw.max(w);
+            cw = cw.max(w + mh);
         } else if linear_h {
             cw += w + mh;
             chh = chh.max(hh + mv);
