@@ -2835,7 +2835,18 @@ fn objects_static(vm: &mut Vm, name: &str, args: &[V]) -> Rt<Option<Option<V>>> 
         "deepEquals" => Some(Some(V::I32(value_eq(vm, args[0], args[1]) as i32))),
         "hashCode" => Some(Some(hash_of(vm, args[0]))),
         "hash" => {
-            let h = args.iter().fold(1i32, |acc, v| {
+            // `Objects.hash(values...)` boxes its varargs into one array
+            // before dispatch. Hashing that array itself gives a fresh
+            // identity hash on every call, so object keys whose hashCode
+            // uses Objects.hash become unstable in ArrayMap/HashMap.
+            let values = match args.first().copied() {
+                Some(V::Ref(h)) => match vm.heap.get(h) {
+                    Some(Obj::Array { data, .. }) => data.clone(),
+                    _ => vec![args[0]],
+                },
+                _ => Vec::new(),
+            };
+            let h = values.iter().fold(1i32, |acc, v| {
                 acc.wrapping_mul(31).wrapping_add(match hash_of(vm, *v) {
                     V::I32(i) => i,
                     _ => 0,
