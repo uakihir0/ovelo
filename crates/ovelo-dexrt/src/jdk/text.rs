@@ -46,7 +46,9 @@ pub(crate) fn call(
         "Landroid/text/SpannableString;"
         | "Landroid/text/SpannableStringBuilder;"
         | "Landroid/text/Spannable;"
-        | "Landroid/text/Spanned;" => Ok(spannable_call(vm, name, args)),
+        | "Landroid/text/Spanned;"
+        | "Landroid/text/Editable;"
+        | "Landroid/text/GetChars;" => Ok(spannable_call(vm, name, args)),
         "Landroid/text/Layout$Alignment;" => Ok(align_call(vm, name, args)),
         "Landroid/text/style/CharacterStyle;" => Ok(chstyle_call(name, args)),
         _ => Ok(None),
@@ -151,6 +153,26 @@ fn spannable_call(vm: &mut Vm, name: &str, args: &[V]) -> Option<Option<V>> {
         }
         "getSpanStart" | "getSpanEnd" | "getSpanFlags" | "nextSpanTransition" => {
             Some(Some(V::I32(-1)))
+        }
+        "getChars" => {
+            let t: Vec<char> = cs_text(vm, this).chars().collect();
+            let start = args.get(1).map(|v| i32v(*v)).unwrap_or(0).max(0) as usize;
+            let end = args
+                .get(2)
+                .map(|v| i32v(*v))
+                .unwrap_or(t.len() as i32)
+                .max(0) as usize;
+            let dst_start = args.get(4).map(|v| i32v(*v)).unwrap_or(0).max(0) as usize;
+            if let Some(V::Ref(dh)) = args.get(3).copied() {
+                if let Some(Obj::Array { data, .. }) = vm.heap.get_mut(dh) {
+                    for (i, c) in t[start.min(t.len())..end.min(t.len())].iter().enumerate() {
+                        if let Some(slot) = data.get_mut(dst_start + i) {
+                            *slot = V::I32(*c as i32);
+                        }
+                    }
+                }
+            }
+            Some(None)
         }
         "append" | "insert" | "delete" | "clear" | "clearSpans" => {
             Some(Some(args.first().copied().unwrap_or(V::Ref(0))))
