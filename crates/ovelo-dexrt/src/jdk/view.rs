@@ -173,6 +173,8 @@ const P_ORIENTATION: u32 = 0xFFFD_FFDD;
 /// CompoundButton checked state / RadioGroup's checked child id.
 const P_CHECKED: u32 = 0xFFFD_FFDC;
 const P_RADIO_CHECKED: u32 = 0xFFFD_FFDB;
+/// CompoundButton/RadioGroup `OnCheckedChangeListener`.
+const P_CHECK_LISTENER: u32 = 0xFFFD_FFD3;
 const P_SCROLL_X: u32 = 0xFFFD_FFD9;
 const P_SCROLL_Y: u32 = 0xFFFD_FFD8;
 const P_PAD_L: u32 = 0xFFFD_FFD7;
@@ -2424,6 +2426,15 @@ pub(crate) fn call(
             }
             Some(None)
         }
+        "setOnCheckedChangeListener" => {
+            pseudo_set(
+                vm,
+                this,
+                P_CHECK_LISTENER,
+                args.get(1).copied().unwrap_or(V::Ref(0)),
+            );
+            Some(None)
+        }
         "isChecked" if is_marked(vm, this) => Some(Some(V::I32(pint(vm, this, P_CHECKED)))),
         "setChecked" if is_marked(vm, this) => {
             let checked = i32v(args.get(1).copied().unwrap_or(V::I32(0)));
@@ -2438,15 +2449,7 @@ pub(crate) fn call(
             } =>
         {
             let id = i32v(args.get(1).copied().unwrap_or(V::I32(0)));
-            pseudo_set(vm, this, P_RADIO_CHECKED, V::I32(id));
-            for c in children(vm, this) {
-                if let V::Ref(ch) = c {
-                    let child_cls = class_of(vm, V::Ref(ch));
-                    if is_radio_desc(vm, &child_cls) {
-                        pseudo_set(vm, ch, P_CHECKED, V::I32((view_id(vm, ch) == id) as i32));
-                    }
-                }
-            }
+            radio_group_set_checked(vm, this, id);
             Some(None)
         }
         "clearCheck"
@@ -2456,12 +2459,7 @@ pub(crate) fn call(
                     || vm.assignable_desc(&cls, "Landroid/widget/RadioGroup;")
             } =>
         {
-            pseudo_set(vm, this, P_RADIO_CHECKED, V::I32(-1));
-            for c in children(vm, this) {
-                if let V::Ref(ch) = c {
-                    pseudo_set(vm, ch, P_CHECKED, V::I32(0));
-                }
-            }
+            radio_group_set_checked(vm, this, -1);
             Some(None)
         }
         "getCheckedRadioButtonId"
@@ -3228,7 +3226,6 @@ pub(crate) fn call(
         | "setFilters"
         | "setEnabled_true"
         | "setCheckMarkDrawable"
-        | "setOnCheckedChangeListener"
         | "setProgress"
         | "setMax"
         | "setIndeterminate"
@@ -7743,33 +7740,53 @@ fn is_radio_desc(vm: &Vm, desc: &str) -> bool {
     desc.contains("RadioButton") || vm.assignable_desc(desc, "Landroid/widget/RadioButton;")
 }
 
-fn set_compound_checked(vm: &mut Vm, this: u32, checked: i32) {
-    pseudo_set(vm, this, P_CHECKED, V::I32((checked != 0) as i32));
-    if checked == 0 {
-        if let Some(V::Ref(parent)) = pseudo_get(vm, this, P_PARENT) {
-            if pseudo_get(vm, parent, P_RADIO_CHECKED) == Some(V::I32(view_id(vm, this))) {
-                pseudo_set(vm, parent, P_RADIO_CHECKED, V::I32(-1));
+fn notify_checked_listener(vm: &mut Vm, this: u32, arg: V) {
+    if let Some(V::Ref(listener)) = pseudo_get(vm, this, P_CHECK_LISTENER) {
+        if listener != 0 {
+            let _ = vm.call_virtual(listener, "onCheckedChanged", &[V::Ref(this), arg]);
+        }
+    }
+}
+
+fn radio_group_set_checked(vm: &mut Vm, group: u32, id: i32) {
+    let old = pint(vm, group, P_RADIO_CHECKED);
+    pseudo_set(vm, group, P_RADIO_CHECKED, V::I32(id));
+    for c in children(vm, group) {
+        if let V::Ref(ch) = c {
+            let child_cls = class_of(vm, V::Ref(ch));
+            if is_radio_desc(vm, &child_cls) {
+                pseudo_set(vm, ch, P_CHECKED, V::I32((view_id(vm, ch) == id) as i32));
             }
         }
     }
-    if checked != 0 {
-        if let Some(V::Ref(parent)) = pseudo_get(vm, this, P_PARENT) {
-            let cls = class_of(vm, V::Ref(parent));
-            if cls == "Landroid/widget/RadioGroup;"
-                || vm.assignable_desc(&cls, "Landroid/widget/RadioGroup;")
-            {
-                let id = view_id(vm, this);
-                pseudo_set(vm, parent, P_RADIO_CHECKED, V::I32(id));
-                for c in children(vm, parent) {
-                    if let V::Ref(ch) = c {
-                        let child_cls = class_of(vm, V::Ref(ch));
-                        if ch != this && is_radio_desc(vm, &child_cls) {
-                            pseudo_set(vm, ch, P_CHECKED, V::I32(0));
-                        }
-                    }
-                }
-            }
+    if old != id {
+        notify_checked_listener(vm, group, V::I32(id));
+    }
+}
+
+fn set_compound_checked(vm: &mut Vm, this: u32, checked: i32) {
+    let checked = (checked != 0) as i32;
+    let old = pint(vm, this, P_CHECKED);
+    pseudo_set(vm, this, P_CHECKED, V::I32(checked));
+    let parent = match pseudo_get(vm, this, P_PARENT) {
+        Some(V::Ref(p)) => p,
+        _ => 0,
+    };
+    let parent_is_group = parent != 0 && {
+        let cls = class_of(vm, V::Ref(parent));
+        cls == "Landroid/widget/RadioGroup;"
+            || vm.assignable_desc(&cls, "Landroid/widget/RadioGroup;")
+    };
+    if parent_is_group {
+        let id = view_id(vm, this);
+        if checked != 0 {
+            radio_group_set_checked(vm, parent, id);
+        } else if pint(vm, parent, P_RADIO_CHECKED) == id {
+            radio_group_set_checked(vm, parent, -1);
         }
+    }
+    if old != checked {
+        notify_checked_listener(vm, this, V::I32(checked));
     }
 }
 
