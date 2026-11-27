@@ -2528,6 +2528,12 @@ impl Vm {
         roots.extend(self.enum_name_cache.values().copied());
         roots.extend(self.bool_cache.into_iter().filter(|h| *h != 0));
         roots.extend(self.int_cache.into_iter().filter(|h| *h != 0));
+        roots.extend(self.activity_back.iter().copied());
+        roots.extend(self.activity_callers.keys().copied());
+        roots.extend(self.activity_callers.values().map(|(caller, _)| *caller));
+        if let Some((caller, _)) = self.pending_activity_caller {
+            roots.push(caller);
+        }
         roots.extend(self.content_views.keys().copied());
         roots.extend(self.content_views.values().copied());
         roots.extend(self.decor_roots.keys().copied());
