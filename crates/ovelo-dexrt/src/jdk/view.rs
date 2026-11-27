@@ -6591,11 +6591,17 @@ pub(crate) fn dispatch_touch(
         // and `performClick` fires the OnClickListener on ACTION_UP.
         // The deepest ancestor with a listener wins.
         if action == 1 {
-            if let Some(V::Ref(l)) = pseudo_get(vm, v, P_LISTENER) {
+            let listener = match pseudo_get(vm, v, P_LISTENER) {
+                Some(V::Ref(l)) if l != 0 => Some(l),
+                _ => None,
+            };
+            let clickable =
+                listener.is_some() || pseudo_get(vm, v, P_DIALOG_BUTTON_WHICH).is_some();
+            if clickable {
                 let down_target = vm.touch_gesture_target;
-                if l != 0 && down_target != 0 && view_or_descendant(vm, v, down_target) {
+                if down_target != 0 && view_or_descendant(vm, v, down_target) {
                     if dbg {
-                        eprintln!("[touchdbg] h{v} OnClickListener.onClick l{l}");
+                        eprintln!("[touchdbg] h{v} performClick listener={listener:?}");
                     }
                     if let Err(e) = vm.call_virtual(v, "performClick", &[]) {
                         if crate::dbg_flag("OVELO_TOUCHDBG") {
