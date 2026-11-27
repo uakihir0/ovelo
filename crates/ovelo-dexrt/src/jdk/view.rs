@@ -2413,11 +2413,9 @@ pub(crate) fn call(
                 set_compound_checked(vm, this, checked as i32);
             }
             let mut fired = match pseudo_get(vm, this, P_LISTENER) {
-                Some(V::Ref(l)) if l != 0 => vm
-                    .call_virtual(l, "onClick", &[V::Ref(this)])
-                    .ok()
-                    .flatten()
-                    .is_some(),
+                // OnClickListener.onClick returns void: a normal dex
+                // completion is `Ok(None)`, not a missing invocation.
+                Some(V::Ref(l)) if l != 0 => vm.call_virtual(l, "onClick", &[V::Ref(this)]).is_ok(),
                 _ => false,
             };
             // `android:onClick="method"` in layout XML: AOSP's
