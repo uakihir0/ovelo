@@ -172,7 +172,7 @@ impl Drawable for ViewGroup {
         } else {
             if let Some(i) = self.pressed_child.take() {
                 if let Some(ch) = self.children.get_mut(i) {
-                    return ch.dispatch_touch(false, x, y);
+                    return ch.dispatch_touch(false, x + self.scroll_x, y + self.scroll_y);
                 }
             }
             release_hit(&mut self.view, x, y)
