@@ -2992,7 +2992,7 @@ pub(crate) fn textclock_update(vm: &mut Vm, this: u32) {
     let text = clock_pattern(&pat, now_ms());
     let cur = pseudo_get(vm, this, P_TEXT).and_then(|v| sv(vm, v));
     if cur.as_deref() != Some(text.as_str()) {
-        let text = jstr(vm, &text);
+        let text = jdynstr(vm, &text);
         pseudo_set(vm, this, P_TEXT, text);
     }
 }
