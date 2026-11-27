@@ -1274,8 +1274,13 @@ fn pop_finished_activity(vm: &mut ovelo_dexrt::Vm, this: &mut u32) -> bool {
             // dex RecyclerView's requestLayout reaching the host root.
             // Resuming an activity is exactly the point where those
             // mutations become visible, so force one fresh layout pass.
-            if let Some(root) = vm.activity_content(prev) {
-                ovelo_dexrt::mark_layout_requested(vm, root);
+            {
+                // JNI worker threads can mutate the heap concurrently;
+                // even this small root-state write must use the VM lock.
+                let _vmg = ovelo_dexrt::lock_vm();
+                if let Some(root) = vm.activity_content(prev) {
+                    ovelo_dexrt::mark_layout_requested(vm, root);
+                }
             }
             vm.retire_activity(finished);
             return true;
