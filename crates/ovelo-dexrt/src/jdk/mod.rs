@@ -61,6 +61,32 @@ pub(crate) const P_RECT_L: u32 = u32::MAX - 7;
 pub(crate) const P_RECT_T: u32 = u32::MAX - 8;
 pub(crate) const P_RECT_R: u32 = u32::MAX - 9;
 pub(crate) const P_RECT_B: u32 = u32::MAX - 10;
+pub(crate) const P_POINT_X: u32 = u32::MAX - 333;
+pub(crate) const P_POINT_Y: u32 = u32::MAX - 334;
+
+pub(crate) fn point_write(vm: &mut Vm, h: u32, x: i32, y: i32) {
+    pseudo_set(vm, h, P_POINT_X, V::I32(x));
+    pseudo_set(vm, h, P_POINT_Y, V::I32(y));
+    for (name, v) in [("x", x), ("y", y)] {
+        if let Some(f) = vm
+            .field_index_of("Landroid/graphics/Point;", name)
+            .map(|g| vm.canon_field(g))
+        {
+            if let Some(Obj::Instance { fields, .. } | Obj::Host { fields, .. }) =
+                vm.heap.get_mut(h)
+            {
+                fields.insert(f, V::I32(v));
+            }
+        }
+    }
+}
+
+pub(crate) fn point_xy(vm: &Vm, h: u32) -> (i32, i32) {
+    (
+        i32v(pseudo_get(vm, h, P_POINT_X).unwrap_or(V::I32(0))),
+        i32v(pseudo_get(vm, h, P_POINT_Y).unwrap_or(V::I32(0))),
+    )
+}
 pub(crate) const P_BOUNDS: u32 = u32::MAX - 11;
 /// Thread was `start()`ed once — JVM forbids a second start.
 pub(crate) const P_STARTED: u32 = u32::MAX - 12;
@@ -2719,8 +2745,13 @@ pub(crate) fn ifield(vm: &Vm, h: u32, owner: &str, name: &str) -> Option<V> {
             Some(pseudo_get(vm, h, P_MSG_ARG2).unwrap_or(V::I32(0)))
         }
         ("Landroid/os/Message;", "obj") => Some(pseudo_get(vm, h, P_MSG_OBJ).unwrap_or(V::Ref(0))),
-        ("Landroid/graphics/Point;", "x" | "y")
-        | ("Landroid/graphics/RectF;", "left" | "top" | "right" | "bottom")
+        ("Landroid/graphics/Point;", "x") => {
+            Some(pseudo_get(vm, h, P_POINT_X).unwrap_or(V::I32(0)))
+        }
+        ("Landroid/graphics/Point;", "y") => {
+            Some(pseudo_get(vm, h, P_POINT_Y).unwrap_or(V::I32(0)))
+        }
+        ("Landroid/graphics/RectF;", "left" | "top" | "right" | "bottom")
         | ("Landroid/graphics/PointF;", "x" | "y") => Some(V::I32(0)),
         // Rect edges are real stored ints (set/setBounds/offset write
         // them as pseudo fields) so drawable bounds round-trip.

@@ -6799,11 +6799,46 @@ fn graphics_call(
             let _ = n;
             Some(Some(V::I32(0)))
         }
-        ("Landroid/graphics/Point;", "set" | "offset" | "negate" | "equals") => {
-            if name == "equals" {
-                Some(Some(V::I32(0)))
-            } else {
-                Some(None)
+        ("Landroid/graphics/Point;", "<init>" | "set" | "offset" | "negate" | "equals") => {
+            let this = match args.first().copied() {
+                Some(V::Ref(h)) => h,
+                _ => 0,
+            };
+            match name {
+                "<init>" => {
+                    if args.len() >= 3 {
+                        point_write(vm, this, i32v(args[1]), i32v(args[2]));
+                    }
+                    Some(None)
+                }
+                "set" => {
+                    point_write(vm, this, i32v(args[1]), i32v(args[2]));
+                    Some(None)
+                }
+                "offset" => {
+                    let (x, y) = point_xy(vm, this);
+                    point_write(
+                        vm,
+                        this,
+                        x + i32v(args.get(1).copied().unwrap_or(V::I32(0))),
+                        y + i32v(args.get(2).copied().unwrap_or(V::I32(0))),
+                    );
+                    Some(None)
+                }
+                "negate" => {
+                    let (x, y) = point_xy(vm, this);
+                    point_write(vm, this, -x, -y);
+                    Some(None)
+                }
+                _ => {
+                    let other = match args.get(1).copied() {
+                        Some(V::Ref(h)) => h,
+                        _ => 0,
+                    };
+                    Some(Some(V::I32(
+                        (other != 0 && point_xy(vm, this) == point_xy(vm, other)) as i32,
+                    )))
+                }
             }
         }
         (

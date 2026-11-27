@@ -1269,6 +1269,7 @@ pub(crate) fn is_viewish(vm: &Vm, class: &str, args: &[V]) -> bool {
             | "Landroid/view/MotionEvent;"
             | "Landroid/view/KeyEvent;"
             | "Landroid/view/WindowManager;"
+            | "Landroid/view/Display;"
             | "Landroid/view/SurfaceHolder;"
             | "Landroid/view/WindowMetrics;"
             | "Landroid/view/WindowInsets;"
@@ -1336,6 +1337,45 @@ pub(crate) fn call(
         // ---------- inflation ----------
         "<init>" if class.ends_with("LayoutParams;") => {
             lp_ctor(vm, class, sig, args);
+            Some(None)
+        }
+        // ---------- Display ----------
+        "getDefaultDisplay" if class == "Landroid/view/WindowManager;" => {
+            Some(Some(host(vm, "Landroid/view/Display;", HostState::Empty)))
+        }
+        "getSize" | "getRealSize" if class == "Landroid/view/Display;" => {
+            if let Some(&V::Ref(point)) = args.get(1) {
+                point_write(vm, point, vm.window_size.0, vm.window_size.1);
+            }
+            Some(None)
+        }
+        "getWidth" | "getDisplayId" if class == "Landroid/view/Display;" => {
+            Some(Some(V::I32(if name == "getWidth" {
+                vm.window_size.0
+            } else {
+                0
+            })))
+        }
+        "getHeight" if class == "Landroid/view/Display;" => Some(Some(V::I32(vm.window_size.1))),
+        "getRotation" | "getFlags" | "getRefreshRate" | "getMode" | "getState"
+            if class == "Landroid/view/Display;" =>
+        {
+            Some(Some(match ret(sig) {
+                "F" => V::F32(60.0),
+                _ => V::I32(0),
+            }))
+        }
+        "isValid" if class == "Landroid/view/Display;" => Some(Some(V::I32(1))),
+        "getMetrics" | "getRealMetrics" if class == "Landroid/view/Display;" => Some(None),
+        "getCurrentSizeRange" if class == "Landroid/view/Display;" => {
+            let small = vm.window_size.0.min(vm.window_size.1);
+            let large = vm.window_size.0.max(vm.window_size.1);
+            if let Some(&V::Ref(smallest)) = args.get(1) {
+                point_write(vm, smallest, small, small);
+            }
+            if let Some(&V::Ref(largest)) = args.get(2) {
+                point_write(vm, largest, large, large);
+            }
             Some(None)
         }
         // ---------- MotionEvent ----------
