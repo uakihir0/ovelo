@@ -1157,25 +1157,38 @@ pub(crate) fn guest_list_backing(
     // must not decide which one is the backing store: when a logical size
     // is known, prefer the candidate whose first window is densest.
     if let Some(n) = size_field {
-        let holes = |x: u32| -> usize {
-            match vm.heap.get(x) {
-                Some(Obj::Array { data, .. }) => data
-                    .iter()
-                    .take(n)
-                    .filter(|v| matches!(v, V::Ref(0) | V::I32(0)))
-                    .count(),
+        let backing_score = |x: u32| -> (usize, usize) {
+            let (len, holes) = match vm.heap.get(x) {
+                Some(Obj::Array { data, .. }) => (
+                    data.len(),
+                    data.iter()
+                        .take(n)
+                        .filter(|v| matches!(v, V::Ref(0) | V::I32(0)))
+                        .count(),
+                ),
                 Some(Obj::Host {
                     state: HostState::List(l),
                     ..
-                }) => l
-                    .iter()
-                    .take(n)
-                    .filter(|v| matches!(v, V::Ref(0) | V::I32(0)))
-                    .count(),
-                _ => usize::MAX,
+                }) => (
+                    l.len(),
+                    l.iter()
+                        .take(n)
+                        .filter(|v| matches!(v, V::Ref(0) | V::I32(0)))
+                        .count(),
+                ),
+                _ => (0, usize::MAX),
+            };
+            if len < n || holes == usize::MAX {
+                (usize::MAX, usize::MAX)
+            } else {
+                // Densest first; on a tie the tightest window is more
+                // likely the element store than a sparse hash table or
+                // oversized auxiliary buffer. Stores shorter than the
+                // logical size can never back the collection.
+                (holes, len)
             }
         };
-        cands.sort_by_key(|&x| holes(x));
+        cands.sort_by_key(|&x| backing_score(x));
     }
     for &x in &cands {
         let len = match vm.heap.get(x) {
