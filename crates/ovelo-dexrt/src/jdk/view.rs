@@ -2151,7 +2151,11 @@ pub(crate) fn call(
                     let down_target = vm.touch_gesture_target;
                     if action == 1 && down_target != 0 && view_or_descendant(vm, this, down_target)
                     {
-                        let _ = vm.call_virtual(l, "onClick", &[V::Ref(this)]);
+                        if let Err(e) = vm.call_virtual(l, "onClick", &[V::Ref(this)]) {
+                            if crate::dbg_flag("OVELO_TOUCHDBG") {
+                                eprintln!("[touchdbg] onClick error: {e:?}");
+                            }
+                        }
                         vm.touch_gesture_target = 0;
                     }
                     Some(Some(V::I32(1)))
@@ -5707,7 +5711,11 @@ pub(crate) fn dispatch_touch(
                     if dbg {
                         eprintln!("[touchdbg] h{v} OnClickListener.onClick l{l}");
                     }
-                    let _ = vm.call_virtual(l, "onClick", &[V::Ref(v)]);
+                    if let Err(e) = vm.call_virtual(l, "onClick", &[V::Ref(v)]) {
+                        if crate::dbg_flag("OVELO_TOUCHDBG") {
+                            eprintln!("[touchdbg] onClick error: {e:?}");
+                        }
+                    }
                     vm.touch_gesture_target = 0;
                     return Ok(true);
                 }
