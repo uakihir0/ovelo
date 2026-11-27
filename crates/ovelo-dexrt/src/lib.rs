@@ -3223,6 +3223,7 @@ impl Vm {
             self.view_roots.retain(|h| *h != root);
         }
         self.activity_themes.remove(&activity);
+        self.activity_menu_created.remove(&activity);
     }
 
     /// Result code and data recorded by `Activity.setResult`.
