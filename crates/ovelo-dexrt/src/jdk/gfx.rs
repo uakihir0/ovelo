@@ -258,9 +258,9 @@ fn blend_px(out: &mut [u8], i: usize, argb: i32) {
     }
     for c in 0..3 {
         let over = src[c] * a + (out[i + c] as u32 * da * ia) / 255;
-        out[i + c] = (over / out_a) as u8;
+        out[i + c] = (over / out_a).min(255) as u8;
     }
-    out[i + 3] = out_a as u8;
+    out[i + 3] = out_a.min(255) as u8;
 }
 
 fn blend_px_coverage(out: &mut [u8], i: usize, argb: i32, num: u32, den: u32) {
