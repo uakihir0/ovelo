@@ -7536,6 +7536,30 @@ pub(crate) fn attach_at(
     }
     if let V::Ref(ch) = child {
         pseudo_set(vm, ch, P_PARENT, V::Ref(parent));
+        // An inflated root stops being an independent layout/render root
+        // once it has a real parent. ActionMenuPresenter item views are
+        // inflated individually and then added to ActionMenuView; leaving
+        // them in view_roots makes the frame walker relayout them as
+        // full-window roots outside the toolbar. Popup/dialog panels are
+        // the deliberate exception: they use independent overlay roots.
+        let parent_reaches_root = {
+            let mut cur = parent;
+            let mut hit = false;
+            for _ in 0..64 {
+                if vm.view_roots.contains(&cur) {
+                    hit = true;
+                    break;
+                }
+                match pseudo_get(vm, cur, P_PARENT) {
+                    Some(V::Ref(p)) if p != 0 => cur = p,
+                    _ => break,
+                }
+            }
+            hit
+        };
+        if pseudo_get(vm, ch, P_POPUP_ROOT).is_none() && parent_reaches_root {
+            vm.view_roots.retain(|r| *r != ch);
+        }
         let parent_cls = class_of(vm, V::Ref(parent));
         let child_cls = class_of(vm, V::Ref(ch));
         if ch != 0
