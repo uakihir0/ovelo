@@ -82,6 +82,40 @@ pub(crate) fn call(
             }
             _ => None,
         }
+    } else if class == "Landroid/util/Size;" {
+        // Size's width/height are private final fields in the framework;
+        // keep them as pseudo state because the constructor receiver can
+        // be either a host object or a classless dex instance.
+        const P_SIZE_WIDTH: u32 = u32::MAX - 335;
+        const P_SIZE_HEIGHT: u32 = u32::MAX - 336;
+        let this = match args.first().copied() {
+            Some(V::Ref(h)) => h,
+            _ => 0,
+        };
+        match name {
+            "<init>" => {
+                pseudo_set(
+                    vm,
+                    this,
+                    P_SIZE_WIDTH,
+                    args.get(1).copied().unwrap_or(V::I32(0)),
+                );
+                pseudo_set(
+                    vm,
+                    this,
+                    P_SIZE_HEIGHT,
+                    args.get(2).copied().unwrap_or(V::I32(0)),
+                );
+                Some(None)
+            }
+            "getWidth" => Some(Some(
+                pseudo_get(vm, this, P_SIZE_WIDTH).unwrap_or(V::I32(0)),
+            )),
+            "getHeight" => Some(Some(
+                pseudo_get(vm, this, P_SIZE_HEIGHT).unwrap_or(V::I32(0)),
+            )),
+            _ => None,
+        }
     } else if class == "Landroid/text/TextUtils;" {
         textutils_call(vm, name, args)?
     } else if class == "Landroid/text/Html;" {
