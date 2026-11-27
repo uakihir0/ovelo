@@ -84,6 +84,8 @@ const P_IMAGE_PLACEHOLDER: u32 = u32::MAX - 30;
 const P_POPUP_ROOT: u32 = u32::MAX - 31;
 const P_POPUP_OWNER: u32 = u32::MAX - 32;
 const P_POPUP_POS: u32 = u32::MAX - 33;
+/// Overflow popup whose rows were compressed to fit the available height.
+const P_POPUP_COMPACT: u32 = u32::MAX - 53;
 /// Dialog cancelable flag (`setCancelable(false)` stores 0).
 const P_DIALOG_CANCELABLE: u32 = u32::MAX - 34;
 /// Synthetic AlertDialog panel wrapping custom content.
@@ -2696,6 +2698,9 @@ pub(crate) fn call(
                 // generically or they keep their 0×0 frames.
                 group_layout_fallback(vm, this, l, t, r, b);
                 pseudo_set(vm, this, P_LAYOUT_REQ, V::I32(0));
+            }
+            if pseudo_get(vm, this, P_POPUP_COMPACT) == Some(V::I32(1)) {
+                layout_popup_rows_compact(vm, this, r - l, b - t);
             }
             Some(None)
         }
@@ -8154,6 +8159,7 @@ fn list_popup_show(vm: &mut Vm, popup: u32) {
         "layout",
         &[V::I32(0), V::I32(0), V::I32(width), V::I32(height)],
     );
+    pseudo_set(vm, root, P_POPUP_COMPACT, V::I32(compressed as i32));
     if compressed {
         layout_popup_rows_compact(vm, root, width, height);
     }
