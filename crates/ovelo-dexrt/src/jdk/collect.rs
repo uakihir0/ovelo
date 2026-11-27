@@ -2912,13 +2912,38 @@ fn arrays_static(vm: &mut Vm, name: &str, _sig: &str, args: &[V]) -> Rt<Option<O
                 V::Ref(h) => match vm.heap.get(h) {
                     Some(Obj::Array { data, .. }) => {
                         let data = data.clone();
-                        let key = args[1];
-                        let mut low = 0usize;
-                        let mut high = data.len();
+                        let ranged = args.len() >= 4
+                            && matches!(args.get(1), Some(V::I32(_)))
+                            && matches!(args.get(2), Some(V::I32(_)));
+                        let key_i = if ranged { 3 } else { 1 };
+                        let key = args.get(key_i).copied().unwrap_or(V::Ref(0));
+                        let comparator = args
+                            .get(if ranged { 4 } else { 2 })
+                            .copied()
+                            .and_then(|v| if let V::Ref(c) = v { Some(c) } else { None })
+                            .unwrap_or(0);
+                        let mut low = if ranged {
+                            i32v(args[1]).max(0) as usize
+                        } else {
+                            0
+                        }
+                        .min(data.len());
+                        let mut high = if ranged {
+                            (i32v(args[2]).max(0) as usize).min(data.len())
+                        } else {
+                            data.len()
+                        };
                         let mut hit = None;
                         while low < high {
                             let mid = (low + high) / 2;
-                            let c = natural_cmp(vm, data[mid], key).cmp(&0) as i32;
+                            let c = if comparator != 0 {
+                                vm.call_virtual_rt(comparator, "compare", &[data[mid], key])?
+                                    .map(i32v)
+                                    .unwrap_or(0)
+                                    .signum()
+                            } else {
+                                natural_cmp(vm, data[mid], key).signum()
+                            };
                             if c < 0 {
                                 low = mid + 1;
                             } else if c > 0 {
