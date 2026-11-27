@@ -2685,9 +2685,10 @@ fn json_obj(vm: &mut Vm, name: &str, args: &[V]) -> Option<Option<V>> {
             map_put(vm, h, args[1], args.get(2).copied().unwrap_or(V::Ref(0)));
             Some(V::Ref(h))
         }
-        "get" | "opt" | "getJSONObject" | "getJSONArray" => {
-            map_get(vm, h, args[1]).or(Some(V::Ref(0)))
-        }
+        "get" | "opt" | "getJSONObject" | "getJSONArray" => match map_get(vm, h, args[1]) {
+            Some(V::Ref(0)) => sfield(vm, "Lorg/json/JSONObject;", "NULL", OBJ).or(Some(V::Ref(0))),
+            v => v.or(Some(V::Ref(0))),
+        },
         "getString" | "optString" | "getName" => {
             let v = map_get(vm, h, args[1]);
             Some(match v {
