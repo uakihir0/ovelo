@@ -2786,13 +2786,25 @@ fn arrays_static(vm: &mut Vm, name: &str, _sig: &str, args: &[V]) -> Rt<Option<O
         "compare" | "mismatch" => Some(Some(V::I32(0))),
         "equals0" => Some(Some(V::I32(1))),
         "stream" => {
-            let items = match args.first().copied().unwrap_or(V::Ref(0)) {
+            let data = match args.first().copied().unwrap_or(V::Ref(0)) {
                 V::Ref(h) => match vm.heap.get(h) {
                     Some(Obj::Array { data, .. }) => data.clone(),
                     _ => vec![],
                 },
                 _ => vec![],
             };
+            let from = args
+                .get(1)
+                .map(|v| i32v(*v).max(0) as usize)
+                .unwrap_or(0)
+                .min(data.len());
+            let to = args
+                .get(2)
+                .map(|v| i32v(*v).max(0) as usize)
+                .unwrap_or(data.len())
+                .min(data.len())
+                .max(from);
+            let items = data[from..to].to_vec();
             Some(Some(host(
                 vm,
                 "Ljava/util/stream/Stream;",
