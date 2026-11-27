@@ -5676,17 +5676,6 @@ pub(crate) fn dispatch_touch(
             };
             continue;
         }
-        if vm.has_dex_virtual(v, "onTouchEvent", &["Landroid/view/MotionEvent;"]) {
-            if dbg {
-                eprintln!("[touchdbg] h{v} dex onTouchEvent {}", vm.dbg_class_of(v));
-            }
-            if matches!(
-                vm.call_virtual(v, "onTouchEvent", &[V::Ref(evt)]),
-                Ok(Some(rv)) if i32v(rv) != 0
-            ) {
-                return Ok(true);
-            }
-        }
         if let Some(V::Ref(l)) = pseudo_get(vm, v, P_TOUCH_L) {
             if l != 0 {
                 if dbg {
@@ -5698,6 +5687,17 @@ pub(crate) fn dispatch_touch(
                 ) {
                     return Ok(true);
                 }
+            }
+        }
+        if vm.has_dex_virtual(v, "onTouchEvent", &["Landroid/view/MotionEvent;"]) {
+            if dbg {
+                eprintln!("[touchdbg] h{v} dex onTouchEvent {}", vm.dbg_class_of(v));
+            }
+            if matches!(
+                vm.call_virtual(v, "onTouchEvent", &[V::Ref(evt)]),
+                Ok(Some(rv)) if i32v(rv) != 0
+            ) {
+                return Ok(true);
             }
         }
         // AOSP `View.onTouchEvent`: a clickable view consumes the touch
