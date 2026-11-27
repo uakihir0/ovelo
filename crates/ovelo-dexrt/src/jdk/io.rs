@@ -3662,6 +3662,37 @@ fn nio_call(vm: &mut Vm, class: &str, name: &str, args: &[V]) -> Option<Option<V
             }
             Some(Some(v))
         }
+        "order" if args.len() == 1 => {
+            // No-arg order() must return the canonical static ByteOrder
+            // object: media3 compares the result with LITTLE_ENDIAN by
+            // reference identity.
+            let little = i32v(pseudo_get(vm, this, P_BBUF_ORD).unwrap_or(V::I32(0))) != 0
+                || (pseudo_get(vm, this, P_BBUF_ORD).is_none()
+                    && pseudo_get(vm, this, P_BBUF_RAW).is_some());
+            let cell = if little {
+                vm.byteorder_h.get()
+            } else {
+                vm.byteorder_big_h.get()
+            };
+            let v = if cell != 0 && vm.heap.get(cell).is_some() {
+                V::Ref(cell)
+            } else {
+                let v = host(
+                    vm,
+                    "Ljava/nio/ByteOrder;",
+                    HostState::Slot(V::I32(little as i32)),
+                );
+                if let V::Ref(h) = v {
+                    if little {
+                        vm.byteorder_h.set(h);
+                    } else {
+                        vm.byteorder_big_h.set(h);
+                    }
+                }
+                v
+            };
+            Some(Some(v))
+        }
         "order" => {
             if crate::dbg_flag("OVELO_ORDDBG") {
                 eprintln!(

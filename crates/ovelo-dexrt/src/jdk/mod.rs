@@ -2212,10 +2212,26 @@ pub(crate) fn sfield(vm: &mut Vm, owner: &str, name: &str, ftype: &str) -> Optio
             return Some(host(vm, "Ljava/io/InputStream;", HostState::Empty))
         }
         ("Ljava/nio/ByteOrder;", "BIG_ENDIAN") => {
-            return Some(host(vm, "Ljava/nio/ByteOrder;", HostState::Slot(V::I32(0))))
+            let h = vm.byteorder_big_h.get();
+            if h != 0 && vm.heap.get(h).is_some() {
+                return Some(V::Ref(h));
+            }
+            let v = host(vm, "Ljava/nio/ByteOrder;", HostState::Slot(V::I32(0)));
+            if let V::Ref(hh) = v {
+                vm.byteorder_big_h.set(hh);
+            }
+            return Some(v);
         }
         ("Ljava/nio/ByteOrder;", "LITTLE_ENDIAN") => {
-            return Some(host(vm, "Ljava/nio/ByteOrder;", HostState::Slot(V::I32(1))))
+            let h = vm.byteorder_h.get();
+            if h != 0 && vm.heap.get(h).is_some() {
+                return Some(V::Ref(h));
+            }
+            let v = host(vm, "Ljava/nio/ByteOrder;", HostState::Slot(V::I32(1)));
+            if let V::Ref(hh) = v {
+                vm.byteorder_h.set(hh);
+            }
+            return Some(v);
         }
         ("Ljava/lang/Void;", "TYPE") => return Some(class_obj(vm, "V".into())),
         ("Ljava/lang/String;", "CASE_INSENSITIVE_ORDER") => {
@@ -2689,6 +2705,9 @@ pub(crate) fn ifield(vm: &Vm, h: u32, owner: &str, name: &str) -> Option<V> {
         }
         ("Landroid/content/pm/ProviderInfo;", "authority") => {
             Some(pseudo_get(vm, h, P_FLAGS).unwrap_or(V::Ref(0)))
+        }
+        ("Landroid/app/Notification;", "extras") => {
+            Some(pseudo_get(vm, h, P_DATA).unwrap_or(V::Ref(0)))
         }
         ("Landroid/os/Message;", "what") => {
             Some(pseudo_get(vm, h, P_MSG_WHAT).unwrap_or(V::I32(0)))
@@ -3848,6 +3867,15 @@ pub(crate) fn host_supers(d: &str) -> &'static [&'static str] {
         | "Landroid/media/ToneGenerator;"
         | "Landroid/media/MediaMetadataRetriever;"
         | "Landroid/media/AudioTrack;"
+        | "Landroid/media/AudioTrack$Builder;"
+        | "Landroid/media/AudioFormat;"
+        | "Landroid/media/AudioFormat$Builder;"
+        | "Landroid/media/AudioAttributes;"
+        | "Landroid/media/AudioAttributes$Builder;"
+        | "Landroid/media/session/PlaybackState;"
+        | "Landroid/media/session/PlaybackState$Builder;"
+        | "Landroid/media/session/PlaybackState$CustomAction;"
+        | "Landroid/media/session/PlaybackState$CustomAction$Builder;"
         | "Landroid/media/AudioRecord;"
         | "Landroid/media/Image;"
         | "Landroid/hardware/Camera;"

@@ -14,6 +14,19 @@ const P_SCR_START_T: u32 = u32::MAX - 306;
 const P_SCR_DURATION: u32 = u32::MAX - 307;
 const P_SCR_STATE: u32 = u32::MAX - 308;
 const P_TASK_CANCELLED: u64 = 0xFFFD_FD00;
+const P_AUDIO_SAMPLE_RATE: u32 = u32::MAX - 320;
+const P_AUDIO_CHANNEL_MASK: u32 = u32::MAX - 321;
+const P_AUDIO_ENCODING: u32 = u32::MAX - 322;
+const P_AUDIO_BUFFER_SIZE: u32 = u32::MAX - 323;
+const P_AUDIO_SESSION: u32 = u32::MAX - 324;
+const P_AUDIO_TRANSFER: u32 = u32::MAX - 325;
+const P_AUDIO_PLAYING: u32 = u32::MAX - 326;
+const P_AUDIO_START_MS: u32 = u32::MAX - 327;
+const P_AUDIO_WRITTEN: u32 = u32::MAX - 328;
+const P_PLAY_STATE: u32 = u32::MAX - 329;
+const P_PLAY_POSITION: u32 = u32::MAX - 330;
+const P_PLAY_SPEED: u32 = u32::MAX - 331;
+const P_PLAY_ACTIONS: u32 = u32::MAX - 332;
 
 fn task_cancelled(vm: &Vm, this: u32) -> bool {
     pseudo_get(vm, this, P_TASK_CANCELLED)
@@ -97,6 +110,28 @@ pub(crate) fn call(
         intent_call(vm, name, sig, args)?
     } else if class == "Landroid/content/ComponentName;" {
         component_call(vm, name, args)?
+    } else if class.starts_with("Landroid/media/Audio")
+        || class.starts_with("Landroid/media/session/PlaybackState")
+    {
+        audio_call(vm, class, name, args)
+    } else if class == "Landroid/media/session/MediaSession;"
+        || class == "Landroid/media/session/MediaController;"
+        || class == "Landroid/media/session/MediaController$TransportControls;"
+    {
+        match name {
+            "setPlaybackState" | "setPlaybackToLocal" | "sendCustomAction" => Some(None),
+            "getTransportControls" => Some(Some(host(
+                vm,
+                "Landroid/media/session/MediaController$TransportControls;",
+                HostState::Empty,
+            ))),
+            _ => None,
+        }
+    } else if class == "Landroid/app/Notification;"
+        || class == "Landroid/app/Notification$Builder;"
+        || class == "Landroid/app/Notification$MediaStyle;"
+    {
+        notification_call(vm, class, name, args)
     } else if class == "Landroid/app/ActivityManager;" {
         // Report a normal modern-device memory budget. Coil derives
         // its memory-cache byte capacity from these values; the
@@ -378,9 +413,17 @@ pub(crate) fn call(
                 // Glide's local-uri fetcher reads the pixels through a
                 // parcelled descriptor — hand it the file's real bytes.
                 let uri = sv(vm, args.get(1).copied().unwrap_or(V::Ref(0))).unwrap_or_default();
-                let bytes = media_uri_path(vm, &uri)
-                    .and_then(|p| std::fs::read(io::fspath(vm, &p)).ok())
+                let path = media_uri_path(vm, &uri);
+                let bytes = path
+                    .as_deref()
+                    .and_then(|p| std::fs::read(io::fspath(vm, p)).ok())
                     .unwrap_or_default();
+                if crate::dbg_flag("OVELO_CONTENTDBG") {
+                    eprintln!(
+                        "[content] {name} uri={uri:?} path={path:?} bytes={}",
+                        bytes.len()
+                    );
+                }
                 if bytes.is_empty() {
                     Some(Some(V::Ref(0)))
                 } else {
@@ -1505,6 +1548,453 @@ fn scroller_call(vm: &mut Vm, name: &str, sig: &str, args: &[V]) -> Option<Optio
             }
             Some(None)
         }
+        _ => None,
+    }
+}
+
+fn pseudo_i64(vm: &Vm, h: u32, key: u32) -> i64 {
+    pseudo_get(vm, h, key).map(i64v).unwrap_or(0)
+}
+
+fn copy_audio_fields(vm: &mut Vm, from: u32, to: u32) {
+    for key in [
+        P_AUDIO_SAMPLE_RATE,
+        P_AUDIO_CHANNEL_MASK,
+        P_AUDIO_ENCODING,
+        P_AUDIO_BUFFER_SIZE,
+        P_AUDIO_SESSION,
+        P_AUDIO_TRANSFER,
+    ] {
+        if let Some(v) = pseudo_get(vm, from, key) {
+            pseudo_set(vm, to, key, v);
+        }
+    }
+}
+
+fn audio_frame_size(vm: &Vm, h: u32) -> i64 {
+    let encoding = pseudo_i64(vm, h, P_AUDIO_ENCODING);
+    let bytes_per_sample = match encoding {
+        2 | 3 => 2, // PCM_16BIT / PCM_8BIT approximation for 3 below
+        4 => 4,     // PCM_FLOAT
+        _ => 2,
+    };
+    if encoding == 3 {
+        // PCM_8BIT really is one byte per sample.
+        let channels = pseudo_i64(vm, h, P_AUDIO_CHANNEL_MASK).count_ones().max(1) as i64;
+        return channels;
+    }
+    let channels = pseudo_i64(vm, h, P_AUDIO_CHANNEL_MASK).count_ones().max(1) as i64;
+    channels * bytes_per_sample
+}
+
+fn mint_audio_track(vm: &mut Vm, builder: u32) -> V {
+    let v = host(vm, "Landroid/media/AudioTrack;", HostState::Empty);
+    if let V::Ref(th) = v {
+        copy_audio_fields(vm, builder, th);
+        if let Some(format) = pseudo_get(vm, builder, P_TARGET) {
+            if let V::Ref(fh) = format {
+                copy_audio_fields(vm, fh, th);
+                pseudo_set(vm, th, P_TARGET, format);
+            }
+        }
+        if pseudo_i64(vm, th, P_AUDIO_BUFFER_SIZE) == 0 {
+            let rate = pseudo_i64(vm, th, P_AUDIO_SAMPLE_RATE).max(8000);
+            let frame = audio_frame_size(vm, th).max(1);
+            pseudo_set(vm, th, P_AUDIO_BUFFER_SIZE, V::I64(rate * frame / 2));
+        }
+    }
+    v
+}
+
+fn playback_state_copy(vm: &mut Vm, from: u32, desc: &str) -> V {
+    let v = host(vm, desc, HostState::Empty);
+    if let V::Ref(to) = v {
+        for key in [
+            P_PLAY_STATE,
+            P_PLAY_POSITION,
+            P_PLAY_SPEED,
+            P_PLAY_ACTIONS,
+            P_DATA,
+        ] {
+            if let Some(x) = pseudo_get(vm, from, key) {
+                pseudo_set(vm, to, key, x);
+            }
+        }
+    }
+    v
+}
+
+fn audio_call(vm: &mut Vm, class: &str, name: &str, args: &[V]) -> Option<Option<V>> {
+    let this = match args.first() {
+        Some(&V::Ref(h)) => h,
+        _ => 0,
+    };
+    match name {
+        "<init>" => {
+            if class == "Landroid/media/AudioTrack;" && args.len() >= 7 {
+                // Legacy streamType/sampleRate/channelConfig/encoding/size/mode ctor.
+                pseudo_set(vm, this, P_AUDIO_SAMPLE_RATE, args[2]);
+                pseudo_set(vm, this, P_AUDIO_CHANNEL_MASK, args[3]);
+                pseudo_set(vm, this, P_AUDIO_ENCODING, args[4]);
+                pseudo_set(vm, this, P_AUDIO_BUFFER_SIZE, args[5]);
+            }
+            Some(None)
+        }
+        "setSampleRate" => {
+            pseudo_set(
+                vm,
+                this,
+                P_AUDIO_SAMPLE_RATE,
+                args.get(1).copied().unwrap_or(V::I32(0)),
+            );
+            Some(Some(args[0]))
+        }
+        "setChannelMask" | "setChannelConfig" => {
+            pseudo_set(
+                vm,
+                this,
+                P_AUDIO_CHANNEL_MASK,
+                args.get(1).copied().unwrap_or(V::I32(0)),
+            );
+            Some(Some(args[0]))
+        }
+        "setEncoding" => {
+            pseudo_set(
+                vm,
+                this,
+                P_AUDIO_ENCODING,
+                args.get(1).copied().unwrap_or(V::I32(0)),
+            );
+            Some(Some(args[0]))
+        }
+        "setAudioFormat" => {
+            pseudo_set(
+                vm,
+                this,
+                P_TARGET,
+                args.get(1).copied().unwrap_or(V::Ref(0)),
+            );
+            if let Some(&V::Ref(fh)) = args.get(1) {
+                copy_audio_fields(vm, fh, this);
+            }
+            Some(Some(args[0]))
+        }
+        "setBufferSizeInBytes" => {
+            pseudo_set(
+                vm,
+                this,
+                P_AUDIO_BUFFER_SIZE,
+                args.get(1).copied().unwrap_or(V::I32(0)),
+            );
+            Some(Some(args[0]))
+        }
+        "setSessionId" => {
+            pseudo_set(
+                vm,
+                this,
+                P_AUDIO_SESSION,
+                args.get(1).copied().unwrap_or(V::I32(0)),
+            );
+            Some(Some(args[0]))
+        }
+        "setTransferMode" => {
+            pseudo_set(
+                vm,
+                this,
+                P_AUDIO_TRANSFER,
+                args.get(1).copied().unwrap_or(V::I32(0)),
+            );
+            Some(Some(args[0]))
+        }
+        "setAudioAttributes" | "setOffloadedPlayback" | "setPerformanceMode" => Some(Some(args[0])),
+        "build" if class == "Landroid/media/AudioFormat$Builder;" => {
+            let v = host(vm, "Landroid/media/AudioFormat;", HostState::Empty);
+            if let V::Ref(fh) = v {
+                copy_audio_fields(vm, this, fh);
+            }
+            Some(Some(v))
+        }
+        "build" if class == "Landroid/media/AudioTrack$Builder;" => {
+            Some(Some(mint_audio_track(vm, this)))
+        }
+        "build" if class == "Landroid/media/session/PlaybackState$Builder;" => Some(Some(
+            playback_state_copy(vm, this, "Landroid/media/session/PlaybackState;"),
+        )),
+        "build" if class == "Landroid/media/session/PlaybackState$CustomAction$Builder;" => {
+            Some(Some(playback_state_copy(
+                vm,
+                this,
+                "Landroid/media/session/PlaybackState$CustomAction;",
+            )))
+        }
+        "setState" if class == "Landroid/media/session/PlaybackState$Builder;" => {
+            pseudo_set(
+                vm,
+                this,
+                P_PLAY_STATE,
+                args.get(1).copied().unwrap_or(V::I32(0)),
+            );
+            pseudo_set(
+                vm,
+                this,
+                P_PLAY_POSITION,
+                args.get(2).copied().unwrap_or(V::I64(0)),
+            );
+            pseudo_set(
+                vm,
+                this,
+                P_PLAY_SPEED,
+                args.get(3).copied().unwrap_or(V::F32(1.0)),
+            );
+            Some(Some(args[0]))
+        }
+        "setActions" => {
+            pseudo_set(
+                vm,
+                this,
+                P_PLAY_ACTIONS,
+                args.get(1).copied().unwrap_or(V::I64(0)),
+            );
+            Some(Some(args[0]))
+        }
+        "setBufferedPosition"
+        | "setActiveQueueItemId"
+        | "setErrorMessage"
+        | "setExtras"
+        | "addCustomAction" => Some(Some(args[0])),
+        "getMinBufferSize" => {
+            // Static overload: (sampleRate, channelMask, encoding).
+            let rate = args.first().map(|v| i64v(*v)).unwrap_or(8000).max(1);
+            let mask = args.get(1).map(|v| i64v(*v)).unwrap_or(4);
+            let channels = mask.count_ones().max(1) as i64;
+            Some(Some(V::I32((rate * channels).max(2048) as i32)))
+        }
+        "getState" if class == "Landroid/media/AudioTrack;" => Some(Some(V::I32(1))),
+        "getPlayState" => Some(Some(V::I32(
+            if pseudo_i64(vm, this, P_AUDIO_PLAYING) != 0 {
+                3
+            } else {
+                2
+            },
+        ))),
+        "play" => {
+            if pseudo_i64(vm, this, P_AUDIO_PLAYING) == 0 {
+                pseudo_set(vm, this, P_AUDIO_PLAYING, V::I32(1));
+                pseudo_set(vm, this, P_AUDIO_START_MS, V::I64(now_ms()));
+            }
+            Some(None)
+        }
+        "pause" | "stop" | "flush" => {
+            if name != "flush" {
+                pseudo_set(vm, this, P_AUDIO_PLAYING, V::I32(0));
+            }
+            Some(None)
+        }
+        "release" => {
+            pseudo_set(vm, this, P_AUDIO_PLAYING, V::I32(0));
+            Some(None)
+        }
+        "write" => {
+            let n = if matches!(args.get(1), Some(V::Ref(h)) if matches!(vm.heap.get(*h), Some(Obj::Array { .. }))) {
+                args.get(3).map(|v| i64v(*v)).unwrap_or(0)
+            } else {
+                args.get(2).map(|v| i64v(*v)).unwrap_or(0)
+            }
+            .max(0);
+            let written = pseudo_i64(vm, this, P_AUDIO_WRITTEN) + n;
+            pseudo_set(vm, this, P_AUDIO_WRITTEN, V::I64(written));
+            if let Some(&V::Ref(bh)) = args.get(1) {
+                if matches!(vm.heap.get(bh), Some(Obj::Host { .. })) {
+                    let pos = i32v(pseudo_get(vm, bh, P_BBUF_POS).unwrap_or(V::I32(0))).max(0);
+                    let lim = pseudo_get(vm, bh, P_BBUF_LIM)
+                        .map(|v| i32v(v).max(0))
+                        .unwrap_or(i32::MAX);
+                    pseudo_set(vm, bh, P_BBUF_POS, V::I32((pos + n as i32).min(lim)));
+                }
+            }
+            Some(Some(V::I32(n as i32)))
+        }
+        "getPlaybackHeadPosition" => {
+            let rate = pseudo_i64(vm, this, P_AUDIO_SAMPLE_RATE).max(1);
+            let frame = audio_frame_size(vm, this).max(1);
+            let written_frames = pseudo_i64(vm, this, P_AUDIO_WRITTEN) / frame;
+            let elapsed_frames = if pseudo_i64(vm, this, P_AUDIO_PLAYING) != 0 {
+                ((now_ms() - pseudo_i64(vm, this, P_AUDIO_START_MS)).max(0) * rate) / 1000
+            } else {
+                written_frames
+            };
+            Some(Some(V::I32(
+                (written_frames.min(elapsed_frames) & 0xffff_ffff) as i32,
+            )))
+        }
+        "getSampleRate" => Some(Some(V::I32(
+            pseudo_i64(vm, this, P_AUDIO_SAMPLE_RATE).max(0) as i32,
+        ))),
+        "getChannelConfiguration" | "getChannelMask" => Some(Some(V::I32(
+            pseudo_i64(vm, this, P_AUDIO_CHANNEL_MASK).max(0) as i32,
+        ))),
+        "getEncoding" => Some(Some(V::I32(
+            pseudo_i64(vm, this, P_AUDIO_ENCODING).max(0) as i32
+        ))),
+        "getBufferSizeInFrames" => {
+            let frame = audio_frame_size(vm, this).max(1);
+            Some(Some(V::I32(
+                (pseudo_i64(vm, this, P_AUDIO_BUFFER_SIZE) / frame).max(0) as i32,
+            )))
+        }
+        "getBufferSizeInBytes" => Some(Some(V::I32(
+            pseudo_i64(vm, this, P_AUDIO_BUFFER_SIZE).max(0) as i32,
+        ))),
+        "getAudioSessionId" => Some(Some(V::I32(
+            pseudo_i64(vm, this, P_AUDIO_SESSION).max(0) as i32
+        ))),
+        "getState" if class == "Landroid/media/session/PlaybackState;" => {
+            Some(Some(V::I32(pseudo_i64(vm, this, P_PLAY_STATE) as i32)))
+        }
+        "getPosition" => Some(Some(V::I64(pseudo_i64(vm, this, P_PLAY_POSITION)))),
+        "getPlaybackSpeed" => Some(Some(V::F32(
+            pseudo_get(vm, this, P_PLAY_SPEED).map(f64v).unwrap_or(1.0) as f32,
+        ))),
+        "getActions" => Some(Some(V::I64(pseudo_i64(vm, this, P_PLAY_ACTIONS)))),
+        "setVolume"
+        | "setStereoVolume"
+        | "setPlaybackParams"
+        | "setPlaybackPositionUpdateListener"
+        | "setPositionNotificationPeriod"
+        | "setNotificationMarkerPosition"
+        | "registerStreamEventCallback"
+        | "unregisterStreamEventCallback"
+        | "addOnCodecConfigChangedListener"
+        | "removeOnCodecConfigChangedListener" => {
+            if name == "setVolume" || name == "setStereoVolume" {
+                Some(Some(V::I32(0)))
+            } else {
+                Some(None)
+            }
+        }
+        "getUnderrunCount" | "getPositionNotificationPeriod" | "getNotificationMarkerPosition" => {
+            Some(Some(V::I32(0)))
+        }
+        "getTimestamp" => Some(Some(V::I32(0))),
+        "getAudioFormat" => Some(Some(pseudo_get(vm, this, P_TARGET).unwrap_or(V::Ref(0)))),
+        _ => None,
+    }
+}
+
+fn mint_notification(vm: &mut Vm) -> V {
+    let notification = host(vm, "Landroid/app/Notification;", HostState::Empty);
+    if let V::Ref(nh) = notification {
+        let extras = vm.alloc_host("Landroid/os/Bundle;", HostState::Map(Vec::new()));
+        pseudo_set(vm, nh, P_DATA, V::Ref(extras));
+    }
+    notification
+}
+
+fn notification_target(vm: &mut Vm, builder: V) -> V {
+    if let V::Ref(bh) = builder {
+        if let Some(v) = pseudo_get(vm, bh, P_TARGET) {
+            if !matches!(v, V::Ref(0) | V::I32(0)) {
+                return v;
+            }
+        }
+        let notification = mint_notification(vm);
+        pseudo_set(vm, bh, P_TARGET, notification);
+        notification
+    } else {
+        V::Ref(0)
+    }
+}
+
+fn notification_call(vm: &mut Vm, class: &str, name: &str, args: &[V]) -> Option<Option<V>> {
+    match name {
+        "<init>" => {
+            if class == "Landroid/app/Notification;" {
+                if let Some(V::Ref(nh)) = args.first() {
+                    let extras = vm.alloc_host("Landroid/os/Bundle;", HostState::Map(Vec::new()));
+                    pseudo_set(vm, *nh, P_DATA, V::Ref(extras));
+                }
+            } else if class == "Landroid/app/Notification$Builder;" {
+                let notification = mint_notification(vm);
+                if let Some(V::Ref(bh)) = args.first() {
+                    pseudo_set(vm, *bh, P_TARGET, notification);
+                }
+            }
+            Some(None)
+        }
+        "build" => {
+            let notification = notification_target(vm, args[0]);
+            Some(Some(notification))
+        }
+        "getExtras" => {
+            let extras = match args.first().copied() {
+                Some(V::Ref(h)) => pseudo_get(vm, h, P_DATA).unwrap_or(V::Ref(0)),
+                _ => V::Ref(0),
+            };
+            Some(Some(extras))
+        }
+        "setExtras" | "addExtras" => {
+            if class == "Landroid/app/Notification$Builder;" {
+                let notification = notification_target(vm, args[0]);
+                if let (V::Ref(nh), Some(&V::Ref(sh))) = (notification, args.get(1)) {
+                    if let Some(V::Ref(extras)) = pseudo_get(vm, nh, P_DATA) {
+                        let pairs = match vm.heap.get(sh) {
+                            Some(Obj::Host {
+                                state: HostState::Map(m),
+                                ..
+                            }) => m.clone(),
+                            _ => vec![],
+                        };
+                        for (k, v) in pairs {
+                            map_put(vm, extras, k, v);
+                        }
+                    }
+                }
+            }
+            Some(Some(args[0]))
+        }
+        "setMediaSession"
+        | "setShowActionsInCompactView"
+        | "setStyle"
+        | "setContentTitle"
+        | "setContentText"
+        | "setSubText"
+        | "setContentInfo"
+        | "setTicker"
+        | "setSmallIcon"
+        | "setLargeIcon"
+        | "setContentIntent"
+        | "setDeleteIntent"
+        | "setFullScreenIntent"
+        | "setWhen"
+        | "setShowWhen"
+        | "setUsesChronometer"
+        | "setOngoing"
+        | "setOnlyAlertOnce"
+        | "setAutoCancel"
+        | "setLocalOnly"
+        | "setCategory"
+        | "setPriority"
+        | "setVisibility"
+        | "setColor"
+        | "setColorized"
+        | "setChannelId"
+        | "setShortcutId"
+        | "setTimeoutAfter"
+        | "setGroup"
+        | "setGroupSummary"
+        | "setGroupAlertBehavior"
+        | "setSound"
+        | "setDefaults"
+        | "setLights"
+        | "setVibrate"
+        | "setAllowSystemGeneratedContextualActions"
+        | "setBubbleMetadata"
+        | "setForegroundServiceBehavior"
+        | "setNumber"
+        | "setBadgeIconType"
+        | "setProgress"
+        | "addAction"
+        | "extend" => Some(Some(args[0])),
         _ => None,
     }
 }

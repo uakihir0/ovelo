@@ -518,6 +518,9 @@ pub struct Vm {
     /// The shared `ByteOrder.nativeOrder()` object — buffer helpers
     /// (Korge's `Lb8`) request it per window write, 100k+/10s.
     pub(crate) byteorder_h: std::cell::Cell<u32>,
+    /// The shared `ByteOrder.BIG_ENDIAN` object — static constants are
+    /// identity-compared by nio/media pipelines.
+    pub(crate) byteorder_big_h: std::cell::Cell<u32>,
     /// `Application.ActivityLifecycleCallbacks` handles registered via
     /// `registerActivityLifecycleCallbacks` — application-global in
     /// AOSP. androidx ReportFragment relies on these to drive
@@ -970,6 +973,7 @@ impl Vm {
             scroll_anim_until_ms: 0,
             choreographer_h: 0,
             byteorder_h: std::cell::Cell::new(0),
+            byteorder_big_h: std::cell::Cell::new(0),
             activity_callbacks: Vec::new(),
             delayed_runnables: Vec::new(),
             pending_surface: Vec::new(),
@@ -2541,6 +2545,7 @@ impl Vm {
         roots.extend(self.frame_callbacks.iter().map(|(h, _)| *h));
         roots.push(self.choreographer_h);
         roots.push(self.byteorder_h.get());
+        roots.push(self.byteorder_big_h.get());
         roots.extend(self.parked_runnables.keys().copied());
         roots.extend(self.thread_runnables.iter().copied());
         roots.extend(self.runnable_thread.values().copied());
