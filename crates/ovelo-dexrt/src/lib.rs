@@ -477,6 +477,10 @@ pub struct Vm {
     /// Any `GLSurfaceView.setRenderer` has been bound. Non-GL apps
     /// must not scan every view every frame looking for renderers.
     pub(crate) gl_renderer_active: bool,
+    /// Wall-clock deadline through which at least one Scroller animation
+    /// may still be active. Lets the frame loop drive computeScroll only
+    /// while animation progress can actually change.
+    pub(crate) scroll_anim_until_ms: i64,
     /// The one `Choreographer.getInstance()` handle — identity matters
     /// (dex code compares instances).
     pub(crate) choreographer_h: u32,
@@ -823,6 +827,13 @@ impl Vm {
         jdk::pseudo_set(self, provider, jdk::view::P_CONTEXT, context);
     }
 
+    /// Whether a Scroller animation may still be progressing. Used by
+    /// the frame loop to avoid walking every view tree each frame once
+    /// all scroll animations have finished.
+    pub fn scroll_animation_active(&self) -> bool {
+        crate::jdk::now_mono_ms() <= self.scroll_anim_until_ms
+    }
+
     /// Static field value stored on class `class_idx` (`None` when the
     /// class is unloaded or the field unset). Used by `Enum.values()`.
     pub(crate) fn static_of(&self, class_idx: GIdx, field_idx: GIdx) -> Option<V> {
@@ -918,6 +929,7 @@ impl Vm {
             frame_callbacks: Vec::new(),
             sched_prefer_worker: false,
             gl_renderer_active: false,
+            scroll_anim_until_ms: 0,
             choreographer_h: 0,
             byteorder_h: std::cell::Cell::new(0),
             activity_callbacks: Vec::new(),

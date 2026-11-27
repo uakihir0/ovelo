@@ -1683,6 +1683,10 @@ fn abs_origin(vm: &Vm, views: &HashMap<u32, Rc<RefCell<GuestView>>>, mut cur: u3
 /// buffer and clips the right/bottom columns offscreen.
 pub fn drive_dex_layout_pass(vm: &mut Vm, activity: u32, frame: u32, win_w: i32, win_h: i32) {
     let do_layout = frame.is_multiple_of(30);
+    let do_scroll = vm.scroll_animation_active();
+    if !do_layout && !do_scroll {
+        return;
+    }
     let Some(root) = vm.activity_content(activity) else {
         return;
     };
@@ -1690,6 +1694,11 @@ pub fn drive_dex_layout_pass(vm: &mut Vm, activity: u32, frame: u32, win_w: i32,
     // DrawerLayout throw unless both specs are EXACTLY, so
     // UNSPECIFIED/0 would leave them unmeasured forever.
     const MS_EXACTLY: i32 = 1 << 30;
+    #[derive(Clone, Copy)]
+    struct Drive {
+        layout: bool,
+        scroll: bool,
+    }
     fn walk(
         vm: &mut Vm,
         h: u32,
@@ -1697,7 +1706,7 @@ pub fn drive_dex_layout_pass(vm: &mut Vm, activity: u32, frame: u32, win_w: i32,
         win_w: i32,
         win_h: i32,
         drove: &mut bool,
-        do_layout: bool,
+        drive: Drive,
     ) {
         if depth > 64 {
             return;
@@ -1750,7 +1759,7 @@ pub fn drive_dex_layout_pass(vm: &mut Vm, activity: u32, frame: u32, win_w: i32,
         // capture (blank screen). Once a stable tree reports no layout
         // request, leave its dex-computed frames alone instead of
         // re-running the whole solver twice a second.
-        if do_layout && !parent_is_dex && needs_layout {
+        if drive.layout && !parent_is_dex && needs_layout {
             *drove = true;
             // The root tracks the window: after a resize its stored
             // frame is stale, so re-measure at the new extent — the
@@ -1880,15 +1889,28 @@ pub fn drive_dex_layout_pass(vm: &mut Vm, activity: u32, frame: u32, win_w: i32,
         // without executing View.draw, so drive the override at layout
         // boundaries instead; otherwise ViewPager smooth-scrolls start a
         // Scroller whose curr position never advances.
-        ovelo_dexrt::drive_compute_scroll(vm, h);
+        if drive.scroll {
+            ovelo_dexrt::drive_compute_scroll(vm, h);
+        }
         // Re-snapshot: the layout pass may have attached children.
         let kids = vm.dex_view(h).map(|i| i.children).unwrap_or_default();
         for ch in kids {
-            walk(vm, ch, depth + 1, win_w, win_h, drove, do_layout);
+            walk(vm, ch, depth + 1, win_w, win_h, drove, drive);
         }
     }
     let mut drove = false;
-    walk(vm, root, 0, win_w, win_h, &mut drove, do_layout);
+    walk(
+        vm,
+        root,
+        0,
+        win_w,
+        win_h,
+        &mut drove,
+        Drive {
+            layout: do_layout,
+            scroll: do_scroll,
+        },
+    );
     // Android fires OnGlobalLayoutListener after an actual layout pass.
     // Firing it for a skipped clean-tree walk just re-enters guest code
     // every frame; adapter fills still get the real pass that lays them out.

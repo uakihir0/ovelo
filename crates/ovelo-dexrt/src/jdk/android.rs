@@ -1293,6 +1293,9 @@ fn scroller_call(vm: &mut Vm, name: &str, sig: &str, args: &[V]) -> Option<Optio
             pseudo_set(vm, h, P_SCR_START_T, V::I64(crate::jdk::now_mono_ms()));
             spi(vm, h, P_SCR_DURATION, duration);
             spi(vm, h, P_SCR_STATE, 0);
+            vm.scroll_anim_until_ms = vm
+                .scroll_anim_until_ms
+                .max(crate::jdk::now_mono_ms() + duration as i64 + 100);
             Some(None)
         }
         "fling" => {
@@ -1320,6 +1323,9 @@ fn scroller_call(vm: &mut Vm, name: &str, sig: &str, args: &[V]) -> Option<Optio
             pseudo_set(vm, h, P_SCR_START_T, V::I64(crate::jdk::now_mono_ms()));
             spi(vm, h, P_SCR_DURATION, duration);
             spi(vm, h, P_SCR_STATE, 0);
+            vm.scroll_anim_until_ms = vm
+                .scroll_anim_until_ms
+                .max(crate::jdk::now_mono_ms() + duration as i64 + 100);
             Some(None)
         }
         "computeScrollOffset" => {
