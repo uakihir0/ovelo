@@ -4614,9 +4614,18 @@ fn min_dim(vm: &mut Vm, this: u32, key: u32, attr: &str) -> i32 {
         .unwrap_or(0)
 }
 
-fn ctor_style_value(vm: &mut Vm, def_attr: u32, def_res: u32, attr_id: u32) -> Option<V> {
+fn ctor_style_value(
+    vm: &mut Vm,
+    xml_style: u32,
+    def_attr: u32,
+    def_res: u32,
+    attr_id: u32,
+) -> Option<V> {
     let res = vm.apk_res.as_ref()?;
     let mut styles = Vec::new();
+    if xml_style != 0 {
+        styles.push(xml_style);
+    }
     if def_attr != 0 {
         // Theme attrs often indirect through another attr (`textInputStyle`
         // = `?attr/textInputOutlinedStyle`) before landing on the style
@@ -4667,9 +4676,12 @@ fn apply_ctor_style(vm: &mut Vm, this: u32, args: &[V]) {
     if args.len() < 4 {
         return;
     }
+    let xml_style = attr_find(vm, this, "style")
+        .map(|v| i32v(v) as u32)
+        .unwrap_or(0);
     let def_attr = i32v(args.get(3).copied().unwrap_or(V::I32(0))) as u32;
     let def_res = i32v(args.get(4).copied().unwrap_or(V::I32(0))) as u32;
-    if def_attr == 0 && def_res == 0 {
+    if xml_style == 0 && def_attr == 0 && def_res == 0 {
         return;
     }
     for (attr_id, key, name) in [
@@ -4677,20 +4689,20 @@ fn apply_ctor_style(vm: &mut Vm, this: u32, args: &[V]) {
         (0x0101_0140, P_MINH, "minHeight"),
     ] {
         if pseudo_get(vm, this, key).is_none() && attr_find(vm, this, name).is_none() {
-            if let Some(px) =
-                ctor_style_value(vm, def_attr, def_res, attr_id).and_then(|v| lp_px(vm, v))
+            if let Some(px) = ctor_style_value(vm, xml_style, def_attr, def_res, attr_id)
+                .and_then(|v| lp_px(vm, v))
             {
                 pseudo_set(vm, this, key, V::I32(px));
             }
         }
     }
-    let base = ctor_style_value(vm, def_attr, def_res, 0x0101_00d5)
+    let base = ctor_style_value(vm, xml_style, def_attr, def_res, 0x0101_00d5)
         .and_then(|v| lp_px(vm, v))
         .unwrap_or(0);
-    let horizontal = ctor_style_value(vm, def_attr, def_res, 0x0101_053d)
+    let horizontal = ctor_style_value(vm, xml_style, def_attr, def_res, 0x0101_053d)
         .and_then(|v| lp_px(vm, v))
         .unwrap_or(base);
-    let vertical = ctor_style_value(vm, def_attr, def_res, 0x0101_053e)
+    let vertical = ctor_style_value(vm, xml_style, def_attr, def_res, 0x0101_053e)
         .and_then(|v| lp_px(vm, v))
         .unwrap_or(base);
     for (attr_id, key, name, fallback) in [
@@ -4716,7 +4728,7 @@ fn apply_ctor_style(vm: &mut Vm, this: u32, args: &[V]) {
             || attr_find(vm, this, axis).is_some()
             || relative.is_some_and(|rel| attr_find(vm, this, rel).is_some());
         if pseudo_get(vm, this, key).is_none() && !xml_has_padding {
-            let px = ctor_style_value(vm, def_attr, def_res, attr_id)
+            let px = ctor_style_value(vm, xml_style, def_attr, def_res, attr_id)
                 .and_then(|v| lp_px(vm, v))
                 .unwrap_or(fallback);
             if px != 0 {
@@ -4725,8 +4737,8 @@ fn apply_ctor_style(vm: &mut Vm, this: u32, args: &[V]) {
         }
     }
     if pseudo_get(vm, this, P_TSIZE).is_none() && attr_find(vm, this, "textSize").is_none() {
-        if let Some(px) =
-            ctor_style_value(vm, def_attr, def_res, 0x0101_0095).and_then(|v| lp_px(vm, v))
+        if let Some(px) = ctor_style_value(vm, xml_style, def_attr, def_res, 0x0101_0095)
+            .and_then(|v| lp_px(vm, v))
         {
             pseudo_set(vm, this, P_TSIZE, V::F32(px as f32));
         }
