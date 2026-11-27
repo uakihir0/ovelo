@@ -4267,6 +4267,17 @@ fn linear_vertical(vm: &Vm, this: u32) -> bool {
     if let Some(V::I32(o)) = pseudo_get(vm, this, P_ORIENTATION) {
         return o != 0;
     }
+    // AndroidX LinearLayoutCompat implements orientation dex-side, so
+    // the host setter never sees constructor-driven VERTICAL. Read the
+    // field across its possible declaring owners.
+    for owner in [
+        "Landroidx/appcompat/widget/LinearLayoutCompat;",
+        "Landroid/widget/LinearLayout;",
+    ] {
+        if let Some(V::I32(o)) = vm.get_object_field(this, owner, "mOrientation") {
+            return o != 0;
+        }
+    }
     let dflt = vm
         .heap
         .class_of(this)
