@@ -86,6 +86,12 @@ const P_POPUP_OWNER: u32 = u32::MAX - 32;
 const P_POPUP_POS: u32 = u32::MAX - 33;
 /// Overflow popup whose rows were compressed to fit the available height.
 const P_POPUP_COMPACT: u32 = u32::MAX - 53;
+/// Synthetic dialog button state: target dialog, button which, and marker.
+const P_DIALOG_BUTTON_DIALOG: u32 = u32::MAX - 54;
+const P_DIALOG_BUTTON_WHICH: u32 = u32::MAX - 55;
+const P_DIALOG_HAS_BUTTONS: u32 = u32::MAX - 56;
+const P_DIALOG_POS_LISTENER: u32 = u32::MAX - 57;
+const P_DIALOG_NEG_LISTENER: u32 = u32::MAX - 58;
 /// Dialog cancelable flag (`setCancelable(false)` stores 0).
 const P_DIALOG_CANCELABLE: u32 = u32::MAX - 34;
 /// Synthetic AlertDialog panel wrapping custom content.
@@ -2417,6 +2423,24 @@ pub(crate) fn call(
             })
         }
         "performClick" | "callOnClick" => {
+            if let (Some(V::Ref(dialog)), Some(which_v)) = (
+                pseudo_get(vm, this, P_DIALOG_BUTTON_DIALOG),
+                pseudo_get(vm, this, P_DIALOG_BUTTON_WHICH),
+            ) {
+                let which = i32v(which_v);
+                let listener = if which == -1 {
+                    pseudo_get(vm, dialog, P_DIALOG_POS_LISTENER)
+                } else {
+                    pseudo_get(vm, dialog, P_DIALOG_NEG_LISTENER)
+                };
+                if let Some(V::Ref(l)) = listener {
+                    if l != 0 {
+                        let _ = vm.call_virtual(l, "onClick", &[V::Ref(dialog), V::I32(which)]);
+                    }
+                }
+                dialog_dismiss(vm, dialog);
+                return Ok(Some(Some(V::I32(1))));
+            }
             let desc = class_of(vm, V::Ref(this));
             if is_compound_desc(vm, &desc) {
                 let checked = pint(vm, this, P_CHECKED) == 0;
@@ -2701,6 +2725,9 @@ pub(crate) fn call(
             }
             if pseudo_get(vm, this, P_POPUP_COMPACT) == Some(V::I32(1)) {
                 layout_popup_rows_compact(vm, this, r - l, b - t);
+            }
+            if pseudo_get(vm, this, P_DIALOG_HAS_BUTTONS) == Some(V::I32(1)) {
+                layout_dialog_buttons(vm, this, r - l, b - t);
             }
             Some(None)
         }
@@ -8212,6 +8239,111 @@ fn ov_popup_dismiss(vm: &mut Vm, a: &[V]) -> ovelo_error::Result<Option<V>> {
     Ok(None)
 }
 
+#[allow(clippy::too_many_arguments)]
+fn dialog_scan_buttons(
+    vm: &Vm,
+    h: u32,
+    depth: usize,
+    seen: &mut std::collections::HashSet<u32>,
+    pos_listener: &mut u32,
+    neg_listener: &mut u32,
+    pos_label: &mut Option<String>,
+    neg_label: &mut Option<String>,
+) {
+    if h == 0 || depth > 5 || !seen.insert(h) {
+        return;
+    }
+    let desc = class_of(vm, V::Ref(h));
+    if depth > 0
+        && (pseudo_get(vm, h, P_IS_VIEW).is_some()
+            || desc == WINDOW
+            || vm.assignable_desc(&desc, "Landroid/content/Context;"))
+    {
+        return;
+    }
+    if desc == "Landroid/os/Message;" {
+        let what = pseudo_get(vm, h, P_MSG_WHAT).map(i32v).unwrap_or(0);
+        if let Some(V::Ref(listener)) = pseudo_get(vm, h, P_MSG_OBJ) {
+            if listener != 0 {
+                if what == -1 && *pos_listener == 0 {
+                    *pos_listener = listener;
+                } else if what == -2 && *neg_listener == 0 {
+                    *neg_listener = listener;
+                }
+            }
+        }
+    }
+    let vals: Vec<V> = match vm.heap.get(h) {
+        Some(Obj::Instance { fields, .. }) | Some(Obj::Host { fields, .. }) => {
+            fields.values().copied().collect()
+        }
+        _ => Vec::new(),
+    };
+    for v in vals {
+        match v {
+            V::Ref(ch) if ch != 0 => {
+                if let Some(Obj::Str(text)) = vm.heap.get(ch) {
+                    if text.eq_ignore_ascii_case("ok") {
+                        pos_label.get_or_insert(text.clone());
+                    } else if text.eq_ignore_ascii_case("cancel") {
+                        neg_label.get_or_insert(text.clone());
+                    }
+                }
+                dialog_scan_buttons(
+                    vm,
+                    ch,
+                    depth + 1,
+                    seen,
+                    pos_listener,
+                    neg_listener,
+                    pos_label,
+                    neg_label,
+                );
+            }
+            _ => {}
+        }
+    }
+}
+
+fn dialog_button(vm: &mut Vm, dialog: u32, which: i32, label: &str) -> u32 {
+    let b = vm.alloc_host("Landroid/widget/Button;", HostState::Empty);
+    pseudo_set(vm, b, P_IS_VIEW, V::I32(1));
+    let text = jstr(vm, label);
+    pseudo_set(vm, b, P_TEXT, text);
+    pseudo_set(vm, b, P_TCOLOR, V::I32(0xff8ab4f8u32 as i32));
+    pseudo_set(vm, b, P_TSIZE, V::F32(15.0));
+    pseudo_set(vm, b, P_DIALOG_BUTTON_DIALOG, V::Ref(dialog));
+    pseudo_set(vm, b, P_DIALOG_BUTTON_WHICH, V::I32(which));
+    b
+}
+
+fn layout_dialog_buttons(vm: &mut Vm, root: u32, width: i32, height: i32) {
+    let buttons: Vec<u32> = children(vm, root)
+        .into_iter()
+        .filter_map(|v| match v {
+            V::Ref(h) if h != 0 && pseudo_get(vm, h, P_DIALOG_BUTTON_WHICH).is_some() => Some(h),
+            _ => None,
+        })
+        .collect();
+    if buttons.is_empty() {
+        return;
+    }
+    let bw = 104;
+    let bh = 42;
+    let bottom = height - 8;
+    let mut right = width - 12;
+    for b in buttons.iter().rev().copied() {
+        let l = (right - bw).max(0);
+        let t = (bottom - bh).max(0);
+        let _ = vm.call_virtual(
+            b,
+            "layout",
+            &[V::I32(l), V::I32(t), V::I32(l + bw), V::I32(t + bh)],
+        );
+        right = l - 8;
+    }
+}
+
 fn dialog_view_scan(
     vm: &Vm,
     h: u32,
@@ -8318,6 +8450,43 @@ pub(crate) fn dialog_show(vm: &mut Vm, dialog: u32) {
             attach_at(vm, root, V::Ref(content), None, false, None);
         }
     }
+    let mut pos_listener = 0;
+    let mut neg_listener = 0;
+    let mut pos_label = None;
+    let mut neg_label = None;
+    dialog_scan_buttons(
+        vm,
+        dialog,
+        0,
+        &mut std::collections::HashSet::new(),
+        &mut pos_listener,
+        &mut neg_listener,
+        &mut pos_label,
+        &mut neg_label,
+    );
+    pseudo_set(vm, dialog, P_DIALOG_POS_LISTENER, V::Ref(pos_listener));
+    pseudo_set(vm, dialog, P_DIALOG_NEG_LISTENER, V::Ref(neg_listener));
+    for child in children(vm, root) {
+        if let V::Ref(ch) = child {
+            if pseudo_get(vm, ch, P_DIALOG_BUTTON_WHICH).is_some() {
+                detach(vm, root, child, true);
+            }
+        }
+    }
+    let mut any_buttons = false;
+    if pos_label.is_some() || pos_listener != 0 {
+        let label = pos_label.as_deref().unwrap_or("OK");
+        let button = dialog_button(vm, dialog, -1, label);
+        attach_at(vm, root, V::Ref(button), None, false, None);
+        any_buttons = true;
+    }
+    if neg_label.is_some() || neg_listener != 0 {
+        let label = neg_label.as_deref().unwrap_or("Cancel");
+        let button = dialog_button(vm, dialog, -2, label);
+        attach_at(vm, root, V::Ref(button), None, false, None);
+        any_buttons = true;
+    }
+    pseudo_set(vm, root, P_DIALOG_HAS_BUTTONS, V::I32(any_buttons as i32));
     let parent = activity_content(vm, vm.cur_activity).unwrap_or(0);
     if parent == 0 {
         return;
