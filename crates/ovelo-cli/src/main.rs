@@ -1665,13 +1665,7 @@ fn run_app(store: &InstallStore, package: &str) -> Result<(), OveloError> {
                 let _ = std::fs::create_dir_all(&music);
                 for (i, freq) in [440.0f32, 550.0, 660.0].iter().enumerate() {
                     let p = music.join(format!("seed-tone-{}.wav", i + 1));
-                    // Refresh the original 0.4s probe tones: they round
-                    // down to 00:00 in players even when duration metadata
-                    // and playback are correct.
-                    let short_probe = std::fs::metadata(&p)
-                        .map(|m| m.len() < 10_000)
-                        .unwrap_or(false);
-                    if !p.exists() || short_probe {
+                    if !p.exists() {
                         let _ = std::fs::write(p, wav_tone(*freq));
                     }
                 }
