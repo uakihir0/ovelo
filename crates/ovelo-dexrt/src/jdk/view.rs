@@ -4871,10 +4871,8 @@ fn relative_positions(vm: &mut Vm, this: u32, w: i32, h: i32) -> Vec<RelKid> {
             let sib_edge = |id: i32, trailing: bool, names: &[&str]| -> Option<Option<i32>> {
                 // Some(edge) = rule present; the inner Option is the
                 // sibling's resolved edge (None while unplaced).
-                Some(
-                    idx_visible(vm, id, names)
-                        .and_then(|j| placed[j].map(|(a, b)| if trailing { b } else { a })),
-                )
+                idx_visible(vm, id, names)
+                    .map(|j| placed[j].map(|(a, b)| if trailing { b } else { a }))
             };
 
             let mut lead: Option<i32> = None;
