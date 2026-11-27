@@ -462,15 +462,19 @@ fn complete_host_future(vm: &mut Vm, future: u32, value: V) {
 fn dispatch_task(vm: &mut Vm, r: u32) -> std::result::Result<Option<V>, ovelo_error::OveloError> {
     if let Some(V::Ref(target)) = pseudo_get(vm, r, P_FUTURE_TARGET) {
         let callable = matches!(pseudo_get(vm, r, P_FUTURE_CALLABLE), Some(V::I32(1)));
-        let out = if callable {
-            vm.call_virtual(target, "call", &[])?
+        let result = if callable {
+            vm.call_virtual(target, "call", &[])
         } else {
-            vm.call_virtual(target, "run", &[])?;
-            None
+            vm.call_virtual(target, "run", &[]).map(|_| None)
         };
         if let Some(V::Ref(future)) = pseudo_get(vm, r, P_FUTURE) {
-            complete_host_future(vm, future, out.unwrap_or(V::Ref(0)));
+            let value = match &result {
+                Ok(v) => v.unwrap_or(V::Ref(0)),
+                Err(_) => V::Ref(0),
+            };
+            complete_host_future(vm, future, value);
         }
+        result?;
         return Ok(None);
     }
     if let Some(ci) = vm.heap.class_of(r) {
