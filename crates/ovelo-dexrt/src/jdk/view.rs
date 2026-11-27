@@ -5273,7 +5273,15 @@ fn group_measure_fallback(vm: &mut Vm, this: u32, pw: i32, ph: i32) {
         // requested minimum is part of that desired extent — otherwise
         // wrap_content ignores android:minWidth/minHeight entirely.
         let desired_w = (cw + pad_w).max(min_dim(vm, this, P_MINW, "minWidth"));
-        let desired_h = (chh + pad_h).max(min_dim(vm, this, P_MINH, "minHeight"));
+        let mut desired_h = (chh + pad_h).max(min_dim(vm, this, P_MINH, "minHeight"));
+        // Text input widgets inherit a touch-target minimum from their
+        // platform background/style. That minimum lives in framework
+        // constructor state this runtime does not fully materialize, so
+        // an empty Material EditText otherwise measures as one bare
+        // glyph line and TextInputLayout collapses around it.
+        if leaf_desc.contains("EditText") || vm.extends_named(&leaf_desc, "EditText") {
+            desired_h = desired_h.max(96);
+        }
         pseudo_set(
             vm,
             this,
