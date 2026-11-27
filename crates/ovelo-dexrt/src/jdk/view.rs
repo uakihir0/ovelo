@@ -7454,6 +7454,9 @@ pub(crate) fn attach_at(
         {
             let id = view_id(vm, ch);
             radio_group_set_checked(vm, parent, id);
+            if view_parent(vm, ch) != parent {
+                return;
+            }
         }
         if crate::dbg_flag("OVELO_VIEWDBG") {
             eprintln!(
@@ -7847,11 +7850,11 @@ fn set_compound_checked(vm: &mut Vm, this: u32, checked: i32) {
         cls == "Landroid/widget/RadioGroup;"
             || vm.assignable_desc(&cls, "Landroid/widget/RadioGroup;")
     };
-    if parent_is_group {
+    if parent_is_group && is_radio_desc(vm, &class_of(vm, V::Ref(this))) {
         let id = view_id(vm, this);
         if checked != 0 {
             radio_group_set_checked(vm, parent, id);
-        } else if radio_group_checked_id(vm, parent) == id {
+        } else if id != -1 && radio_group_checked_id(vm, parent) == id {
             radio_group_set_checked(vm, parent, -1);
         }
     }
