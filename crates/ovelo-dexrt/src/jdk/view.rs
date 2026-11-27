@@ -3083,10 +3083,16 @@ fn inflate_call(vm: &mut Vm, args: &[V]) -> V {
     }
     // inflate(int, ViewGroup, bool) — the parser-taking overloads aren't
     // modeled yet and degrade to a bare view.
-    // Static View.inflate's first parameter is already the Context.
-    // Looking through P_CONTEXT only works for view receivers and hands
-    // constructors a null context.
-    let ctx = args.first().copied().unwrap_or(V::Ref(0));
+    // Static View.inflate's first parameter is already the Context;
+    // LayoutInflater instance calls pass the inflater and store the
+    // Context on it.
+    let first = args.first().copied().unwrap_or(V::Ref(0));
+    let ctx = match first {
+        V::Ref(h) if class_of(vm, first).contains("LayoutInflater") => {
+            pseudo_get(vm, h, P_CONTEXT).unwrap_or(first)
+        }
+        _ => first,
+    };
     let inflated = match args.get(1).copied() {
         Some(V::I32(id)) if id != 0 => inflate_res(vm, id as u32, ctx),
         _ => empty_view(vm),
