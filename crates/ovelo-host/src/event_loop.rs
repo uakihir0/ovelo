@@ -129,6 +129,9 @@ impl ApplicationHandler for HostWindow {
             }
             WindowEvent::CursorMoved { position, .. } => {
                 self.cursor = (position.x, position.y);
+                if self.pointer_down {
+                    self.input_q.push_back(self.motion(MotionAction::Move));
+                }
             }
             WindowEvent::KeyboardInput { event, .. } => {
                 self.key_q.push_back(crate::map_key_input(&event));
