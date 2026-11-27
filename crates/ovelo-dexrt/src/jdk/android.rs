@@ -15,6 +15,34 @@ const P_SCR_DURATION: u32 = u32::MAX - 307;
 const P_SCR_STATE: u32 = u32::MAX - 308;
 const P_TASK_CANCELLED: u64 = 0xFFFD_FD00;
 
+fn task_cancelled(vm: &Vm, this: u32) -> bool {
+    pseudo_get(vm, this, P_TASK_CANCELLED)
+        .map(i32v)
+        .unwrap_or(0)
+        != 0
+}
+
+fn has_virtual(vm: &mut Vm, this: u32, name: &str, args: &[V]) -> bool {
+    let Some(ci) = vm.heap.class_of(this) else {
+        return false;
+    };
+    vm.resolve_call_args(ci, name, args)
+        .map(|(m, _)| m.is_some())
+        .unwrap_or(false)
+}
+
+fn call_task_cancelled(vm: &mut Vm, this: u32, result: V) -> Rt<()> {
+    // AsyncTask's result-taking default delegates to the no-arg
+    // overload. The framework base is host-side here, so reproduce
+    // that fallback explicitly for subclasses overriding either form.
+    if has_virtual(vm, this, "onCancelled", &[result]) {
+        let _ = vm.call_virtual_rt(this, "onCancelled", &[result])?;
+    } else {
+        let _ = vm.call_virtual_rt(this, "onCancelled", &[])?;
+    }
+    Ok(())
+}
+
 pub(crate) fn call(
     vm: &mut Vm,
     class: &str,
@@ -757,13 +785,13 @@ pub(crate) fn call(
                 }
                 .unwrap_or(V::Ref(0));
                 let _ = vm.call_virtual_rt(this, "onPreExecute", &[])?;
-                if let Some(result) = vm.call_virtual_rt(this, "doInBackground", &[params])? {
-                    let cancelled = pseudo_get(vm, this, P_TASK_CANCELLED)
-                        .map(i32v)
-                        .unwrap_or(0)
-                        != 0;
-                    if cancelled {
-                        let _ = vm.call_virtual_rt(this, "onCancelled", &[result])?;
+                if task_cancelled(vm, this) {
+                    call_task_cancelled(vm, this, V::Ref(0))?;
+                } else if let Some(result) =
+                    vm.call_virtual_rt(this, "doInBackground", &[params])?
+                {
+                    if task_cancelled(vm, this) {
+                        call_task_cancelled(vm, this, result)?;
                     } else {
                         let _ = vm.call_virtual_rt(this, "onPostExecute", &[result])?;
                     }
@@ -778,12 +806,10 @@ pub(crate) fn call(
             }
             "isCancelled" => {
                 let cancelled = match args.first().copied() {
-                    Some(V::Ref(this)) => pseudo_get(vm, this, P_TASK_CANCELLED)
-                        .map(i32v)
-                        .unwrap_or(0),
-                    _ => 0,
+                    Some(V::Ref(this)) => task_cancelled(vm, this),
+                    _ => false,
                 };
-                Some(Some(V::I32((cancelled != 0) as i32)))
+                Some(Some(V::I32(cancelled as i32)))
             }
             "getStatus" => Some(Some(V::Ref(0))),
             "get" => Some(Some(V::Ref(0))),
