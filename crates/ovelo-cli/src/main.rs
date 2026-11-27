@@ -1002,7 +1002,7 @@ fn register_compat_shims(
         }
     }
     let own_pkg = manifest.package.clone();
-    for (info_desc, meth, names, launcher_scope) in [
+    for (info_desc, meth, names, launcher_scope, intent_filters) in [
         (
             "Landroid/content/pm/ServiceInfo;",
             "queryIntentServices",
@@ -1012,12 +1012,14 @@ fn register_compat_shims(
                 .map(|s| (s.clone(), manifest.package.clone()))
                 .collect::<Vec<_>>(),
             false,
+            vec![],
         ),
         (
             "Landroid/content/pm/ActivityInfo;",
             "queryIntentActivities",
             launcher_pairs.clone(),
             true,
+            vec![],
         ),
         (
             "Landroid/content/pm/ActivityInfo;",
@@ -1028,6 +1030,7 @@ fn register_compat_shims(
                 .map(|s| (s.clone(), manifest.package.clone()))
                 .collect::<Vec<_>>(),
             false,
+            manifest.receiver_intent_filters.clone(),
         ),
         (
             "Landroid/content/pm/ProviderInfo;",
@@ -1038,6 +1041,7 @@ fn register_compat_shims(
                 .map(|s| (s.clone(), manifest.package.clone()))
                 .collect::<Vec<_>>(),
             false,
+            vec![],
         ),
     ] {
         let _ = v.register_host(
@@ -1048,6 +1052,14 @@ fn register_compat_shims(
                 let own_pkg = own_pkg.clone();
                 Rc::new(RefCell::new(move |vm: &mut ovelo_dexrt::Vm, a: &[V]| {
                     let want = intent_class(vm, a.get(1).copied());
+                    let action = match a.get(1).copied() {
+                        Some(V::Ref(ih)) => ovelo_dexrt::pseudo_get(vm, ih, ovelo_dexrt::P_ACTION)
+                            .and_then(|v| match v {
+                                V::Ref(s) => vm.heap.str_val(s).map(str::to_string),
+                                _ => None,
+                            }),
+                        _ => None,
+                    };
                     // Other apps' launcher activities only answer a
                     // MAIN query — an implicit VIEW/EDIT intent must not
                     // see unrelated apps (their filters don't match).
@@ -1071,6 +1083,15 @@ fn register_compat_shims(
                         .filter(|(n, p)| {
                             want.as_deref().is_none_or(|c| n.ends_with(c) || *n == c)
                                 && (*p == own_pkg || want.is_some() || main_query)
+                                && (intent_filters.is_empty()
+                                    || want.is_some()
+                                    || action.is_none()
+                                    || intent_filters.iter().any(|f| {
+                                        f.activity == *n
+                                            && action.as_ref().is_some_and(|act| {
+                                                f.actions.iter().any(|a| a == act)
+                                            })
+                                    }))
                         })
                         .map(|(n, p)| mint_ri(vm, info_desc, n, p))
                         .collect();

@@ -491,6 +491,10 @@ pub struct ManifestInfo {
     /// resolution uses these for implicit intra-app launches such as a
     /// file manager's ACTION_VIEW text editor.
     pub activity_intent_filters: Vec<IntentFilterEntry>,
+    /// Receiver intent filters in manifest order — PackageManager's
+    /// queryBroadcastReceivers must match actions, not merely enumerate
+    /// every declared receiver.
+    pub receiver_intent_filters: Vec<IntentFilterEntry>,
 }
 
 /// One activity `<intent-filter>` declaration.
@@ -529,6 +533,7 @@ pub fn parse_manifest(b: &[u8]) -> Result<ManifestInfo> {
     let mut info = ManifestInfo::default();
     // Track per-intent-filter state.
     let mut cur_activity_for_filter: Option<String> = None;
+    let mut cur_receiver_for_filter: Option<String> = None;
     let mut filter_main = false;
     let mut filter_launcher = false;
     let mut in_filter = false;
@@ -538,6 +543,8 @@ pub fn parse_manifest(b: &[u8]) -> Result<ManifestInfo> {
     let mut filter_mime_types: Vec<String> = Vec::new();
     let mut filter_schemes: Vec<String> = Vec::new();
     let mut component_is_activity = false;
+    let mut component_is_receiver = false;
+    let mut filter_owner_is_receiver = false;
     // Name of the provider element currently open, if any — meta-data
     // children of androidx.startup.InitializationProvider declare the
     // app's Initializer classes.
@@ -559,13 +566,18 @@ pub fn parse_manifest(b: &[u8]) -> Result<ManifestInfo> {
                     }
                 }
                 if let Some(act) = filter_owner.take() {
-                    info.activity_intent_filters.push(IntentFilterEntry {
+                    let entry = IntentFilterEntry {
                         activity: act,
                         actions: std::mem::take(&mut filter_actions),
                         categories: std::mem::take(&mut filter_categories),
                         mime_types: std::mem::take(&mut filter_mime_types),
                         schemes: std::mem::take(&mut filter_schemes),
-                    });
+                    };
+                    if filter_owner_is_receiver {
+                        info.receiver_intent_filters.push(entry);
+                    } else {
+                        info.activity_intent_filters.push(entry);
+                    }
                 } else {
                     filter_actions.clear();
                     filter_categories.clear();
@@ -581,6 +593,7 @@ pub fn parse_manifest(b: &[u8]) -> Result<ManifestInfo> {
                 "activity" | "activity-alias" | "service" | "receiver"
             ) {
                 component_is_activity = false;
+                component_is_receiver = false;
             }
             if popped == "provider" {
                 cur_provider = None;
@@ -687,6 +700,7 @@ pub fn parse_manifest(b: &[u8]) -> Result<ManifestInfo> {
                         q.clone()
                     });
                     component_is_activity = true;
+                    component_is_receiver = false;
                     if let Some(Value::Reference(t)) = el.android("theme") {
                         info.activity_themes.insert(q, *t);
                     }
@@ -694,17 +708,22 @@ pub fn parse_manifest(b: &[u8]) -> Result<ManifestInfo> {
             }
             "service" => {
                 component_is_activity = false;
+                component_is_receiver = false;
                 if let Some(n) = el.android_str("name") {
                     info.services.push(qualify(&info.package, n));
                 }
             }
             "receiver" => {
                 component_is_activity = false;
+                component_is_receiver = true;
                 if let Some(n) = el.android_str("name") {
-                    info.receivers.push(qualify(&info.package, n));
+                    let q = qualify(&info.package, n);
+                    cur_receiver_for_filter = Some(q.clone());
+                    info.receivers.push(q);
                 }
             }
             "provider" => {
+                component_is_receiver = false;
                 if let Some(n) = el.android_str("name") {
                     let q = qualify(&info.package, n);
                     info.providers.push(q.clone());
@@ -733,9 +752,14 @@ pub fn parse_manifest(b: &[u8]) -> Result<ManifestInfo> {
                 in_filter = true;
                 filter_main = false;
                 filter_launcher = false;
-                filter_owner = component_is_activity
-                    .then(|| cur_activity_for_filter.clone())
-                    .flatten();
+                filter_owner_is_receiver = component_is_receiver;
+                filter_owner = if component_is_receiver {
+                    cur_receiver_for_filter.clone()
+                } else {
+                    component_is_activity
+                        .then(|| cur_activity_for_filter.clone())
+                        .flatten()
+                };
                 filter_actions.clear();
                 filter_categories.clear();
                 filter_mime_types.clear();
@@ -776,13 +800,18 @@ pub fn parse_manifest(b: &[u8]) -> Result<ManifestInfo> {
                 }
             }
             if let Some(act) = filter_owner.take() {
-                info.activity_intent_filters.push(IntentFilterEntry {
+                let entry = IntentFilterEntry {
                     activity: act,
                     actions: std::mem::take(&mut filter_actions),
                     categories: std::mem::take(&mut filter_categories),
                     mime_types: std::mem::take(&mut filter_mime_types),
                     schemes: std::mem::take(&mut filter_schemes),
-                });
+                };
+                if filter_owner_is_receiver {
+                    info.receiver_intent_filters.push(entry);
+                } else {
+                    info.activity_intent_filters.push(entry);
+                }
             }
             in_filter = false;
         }
