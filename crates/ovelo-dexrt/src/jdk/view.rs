@@ -4586,8 +4586,21 @@ fn view_is_gone(vm: &mut Vm, h: u32) -> bool {
 /// fill) — Framework containers must report their content extent
 /// there or every ancestor's measured height collapses to padding.
 fn group_measure_fallback(vm: &mut Vm, this: u32, pw: i32, ph: i32) {
-    let pad_w = lp_px(vm, attr_find(vm, this, "paddingLeft").unwrap_or(V::I32(0))).unwrap_or(0)
-        + lp_px(vm, attr_find(vm, this, "paddingRight").unwrap_or(V::I32(0))).unwrap_or(0);
+    // Start/end padding resolves to physical left/right in LTR layouts;
+    // XML that only uses paddingStart/End otherwise measures a padded
+    // TextView as if it had no horizontal padding at all.
+    let pad_left = lp_px(vm, attr_find(vm, this, "paddingLeft").unwrap_or(V::I32(0))).unwrap_or(0);
+    let pad_right =
+        lp_px(vm, attr_find(vm, this, "paddingRight").unwrap_or(V::I32(0))).unwrap_or(0);
+    let pad_w = (if pad_left != 0 {
+        pad_left
+    } else {
+        lp_px(vm, attr_find(vm, this, "paddingStart").unwrap_or(V::I32(0))).unwrap_or(0)
+    }) + (if pad_right != 0 {
+        pad_right
+    } else {
+        lp_px(vm, attr_find(vm, this, "paddingEnd").unwrap_or(V::I32(0))).unwrap_or(0)
+    });
     let pad_h = lp_px(vm, attr_find(vm, this, "paddingTop").unwrap_or(V::I32(0))).unwrap_or(0)
         + lp_px(
             vm,
@@ -4629,10 +4642,18 @@ fn group_measure_fallback(vm: &mut Vm, this: u32, pw: i32, ph: i32) {
             text
         };
         let ts = match pseudo_get(vm, this, P_TSIZE) {
-            Some(V::F32(f)) => f,
-            Some(V::I32(b)) => f32::from_bits(b as u32),
-            _ => 14.0,
+            Some(V::F32(f)) => Some(f),
+            Some(V::I32(b)) => Some(f32::from_bits(b as u32)),
+            _ => None,
         }
+        .or_else(|| {
+            attr_find(vm, this, "textSize").and_then(|v| match v {
+                V::F32(f) => Some(f),
+                V::I32(id) if id > 0 => vm.apk_res.as_ref().and_then(|r| r.dimen(id as u32)),
+                _ => None,
+            })
+        })
+        .unwrap_or(14.0)
         .abs()
         .max(1.0);
         // An ImageView's content is its drawable: AOSP ImageView.
@@ -4653,10 +4674,14 @@ fn group_measure_fallback(vm: &mut Vm, this: u32, pw: i32, ph: i32) {
             // check uses a fatter factor than the extent itself or a
             // frame measured "one line" renders two.
             let line_h = (ts * 1.3) as i32;
-            let raw_w = (text.chars().count() as f32 * ts * 0.6) as i32;
+            // The renderer's proportional glyphs run substantially wider
+            // than the old 0.6em estimate for wide Latin letters (`m`, `w`,
+            // capitals). Measure against the wider estimate consistently:
+            // using a narrower width for the frame than for the wrap count
+            // clipped ordinary labels even when no width constraint existed.
+            let real_w = (text.chars().count() as f32 * ts * 0.85).ceil() as i32;
             let avail = (pw & 0x3FFF_FFFF) - pad_w;
-            let frame_w = if avail > 0 { raw_w.min(avail) } else { raw_w };
-            let real_w = (text.chars().count() as f32 * ts * 0.85) as i32;
+            let frame_w = if avail > 0 { real_w.min(avail) } else { real_w };
             let lines = if frame_w > 0 {
                 ((real_w + frame_w - 1) / frame_w).max(1)
             } else {
@@ -5078,9 +5103,63 @@ fn group_measure_fallback(vm: &mut Vm, this: u32, pw: i32, ph: i32) {
 /// Generic `onLayout` for framework skeleton containers: FrameLayout
 /// semantics (children at the parent's content origin plus their
 /// margins, at measured size); LinearLayout stacks vertically.
+fn gravity_of(vm: &Vm, view: u32) -> i32 {
+    attr_find(vm, view, "layout_gravity")
+        .map(i32v)
+        .unwrap_or(-1)
+}
+
+fn horizontal_gravity(gravity: i32) -> i32 {
+    if gravity & 0x800003 == 0x800003 {
+        3
+    } else if gravity & 0x800005 == 0x800005 {
+        5
+    } else {
+        gravity & 0x7
+    }
+}
+
+fn gravity_x(
+    gravity: i32,
+    pad_l: i32,
+    pad_r: i32,
+    width: i32,
+    child: i32,
+    ml: i32,
+    mr: i32,
+) -> i32 {
+    match horizontal_gravity(gravity) {
+        1 => pad_l + ml + ((width - pad_l - pad_r - ml - mr - child) / 2).max(0),
+        5 => width - pad_r - mr - child,
+        _ => pad_l + ml,
+    }
+}
+
+fn gravity_y(
+    gravity: i32,
+    pad_t: i32,
+    pad_b: i32,
+    height: i32,
+    child: i32,
+    mt: i32,
+    mb: i32,
+) -> i32 {
+    match gravity & 0x70 {
+        0x10 => pad_t + mt + ((height - pad_t - pad_b - mt - mb - child) / 2).max(0),
+        0x50 => height - pad_b - mb - child,
+        _ => pad_t + mt,
+    }
+}
+
 fn group_layout_fallback(vm: &mut Vm, this: u32, _l: i32, _t: i32, r: i32, b: i32) {
     let pad_l = lp_px(vm, attr_find(vm, this, "paddingLeft").unwrap_or(V::I32(0))).unwrap_or(0);
     let pad_t = lp_px(vm, attr_find(vm, this, "paddingTop").unwrap_or(V::I32(0))).unwrap_or(0);
+    let pad_r = lp_px(vm, attr_find(vm, this, "paddingRight").unwrap_or(V::I32(0))).unwrap_or(0);
+    let pad_b = lp_px(
+        vm,
+        attr_find(vm, this, "paddingBottom").unwrap_or(V::I32(0)),
+    )
+    .unwrap_or(0);
     let desc = class_of(vm, V::Ref(this));
     let linear = desc.contains("LinearLayout") || vm.extends_named(&desc, "LinearLayout");
     let linear_h = linear && !linear_vertical(vm, this);
@@ -5123,12 +5202,24 @@ fn group_layout_fallback(vm: &mut Vm, this: u32, _l: i32, _t: i32, r: i32, b: i3
         };
         let cw = pint(vm, ch, P_MEAS_W) & 0x00FF_FFFF;
         let chh = pint(vm, ch, P_MEAS_H) & 0x00FF_FFFF;
+        let gravity = gravity_of(vm, ch);
+        let width = r - _l;
+        let height = b - _t;
         let (cl, ct) = if linear_h {
-            (cur_l + ml, pad_t + mt)
+            (
+                cur_l + ml,
+                gravity_y(gravity, pad_t, pad_b, height, chh, mt, mb),
+            )
         } else if linear {
-            (pad_l + ml, cur_t + mt)
+            (
+                gravity_x(gravity, pad_l, pad_r, width, cw, ml, mr),
+                cur_t + mt,
+            )
         } else {
-            (pad_l + ml, pad_t + mt)
+            (
+                gravity_x(gravity, pad_l, pad_r, width, cw, ml, mr),
+                gravity_y(gravity, pad_t, pad_b, height, chh, mt, mb),
+            )
         };
         if crate::dbg_flag("OVELO_VIEWDBG") {
             eprintln!("[viewdbg] groupLayout h{ch} meas={cw}x{chh} at {cl},{ct}");
