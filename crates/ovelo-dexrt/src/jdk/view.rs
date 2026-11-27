@@ -6973,7 +6973,40 @@ pub(crate) fn dispatch_touch(
         0
     };
     if target == 0 {
-        for r in vm.view_roots.clone().iter().rev() {
+        // Popup/dialog panels are independent overlay roots. Adapter rows and
+        // activity content can be appended to view_roots after them, so raw
+        // insertion order is not z-order: scan overlays first, then the rest
+        // in reverse insertion order.
+        let mut roots: Vec<u32> = vm.view_roots.clone().into_iter().rev().collect();
+        roots.sort_by_key(|r| {
+            usize::from(!matches!(pseudo_get(vm, *r, P_POPUP_ROOT), Some(V::Ref(o)) if o != 0))
+        });
+        for r in roots.iter() {
+            // Detached adapter rows can remain registered as roots even after
+            // they are adopted into the activity tree. Do not treat such a row
+            // as a top overlay when one of its ancestors is itself a root; the
+            // ancestor traversal already reaches it in correct z-order.
+            let mut ancestor = match pseudo_get(vm, *r, P_PARENT) {
+                Some(V::Ref(p)) if p != 0 => p,
+                _ => 0,
+            };
+            let mut nested = false;
+            for _ in 0..64 {
+                if ancestor == 0 {
+                    break;
+                }
+                if ancestor != *r && vm.view_roots.contains(&ancestor) {
+                    nested = true;
+                    break;
+                }
+                ancestor = match pseudo_get(vm, ancestor, P_PARENT) {
+                    Some(V::Ref(p)) if p != ancestor => p,
+                    _ => 0,
+                };
+            }
+            if nested {
+                continue;
+            }
             if dbg {
                 eprintln!(
                     "[touchdbg] root h{r} {} {},{},{},{}",
@@ -8718,22 +8751,43 @@ fn menu_item_action_view(vm: &mut Vm, ih: u32, view: V) {
 
 /// `Activity.setContentView(int|View)`: inflate (if an id) and attach the
 /// content under the window's decor, remembering it for findViewById.
-pub(crate) fn set_content_view(vm: &mut Vm, activity: u32, content: V) {
-    let cv = match content {
+fn content_view_value(vm: &mut Vm, activity: u32, content: V) -> V {
+    match content {
         V::I32(id) if id != 0 => inflate_res(vm, id as u32, V::Ref(activity)),
         v @ V::Ref(_) => v,
         _ => V::Ref(0),
-    };
+    }
+}
+
+/// Add an additional content view without replacing the primary content.
+/// Android activities can layer scrims, floating menus and other overlays
+/// above the view installed by setContentView.
+pub(crate) fn add_content_view(vm: &mut Vm, activity: u32, content: V) {
+    let cv = content_view_value(vm, activity, content);
     if matches!(cv, V::Ref(0)) {
         return;
     }
-    pseudo_set(vm, activity, P_CONTENT, cv);
+    if let Some(w) = window_of(vm, activity) {
+        if let Some(cf) = content_frame_of(vm, w) {
+            attach(vm, cf, cv);
+            return;
+        }
+    }
     if let V::Ref(h) = cv {
         if h != 0 {
             vm.view_roots.retain(|r| *r != h);
             vm.view_roots.push(h);
         }
     }
+}
+
+pub(crate) fn set_content_view(vm: &mut Vm, activity: u32, content: V) {
+    let cv = content_view_value(vm, activity, content);
+    if matches!(cv, V::Ref(0)) {
+        return;
+    }
+    pseudo_set(vm, activity, P_CONTENT, cv);
+    let mut attached = false;
     if let Some(w) = window_of(vm, activity) {
         if let Some(cf) = content_frame_of(vm, w) {
             // A second setContentView replaces the content view — the
@@ -8745,6 +8799,15 @@ pub(crate) fn set_content_view(vm: &mut Vm, activity: u32, content: V) {
                 }
             }
             attach(vm, cf, cv);
+            attached = true;
+        }
+    }
+    if let V::Ref(h) = cv {
+        if h != 0 {
+            vm.view_roots.retain(|r| *r != h);
+            if !attached {
+                vm.view_roots.push(h);
+            }
         }
     }
 }

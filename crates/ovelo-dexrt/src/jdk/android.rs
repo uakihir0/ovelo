@@ -3547,12 +3547,20 @@ fn context_call(
                 .unwrap_or(0);
             Some(Some(V::Ref(hit)))
         }
-        "setContentView" | "addContentView" => {
+        "setContentView" => {
             let act = match args.first() {
                 Some(V::Ref(h)) => *h,
                 _ => 0,
             };
             view::set_content_view(vm, act, args.get(1).copied().unwrap_or(V::Ref(0)));
+            Some(None)
+        }
+        "addContentView" => {
+            let act = match args.first() {
+                Some(V::Ref(h)) => *h,
+                _ => 0,
+            };
+            view::add_content_view(vm, act, args.get(1).copied().unwrap_or(V::Ref(0)));
             Some(None)
         }
         "setContentView_Int" => Some(None),
