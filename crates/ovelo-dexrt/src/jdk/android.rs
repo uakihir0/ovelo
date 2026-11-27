@@ -1972,6 +1972,35 @@ fn clone_intent(vm: &mut Vm, h: u32) -> V {
     V::Ref(nh)
 }
 
+fn intent_field_eq(vm: &Vm, a: V, b: V) -> bool {
+    if a == b {
+        return true;
+    }
+    match (a, b) {
+        (V::Ref(x), V::Ref(y)) if x != 0 && y != 0 => {
+            match (sv(vm, V::Ref(x)), sv(vm, V::Ref(y))) {
+                (Some(xs), Some(ys)) => xs == ys,
+                _ => false,
+            }
+        }
+        _ => false,
+    }
+}
+
+/// The intent identity Android uses for bind/rebind matching: action,
+/// data, type, package and component — not flags or extras.
+fn intents_match(vm: &Vm, a: u32, b: u32) -> bool {
+    [P_ACTION, P_DATA, P_TYPE, P_PACKAGE, P_COMPONENT]
+        .iter()
+        .all(|&k| {
+            intent_field_eq(
+                vm,
+                pseudo_get(vm, a, k).unwrap_or(V::Ref(0)),
+                pseudo_get(vm, b, k).unwrap_or(V::Ref(0)),
+            )
+        })
+}
+
 fn mime_matches(pattern: &str, actual: &str) -> bool {
     if pattern == "*" || actual == "*/*" || pattern == "*/*" {
         return true;
@@ -3533,7 +3562,14 @@ fn context_call(
                         h
                     }
                 };
-                let binder = if let Some(rebind_intent) = vm.service_rebind.remove(&sh) {
+                let rebind_intent = match vm.service_rebind.get(&sh).copied() {
+                    Some(ri @ V::Ref(rh)) if intents_match(vm, rh, ih) => {
+                        vm.service_rebind.remove(&sh);
+                        Some(ri)
+                    }
+                    _ => None,
+                };
+                let binder = if let Some(rebind_intent) = rebind_intent {
                     let _ = vm.call_virtual(sh, "onRebind", &[rebind_intent]);
                     vm.service_binders.get(&sh).copied().unwrap_or(V::Ref(0))
                 } else {
