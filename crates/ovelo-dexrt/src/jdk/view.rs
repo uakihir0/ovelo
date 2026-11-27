@@ -2138,6 +2138,14 @@ pub(crate) fn call(
                     return Ok(Some(Some(V::I32(1))));
                 }
             }
+            if vm.has_dex_virtual(this, "onTouchEvent", &["Landroid/view/MotionEvent;"]) {
+                return Ok(Some(Some(V::I32(
+                    match vm.call_virtual(this, "onTouchEvent", &[args[1]]) {
+                        Ok(Some(rv)) if i32v(rv) != 0 => 1,
+                        _ => 0,
+                    },
+                ))));
+            }
             match pseudo_get(vm, this, P_LISTENER) {
                 Some(V::Ref(l)) if l != 0 => {
                     let down_target = vm.touch_gesture_target;
