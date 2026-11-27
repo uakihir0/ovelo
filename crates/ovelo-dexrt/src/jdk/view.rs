@@ -2116,11 +2116,10 @@ pub(crate) fn call(
                 _ => Some(V::I32(1)),
             })
         }
-        "dispatchTouchEvent" => {
-            // A clickable plain View consumes the gesture and performs
-            // the click on ACTION_UP. The previous blanket `true` made
-            // BottomNavigationItemView swallow taps without dispatching
-            // its listener.
+        "onTouchEvent" => {
+            // Base View.onTouchEvent: a clickable view consumes the
+            // gesture and performs the click on ACTION_UP. Dex overrides
+            // that delegate to super rely on this path.
             let action = match args.get(1) {
                 Some(V::Ref(ev)) => match pseudo_get(vm, *ev, P_ME_ACTION) {
                     Some(v) => i32v(v),
@@ -2128,24 +2127,6 @@ pub(crate) fn call(
                 },
                 _ => -1,
             };
-            if let Some(V::Ref(l)) = pseudo_get(vm, this, P_TOUCH_L) {
-                if l != 0
-                    && matches!(
-                        vm.call_virtual(l, "onTouch", &[V::Ref(this), args[1]]),
-                        Ok(Some(rv)) if i32v(rv) != 0
-                    )
-                {
-                    return Ok(Some(Some(V::I32(1))));
-                }
-            }
-            if vm.has_dex_virtual(this, "onTouchEvent", &["Landroid/view/MotionEvent;"]) {
-                return Ok(Some(Some(V::I32(
-                    match vm.call_virtual(this, "onTouchEvent", &[args[1]]) {
-                        Ok(Some(rv)) if i32v(rv) != 0 => 1,
-                        _ => 0,
-                    },
-                ))));
-            }
             match pseudo_get(vm, this, P_LISTENER) {
                 Some(V::Ref(l)) if l != 0 => {
                     let down_target = vm.touch_gesture_target;
@@ -2162,6 +2143,24 @@ pub(crate) fn call(
                 }
                 _ => Some(Some(V::I32(0))),
             }
+        }
+        "dispatchTouchEvent" => {
+            if let Some(V::Ref(l)) = pseudo_get(vm, this, P_TOUCH_L) {
+                if l != 0
+                    && matches!(
+                        vm.call_virtual(l, "onTouch", &[V::Ref(this), args[1]]),
+                        Ok(Some(rv)) if i32v(rv) != 0
+                    )
+                {
+                    return Ok(Some(Some(V::I32(1))));
+                }
+            }
+            Some(Some(V::I32(
+                match vm.call_virtual(this, "onTouchEvent", &[args[1]]) {
+                    Ok(Some(rv)) if i32v(rv) != 0 => 1,
+                    _ => 0,
+                },
+            )))
         }
         "setOnClickListener"
         | "setOnLongClickListener"
