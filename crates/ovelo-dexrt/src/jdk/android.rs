@@ -899,7 +899,40 @@ pub(crate) fn call(
                     Some(None)
                 }
             }
-            "getInterfaceDescriptor" | "getInterfaceDescriptor0" => Some(Some(jstr(vm, ""))),
+            "attachInterface" => {
+                if let Some(V::Ref(bh)) = args.first().copied() {
+                    if let Some(interface) = args.get(1).copied() {
+                        pseudo_set(vm, bh, P_BINDER_INTERFACE, interface);
+                    }
+                    if let Some(descriptor) = args.get(2).copied() {
+                        pseudo_set(vm, bh, P_BINDER_DESCRIPTOR, descriptor);
+                    }
+                }
+                Some(None)
+            }
+            "queryLocalInterface" => {
+                let this = match args.first().copied() {
+                    Some(V::Ref(h)) => h,
+                    _ => 0,
+                };
+                let wanted = args.get(1).copied().and_then(|v| sv(vm, v));
+                let stored = pseudo_get(vm, this, P_BINDER_DESCRIPTOR).and_then(|v| sv(vm, v));
+                let out = if wanted.is_some() && wanted == stored {
+                    pseudo_get(vm, this, P_BINDER_INTERFACE).unwrap_or(V::Ref(0))
+                } else {
+                    V::Ref(0)
+                };
+                Some(Some(out))
+            }
+            "getInterfaceDescriptor" | "getInterfaceDescriptor0" => {
+                let this = match args.first().copied() {
+                    Some(V::Ref(h)) => h,
+                    _ => 0,
+                };
+                Some(Some(
+                    pseudo_get(vm, this, P_BINDER_DESCRIPTOR).unwrap_or(V::Ref(0)),
+                ))
+            }
             _ => None,
         }
     } else if class == "Landroid/content/ClipData;" || class == "Landroid/content/ClipboardManager;"
@@ -3421,6 +3454,85 @@ fn context_call(
             }
             Some(Some(V::I32(1)))
         }
+        "bindService" | "bindServiceAsUser" | "bindIsolatedService" => {
+            // Bind the live service through its real onBind path and
+            // deliver ServiceConnection.onServiceConnected. Media3's
+            // MediaController never becomes connected without this
+            // round trip, so playback actions queue forever.
+            let bound = (|| -> Option<()> {
+                let V::Ref(ih) = args.get(1).copied()? else {
+                    return None;
+                };
+                let V::Ref(ch) = pseudo_get(vm, ih, P_COMPONENT)? else {
+                    return None;
+                };
+                let desc = vm
+                    .class_descriptor_of(ch)
+                    .or_else(|| sv(vm, V::Ref(ch)))
+                    .or_else(|| pseudo_get(vm, ch, P_DATA).and_then(|v| sv(vm, v)))?;
+                let desc = if desc.starts_with('L') {
+                    desc
+                } else {
+                    format!("L{};", desc.replace('.', "/"))
+                };
+                let sh = match vm.services.get(&desc) {
+                    Some(&h) => h,
+                    None => {
+                        let h = vm.instantiate(&desc).ok()?;
+                        let _ = vm.call_virtual(h, "onCreate", &[]);
+                        if vm.service_stop_pending.remove(&h) {
+                            return None;
+                        }
+                        vm.services.insert(desc.clone(), h);
+                        h
+                    }
+                };
+                let bind_result = vm.call_virtual(sh, "onBind", &[V::Ref(ih)]);
+                if crate::dbg_flag("OVELO_BINDDBG") {
+                    eprintln!("[binddbg] service={desc} h{sh} onBind={bind_result:?}");
+                }
+                let binder = bind_result.ok().flatten().unwrap_or(V::Ref(0));
+                let conn = args.iter().skip(2).find_map(|v| match v {
+                    V::Ref(h)
+                        if *h != 0
+                            && vm.has_dex_virtual(
+                                *h,
+                                "onServiceConnected",
+                                &["Landroid/content/ComponentName;", "Landroid/os/IBinder;"],
+                            ) =>
+                    {
+                        Some(*h)
+                    }
+                    _ => None,
+                })?;
+                let component = if vm
+                    .class_descriptor_of(ch)
+                    .is_some_and(|d| d == "Landroid/content/ComponentName;")
+                {
+                    V::Ref(ch)
+                } else {
+                    let cn = host(vm, "Landroid/content/ComponentName;", HostState::Empty);
+                    if let V::Ref(cnh) = cn {
+                        let pkg = vm.guest_package.clone().unwrap_or_default();
+                        let cls = desc
+                            .trim_start_matches('L')
+                            .trim_end_matches(';')
+                            .replace('/', ".");
+                        let pv = jstr(vm, &pkg);
+                        let cv = jstr(vm, &cls);
+                        pseudo_set(vm, cnh, P_COMPONENT, pv);
+                        pseudo_set(vm, cnh, P_DATA, cv);
+                    }
+                    cn
+                };
+                let connected = vm.call_virtual(conn, "onServiceConnected", &[component, binder]);
+                if crate::dbg_flag("OVELO_BINDDBG") {
+                    eprintln!("[binddbg] conn=h{conn} binder={binder:?} connected={connected:?}");
+                }
+                Some(())
+            })();
+            Some(Some(V::I32(if bound.is_some() { 1 } else { 0 })))
+        }
         "stopService" => {
             let desc = args
                 .get(1)
@@ -3452,8 +3564,7 @@ fn context_call(
             }
             Some(Some(V::I32(1)))
         }
-        "bindService"
-        | "unbindService"
+        "unbindService"
         | "sendBroadcast"
         | "sendOrderedBroadcast"
         | "sendStickyBroadcast"
@@ -3490,8 +3601,6 @@ fn context_call(
         | "createWindowContext"
         | "moveResources"
         | "reloadResources"
-        | "bindServiceAsUser"
-        | "bindIsolatedService"
         | "updateServiceGroup" => {
             if name.starts_with("check") {
                 // checkSelfPermission/checkPermission/…: PERMISSION_
@@ -3503,10 +3612,7 @@ fn context_call(
                     .map(|p| vm.granted_permissions.contains(&p))
                     .unwrap_or(true);
                 Some(Some(V::I32(if g { 0 } else { -1 })))
-            } else if matches!(
-                name,
-                "bindService" | "bindServiceAsUser" | "bindIsolatedService" | "stopService"
-            ) {
+            } else if matches!(name, "stopService") {
                 Some(Some(V::I32(1)))
             } else if matches!(
                 name,

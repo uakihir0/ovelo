@@ -42,6 +42,8 @@ pub(crate) const P_FLAGS: u32 = u32::MAX - 3;
 pub(crate) const P_TYPE: u32 = u32::MAX - 75;
 /// The `P_PACKAGE` pseudo key (Intent package restriction).
 pub(crate) const P_PACKAGE: u32 = u32::MAX - 76;
+pub(crate) const P_BINDER_INTERFACE: u32 = u32::MAX - 77;
+pub(crate) const P_BINDER_DESCRIPTOR: u32 = u32::MAX - 78;
 /// The `P_COMPONENT` pseudo key (Intent component, `*Info` package).
 pub const P_COMPONENT: u32 = u32::MAX - 4;
 /// Resolved `GIdx` of the `<init>` a `Constructor` mirror stands for.
