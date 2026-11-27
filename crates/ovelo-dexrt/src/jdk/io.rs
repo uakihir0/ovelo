@@ -246,6 +246,7 @@ pub(crate) fn call(
         || desc_is_a(class, "Ljava/text/DateFormat;")
         || class == "Ljava/text/NumberFormat;"
         || class == "Ljava/text/DecimalFormat;"
+        || class == "Ljava/text/DecimalFormatSymbols;"
     {
         format_call(vm, name, args)
     } else if class == "Lorg/json/JSONObject;" {
@@ -2411,6 +2412,8 @@ fn format_call(vm: &mut Vm, name: &str, args: &[V]) -> Option<Option<V>> {
             HostState::Empty,
         ))),
         "getAvailableLocales" => Some(Some(arr(vm, "Ljava/util/Locale;", vec![]))),
+        "getDecimalSeparator" => Some(Some(V::I32('.' as i32))),
+        "getGroupingSeparator" => Some(Some(V::I32(',' as i32))),
         "get2DigitYearStart" | "set2DigitYearStart" => Some(Some(V::Ref(0))),
         "parseObject" => Some(Some(V::Ref(0))),
         _ => None,
