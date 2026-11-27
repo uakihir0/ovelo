@@ -7039,49 +7039,45 @@ pub(crate) fn dispatch_touch(
         roots.sort_by_key(|r| {
             usize::from(!matches!(pseudo_get(vm, *r, P_POPUP_ROOT), Some(V::Ref(o)) if o != 0))
         });
+        let mut scanned: Vec<u32> = Vec::new();
         for r in roots.iter() {
-            // Detached adapter rows can remain registered as roots even after
-            // they are adopted into the activity tree. Do not treat such a row
-            // as a top overlay when one of its ancestors is itself a root; the
-            // ancestor traversal already reaches it in correct z-order.
-            let mut ancestor = match pseudo_get(vm, *r, P_PARENT) {
-                Some(V::Ref(p)) if p != 0 => p,
-                _ => 0,
-            };
-            let mut nested = false;
-            for _ in 0..64 {
-                if ancestor == 0 {
-                    break;
+            // Inflated views can remain registered as roots after being
+            // adopted into a larger tree (ViewBinding inflate with
+            // attachToParent). Scan their topmost ancestor instead so
+            // sibling chrome — navigation arrows, toolbars, headers —
+            // participates in hit testing instead of being covered by
+            // the stale child root. Popup roots are deliberately
+            // independent overlays and keep their own subtree.
+            let mut scan_root = *r;
+            if pseudo_get(vm, *r, P_POPUP_ROOT).is_none() {
+                for _ in 0..64 {
+                    match pseudo_get(vm, scan_root, P_PARENT) {
+                        Some(V::Ref(p)) if p != 0 && p != scan_root => scan_root = p,
+                        _ => break,
+                    }
                 }
-                if ancestor != *r && vm.view_roots.contains(&ancestor) {
-                    nested = true;
-                    break;
-                }
-                ancestor = match pseudo_get(vm, ancestor, P_PARENT) {
-                    Some(V::Ref(p)) if p != ancestor => p,
-                    _ => 0,
-                };
             }
-            if nested {
+            if scanned.contains(&scan_root) {
                 continue;
             }
+            scanned.push(scan_root);
             if dbg {
                 eprintln!(
-                    "[touchdbg] root h{r} {} {},{},{},{}",
-                    vm.dbg_class_of(*r),
-                    pint(vm, *r, P_LEFT),
-                    pint(vm, *r, P_TOP),
-                    pint(vm, *r, P_RIGHT),
-                    pint(vm, *r, P_BOTTOM)
+                    "[touchdbg] root h{scan_root} {} {},{},{},{}",
+                    vm.dbg_class_of(scan_root),
+                    pint(vm, scan_root, P_LEFT),
+                    pint(vm, scan_root, P_TOP),
+                    pint(vm, scan_root, P_RIGHT),
+                    pint(vm, scan_root, P_BOTTOM)
                 );
             }
             // A laid-out root only wins when the point is inside it —
             // view_roots also collects detached adapter rows/dialog
             // trees, and the last one would otherwise swallow every tap.
-            let l = pint(vm, *r, P_LEFT);
-            let t = pint(vm, *r, P_TOP);
-            let rr = pint(vm, *r, P_RIGHT);
-            let b = pint(vm, *r, P_BOTTOM);
+            let l = pint(vm, scan_root, P_LEFT);
+            let t = pint(vm, scan_root, P_TOP);
+            let rr = pint(vm, scan_root, P_RIGHT);
+            let b = pint(vm, scan_root, P_BOTTOM);
             let inside = if rr > l || b > t {
                 x >= l && x < rr && y >= t && y < b
             } else {
@@ -7092,7 +7088,7 @@ pub(crate) fn dispatch_touch(
                 continue;
             }
             // A root's frame is already absolute (screen origin).
-            if let Some(v) = deepest(vm, *r, x, y, 0, 0) {
+            if let Some(v) = deepest(vm, scan_root, x, y, 0, 0) {
                 target = v;
                 break;
             }
@@ -7663,6 +7659,20 @@ pub(crate) fn dispatch_key(
             .unwrap_or(false))
 }
 
+fn remove_adopted_roots(vm: &mut Vm, h: u32, depth: u32) {
+    if h == 0 || depth > 128 {
+        return;
+    }
+    if pseudo_get(vm, h, P_POPUP_ROOT).is_none() {
+        vm.view_roots.retain(|r| *r != h);
+    }
+    for c in children(vm, h) {
+        if let V::Ref(ch) = c {
+            remove_adopted_roots(vm, ch, depth + 1);
+        }
+    }
+}
+
 pub(crate) fn attach(vm: &mut Vm, parent: u32, child: V) {
     attach_at(vm, parent, child, None, true, None)
 }
@@ -7763,7 +7773,7 @@ pub(crate) fn attach_at(
             hit
         };
         if pseudo_get(vm, ch, P_POPUP_ROOT).is_none() && parent_reaches_root {
-            vm.view_roots.retain(|r| *r != ch);
+            remove_adopted_roots(vm, ch, 0);
         }
         let parent_cls = class_of(vm, V::Ref(parent));
         let child_cls = class_of(vm, V::Ref(ch));
