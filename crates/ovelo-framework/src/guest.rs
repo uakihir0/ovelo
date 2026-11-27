@@ -554,7 +554,7 @@ impl GuestUi {
                     }
                 }
                 let activity = vm.current_activity();
-                let ctx = (activity != 0).then(|| V::Ref(activity));
+                let ctx = (activity != 0).then_some(V::Ref(activity));
                 Ok(Some(vm.layout_inflater(ctx)))
             })) as HostCall,
         );
