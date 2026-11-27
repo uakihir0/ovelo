@@ -3542,9 +3542,17 @@ fn context_call(
                 _ => 0,
             };
             let id = i32v(args.get(1).copied().unwrap_or(V::I32(0)));
-            let hit = view::content_root(vm, act)
+            let decor_hit = view::window_of(vm, act)
+                .and_then(|w| view::decor_of(vm, w))
                 .and_then(|root| view::find_in_tree(vm, root, id))
                 .unwrap_or(0);
+            let hit = if decor_hit != 0 {
+                decor_hit
+            } else {
+                view::content_root(vm, act)
+                    .and_then(|root| view::find_in_tree(vm, root, id))
+                    .unwrap_or(0)
+            };
             Some(Some(V::Ref(hit)))
         }
         "setContentView" => {

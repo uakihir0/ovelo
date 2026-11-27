@@ -8231,6 +8231,12 @@ pub(crate) fn decor_of(vm: &mut Vm, window: u32) -> Option<u32> {
     frame_set(vm, cf, 0, 0, ww, wh);
     vm.content_frames.insert(owner, cf);
     pseudo_set(vm, window, P_DECOR, V::Ref(d));
+    // The synthetic decor is parentless so no attach events fire early,
+    // but it is still the window's render/input root once content is
+    // installed. Without this, attached content would vanish for apps
+    // that do not build an appcompat decor tree.
+    vm.view_roots.retain(|r| *r != d);
+    vm.view_roots.push(d);
     if crate::dbg_flag("OVELO_VIEWDBG") {
         eprintln!("[viewdbg] decor_of window=h{window} owner=h{owner} -> d=h{d} cf=h{cf}");
     }
