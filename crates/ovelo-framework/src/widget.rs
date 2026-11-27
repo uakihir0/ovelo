@@ -417,22 +417,23 @@ impl Drawable for TextView {
             0x50 => self.view.top + s.h - pb - text_h,
             _ => self.view.top + pt,
         };
+        let compound_w = if self.checked.is_some() && !self.text.is_empty() {
+            36
+        } else {
+            0
+        };
         let mut baseline = vy + t.ascent;
         for line in lines {
             let seg = &self.text[line.range.0..line.range.1];
             // Horizontal gravity: 1 center, 5 right/end, else left.
+            // Centering happens in the text area after the compound
+            // button affordance, not across it.
             let tx = match self.gravity & 0x7 {
-                0x1 => self.view.left + pl + (s.w - pl - pr - line.width) / 2,
-                0x5 => self.view.left + s.w - pr - line.width,
-                _ => {
-                    self.view.left
-                        + pl
-                        + if self.checked.is_some() && !self.text.is_empty() {
-                            36
-                        } else {
-                            0
-                        }
+                0x1 => {
+                    self.view.left + pl + compound_w + (s.w - pl - pr - compound_w - line.width) / 2
                 }
+                0x5 => self.view.left + s.w - pr - line.width,
+                _ => self.view.left + pl + compound_w,
             };
             if dbg_flag("OVELO_POSDBG") && !self.text.is_empty() {
                 eprintln!(
