@@ -3994,6 +3994,17 @@ fn num_wide(vm: &Vm, fid: u64) -> bool {
 
 fn pair_call(vm: &mut Vm, name: &str, args: &[V]) -> Rt<Option<Option<V>>> {
     Ok(match name {
+        "<init>" => {
+            if let (Some(&V::Ref(h)), Some(&first), Some(&second)) =
+                (args.first(), args.get(1), args.get(2))
+            {
+                if let Some(Obj::Host { state, .. }) = vm.heap.get_mut(h) {
+                    *state = HostState::Slot(first);
+                }
+                pseudo_set(vm, h, P_DATA, second);
+            }
+            Some(None)
+        }
         "create" => {
             let h = vm.alloc_host("Landroid/util/Pair;", HostState::Slot(args[0]));
             pseudo_set(vm, h, P_DATA, args[1]);

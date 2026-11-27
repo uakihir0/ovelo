@@ -2609,6 +2609,13 @@ fn context_service_name(n: &str) -> &'static str {
 /// `DisplayMetrics.density`, `Point.x`…).
 pub(crate) fn ifield(vm: &Vm, h: u32, owner: &str, name: &str) -> Option<V> {
     match (owner, name) {
+        ("Landroid/util/Pair;" | "Landroidx/core/util/Pair;", "first") => {
+            Some(slot_of(vm, h).unwrap_or(V::Ref(0)))
+        }
+        ("Landroid/util/Pair;" | "Landroidx/core/util/Pair;", "second") => {
+            Some(pseudo_get(vm, h, P_DATA).unwrap_or(V::Ref(0)))
+        }
+
         ("Landroid/util/DisplayMetrics;", "density") => Some(V::F32(1.0)),
         ("Landroid/util/DisplayMetrics;", "densityDpi") => Some(V::I32(160)),
         ("Landroid/util/DisplayMetrics;", "scaledDensity") => Some(V::F32(1.0)),
