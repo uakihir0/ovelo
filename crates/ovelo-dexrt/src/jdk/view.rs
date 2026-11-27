@@ -6744,7 +6744,14 @@ pub(crate) fn dispatch_touch(
         for c in children(vm, h).iter().rev() {
             if let V::Ref(ch) = c {
                 if *ch != 0 {
-                    if let Some(v) = deepest(vm, *ch, x, y, l, t) {
+                    if let Some(v) = deepest(
+                        vm,
+                        *ch,
+                        x,
+                        y,
+                        l - pint(vm, h, P_SCROLL_X),
+                        t - pint(vm, h, P_SCROLL_Y),
+                    ) {
                         return Some(v);
                     }
                 }
@@ -6756,15 +6763,31 @@ pub(crate) fn dispatch_touch(
         }
         Some(h)
     }
-    fn abs_origin(vm: &Vm, mut v: u32) -> (i32, i32) {
-        let (mut ox, mut oy) = (0, 0);
+    fn abs_origin(vm: &Vm, v: u32) -> (i32, i32) {
+        // Child frames live in the parent's content coordinates: a
+        // scrolled parent shifts every descendant opposite to its
+        // scroll offset. Walk root→leaf so each parent's scroll is
+        // applied exactly once.
+        let mut chain = vec![v];
+        let mut cur = v;
         for _ in 0..64 {
-            ox += pint(vm, v, P_LEFT);
-            oy += pint(vm, v, P_TOP);
-            v = match pseudo_get(vm, v, P_PARENT) {
-                Some(V::Ref(p)) => p,
+            cur = match pseudo_get(vm, cur, P_PARENT) {
+                Some(V::Ref(p)) if p != 0 => p,
                 _ => break,
             };
+            chain.push(cur);
+        }
+        chain.reverse();
+        let mut ox = 0;
+        let mut oy = 0;
+        for i in 0..chain.len() {
+            let h = chain[i];
+            ox += pint(vm, h, P_LEFT);
+            oy += pint(vm, h, P_TOP);
+            if i + 1 < chain.len() {
+                ox -= pint(vm, h, P_SCROLL_X);
+                oy -= pint(vm, h, P_SCROLL_Y);
+            }
         }
         (ox, oy)
     }
