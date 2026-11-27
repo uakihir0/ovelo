@@ -4706,6 +4706,7 @@ struct RelKid {
     mb: i32,
     match_w: bool,
     match_h: bool,
+    gone: bool,
     rect: (i32, i32, i32, i32),
 }
 
@@ -4730,7 +4731,7 @@ fn relative_positions(vm: &mut Vm, this: u32, w: i32, h: i32) -> Vec<RelKid> {
     let kids: Vec<u32> = children(vm, this)
         .into_iter()
         .filter_map(|v| match v {
-            V::Ref(h) if h != 0 && !view_is_gone(vm, h) => Some(h),
+            V::Ref(h) if h != 0 => Some(h),
             _ => None,
         })
         .collect();
@@ -4770,6 +4771,7 @@ fn relative_positions(vm: &mut Vm, this: u32, w: i32, h: i32) -> Vec<RelKid> {
             mb: margin(vm, ch, "bottomMargin"),
             match_w: lp_dim("width", "layout_width") == -1,
             match_h: lp_dim("height", "layout_height") == -1,
+            gone: view_is_gone(vm, ch),
             rect: (0, 0, 0, 0),
         });
     }
@@ -4778,6 +4780,25 @@ fn relative_positions(vm: &mut Vm, this: u32, w: i32, h: i32) -> Vec<RelKid> {
             return None;
         }
         ks.iter().position(|k| k.id == id)
+    };
+    let idx_visible = |vm: &Vm, id: i32, names: &[&str]| -> Option<usize> {
+        // AOSP RelativeLayout resolves an anchor chain through GONE
+        // intermediates: `below(goneHeader)` anchors at whatever the
+        // gone header itself was below, not at the parent origin.
+        let mut cur = id;
+        for _ in 0..16 {
+            let j = idx_of(cur)?;
+            if !ks[j].gone {
+                return Some(j);
+            }
+            cur = names
+                .iter()
+                .find_map(|n| match attr_find(vm, ks[j].ch, n) {
+                    Some(V::I32(next)) if next > 0 => Some(next),
+                    _ => None,
+                })?;
+        }
+        None
     };
     let truthy = |v: Option<V>| matches!(v, Some(V::I32(i)) if i != 0);
     let ref_id = |v: Option<V>| -> Option<i32> {
@@ -4829,10 +4850,13 @@ fn relative_positions(vm: &mut Vm, this: u32, w: i32, h: i32) -> Vec<RelKid> {
             } else {
                 (h, pad_t, pad_b)
             };
-            let sib_edge = |id: i32, trailing: bool| -> Option<Option<i32>> {
+            let sib_edge = |id: i32, trailing: bool, names: &[&str]| -> Option<Option<i32>> {
                 // Some(edge) = rule present; the inner Option is the
                 // sibling's resolved edge (None while unplaced).
-                Some(idx_of(id).and_then(|j| placed[j].map(|(a, b)| if trailing { b } else { a })))
+                Some(
+                    idx_visible(vm, id, names)
+                        .and_then(|j| placed[j].map(|(a, b)| if trailing { b } else { a })),
+                )
             };
 
             let mut lead: Option<i32> = None;
@@ -4847,14 +4871,14 @@ fn relative_positions(vm: &mut Vm, this: u32, w: i32, h: i32) -> Vec<RelKid> {
                 lead = Some(pleading + mlead);
             }
             if let Some(dep) = ref_id(rule(vm, ch, lead_rules)) {
-                match sib_edge(dep, true) {
+                match sib_edge(dep, true, lead_rules) {
                     Some(Some(e)) => lead = Some(e + mlead),
                     Some(None) => pending = true,
                     None => {}
                 }
             }
             if let Some(dep) = ref_id(rule(vm, ch, lead_sib_rules)) {
-                match sib_edge(dep, false) {
+                match sib_edge(dep, false, lead_sib_rules) {
                     Some(Some(e)) => lead = Some(e + mlead),
                     Some(None) => pending = true,
                     None => {}
@@ -4874,7 +4898,7 @@ fn relative_positions(vm: &mut Vm, this: u32, w: i32, h: i32) -> Vec<RelKid> {
             };
             for (names, on_trailing) in [(trail_lead_anchor, false), (trail_trail_anchor, true)] {
                 if let Some(dep) = ref_id(rule(vm, ch, names)) {
-                    match sib_edge(dep, on_trailing) {
+                    match sib_edge(dep, on_trailing, names) {
                         Some(Some(e)) => trail = Some(e - mtrail),
                         Some(None) => pending = true,
                         None => {}
