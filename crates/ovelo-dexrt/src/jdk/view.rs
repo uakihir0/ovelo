@@ -2235,7 +2235,10 @@ pub(crate) fn call(
             pseudo_set(vm, this, P_RADIO_CHECKED, V::I32(id));
             for c in children(vm, this) {
                 if let V::Ref(ch) = c {
-                    pseudo_set(vm, ch, P_CHECKED, V::I32((view_id(vm, ch) == id) as i32));
+                    let child_cls = class_of(vm, V::Ref(ch));
+                    if is_radio_desc(vm, &child_cls) {
+                        pseudo_set(vm, ch, P_CHECKED, V::I32((view_id(vm, ch) == id) as i32));
+                    }
                 }
             }
             Some(None)
@@ -7338,7 +7341,8 @@ fn set_compound_checked(vm: &mut Vm, this: u32, checked: i32) {
                 pseudo_set(vm, parent, P_RADIO_CHECKED, V::I32(id));
                 for c in children(vm, parent) {
                     if let V::Ref(ch) = c {
-                        if ch != this {
+                        let child_cls = class_of(vm, V::Ref(ch));
+                        if ch != this && is_radio_desc(vm, &child_cls) {
                             pseudo_set(vm, ch, P_CHECKED, V::I32(0));
                         }
                     }
