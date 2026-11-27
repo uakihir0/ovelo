@@ -1324,7 +1324,7 @@ impl GuestUi {
 
     fn materialize_dex(&mut self, vm: &mut Vm, h: u32) -> Option<Rc<RefCell<GuestView>>> {
         self.dex_live.insert(h);
-        let info = vm.dex_view(h)?;
+        let mut info = vm.dex_view(h)?;
         if viewdbg() {
             eprintln!(
                 "[viewdbg] node {} h{h} vis={} kids={} text={:?} frame={:?} tc={:?} bg={:?} lp={}x{}",
@@ -1383,6 +1383,15 @@ impl GuestUi {
             let raw = vm.guest_draw_ops_raw(h, ow, oh);
             (raw.clone(), vm.expand_display_list_ops(&raw))
         });
+        // Guest onDraw may itself call setters such as setTextColor.
+        // `info` was snapshotted before that guest code ran; refresh it
+        // or this materialize writes the pre-draw color back and the
+        // runtime setter is effectively lost.
+        if capture {
+            if let Some(fresh) = vm.dex_view(h) {
+                info = fresh;
+            }
+        }
         let mut g = rc.borrow_mut();
         // The widget kind is chosen once, but `is_group` can arrive
         // late: ViewPager2 builds its page container FrameLayout
