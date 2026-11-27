@@ -86,6 +86,8 @@ const P_POPUP_OWNER: u32 = u32::MAX - 32;
 const P_POPUP_POS: u32 = u32::MAX - 33;
 /// Dialog cancelable flag (`setCancelable(false)` stores 0).
 const P_DIALOG_CANCELABLE: u32 = u32::MAX - 34;
+/// Synthetic AlertDialog panel wrapping custom content.
+const P_DIALOG_PANEL: u32 = u32::MAX - 35;
 /// Pseudo key: a view's lazily-minted `Menu` (Toolbar.getMenu() etc.) /
 /// the menuish marker on the Menu itself (`I32(1)`).
 const P_MENU: u32 = 0xFFFD_FFF8;
@@ -7493,10 +7495,39 @@ pub(crate) fn dialog_show(vm: &mut Vm, dialog: u32) {
         _ => None,
     };
     let mut seen = std::collections::HashSet::new();
-    let Some(root) = explicit.or_else(|| dialog_view_scan(vm, dialog, 0, &mut seen).map(|x| x.0))
+    let Some(content) =
+        explicit.or_else(|| dialog_view_scan(vm, dialog, 0, &mut seen).map(|x| x.0))
     else {
         return;
     };
+    // AlertDialog normally wraps custom content in the appcompat decor:
+    // an opaque panel, title area, and button bar. The runtime does not
+    // execute that decor construction, so give the content its opaque
+    // panel explicitly; otherwise transparent list rows draw directly
+    // over the activity behind them.
+    let root = match pseudo_get(vm, dialog, P_DIALOG_PANEL) {
+        Some(V::Ref(p)) if p != 0 => p,
+        _ => {
+            let p = vm.alloc_host("Landroid/widget/LinearLayout;", HostState::Empty);
+            pseudo_set(vm, p, P_IS_VIEW, V::I32(1));
+            pseudo_set(vm, p, P_IS_GROUP, V::I32(1));
+            pseudo_set(vm, p, P_ORIENTATION, V::I32(1));
+            pseudo_set(vm, p, P_BGCOLOR, V::I32(0xff202020u32 as i32));
+            pseudo_set(vm, dialog, P_DIALOG_PANEL, V::Ref(p));
+            p
+        }
+    };
+    if content != root {
+        if let Some(V::Ref(old_parent)) = pseudo_get(vm, content, P_PARENT) {
+            if old_parent != 0 && old_parent != root {
+                detach(vm, old_parent, V::Ref(content), false);
+            }
+        }
+        if pseudo_get(vm, content, P_PARENT) != Some(V::Ref(root)) {
+            vm.view_roots.retain(|r| *r != content);
+            attach_at(vm, root, V::Ref(content), None, false, None);
+        }
+    }
     let parent = activity_content(vm, vm.cur_activity).unwrap_or(0);
     if parent == 0 {
         return;
