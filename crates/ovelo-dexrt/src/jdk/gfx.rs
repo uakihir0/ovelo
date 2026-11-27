@@ -166,10 +166,16 @@ fn flatten_path_cmds(cmds: &[PathCmd], m: [f32; 6]) -> Vec<Vec<(f32, f32)>> {
                 push(&mut pts, x, y);
             }
             PathCmd::LineTo { x, y } => {
+                if pts.is_empty() {
+                    push(&mut pts, cur.0, cur.1);
+                }
                 push(&mut pts, x, y);
                 cur = (x, y);
             }
             PathCmd::QuadTo { cx, cy, x, y } => {
+                if pts.is_empty() {
+                    push(&mut pts, cur.0, cur.1);
+                }
                 for i in 1..=12 {
                     let t = i as f32 / 12.0;
                     let q = 1.0 - t;
@@ -187,6 +193,9 @@ fn flatten_path_cmds(cmds: &[PathCmd], m: [f32; 6]) -> Vec<Vec<(f32, f32)>> {
                 x,
                 y,
             } => {
+                if pts.is_empty() {
+                    push(&mut pts, cur.0, cur.1);
+                }
                 for i in 1..=16 {
                     let t = i as f32 / 16.0;
                     let q = 1.0 - t;
