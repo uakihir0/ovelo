@@ -617,6 +617,11 @@ pub(crate) fn layout_requested(vm: &Vm, h: u32) -> bool {
     pint(vm, h, P_LAYOUT_REQ) != 0
 }
 
+/// True for a root view owned by a popup or dialog overlay.
+pub fn is_popup_root(vm: &Vm, h: u32) -> bool {
+    h != 0 && pseudo_get(vm, h, P_POPUP_ROOT).is_some()
+}
+
 /// Store a view frame; returns whether it changed (View.setFrame's
 /// contract and `layout`'s `changed` argument).
 pub(crate) fn frame_set(vm: &mut Vm, h: u32, l: i32, t: i32, r: i32, b: i32) -> bool {

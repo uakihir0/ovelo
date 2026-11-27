@@ -17,8 +17,8 @@ mod value;
 
 pub use aot::Aot;
 pub use jdk::view::{
-    fire_global_layout, fire_pre_draw, mark_layout_requested, DexViewInfo, P_BGCOLOR, P_TCOLOR,
-    P_TEXT, P_TSIZE,
+    fire_global_layout, fire_pre_draw, is_popup_root, mark_layout_requested, DexViewInfo,
+    P_BGCOLOR, P_TCOLOR, P_TEXT, P_TSIZE,
 };
 pub use jdk::{pseudo_get, pseudo_set, P_ACTION, P_APPINFO, P_COMPONENT, P_DATA, P_META, P_TARGET};
 pub use value::{CanvasOp, PaintState, PathCmd};

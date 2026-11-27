@@ -1711,7 +1711,10 @@ pub fn drive_dex_layout_pass(vm: &mut Vm, activity: u32, frame: u32, win_w: i32,
         // reports a dex parent (the `android.R.id.content` frame the
         // decor wraps it in), so `!parent_is_dex` alone would skip
         // every node and no frame would ever be set.
-        let parent_is_dex = depth != 0 && info.parent != 0 && vm.is_dex_view(info.parent);
+        let parent_is_dex = depth != 0
+            && info.parent != 0
+            && vm.is_dex_view(info.parent)
+            && !ovelo_dexrt::is_popup_root(vm, h);
         let root_size_changed = depth == 0
             && info
                 .frame
