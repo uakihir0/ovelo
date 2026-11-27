@@ -3442,10 +3442,21 @@ pub(crate) fn host_supers(d: &str) -> &'static [&'static str] {
         }
         "Landroid/view/InputEvent;" => &[OBJ],
         // ----- android.widget remaining
+        "Landroid/widget/AutoCompleteTextView;" => &[
+            "Landroid/widget/EditText;",
+            "Landroid/widget/TextView;",
+            "Landroid/view/View;",
+            OBJ,
+        ],
+        "Landroid/widget/MultiAutoCompleteTextView;" => &[
+            "Landroid/widget/AutoCompleteTextView;",
+            "Landroid/widget/EditText;",
+            "Landroid/widget/TextView;",
+            "Landroid/view/View;",
+            OBJ,
+        ],
         "Landroid/widget/PopupWindow;"
         | "Landroid/widget/PopupMenu;"
-        | "Landroid/widget/AutoCompleteTextView;"
-        | "Landroid/widget/MultiAutoCompleteTextView;"
         | "Landroid/widget/CheckedTextView;"
         | "Landroid/widget/CalendarView;"
         | "Landroid/widget/DatePicker;"
