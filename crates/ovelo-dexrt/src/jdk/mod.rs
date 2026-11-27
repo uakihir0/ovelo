@@ -2563,8 +2563,8 @@ pub(crate) fn ifield(vm: &Vm, h: u32, owner: &str, name: &str) -> Option<V> {
         ("Landroid/content/res/Configuration;", "uiMode") => {
             Some(pseudo_get(vm, h, crate::P_META).unwrap_or(V::I32(0x21)))
         }
-        ("Landroid/content/res/Configuration;", "screenWidthDp")
-        | ("Landroid/content/res/Configuration;", "screenHeightDp") => Some(V::I32(360)),
+        ("Landroid/content/res/Configuration;", "screenWidthDp") => Some(V::I32(vm.window_size.0)),
+        ("Landroid/content/res/Configuration;", "screenHeightDp") => Some(V::I32(vm.window_size.1)),
         _ => None,
     }
 }
