@@ -4614,6 +4614,22 @@ fn min_dim(vm: &mut Vm, this: u32, key: u32, attr: &str) -> i32 {
         .unwrap_or(0)
 }
 
+fn theme_style_ref(res: &crate::res::ApkResources, theme_id: u32, attr_id: u32) -> Option<u32> {
+    // Theme attrs often indirect through another attr (`textInputStyle`
+    // = `?attr/textInputOutlinedStyle`) before landing on the style
+    // reference. Chase that chain here; only the final reference is a
+    // style resource id.
+    let mut cur = res.style_item(theme_id, attr_id).cloned();
+    for _ in 0..8 {
+        let ev = cur?;
+        if ev.data_type != 0x02 {
+            return (ev.data != 0).then_some(ev.data);
+        }
+        cur = res.style_item(theme_id, ev.data).cloned();
+    }
+    None
+}
+
 fn ctor_style_value(
     vm: &mut Vm,
     xml_style: u32,
@@ -4627,20 +4643,8 @@ fn ctor_style_value(
         styles.push(xml_style);
     }
     if def_attr != 0 {
-        // Theme attrs often indirect through another attr (`textInputStyle`
-        // = `?attr/textInputOutlinedStyle`) before landing on the style
-        // reference. Chase that chain here; only the final reference is a
-        // style resource id.
-        let mut cur = res.style_item(vm.theme_id, def_attr).cloned();
-        for _ in 0..8 {
-            let Some(ev) = cur else { break };
-            if ev.data_type != 0x02 {
-                if ev.data != 0 {
-                    styles.push(ev.data);
-                }
-                break;
-            }
-            cur = res.style_item(vm.theme_id, ev.data).cloned();
+        if let Some(style) = theme_style_ref(res, vm.theme_id, def_attr) {
+            styles.push(style);
         }
     }
     if def_res != 0 {
@@ -4676,9 +4680,22 @@ fn apply_ctor_style(vm: &mut Vm, this: u32, args: &[V]) {
     if args.len() < 4 {
         return;
     }
-    let xml_style = attr_find(vm, this, "style")
+    let xml_style_raw = attr_find(vm, this, "style")
         .map(|v| i32v(v) as u32)
         .unwrap_or(0);
+    let xml_style = if xml_style_raw != 0 {
+        match vm.apk_res.as_ref() {
+            Some(res)
+                if res.type_name(xml_style_raw) == Some("attr")
+                    || crate::res_attrs::framework_attr_name(xml_style_raw).is_some() =>
+            {
+                theme_style_ref(res, vm.theme_id, xml_style_raw).unwrap_or(0)
+            }
+            _ => xml_style_raw,
+        }
+    } else {
+        0
+    };
     let def_attr = i32v(args.get(3).copied().unwrap_or(V::I32(0))) as u32;
     let def_res = i32v(args.get(4).copied().unwrap_or(V::I32(0))) as u32;
     if xml_style == 0 && def_attr == 0 && def_res == 0 {
