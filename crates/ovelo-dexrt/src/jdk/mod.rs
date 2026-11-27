@@ -1161,7 +1161,11 @@ pub(crate) fn guest_list_backing(
                     .filter_map(|(g, v)| match v {
                         V::I32(n)
                             if *n >= 0
-                                && vm.dbg_field_name(*g).rsplit('.').next() != Some("modCount") =>
+                                && vm.dbg_field_name(*g).rsplit('.').next() != Some("modCount")
+                                // Fixed array-backed collections carry a
+                                // boolean "trusted/exact" flag beside the
+                                // array; it is not a one-element window.
+                                && vm.field_type_desc(*g).as_deref() != Some("Z") =>
                         {
                             Some(*n as usize)
                         }
