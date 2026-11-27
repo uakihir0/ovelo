@@ -103,6 +103,8 @@ const P_MENU_CHK: u32 = 0xFFFD_FFF4;
 const P_MENU_GROUP: u32 = 0xFFFD_FFF3;
 /// Pseudo key: a MenuItem's checkable flag (distinct from enabled).
 const P_MENU_CKABLE: u32 = 0xFFFD_FFF2;
+/// Pseudo key: a MenuItem's inflated action view.
+const P_MENU_ACTION_VIEW: u32 = 0xFFFD_FFEC;
 
 /// Backing store key on a dex menu object (`Obj::Instance` — e.g.
 /// androidx `MenuBuilder`): the item list lives on a lazily-minted host
@@ -1447,6 +1449,7 @@ pub(crate) fn call(
                 "setCheckable" => P_MENU_CKABLE,
                 "setChecked" => P_MENU_CHK,
                 "setTitle" | "setTitleCondensed" => P_TEXT,
+                "setActionView" => P_MENU_ACTION_VIEW,
                 _ => P_TAG,
             };
             let v = args.get(1).copied().unwrap_or(V::Ref(0));
@@ -1503,6 +1506,12 @@ pub(crate) fn call(
         "getSubMenu" if is_menuitem(vm, this) => Some(Some(
             pseudo_get(vm, this, P_ITEM_SUBMENU).unwrap_or(V::Ref(0)),
         )),
+        "getActionView" if is_menuitem(vm, this) => {
+            Some(Some(match pseudo_get(vm, this, P_MENU_ACTION_VIEW) {
+                Some(v @ V::Ref(_)) => v,
+                _ => V::Ref(0),
+            }))
+        }
         "isActionViewExpanded" | "expandActionView" | "collapseActionView"
             if is_menuitem(vm, this) =>
         {
