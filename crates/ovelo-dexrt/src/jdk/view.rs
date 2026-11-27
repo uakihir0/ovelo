@@ -4807,7 +4807,7 @@ fn group_measure_fallback(vm: &mut Vm, this: u32, pw: i32, ph: i32) {
             cw += w + mh;
             chh = chh.max(hh + mv);
         } else {
-            cw = cw.max(w);
+            cw = cw.max(w + mh);
             chh = chh.max(hh + mv);
         }
     }
