@@ -965,6 +965,16 @@ impl Vm {
             class_mirrors: HashMap::new(),
             granted_permissions: hashbrown::HashSet::new(),
         };
+        // Android creates the app-private sandbox before any application
+        // code runs. Do the same independent of which Context wrapper the
+        // app first calls `getFilesDir`/`getCacheDir` through.
+        for dir in [
+            "data/local/ovelo/files",
+            "data/local/ovelo/cache",
+            "data/local/ovelo/databases",
+        ] {
+            let _ = std::fs::create_dir_all(v.guest_root.join(dir));
+        }
         v.add_dex(dex)?;
         Ok(v)
     }
