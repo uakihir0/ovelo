@@ -274,8 +274,6 @@ pub struct TextView {
     pub fonts: Rc<FontSet>,
     /// Em size in px.
     pub text_size: f32,
-    /// Uniform padding px.
-    pub padding: i32,
     /// AOSP gravity flags (CENTER_HORIZONTAL=1, CENTER_VERTICAL=0x10,
     /// RIGHT/END=5, BOTTOM=0x50). 0 = top|start.
     pub gravity: i32,
@@ -295,7 +293,6 @@ impl TextView {
             color,
             fonts,
             text_size,
-            padding: 0,
             gravity: 0,
             max_lines: None,
             checked: None,
@@ -321,14 +318,15 @@ impl TextView {
             max_w,
             false,
         );
+        let (pl, pt, pr, pb) = self.view.padding;
         let box_w = if self.checked.is_some() {
             28 + if self.text.is_empty() { 0 } else { 8 }
         } else {
             0
         };
         Size {
-            w: t.width + self.padding * 2 + box_w,
-            h: (t.height + self.padding * 2).max(if self.checked.is_some() { 28 } else { 0 }),
+            w: t.width + pl + pr + box_w,
+            h: (t.height + pt + pb).max(if self.checked.is_some() { 28 } else { 0 }),
         }
     }
 }
@@ -343,7 +341,9 @@ impl Drawable for TextView {
     }
     fn measure(&mut self, w: MeasureSpec, h: MeasureSpec) -> Size {
         let cap = match w {
-            MeasureSpec::Exactly(s) | MeasureSpec::AtMost(s) => Some(s - self.padding * 2),
+            MeasureSpec::Exactly(s) | MeasureSpec::AtMost(s) => {
+                Some(s - self.view.padding.0 - self.view.padding.2)
+            }
             MeasureSpec::Unspecified => None,
         };
         self.view.desired = self.measure_text(cap.map(|c| c.max(0)));
@@ -362,7 +362,7 @@ impl Drawable for TextView {
         }
         if let Some(checked) = self.checked {
             let box_sz = 20;
-            let bx = self.view.left + self.padding + 4;
+            let bx = self.view.left + self.view.padding.0 + 4;
             let by = self.view.top + (s.h - box_sz) / 2;
             if checked {
                 let accent = Paint::color(Color::srgb(0x66, 0xbb, 0x6a));
@@ -398,7 +398,7 @@ impl Drawable for TextView {
                 size_px: self.text_size,
             },
             &self.fonts,
-            Some((s.w - self.padding * 2).max(0)),
+            Some((s.w - self.view.padding.0 - self.view.padding.2).max(0)),
             false,
         );
         let lh = t.ascent + t.descent;
@@ -411,21 +411,22 @@ impl Drawable for TextView {
         };
         // Vertical gravity: 0x10 center, 0x50 bottom, else top.
         let text_h = lh * lines.len().max(1) as i32;
+        let (pl, pt, pr, pb) = self.view.padding;
         let vy = match self.gravity & 0x70 {
-            0x10 => self.view.top + (s.h - text_h) / 2,
-            0x50 => self.view.top + s.h - self.padding - text_h,
-            _ => self.view.top + self.padding,
+            0x10 => self.view.top + pt + (s.h - pt - pb - text_h) / 2,
+            0x50 => self.view.top + s.h - pb - text_h,
+            _ => self.view.top + pt,
         };
         let mut baseline = vy + t.ascent;
         for line in lines {
             let seg = &self.text[line.range.0..line.range.1];
             // Horizontal gravity: 1 center, 5 right/end, else left.
             let tx = match self.gravity & 0x7 {
-                0x1 => self.view.left + (s.w - line.width) / 2,
-                0x5 => self.view.left + s.w - self.padding - line.width,
+                0x1 => self.view.left + pl + (s.w - pl - pr - line.width) / 2,
+                0x5 => self.view.left + s.w - pr - line.width,
                 _ => {
                     self.view.left
-                        + self.padding
+                        + pl
                         + if self.checked.is_some() && !self.text.is_empty() {
                             36
                         } else {
@@ -497,7 +498,7 @@ impl Button {
             bg: Color::srgb(0xDD, 0xDD, 0xDD),
             on_click: None,
         };
-        b.tv.padding = 12;
+        b.tv.view.padding = (12, 12, 12, 12);
         b.tv.view.desired = b.tv.measure_text(None);
         b
     }
