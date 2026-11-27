@@ -175,6 +175,19 @@ fn elem_eq_depth(vm: &mut Vm, e: V, other: V, depth: u8) -> Rt<bool> {
         }
     }
     match e {
+        V::Ref(h)
+            if h != 0
+                && matches!(
+                    vm.heap.get(h),
+                    Some(Obj::Host { desc, .. }) if desc == "Ljava/math/BigDecimal;"
+                ) =>
+        {
+            match vm.call_virtual_rt(h, "equals", &[other]) {
+                Ok(Some(v)) => Ok(i32v(v) != 0),
+                Ok(None) => Ok(value_eq(vm, e, other)),
+                Err(e2) => Err(e2),
+            }
+        }
         V::Ref(h) if h != 0 && matches!(vm.heap.get(h), Some(Obj::Instance { .. })) => {
             match vm.call_virtual_rt(h, "equals", &[other]) {
                 Ok(Some(v)) => Ok(i32v(v) != 0),
