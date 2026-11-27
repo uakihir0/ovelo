@@ -2008,7 +2008,25 @@ fn class_call(vm: &mut Vm, name: &str, _sig: &str, args: &[V]) -> Rt<Option<Opti
             }
         }
         "getResourceAsStream" => {
-            let name = args.get(1).and_then(|v| sv(vm, *v)).unwrap_or_default();
+            let mut name = args.get(1).and_then(|v| sv(vm, *v)).unwrap_or_default();
+            if !name.starts_with('/') {
+                let cdesc = class_desc_of(
+                    vm,
+                    match args[0] {
+                        V::Ref(h) => h,
+                        _ => 0,
+                    },
+                )
+                .unwrap_or_default();
+                let path = cdesc
+                    .strip_prefix('L')
+                    .unwrap_or(&cdesc)
+                    .strip_suffix(';')
+                    .unwrap_or_else(|| cdesc.strip_prefix('L').unwrap_or(&cdesc));
+                if let Some((pkg, _)) = path.rsplit_once('/') {
+                    name = format!("{pkg}/{name}");
+                }
+            }
             Some(Some(apk_resource_stream(vm, &name)))
         }
         "getResource"
