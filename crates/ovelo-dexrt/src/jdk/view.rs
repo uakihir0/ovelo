@@ -5728,6 +5728,10 @@ pub(crate) fn dispatch_touch(
             vm.dbg_class_of(target)
         );
     }
+    if action == 0 && is_edit_text(vm, target) {
+        clear_window_focus(vm);
+        pseudo_set(vm, target, P_FOCUSED, V::I32(1));
+    }
     // Modal popup semantics: ACTION_DOWN outside an open popup dismisses
     // it and is consumed instead of activating the background control.
     if action == 0 {
@@ -5958,12 +5962,45 @@ pub(crate) fn offer_input_connection(vm: &mut Vm, view: u32) -> ovelo_error::Res
     Ok(conn != 0)
 }
 
+fn is_edit_text(vm: &Vm, h: u32) -> bool {
+    if h == 0 {
+        return false;
+    }
+    let desc = class_of(vm, V::Ref(h));
+    desc.contains("EditText") || vm.extends_named(&desc, "EditText")
+}
+
 fn key_scan_roots(vm: &Vm) -> Vec<u32> {
+    // Decor first, then any inflated-but-detached roots. Fragment
+    // materialization can leave a real editor outside the synthetic
+    // decor while still rendering it as a view root; key input must not
+    // become unreachable merely because attachment is incomplete.
     let mut roots: Vec<u32> = vm.decor_roots.values().copied().collect();
-    if roots.is_empty() {
-        roots = vm.view_roots.clone();
+    for r in &vm.view_roots {
+        if !roots.contains(r) {
+            roots.push(*r);
+        }
     }
     roots
+}
+
+fn focused_edit_text(vm: &Vm, h: u32, depth: usize) -> Option<u32> {
+    if depth > 40 {
+        return None;
+    }
+    if pint(vm, h, P_FOCUSED) != 0 && is_edit_text(vm, h) {
+        return Some(h);
+    }
+    for c in children(vm, h) {
+        if let V::Ref(ch) = c {
+            if ch != 0 && ch != h {
+                if let Some(v) = focused_edit_text(vm, ch, depth + 1) {
+                    return Some(v);
+                }
+            }
+        }
+    }
+    None
 }
 
 /// Route a host key event into the top-most dex view root. Compose
@@ -6099,6 +6136,34 @@ pub(crate) fn dispatch_key(
     pseudo_set(vm, evt, P_KE_CODE, V::I32(keycode));
     pseudo_set(vm, evt, P_KE_UNICODE, V::I32(unicode));
     pseudo_set(vm, evt, P_KE_REPEAT, V::I32(repeat as i32));
+
+    // Classic EditText is a framework skeleton here, so it has no dex
+    // InputConnection implementation for `input_view` to discover. Give
+    // the focused editor the same visible editing behavior for host text
+    // keys; `getText` already reads P_TEXT in this runtime.
+    let focused_edit = key_scan_roots(vm)
+        .iter()
+        .rev()
+        .find_map(|r| focused_edit_text(vm, *r, 0));
+    if let Some(view) = focused_edit {
+        if action == 0 {
+            let mut text = pseudo_get(vm, view, P_TEXT)
+                .and_then(|v| sv(vm, v))
+                .unwrap_or_default();
+            if keycode == 67 {
+                text.pop();
+            } else if unicode != 0 {
+                if let Some(ch) = char::from_u32(unicode as u32) {
+                    if !ch.is_control() {
+                        text.push(ch);
+                    }
+                }
+            }
+            let text = jstr(vm, &text);
+            pseudo_set(vm, view, P_TEXT, text);
+            return Ok(true);
+        }
+    }
 
     let mut ime_view = 0;
     for root in key_scan_roots(vm).iter().rev() {
