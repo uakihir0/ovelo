@@ -14,6 +14,7 @@ pub(crate) mod http;
 mod io;
 pub(crate) mod kser;
 mod lang;
+mod math;
 mod rx;
 mod text;
 pub(crate) mod time;
@@ -632,6 +633,14 @@ pub(crate) fn v_to_s(vm: &mut Vm, v: V) -> String {
                         } else {
                             "true".to_string()
                         }
+                    } else if desc == "Ljava/math/BigDecimal;" {
+                        math::fmt_bd(match inner {
+                            V::F64(f) => *f,
+                            V::F32(f) => *f as f64,
+                            V::I64(i) => *i as f64,
+                            V::I32(i) => *i as f64,
+                            _ => 0.0,
+                        })
                     } else {
                         v_to_s(vm, *inner)
                     }
@@ -1615,6 +1624,9 @@ pub(crate) fn call(
     if let Some(r) = universal(vm, class, name, sig, args)? {
         return Ok(Some(r));
     }
+    if let Some(r) = math::call(vm, class, name, sig, args)? {
+        return Ok(Some(r));
+    }
     if let Some(r) = lang::call(vm, class, name, sig, args)? {
         return Ok(Some(r));
     }
@@ -1653,7 +1665,9 @@ fn universal(vm: &mut Vm, class: &str, name: &str, sig: &str, args: &[V]) -> Rt<
     // UUID implements these object operations from its 128-bit value in
     // the collections module; the generic identity/object-id versions
     // would make equal UUIDs and serialized UUID strings unusable.
-    if class == "Ljava/util/UUID;" && matches!(name, "toString" | "hashCode" | "equals") {
+    if matches!(class, "Ljava/util/UUID;" | "Ljava/math/BigDecimal;")
+        && matches!(name, "toString" | "hashCode" | "equals")
+    {
         return Ok(None);
     }
     Ok(match name {
@@ -1947,6 +1961,27 @@ pub(crate) fn sfield(vm: &mut Vm, owner: &str, name: &str, ftype: &str) -> Optio
         ("Ljava/lang/Float;", "NaN") => V::F32(f32::NAN),
         ("Ljava/lang/Float;", "SIZE") => V::I32(32),
         ("Ljava/lang/Float;", "BYTES") => V::I32(4),
+        ("Ljava/math/BigDecimal;", "ZERO") => {
+            return Some(host(vm, owner, HostState::Slot(V::F64(0.0))));
+        }
+        ("Ljava/math/BigDecimal;", "ONE") => {
+            return Some(host(vm, owner, HostState::Slot(V::F64(1.0))));
+        }
+        ("Ljava/math/BigDecimal;", "TEN") => {
+            return Some(host(vm, owner, HostState::Slot(V::F64(10.0))));
+        }
+        ("Ljava/math/MathContext;", "UNLIMITED") => {
+            return Some(host(vm, owner, HostState::Slot(V::I32(0))));
+        }
+        ("Ljava/math/MathContext;", "DECIMAL32") => {
+            return Some(host(vm, owner, HostState::Slot(V::I32(7))));
+        }
+        ("Ljava/math/MathContext;", "DECIMAL64") => {
+            return Some(host(vm, owner, HostState::Slot(V::I32(16))));
+        }
+        ("Ljava/math/MathContext;", "DECIMAL128") => {
+            return Some(host(vm, owner, HostState::Slot(V::I32(34))));
+        }
         ("Ljava/lang/Math;", "PI") => V::F64(std::f64::consts::PI),
         ("Ljava/lang/Math;", "E") => V::F64(std::f64::consts::E),
         // BreakIterator.DONE — loops compare `next()` against it; the

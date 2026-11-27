@@ -1865,6 +1865,9 @@ fn run_app(store: &InstallStore, package: &str) -> Result<(), OveloError> {
                 continue;
             };
             let (tx, ty) = (pt.x as i32, pt.y as i32);
+            if std::env::var_os("OVELO_INPUTDBG").is_some() {
+                eprintln!("[inputdbg] host x={tx} y={ty} raw=({},{})", pt.x, pt.y);
+            }
             // Android MotionEvent action codes.
             let a = match ev.action {
                 ovelo_host::MotionAction::Down => 0,

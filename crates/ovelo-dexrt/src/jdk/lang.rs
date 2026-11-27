@@ -2118,6 +2118,74 @@ fn class_call(vm: &mut Vm, name: &str, _sig: &str, args: &[V]) -> Rt<Option<Opti
                 .unwrap_or(V::Ref(0));
             Some(Some(v))
         }
+        "getAnnotationsByType" | "getDeclaredAnnotationsByType" => {
+            let cdesc = class_desc_of(
+                vm,
+                match args[0] {
+                    V::Ref(h) => h,
+                    _ => 0,
+                },
+            )
+            .unwrap_or_default();
+            let adesc = class_desc_of(
+                vm,
+                match args[1] {
+                    V::Ref(h) => h,
+                    _ => 0,
+                },
+            )
+            .unwrap_or_default();
+            let all = vm
+                .class_gidx_of(&cdesc)
+                .map(|cg| vm.class_annotations(cg))
+                .unwrap_or_default();
+            let mut items = Vec::new();
+            for a in all {
+                let V::Ref(h) = a else { continue };
+                let mut nested = Vec::new();
+                let matches_direct = match vm.heap.get(h) {
+                    Some(Obj::Host { desc, state, .. }) => {
+                        if desc == &adesc {
+                            true
+                        } else {
+                            if let HostState::Map(pairs) = state {
+                                for (k, v) in pairs {
+                                    let key = match k {
+                                        V::Ref(kh) => match vm.heap.get(*kh) {
+                                            Some(Obj::Str(t)) => t.as_str(),
+                                            _ => "",
+                                        },
+                                        _ => "",
+                                    };
+                                    if key != "value" {
+                                        continue;
+                                    }
+                                    if let V::Ref(av) = v {
+                                        if let Some(Obj::Array { data, .. }) = vm.heap.get(*av) {
+                                            nested.extend(data.iter().copied());
+                                        }
+                                    }
+                                }
+                            }
+                            false
+                        }
+                    }
+                    _ => false,
+                };
+                if matches_direct {
+                    items.push(a);
+                }
+                for n in nested {
+                    if let V::Ref(nh) = n {
+                        if matches!(vm.heap.get(nh), Some(Obj::Host { desc, .. }) if desc == &adesc)
+                        {
+                            items.push(n);
+                        }
+                    }
+                }
+            }
+            Some(Some(arr(vm, &adesc, items)))
+        }
         "getAnnotations" | "getDeclaredAnnotations" => {
             let cdesc = class_desc_of(
                 vm,

@@ -4176,6 +4176,7 @@ impl Vm {
             | "Ljava/util/SplittableRandom;" => {
                 HostState::Slot(V::I64(0x9E3779B97F4A7C15_u64 as i64))
             }
+            "Ljava/math/BigDecimal;" => HostState::Slot(V::F64(0.0)),
             "Ljava/lang/Integer;"
             | "Ljava/lang/Long;"
             | "Ljava/lang/Short;"
