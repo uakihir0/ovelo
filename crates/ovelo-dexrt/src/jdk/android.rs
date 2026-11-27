@@ -2014,6 +2014,7 @@ fn intent_call(vm: &mut Vm, name: &str, sig: &str, args: &[V]) -> Rt<Option<Opti
         "getAction" => Some(Some(pseudo_get(vm, h, P_ACTION).unwrap_or(V::Ref(0)))),
         "setData" | "setDataAndNormalize" => {
             pseudo_set(vm, h, P_DATA, args[1]);
+            pseudo_set(vm, h, P_TYPE, V::Ref(0));
             Some(Some(args[0]))
         }
         "setDataAndType" | "setDataAndTypeAndNormalize" => {
@@ -2024,6 +2025,7 @@ fn intent_call(vm: &mut Vm, name: &str, sig: &str, args: &[V]) -> Rt<Option<Opti
         "getData" | "getDataString" => Some(Some(pseudo_get(vm, h, P_DATA).unwrap_or(V::Ref(0)))),
         "setType" => {
             pseudo_set(vm, h, P_TYPE, args[1]);
+            pseudo_set(vm, h, P_DATA, V::Ref(0));
             Some(Some(args[0]))
         }
         "getType" => Some(Some(pseudo_get(vm, h, P_TYPE).unwrap_or(V::Ref(0)))),
