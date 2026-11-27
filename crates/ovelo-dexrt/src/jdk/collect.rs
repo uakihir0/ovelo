@@ -1193,7 +1193,22 @@ fn list_call(vm: &mut Vm, name: &str, sig: &str, args: &[V]) -> Rt<Option<Option
             // Host::List stores — they'd iterate empty (navigation
             // `getBackStackEntry` found nothing and threw).
             let items: Vec<V> = match list_snapshot(vm, h) {
-                Some(l) => {
+                Some(mut l) => {
+                    // Obfuscated kotlin ArrayDeque fields do not expose
+                    // usable head/size names. Its backing array capacity
+                    // otherwise looks like logical elements, including
+                    // trailing nulls; ask the guest for the real size and
+                    // keep intentional nulls inside that logical window.
+                    if vm.dbg_class_of(h) == "Lkotlin/collections/ArrayDeque;" {
+                        if let Some(n) = vm
+                            .call_virtual_rt(h, "size", &[])
+                            .ok()
+                            .flatten()
+                            .map(|v| i64v(v).max(0) as usize)
+                        {
+                            l.truncate(n);
+                        }
+                    }
                     if crate::dbg_flag("OVELO_ITERDBG") {
                         eprintln!(
                             "[iterdbg] iterator on h{h} {} len={}",
