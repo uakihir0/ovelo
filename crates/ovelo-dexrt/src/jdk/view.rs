@@ -8522,6 +8522,16 @@ fn menu_add_entry(
             &[V::I32(group), V::I32(id), V::I32(order), title_v],
         ) {
             Ok(Some(it)) => {
+                // Host compatibility accessors (`getTitleCondensed` and
+                // friends) sit in front of the dex item, so mirror the
+                // constructor-time metadata that MenuBuilder.add set on
+                // its real fields. ActionMenuItemView.initialize depends
+                // on that title to size and draw the action button.
+                if let V::Ref(ih) = it {
+                    pseudo_set(vm, ih, P_MENU_ID, V::I32(id));
+                    pseudo_set(vm, ih, P_MENU_GROUP, V::I32(group));
+                    pseudo_set(vm, ih, P_TEXT, title_v);
+                }
                 menu_push(vm, menu_h, id, it);
                 return it;
             }
