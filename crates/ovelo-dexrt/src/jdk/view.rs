@@ -6968,8 +6968,9 @@ pub(crate) fn dispatch_touch(
                 Some(V::Ref(l)) if l != 0 => Some(l),
                 _ => None,
             };
-            let clickable =
-                listener.is_some() || pseudo_get(vm, v, P_DIALOG_BUTTON_WHICH).is_some();
+            let clickable = listener.is_some()
+                || pseudo_get(vm, v, P_DIALOG_BUTTON_WHICH).is_some()
+                || is_compound_desc(vm, &class_of(vm, V::Ref(v)));
             if clickable {
                 let down_target = vm.touch_gesture_target;
                 if down_target != 0 && view_or_descendant(vm, v, down_target) {
