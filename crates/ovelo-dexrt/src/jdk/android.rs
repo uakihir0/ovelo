@@ -4417,6 +4417,15 @@ fn pm_call(vm: &mut Vm, name: &str, args: &[V]) -> Rt<Option<Option<V>>> {
                     None => Some(Some(V::Ref(0))),
                 }
             }
+            "getPackagesForUid" => {
+                let pkg = vm.guest_package.clone().unwrap_or_default();
+                let pv = jstr(vm, &pkg);
+                Some(Some(vm.alloc_array("Ljava/lang/String;", vec![pv])))
+            }
+            "getNameForUid" => {
+                let pkg = vm.guest_package.clone().unwrap_or_default();
+                Some(Some(jstr(vm, &pkg)))
+            }
             "getInstallerPackageName"
             | "getDrawable"
             | "getActivityIcon"
@@ -4439,8 +4448,6 @@ fn pm_call(vm: &mut Vm, name: &str, args: &[V]) -> Rt<Option<Option<V>>> {
             | "getUserBadgedIcon"
             | "getUserBadgedLabel"
             | "getUserBadgedDrawableForDensity"
-            | "getPackagesForUid"
-            | "getNameForUid"
             | "resolveActivity"
             | "resolveService"
             | "resolveContentProvider"
