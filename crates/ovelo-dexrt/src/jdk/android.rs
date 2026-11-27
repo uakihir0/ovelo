@@ -2026,7 +2026,7 @@ fn intent_call(vm: &mut Vm, name: &str, sig: &str, args: &[V]) -> Rt<Option<Opti
         "getDataString" => Some(Some(
             pseudo_get(vm, h, P_DATA)
                 .and_then(|v| sv(vm, v))
-                .map(|s| jstr(vm, &s))
+                .map(|s| jdynstr(vm, &s))
                 .unwrap_or(V::Ref(0)),
         )),
         "setType" => {
