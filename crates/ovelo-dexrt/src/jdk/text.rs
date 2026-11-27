@@ -46,9 +46,14 @@ pub(crate) fn call(
         "Landroid/text/SpannableString;"
         | "Landroid/text/SpannableStringBuilder;"
         | "Landroid/text/Spannable;"
-        | "Landroid/text/Spanned;"
-        | "Landroid/text/Editable;"
-        | "Landroid/text/GetChars;" => Ok(spannable_call(vm, name, args)),
+        | "Landroid/text/Spanned;" => Ok(spannable_call(vm, name, args)),
+        "Landroid/text/Editable;" | "Landroid/text/GetChars;" => {
+            if name == "getChars" {
+                getchars_call(vm, args)
+            } else {
+                Ok(spannable_call(vm, name, args))
+            }
+        }
         "Landroid/text/Layout$Alignment;" => Ok(align_call(vm, name, args)),
         "Landroid/text/style/CharacterStyle;" => Ok(chstyle_call(name, args)),
         _ => Ok(None),
@@ -154,31 +159,51 @@ fn spannable_call(vm: &mut Vm, name: &str, args: &[V]) -> Option<Option<V>> {
         "getSpanStart" | "getSpanEnd" | "getSpanFlags" | "nextSpanTransition" => {
             Some(Some(V::I32(-1)))
         }
-        "getChars" => {
-            let t: Vec<char> = cs_text(vm, this).chars().collect();
-            let start = args.get(1).map(|v| i32v(*v)).unwrap_or(0).max(0) as usize;
-            let end = args
-                .get(2)
-                .map(|v| i32v(*v))
-                .unwrap_or(t.len() as i32)
-                .max(0) as usize;
-            let dst_start = args.get(4).map(|v| i32v(*v)).unwrap_or(0).max(0) as usize;
-            if let Some(V::Ref(dh)) = args.get(3).copied() {
-                if let Some(Obj::Array { data, .. }) = vm.heap.get_mut(dh) {
-                    for (i, c) in t[start.min(t.len())..end.min(t.len())].iter().enumerate() {
-                        if let Some(slot) = data.get_mut(dst_start + i) {
-                            *slot = V::I32(*c as i32);
-                        }
-                    }
-                }
-            }
-            Some(None)
-        }
         "append" | "insert" | "delete" | "clear" | "clearSpans" => {
             Some(Some(args.first().copied().unwrap_or(V::Ref(0))))
         }
         _ => None,
     }
+}
+
+/// `GetChars.getChars` — Java indexes and `char[]` elements are UTF-16
+/// code units, so iterating Rust scalar values would split surrogate
+/// pairs and shift every following index.
+fn getchars_call(vm: &mut Vm, args: &[V]) -> Rt<Option<Option<V>>> {
+    let this = match args.first() {
+        Some(&V::Ref(h)) => h,
+        _ => 0,
+    };
+    let units: Vec<u16> = cs_text(vm, this).encode_utf16().collect();
+    let start = args.get(1).map(|v| i32v(*v)).unwrap_or(0);
+    let end = args.get(2).map(|v| i32v(*v)).unwrap_or(0);
+    let dst_start = args.get(4).map(|v| i32v(*v)).unwrap_or(0);
+    let count = end.wrapping_sub(start);
+    let (dst_len, dh) = match args.get(3).copied() {
+        Some(V::Ref(dh)) => match vm.heap.get(dh) {
+            Some(Obj::Array { data, .. }) => (data.len(), dh),
+            _ => (0, 0),
+        },
+        _ => (0, 0),
+    };
+    let bad = start < 0
+        || end < start
+        || end as usize > units.len()
+        || dst_start < 0
+        || count as usize > dst_len.saturating_sub(dst_start.max(0) as usize);
+    if bad {
+        return Err(vm.throw_builtin(
+            "Ljava/lang/IndexOutOfBoundsException;",
+            "getChars range outside text or destination",
+        ));
+    }
+    if let Some(Obj::Array { data, .. }) = vm.heap.get_mut(dh) {
+        let (start, end, dst_start) = (start as usize, end as usize, dst_start as usize);
+        for (i, unit) in units[start..end].iter().enumerate() {
+            data[dst_start + i] = V::I32(*unit as i32);
+        }
+    }
+    Ok(Some(None))
 }
 
 /// `BoringLayout$Metrics` — `width` canon field + pseudo mirror.
