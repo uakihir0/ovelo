@@ -6795,43 +6795,55 @@ pub(crate) fn dispatch_touch(
     // An outside-tap dismissal consumes the whole gesture. The DOWN is
     // handled below; remember it with a sentinel so the paired UP cannot
     // fall through to the newly exposed background and fire its click.
-    if (action == 1 || action == 3) && vm.touch_gesture_target == u32::MAX {
-        vm.touch_gesture_target = 0;
-        vm.touch_gesture_down_time = -1;
+    if (action == 1 || action == 2 || action == 3) && vm.touch_gesture_target == u32::MAX {
+        if action != 2 {
+            vm.touch_gesture_target = 0;
+            vm.touch_gesture_down_time = -1;
+        }
         return Ok(true);
     }
-    let mut target = 0u32;
-    for r in vm.view_roots.clone().iter().rev() {
-        if dbg {
-            eprintln!(
-                "[touchdbg] root h{r} {} {},{},{},{}",
-                vm.dbg_class_of(*r),
-                pint(vm, *r, P_LEFT),
-                pint(vm, *r, P_TOP),
-                pint(vm, *r, P_RIGHT),
-                pint(vm, *r, P_BOTTOM)
-            );
-        }
-        // A laid-out root only wins when the point is inside it —
-        // view_roots also collects detached adapter rows/dialog
-        // trees, and the last one would otherwise swallow every tap.
-        let l = pint(vm, *r, P_LEFT);
-        let t = pint(vm, *r, P_TOP);
-        let rr = pint(vm, *r, P_RIGHT);
-        let b = pint(vm, *r, P_BOTTOM);
-        let inside = if rr > l || b > t {
-            x >= l && x < rr && y >= t && y < b
-        } else {
-            // Never laid out yet — accept so early taps still land.
-            true
-        };
-        if !inside {
-            continue;
-        }
-        // A root's frame is already absolute (screen origin).
-        if let Some(v) = deepest(vm, *r, x, y, 0, 0) {
-            target = v;
-            break;
+    // Once a dex view owns DOWN, the rest of the gesture goes to that
+    // view even when the pointer leaves its bounds. Re-hit-testing each
+    // MOVE/UP would deliver a move series to a neighbor that never saw
+    // the original DOWN.
+    let mut target = if action != 0 && vm.touch_gesture_target != 0 {
+        vm.touch_gesture_target
+    } else {
+        0
+    };
+    if target == 0 {
+        for r in vm.view_roots.clone().iter().rev() {
+            if dbg {
+                eprintln!(
+                    "[touchdbg] root h{r} {} {},{},{},{}",
+                    vm.dbg_class_of(*r),
+                    pint(vm, *r, P_LEFT),
+                    pint(vm, *r, P_TOP),
+                    pint(vm, *r, P_RIGHT),
+                    pint(vm, *r, P_BOTTOM)
+                );
+            }
+            // A laid-out root only wins when the point is inside it —
+            // view_roots also collects detached adapter rows/dialog
+            // trees, and the last one would otherwise swallow every tap.
+            let l = pint(vm, *r, P_LEFT);
+            let t = pint(vm, *r, P_TOP);
+            let rr = pint(vm, *r, P_RIGHT);
+            let b = pint(vm, *r, P_BOTTOM);
+            let inside = if rr > l || b > t {
+                x >= l && x < rr && y >= t && y < b
+            } else {
+                // Never laid out yet — accept so early taps still land.
+                true
+            };
+            if !inside {
+                continue;
+            }
+            // A root's frame is already absolute (screen origin).
+            if let Some(v) = deepest(vm, *r, x, y, 0, 0) {
+                target = v;
+                break;
+            }
         }
     }
     if target == 0 {
