@@ -7518,6 +7518,14 @@ pub(crate) fn dialog_show(vm: &mut Vm, dialog: u32) {
         }
     };
     if content != root {
+        // `setContentView` can replace the content between shows while
+        // the panel object is reused. Drop the prior child or both old
+        // and new content remain stacked in the same panel.
+        for child in children(vm, root) {
+            if child != V::Ref(content) {
+                detach(vm, root, child, false);
+            }
+        }
         if let Some(V::Ref(old_parent)) = pseudo_get(vm, content, P_PARENT) {
             if old_parent != 0 && old_parent != root {
                 detach(vm, old_parent, V::Ref(content), false);
