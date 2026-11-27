@@ -5615,6 +5615,8 @@ fn handler_call(vm: &mut Vm, name: &str, args: &[V]) -> Rt<Option<Option<V>>> {
                 };
                 if delay > 0 {
                     vm.enqueue_runnable_delayed(r, true, delay);
+                } else if name.contains("AtFrontOfQueue") {
+                    vm.pending_runnables.push_front((r, true));
                 } else {
                     vm.enqueue_runnable(r, true);
                 }
