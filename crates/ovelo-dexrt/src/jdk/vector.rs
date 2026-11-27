@@ -382,10 +382,22 @@ fn render_layer_list(rv: RCtx<'_>, res_id: u32) -> Option<(u32, u32, Rc<Vec<u8>>
     // remained visible in a correctly sized drawable.
     let (mut cw, mut ch) = (96usize, 96usize);
     for item in els.iter().filter(|e| e.depth == 1 && e.name == "item") {
-        let l = xml_dimen_attr(rv, item, "left").unwrap_or(0.0).max(0.0) as usize;
-        let t = xml_dimen_attr(rv, item, "top").unwrap_or(0.0).max(0.0) as usize;
-        let r = xml_dimen_attr(rv, item, "right").unwrap_or(0.0).max(0.0) as usize;
-        let b = xml_dimen_attr(rv, item, "bottom").unwrap_or(0.0).max(0.0) as usize;
+        let l = xml_dimen_attr(rv, item, "left")
+            .unwrap_or(0.0)
+            .round()
+            .max(0.0) as usize;
+        let t = xml_dimen_attr(rv, item, "top")
+            .unwrap_or(0.0)
+            .round()
+            .max(0.0) as usize;
+        let r = xml_dimen_attr(rv, item, "right")
+            .unwrap_or(0.0)
+            .round()
+            .max(0.0) as usize;
+        let b = xml_dimen_attr(rv, item, "bottom")
+            .unwrap_or(0.0)
+            .round()
+            .max(0.0) as usize;
         if let Some(Value::Reference(child)) = item.android("drawable") {
             if let Some((w, h, _)) = drawable_bitmap(
                 RCtx {
