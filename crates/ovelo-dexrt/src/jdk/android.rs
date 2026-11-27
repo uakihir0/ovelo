@@ -4317,7 +4317,9 @@ fn res_misc(vm: &mut Vm, class: &str, name: &str, args: &[V]) -> Rt<Option<Optio
                     let u = raw as u32;
                     let color = if raw >= 0 && (0x0101_0000..0x0102_0000).contains(&u) {
                         crate::theme_color(vm, u).unwrap_or_else(|| resolve_color_id(vm, u)) as i32
-                    } else if raw >= 0 && u >= 0x7f00_0000 {
+                    } else if raw >= 0
+                        && (u >= 0x7f00_0000 || (0x0106_0000..0x0107_0000).contains(&u))
+                    {
                         resolve_color_id(vm, u) as i32
                     } else {
                         raw
