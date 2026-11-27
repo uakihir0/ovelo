@@ -1013,8 +1013,11 @@ impl GuestUi {
                     Some(V::I32(b)) => f32::from_bits(*b as u32),
                     _ => return Err(crate::err("guest.arg.type")),
                 };
+                // setTextSize uses scaled pixels; DisplayMetrics exposes
+                // scaledDensity=2 in this runtime.
+                let size = size * 2.0;
+                ovelo_dexrt::pseudo_set(vm, this, ovelo_dexrt::P_TSIZE, V::F32(size));
                 let Some(rc) = ui.views.get(&this).cloned() else {
-                    ovelo_dexrt::pseudo_set(vm, this, ovelo_dexrt::P_TSIZE, V::F32(size));
                     ovelo_dexrt::mark_layout_requested(vm, this);
                     return Ok(None);
                 };

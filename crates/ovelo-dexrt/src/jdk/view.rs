@@ -2078,6 +2078,26 @@ pub(crate) fn call(
         "getContentDescription" => Some(Some(
             pseudo_get(vm, this, P_CDESC).unwrap_or_else(|| jstr(vm, "")),
         )),
+        "setTextSize" => {
+            let size = match args.last() {
+                Some(V::F32(f)) => *f,
+                Some(V::I32(b)) => f32::from_bits(*b as u32),
+                _ => 0.0,
+            };
+            let unit = if args.len() >= 3 {
+                i32v(args.get(1).copied().unwrap_or(V::I32(2)))
+            } else {
+                2
+            };
+            let scale = match unit {
+                0 => 1.0,
+                1 | 2 => 2.0,
+                _ => 1.0,
+            };
+            pseudo_set(vm, this, P_TSIZE, V::F32(size * scale));
+            mark_layout_requested(vm, this);
+            Some(None)
+        }
         "setImageBitmap" | "setImageDrawable" | "setImageURI" | "setImageIcon"
         | "setImageResource" => {
             pseudo_set(vm, this, P_IMAGE, args.get(1).copied().unwrap_or(V::I32(0)));
@@ -2659,7 +2679,6 @@ pub(crate) fn call(
         | "setAccessibilityLiveRegion"
         | "setBackground"
         | "setTextColor"
-        | "setTextSize"
         | "setTypeface"
         | "setSingleLine"
         | "setMaxLines"
