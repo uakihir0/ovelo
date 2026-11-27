@@ -244,7 +244,7 @@ pub(crate) fn call(
     {
         format_call(vm, name, args)
     } else if class == "Lorg/json/JSONObject;" {
-        json_obj(vm, name, args)
+        json_obj(vm, name, args)?
     } else if class == "Lorg/json/JSONArray;" {
         json_arr(vm, name, args)
     } else if class == "Ljavax/net/ssl/TrustManagerFactory;" {
@@ -2677,12 +2677,12 @@ fn json_coerce_number(vm: &Vm, v: V, name: &str) -> V {
     }
 }
 
-fn json_obj(vm: &mut Vm, name: &str, args: &[V]) -> Option<Option<V>> {
+fn json_obj(vm: &mut Vm, name: &str, args: &[V]) -> Rt<Option<Option<V>>> {
     let h = match args.first() {
         Some(V::Ref(h)) => *h,
-        _ => return None,
+        _ => return Ok(None),
     };
-    match name {
+    Ok(match name {
         "<init>" => {
             if let Some(src) = args.get(1).and_then(|v| sv(vm, *v)) {
                 let b: Vec<char> = src.chars().collect();
@@ -2706,10 +2706,38 @@ fn json_obj(vm: &mut Vm, name: &str, args: &[V]) -> Option<Option<V>> {
             map_put(vm, h, args[1], args.get(2).copied().unwrap_or(V::Ref(0)));
             Some(V::Ref(h))
         }
-        "get" | "opt" | "getJSONObject" | "getJSONArray" => match map_get(vm, h, args[1]) {
-            Some(V::Ref(0)) => sfield(vm, "Lorg/json/JSONObject;", "NULL", OBJ).or(Some(V::Ref(0))),
+        "get" | "opt" => match map_get(vm, h, args[1]) {
+            Some(V::Ref(0)) => Some(json_null(vm)),
             v => v.or(Some(V::Ref(0))),
         },
+        "getJSONObject" | "getJSONArray" | "optJSONObject" | "optJSONArray" => {
+            let v = match map_get(vm, h, args[1]) {
+                Some(V::Ref(0)) => json_null(vm),
+                Some(v) => v,
+                None => V::Ref(0),
+            };
+            let want_arr = name.ends_with("JSONArray");
+            let is_null = matches!(v, V::Ref(0)) || matches!(v, V::Ref(vh) if vh == vm.json_null_h);
+            let matches_type = matches!(v, V::Ref(vh) if vh != 0 && matches!(
+                vm.heap.get(vh),
+                Some(Obj::Host { desc, .. })
+                    if (want_arr && desc == "Lorg/json/JSONArray;")
+                        || (!want_arr && desc == "Lorg/json/JSONObject;")
+            ));
+            if matches_type {
+                Some(v)
+            } else if name.starts_with("opt") {
+                Some(V::Ref(0))
+            } else {
+                let key = sv(vm, args[1]).unwrap_or_default();
+                let why = if is_null {
+                    format!("Value null at {key} is not an object")
+                } else {
+                    format!("Value at {key} has the wrong type")
+                };
+                return Err(vm.throw_builtin("Lorg/json/JSONException;", &why));
+            }
+        }
         "getString" | "optString" | "getName" => {
             let v = map_get(vm, h, args[1]);
             Some(match v {
@@ -2771,9 +2799,9 @@ fn json_obj(vm: &mut Vm, name: &str, args: &[V]) -> Option<Option<V>> {
             ))
         }
         "toString" | "toStringInt" => Some(jstr(vm, &json_dump_v(vm, V::Ref(h)))),
-        _ => return None,
+        _ => return Ok(None),
     }
-    .map(Some)
+    .map(Some))
 }
 
 fn json_arr(vm: &mut Vm, name: &str, args: &[V]) -> Option<Option<V>> {

@@ -1889,6 +1889,15 @@ fn universal(vm: &mut Vm, class: &str, name: &str, sig: &str, args: &[V]) -> Rt<
 /// `ftype` is the field's declared type — a self-typed field
 /// (`TimeUnit.SECONDS: Ljava/util/concurrent/TimeUnit;`) is an enum
 /// constant and gets a stable host object carrying its name.
+pub(crate) fn json_null(vm: &mut Vm) -> V {
+    if vm.json_null_h == 0 {
+        if let V::Ref(h) = host(vm, "Lorg/json/JSONObject$Null;", HostState::Empty) {
+            vm.json_null_h = h;
+        }
+    }
+    V::Ref(vm.json_null_h)
+}
+
 pub(crate) fn sfield(vm: &mut Vm, owner: &str, name: &str, ftype: &str) -> Option<V> {
     // Reflective static reads (`Field.get(null)`) on host classes reach
     // here by name — the dex field index never sees them.
@@ -2256,9 +2265,7 @@ pub(crate) fn sfield(vm: &mut Vm, owner: &str, name: &str, ftype: &str) -> Optio
         ("Landroid/content/Intent;", "FLAG_ACTIVITY_SINGLE_TOP") => V::I32(0x20000000),
         ("Landroid/content/Intent;", "FLAG_GRANT_READ_URI_PERMISSION") => V::I32(1),
         ("Landroid/content/Intent;", "FLAG_GRANT_WRITE_URI_PERMISSION") => V::I32(2),
-        ("Lorg/json/JSONObject;", "NULL") => {
-            return Some(host(vm, "Lorg/json/JSONObject$Null;", HostState::Empty))
-        }
+        ("Lorg/json/JSONObject;", "NULL") => return Some(json_null(vm)),
         // MediaStore$Images$Media.EXTERNAL_CONTENT_URI & friends —
         // content-provider base URIs guests parse/query on. Null here
         // NPEs inside <clinit> (fossify gallery NewPhotoFetcher).

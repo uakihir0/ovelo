@@ -240,6 +240,9 @@ pub struct Vm {
     /// Interned `Application` — `getApplication[Context]` must return a
     /// real Application-typed object (callers `check-cast` it).
     pub(crate) app_h: u32,
+    /// Interned org.json JSONObject.NULL sentinel — reference equality
+    /// against the static field must hold across parses and reads.
+    pub(crate) json_null_h: u32,
     /// sun.misc.Unsafe model: offset tokens minted by `objectFieldOffset`,
     /// `(object handle, offset)` -> stored value (CAS/volatile get/put).
     pub(crate) unsafe_offsets: HashMap<(u32, i64), V>,
@@ -851,6 +854,7 @@ impl Vm {
             main_looper_h: 0,
             main_dispatcher_h: 0,
             app_h: 0,
+            json_null_h: 0,
             unsafe_offsets: HashMap::new(),
             unsafe_next_offset: 0,
             trace_field: std::env::var("OVELO_TRACE_FIELD").ok(),
