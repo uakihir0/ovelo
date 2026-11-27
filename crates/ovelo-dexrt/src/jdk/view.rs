@@ -5624,6 +5624,14 @@ pub(crate) fn dispatch_touch(
         (ox, oy)
     }
     let dbg = crate::dbg_flag("OVELO_TOUCHDBG");
+    // An outside-tap dismissal consumes the whole gesture. The DOWN is
+    // handled below; remember it with a sentinel so the paired UP cannot
+    // fall through to the newly exposed background and fire its click.
+    if (action == 1 || action == 3) && vm.touch_gesture_target == u32::MAX {
+        vm.touch_gesture_target = 0;
+        vm.touch_gesture_down_time = -1;
+        return Ok(true);
+    }
     let mut target = 0u32;
     for r in vm.view_roots.clone().iter().rev() {
         if dbg {
@@ -5695,6 +5703,8 @@ pub(crate) fn dispatch_touch(
             }
         }
         if consumed {
+            vm.touch_gesture_target = u32::MAX;
+            vm.touch_gesture_down_time = now_ms();
             return Ok(true);
         }
     }
