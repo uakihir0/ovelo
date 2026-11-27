@@ -278,6 +278,7 @@ fn raster_stroke_to_bitmap(
     }
     let radius = (paint.stroke_w / 2.0).max(0.5);
     let mut out = base.as_ref().clone();
+    let mut covered = vec![false; (bw * bh) as usize];
     for pts in contours {
         for seg in pts.windows(2) {
             let (a, b) = (seg[0], seg[1]);
@@ -289,12 +290,10 @@ fn raster_stroke_to_bitmap(
                 for xx in minx..=maxx {
                     let px = xx as f32 + 0.5;
                     let py = yy as f32 + 0.5;
-                    if stroke_seg_dist(px, py, a, b) <= radius {
-                        blend_px(
-                            &mut out,
-                            ((yy as u32 * bw + xx as u32) * 4) as usize,
-                            paint.draw_argb(),
-                        );
+                    let pi = (yy as u32 * bw + xx as u32) as usize;
+                    if !covered[pi] && stroke_seg_dist(px, py, a, b) <= radius {
+                        covered[pi] = true;
+                        blend_px(&mut out, pi * 4, paint.draw_argb());
                     }
                 }
             }
