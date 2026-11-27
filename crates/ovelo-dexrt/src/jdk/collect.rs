@@ -1362,6 +1362,43 @@ fn map_call(vm: &mut Vm, name: &str, sig: &str, args: &[V]) -> Rt<Option<Option<
     };
     let class = class_of(vm, args[0]);
     Ok(match name {
+        "getProperty" if class == "Ljava/util/Properties;" => {
+            let out = map_get(vm, h, args[1]).or_else(|| args.get(2).copied());
+            Some(Some(out.unwrap_or(V::Ref(0))))
+        }
+        "load" if class == "Ljava/util/Properties;" => {
+            let bytes = match args.get(1).copied() {
+                Some(V::Ref(sh)) => match vm.heap.get_mut(sh) {
+                    Some(Obj::Host {
+                        state: HostState::Bytes(b, pos),
+                        ..
+                    }) => {
+                        let out = b[*pos..].to_vec();
+                        *pos = b.len();
+                        out
+                    }
+                    _ => Vec::new(),
+                },
+                _ => Vec::new(),
+            };
+            let text = String::from_utf8_lossy(&bytes).into_owned();
+            for line in text.split('\n') {
+                let line = line.trim_end_matches('\r').trim();
+                if line.is_empty() || line.starts_with('#') || line.starts_with('!') {
+                    continue;
+                }
+                let cut = line
+                    .find(['=', ':'])
+                    .or_else(|| line.find(char::is_whitespace));
+                let (k, v) = match cut {
+                    Some(i) => (line[..i].trim(), line[i + 1..].trim()),
+                    None => (line, ""),
+                };
+                let (k, v) = (jstr(vm, k), jstr(vm, v));
+                map_put(vm, h, k, v);
+            }
+            Some(None)
+        }
         "<init>" => {
             // Copy ctor HashMap(Map)/LinkedHashMap(Map) — kotlin
             // `Map.toMap` materializes its copy through it; without a
