@@ -4342,9 +4342,11 @@ impl Vm {
     /// A named field exposed by a host object (`PackageInfo.versionCode`,
     /// `Message.what`, `Pair.first`…) — read when `iget` misses `fields`.
     fn builtin_ifield(&self, h: u32, f: GIdx) -> Option<V> {
-        let Some(Obj::Host { .. }) = self.heap.get(h) else {
-            return None;
-        };
+        // Framework objects are sometimes materialized as ordinary dex
+        // instances even when their class has no guest implementation
+        // (new Point(); Display.getRealSize(point) is the load-bearing
+        // case). Their builtin named fields must still answer instead of
+        // the type default, or host-side writes remain invisible.
         let d = self.dex_of(f)?;
         let fd = d.field(gl(f)).ok()?;
         let owner = d.type_descriptor(fd.class_idx as u32).ok()?;
