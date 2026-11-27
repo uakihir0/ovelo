@@ -1888,6 +1888,7 @@ fn path_call(vm: &mut Vm, name: &str, args: &[V]) -> Rt<Option<Option<V>>> {
     };
     Ok(match name {
         "<init>" => {
+            backing_path_h(vm, h);
             if let Some(V::Ref(src)) = args
                 .get(1)
                 .copied()
