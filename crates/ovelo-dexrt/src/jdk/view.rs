@@ -2636,8 +2636,12 @@ pub(crate) fn call(
             }
             let desc = class_of(vm, V::Ref(this));
             if is_compound_desc(vm, &desc) {
-                let checked = pint(vm, this, P_CHECKED) == 0;
-                set_compound_checked(vm, this, checked as i32);
+                let checked = pint(vm, this, P_CHECKED) != 0;
+                // RadioButton.toggle() is a no-op while already checked;
+                // only CheckBox/Switch-style compounds flip both ways.
+                if !(checked && is_radio_desc(vm, &desc)) {
+                    set_compound_checked(vm, this, (!checked) as i32);
+                }
             }
             let mut fired = match pseudo_get(vm, this, P_LISTENER) {
                 // OnClickListener.onClick returns void: a normal dex
