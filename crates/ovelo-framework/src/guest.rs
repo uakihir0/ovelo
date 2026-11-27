@@ -1129,6 +1129,12 @@ impl GuestUi {
         }
     }
 
+    /// Force the next dex-tree refresh to rematerialize even when the root
+    /// handle is unchanged — activity switches replace which tree is current.
+    pub fn invalidate_dex_tree(&mut self) {
+        self.dex_gen_seen = u64::MAX;
+    }
+
     /// Materialize the Activity's dex view tree (from `setContentView(res)`
     /// inflation) into real host views and hang it under the root — the
     /// renderer for apps that build UI from layout xml rather than

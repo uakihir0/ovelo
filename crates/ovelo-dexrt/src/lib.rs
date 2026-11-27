@@ -628,6 +628,8 @@ pub struct Vm {
     pub pending_activity_caller: Option<(u32, i32)>,
     /// Child activity handle → caller activity and request code.
     pub activity_callers: HashMap<u32, (u32, i32)>,
+    /// Theme resource selected while each activity is foregrounded.
+    pub activity_themes: HashMap<u32, u32>,
     /// canonical class_idx → `java.lang.Class` mirror handle — Class
     /// objects are singletons (`Foo.class == x.getClass()`).
     class_mirrors: HashMap<GIdx, u32>,
@@ -902,6 +904,7 @@ impl Vm {
             activity_back: Vec::new(),
             pending_activity_caller: None,
             activity_callers: HashMap::new(),
+            activity_themes: HashMap::new(),
             pending_runnables: std::collections::VecDeque::new(),
             single_executors: hashbrown::HashSet::new(),
             executor_queues: HashMap::new(),
@@ -3206,6 +3209,17 @@ impl Vm {
             Some(V::I32(res)) if res > 0 => Some(self.drawable_for_res(res as u32)),
             _ => None,
         }
+    }
+
+    /// Drop renderer bookkeeping for a finished activity so a later GC can
+    /// reclaim its view tree and activity object.
+    pub fn retire_activity(&mut self, activity: u32) {
+        let content = self.content_views.remove(&activity);
+        let decor = self.decor_roots.remove(&activity);
+        for root in [content, decor].into_iter().flatten() {
+            self.view_roots.retain(|h| *h != root);
+        }
+        self.activity_themes.remove(&activity);
     }
 
     /// Result code and data recorded by `Activity.setResult`.

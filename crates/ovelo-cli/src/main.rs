@@ -1214,8 +1214,10 @@ fn drain_pending_activity(
             Ok(h2) => {
                 println!("activity {} (started)", disp(&next));
                 if *this != 0 && *this != h2 && !vm.is_finishing(*this) {
+                    vm.activity_themes.insert(*this, prev_theme);
                     vm.activity_back.push(*this);
                 }
+                vm.activity_themes.insert(h2, vm.theme_id);
                 vm.set_activity_intent(h2, intent);
                 if let Some(caller) = vm.pending_activity_caller.take() {
                     vm.activity_callers.insert(h2, caller);
@@ -1246,6 +1248,9 @@ fn pop_finished_activity(vm: &mut ovelo_dexrt::Vm, this: &mut u32) -> bool {
             let finished = *this;
             *this = prev;
             vm.set_activity(prev);
+            if let Some(theme) = vm.activity_themes.get(&prev).copied() {
+                vm.theme_id = theme;
+            }
             if let Some((caller, request_code)) = vm.activity_callers.remove(&finished) {
                 if caller == prev {
                     let (result_code, data) = vm.activity_result(finished);
@@ -1263,6 +1268,9 @@ fn pop_finished_activity(vm: &mut ovelo_dexrt::Vm, this: &mut u32) -> bool {
                     }
                 }
             }
+            let resume = ["onStart".to_string(), "onResume".to_string()];
+            run_activity_cbs(vm, prev, &resume);
+            vm.retire_activity(finished);
             return true;
         }
     }
@@ -1938,6 +1946,7 @@ fn run_app(store: &InstallStore, package: &str) -> Result<(), OveloError> {
         // VM's dex view tree — materialize it into drawable host views.
         if let Some((vm, this)) = &mut guest {
             if pop_finished_activity(vm, this) {
+                ui2.borrow_mut().invalidate_dex_tree();
                 println!("activity finished — restoring previous");
             }
             // One lock for the whole tick — drain_runnables, GC and
