@@ -935,6 +935,46 @@ pub(crate) fn call(
             }
             _ => None,
         }
+    } else if class == "Landroid/app/PendingIntent;" {
+        match name {
+            "getActivity" | "getService" | "getForegroundService" | "getBroadcast" => {
+                let pi = host(vm, "Landroid/app/PendingIntent;", HostState::Empty);
+                if let V::Ref(ph) = pi {
+                    let kind = match name {
+                        "getActivity" => "activity",
+                        "getBroadcast" => "broadcast",
+                        "getService" => "service",
+                        _ => "foregroundservice",
+                    };
+                    let kv = jstr(vm, kind);
+                    pseudo_set(vm, ph, P_ACTION, kv);
+                    if let Some(intent) = args.get(3).copied() {
+                        pseudo_set(vm, ph, P_DATA, intent);
+                    }
+                }
+                Some(Some(pi))
+            }
+            "isActivity" | "isBroadcast" | "isService" | "isForegroundService" => {
+                let wanted = name.trim_start_matches("is").to_ascii_lowercase();
+                let actual = args
+                    .first()
+                    .copied()
+                    .and_then(|v| match v {
+                        V::Ref(h) => pseudo_get(vm, h, P_ACTION).and_then(|k| sv(vm, k)),
+                        _ => None,
+                    })
+                    .unwrap_or_default();
+                Some(Some(V::I32((actual == wanted) as i32)))
+            }
+            "send" | "sendAndReturnResult" => Some(None),
+            "cancel" => Some(None),
+            "getIntentSender"
+            | "getCreatorPackage"
+            | "getCreatorUid"
+            | "getCreatorUserHandle"
+            | "getIntent" => Some(Some(V::Ref(0))),
+            _ => None,
+        }
     } else if class == "Landroid/content/ClipData;" || class == "Landroid/content/ClipboardManager;"
     {
         match name {
