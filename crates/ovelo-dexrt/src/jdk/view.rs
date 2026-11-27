@@ -175,6 +175,8 @@ const P_CHECKED: u32 = 0xFFFD_FFDC;
 const P_RADIO_CHECKED: u32 = 0xFFFD_FFDB;
 /// CompoundButton/RadioGroup `OnCheckedChangeListener`.
 const P_CHECK_LISTENER: u32 = 0xFFFD_FFD3;
+/// Set while a checked-change callback is on the dex stack.
+const P_CHECK_BROADCAST: u32 = 0xFFFD_FFD2;
 const P_SCROLL_X: u32 = 0xFFFD_FFD9;
 const P_SCROLL_Y: u32 = 0xFFFD_FFD8;
 const P_PAD_L: u32 = 0xFFFD_FFD7;
@@ -7741,9 +7743,16 @@ fn is_radio_desc(vm: &Vm, desc: &str) -> bool {
 }
 
 fn notify_checked_listener(vm: &mut Vm, this: u32, arg: V) {
+    // CompoundButton uses mBroadcasting to keep a listener that calls
+    // setChecked() from recursively re-entering the same notification.
+    if pint(vm, this, P_CHECK_BROADCAST) != 0 {
+        return;
+    }
     if let Some(V::Ref(listener)) = pseudo_get(vm, this, P_CHECK_LISTENER) {
         if listener != 0 {
+            pseudo_set(vm, this, P_CHECK_BROADCAST, V::I32(1));
             let _ = vm.call_virtual(listener, "onCheckedChanged", &[V::Ref(this), arg]);
+            pseudo_set(vm, this, P_CHECK_BROADCAST, V::I32(0));
         }
     }
 }
@@ -7755,7 +7764,12 @@ fn radio_group_set_checked(vm: &mut Vm, group: u32, id: i32) {
         if let V::Ref(ch) = c {
             let child_cls = class_of(vm, V::Ref(ch));
             if is_radio_desc(vm, &child_cls) {
-                pseudo_set(vm, ch, P_CHECKED, V::I32((view_id(vm, ch) == id) as i32));
+                let child_checked = (view_id(vm, ch) == id) as i32;
+                let old_child = pint(vm, ch, P_CHECKED);
+                pseudo_set(vm, ch, P_CHECKED, V::I32(child_checked));
+                if old_child != child_checked {
+                    notify_checked_listener(vm, ch, V::I32(child_checked));
+                }
             }
         }
     }
