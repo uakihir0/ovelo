@@ -3586,7 +3586,6 @@ fn context_call(
             if let Some(V::Ref(conn)) = args.get(1).copied() {
                 if let Some(sh) = vm.service_bindings.remove(&conn) {
                     let intent = vm.service_bind_intents.remove(&conn).unwrap_or(V::Ref(0));
-                    let _ = vm.call_virtual(sh, "onUnbind", &[intent]);
                     let remaining = vm
                         .service_bind_counts
                         .get(&sh)
@@ -3595,6 +3594,7 @@ fn context_call(
                         .saturating_sub(1);
                     if remaining == 0 {
                         vm.service_bind_counts.remove(&sh);
+                        let _ = vm.call_virtual(sh, "onUnbind", &[intent]);
                         if !vm.service_started.contains(&sh) {
                             vm.services.retain(|_, live| *live != sh);
                             if !vm.pending_destroy.contains(&sh) {
