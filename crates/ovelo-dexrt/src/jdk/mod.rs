@@ -67,6 +67,8 @@ pub(crate) const P_APPCLASS: u32 = u32::MAX - 54;
 pub(crate) const P_BITMAP_SLOT: u64 = 0xFFFD_FEE0;
 /// A `ColorDrawable`'s fill ARGB — `Drawable.draw` emits a rect fill.
 pub(crate) const P_DRAW_COLOR: u64 = 0xFFFD_FEE1;
+/// A Drawable's cached ConstantState mirror object.
+pub(crate) const P_CONST_STATE: u64 = 0xFFFD_FEE4;
 /// `ByteBuffer` write/read cursor and endianness (1 = little) — the
 /// backing bytes live in `HostState::Slot`.
 pub(crate) const P_BBUF_POS: u64 = 0xFFFD_FEE2;

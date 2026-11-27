@@ -2526,19 +2526,28 @@ fn context_call(
             i64v(args.get(1).copied().unwrap_or(V::I32(0))) as u32,
         ) as i32))),
         "getDrawable" => {
-            let vdc = [
-                "Landroidx/vectordrawable/graphics/drawable/VectorDrawableCompat;",
-                "Landroid/support/graphics/drawable/VectorDrawableCompat;",
-            ]
-            .iter()
-            .find_map(|c| vm.instantiate(c).ok().map(V::Ref));
-            let r = vdc.unwrap_or_else(|| {
-                host(
-                    vm,
-                    "Landroid/graphics/drawable/VectorDrawable;",
-                    HostState::Empty,
-                )
-            });
+            let res_id = i64v(args.get(1).copied().unwrap_or(V::I32(0))) as u32;
+            let r = if res_id > 0
+                && super::vector::rctx(vm)
+                    .and_then(|r| super::vector::drawable_bitmap(r, res_id))
+                    .is_some()
+            {
+                super::vector::drawable_for_res(vm, res_id)
+            } else {
+                [
+                    "Landroidx/vectordrawable/graphics/drawable/VectorDrawableCompat;",
+                    "Landroid/support/graphics/drawable/VectorDrawableCompat;",
+                ]
+                .iter()
+                .find_map(|c| vm.instantiate(c).ok().map(V::Ref))
+                .unwrap_or_else(|| {
+                    host(
+                        vm,
+                        "Landroid/graphics/drawable/VectorDrawable;",
+                        HostState::Empty,
+                    )
+                })
+            };
             if crate::dbg_flag("OVELO_TRACE_DRAW") {
                 eprintln!(
                     "[ctx.getDrawable] class={class} args={:?} -> {r:?}",
@@ -4862,6 +4871,55 @@ fn graphics_call(
             }
             _ => Some(Some(V::Ref(0))),
         },
+        // Drawable constant-state cloning. Material components copy menu
+        // icons through getConstantState().newDrawable(); without carrying
+        // the original bitmap payload across that copy the cloned drawable
+        // is an empty shell and the icon never renders.
+        (c, "getConstantState") if c.ends_with("Drawable;") => match args.first().copied() {
+            Some(V::Ref(h)) => {
+                if let Some(cs @ V::Ref(_)) = pseudo_get(vm, h, P_CONST_STATE) {
+                    Some(Some(cs))
+                } else {
+                    let cs = host(
+                        vm,
+                        "Landroid/graphics/drawable/Drawable$ConstantState;",
+                        HostState::Empty,
+                    );
+                    if let V::Ref(csh) = cs {
+                        pseudo_set(vm, csh, P_DATA, V::Ref(h));
+                    }
+                    pseudo_set(vm, h, P_CONST_STATE, cs);
+                    Some(Some(cs))
+                }
+            }
+            _ => Some(Some(V::Ref(0))),
+        },
+        (c, "newDrawable") if c.ends_with("Drawable$ConstantState;") => {
+            let src = match args.first().copied() {
+                Some(V::Ref(h)) => pseudo_get(vm, h, P_DATA),
+                _ => None,
+            };
+            let cloned = src.and_then(|v| match v {
+                V::Ref(h) => {
+                    let (desc, fields) = match vm.heap.get(h) {
+                        Some(Obj::Host { desc, fields, .. }) => (desc.clone(), fields.clone()),
+                        _ => (
+                            "Landroid/graphics/drawable/Drawable;".to_string(),
+                            Default::default(),
+                        ),
+                    };
+                    let out = host(vm, &desc, HostState::Empty);
+                    if let V::Ref(oh) = out {
+                        if let Some(dst) = fields_mut(vm, oh) {
+                            dst.extend(fields);
+                        }
+                    }
+                    Some(out)
+                }
+                _ => None,
+            });
+            Some(cloned.or(Some(V::Ref(0))))
+        }
         // Drawable bounds: a cached Rect mirroring setBounds writes —
         // TabLayout's indicator path reads `drawable.getBounds().left`.
         (
