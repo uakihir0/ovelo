@@ -2186,7 +2186,9 @@ fn color_state_list_match(vm: &Vm, h: u32, state_set: Option<u32>) -> Option<V> 
         pseudo_get(vm, h, P_CSL_STATES),
         pseudo_get(vm, h, P_CSL_COLORS),
     ) else {
-        return None;
+        // valueOf()/flat resource colors carry no state rows: they are
+        // the same color in every state, not an unmatched stateful list.
+        return slot_of(vm, h);
     };
     let n = list_len(vm, states).unwrap_or(0);
     for row in 0..n {
