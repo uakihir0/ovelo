@@ -1900,15 +1900,16 @@ fn clone_intent(vm: &mut Vm, h: u32) -> V {
 }
 
 fn mime_matches(pattern: &str, actual: &str) -> bool {
+    if pattern == "*" || actual == "*/*" || pattern == "*/*" {
+        return true;
+    }
     let Some((pt, ps)) = pattern.split_once('/') else {
         return false;
     };
-    let Some((at, _)) = actual.split_once('/') else {
+    let Some((at, asub)) = actual.split_once('/') else {
         return false;
     };
-    (ps == "*" && pt.eq_ignore_ascii_case(at))
-        || pattern.eq_ignore_ascii_case(actual)
-        || (pt == "*" && ps == "*")
+    pt.eq_ignore_ascii_case(at) && (ps == "*" || asub == "*" || ps.eq_ignore_ascii_case(asub))
 }
 
 /// Resolve an implicit activity Intent against the manifest filters the
