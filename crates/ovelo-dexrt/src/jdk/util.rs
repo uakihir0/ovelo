@@ -281,10 +281,32 @@ pub(crate) fn call(
                             | "completeExceptionally"
                             | "cancel"
                     ) {
-                        Some(Some(V::I32(matches!(name, "isDone") as i32)))
+                        let done = args.first().and_then(|v| match v {
+                            V::Ref(h) => pseudo_get(vm, *h, P_FUTURE_DONE),
+                            _ => None,
+                        });
+                        Some(Some(V::I32(match (name, done) {
+                            ("isDone", Some(v)) => i32v(v),
+                            ("isDone", None) => 1,
+                            _ => 0,
+                        })))
                     } else if name == "complete" {
                         Some(Some(V::I32(1)))
                     } else if matches!(name, "get" | "join" | "getNow") {
+                        if let Some(V::Ref(h)) = args.first() {
+                            // ExecutorService.submit futures start pending.
+                            // `get` blocks in Java; pump the cooperative
+                            // scheduler for a bounded interval so the queued
+                            // wrapper can complete before reading the slot.
+                            for _ in 0..64 {
+                                if !matches!(pseudo_get(vm, *h, P_FUTURE_DONE), Some(V::I32(0))) {
+                                    break;
+                                }
+                                if vm.drain_runnables(16) == 0 {
+                                    break;
+                                }
+                            }
+                        }
                         if let Some(v) = args.first().and_then(|v| match v {
                             V::Ref(h) => slot_of(vm, *h),
                             _ => None,

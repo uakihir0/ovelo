@@ -547,6 +547,7 @@ pub(crate) fn call(
                     );
                     let wrapper_v = host(vm, "Ljava/lang/Runnable;", HostState::Empty);
                     if let (V::Ref(future), V::Ref(wrapper)) = (future_v, wrapper_v) {
+                        pseudo_set(vm, future, P_FUTURE_DONE, V::I32(0));
                         pseudo_set(vm, wrapper, P_FUTURE_TARGET, V::Ref(task));
                         pseudo_set(vm, wrapper, P_FUTURE, V::Ref(future));
                         pseudo_set(
