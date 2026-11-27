@@ -164,6 +164,8 @@ const P_ORIENTATION: u32 = 0xFFFD_FFDD;
 /// CompoundButton checked state / RadioGroup's checked child id.
 const P_CHECKED: u32 = 0xFFFD_FFDC;
 const P_RADIO_CHECKED: u32 = 0xFFFD_FFDB;
+/// TextView compound drawables in start/top/end/bottom order.
+const P_COMPOUND_DRAWABLES: u32 = 0xFFFD_FFDA;
 /// Live `setTextColor` ARGB — written by the guest bridge's
 /// fallthrough for dex-inflated views.
 pub const P_TCOLOR: u32 = 0xFFFD_FFE3;
@@ -2789,6 +2791,28 @@ pub(crate) fn call(
             pseudo_set(vm, this, P_FOCUSED, V::I32(0));
             Some(None)
         }
+        "setCompoundDrawables"
+        | "setCompoundDrawablesRelative"
+        | "setCompoundDrawablesWithIntrinsicBounds"
+        | "setCompoundDrawablesRelativeWithIntrinsicBounds" => {
+            let vals: Vec<V> = (1..=4)
+                .map(|i| args.get(i).copied().unwrap_or(V::Ref(0)))
+                .collect();
+            let a = arr(vm, "Landroid/graphics/drawable/Drawable;", vals);
+            pseudo_set(vm, this, P_COMPOUND_DRAWABLES, a);
+            Some(None)
+        }
+        "getCompoundDrawables" | "getCompoundDrawablesRelative" => {
+            let out = match pseudo_get(vm, this, P_COMPOUND_DRAWABLES) {
+                Some(v @ V::Ref(_)) => v,
+                _ => arr(
+                    vm,
+                    "Landroid/graphics/drawable/Drawable;",
+                    vec![V::Ref(0); 4],
+                ),
+            };
+            Some(Some(out))
+        }
         "setAlpha"
         | "setPadding"
         | "setElevation"
@@ -2849,7 +2873,6 @@ pub(crate) fn call(
         | "setEllipsize"
         | "setInputType"
         | "setImeOptions"
-        | "setCompoundDrawables"
         | "setError"
         | "setMovementMethod"
         | "setMarqueeRepeatLimit"
