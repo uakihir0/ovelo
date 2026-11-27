@@ -1889,14 +1889,7 @@ pub(crate) fn call(
             Some(Some(V::Ref(hit)))
         }
         "getId" => Some(Some(V::I32(view_id(vm, this)))),
-        "generateViewId" => {
-            // AOSP: AtomicInteger starting at 1 — dex-created views
-            // (FragmentContainerView) need nonzero unique ids.
-            static NEXT: std::sync::atomic::AtomicI32 = std::sync::atomic::AtomicI32::new(1);
-            Some(Some(V::I32(
-                NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed),
-            )))
-        }
+        "generateViewId" => Some(Some(V::I32(generate_view_id()))),
         "setId" => {
             pseudo_set(
                 vm,
@@ -6599,15 +6592,13 @@ fn build_tree(vm: &mut Vm, elems: &[Element], ctx: V) -> V {
                     eprintln!("[viewdbg] attach h{h} -> parent h{p}");
                 }
                 attach(vm, p, V::Ref(h));
-                if pint(vm, h, P_CHECKED) != 0 {
-                    let child_cls = class_of(vm, V::Ref(h));
-                    let cls = class_of(vm, V::Ref(p));
-                    if is_radio_desc(vm, &child_cls)
-                        && (cls == "Landroid/widget/RadioGroup;"
-                            || vm.assignable_desc(&cls, "Landroid/widget/RadioGroup;"))
-                    {
-                        set_compound_checked(vm, h, 1);
-                    }
+                let child_cls = class_of(vm, V::Ref(h));
+                let cls = class_of(vm, V::Ref(p));
+                let radio_in_group = is_radio_desc(vm, &child_cls)
+                    && (cls == "Landroid/widget/RadioGroup;"
+                        || vm.assignable_desc(&cls, "Landroid/widget/RadioGroup;"));
+                if radio_in_group && pint(vm, h, P_CHECKED) != 0 {
+                    set_compound_checked(vm, h, 1);
                 }
                 // A parent with XML children is a container.
                 pseudo_set(vm, p, P_IS_GROUP, V::I32(1));
@@ -6683,6 +6674,13 @@ pub(crate) fn children(vm: &Vm, h: u32) -> Vec<V> {
         },
         _ => Vec::new(),
     }
+}
+
+fn generate_view_id() -> i32 {
+    // AOSP: AtomicInteger starting at 1 — dex-created views and
+    // RadioGroup's automatic child ids need nonzero unique values.
+    static NEXT: std::sync::atomic::AtomicI32 = std::sync::atomic::AtomicI32::new(1);
+    NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
 }
 
 fn view_id(vm: &Vm, h: u32) -> i32 {
@@ -7417,6 +7415,21 @@ pub(crate) fn attach_at(
             }
         }
     }
+    if let V::Ref(ch) = child {
+        let parent_cls = class_of(vm, V::Ref(parent));
+        let child_cls = class_of(vm, V::Ref(ch));
+        if ch != 0
+            && view_id(vm, ch) == -1
+            && is_radio_desc(vm, &child_cls)
+            && (parent_cls == "Landroid/widget/RadioGroup;"
+                || vm.assignable_desc(&parent_cls, "Landroid/widget/RadioGroup;"))
+        {
+            // RadioGroup's hierarchy listener generates an id for an
+            // id-less RadioButton before tracking checked state.
+            pseudo_set(vm, ch, P_VIEW_ID, V::I32(generate_view_id()));
+        }
+    }
+
     if let Some(a) = children_arr(vm, parent) {
         // Re-attaching the same child (dex scrap/attach flows do this)
         // must move it, not duplicate it: a later detach removes one
@@ -7757,25 +7770,59 @@ fn notify_checked_listener(vm: &mut Vm, this: u32, arg: V) {
     }
 }
 
-fn radio_group_set_checked(vm: &mut Vm, group: u32, id: i32) {
-    let old = pint(vm, group, P_RADIO_CHECKED);
-    pseudo_set(vm, group, P_RADIO_CHECKED, V::I32(id));
+fn radio_child(vm: &Vm, group: u32, id: i32) -> u32 {
     for c in children(vm, group) {
         if let V::Ref(ch) = c {
             let child_cls = class_of(vm, V::Ref(ch));
-            if is_radio_desc(vm, &child_cls) {
-                let child_checked = (view_id(vm, ch) == id) as i32;
-                let old_child = pint(vm, ch, P_CHECKED);
-                pseudo_set(vm, ch, P_CHECKED, V::I32(child_checked));
-                if old_child != child_checked {
-                    notify_checked_listener(vm, ch, V::I32(child_checked));
-                }
+            if ch != 0 && is_radio_desc(vm, &child_cls) && view_id(vm, ch) == id {
+                return ch;
             }
         }
     }
-    if old != id {
-        notify_checked_listener(vm, group, V::I32(id));
+    0
+}
+
+fn set_radio_child_checked(vm: &mut Vm, child: u32, checked: i32) {
+    let old = pint(vm, child, P_CHECKED);
+    if old == checked {
+        return;
     }
+    pseudo_set(vm, child, P_CHECKED, V::I32(checked));
+    notify_checked_listener(vm, child, V::I32(checked));
+}
+
+fn notify_group_checked_listener(vm: &mut Vm, group: u32, id: i32) {
+    // RadioGroup deliberately does not suppress nested check() calls:
+    // mCheckedId is assigned before the callback, so a listener that
+    // selects another item leaves that newer selection in force.
+    if let Some(V::Ref(listener)) = pseudo_get(vm, group, P_CHECK_LISTENER) {
+        if listener != 0 {
+            let _ = vm.call_virtual(listener, "onCheckedChanged", &[V::Ref(group), V::I32(id)]);
+        }
+    }
+}
+
+fn radio_group_set_checked(vm: &mut Vm, group: u32, id: i32) {
+    let old = pint(vm, group, P_RADIO_CHECKED);
+    if id != -1 && id == old {
+        return;
+    }
+    // AOSP ordering: clear the old button first, then select the new
+    // button, then publish the group id and notify the group listener.
+    if old != -1 {
+        let old_child = radio_child(vm, group, old);
+        if old_child != 0 {
+            set_radio_child_checked(vm, old_child, 0);
+        }
+    }
+    if id != -1 {
+        let new_child = radio_child(vm, group, id);
+        if new_child != 0 {
+            set_radio_child_checked(vm, new_child, 1);
+        }
+    }
+    pseudo_set(vm, group, P_RADIO_CHECKED, V::I32(id));
+    notify_group_checked_listener(vm, group, id);
 }
 
 fn set_compound_checked(vm: &mut Vm, this: u32, checked: i32) {
