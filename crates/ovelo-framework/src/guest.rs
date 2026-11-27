@@ -1024,26 +1024,34 @@ impl GuestUi {
                 ovelo_dexrt::mark_layout_requested(vm, this);
                 Ok(None)
             });
-            Self::on(ui, vm, cls, "setTextColor", "(I)V", |ui, vm, a| {
+            Self::on_rc(ui, vm, cls, "setTextColor", "(I)V", |ui, vm, a| {
                 let this = ref_arg(a, 0)?;
                 let raw = match a.get(1) {
                     Some(V::I32(c)) => *c,
                     _ => return Err(crate::err("guest.arg.type")),
                 };
-                let Some(rc) = ui.views.get(&this).cloned() else {
-                    ovelo_dexrt::pseudo_set(vm, this, ovelo_dexrt::P_TCOLOR, V::I32(raw));
+                // Runtime colors win over XML inflation colors during
+                // later sync passes, and remain authoritative even when
+                // this setter is re-entered while the UI is borrowed
+                // for drawing.
+                ovelo_dexrt::pseudo_set(vm, this, ovelo_dexrt::P_TCOLOR, V::I32(raw));
+                let Some(rc) = ui
+                    .try_borrow()
+                    .ok()
+                    .and_then(|ui| ui.views.get(&this).cloned())
+                else {
                     return Ok(None);
                 };
-                let color = argb(raw);
-                let mut g = rc.borrow_mut();
-                let tv = g
-                    .text_mut()
-                    .ok_or_else(|| crate::err("guest.setTextColor.not_text"))?;
-                tv.color = color;
-                tv.invalidate();
+                if let Ok(mut g) = rc.try_borrow_mut() {
+                    let tv = g
+                        .text_mut()
+                        .ok_or_else(|| crate::err("guest.setTextColor.not_text"))?;
+                    tv.color = argb(raw);
+                    tv.invalidate();
+                }
                 Ok(None)
             });
-            Self::on(
+            Self::on_rc(
                 ui,
                 vm,
                 cls,
@@ -1059,17 +1067,21 @@ impl GuestUi {
                         Some(V::I32(c)) => *c,
                         _ => return Err(crate::err("guest.arg.type")),
                     };
-                    let Some(rc) = ui.views.get(&this).cloned() else {
-                        ovelo_dexrt::pseudo_set(vm, this, ovelo_dexrt::P_TCOLOR, V::I32(raw));
+                    ovelo_dexrt::pseudo_set(vm, this, ovelo_dexrt::P_TCOLOR, V::I32(raw));
+                    let Some(rc) = ui
+                        .try_borrow()
+                        .ok()
+                        .and_then(|ui| ui.views.get(&this).cloned())
+                    else {
                         return Ok(None);
                     };
-                    let color = argb(raw);
-                    let mut g = rc.borrow_mut();
-                    let tv = g
-                        .text_mut()
-                        .ok_or_else(|| crate::err("guest.setTextColor.not_text"))?;
-                    tv.color = color;
-                    tv.invalidate();
+                    if let Ok(mut g) = rc.try_borrow_mut() {
+                        let tv = g
+                            .text_mut()
+                            .ok_or_else(|| crate::err("guest.setTextColor.not_text"))?;
+                        tv.color = argb(raw);
+                        tv.invalidate();
+                    }
                     Ok(None)
                 },
             );
