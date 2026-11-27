@@ -2387,10 +2387,14 @@ fn thread_call(vm: &mut Vm, name: &str, _sig: &str, args: &[V]) -> Rt<Option<Opt
             // Started and its runnable is still queued/parked/running.
             let alive = match args.first() {
                 Some(V::Ref(h)) => {
-                    let t = pseudo_get(vm, *h, P_TARGET).unwrap_or(V::Ref(*h));
-                    pseudo_get(vm, *h, P_STARTED).is_some()
-                        && matches!(t, V::Ref(r) if vm.thread_runnables.contains(&r)
-                            && vm.runnable_thread.get(&r) == Some(h))
+                    if *h == vm.main_thread_h || *h == vm.cur_thread {
+                        true
+                    } else {
+                        let t = pseudo_get(vm, *h, P_TARGET).unwrap_or(V::Ref(*h));
+                        pseudo_get(vm, *h, P_STARTED).is_some()
+                            && matches!(t, V::Ref(r) if vm.thread_runnables.contains(&r)
+                                && vm.runnable_thread.get(&r) == Some(h))
+                    }
                 }
                 _ => false,
             };
