@@ -173,7 +173,10 @@ pub(crate) fn call(
                     }
                 }
                 None => {
-                    // Wrapper reader: remember the delegate.
+                    // Wrapper reader: remember the delegate. P_DATA is
+                    // authoritative because JDK-private `in` fields are
+                    // commonly absent from the app's dex field table.
+                    pseudo_set(vm, this, P_DATA, arg);
                     for owner in ["Ljava/io/FilterReader;", "Ljava/io/Reader;"] {
                         field_set(vm, this, owner, "in", arg);
                     }
@@ -753,19 +756,22 @@ fn stream_call(vm: &mut Vm, name: &str, args: &[V]) -> Rt<Option<Option<V>>> {
             | "ready"
             | "close"
     ) {
-        let inner = [
-            "Ljava/io/FilterInputStream;",
-            "Ljava/io/FilterReader;",
-            "Ljava/io/Reader;",
-            "Ljava/io/BufferedReader;",
-            "Ljava/io/InputStreamReader;",
-        ]
-        .iter()
-        .find_map(|owner| field_get(vm, this, owner, "in"))
-        .and_then(|v| match v {
-            V::Ref(h) => Some(h),
-            _ => None,
-        });
+        let inner = pseudo_get(vm, this, P_DATA)
+            .or_else(|| {
+                [
+                    "Ljava/io/FilterInputStream;",
+                    "Ljava/io/FilterReader;",
+                    "Ljava/io/Reader;",
+                    "Ljava/io/BufferedReader;",
+                    "Ljava/io/InputStreamReader;",
+                ]
+                .iter()
+                .find_map(|owner| field_get(vm, this, owner, "in"))
+            })
+            .and_then(|v| match v {
+                V::Ref(h) => Some(h),
+                _ => None,
+            });
         if let Some(inner) = inner {
             if inner != 0 && inner != this {
                 if crate::dbg_flag("OVELO_STREAMDBG") {
