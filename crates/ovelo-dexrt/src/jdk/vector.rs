@@ -536,10 +536,19 @@ pub(crate) fn drawable_flat_color(rv: RCtx<'_>, res_id: u32) -> Option<u32> {
             "item" => {
                 // Skip items bound to a state set; an unqualified item
                 // is the drawable's default.
-                let has_state = el
-                    .attrs
-                    .iter()
-                    .any(|a| a.name.starts_with("state_") && a.name != "state_enabled");
+                let has_state = el.attrs.iter().any(|a| {
+                    if !a.name.starts_with("state_") {
+                        return false;
+                    }
+                    // state_enabled=true is the normal resting state and
+                    // commonly accompanies otherwise default items;
+                    // state_enabled=false is a real disabled-state rule.
+                    if a.name == "state_enabled" {
+                        matches!(&a.value, Value::Bool(false) | Value::Int(0))
+                    } else {
+                        true
+                    }
+                });
                 if has_state {
                     continue;
                 }

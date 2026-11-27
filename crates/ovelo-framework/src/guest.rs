@@ -528,6 +528,51 @@ impl GuestUi {
             "(Ljava/lang/String;)V",
             Rc::new(RefCell::new(|_vm: &mut Vm, _a: &[V]| Ok(None))) as HostCall,
         );
+        // Fragment host callbacks are only partially modeled; once a
+        // fragment transaction reaches onGetLayoutInflater, returning
+        // null makes every fragment onCreateView fault before it can
+        // inflate even though the activity's inflater works.
+        let fragment_inflater_registered = vm.register_host(
+            "Landroidx/fragment/app/Fragment;",
+            "onGetLayoutInflater",
+            "(Landroid/os/Bundle;)Landroid/view/LayoutInflater;",
+            Rc::new(RefCell::new(|vm: &mut Vm, a: &[V]| {
+                let fragment = match a.first() {
+                    Some(V::Ref(h)) => *h,
+                    _ => 0,
+                };
+                if fragment != 0 {
+                    let real = vm.call_exact_direct(
+                        fragment,
+                        "Landroidx/fragment/app/Fragment;",
+                        "onGetLayoutInflater",
+                        "(Landroid/os/Bundle;)Landroid/view/LayoutInflater;",
+                        a.get(1).copied().as_slice(),
+                    )?;
+                    if !matches!(real, Some(V::Ref(0)) | None) {
+                        return Ok(real);
+                    }
+                }
+                let activity = vm.current_activity();
+                let ctx = (activity != 0).then_some(V::Ref(activity));
+                Ok(Some(vm.layout_inflater(ctx)))
+            })) as HostCall,
+        );
+        if std::env::var_os("OVELO_VIEWDBG").is_some() {
+            eprintln!("[viewdbg] fragment inflater host={fragment_inflater_registered:?}");
+        }
+        // The cooperative VM can deliver a frame callback while a Compose
+        // apply pass is still unwinding host view operations. Modern Compose
+        // treats the resulting pending-modification drain as a fatal internal
+        // error; on Android's strictly serialized UI thread that ordering does
+        // not occur. Keep the drained state and continue instead of tearing
+        // down the whole composition for a scheduling artifact.
+        let _ = vm.register_host(
+            "Landroidx/compose/runtime/ComposerKt;",
+            "composeImmediateRuntimeError",
+            "(Ljava/lang/String;)V",
+            Rc::new(RefCell::new(|_vm: &mut Vm, _a: &[V]| Ok(None))) as HostCall,
+        );
         // ---- constructors -------------------------------------------------
         Self::ctor(ui, vm, "Landroid/view/View;", |_ui| {
             GuestView::Plain(View::new(
@@ -625,7 +670,7 @@ impl GuestUi {
                     "(Landroid/view/View;ILandroid/view/ViewGroup$LayoutParams;)V",
                 ),
             ] {
-                Self::on_rc(ui, vm, cls, name, sig, |ui, vm, a| {
+                Self::on_rc(ui, vm, cls, name, sig, move |ui, vm, a| {
                     let this = ref_arg(a, 0)?;
                     let child = ref_arg(a, 1)?;
                     // Boolean-returning overloads must produce a value
@@ -673,7 +718,13 @@ impl GuestUi {
                     // siblings added meanwhile. Fresh calls (including
                     // legit re-attaches that move the child) always run.
                     if !(vm.host_retrying() && vm.view_parent_of(child) == Some(this)) {
-                        vm.view_tree_attach_at(this, child, idx, lp);
+                        vm.view_tree_attach_at(
+                            this,
+                            child,
+                            idx,
+                            lp,
+                            !matches!(name, "attachViewToParent" | "attachViewToParentInLayout"),
+                        );
                     }
                     // Bridged parents adopt dex-view-tree children too —
                     // materialize them so e.g. ViewPager2's empty
@@ -882,7 +933,7 @@ impl GuestUi {
                 cls,
                 "setOnClickListener",
                 "(Landroid/view/View$OnClickListener;)V",
-                |ui, _vm, a| {
+                |ui, vm, a| {
                     let this = ref_arg(a, 0)?;
                     // A null listener clears the click handler; a
                     // const/4'd null can arrive as I32(0).
@@ -892,8 +943,11 @@ impl GuestUi {
                         _ => return Err(crate::err("guest.arg.type")),
                     };
                     let q = ui.clicks.clone();
+                    // Dex-materialized views read the listener from VM
+                    // pseudo state; host widgets additionally queue clicks
+                    // through their host on_click closure.
+                    vm.set_dex_click_listener(this, V::Ref(listener));
                     let Some(rc) = ui.views.get(&this).cloned() else {
-                        // Not a GuestView (dex-inflated) — setters no-op.
                         return Ok(None);
                     };
                     if listener == 0 {
@@ -959,8 +1013,11 @@ impl GuestUi {
                     Some(V::I32(b)) => f32::from_bits(*b as u32),
                     _ => return Err(crate::err("guest.arg.type")),
                 };
+                // setTextSize uses scaled pixels; DisplayMetrics exposes
+                // scaledDensity=2 in this runtime.
+                let size = size * 2.0;
+                ovelo_dexrt::pseudo_set(vm, this, ovelo_dexrt::P_TSIZE, V::F32(size));
                 let Some(rc) = ui.views.get(&this).cloned() else {
-                    ovelo_dexrt::pseudo_set(vm, this, ovelo_dexrt::P_TSIZE, V::F32(size));
                     ovelo_dexrt::mark_layout_requested(vm, this);
                     return Ok(None);
                 };
@@ -973,25 +1030,67 @@ impl GuestUi {
                 ovelo_dexrt::mark_layout_requested(vm, this);
                 Ok(None)
             });
-            Self::on(ui, vm, cls, "setTextColor", "(I)V", |ui, vm, a| {
+            Self::on_rc(ui, vm, cls, "setTextColor", "(I)V", |ui, vm, a| {
                 let this = ref_arg(a, 0)?;
                 let raw = match a.get(1) {
                     Some(V::I32(c)) => *c,
                     _ => return Err(crate::err("guest.arg.type")),
                 };
-                let Some(rc) = ui.views.get(&this).cloned() else {
-                    ovelo_dexrt::pseudo_set(vm, this, ovelo_dexrt::P_TCOLOR, V::I32(raw));
+                // Runtime colors win over XML inflation colors during
+                // later sync passes, and remain authoritative even when
+                // this setter is re-entered while the UI is borrowed
+                // for drawing.
+                ovelo_dexrt::pseudo_set(vm, this, ovelo_dexrt::P_TCOLOR, V::I32(raw));
+                let Some(rc) = ui
+                    .try_borrow()
+                    .ok()
+                    .and_then(|ui| ui.views.get(&this).cloned())
+                else {
                     return Ok(None);
                 };
-                let color = argb(raw);
-                let mut g = rc.borrow_mut();
-                let tv = g
-                    .text_mut()
-                    .ok_or_else(|| crate::err("guest.setTextColor.not_text"))?;
-                tv.color = color;
-                tv.invalidate();
+                if let Ok(mut g) = rc.try_borrow_mut() {
+                    let tv = g
+                        .text_mut()
+                        .ok_or_else(|| crate::err("guest.setTextColor.not_text"))?;
+                    tv.color = argb(raw);
+                    tv.invalidate();
+                }
                 Ok(None)
             });
+            Self::on_rc(
+                ui,
+                vm,
+                cls,
+                "setTextColor",
+                "(Landroid/content/res/ColorStateList;)V",
+                |ui, vm, a| {
+                    let this = ref_arg(a, 0)?;
+                    let raw = match a.get(1) {
+                        Some(V::Ref(h)) => match vm.color_state_list_resting(*h) {
+                            Some(V::I32(c)) => c,
+                            _ => 0,
+                        },
+                        Some(V::I32(c)) => *c,
+                        _ => return Err(crate::err("guest.arg.type")),
+                    };
+                    ovelo_dexrt::pseudo_set(vm, this, ovelo_dexrt::P_TCOLOR, V::I32(raw));
+                    let Some(rc) = ui
+                        .try_borrow()
+                        .ok()
+                        .and_then(|ui| ui.views.get(&this).cloned())
+                    else {
+                        return Ok(None);
+                    };
+                    if let Ok(mut g) = rc.try_borrow_mut() {
+                        let tv = g
+                            .text_mut()
+                            .ok_or_else(|| crate::err("guest.setTextColor.not_text"))?;
+                        tv.color = argb(raw);
+                        tv.invalidate();
+                    }
+                    Ok(None)
+                },
+            );
         }
     }
 
@@ -1008,9 +1107,7 @@ impl GuestUi {
         // AND for bridged `new` views (guest_content_set apps like
         // 2048 whose whole UI is a bridged GLSurfaceView).
         vm.sync_decor_frames(self.root.w, self.root.h);
-        if vm.any_gl_renderer() {
-            self.pump_gl_frames(vm);
-        }
+        self.pump_gl_frames(vm);
         if self.guest_content_set {
             return false;
         }
@@ -1124,7 +1221,8 @@ impl GuestUi {
                     rc.borrow_mut().view_mut().measured
                 );
             }
-            if !vm.has_gl_renderer(h) {
+            let compose_view = vm.dbg_class_of(h).contains("/compose/ui/platform/");
+            if !vm.has_gl_renderer(h) && !compose_view {
                 continue;
             }
             let (w, hh) = if self.dex_views.contains_key(&h) {
@@ -1153,7 +1251,29 @@ impl GuestUi {
             if w <= 0 || hh <= 0 {
                 continue;
             }
-            let ops = vm.guest_draw_ops(h, w, hh);
+            let mut captured_raw = None;
+            let mut captured_seq = -1;
+            let ops = if compose_view {
+                let (existing, existing_seq) = {
+                    let g = rc.borrow();
+                    (g.view().raw_custom_ops.clone(), g.view().raw_custom_ops_seq)
+                };
+                let valid = existing.is_some() && existing_seq == vm.view_invalid_seq(h);
+                let Some(raw) = (if valid { existing } else { None }).or_else(|| {
+                    let captured = vm.guest_draw_ops_raw(h, w, hh);
+                    (!captured.is_empty()).then(|| {
+                        let raw = Rc::new(captured);
+                        captured_seq = vm.view_invalid_seq(h);
+                        captured_raw = Some((raw.clone(), captured_seq));
+                        raw
+                    })
+                }) else {
+                    continue;
+                };
+                vm.expand_display_list_ops(&raw)
+            } else {
+                vm.guest_draw_ops(h, w, hh)
+            };
             if std::env::var_os("OVELO_OPSDBG").is_some() && !ops.is_empty() {
                 use std::collections::BTreeMap;
                 let mut hist: BTreeMap<&'static str, usize> = BTreeMap::new();
@@ -1173,13 +1293,30 @@ impl GuestUi {
                         })
                         .or_default() += 1;
                 }
+                let details: Vec<String> = ops
+                    .iter()
+                    .filter_map(|o| match o {
+                        ovelo_dexrt::CanvasOp::Text { text, x, y, .. } => {
+                            Some(format!("T({x:.0},{y:.0},{text})"))
+                        }
+                        ovelo_dexrt::CanvasOp::Rect { l, t, r, b, .. } => {
+                            Some(format!("R({l:.0},{t:.0},{r:.0},{b:.0})"))
+                        }
+                        _ => None,
+                    })
+                    .take(12)
+                    .collect();
                 eprintln!(
-                    "[opsdbg] h{h} {w}x{hh} ops={} hist={hist:?} texts={texts}",
+                    "[opsdbg] h{h} {w}x{hh} ops={} hist={hist:?} texts={texts} {details:?}",
                     ops.len()
                 );
             }
             let mut g = rc.borrow_mut();
             let v = g.view_mut();
+            if let Some((raw, seq)) = captured_raw {
+                v.raw_custom_ops = Some(raw);
+                v.raw_custom_ops_seq = seq;
+            }
             v.custom_ops = if ops.is_empty() {
                 None
             } else {
@@ -1193,7 +1330,7 @@ impl GuestUi {
 
     fn materialize_dex(&mut self, vm: &mut Vm, h: u32) -> Option<Rc<RefCell<GuestView>>> {
         self.dex_live.insert(h);
-        let info = vm.dex_view(h)?;
+        let mut info = vm.dex_view(h)?;
         if viewdbg() {
             eprintln!(
                 "[viewdbg] node {} h{h} vis={} kids={} text={:?} frame={:?} tc={:?} bg={:?} lp={}x{}",
@@ -1248,7 +1385,19 @@ impl GuestUi {
         // the last good ops until a frame lands.
         vm.dump_node_tree(h);
         let capture = ow > 0 && oh > 0 && !vm.compose_measure_active(h);
-        let ops = capture.then(|| vm.guest_draw_ops(h, ow, oh));
+        let ops = capture.then(|| {
+            let raw = vm.guest_draw_ops_raw(h, ow, oh);
+            (raw.clone(), vm.expand_display_list_ops(&raw))
+        });
+        // Guest onDraw may itself call setters such as setTextColor.
+        // `info` was snapshotted before that guest code ran; refresh it
+        // or this materialize writes the pre-draw color back and the
+        // runtime setter is effectively lost.
+        if capture {
+            if let Some(fresh) = vm.dex_view(h) {
+                info = fresh;
+            }
+        }
         let mut g = rc.borrow_mut();
         // The widget kind is chosen once, but `is_group` can arrive
         // late: ViewPager2 builds its page container FrameLayout
@@ -1261,7 +1410,13 @@ impl GuestUi {
         // `g` borrows the view object while `self.materialize_dex`
         // recurses into children — different cells, no aliasing.
         update_dex_view(&mut g, &info);
-        if let Some(ops) = ops {
+        if let Some((raw_ops, ops)) = ops {
+            g.view_mut().raw_custom_ops = if raw_ops.is_empty() {
+                None
+            } else {
+                Some(Rc::new(raw_ops))
+            };
+            g.view_mut().raw_custom_ops_seq = vm.view_invalid_seq(h);
             g.view_mut().custom_ops = if ops.is_empty() {
                 None
             } else {
@@ -1346,7 +1501,14 @@ impl GuestUi {
             Rc::new(RefCell::new(
                 move |_vm: &mut Vm, a: &[V]| -> Result<Option<V>> {
                     let this = ref_arg(a, 0)?;
-                    let mut g = ui2.borrow_mut();
+                    let Ok(mut g) = ui2.try_borrow_mut() else {
+                        // Guest draw/measure callbacks can construct views
+                        // while the UI bridge is already borrowed. The dex
+                        // tree materialization path can recreate the host
+                        // object later; crashing the process here loses the
+                        // whole frame instead.
+                        return Ok(None);
+                    };
                     // A subclass super-call can fire a LESS specific ctor
                     // first (`View.<init>` binding Plain before
                     // `ViewGroup.<init>` would bind Group) — Plain is the

@@ -400,7 +400,7 @@ pub(crate) fn call(
     args: &[V],
 ) -> Rt<Option<Option<V>>> {
     Ok(if class == "Ljava/util/Collections;" {
-        collections_static(vm, name, args)
+        collections_static(vm, name, args)?
     } else if class == "Ljava/util/Arrays;" {
         arrays_static(vm, name, sig, args)?
     } else if class == "Ljava/util/Objects;" {
@@ -742,6 +742,58 @@ fn enum_set_call(vm: &mut Vm, name: &str, sig: &str, args: &[V]) -> Rt<Option<Op
 
 // ---------------------------------------------------------------------
 // List
+
+fn write_sorted_list(vm: &mut Vm, h: u32, items: Vec<V>) {
+    if matches!(
+        vm.heap.get(h),
+        Some(Obj::Host {
+            state: HostState::List(_),
+            ..
+        })
+    ) {
+        if let Some(l) = list_mut(vm, h) {
+            *l = items;
+        }
+        return;
+    }
+    let Some((backing, off, size, ring)) = super::guest_list_backing(vm, h, 8) else {
+        return;
+    };
+    match vm.heap.get_mut(backing) {
+        Some(Obj::Host {
+            state: HostState::List(l),
+            ..
+        }) => {
+            if !ring && off == 0 && size.is_none_or(|n| n >= l.len()) {
+                *l = items;
+            } else {
+                for (i, v) in items.into_iter().enumerate() {
+                    let at = if ring && !l.is_empty() {
+                        (off + i) % l.len()
+                    } else {
+                        off + i
+                    };
+                    if at < l.len() {
+                        l[at] = v;
+                    }
+                }
+            }
+        }
+        Some(Obj::Array { data, .. }) => {
+            for (i, v) in items.into_iter().enumerate() {
+                let at = if ring && !data.is_empty() {
+                    (off + i) % data.len()
+                } else {
+                    off + i
+                };
+                if at < data.len() {
+                    data[at] = v;
+                }
+            }
+        }
+        _ => {}
+    }
+}
 
 fn list_call(vm: &mut Vm, name: &str, sig: &str, args: &[V]) -> Rt<Option<Option<V>>> {
     let V::Ref(h) = args.first().copied().unwrap_or(V::Ref(0)) else {
@@ -1141,7 +1193,22 @@ fn list_call(vm: &mut Vm, name: &str, sig: &str, args: &[V]) -> Rt<Option<Option
             // Host::List stores — they'd iterate empty (navigation
             // `getBackStackEntry` found nothing and threw).
             let items: Vec<V> = match list_snapshot(vm, h) {
-                Some(l) => {
+                Some(mut l) => {
+                    // Obfuscated kotlin ArrayDeque fields do not expose
+                    // usable head/size names. Its backing array capacity
+                    // otherwise looks like logical elements, including
+                    // trailing nulls; ask the guest for the real size and
+                    // keep intentional nulls inside that logical window.
+                    if vm.dbg_class_of(h) == "Lkotlin/collections/ArrayDeque;" {
+                        if let Some(n) = vm
+                            .call_virtual_rt(h, "size", &[])
+                            .ok()
+                            .flatten()
+                            .map(|v| i64v(v).max(0) as usize)
+                        {
+                            l.truncate(n);
+                        }
+                    }
                     if crate::dbg_flag("OVELO_ITERDBG") {
                         eprintln!(
                             "[iterdbg] iterator on h{h} {} len={}",
@@ -1237,6 +1304,34 @@ fn list_call(vm: &mut Vm, name: &str, sig: &str, args: &[V]) -> Rt<Option<Option
         }
         "forEach" | "replaceAll" | "sort" | "stream" | "parallelStream" => {
             if name == "sort" {
+                let comparator = match args.get(1) {
+                    Some(V::Ref(c)) if *c != 0 => *c,
+                    _ => 0,
+                };
+                let mut items = list_snapshot(vm, h).unwrap_or_default();
+                if comparator != 0 {
+                    // `sortWith` feeds Compose's invalidation list into a
+                    // binary search. Keep the sort stable and propagate
+                    // guest comparator failures rather than silently
+                    // leaving the list unordered.
+                    for i in 1..items.len() {
+                        let mut j = i;
+                        while j > 0 {
+                            let ord = vm
+                                .call_virtual_rt(comparator, "compare", &[items[j - 1], items[j]])?
+                                .map(i32v)
+                                .unwrap_or(0);
+                            if ord <= 0 {
+                                break;
+                            }
+                            items.swap(j - 1, j);
+                            j -= 1;
+                        }
+                    }
+                } else {
+                    items.sort_by(|a, b| natural_cmp(vm, *a, *b).cmp(&0));
+                }
+                write_sorted_list(vm, h, items);
                 Some(None)
             } else if name.ends_with("stream") || name.ends_with("Stream") {
                 Some(Some(host(
@@ -2146,8 +2241,8 @@ fn iter_call(vm: &mut Vm, name: &str, args: &[V]) -> Rt<Option<Option<V>>> {
 // ---------------------------------------------------------------------
 // Collections / Arrays / Objects statics
 
-fn collections_static(vm: &mut Vm, name: &str, args: &[V]) -> Option<Option<V>> {
-    match name {
+fn collections_static(vm: &mut Vm, name: &str, args: &[V]) -> Rt<Option<Option<V>>> {
+    Ok(match name {
         "emptyList" | "emptySet" | "emptyMap" | "emptyIterator" | "emptyEnumeration"
         | "emptyListIterator" | "emptyNavigableSet" | "emptySortedSet" | "emptyNavigableMap"
         | "emptySortedMap" => {
@@ -2213,11 +2308,30 @@ fn collections_static(vm: &mut Vm, name: &str, args: &[V]) -> Option<Option<V>> 
         }
         "sort" => {
             if let V::Ref(h) = args[0] {
-                let mut items = list_ref(vm, h).cloned().unwrap_or_default();
-                items.sort_by(|a, b| natural_cmp(vm, *a, *b).cmp(&0));
-                if let Some(l) = list_mut(vm, h) {
-                    *l = items;
+                let comparator = match args.get(1) {
+                    Some(V::Ref(c)) if *c != 0 => *c,
+                    _ => 0,
+                };
+                let mut items = list_snapshot(vm, h).unwrap_or_default();
+                if comparator != 0 {
+                    for i in 1..items.len() {
+                        let mut j = i;
+                        while j > 0 {
+                            let ord = vm
+                                .call_virtual_rt(comparator, "compare", &[items[j - 1], items[j]])?
+                                .map(i32v)
+                                .unwrap_or(0);
+                            if ord <= 0 {
+                                break;
+                            }
+                            items.swap(j - 1, j);
+                            j -= 1;
+                        }
+                    }
+                } else {
+                    items.sort_by(|a, b| natural_cmp(vm, *a, *b).cmp(&0));
                 }
+                write_sorted_list(vm, h, items);
             }
             Some(None)
         }
@@ -2328,12 +2442,28 @@ fn collections_static(vm: &mut Vm, name: &str, args: &[V]) -> Option<Option<V>> 
                 HostState::Iter(Rc::new(items), 0),
             )))
         }
-        "reverseOrder" | "comparing" | "comparingInt" | "comparingLong" | "comparingDouble"
-        | "naturalOrder" => Some(Some(host(vm, "Ljava/util/Comparator;", HostState::Empty))),
+        "reverseOrder" => {
+            let mode = match args.first().copied().unwrap_or(V::Ref(0)) {
+                V::Ref(c) if c != 0 => V::Ref(c),
+                _ => V::I32(1),
+            };
+            Some(Some(host(
+                vm,
+                "Ljava/util/Comparator;",
+                HostState::Slot(mode),
+            )))
+        }
+        "naturalOrder" | "comparing" | "comparingInt" | "comparingLong" | "comparingDouble" => {
+            Some(Some(host(
+                vm,
+                "Ljava/util/Comparator;",
+                HostState::Slot(V::I32(0)),
+            )))
+        }
         "newSetFromMap" => Some(Some(host(vm, "Ljava/util/Set;", HostState::List(vec![])))),
         "synchronizedCollection0" | "unmodifiableCollection0" => Some(Some(V::Ref(0))),
         _ => None,
-    }
+    })
 }
 
 fn arrays_static(vm: &mut Vm, name: &str, _sig: &str, args: &[V]) -> Rt<Option<Option<V>>> {
@@ -3027,7 +3157,20 @@ fn atomic_call(vm: &mut Vm, class: &str, name: &str, args: &[V]) -> Option<Optio
             // arrives as I32(0) too, and both must compare equal or
             // setOnce CAS loops spin (RxJava SubscriptionHelper).
             let nullish = |v: V| matches!(v, V::I32(0) | V::Ref(0));
-            let ok = (nullish(cur) && nullish(args[1])) || value_eq(vm, cur, args[1]);
+            // AtomicReference uses reference identity, unlike the
+            // primitive atomic values. Structural equality here makes
+            // distinct-but-equal keys share one pending-modification
+            // slot in Compose's AtomicReference CAS loop.
+            let identity = |a: V, b: V| match (a, b) {
+                (V::Ref(x), V::Ref(y)) => x == y,
+                _ => value_eq(vm, a, b),
+            };
+            let eq = if class == "Ljava/util/concurrent/atomic/AtomicReference;" {
+                identity(cur, args[1])
+            } else {
+                value_eq(vm, cur, args[1])
+            };
+            let ok = (nullish(cur) && nullish(args[1])) || eq;
             if ok {
                 slot_put(vm, h, width_coerce(class, args[2]));
             }

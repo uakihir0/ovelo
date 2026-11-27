@@ -67,6 +67,8 @@ pub(crate) const P_APPCLASS: u32 = u32::MAX - 54;
 pub(crate) const P_BITMAP_SLOT: u64 = 0xFFFD_FEE0;
 /// A `ColorDrawable`'s fill ARGB — `Drawable.draw` emits a rect fill.
 pub(crate) const P_DRAW_COLOR: u64 = 0xFFFD_FEE1;
+/// A Drawable's cached ConstantState mirror object.
+pub(crate) const P_CONST_STATE: u64 = 0xFFFD_FEE4;
 /// `ByteBuffer` write/read cursor and endianness (1 = little) — the
 /// backing bytes live in `HostState::Slot`.
 pub(crate) const P_BBUF_POS: u64 = 0xFFFD_FEE2;
@@ -152,6 +154,12 @@ pub(crate) const P_TLS: u64 = 0xFFFD_FEF4;
 pub(crate) const P_SUBLIST_PARENT: u64 = 0xFFFD_FEF5;
 pub(crate) const P_SUBLIST_START: u64 = 0xFFFD_FEF6;
 pub(crate) const P_SUBLIST_END: u64 = 0xFFFD_FEF7;
+/// ColorStateList constructor state-array argument.
+pub(crate) const P_CSL_STATES: u64 = 0xFFFD_FEF8;
+/// ColorStateList constructor color-array argument.
+pub(crate) const P_CSL_COLORS: u64 = 0xFFFD_FEF9;
+/// Resting enabled/unchecked color chosen from a ColorStateList.
+pub(crate) const P_CSL_RESTING: u64 = 0xFFFD_FEFA;
 
 pub(crate) fn now_ms() -> i64 {
     std::time::SystemTime::now()
@@ -305,6 +313,22 @@ pub(crate) fn boxed_boolean(vm: &mut Vm, value: bool) -> V {
         vm.bool_cache[idx] = h;
     }
     v
+}
+
+pub(crate) fn boxed_integer(vm: &mut Vm, value: i32) -> V {
+    if (-128..=127).contains(&value) {
+        let idx = (value + 128) as usize;
+        if vm.int_cache[idx] != 0 {
+            return V::Ref(vm.int_cache[idx]);
+        }
+        let v = host(vm, "Ljava/lang/Integer;", HostState::Slot(V::I32(value)));
+        if let V::Ref(h) = v {
+            vm.int_cache[idx] = h;
+        }
+        v
+    } else {
+        host(vm, "Ljava/lang/Integer;", HostState::Slot(V::I32(value)))
+    }
 }
 
 pub(crate) fn host(vm: &mut Vm, desc: &str, state: HostState) -> V {
@@ -1057,7 +1081,11 @@ pub(crate) fn list_len(vm: &Vm, h: u32) -> Option<usize> {
 /// Collection` so arbitrary guest objects holding collection fields
 /// are not misread; direct backing fields are preferred over nested
 /// delegates, and the depth budget ends reference cycles.
-fn guest_list_backing(vm: &Vm, h: u32, depth: u8) -> Option<(u32, usize, Option<usize>, bool)> {
+pub(crate) fn guest_list_backing(
+    vm: &Vm,
+    h: u32,
+    depth: u8,
+) -> Option<(u32, usize, Option<usize>, bool)> {
     if depth == 0 || !vm.is_guest_collection(h) {
         return None;
     }
@@ -1128,7 +1156,7 @@ fn guest_list_backing(vm: &Vm, h: u32, depth: u8) -> Option<(u32, usize, Option<
                 // assignment by how many null slots its window reads —
                 // a live ring/queue window is dense, the stale prefix
                 // isn't. `modCount` keeps its real name even under R8.
-                let ints: Vec<usize> = fields
+                let mut ints: Vec<usize> = fields
                     .iter()
                     .filter_map(|(g, v)| match v {
                         V::I32(n)
@@ -1140,6 +1168,13 @@ fn guest_list_backing(vm: &Vm, h: u32, depth: u8) -> Option<(u32, usize, Option<
                         _ => None,
                     })
                     .collect();
+                // Zero-valued primitive fields are absent from the sparse
+                // instance map. Obfuscated ring buffers therefore expose
+                // only one of (head, size) when the other is zero; include
+                // that implicit zero before scoring the two assignments.
+                if ints.len() == 1 {
+                    ints.push(0);
+                }
                 if ints.len() == 2 {
                     let nulls = |off: usize, n: usize| -> usize {
                         let n = n.min(len);
@@ -1637,6 +1672,34 @@ fn universal(vm: &mut Vm, class: &str, name: &str, sig: &str, args: &[V]) -> Rt<
         "equals" if class != "Ljava/util/Arrays;" && !lang::primitive_type(class) => Some(Some(
             V::I32((args.len() > 1 && value_eq(vm, args[0], args[1])) as i32),
         )),
+        "compare" if class == "Ljava/util/Comparator;" => {
+            let mode = match args.first().copied().unwrap_or(V::Ref(0)) {
+                V::Ref(h) => slot_of(vm, h).unwrap_or(V::I32(0)),
+                _ => V::I32(0),
+            };
+            let cmp = if matches!(mode, V::I32(2)) {
+                let a = sv(vm, args[1])
+                    .unwrap_or_else(|| v_to_s(vm, args[1]))
+                    .to_lowercase();
+                let b = sv(vm, args[2])
+                    .unwrap_or_else(|| v_to_s(vm, args[2]))
+                    .to_lowercase();
+                a.cmp(&b) as i32
+            } else if let V::Ref(cmp) = mode {
+                let v = vm
+                    .call_virtual_rt(cmp, "compare", &[args[2], args[1]])?
+                    .unwrap_or(V::I32(0));
+                i32v(v)
+            } else {
+                let c = collect::natural_cmp(vm, args[1], args[2]);
+                if matches!(mode, V::I32(1)) {
+                    -c
+                } else {
+                    c
+                }
+            };
+            Some(Some(V::I32(cmp)))
+        }
         "getClass" => {
             let d = class_of(vm, args[0]);
             Some(Some(class_obj(vm, d)))
@@ -1981,7 +2044,11 @@ pub(crate) fn sfield(vm: &mut Vm, owner: &str, name: &str, ftype: &str) -> Optio
         }
         ("Ljava/lang/Void;", "TYPE") => return Some(class_obj(vm, "V".into())),
         ("Ljava/lang/String;", "CASE_INSENSITIVE_ORDER") => {
-            return Some(host(vm, "Ljava/util/Comparator;", HostState::Empty))
+            return Some(host(
+                vm,
+                "Ljava/util/Comparator;",
+                HostState::Slot(V::I32(2)),
+            ))
         }
         ("Ljava/nio/charset/StandardCharsets;", n) => {
             return Some(host(

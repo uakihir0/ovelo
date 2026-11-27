@@ -406,6 +406,25 @@ fn attr_bool_ref(vm: &Vm, id: u32) -> Option<bool> {
     None
 }
 
+/// Resolve an attribute out of the explicit XML `style` reference.
+/// `attr_find` only sees direct tag attributes, while Android applies
+/// style items before falling back to the theme's default text color.
+fn style_attr_color(vm: &Vm, style: u32, attr_id: u32) -> Option<i32> {
+    let res = vm.apk_res.as_ref()?;
+    let ev = res.style_item(style, attr_id)?;
+    match ev.data_type {
+        0x01 => color_v(vm, V::I32(ev.data as i32)),
+        0x02 => crate::theme_color(vm, ev.data).map(|c| c as i32),
+        0x1c..=0x1f | 0x10 | 0x11 | 0x04 => Some(ev.data as i32),
+        0x03 => ev
+            .string
+            .as_deref()
+            .and_then(vector::parse_color)
+            .map(|c| c as i32),
+        _ => None,
+    }
+}
+
 /// Resolve an ARGB color from an int literal or a color resource ref.
 fn color_v(vm: &Vm, v: V) -> Option<i32> {
     match v {
@@ -542,6 +561,10 @@ pub fn mark_layout_requested(vm: &mut Vm, h: u32) {
     }
 }
 
+pub(crate) fn invalid_seq(vm: &Vm, h: u32) -> i32 {
+    pint(vm, h, P_INVALID_SEQ)
+}
+
 pub(crate) fn layout_requested(vm: &Vm, h: u32) -> bool {
     pint(vm, h, P_LAYOUT_REQ) != 0
 }
@@ -622,7 +645,16 @@ pub(crate) fn dex_view_info(vm: &Vm, h: u32) -> Option<DexViewInfo> {
         // P_TCOLOR only carries setTextColor args — packed ARGB.
         Some(V::I32(c)) => Some(c),
         Some(v) => color_v(vm, v),
-        _ => attr_find(vm, h, "textColor").and_then(|v| color_v(vm, v)),
+        _ => attr_find(vm, h, "textColor")
+            .and_then(|v| color_v(vm, v))
+            .or_else(|| match attr_find(vm, h, "style") {
+                Some(V::I32(style)) if style > 0 => style_attr_color(vm, style as u32, 0x0101_0098),
+                _ => None,
+            })
+            // TextView's default style takes its normal color from the
+            // theme when XML/runtime didn't set one. Without this every
+            // theme-colored label falls back to the renderer's black.
+            .or_else(|| crate::theme_color(vm, 0x0101_0036).map(|c| c as i32)),
     };
     let bg_color = match pseudo_get(vm, h, P_BGCOLOR) {
         // P_BGCOLOR only carries setBackgroundColor args — packed
@@ -1550,6 +1582,23 @@ pub(crate) fn call(
             Some(Some(v))
         }
         "generateDefaultLayoutParams" => Some(Some(default_lp(vm, this))),
+        // Framework groups refine ViewGroup.checkLayoutParams to their
+        // own LP type (LinearLayout.LayoutParams, FrameLayout.LayoutParams,
+        // …). Use the receiver's LP class rather than a bare null check:
+        // addView relies on a false result to convert foreign params, while
+        // dex groups such as CoordinatorLayout still reach here only after
+        // their own instanceof check has accepted the object.
+        "checkLayoutParams" => {
+            let ok = match args.get(1).copied() {
+                Some(v @ V::Ref(lph)) if lph != 0 => {
+                    let got = class_of(vm, v);
+                    let want = lp_class_for(vm, this);
+                    got == want || desc_is_a(&got, &want) || vm.assignable_desc(&got, &want)
+                }
+                _ => false,
+            };
+            Some(Some(V::I32(ok as i32)))
+        }
         "getChildCount" => {
             let n = children(vm, this).len();
             if crate::dbg_flag("OVELO_VIEWDBG") {
@@ -2029,6 +2078,26 @@ pub(crate) fn call(
         "getContentDescription" => Some(Some(
             pseudo_get(vm, this, P_CDESC).unwrap_or_else(|| jstr(vm, "")),
         )),
+        "setTextSize" => {
+            let size = match args.last() {
+                Some(V::F32(f)) => *f,
+                Some(V::I32(b)) => f32::from_bits(*b as u32),
+                _ => 0.0,
+            };
+            let unit = if args.len() >= 3 {
+                i32v(args.get(1).copied().unwrap_or(V::I32(2)))
+            } else {
+                2
+            };
+            let scale = match unit {
+                0 => 1.0,
+                1 | 2 => 2.0,
+                _ => 1.0,
+            };
+            pseudo_set(vm, this, P_TSIZE, V::F32(size * scale));
+            mark_layout_requested(vm, this);
+            Some(None)
+        }
         "setImageBitmap" | "setImageDrawable" | "setImageURI" | "setImageIcon"
         | "setImageResource" => {
             pseudo_set(vm, this, P_IMAGE, args.get(1).copied().unwrap_or(V::I32(0)));
@@ -2046,6 +2115,52 @@ pub(crate) fn call(
                 "V" => None,
                 _ => Some(V::I32(1)),
             })
+        }
+        "onTouchEvent" => {
+            // Base View.onTouchEvent: a clickable view consumes the
+            // gesture and performs the click on ACTION_UP. Dex overrides
+            // that delegate to super rely on this path.
+            let action = match args.get(1) {
+                Some(V::Ref(ev)) => match pseudo_get(vm, *ev, P_ME_ACTION) {
+                    Some(v) => i32v(v),
+                    _ => -1,
+                },
+                _ => -1,
+            };
+            match pseudo_get(vm, this, P_LISTENER) {
+                Some(V::Ref(l)) if l != 0 => {
+                    let down_target = vm.touch_gesture_target;
+                    if action == 1 && down_target != 0 && view_or_descendant(vm, this, down_target)
+                    {
+                        if let Err(e) = vm.call_virtual(l, "onClick", &[V::Ref(this)]) {
+                            if crate::dbg_flag("OVELO_TOUCHDBG") {
+                                eprintln!("[touchdbg] onClick error: {e:?}");
+                            }
+                        }
+                        vm.touch_gesture_target = 0;
+                    }
+                    Some(Some(V::I32(1)))
+                }
+                _ => Some(Some(V::I32(0))),
+            }
+        }
+        "dispatchTouchEvent" => {
+            if let Some(V::Ref(l)) = pseudo_get(vm, this, P_TOUCH_L) {
+                if l != 0
+                    && matches!(
+                        vm.call_virtual(l, "onTouch", &[V::Ref(this), args[1]]),
+                        Ok(Some(rv)) if i32v(rv) != 0
+                    )
+                {
+                    return Ok(Some(Some(V::I32(1))));
+                }
+            }
+            Some(Some(V::I32(
+                match vm.call_virtual(this, "onTouchEvent", &[args[1]]) {
+                    Ok(Some(rv)) if i32v(rv) != 0 => 1,
+                    _ => 0,
+                },
+            )))
         }
         "setOnClickListener"
         | "setOnLongClickListener"
@@ -2306,12 +2421,13 @@ pub(crate) fn call(
             if crate::dbg_flag("OVELO_VIEWDBG") {
                 eprintln!("[viewdbg] builtin layout h{this} {l},{t},{r},{b}");
             }
-            // AOSP clears PFLAG_LAYOUT_REQUESTED once the view is laid out.
-            pseudo_set(vm, this, P_LAYOUT_REQ, V::I32(0));
+            // Keep the request flag through guest onLayout: an exception
+            // here leaves the tree unlaid-out, and clearing first makes the
+            // host scheduler treat the failed pass as final.
             let changed = frame_set(vm, this, l, t, r, b);
             pseudo_set(vm, this, P_LAYOUT_DONE, V::I32(1));
             if vm.has_dex_virtual(this, "onLayout", &["Z", "I", "I", "I", "I"]) {
-                if let Err(e) = vm.call_virtual_rt(
+                let out = vm.call_virtual_rt(
                     this,
                     "onLayout",
                     &[
@@ -2321,7 +2437,8 @@ pub(crate) fn call(
                         V::I32(r),
                         V::I32(b),
                     ],
-                ) {
+                );
+                if let Err(e) = out {
                     if crate::dbg_flag("OVELO_VIEWDBG") {
                         match &e {
                             crate::E::Vm(oe) => {
@@ -2334,10 +2451,13 @@ pub(crate) fn call(
                     }
                     return Err(e);
                 }
+                // AOSP clears PFLAG_LAYOUT_REQUESTED once the view is laid out.
+                pseudo_set(vm, this, P_LAYOUT_REQ, V::I32(0));
             } else {
                 // Framework skeleton container — position children
                 // generically or they keep their 0×0 frames.
                 group_layout_fallback(vm, this, l, t, r, b);
+                pseudo_set(vm, this, P_LAYOUT_REQ, V::I32(0));
             }
             Some(None)
         }
@@ -2570,7 +2690,6 @@ pub(crate) fn call(
         | "setAccessibilityLiveRegion"
         | "setBackground"
         | "setTextColor"
-        | "setTextSize"
         | "setTypeface"
         | "setSingleLine"
         | "setMaxLines"
@@ -2617,7 +2736,6 @@ pub(crate) fn call(
         | "setAutofillHints"
         | "setScreenReaderFocusable"
         | "dispatchKeyEvent"
-        | "dispatchTouchEvent"
         | "dispatchGenericMotionEvent" => Some(match ret(sig) {
             "V" => None,
             "Z" => Some(V::I32(if name == "setRefreshing" { 0 } else { 1 })),
@@ -2965,13 +3083,16 @@ fn inflate_call(vm: &mut Vm, args: &[V]) -> V {
     }
     // inflate(int, ViewGroup, bool) — the parser-taking overloads aren't
     // modeled yet and degrade to a bare view.
-    let ctx = args
-        .first()
-        .and_then(|a| match a {
-            V::Ref(h) => pseudo_get(vm, *h, P_CONTEXT),
-            _ => None,
-        })
-        .unwrap_or(V::Ref(0));
+    // Static View.inflate's first parameter is already the Context;
+    // LayoutInflater instance calls pass the inflater and store the
+    // Context on it.
+    let first = args.first().copied().unwrap_or(V::Ref(0));
+    let ctx = match first {
+        V::Ref(h) if class_of(vm, first).contains("LayoutInflater") => {
+            pseudo_get(vm, h, P_CONTEXT).unwrap_or(first)
+        }
+        _ => first,
+    };
     let inflated = match args.get(1).copied() {
         Some(V::I32(id)) if id != 0 => inflate_res(vm, id as u32, ctx),
         _ => empty_view(vm),
@@ -5377,6 +5498,22 @@ fn view_id(vm: &Vm, h: u32) -> i32 {
 /// `onTouchEvent` first, then a registered `OnTouchListener`. Without
 /// this bridge, dex-materialized views (games: libGDX's input view)
 /// never see host input.
+fn view_or_descendant(vm: &Vm, ancestor: u32, mut view: u32) -> bool {
+    for _ in 0..32 {
+        if view == 0 {
+            return false;
+        }
+        if view == ancestor {
+            return true;
+        }
+        view = match pseudo_get(vm, view, P_PARENT) {
+            Some(V::Ref(p)) => p,
+            _ => return false,
+        };
+    }
+    false
+}
+
 pub(crate) fn dispatch_touch(
     vm: &mut Vm,
     x: i32,
@@ -5498,6 +5635,7 @@ pub(crate) fn dispatch_touch(
     let now = now_ms();
     if action == 0 {
         vm.touch_gesture_down_time = now;
+        vm.touch_gesture_target = target;
     }
     let down_time = if vm.touch_gesture_down_time >= 0 {
         vm.touch_gesture_down_time
@@ -5508,6 +5646,9 @@ pub(crate) fn dispatch_touch(
     pseudo_set(vm, evt, P_ME_EVENT_TIME, V::I64(now));
     if action == 1 || action == 3 {
         vm.touch_gesture_down_time = -1;
+        if action == 3 {
+            vm.touch_gesture_target = 0;
+        }
     }
     pseudo_set(vm, evt, P_ME_RAWX, V::F32(x as f32));
     pseudo_set(vm, evt, P_ME_RAWY, V::F32(y as f32));
@@ -5528,26 +5669,37 @@ pub(crate) fn dispatch_touch(
                     vm.dbg_class_of(v)
                 );
             }
-            if vm
-                .call_virtual(v, "dispatchTouchEvent", &[V::Ref(evt)])
-                .is_ok()
-            {
+            let dr = vm.call_virtual(v, "dispatchTouchEvent", &[V::Ref(evt)]);
+            if matches!(dr, Ok(Some(rv)) if i32v(rv) != 0) {
                 return Ok(true);
             }
-        }
-        if vm.has_dex_virtual(v, "onTouchEvent", &["Landroid/view/MotionEvent;"]) {
-            if dbg {
-                eprintln!("[touchdbg] h{v} dex onTouchEvent {}", vm.dbg_class_of(v));
-            }
-            let _ = vm.call_virtual(v, "onTouchEvent", &[V::Ref(evt)]);
-            return Ok(true);
+            v = match pseudo_get(vm, v, P_PARENT) {
+                Some(V::Ref(p)) => p,
+                _ => break,
+            };
+            continue;
         }
         if let Some(V::Ref(l)) = pseudo_get(vm, v, P_TOUCH_L) {
             if l != 0 {
                 if dbg {
                     eprintln!("[touchdbg] h{v} OnTouchListener.onTouch l{l}");
                 }
-                let _ = vm.call_virtual(l, "onTouch", &[V::Ref(v), V::Ref(evt)]);
+                if matches!(
+                    vm.call_virtual(l, "onTouch", &[V::Ref(v), V::Ref(evt)]),
+                    Ok(Some(rv)) if i32v(rv) != 0
+                ) {
+                    return Ok(true);
+                }
+            }
+        }
+        if vm.has_dex_virtual(v, "onTouchEvent", &["Landroid/view/MotionEvent;"]) {
+            if dbg {
+                eprintln!("[touchdbg] h{v} dex onTouchEvent {}", vm.dbg_class_of(v));
+            }
+            if matches!(
+                vm.call_virtual(v, "onTouchEvent", &[V::Ref(evt)]),
+                Ok(Some(rv)) if i32v(rv) != 0
+            ) {
                 return Ok(true);
             }
         }
@@ -5556,11 +5708,17 @@ pub(crate) fn dispatch_touch(
         // The deepest ancestor with a listener wins.
         if action == 1 {
             if let Some(V::Ref(l)) = pseudo_get(vm, v, P_LISTENER) {
-                if l != 0 {
+                let down_target = vm.touch_gesture_target;
+                if l != 0 && down_target != 0 && view_or_descendant(vm, v, down_target) {
                     if dbg {
                         eprintln!("[touchdbg] h{v} OnClickListener.onClick l{l}");
                     }
-                    let _ = vm.call_virtual(l, "onClick", &[V::Ref(v)]);
+                    if let Err(e) = vm.call_virtual(l, "onClick", &[V::Ref(v)]) {
+                        if crate::dbg_flag("OVELO_TOUCHDBG") {
+                            eprintln!("[touchdbg] onClick error: {e:?}");
+                        }
+                    }
+                    vm.touch_gesture_target = 0;
                     return Ok(true);
                 }
             }
@@ -5608,6 +5766,13 @@ pub(crate) fn dispatch_touch(
     // listener, and no activity hook — the host tree may hold the
     // handler (host-materialized views keep listeners host-side).
     Ok(false)
+}
+
+/// Record a click listener on a dex view when the high-level UI bridge
+/// has no host widget for it. Dispatch/materialization both read this
+/// same pseudo state.
+pub(crate) fn set_click_listener(vm: &mut Vm, view: u32, listener: V) {
+    pseudo_set(vm, view, P_LISTENER, listener);
 }
 
 pub(crate) fn has_input_connection(vm: &Vm, view: u32) -> bool {
@@ -6607,7 +6772,7 @@ fn menu_inflate_level(vm: &mut Vm, doc: &[Element], i: &mut usize, depth: usize,
         if el.depth < depth {
             break;
         }
-        if el.depth > depth || el.name != "item" {
+        if el.name != "item" {
             *i += 1;
             continue;
         }

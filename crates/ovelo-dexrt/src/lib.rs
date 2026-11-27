@@ -288,6 +288,7 @@ pub struct Vm {
     pub(crate) window_size: (i32, i32),
     /// Down time of the currently active single-pointer touch gesture.
     pub(crate) touch_gesture_down_time: i64,
+    pub(crate) touch_gesture_target: u32,
     /// Interned host enum constants, keyed (desc, ordinal) — so
     /// `Month.of(1) == Month.JANUARY` and `date.getMonth()` return the
     /// same handle the static constant did.
@@ -300,6 +301,7 @@ pub struct Vm {
     /// constants must be identity-stable because bytecode uses reference
     /// comparisons for sentinel/control-flow checks.
     pub(crate) bool_cache: [u32; 2],
+    pub(crate) int_cache: [u32; 256],
     /// Attached `TextClock` views that tick — refreshed once per
     /// `drain_runnables` pass (AOSP ticks them per postDelayed).
     pub clock_views: Vec<u32>,
@@ -581,6 +583,12 @@ pub struct Vm {
     /// Nesting depth of inline drains issued from `park` — bounds the
     /// recursion when a task inside such a drain parks again.
     pub(crate) park_depth: u32,
+    /// Active Compose measure/layout calls, keyed by receiver and method.
+    /// The runtime's cooperative scheduling can otherwise re-enter the
+    /// same measure pass in orders that cannot occur on Android's
+    /// serialized UI thread; ordinary owner→delegate delegation uses a
+    /// different receiver/method pair and must still run.
+    pub(crate) compose_measure_active: Vec<(u32, GIdx)>,
     /// Runnables that re-parked inside a drain — when the queue holds
     /// only these, draining them again just makes two waiting workers
     /// hand the slot back and forth until the instruction budget
@@ -858,9 +866,11 @@ impl Vm {
             content_frames: HashMap::new(),
             window_size: (720, 1280),
             touch_gesture_down_time: -1,
+            touch_gesture_target: 0,
             enum_cache: HashMap::new(),
             enum_name_cache: HashMap::new(),
             bool_cache: [0, 0],
+            int_cache: [0; 256],
             clock_views: Vec::new(),
             apk_res: None,
             dbs: HashMap::new(),
@@ -909,6 +919,7 @@ impl Vm {
             vto_predraw: HashMap::new(),
             draining: false,
             park_depth: 0,
+            compose_measure_active: Vec::new(),
             reparked: hashbrown::HashSet::new(),
             fill_bad: hashbrown::HashSet::new(),
             park_spins: 0,
@@ -1663,7 +1674,7 @@ impl Vm {
     /// `args`' slot count. Used by the layout inflater: custom view
     /// classes (and bundled libs like material's NavigationView) get
     /// real constructor state, not an opaque host stub.
-    pub(crate) fn instantiate_with(&mut self, class_desc: &str, args: &[V]) -> Result<u32> {
+    pub fn instantiate_with(&mut self, class_desc: &str, args: &[V]) -> Result<u32> {
         let ty = self
             .type_index_of(class_desc)
             .ok_or_else(|| errd("dexrt.class.missing", class_desc.to_string()))?;
@@ -1920,6 +1931,16 @@ impl Vm {
     /// attached while it runs are recorded under it.
     pub fn set_activity(&mut self, activity: u32) {
         self.cur_activity = activity;
+    }
+
+    /// Activity currently dispatching guest code, or zero outside one.
+    pub fn current_activity(&self) -> u32 {
+        self.cur_activity
+    }
+
+    /// A host LayoutInflater carrying the supplied Context.
+    pub fn layout_inflater(&mut self, ctx: Option<V>) -> V {
+        jdk::view::inflater(self, ctx)
     }
 
     /// Deliver a host pointer event into the dex view tree
@@ -2437,6 +2458,7 @@ impl Vm {
         roots.extend(self.enum_cache.values().copied());
         roots.extend(self.enum_name_cache.values().copied());
         roots.extend(self.bool_cache.into_iter().filter(|h| *h != 0));
+        roots.extend(self.int_cache.into_iter().filter(|h| *h != 0));
         roots.extend(self.content_views.keys().copied());
         roots.extend(self.content_views.values().copied());
         roots.extend(self.decor_roots.keys().copied());
@@ -2875,9 +2897,10 @@ impl Vm {
         child: u32,
         idx: Option<usize>,
         lp: Option<V>,
+        notify: bool,
     ) {
         if parent != 0 && child != 0 {
-            jdk::view::attach_at(self, parent, V::Ref(child), idx, true, lp);
+            jdk::view::attach_at(self, parent, V::Ref(child), idx, notify, lp);
         }
     }
 
@@ -2988,6 +3011,11 @@ impl Vm {
         }
     }
 
+    /// Record a click listener on a dex-materialized view.
+    pub fn set_dex_click_listener(&mut self, view: u32, listener: V) {
+        jdk::view::set_click_listener(self, view, listener);
+    }
+
     /// Snapshot one node of the dex view tree for host rendering —
     /// text, colors, layout params, visibility, listener, children.
     pub fn dex_view(&self, h: u32) -> Option<jdk::view::DexViewInfo> {
@@ -2999,6 +3027,29 @@ impl Vm {
     /// no class in the chain overrides `onDraw` or the call fails.
     pub fn guest_draw_ops(&mut self, view: u32, w: i32, h: i32) -> Vec<crate::value::CanvasOp> {
         jdk::gfx::guest_draw_ops(self, view, w, h)
+    }
+
+    /// Record guest draw ops without resolving nested RenderNode
+    /// references — Compose child layers can be re-recorded after the
+    /// parent capture, so the framework re-expands the references each
+    /// frame instead of re-running guest dispatchDraw.
+    pub fn guest_draw_ops_raw(&mut self, view: u32, w: i32, h: i32) -> Vec<crate::value::CanvasOp> {
+        jdk::gfx::guest_draw_ops_raw(self, view, w, h)
+    }
+
+    /// Per-view guest invalidate sequence used to decide when a cached
+    /// display-list recording is stale.
+    pub fn view_invalid_seq(&self, view: u32) -> i32 {
+        jdk::view::invalid_seq(self, view)
+    }
+
+    /// Resolve nested RenderNode references against their current
+    /// recordings.
+    pub fn expand_display_list_ops(
+        &self,
+        ops: &[crate::value::CanvasOp],
+    ) -> Vec<crate::value::CanvasOp> {
+        jdk::gfx::expand_display_list_ops(self, ops)
     }
 
     /// Whether the view's Compose measure/layout pass is currently active.
@@ -3240,6 +3291,17 @@ impl Vm {
                 jdk::host(self, desc, HostState::Slot(*v))
             })
             .collect()
+    }
+
+    /// Read the scalar/reference payload of a host slot object.
+    pub fn host_slot(&self, h: u32) -> Option<V> {
+        jdk::slot_of(self, h)
+    }
+
+    /// Resolve a ColorStateList in the resting enabled/unchecked state.
+    pub fn color_state_list_resting(&self, h: u32) -> Option<V> {
+        jdk::pseudo_get(self, h, jdk::P_CSL_RESTING)
+            .or_else(|| jdk::android::color_state_list_resting_color(self, h))
     }
 
     /// Resolve `name` on `ci`'s chain for `args`, retrying with each
@@ -4950,7 +5012,36 @@ impl Vm {
         }
     }
 
-    /// Invoke `midx` per `kind`; `args` includes the receiver for non-static.
+    /// Invoke the exact dex method body for `(class, name, sig)`, bypassing
+    /// both virtual overrides and the registered host shim on that root
+    /// method. Compat shims registered on a base library method use this to
+    /// delegate to the base implementation without re-entering themselves.
+    pub fn call_exact_direct(
+        &mut self,
+        this: u32,
+        class: &str,
+        name: &str,
+        sig: &str,
+        args: &[V],
+    ) -> Result<Option<V>> {
+        let midx = self
+            .methods_by_sig
+            .get(&(class.to_string(), name.to_string(), sig.to_string()))
+            .copied()
+            .ok_or_else(|| errd("dexrt.invoke.unresolved", format!("{class}.{name}{sig}")))?;
+        let mut a = Vec::with_capacity(args.len() + 1);
+        a.push(V::Ref(this));
+        a.extend_from_slice(args);
+        match self.invoke_inner(midx, a, InvokeKind::Direct, true) {
+            Ok(v) => Ok(v),
+            Err(E::Vm(e)) => Err(e),
+            Err(E::Throw(r)) => {
+                let d = self.describe_throw(r);
+                Err(errd("dexrt.exception.uncaught", d))
+            }
+        }
+    }
+
     /// `call_virtual` that bypasses registered host overrides on the
     /// ROOT method only — compat shims delegate to the real dex body
     /// through this once the genuine path is known to work (nested
@@ -5186,6 +5277,12 @@ impl Vm {
             InvokeKind::Static | InvokeKind::Direct => match self.resolve_defined(midx) {
                 Ok(l) => l,
                 Err(_) => {
+                    if crate::dbg_flag("OVELO_STUBDBG") {
+                        eprintln!(
+                            "[stubdbg] unresolved direct/static {}",
+                            self.describe_method(midx)
+                        );
+                    }
                     return self.call_builtin(midx, &args, matches!(kind, InvokeKind::Direct));
                 }
             },
@@ -5267,153 +5364,204 @@ impl Vm {
                 }
             }
         };
-        // A registered host override short-circuits even a dex-defined
-        // method — used for compat shims on library code that can't run
-        // here (e.g. appcompat's vector-drawable path).
-        let host = if skip_host {
-            None
-        } else {
-            self.hosts.get(&loc.midx).cloned()
+        let compose_measure = {
+            let md = self.dex_of(loc.midx).and_then(|d| {
+                let m = d.method(gl(loc.midx)).ok()?;
+                d.string(m.name_idx).ok()
+            });
+            matches!(md.as_deref(), Some("measureAndLayout" | "applyChanges"))
         };
-        if let Some(f) = host {
-            // A re-entrant call into an already-borrowed host callback
-            // falls through to dex/builtin execution — the outer call
-            // dispatching guest code (attach → onAttachedToWindow →
-            // addView) is a legitimate AOSP flow, not an error.
-            match f.try_borrow_mut() {
-                Ok(mut g) => {
-                    let has_recv = !matches!(kind, InvokeKind::Static);
-                    let args = self.compact_args(loc.midx, &args, has_recv);
-                    let r = g(self, &args).map_err(E::Vm);
-                    if let Some(h) = self.host_throw.take() {
-                        return Err(E::Throw(h));
-                    }
-                    return r;
-                }
-                Err(_) => {
-                    // Queue the bridge for the next drain tick so its
-                    // host-side wiring still runs once the borrow frees.
-                    let has_recv = !matches!(kind, InvokeKind::Static);
-                    let args = self.compact_args(loc.midx, &args, has_recv);
-                    self.pending_host_retry.push((loc.midx, args));
-                }
+        let compose_key = if compose_measure && !matches!(kind, InvokeKind::Static) {
+            match args.first() {
+                Some(V::Ref(h)) if *h != 0 => Some((*h, loc.midx)),
+                _ => None,
             }
-        }
-        if !matches!(kind, InvokeKind::Static) {
-            if let Some(f) = self.simple_getter_field(loc) {
-                let h = match args.first() {
-                    Some(&V::Ref(h)) => h,
-                    _ => 0,
-                };
-                if h == 0 {
-                    return Err(self.throw_builtin(
-                        "Ljava/lang/NullPointerException;",
-                        &format!("null receiver calling {}", self.describe_method(midx)),
-                    ));
-                }
-                let stored = match self.heap.get(h) {
-                    Some(Obj::Instance { fields, .. }) | Some(Obj::Host { fields, .. }) => {
-                        fields.get(&f).copied()
-                    }
-                    other => {
-                        return Err(E::Vm(errd(
-                            "dexrt.type",
-                            format!(
-                                "fast iget h{h} field={} kind={:?}",
-                                self.describe_field(f),
-                                other.map(std::mem::discriminant),
-                            ),
-                        )));
-                    }
-                };
-                let v = match stored {
-                    Some(v) => v,
-                    None => match self.builtin_ifield(h, f) {
-                        Some(b) => b,
-                        None => match self.ref_field_stub(h, f) {
-                            Some(v) => v,
-                            None => self.field_default(f).unwrap_or(V::I32(0)),
-                        },
-                    },
-                };
-                return Ok(Some(v));
+        } else {
+            None
+        };
+        if compose_key.is_some_and(|key| self.compose_measure_active.contains(&key)) {
+            if crate::dbg_flag("OVELO_COMPOSEDBG") {
+                eprintln!("[composedbg] reenter skip key={compose_key:?}");
             }
-        }
-        if matches!(kind, InvokeKind::Static) {
-            self.ensure_init(loc.class_idx)?;
-        }
-        if loc.em.code_off == 0 {
-            // Bodiless declaration (native / external / abstract decl):
-            // jdk shims may still answer it; otherwise a typed
-            // placeholder keeps a compat run moving — real JNI bridging
-            // arrives with the native stack.
-            let (class, name, sig, ret_desc) = {
-                let d = self
-                    .dex_of(loc.midx)
-                    .ok_or_else(|| E::Vm(err("dexrt.dex.idx")))?;
-                let mid = *d.method(gl(loc.midx)).map_err(E::Vm)?;
-                (
-                    d.type_descriptor(mid.class_idx as u32).map_err(E::Vm)?,
-                    d.string(mid.name_idx).map_err(E::Vm)?,
-                    self.proto_sig_of(loc.midx)?,
-                    d.proto(mid.proto_idx as u32)
+            let ret_desc = self
+                .dex_of(loc.midx)
+                .and_then(|d| {
+                    let m = d.method(gl(loc.midx)).ok()?;
+                    d.proto(m.proto_idx as u32)
                         .and_then(|p| d.type_descriptor(p.return_type_idx))
-                        .map_err(E::Vm)?,
-                )
+                        .ok()
+                })
+                .unwrap_or_else(|| "V".into());
+            return Ok(match ret_desc.as_str() {
+                "V" => None,
+                "Z" | "B" | "C" | "S" | "I" => Some(V::I32(0)),
+                "J" => Some(V::I64(0)),
+                "F" => Some(V::F32(0.0)),
+                "D" => Some(V::F64(0.0)),
+                _ => Some(V::Ref(0)),
+            });
+        }
+        if let Some(key) = compose_key {
+            if crate::dbg_flag("OVELO_COMPOSEDBG") {
+                eprintln!("[composedbg] push key={key:?}");
+            }
+            self.compose_measure_active.push(key);
+        }
+        let invoke_out = (|| {
+            // A registered host override short-circuits even a dex-defined
+            // method — used for compat shims on library code that can't run
+            // here (e.g. appcompat's vector-drawable path).
+            let host = if skip_host {
+                None
+            } else {
+                self.hosts.get(&loc.midx).cloned()
             };
-            let args = self.compact_args(loc.midx, &args, !matches!(kind, InvokeKind::Static));
-            if let Some(r) = jdk::call(self, &class, &name, &sig, &args)? {
-                return Ok(r);
+            if let Some(f) = host {
+                // A re-entrant call into an already-borrowed host callback
+                // falls through to dex/builtin execution — the outer call
+                // dispatching guest code (attach → onAttachedToWindow →
+                // addView) is a legitimate AOSP flow, not an error.
+                match f.try_borrow_mut() {
+                    Ok(mut g) => {
+                        let has_recv = !matches!(kind, InvokeKind::Static);
+                        let args = self.compact_args(loc.midx, &args, has_recv);
+                        let r = g(self, &args).map_err(E::Vm);
+                        if let Some(h) = self.host_throw.take() {
+                            return Err(E::Throw(h));
+                        }
+                        return r;
+                    }
+                    Err(_) => {
+                        // Queue the bridge for the next drain tick so its
+                        // host-side wiring still runs once the borrow frees.
+                        let has_recv = !matches!(kind, InvokeKind::Static);
+                        let args = self.compact_args(loc.midx, &args, has_recv);
+                        self.pending_host_retry.push((loc.midx, args));
+                    }
+                }
             }
-            // Annotation-interface calls (`Navigator.Name.value()`,
-            // `Subscribe.threadMode()`) are bodiless decls too — answer
-            // from the receiver mirror's elements (or declared
-            // AnnotationDefault) before falling to the stub path.
-            if let Some(v) = self.annotation_method_value(loc.midx, &args) {
-                return Ok(Some(v));
+            if !matches!(kind, InvokeKind::Static) {
+                if let Some(f) = self.simple_getter_field(loc) {
+                    let h = match args.first() {
+                        Some(&V::Ref(h)) => h,
+                        _ => 0,
+                    };
+                    if h == 0 {
+                        return Err(self.throw_builtin(
+                            "Ljava/lang/NullPointerException;",
+                            &format!("null receiver calling {}", self.describe_method(midx)),
+                        ));
+                    }
+                    let stored = match self.heap.get(h) {
+                        Some(Obj::Instance { fields, .. }) | Some(Obj::Host { fields, .. }) => {
+                            fields.get(&f).copied()
+                        }
+                        other => {
+                            return Err(E::Vm(errd(
+                                "dexrt.type",
+                                format!(
+                                    "fast iget h{h} field={} kind={:?}",
+                                    self.describe_field(f),
+                                    other.map(std::mem::discriminant),
+                                ),
+                            )));
+                        }
+                    };
+                    let v = match stored {
+                        Some(v) => v,
+                        None => match self.builtin_ifield(h, f) {
+                            Some(b) => b,
+                            None => match self.ref_field_stub(h, f) {
+                                Some(v) => v,
+                                None => self.field_default(f).unwrap_or(V::I32(0)),
+                            },
+                        },
+                    };
+                    return Ok(Some(v));
+                }
             }
-            // Debug bisection: OVELO_STUB_NATIVE=<substring> skips the
-            // native call entirely, returning a zero value for its
-            // return type — used to isolate which guest `.so` entry
-            // point's execution corrupts state.
-            static STUB_PAT: std::sync::OnceLock<Option<String>> = std::sync::OnceLock::new();
-            let stub = STUB_PAT
-                .get_or_init(|| std::env::var("OVELO_STUB_NATIVE").ok())
-                .as_deref();
-            if stub.is_some_and(|p| name.contains(p)) {
-                eprintln!("[stubnative] {class}.{name}{sig} skipped");
-                return Ok(void_resolved(match ret_desc.as_str() {
-                    "V" => None,
-                    "Z" | "B" | "C" | "S" | "I" => Some(V::I32(0)),
-                    "J" => Some(V::I64(0)),
-                    "F" => Some(V::F32(0.0)),
-                    "D" => Some(V::F64(0.0)),
-                    _ => Some(V::Ref(0)),
-                }));
+            if matches!(kind, InvokeKind::Static) {
+                self.ensure_init(loc.class_idx)?;
             }
-            // A dex `native` method resolves to a loaded `.so`: the
-            // `Java_<cls>_<name>` symbol or a RegisterNatives binding.
-            if let Some(addr) = jni::native_addr(self, &class, &name, &sig) {
-                return jni::dispatch_native(
-                    self,
-                    addr,
-                    &class,
-                    &ret_desc,
-                    matches!(kind, InvokeKind::Static),
-                    &args,
-                )
-                .map(void_resolved);
+            if loc.em.code_off == 0 {
+                // Bodiless declaration (native / external / abstract decl):
+                // jdk shims may still answer it; otherwise a typed
+                // placeholder keeps a compat run moving — real JNI bridging
+                // arrives with the native stack.
+                let (class, name, sig, ret_desc) = {
+                    let d = self
+                        .dex_of(loc.midx)
+                        .ok_or_else(|| E::Vm(err("dexrt.dex.idx")))?;
+                    let mid = *d.method(gl(loc.midx)).map_err(E::Vm)?;
+                    (
+                        d.type_descriptor(mid.class_idx as u32).map_err(E::Vm)?,
+                        d.string(mid.name_idx).map_err(E::Vm)?,
+                        self.proto_sig_of(loc.midx)?,
+                        d.proto(mid.proto_idx as u32)
+                            .and_then(|p| d.type_descriptor(p.return_type_idx))
+                            .map_err(E::Vm)?,
+                    )
+                };
+                let args = self.compact_args(loc.midx, &args, !matches!(kind, InvokeKind::Static));
+                if let Some(r) = jdk::call(self, &class, &name, &sig, &args)? {
+                    return Ok(r);
+                }
+                // Annotation-interface calls (`Navigator.Name.value()`,
+                // `Subscribe.threadMode()`) are bodiless decls too — answer
+                // from the receiver mirror's elements (or declared
+                // AnnotationDefault) before falling to the stub path.
+                if let Some(v) = self.annotation_method_value(loc.midx, &args) {
+                    return Ok(Some(v));
+                }
+                // Debug bisection: OVELO_STUB_NATIVE=<substring> skips the
+                // native call entirely, returning a zero value for its
+                // return type — used to isolate which guest `.so` entry
+                // point's execution corrupts state.
+                static STUB_PAT: std::sync::OnceLock<Option<String>> = std::sync::OnceLock::new();
+                let stub = STUB_PAT
+                    .get_or_init(|| std::env::var("OVELO_STUB_NATIVE").ok())
+                    .as_deref();
+                if stub.is_some_and(|p| name.contains(p)) {
+                    eprintln!("[stubnative] {class}.{name}{sig} skipped");
+                    return Ok(void_resolved(match ret_desc.as_str() {
+                        "V" => None,
+                        "Z" | "B" | "C" | "S" | "I" => Some(V::I32(0)),
+                        "J" => Some(V::I64(0)),
+                        "F" => Some(V::F32(0.0)),
+                        "D" => Some(V::F64(0.0)),
+                        _ => Some(V::Ref(0)),
+                    }));
+                }
+                // A dex `native` method resolves to a loaded `.so`: the
+                // `Java_<cls>_<name>` symbol or a RegisterNatives binding.
+                if let Some(addr) = jni::native_addr(self, &class, &name, &sig) {
+                    return jni::dispatch_native(
+                        self,
+                        addr,
+                        &class,
+                        &ret_desc,
+                        matches!(kind, InvokeKind::Static),
+                        &args,
+                    )
+                    .map(void_resolved);
+                }
+                return self
+                    .stub_placeholder(loc.midx, &ret_desc, &name, &class, &args)
+                    .map(void_resolved);
             }
-            return self
-                .stub_placeholder(loc.midx, &ret_desc, &name, &class, &args)
-                .map(void_resolved);
+            if let Some(f) = self.aot.as_ref().and_then(|a| a.get(loc.midx)) {
+                return self
+                    .run_native(f, loc.midx, loc.em.code_off, args)
+                    .map(void_resolved);
+            }
+            self.exec(loc, args).map(void_resolved)
+        })();
+        if let Some(key) = compose_key {
+            if let Some(pos) = self.compose_measure_active.iter().rposition(|k| *k == key) {
+                self.compose_measure_active.remove(pos);
+            }
         }
-        if let Some(f) = self.aot.as_ref().and_then(|a| a.get(loc.midx)) {
-            return self
-                .run_native(f, loc.midx, loc.em.code_off, args)
-                .map(void_resolved);
-        }
-        self.exec(loc, args).map(void_resolved)
+        invoke_out
     }
 
     /// JNI-facing wrappers — the `jni` module sits outside `Vm` but
@@ -5939,6 +6087,56 @@ impl Vm {
         self.sget_pub(g)
     }
 
+    /// Find a declared field by its type rather than its source-level
+    /// name. R8/ProGuard rename exactly the singleton/state fields this
+    /// is used for, while their declared types remain stable.
+    pub fn find_field_by_type(
+        &self,
+        owner: &str,
+        type_desc: &str,
+        is_static: bool,
+    ) -> Option<GIdx> {
+        let ty = self.type_index_of(owner)?;
+        let (cg, _) = self.def_loc_of(ty)?;
+        let cd = self.class_data_of(cg).ok()??;
+        let it = if is_static {
+            &cd.static_fields
+        } else {
+            &cd.instance_fields
+        };
+        it.iter()
+            .map(|f| gx(gd(cg), f.field_idx))
+            .find(|g| self.field_type_desc(*g).as_deref() == Some(type_desc))
+            .map(|g| self.canon_field(g))
+    }
+
+    /// Read/write a static selected by declared type (obfuscation-safe).
+    pub fn get_static_typed(&mut self, owner: &str, type_desc: &str) -> Option<V> {
+        let f = self.find_field_by_type(owner, type_desc, true)?;
+        self.sget_pub(f)
+    }
+
+    /// Write a static selected by declared type; returns false when the
+    /// owner declares no field of that type.
+    pub fn set_static_typed(&mut self, owner: &str, type_desc: &str, v: V) -> bool {
+        let Some(f) = self.find_field_by_type(owner, type_desc, true) else {
+            return false;
+        };
+        self.sput_pub(f, v);
+        true
+    }
+
+    /// Read an instance field selected by declared type.
+    pub fn get_object_field_typed(&self, h: u32, owner: &str, type_desc: &str) -> Option<V> {
+        let f = self.canon_field(self.find_field_by_type(owner, type_desc, false)?);
+        match self.heap.get(h) {
+            Some(Obj::Instance { fields, .. }) | Some(Obj::Host { fields, .. }) => {
+                fields.get(&f).copied()
+            }
+            _ => None,
+        }
+    }
+
     /// Reflective static read for `Field.get(null)`. Unlike `sget`, a
     /// `<clinit>` failure triggered by the probe is rolled back: a
     /// reflective miss (kotlinx.serialization's `INSTANCE`/`Companion`
@@ -6170,7 +6368,7 @@ impl Vm {
 
     /// Execute one frame to return or throw.
     fn exec(&mut self, loc: Loc, args: Vec<V>) -> Rt<Option<V>> {
-        if self.depth >= 4096 {
+        if self.depth >= 1024 {
             return Err(self.throw_builtin("Ljava/lang/StackOverflowError;", "call depth exceeded"));
         }
         self.depth += 1;

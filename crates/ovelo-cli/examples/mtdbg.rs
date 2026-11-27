@@ -92,7 +92,25 @@ fn main() {
                         } else if let Ok(tm) = dex.method(ix) {
                             let to = dex.type_descriptor(tm.class_idx.into()).unwrap_or_default();
                             let tn = dex.string(tm.name_idx).unwrap_or_default();
-                            line += &format!(" -> {to}.{tn}");
+                            let sig = dex
+                                .proto(tm.proto_idx.into())
+                                .ok()
+                                .and_then(|p| {
+                                    let params = dex.proto_params(p).ok()?;
+                                    let ps: Vec<String> = params
+                                        .iter()
+                                        .map(|t| {
+                                            dex.type_descriptor((*t).into())
+                                                .unwrap_or_default()
+                                                .to_string()
+                                        })
+                                        .collect();
+                                    let r =
+                                        dex.type_descriptor(p.return_type_idx).unwrap_or_default();
+                                    Some(format!("({}){}", ps.join(""), r))
+                                })
+                                .unwrap_or_default();
+                            line += &format!(" -> {to}.{tn}{sig}");
                         }
                     }
                     println!("{line}");
