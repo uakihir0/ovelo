@@ -5712,14 +5712,7 @@ fn gravity_y(
 }
 
 fn group_layout_fallback(vm: &mut Vm, this: u32, _l: i32, _t: i32, r: i32, b: i32) {
-    let pad_l = lp_px(vm, attr_find(vm, this, "paddingLeft").unwrap_or(V::I32(0))).unwrap_or(0);
-    let pad_t = lp_px(vm, attr_find(vm, this, "paddingTop").unwrap_or(V::I32(0))).unwrap_or(0);
-    let pad_r = lp_px(vm, attr_find(vm, this, "paddingRight").unwrap_or(V::I32(0))).unwrap_or(0);
-    let pad_b = lp_px(
-        vm,
-        attr_find(vm, this, "paddingBottom").unwrap_or(V::I32(0)),
-    )
-    .unwrap_or(0);
+    let (pad_l, pad_t, pad_r, pad_b) = view_padding(vm, this);
     let desc = class_of(vm, V::Ref(this));
     let linear = desc.contains("LinearLayout")
         || desc.contains("RadioGroup")
