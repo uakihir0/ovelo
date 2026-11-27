@@ -2132,6 +2132,19 @@ fn component_call(vm: &mut Vm, name: &str, args: &[V]) -> Rt<Option<Option<V>>> 
 /// hops and `?attr` indirection through the bound theme, then through
 /// `android.R.color` ids (`0x0106xxxx`) via the framework table.
 /// Unresolvable attrs fall back to opaque black so text stays visible.
+fn resource_or_attr_color(vm: &mut Vm, id: u32) -> i32 {
+    let is_attr = vm
+        .apk_res
+        .as_ref()
+        .and_then(|r| r.type_name(id).map(|t| t == "attr"))
+        .unwrap_or(false);
+    if is_attr {
+        crate::theme_color(vm, id).unwrap_or(0xff00_0000) as i32
+    } else {
+        resolve_color_id(vm, id) as i32
+    }
+}
+
 fn typed_entry_color(vm: &mut Vm, ev: &ovelo_apk::arsc::EntryValue) -> Option<i32> {
     match ev.data_type {
         0x01 => Some(resolve_color_id(vm, ev.data) as i32),
@@ -2211,7 +2224,7 @@ fn typed_array_color(vm: &mut Vm, h: u32, index: i32) -> Option<i32> {
                             } else if raw >= 0
                                 && (u >= 0x7f00_0000 || (0x0106_0000..0x0107_0000).contains(&u))
                             {
-                                Some(resolve_color_id(vm, u) as i32)
+                                Some(resource_or_attr_color(vm, u))
                             } else {
                                 Some(raw)
                             }
@@ -4466,7 +4479,7 @@ fn res_misc(vm: &mut Vm, class: &str, name: &str, args: &[V]) -> Rt<Option<Optio
                                 } else if raw >= 0
                                     && (u >= 0x7f00_0000 || (0x0106_0000..0x0107_0000).contains(&u))
                                 {
-                                    resolve_color_id(vm, u) as i32
+                                    resource_or_attr_color(vm, u)
                                 } else {
                                     raw
                                 };

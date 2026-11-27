@@ -124,9 +124,15 @@ impl Drawable for View {
             let cw = (s.w - pl - pr).max(0);
             let ch = (s.h - pt - pb).max(0);
             if cw > 0 && ch > 0 && *iw > 0 && *ih > 0 {
-                let fit = (cw as f32 / *iw as f32).min(ch as f32 / *ih as f32);
-                let dw = (*iw as f32 * fit).max(1.0) as i32;
-                let dh = (*ih as f32 * fit).max(1.0) as i32;
+                let (dw, dh) = if self.scale_type == 1 {
+                    (cw, ch)
+                } else {
+                    let fit = (cw as f32 / *iw as f32).min(ch as f32 / *ih as f32);
+                    (
+                        (*iw as f32 * fit).max(1.0) as i32,
+                        (*ih as f32 * fit).max(1.0) as i32,
+                    )
+                };
                 c.draw_image(
                     self.left + pl + (cw - dw) / 2,
                     self.top + pt + (ch - dh) / 2,

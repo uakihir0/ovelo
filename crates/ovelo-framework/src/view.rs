@@ -88,6 +88,8 @@ pub struct View {
     pub image: Option<(u32, u32, std::rc::Rc<Vec<u8>>)>,
     /// Content padding `(left, top, right, bottom)` in px.
     pub padding: (i32, i32, i32, i32),
+    /// ImageView scaleType enum (default fitCenter=3).
+    pub scale_type: i32,
     /// `setOnClickListener` — fired on tap inside the laid-out rect.
     pub on_click: Option<Box<dyn FnMut()>>,
     /// Guest `onDraw(Canvas)` ops recorded by the dexrt materializer —
@@ -117,6 +119,7 @@ impl View {
             background: None,
             image: None,
             padding: (0, 0, 0, 0),
+            scale_type: 3,
             on_click: None,
             custom_ops: None,
             raw_custom_ops: None,

@@ -352,6 +352,8 @@ pub struct DexViewInfo {
     pub image: Option<(u32, u32, std::rc::Rc<Vec<u8>>)>,
     /// Content padding `(left, top, right, bottom)` in px.
     pub padding: (i32, i32, i32, i32),
+    /// ImageView scaleType enum (0 matrix, 1 fitXY, 3 fitCenter).
+    pub scale_type: i32,
     /// Parent view handle (0 = detached/root).
     pub parent: u32,
     /// Child view handles, in z-order.
@@ -761,45 +763,7 @@ pub(crate) fn dex_view_info(vm: &Vm, h: u32) -> Option<DexViewInfo> {
         (Some(V::I32(l)), Some(V::I32(t)), Some(V::I32(r)), Some(V::I32(b))) => Some((l, t, r, b)),
         _ => None,
     };
-    let pad_base = lp_px(vm, attr_find(vm, h, "padding").unwrap_or(V::I32(0))).unwrap_or(0);
-    let pad_l = lp_px(vm, attr_find(vm, h, "paddingLeft").unwrap_or(V::I32(0)))
-        .unwrap_or(0)
-        .max(0)
-        + if pad_base != 0
-            && attr_find(vm, h, "paddingLeft").is_none()
-            && attr_find(vm, h, "paddingStart").is_none()
-        {
-            pad_base
-        } else {
-            0
-        };
-    let pad_t = lp_px(vm, attr_find(vm, h, "paddingTop").unwrap_or(V::I32(0)))
-        .unwrap_or(0)
-        .max(0)
-        + if pad_base != 0 && attr_find(vm, h, "paddingTop").is_none() {
-            pad_base
-        } else {
-            0
-        };
-    let pad_r = lp_px(vm, attr_find(vm, h, "paddingRight").unwrap_or(V::I32(0)))
-        .unwrap_or(0)
-        .max(0)
-        + if pad_base != 0
-            && attr_find(vm, h, "paddingRight").is_none()
-            && attr_find(vm, h, "paddingEnd").is_none()
-        {
-            pad_base
-        } else {
-            0
-        };
-    let pad_b = lp_px(vm, attr_find(vm, h, "paddingBottom").unwrap_or(V::I32(0)))
-        .unwrap_or(0)
-        .max(0)
-        + if pad_base != 0 && attr_find(vm, h, "paddingBottom").is_none() {
-            pad_base
-        } else {
-            0
-        };
+    let (pad_l, pad_t, pad_r, pad_b) = view_padding(vm, h);
     Some(DexViewInfo {
         desc,
         is_group,
@@ -817,6 +781,10 @@ pub(crate) fn dex_view_info(vm: &Vm, h: u32) -> Option<DexViewInfo> {
             .and_then(|v| image_pixels(vm, v))
             .map(|img| tint_image(vm, h, img)),
         padding: (pad_l, pad_t, pad_r, pad_b),
+        scale_type: match attr_find(vm, h, "scaleType") {
+            Some(V::I32(v)) => v,
+            _ => 3,
+        },
         parent: match pseudo_get(vm, h, P_PARENT) {
             Some(V::Ref(p)) => p,
             _ => 0,
@@ -916,7 +884,16 @@ fn xml_image_tint(vm: &Vm, h: u32) -> Option<u32> {
     if raw >= 0 && (0x0101_0000..0x0102_0000).contains(&u) {
         crate::theme_color(vm, u)
     } else if raw >= 0 && u >= 0x0100_0000 {
-        super::vector::rctx(vm).and_then(|r| super::vector::resolve_ref_color(r, u))
+        let is_attr = vm
+            .apk_res
+            .as_ref()
+            .and_then(|r| r.type_name(u).map(|t| t == "attr"))
+            .unwrap_or(false);
+        if is_attr {
+            crate::theme_color(vm, u)
+        } else {
+            super::vector::rctx(vm).and_then(|r| super::vector::resolve_ref_color(r, u))
+        }
     } else {
         Some(u)
     }
@@ -932,18 +909,15 @@ fn tint_image(
     };
     let (w, h, px) = image;
     let mut out = px.as_ref().clone();
-    let (tr, tg, tb, ta) = (
-        (tint >> 16) & 0xff,
-        (tint >> 8) & 0xff,
-        tint & 0xff,
-        (tint >> 24) & 0xff,
-    );
+    let (tr, tg, tb) = ((tint >> 16) & 0xff, (tint >> 8) & 0xff, tint & 0xff);
     for p in out.as_chunks_mut::<4>().0 {
         let sa = p[3] as u32;
         p[0] = tr as u8;
         p[1] = tg as u8;
         p[2] = tb as u8;
-        p[3] = (sa * ta / 255) as u8;
+        // SRC_ATOP tinting preserves the source alpha; a transparent
+        // tint changes color channels but must not erase the image.
+        p[3] = sa as u8;
     }
     (w, h, std::rc::Rc::new(out))
 }
@@ -4560,6 +4534,29 @@ fn lp_px(vm: &Vm, v: V) -> Option<i32> {
     Some(i)
 }
 
+fn padding_component(vm: &Vm, h: u32, exact: &str, relative: Option<&str>, base: i32) -> i32 {
+    if let Some(v) = attr_find(vm, h, exact) {
+        return lp_px(vm, v).unwrap_or(0).max(0);
+    }
+    if let Some(rel) = relative {
+        if let Some(v) = attr_find(vm, h, rel) {
+            return lp_px(vm, v).unwrap_or(0).max(0);
+        }
+    }
+    base.max(0)
+}
+
+/// View padding in physical LTR order, including uniform `android:padding`.
+fn view_padding(vm: &Vm, h: u32) -> (i32, i32, i32, i32) {
+    let base = lp_px(vm, attr_find(vm, h, "padding").unwrap_or(V::I32(0))).unwrap_or(0);
+    (
+        padding_component(vm, h, "paddingLeft", Some("paddingStart"), base),
+        padding_component(vm, h, "paddingTop", None, base),
+        padding_component(vm, h, "paddingRight", Some("paddingEnd"), base),
+        padding_component(vm, h, "paddingBottom", None, base),
+    )
+}
+
 /// Shared `measureChild(WithMargins)` core: reads the child's
 /// LayoutParams, builds the child spec per AOSP
 /// `getChildMeasureSpec`, and drives `child.measure`. Used by the
@@ -4702,24 +4699,9 @@ fn group_measure_fallback(vm: &mut Vm, this: u32, pw: i32, ph: i32) {
     // Start/end padding resolves to physical left/right in LTR layouts;
     // XML that only uses paddingStart/End otherwise measures a padded
     // TextView as if it had no horizontal padding at all.
-    let pad_left = lp_px(vm, attr_find(vm, this, "paddingLeft").unwrap_or(V::I32(0))).unwrap_or(0);
-    let pad_right =
-        lp_px(vm, attr_find(vm, this, "paddingRight").unwrap_or(V::I32(0))).unwrap_or(0);
-    let pad_w = (if pad_left != 0 {
-        pad_left
-    } else {
-        lp_px(vm, attr_find(vm, this, "paddingStart").unwrap_or(V::I32(0))).unwrap_or(0)
-    }) + (if pad_right != 0 {
-        pad_right
-    } else {
-        lp_px(vm, attr_find(vm, this, "paddingEnd").unwrap_or(V::I32(0))).unwrap_or(0)
-    });
-    let pad_h = lp_px(vm, attr_find(vm, this, "paddingTop").unwrap_or(V::I32(0))).unwrap_or(0)
-        + lp_px(
-            vm,
-            attr_find(vm, this, "paddingBottom").unwrap_or(V::I32(0)),
-        )
-        .unwrap_or(0);
+    let (pad_l, pad_t, pad_r, pad_b) = view_padding(vm, this);
+    let pad_w = pad_l + pad_r;
+    let pad_h = pad_t + pad_b;
     let kids = children(vm, this);
     if kids.is_empty() {
         // Leaf view (TextView/Button with no dex onMeasure): report
@@ -4774,7 +4756,7 @@ fn group_measure_fallback(vm: &mut Vm, this: u32, pw: i32, ph: i32) {
         // through resolveSize below), never the parent's spec size.
         let (iw, ih) = pseudo_get(vm, this, P_IMAGE)
             .and_then(|v| image_pixels(vm, v))
-            .map(|(w, h, _)| (w as i32, h as i32))
+            .map(|(w, h, _)| (w as i32 + pad_w, h as i32 + pad_h))
             .unwrap_or((0, 0));
         let (cw, chh) = if text.is_empty() {
             (iw, ih)

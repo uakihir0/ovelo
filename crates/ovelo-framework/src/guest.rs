@@ -419,6 +419,10 @@ fn update_dex_view(g: &mut GuestView, info: &ovelo_dexrt::DexViewInfo) {
             v.padding = info.padding;
             changed = true;
         }
+        if v.scale_type != info.scale_type {
+            v.scale_type = info.scale_type;
+            changed = true;
+        }
     }
     if let GuestView::Group(gr) = g {
         if gr.clip_children != info.clip_children {
