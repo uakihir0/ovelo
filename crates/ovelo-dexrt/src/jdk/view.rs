@@ -7552,15 +7552,20 @@ pub(crate) fn dialog_show(vm: &mut Vm, dialog: u32) {
         &[V::I32(0), V::I32(0), V::I32(width), V::I32(height)],
     );
     if content != root {
-        // A custom-view dialog often supplies a bare leaf whose XML-free
-        // layout params are wrap_content. Measured inside the synthetic
-        // panel it would collapse to its intrinsic 0×0, while the real
-        // AlertDialog custom panel still gives it the panel extent.
-        let _ = vm.call_virtual(content, "measure", &[V::I32(spec_w), V::I32(spec_h)]);
+        // Measure wrap-style custom content at most to the panel. Only a
+        // dimension that remains empty is expanded: fixed-size content
+        // must keep its bounds or its touch target would cover the panel.
+        let aw = 0x8000_0000u32 as i32 | width;
+        let ah = 0x8000_0000u32 as i32 | height;
+        let _ = vm.call_virtual(content, "measure", &[V::I32(aw), V::I32(ah)]);
+        let cw = pint(vm, content, P_MEAS_W).clamp(0, width);
+        let ch = pint(vm, content, P_MEAS_H).clamp(0, height);
+        let cw = if cw == 0 { width } else { cw };
+        let ch = if ch == 0 { height } else { ch };
         let _ = vm.call_virtual(
             content,
             "layout",
-            &[V::I32(0), V::I32(0), V::I32(width), V::I32(height)],
+            &[V::I32(0), V::I32(0), V::I32(cw), V::I32(ch)],
         );
     }
     let x = ((ww - width) / 2).max(0);
