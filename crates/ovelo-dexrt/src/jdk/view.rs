@@ -7372,7 +7372,15 @@ fn menu_inflate_level(vm: &mut Vm, doc: &[Element], i: &mut usize, depth: usize,
                         pseudo_set(vm, av, P_IS_GROUP, V::I32(1));
                     }
                     pseudo_set(vm, av, P_CONTEXT, ctx);
-                    if vm.call_virtual(ih, "setActionView", &[V::Ref(av)]).is_err() {
+                    if vm
+                        .call_virtual_sig(
+                            ih,
+                            "setActionView",
+                            &["Landroid/view/View;"],
+                            &[V::Ref(av)],
+                        )
+                        .is_err()
+                    {
                         vm.set_object_field(
                             ih,
                             "Landroidx/appcompat/view/menu/MenuItemImpl;",
