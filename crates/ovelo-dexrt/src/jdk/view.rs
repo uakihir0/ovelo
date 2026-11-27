@@ -406,6 +406,25 @@ fn attr_bool_ref(vm: &Vm, id: u32) -> Option<bool> {
     None
 }
 
+/// Resolve an attribute out of the explicit XML `style` reference.
+/// `attr_find` only sees direct tag attributes, while Android applies
+/// style items before falling back to the theme's default text color.
+fn style_attr_color(vm: &Vm, style: u32, attr_id: u32) -> Option<i32> {
+    let res = vm.apk_res.as_ref()?;
+    let ev = res.style_item(style, attr_id)?;
+    match ev.data_type {
+        0x01 => color_v(vm, V::I32(ev.data as i32)),
+        0x02 => crate::theme_color(vm, ev.data).map(|c| c as i32),
+        0x1c..=0x1f | 0x10 | 0x11 | 0x04 => Some(ev.data as i32),
+        0x03 => ev
+            .string
+            .as_deref()
+            .and_then(vector::parse_color)
+            .map(|c| c as i32),
+        _ => None,
+    }
+}
+
 /// Resolve an ARGB color from an int literal or a color resource ref.
 fn color_v(vm: &Vm, v: V) -> Option<i32> {
     match v {
@@ -628,6 +647,10 @@ pub(crate) fn dex_view_info(vm: &Vm, h: u32) -> Option<DexViewInfo> {
         Some(v) => color_v(vm, v),
         _ => attr_find(vm, h, "textColor")
             .and_then(|v| color_v(vm, v))
+            .or_else(|| match attr_find(vm, h, "style") {
+                Some(V::I32(style)) if style > 0 => style_attr_color(vm, style as u32, 0x0101_0098),
+                _ => None,
+            })
             // TextView's default style takes its normal color from the
             // theme when XML/runtime didn't set one. Without this every
             // theme-colored label falls back to the renderer's black.
