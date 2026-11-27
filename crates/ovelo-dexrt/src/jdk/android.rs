@@ -2022,7 +2022,13 @@ fn intent_call(vm: &mut Vm, name: &str, sig: &str, args: &[V]) -> Rt<Option<Opti
             pseudo_set(vm, h, P_TYPE, args.get(2).copied().unwrap_or(V::Ref(0)));
             Some(Some(args[0]))
         }
-        "getData" | "getDataString" => Some(Some(pseudo_get(vm, h, P_DATA).unwrap_or(V::Ref(0)))),
+        "getData" => Some(Some(pseudo_get(vm, h, P_DATA).unwrap_or(V::Ref(0)))),
+        "getDataString" => Some(Some(
+            pseudo_get(vm, h, P_DATA)
+                .and_then(|v| sv(vm, v))
+                .map(|s| jstr(vm, &s))
+                .unwrap_or(V::Ref(0)),
+        )),
         "setType" => {
             pseudo_set(vm, h, P_TYPE, args[1]);
             pseudo_set(vm, h, P_DATA, V::Ref(0));
