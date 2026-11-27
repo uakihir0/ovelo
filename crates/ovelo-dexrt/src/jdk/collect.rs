@@ -533,12 +533,16 @@ pub(crate) fn call(
             }
             "submit" => {
                 // `submit(Callable)` must invoke `call`, not `run`: media3
-                // resolves fast media ids through such futures. Running it
-                // inline also gives `Future.get` the produced value instead
-                // of the permanent null an unobserved queue slot yielded.
+                // resolves fast media ids through such futures. This
+                // executor shim completes the task inline so Future.get can
+                // expose the produced value.
                 let out = if let V::Ref(r) = args[1] {
                     match vm.call_virtual_rt(r, "call", &[]) {
-                        Ok(v) => v,
+                        Ok(Some(v)) => Some(v),
+                        Ok(None) => {
+                            let _ = vm.call_virtual_rt(r, "run", &[]);
+                            None
+                        }
                         Err(_) => {
                             let _ = vm.call_virtual_rt(r, "run", &[]);
                             None
