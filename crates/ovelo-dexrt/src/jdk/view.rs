@@ -609,6 +609,23 @@ fn overlay_aware_style_color(vm: &Vm, style: u32, color_res: u32) -> Option<u32>
     themed_color_resource(res, vm.theme_id, Some(overlay), color_res, 0)
 }
 
+fn view_content_image(
+    vm: &Vm,
+    h: u32,
+    icon_only: bool,
+) -> Option<(u32, u32, std::rc::Rc<Vec<u8>>)> {
+    pseudo_get(vm, h, P_IMAGE)
+        .and_then(|v| image_pixels(vm, v))
+        .or_else(|| {
+            // MaterialButton's `app:icon` is a compound drawable rather
+            // than an ImageView src. The host materialization has one
+            // centered image slot, which is correct for the common
+            // icon-only button; text+icon layout needs real compound
+            // drawable support and is intentionally not approximated.
+            icon_only.then(|| attr_find(vm, h, "icon").and_then(|v| image_pixels(vm, v)))?
+        })
+}
+
 fn style_attr_color(vm: &Vm, style: u32, attr_id: u32) -> Option<i32> {
     let res = vm.apk_res.as_ref()?;
     let ev = res.style_item(style, attr_id)?;
@@ -969,20 +986,7 @@ pub(crate) fn dex_view_info(vm: &Vm, h: u32) -> Option<DexViewInfo> {
         listener,
         frame,
         layout_requested: layout_requested(vm, h),
-        image: pseudo_get(vm, h, P_IMAGE)
-            .and_then(|v| image_pixels(vm, v))
-            .or_else(|| {
-                // MaterialButton's `app:icon` is a compound drawable rather
-                // than an ImageView src. The host materialization has one
-                // centered image slot, which is correct for the common
-                // icon-only button; text+icon layout needs real compound
-                // drawable support and is intentionally not approximated.
-                if !icon_only {
-                    return None;
-                }
-                attr_find(vm, h, "icon").and_then(|v| image_pixels(vm, v))
-            })
-            .map(|img| tint_image(vm, h, img)),
+        image: view_content_image(vm, h, icon_only).map(|img| tint_image(vm, h, img)),
         padding: (pad_l, pad_t, pad_r, pad_b),
         scale_type: match attr_find(vm, h, "scaleType") {
             Some(V::I32(v)) => v,
@@ -4979,8 +4983,7 @@ fn group_measure_fallback(vm: &mut Vm, this: u32, pw: i32, ph: i32) {
         // An ImageView's content is its drawable: AOSP ImageView.
         // onMeasure reports the drawable's intrinsic size (still folded
         // through resolveSize below), never the parent's spec size.
-        let (iw, ih) = pseudo_get(vm, this, P_IMAGE)
-            .and_then(|v| image_pixels(vm, v))
+        let (iw, ih) = view_content_image(vm, this, text.is_empty())
             .map(|(w, h, _)| (w as i32, h as i32))
             .unwrap_or((0, 0));
         let leaf_desc = class_of(vm, V::Ref(this));
