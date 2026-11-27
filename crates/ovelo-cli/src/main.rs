@@ -1665,7 +1665,13 @@ fn run_app(store: &InstallStore, package: &str) -> Result<(), OveloError> {
                 let _ = std::fs::create_dir_all(&music);
                 for (i, freq) in [440.0f32, 550.0, 660.0].iter().enumerate() {
                     let p = music.join(format!("seed-tone-{}.wav", i + 1));
-                    if !p.exists() {
+                    // Refresh the original 0.4s probe tones: they round
+                    // down to 00:00 in players even when duration metadata
+                    // and playback are correct.
+                    let short_probe = std::fs::metadata(&p)
+                        .map(|m| m.len() < 10_000)
+                        .unwrap_or(false);
+                    if !p.exists() || short_probe {
                         let _ = std::fs::write(p, wav_tone(*freq));
                     }
                 }
@@ -2083,7 +2089,7 @@ fn run_app(store: &InstallStore, package: &str) -> Result<(), OveloError> {
 /// MediaStore to index and players to probe, no asset file needed.
 fn wav_tone(freq_hz: f32) -> Vec<u8> {
     const RATE: u32 = 8000;
-    let n = (RATE as f32 * 0.4) as usize;
+    let n = (RATE as f32 * 10.0) as usize;
     let mut data = Vec::with_capacity(n + 44);
     let data_len = n as u32;
     data.extend_from_slice(b"RIFF");
