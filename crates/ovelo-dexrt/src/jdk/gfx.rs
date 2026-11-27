@@ -257,6 +257,19 @@ fn blend_px(out: &mut [u8], i: usize, argb: i32) {
     out[i + 3] = (a + (out[i + 3] as u32 * ia) / 255) as u8;
 }
 
+fn blend_px_coverage(out: &mut [u8], i: usize, argb: i32, num: u32, den: u32) {
+    if num == 0 {
+        return;
+    }
+    if num >= den {
+        blend_px(out, i, argb);
+        return;
+    }
+    let a = (((argb as u32) >> 24) * num / den) << 24;
+    let rgb = argb as u32 & 0x00ff_ffff;
+    blend_px(out, i, (a | rgb) as i32);
+}
+
 fn stroke_seg_dist(px: f32, py: f32, a: (f32, f32), b: (f32, f32)) -> f32 {
     let vx = b.0 - a.0;
     let vy = b.1 - a.1;
@@ -323,23 +336,36 @@ fn raster_stroke_to_bitmap(
                             let row = da.1.floor() as i32;
                             let x0 = da.0.min(db.0) - 0.5;
                             let x1 = da.0.max(db.0) + 0.5;
-                            yy == row && px >= x0 && px <= x1
+                            u32::from(yy == row && px >= x0 && px <= x1)
                         } else if da.0 == db.0 {
                             let col = da.0.floor() as i32;
                             let y0 = da.1.min(db.1) - 0.5;
                             let y1 = da.1.max(db.1) + 0.5;
-                            xx == col && py >= y0 && py <= y1
+                            u32::from(xx == col && py >= y0 && py <= y1)
                         } else {
-                            stroke_seg_dist(px, py, da, db) < radius
+                            u32::from(stroke_seg_dist(px, py, da, db) < radius)
                         }
                     } else {
-                        let (sx, sy) = inv_mat_point(inverse_m, px, py);
-                        stroke_seg_dist(sx, sy, sa, sb) <= radius
+                        let mut hits = 0u32;
+                        for fy in [0.25, 0.75] {
+                            for fx in [0.25, 0.75] {
+                                let (sx, sy) =
+                                    inv_mat_point(inverse_m, xx as f32 + fx, yy as f32 + fy);
+                                if stroke_seg_dist(sx, sy, sa, sb) <= radius {
+                                    hits += 1;
+                                }
+                            }
+                        }
+                        hits
                     };
                     let pi = (yy as u32 * bw + xx as u32) as usize;
-                    if !covered[pi] && inside {
+                    if !covered[pi] && inside != 0 {
                         covered[pi] = true;
-                        blend_px(&mut out, pi * 4, paint.draw_argb());
+                        if hairline {
+                            blend_px(&mut out, pi * 4, paint.draw_argb());
+                        } else {
+                            blend_px_coverage(&mut out, pi * 4, paint.draw_argb(), inside, 4);
+                        }
                     }
                 }
             }
