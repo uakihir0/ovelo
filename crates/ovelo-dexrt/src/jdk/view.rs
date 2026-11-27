@@ -4578,6 +4578,38 @@ fn view_is_gone(vm: &mut Vm, h: u32) -> bool {
     matches!(attr_find(vm, h, "visibility"), Some(V::I32(2)))
 }
 
+/// Rough proportional-text advance in em units. The runtime cannot use
+/// the host font shaper from dexrt's measure fallback, but a flat wide
+/// factor both clips narrow text and reserves far too much width for
+/// labels made of narrow glyphs. These classes track common Latin font
+/// metrics closely enough for wrap_content layout.
+fn em_width(c: char) -> f32 {
+    match c {
+        ' ' => 0.30,
+        'i' | 'j' | 'l' | 'I' | '\'' | '`' | '.' | ',' | ':' | ';' | '!' | '|' => 0.34,
+        'f' | 'r' | 't' | '(' | ')' | '[' | ']' | '{' | '}' => 0.43,
+        'm' | 'w' => 0.86,
+        'M' | 'W' => 0.92,
+        'A'..='Z' => 0.70,
+        '0'..='9' => 0.60,
+        'a'..='z' => 0.56,
+        c if c.is_ascii_punctuation() => 0.48,
+        c if c.is_ascii() => 0.56,
+        // CJK and most emoji/cyrillic fallback glyphs occupy close to a
+        // full em in the fonts the host renderer substitutes.
+        c if !c.is_ascii() => 1.0,
+        _ => 0.56,
+    }
+}
+
+fn estimated_text_width(text: &str, ts: f32) -> i32 {
+    text.chars()
+        .map(em_width)
+        .sum::<f32>()
+        .mul_add(ts, 0.0)
+        .ceil() as i32
+}
+
 /// Generic `onMeasure` for framework skeleton containers: measure
 /// each child with margins, then fold the measured content size
 /// against the spec via `resolveSize`. The `measure` arm pre-seeds
@@ -4674,18 +4706,24 @@ fn group_measure_fallback(vm: &mut Vm, this: u32, pw: i32, ph: i32) {
             // check uses a fatter factor than the extent itself or a
             // frame measured "one line" renders two.
             let line_h = (ts * 1.3) as i32;
-            // The renderer's proportional glyphs run substantially wider
-            // than the old 0.6em estimate for wide Latin letters (`m`, `w`,
-            // capitals). Measure against the wider estimate consistently:
-            // using a narrower width for the frame than for the wrap count
-            // clipped ordinary labels even when no width constraint existed.
-            let real_w = (text.chars().count() as f32 * ts * 0.85).ceil() as i32;
+            // Measure each explicit paragraph separately: `split('\n')`
+            // keeps the trailing empty paragraph, so `a\n` correctly
+            // reserves two line heights even without a width constraint.
+            let paragraphs: Vec<&str> = text.split('\n').collect();
+            let widths: Vec<i32> = paragraphs
+                .iter()
+                .map(|p| estimated_text_width(p, ts))
+                .collect();
+            let real_w = widths.iter().copied().max().unwrap_or(0);
             let avail = (pw & 0x3FFF_FFFF) - pad_w;
             let frame_w = if avail > 0 { real_w.min(avail) } else { real_w };
             let lines = if frame_w > 0 {
-                ((real_w + frame_w - 1) / frame_w).max(1)
+                widths
+                    .iter()
+                    .map(|w| ((*w + frame_w - 1) / frame_w).max(1))
+                    .sum()
             } else {
-                1
+                paragraphs.len() as i32
             };
             (frame_w, line_h * lines)
         };
