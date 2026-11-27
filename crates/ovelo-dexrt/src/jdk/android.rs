@@ -3022,16 +3022,19 @@ fn context_call(
             }
         }
         "getSystemServiceName" => Some(Some(jstr(vm, "java.lang.Object"))),
-        "getFilesDir" => Some(Some(host(
-            vm,
-            "Ljava/io/File;",
-            HostState::Path("/data/local/ovelo/files".into()),
-        ))),
-        "getCacheDir" => Some(Some(host(
-            vm,
-            "Ljava/io/File;",
-            HostState::Path("/data/local/ovelo/cache".into()),
-        ))),
+        "getFilesDir" | "getCacheDir" => {
+            let logical = if name == "getFilesDir" {
+                "/data/local/ovelo/files"
+            } else {
+                "/data/local/ovelo/cache"
+            };
+            let _ = std::fs::create_dir_all(io::fspath(vm, logical));
+            Some(Some(host(
+                vm,
+                "Ljava/io/File;",
+                HostState::Path(logical.into()),
+            )))
+        }
         "getDatabasePath" => {
             let name = sv(vm, args.get(1).copied().unwrap_or(V::Ref(0)))
                 .unwrap_or_else(|| "db".to_string());
