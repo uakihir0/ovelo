@@ -3528,14 +3528,7 @@ fn nio_call(vm: &mut Vm, class: &str, name: &str, args: &[V]) -> Option<Option<V
     };
     let bpos =
         |vm: &Vm| i32v(pseudo_get(vm, this, P_BBUF_POS).unwrap_or(V::I32(0))).max(0) as usize;
-    let little = |vm: &Vm| match pseudo_get(vm, this, P_BBUF_ORD) {
-        Some(v) => i32v(v) != 0,
-        // Foreign bytes represented by a raw wrapper are exposed as
-        // little-endian by order(); multi-byte access must use the same
-        // interpretation instead of silently switching to Java's BE
-        // default.
-        None => pseudo_get(vm, this, P_BBUF_RAW).is_some(),
-    };
+    let little = |vm: &Vm| i32v(pseudo_get(vm, this, P_BBUF_ORD).unwrap_or(V::I32(0))) != 0;
     // Typed views (`asIntBuffer`…) keep the same byte backing but
     // address it in elements of `esz` bytes.
     let esz =
@@ -3673,9 +3666,7 @@ fn nio_call(vm: &mut Vm, class: &str, name: &str, args: &[V]) -> Option<Option<V
             // No-arg order() must return the canonical static ByteOrder
             // object: media3 compares the result with LITTLE_ENDIAN by
             // reference identity.
-            let little = i32v(pseudo_get(vm, this, P_BBUF_ORD).unwrap_or(V::I32(0))) != 0
-                || (pseudo_get(vm, this, P_BBUF_ORD).is_none()
-                    && pseudo_get(vm, this, P_BBUF_RAW).is_some());
+            let little = i32v(pseudo_get(vm, this, P_BBUF_ORD).unwrap_or(V::I32(0))) != 0;
             let cell = if little {
                 vm.byteorder_h.get()
             } else {
