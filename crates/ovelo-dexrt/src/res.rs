@@ -76,7 +76,7 @@ impl ApkResources {
         // outranks `default`; a bucket with an unknown qualifier, or an
         // understood one that fails, returns 0 and stays a last-seen
         // fallback only for entries with no default.
-        // Device: portrait 360x360dp (what Configuration reports),
+        // Device: portrait 360x640dp (what Configuration reports),
         // API 35, NIGHT mode (Configuration.uiMode reports
         // UI_MODE_NIGHT_YES) — `night` buckets match, `notnight` fail.
         // Matched-key precedence follows AOSP: smallestScreenWidth >
@@ -105,7 +105,7 @@ impl ApkResources {
                 } else if let Some(n) = num(part, "h", "dp") {
                     has_h = 1;
                     h = n as i64;
-                    n <= 360
+                    n <= 640
                 } else if let Some(n) = part.strip_prefix('v').and_then(|s| s.parse::<u32>().ok()) {
                     n <= 35
                 } else {

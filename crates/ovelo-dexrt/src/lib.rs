@@ -878,7 +878,7 @@ impl Vm {
             content_views: HashMap::new(),
             decor_roots: HashMap::new(),
             content_frames: HashMap::new(),
-            window_size: (720, 1280),
+            window_size: (360, 640),
             touch_gesture_down_time: -1,
             touch_gesture_target: 0,
             enum_cache: HashMap::new(),
