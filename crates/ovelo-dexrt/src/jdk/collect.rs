@@ -555,10 +555,17 @@ pub(crate) fn call(
                         } else {
                             vec![V::Ref(task), args.get(2).copied().unwrap_or(V::Ref(0))]
                         };
-                        if let Some(future @ V::Ref(_)) =
+                        if let Some(future @ V::Ref(fh)) =
                             vm.call_virtual_rt(ex, "newTaskFor", &nt_args)?
                         {
-                            vm.call_virtual_rt(ex, "execute", &[future])?;
+                            if vm.call_virtual_rt(ex, "execute", &[future])?.is_none() {
+                                // A dex subclass of a host ThreadPoolExecutor
+                                // can inherit execute without overriding it.
+                                // The virtual lookup has no dex method to
+                                // invoke in that case, but the task still has
+                                // to enter the executor queue.
+                                enqueue_executor_task(vm, ex, fh);
+                            }
                             return Ok(Some(Some(future)));
                         }
                     }
