@@ -3438,11 +3438,14 @@ fn context_call(
             if args.len() > 1 && vm.service_start_id.get(&this).copied() != Some(i64v(args[1])) {
                 return Ok(Some(Some(V::I32(0))));
             }
+            let has_bindings = vm.service_bind_counts.get(&this).copied().unwrap_or(0) > 0;
             if vm.services.values().any(|sh| *sh == this) {
-                vm.services.retain(|_, sh| *sh != this);
                 vm.service_started.remove(&this);
                 vm.service_start_id.remove(&this);
-            } else {
+                if !has_bindings {
+                    vm.services.retain(|_, sh| *sh != this);
+                }
+            } else if !has_bindings {
                 // Self-stop before startService registered the handle
                 // (inside onCreate): the starter consults this set and
                 // skips insert/onStartCommand entirely.
@@ -3450,8 +3453,9 @@ fn context_call(
             }
             // Defer onDestroy to the drain loop: running it inline
             // tears the service down while its own onStartCommand (or
-            // the startService call) is still on the stack.
-            if !vm.pending_destroy.contains(&this) {
+            // the startService call) is still on the stack. Live bound
+            // clients keep the service up after the start request ends.
+            if !has_bindings && !vm.pending_destroy.contains(&this) {
                 vm.pending_destroy.push(this);
             }
             Some(Some(V::I32(1)))
@@ -3563,13 +3567,16 @@ fn context_call(
                     }
                 });
             if let Some(desc) = desc {
-                if let Some(sh) = vm.services.remove(&desc) {
+                if let Some(&sh) = vm.services.get(&desc) {
                     vm.service_started.remove(&sh);
                     vm.service_start_id.remove(&sh);
-                    // Same deferred-teardown rule as stopSelf: the
-                    // caller may be this service's own callback.
-                    if !vm.pending_destroy.contains(&sh) {
-                        vm.pending_destroy.push(sh);
+                    if vm.service_bind_counts.get(&sh).copied().unwrap_or(0) == 0 {
+                        vm.services.remove(&desc);
+                        // Same deferred-teardown rule as stopSelf: the
+                        // caller may be this service's own callback.
+                        if !vm.pending_destroy.contains(&sh) {
+                            vm.pending_destroy.push(sh);
+                        }
                     }
                 }
             }
