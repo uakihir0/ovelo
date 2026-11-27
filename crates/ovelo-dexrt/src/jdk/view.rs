@@ -3263,7 +3263,7 @@ fn make_view_named(vm: &mut Vm, tag: &str, attrs: V, ctx: V) -> V {
         "include" => VIEWGROUP.to_string(),
         "view" => {
             if !class_attr.is_empty() {
-                format!("L{class_attr};")
+                format!("L{};", class_attr.replace('.', "/"))
             } else {
                 VIEW.to_string()
             }
