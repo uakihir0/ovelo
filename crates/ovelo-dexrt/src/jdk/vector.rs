@@ -297,11 +297,34 @@ const OUT_SCALE: f32 = 4.0;
 /// Supersample factor inside the output raster (AA).
 const SS: u32 = 4;
 
+fn theme_dimen(res: &ApkResources, theme: u32, attr: u32, depth: u8) -> Option<f32> {
+    if depth >= 8 {
+        return None;
+    }
+    let ev = res.style_item(theme, attr)?;
+    match ev.data_type {
+        // TYPE_ATTRIBUTE in a theme points at another theme attribute;
+        // TYPE_REFERENCE may point either at a concrete dimen or at a
+        // theme-provided indirection.
+        0x02 => theme_dimen(res, theme, ev.data, depth + 1),
+        0x01 => res
+            .dimen(ev.data)
+            .or_else(|| theme_dimen(res, theme, ev.data, depth + 1)),
+        _ => Some(crate::res::typed_px(ev)),
+    }
+}
+
 fn xml_dimen(rv: RCtx<'_>, v: &Value) -> Option<f32> {
     match v {
-        Value::Reference(id) => rv.res.dimen(*id),
+        Value::Reference(id) => rv
+            .res
+            .dimen(*id)
+            .or_else(|| theme_dimen(rv.res, rv.theme, *id, 0)),
         Value::Float(f) => Some(*f),
         Value::Int(i) => Some(*i as f32),
+        Value::Other { data_type, data } if *data_type == 0x02 => {
+            theme_dimen(rv.res, rv.theme, *data, 0)
+        }
         Value::Other { data_type, data } => {
             Some(crate::res::typed_px(&ovelo_apk::arsc::EntryValue {
                 data_type: *data_type,
