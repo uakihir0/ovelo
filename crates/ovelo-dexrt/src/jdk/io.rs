@@ -2442,6 +2442,31 @@ fn json_dump_d(vm: &Vm, v: V, depth: u32) -> String {
     }
 }
 
+fn json_coerce_number(vm: &Vm, v: V, name: &str) -> V {
+    let parsed = sv(vm, v);
+    let int_bits = parsed
+        .as_deref()
+        .and_then(|s| s.parse::<i64>().ok())
+        .unwrap_or_else(|| i64v(v));
+    let double_bits = parsed
+        .as_deref()
+        .and_then(|s| s.parse::<f64>().ok())
+        .unwrap_or_else(|| f64v(v));
+    if name.ends_with("Int") {
+        V::I32(int_bits as i32)
+    } else if name.ends_with("Long") {
+        V::I64(int_bits)
+    } else if name.ends_with("Double") {
+        V::F64(double_bits)
+    } else {
+        let truthy = parsed
+            .as_deref()
+            .map(|s| s.eq_ignore_ascii_case("true"))
+            .unwrap_or_else(|| i64v(v) != 0);
+        V::I32(truthy as i32)
+    }
+}
+
 fn json_obj(vm: &mut Vm, name: &str, args: &[V]) -> Option<Option<V>> {
     let h = match args.first() {
         Some(V::Ref(h)) => *h,
@@ -2491,7 +2516,9 @@ fn json_obj(vm: &mut Vm, name: &str, args: &[V]) -> Option<Option<V>> {
         | "optBoolean" => {
             let dflt = args.get(1 + (name.starts_with('o') as usize));
             match map_get(vm, h, args[1]) {
-                Some(v) if !matches!(v, V::Ref(0)) => Some(json_unbox(vm, v)),
+                Some(v) if !matches!(v, V::Ref(0)) => {
+                    Some(json_coerce_number(vm, json_unbox(vm, v), name))
+                }
                 _ => Some(dflt.copied().unwrap_or(V::I32(0))),
             }
         }
