@@ -5174,12 +5174,20 @@ fn group_measure_fallback(vm: &mut Vm, this: u32, pw: i32, ph: i32) {
             || leaf_desc.contains("RadioButton")
             || leaf_desc.contains("Switch")
             || vm.extends_named(&leaf_desc, "CompoundButton");
+        let is_text_leaf = leaf_desc.contains("TextView")
+            || leaf_desc.contains("EditText")
+            || vm.extends_named(&leaf_desc, "Landroid/widget/TextView;");
         let (cw, chh) = if text.is_empty() {
             if is_compound {
                 // CompoundButton's button drawable has an intrinsic
                 // affordance even when the label is empty; without it a
                 // wrap_content CheckBox measures to zero width.
                 (iw.max(28), ih.max(28))
+            } else if is_text_leaf {
+                // An empty TextView/EditText still reserves one line
+                // of text height in AOSP. Inputs otherwise collapse to
+                // a few pixels when their hint lives on TextInputLayout.
+                (iw, ih.max((ts * 1.3) as i32))
             } else {
                 (iw, ih)
             }
