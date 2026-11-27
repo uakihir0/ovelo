@@ -4,6 +4,16 @@
 use super::*;
 use crate::value::{CanvasOp, HostState, Obj, PaintState, V};
 
+const P_SCR_START_X: u32 = u32::MAX - 300;
+const P_SCR_START_Y: u32 = u32::MAX - 301;
+const P_SCR_FINAL_X: u32 = u32::MAX - 302;
+const P_SCR_FINAL_Y: u32 = u32::MAX - 303;
+const P_SCR_CURR_X: u32 = u32::MAX - 304;
+const P_SCR_CURR_Y: u32 = u32::MAX - 305;
+const P_SCR_START_T: u32 = u32::MAX - 306;
+const P_SCR_DURATION: u32 = u32::MAX - 307;
+const P_SCR_STATE: u32 = u32::MAX - 308;
+
 pub(crate) fn call(
     vm: &mut Vm,
     class: &str,
@@ -580,6 +590,8 @@ pub(crate) fn call(
             "setData" | "copyFrom" => Some(None),
             _ => None,
         }
+    } else if class == "Landroid/widget/Scroller;" || class == "Landroid/widget/OverScroller;" {
+        scroller_call(vm, name, sig, args)
     } else if class == "Landroid/os/SystemClock;" {
         match name {
             "uptimeMillis" | "elapsedRealtime" | "currentThreadTimeMillis" => {
@@ -1180,6 +1192,181 @@ fn measurespec_call(vm: &mut Vm, name: &str, args: &[V]) -> Option<Option<V>> {
 
 // ---------------------------------------------------------------------
 // Log
+
+fn scroller_call(vm: &mut Vm, name: &str, sig: &str, args: &[V]) -> Option<Option<V>> {
+    let h = match args.first() {
+        Some(V::Ref(h)) if *h != 0 => *h,
+        _ => return Some(None),
+    };
+    fn pi(vm: &Vm, h: u32, key: u32) -> i32 {
+        match pseudo_get(vm, h, key) {
+            Some(v) => i32v(v),
+            None => 0,
+        }
+    }
+    fn spi(vm: &mut Vm, h: u32, key: u32, v: i32) {
+        pseudo_set(vm, h, key, V::I32(v));
+    }
+    match name {
+        "<init>" => {
+            spi(vm, h, P_SCR_STATE, 2);
+            Some(None)
+        }
+        "startScroll" => {
+            let sx = i32v(args.get(1).copied().unwrap_or(V::I32(0)));
+            let sy = i32v(args.get(2).copied().unwrap_or(V::I32(0)));
+            let dx = i32v(args.get(3).copied().unwrap_or(V::I32(0)));
+            let dy = i32v(args.get(4).copied().unwrap_or(V::I32(0)));
+            let duration = if sig == "(IIIII)V" {
+                i32v(args.get(5).copied().unwrap_or(V::I32(250))).max(1)
+            } else {
+                250
+            };
+            spi(vm, h, P_SCR_START_X, sx);
+            spi(vm, h, P_SCR_START_Y, sy);
+            spi(vm, h, P_SCR_FINAL_X, sx + dx);
+            spi(vm, h, P_SCR_FINAL_Y, sy + dy);
+            spi(vm, h, P_SCR_CURR_X, sx);
+            spi(vm, h, P_SCR_CURR_Y, sy);
+            pseudo_set(vm, h, P_SCR_START_T, V::I64(crate::jdk::now_mono_ms()));
+            spi(vm, h, P_SCR_DURATION, duration);
+            spi(vm, h, P_SCR_STATE, 0);
+            Some(None)
+        }
+        "fling" => {
+            let sx = i32v(args.get(1).copied().unwrap_or(V::I32(0)));
+            let sy = i32v(args.get(2).copied().unwrap_or(V::I32(0)));
+            let vx = i32v(args.get(3).copied().unwrap_or(V::I32(0))) as f32;
+            let vy = i32v(args.get(4).copied().unwrap_or(V::I32(0))) as f32;
+            let min_x = i32v(args.get(5).copied().unwrap_or(V::I32(i32::MIN)));
+            let max_x = i32v(args.get(6).copied().unwrap_or(V::I32(i32::MAX)));
+            let min_y = i32v(args.get(7).copied().unwrap_or(V::I32(i32::MIN)));
+            let max_y = i32v(args.get(8).copied().unwrap_or(V::I32(i32::MAX)));
+            // AOSP uses a physical friction model. A bounded half-second
+            // approximation preserves the important contract for View
+            // flingers: curr positions advance over time and finish at a
+            // clamped edge.
+            let duration = 500;
+            let fx = (sx + (vx * duration as f32 / 2000.0) as i32).clamp(min_x, max_x);
+            let fy = (sy + (vy * duration as f32 / 2000.0) as i32).clamp(min_y, max_y);
+            spi(vm, h, P_SCR_START_X, sx);
+            spi(vm, h, P_SCR_START_Y, sy);
+            spi(vm, h, P_SCR_FINAL_X, fx);
+            spi(vm, h, P_SCR_FINAL_Y, fy);
+            spi(vm, h, P_SCR_CURR_X, sx);
+            spi(vm, h, P_SCR_CURR_Y, sy);
+            pseudo_set(vm, h, P_SCR_START_T, V::I64(crate::jdk::now_mono_ms()));
+            spi(vm, h, P_SCR_DURATION, duration);
+            spi(vm, h, P_SCR_STATE, 0);
+            Some(None)
+        }
+        "computeScrollOffset" => {
+            let state = pi(vm, h, P_SCR_STATE);
+            if state >= 2 {
+                return Some(Some(V::I32(0)));
+            }
+            let start_t = match pseudo_get(vm, h, P_SCR_START_T) {
+                Some(V::I64(t)) => t,
+                _ => crate::jdk::now_mono_ms(),
+            };
+            let dur = pi(vm, h, P_SCR_DURATION).max(1) as i64;
+            let elapsed = (crate::jdk::now_mono_ms() - start_t).max(0);
+            let done = elapsed >= dur;
+            let t = (elapsed as f32 / dur as f32).min(1.0);
+            // Ease-out interpolation approximates Scroller's deceleration
+            // closely enough for page snapping while remaining monotonic.
+            let eased = 1.0 - (1.0 - t) * (1.0 - t);
+            let sx = pi(vm, h, P_SCR_START_X);
+            let sy = pi(vm, h, P_SCR_START_Y);
+            let fx = pi(vm, h, P_SCR_FINAL_X);
+            let fy = pi(vm, h, P_SCR_FINAL_Y);
+            let cx = if done {
+                fx
+            } else {
+                sx + ((fx - sx) as f32 * eased) as i32
+            };
+            let cy = if done {
+                fy
+            } else {
+                sy + ((fy - sy) as f32 * eased) as i32
+            };
+            spi(vm, h, P_SCR_CURR_X, cx);
+            spi(vm, h, P_SCR_CURR_Y, cy);
+            if done {
+                // Emit the final position once, then report completion on
+                // the next compute pass just like a finished animation.
+                let next = if state == 0 { 1 } else { 2 };
+                spi(vm, h, P_SCR_STATE, next);
+            }
+            Some(Some(V::I32(1)))
+        }
+        "getCurrX" => Some(Some(V::I32(pi(vm, h, P_SCR_CURR_X)))),
+        "getCurrY" => Some(Some(V::I32(pi(vm, h, P_SCR_CURR_Y)))),
+        "getFinalX" => Some(Some(V::I32(pi(vm, h, P_SCR_FINAL_X)))),
+        "getFinalY" => Some(Some(V::I32(pi(vm, h, P_SCR_FINAL_Y)))),
+        "getStartX" => Some(Some(V::I32(pi(vm, h, P_SCR_START_X)))),
+        "getStartY" => Some(Some(V::I32(pi(vm, h, P_SCR_START_Y)))),
+        "isFinished" => Some(Some(V::I32((pi(vm, h, P_SCR_STATE) != 0) as i32))),
+        "abortAnimation" => {
+            spi(vm, h, P_SCR_CURR_X, pi(vm, h, P_SCR_FINAL_X));
+            spi(vm, h, P_SCR_CURR_Y, pi(vm, h, P_SCR_FINAL_Y));
+            spi(vm, h, P_SCR_STATE, 2);
+            Some(None)
+        }
+        "forceFinished" => {
+            let finished = i32v(args.get(1).copied().unwrap_or(V::I32(0))) != 0;
+            spi(vm, h, P_SCR_STATE, if finished { 2 } else { 0 });
+            Some(None)
+        }
+        "getCurrVelocity" => {
+            let dx = pi(vm, h, P_SCR_FINAL_X) - pi(vm, h, P_SCR_START_X);
+            let dy = pi(vm, h, P_SCR_FINAL_Y) - pi(vm, h, P_SCR_START_Y);
+            let dur = pi(vm, h, P_SCR_DURATION).max(1) as f32 / 1000.0;
+            Some(Some(V::F32((((dx * dx + dy * dy) as f32).sqrt()) / dur)))
+        }
+        "getDuration" => Some(Some(V::I32(pi(vm, h, P_SCR_DURATION)))),
+        "timePassed" => {
+            let start_t = match pseudo_get(vm, h, P_SCR_START_T) {
+                Some(V::I64(t)) => t,
+                _ => crate::jdk::now_mono_ms(),
+            };
+            Some(Some(V::I32((crate::jdk::now_mono_ms() - start_t) as i32)))
+        }
+        "springBack" => Some(Some(V::I32(0))),
+        "notifyHorizontalEdgeReached"
+        | "notifyVerticalEdgeReached"
+        | "setFriction"
+        | "setFinalX"
+        | "setFinalY"
+        | "extendDuration" => {
+            if name == "setFinalX" {
+                spi(
+                    vm,
+                    h,
+                    P_SCR_FINAL_X,
+                    i32v(args.get(1).copied().unwrap_or(V::I32(0))),
+                );
+            } else if name == "setFinalY" {
+                spi(
+                    vm,
+                    h,
+                    P_SCR_FINAL_Y,
+                    i32v(args.get(1).copied().unwrap_or(V::I32(0))),
+                );
+            } else if name == "extendDuration" {
+                let cur = pi(vm, h, P_SCR_DURATION);
+                spi(
+                    vm,
+                    h,
+                    P_SCR_DURATION,
+                    cur + i32v(args.get(1).copied().unwrap_or(V::I32(0))),
+                );
+            }
+            Some(None)
+        }
+        _ => None,
+    }
+}
 
 fn log_call(vm: &mut Vm, name: &str, args: &[V]) -> Option<Option<V>> {
     match name {
