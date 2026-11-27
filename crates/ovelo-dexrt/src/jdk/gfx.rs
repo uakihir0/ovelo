@@ -322,10 +322,8 @@ fn raster_path_to_bitmap(
     if contours.is_empty() {
         return;
     }
-    if paint.style != 0 {
-        raster_stroke_to_bitmap(vm, dst_h, &contours, paint);
-    }
     if paint.style == 1 {
+        raster_stroke_to_bitmap(vm, dst_h, &contours, paint);
         return;
     }
     let even_odd = fill_type % 2 == 1;
@@ -374,6 +372,9 @@ fn raster_path_to_bitmap(
     }) = vm.heap.get_mut(dst_h)
     {
         *dst = std::rc::Rc::new(out);
+    }
+    if paint.style != 0 {
+        raster_stroke_to_bitmap(vm, dst_h, &contours, paint);
     }
 }
 
