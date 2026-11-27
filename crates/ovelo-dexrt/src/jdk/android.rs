@@ -1830,10 +1830,60 @@ fn uri_call(vm: &mut Vm, name: &str, args: &[V]) -> Rt<Option<Option<V>>> {
 // ---------------------------------------------------------------------
 // Intent — map + pseudo fields for action/data/component
 
+fn intent_map_handle(vm: &mut Vm, h: u32) -> Option<u32> {
+    match vm.heap.get(h) {
+        Some(Obj::Host {
+            state: HostState::Map(_),
+            ..
+        }) => Some(h),
+        Some(Obj::Instance { .. }) => {
+            if let Some(V::Ref(bh)) = pseudo_get(vm, h, P_MAP_BACKING) {
+                if matches!(
+                    vm.heap.get(bh),
+                    Some(Obj::Host {
+                        state: HostState::Map(_),
+                        ..
+                    })
+                ) {
+                    return Some(bh);
+                }
+            }
+            let bh = vm.alloc_host("Landroid/os/Bundle;", HostState::Map(Vec::new()));
+            pseudo_set(vm, h, P_MAP_BACKING, V::Ref(bh));
+            Some(bh)
+        }
+        _ => None,
+    }
+}
+
+fn intent_map_pairs(vm: &mut Vm, h: u32) -> Vec<(V, V)> {
+    match intent_map_handle(vm, h).and_then(|mh| vm.heap.get(mh)) {
+        Some(Obj::Host {
+            state: HostState::Map(m),
+            ..
+        }) => m.clone(),
+        _ => Vec::new(),
+    }
+}
+
+fn intent_map_put(vm: &mut Vm, h: u32, k: V, v: V) {
+    if let Some(mh) = intent_map_handle(vm, h) {
+        map_put(vm, mh, k, v);
+    }
+}
+
+fn intent_map_get(vm: &mut Vm, h: u32, k: V) -> Option<V> {
+    intent_map_handle(vm, h).and_then(|mh| map_get(vm, mh, k))
+}
+
+fn intent_map_remove(vm: &mut Vm, h: u32, k: V) {
+    if let Some(mh) = intent_map_handle(vm, h) {
+        map_remove(vm, mh, k);
+    }
+}
+
 fn clone_intent(vm: &mut Vm, h: u32) -> V {
-    // Intent subclasses keep their guest-map extras in a backing store;
-    // map_pairs_of resolves either representation.
-    let m = map_pairs_of(vm, h);
+    let m = intent_map_pairs(vm, h);
     let nh = vm.alloc_host("Landroid/content/Intent;", HostState::Map(m));
     for k in [P_ACTION, P_DATA, P_FLAGS, P_COMPONENT] {
         if let Some(v) = pseudo_get(vm, h, k) {
@@ -1910,17 +1960,17 @@ fn intent_call(vm: &mut Vm, name: &str, sig: &str, args: &[V]) -> Rt<Option<Opti
         | "putStringArrayListExtra"
         | "putIntegerArrayListExtra"
         | "putParcelableArrayListExtra" => {
-            map_put(vm, h, args[1], args[2]);
+            intent_map_put(vm, h, args[1], args[2]);
             Some(Some(args[0]))
         }
         "getStringExtra"
         | "getCharSequenceExtra"
         | "getSerializableExtra"
         | "getParcelableExtra"
-        | "getBundleExtra" => Some(Some(map_get(vm, h, args[1]).unwrap_or(V::Ref(0)))),
+        | "getBundleExtra" => Some(Some(intent_map_get(vm, h, args[1]).unwrap_or(V::Ref(0)))),
         n if n.starts_with("get") && n.ends_with("Extra") => {
             // getIntExtra/getBooleanExtra/…: map get with default arg
-            let v = map_get(vm, h, args[1])
+            let v = intent_map_get(vm, h, args[1])
                 .or_else(|| args.get(2).copied())
                 .unwrap_or(V::I32(0));
             Some(Some(match v {
@@ -1930,11 +1980,11 @@ fn intent_call(vm: &mut Vm, name: &str, sig: &str, args: &[V]) -> Rt<Option<Opti
             }))
         }
         "hasExtra" => {
-            let c = map_get(vm, h, args[1]).is_some();
+            let c = intent_map_get(vm, h, args[1]).is_some();
             Some(Some(V::I32(c as i32)))
         }
         "removeExtra" => {
-            map_remove(vm, h, args[1]);
+            intent_map_remove(vm, h, args[1]);
             Some(None)
         }
         "replaceExtras" => Some(Some(args[0])),
@@ -1942,13 +1992,7 @@ fn intent_call(vm: &mut Vm, name: &str, sig: &str, args: &[V]) -> Rt<Option<Opti
             // AOSP returns the Bundle (or null), never the Intent —
             // `createSavedStateHandle` check-casts the result to
             // Bundle, so an Intent here throws ClassCastException.
-            let m = match vm.heap.get(h) {
-                Some(Obj::Host {
-                    state: HostState::Map(m),
-                    ..
-                }) => m.clone(),
-                _ => vec![],
-            };
+            let m = intent_map_pairs(vm, h);
             if m.is_empty() {
                 Some(Some(V::Ref(0)))
             } else {
@@ -1966,7 +2010,7 @@ fn intent_call(vm: &mut Vm, name: &str, sig: &str, args: &[V]) -> Rt<Option<Opti
                     _ => vec![],
                 };
                 for (k, v) in pairs {
-                    map_put(vm, h, k, v);
+                    intent_map_put(vm, h, k, v);
                 }
             }
             Some(Some(args[0]))
@@ -1975,30 +2019,30 @@ fn intent_call(vm: &mut Vm, name: &str, sig: &str, args: &[V]) -> Rt<Option<Opti
         "fillIn" | "filterEquals" | "filterHashCode" => Some(Some(V::I32(0))),
         "toUri" | "toInsecureString" | "toShortString" => Some(Some(jstr(vm, ""))),
         "getIntExtra" => Some(Some(
-            map_get(vm, h, args[1])
+            intent_map_get(vm, h, args[1])
                 .map(|v| V::I32(i32v(v)))
                 .or_else(|| args.get(2).copied())
                 .unwrap_or(V::I32(0)),
         )),
         "getLongExtra" => Some(Some(
-            map_get(vm, h, args[1])
+            intent_map_get(vm, h, args[1])
                 .map(|v| V::I64(i64v(v)))
                 .or_else(|| args.get(2).copied())
                 .unwrap_or(V::I64(0)),
         )),
         "getBooleanExtra" => Some(Some(
-            map_get(vm, h, args[1])
+            intent_map_get(vm, h, args[1])
                 .map(|v| V::I32((i32v(v) != 0) as i32))
                 .or_else(|| args.get(2).copied())
                 .unwrap_or(V::I32(0)),
         )),
         "getFloatExtra" => Some(Some(V::F32(f64v(
-            map_get(vm, h, args[1])
+            intent_map_get(vm, h, args[1])
                 .or_else(|| args.get(2).copied())
                 .unwrap_or(V::F32(0.0)),
         ) as f32))),
         "getDoubleExtra" => Some(Some(V::F64(f64v(
-            map_get(vm, h, args[1])
+            intent_map_get(vm, h, args[1])
                 .or_else(|| args.get(2).copied())
                 .unwrap_or(V::F64(0.0)),
         )))),
