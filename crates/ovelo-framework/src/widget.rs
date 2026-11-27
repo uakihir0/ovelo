@@ -161,8 +161,9 @@ impl Drawable for ViewGroup {
     fn dispatch_touch(&mut self, down: bool, x: i32, y: i32) -> bool {
         if down {
             // Topmost first: later-drawn children get the first shot.
+            let (cx, cy) = (x + self.scroll_x, y + self.scroll_y);
             for (i, ch) in self.children.iter_mut().enumerate().rev() {
-                if ch.dispatch_touch(true, x, y) {
+                if ch.dispatch_touch(true, cx, cy) {
                     self.pressed_child = Some(i);
                     return true;
                 }
@@ -171,7 +172,7 @@ impl Drawable for ViewGroup {
         } else {
             if let Some(i) = self.pressed_child.take() {
                 if let Some(ch) = self.children.get_mut(i) {
-                    return ch.dispatch_touch(false, x, y);
+                    return ch.dispatch_touch(false, x + self.scroll_x, y + self.scroll_y);
                 }
             }
             release_hit(&mut self.view, x, y)
@@ -205,17 +206,25 @@ impl Drawable for ViewGroup {
         // with clipChildren=false (overflowing menus, FABs, …).
         for ch in &mut self.children {
             if self.clip_children {
-                let (cl, ct) = ch.origin();
-                let cs = ch.measured();
                 if dbg_flag("OVELO_CLIPDBG") {
-                    eprintln!("[clipdbg] kid clip {cl},{ct} {cs:?}");
+                    eprintln!(
+                        "[clipdbg] parent clip {},{} {s:?}",
+                        self.view.left, self.view.top
+                    );
                 }
                 c.save();
+                c.clip_rect(Rect::new(self.view.left, self.view.top, s.w, s.h));
+                let (cl, ct) = ch.origin();
+                let cs = ch.measured();
                 c.clip_rect(Rect::new(cl, ct, cs.w, cs.h));
+                c.translate(-self.scroll_x, -self.scroll_y);
                 ch.draw(c);
                 c.restore();
             } else {
+                c.save();
+                c.translate(-self.scroll_x, -self.scroll_y);
                 ch.draw(c);
+                c.restore();
             }
         }
     }

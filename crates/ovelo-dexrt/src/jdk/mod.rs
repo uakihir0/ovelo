@@ -1161,7 +1161,11 @@ pub(crate) fn guest_list_backing(
                     .filter_map(|(g, v)| match v {
                         V::I32(n)
                             if *n >= 0
-                                && vm.dbg_field_name(*g).rsplit('.').next() != Some("modCount") =>
+                                && vm.dbg_field_name(*g).rsplit('.').next() != Some("modCount")
+                                // Fixed array-backed collections carry a
+                                // boolean "trusted/exact" flag beside the
+                                // array; it is not a one-element window.
+                                && vm.field_type_desc(*g).as_deref() != Some("Z") =>
                         {
                             Some(*n as usize)
                         }
@@ -3350,6 +3354,12 @@ pub(crate) fn host_supers(d: &str) -> &'static [&'static str] {
             OBJ,
         ],
         "Landroid/widget/ProgressBar;" => &["Landroid/view/View;", OBJ],
+        "Landroid/widget/RadioGroup;" => &[
+            "Landroid/widget/LinearLayout;",
+            "Landroid/view/ViewGroup;",
+            "Landroid/view/View;",
+            OBJ,
+        ],
         "Landroid/widget/SeekBar;" | "Landroid/widget/RatingBar;" => {
             &["Landroid/widget/ProgressBar;", "Landroid/view/View;", OBJ]
         }
@@ -3438,10 +3448,21 @@ pub(crate) fn host_supers(d: &str) -> &'static [&'static str] {
         }
         "Landroid/view/InputEvent;" => &[OBJ],
         // ----- android.widget remaining
+        "Landroid/widget/AutoCompleteTextView;" => &[
+            "Landroid/widget/EditText;",
+            "Landroid/widget/TextView;",
+            "Landroid/view/View;",
+            OBJ,
+        ],
+        "Landroid/widget/MultiAutoCompleteTextView;" => &[
+            "Landroid/widget/AutoCompleteTextView;",
+            "Landroid/widget/EditText;",
+            "Landroid/widget/TextView;",
+            "Landroid/view/View;",
+            OBJ,
+        ],
         "Landroid/widget/PopupWindow;"
         | "Landroid/widget/PopupMenu;"
-        | "Landroid/widget/AutoCompleteTextView;"
-        | "Landroid/widget/MultiAutoCompleteTextView;"
         | "Landroid/widget/CheckedTextView;"
         | "Landroid/widget/CalendarView;"
         | "Landroid/widget/DatePicker;"
@@ -3453,7 +3474,6 @@ pub(crate) fn host_supers(d: &str) -> &'static [&'static str] {
         | "Landroid/widget/AnalogClock;"
         | "Landroid/widget/ExpandableListView;"
         | "Landroid/widget/QuickContactBadge;"
-        | "Landroid/widget/RadioGroup;"
         | "Landroid/widget/SimpleAdapter;"
         | "Landroid/widget/CursorAdapter;"
         | "Landroid/widget/ResourceCursorAdapter;"

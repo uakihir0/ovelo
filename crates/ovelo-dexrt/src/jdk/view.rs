@@ -76,6 +76,18 @@ const P_VTO: u32 = u32::MAX - 25;
 /// `ImageView`'s current image: a `Bitmap` handle, a `Drawable`
 /// handle, or a `Uri`/res-id the renderer resolves.
 const P_IMAGE: u32 = u32::MAX - 27;
+/// Stable placeholder returned by `getDrawable()` before any image is
+/// set. Kept separate from P_IMAGE so it does not suppress XML src.
+const P_IMAGE_PLACEHOLDER: u32 = u32::MAX - 30;
+/// Internal popup state: root view attached over the activity and the
+/// ListPopupWindow/row position carried by synthetic row listeners.
+const P_POPUP_ROOT: u32 = u32::MAX - 31;
+const P_POPUP_OWNER: u32 = u32::MAX - 32;
+const P_POPUP_POS: u32 = u32::MAX - 33;
+/// Dialog cancelable flag (`setCancelable(false)` stores 0).
+const P_DIALOG_CANCELABLE: u32 = u32::MAX - 34;
+/// Synthetic AlertDialog panel wrapping custom content.
+const P_DIALOG_PANEL: u32 = u32::MAX - 35;
 /// Pseudo key: a view's lazily-minted `Menu` (Toolbar.getMenu() etc.) /
 /// the menuish marker on the Menu itself (`I32(1)`).
 const P_MENU: u32 = 0xFFFD_FFF8;
@@ -91,6 +103,8 @@ const P_MENU_CHK: u32 = 0xFFFD_FFF4;
 const P_MENU_GROUP: u32 = 0xFFFD_FFF3;
 /// Pseudo key: a MenuItem's checkable flag (distinct from enabled).
 const P_MENU_CKABLE: u32 = 0xFFFD_FFF2;
+/// Pseudo key: a MenuItem's inflated action view.
+const P_MENU_ACTION_VIEW: u32 = 0xFFFD_FFEC;
 
 /// Backing store key on a dex menu object (`Obj::Instance` — e.g.
 /// androidx `MenuBuilder`): the item list lives on a lazily-minted host
@@ -147,6 +161,13 @@ const P_MINW: u32 = 0xFFFD_FFDF;
 const P_MINH: u32 = 0xFFFD_FFDE;
 /// `LinearLayout.setOrientation` — 0=HORIZONTAL, 1=VERTICAL.
 const P_ORIENTATION: u32 = 0xFFFD_FFDD;
+/// CompoundButton checked state / RadioGroup's checked child id.
+const P_CHECKED: u32 = 0xFFFD_FFDC;
+const P_RADIO_CHECKED: u32 = 0xFFFD_FFDB;
+const P_SCROLL_X: u32 = 0xFFFD_FFD9;
+const P_SCROLL_Y: u32 = 0xFFFD_FFD8;
+/// TextView compound drawables in start/top/end/bottom order.
+const P_COMPOUND_DRAWABLES: u32 = 0xFFFD_FFDA;
 /// Live `setTextColor` ARGB — written by the guest bridge's
 /// fallthrough for dex-inflated views.
 pub const P_TCOLOR: u32 = 0xFFFD_FFE3;
@@ -343,6 +364,12 @@ pub struct DexViewInfo {
     /// `android:maxLines` — caps wrapped line count; overflowing text
     /// truncates to the first `n` lines.
     pub max_lines: Option<i32>,
+    /// Horizontal scroll offset (`scrollTo`/`setScrollX`).
+    pub scroll_x: i32,
+    /// Vertical scroll offset (`scrollTo`/`setScrollY`).
+    pub scroll_y: i32,
+    /// LinearLayout orientation: true for vertical, false for horizontal.
+    pub linear_vertical: bool,
 }
 
 /// The activity's content view handle (what `setContentView` attached).
@@ -765,6 +792,9 @@ pub(crate) fn dex_view_info(vm: &Vm, h: u32) -> Option<DexViewInfo> {
                 _ => true,
             },
         },
+        linear_vertical: linear_vertical(vm, h),
+        scroll_x: pint(vm, h, P_SCROLL_X),
+        scroll_y: pint(vm, h, P_SCROLL_Y),
         max_lines: match attr_find(vm, h, "maxLines").or_else(|| attr_find(vm, h, "lines")) {
             Some(V::I32(n)) if n > 0 => Some(n),
             Some(V::Ref(r)) => s(vm, r)
@@ -783,13 +813,18 @@ fn image_drawable(vm: &mut Vm, this: u32) -> V {
     let Some(raw) = pseudo_get(vm, this, P_IMAGE) else {
         // No image was ever set (icon plumbing not wired). Android
         // allows null here, but Kotlin `!!`/mutate() chains NPE on
-        // it — hand back a stable placeholder drawable instead.
+        // it — hand back a stable placeholder drawable instead. Keep it
+        // out of P_IMAGE: constructors that probe getDrawable() before
+        // inflation must not suppress the XML src/srcCompat default.
+        if let Some(d) = pseudo_get(vm, this, P_IMAGE_PLACEHOLDER) {
+            return d;
+        }
         let d = host(
             vm,
             "Landroid/graphics/drawable/BitmapDrawable;",
             HostState::Empty,
         );
-        pseudo_set(vm, this, P_IMAGE, d);
+        pseudo_set(vm, this, P_IMAGE_PLACEHOLDER, d);
         return d;
     };
     if is_null(raw) || raw == V::I32(0) {
@@ -844,6 +879,9 @@ fn image_pixels_at(vm: &Vm, v: V, depth: u32) -> Option<(u32, u32, std::rc::Rc<V
             super::vector::rctx(vm).and_then(|r| super::vector::drawable_bitmap(r, res as u32))
         }
         V::Ref(h) => super::android::bitmap_pixels(vm, v)
+            .or_else(|| {
+                pseudo_get(vm, h, P_BITMAP_SLOT).and_then(|bmp| image_pixels_at(vm, bmp, depth + 1))
+            })
             .or_else(|| {
                 let path = image_source_path(vm, v)?;
                 decode_image(&std::fs::read(io::fspath(vm, &path)).ok()?)
@@ -909,6 +947,7 @@ pub(crate) fn is_viewish(vm: &Vm, class: &str, args: &[V]) -> bool {
             | "Landroidx/appcompat/view/SupportMenuInflater;"
             | "Landroidx/appcompat/view/menu/MenuBuilder;"
             | "Landroidx/appcompat/view/menu/MenuItemImpl;"
+            | "Landroidx/appcompat/widget/ListPopupWindow;"
             | "Landroid/view/ViewTreeObserver;"
             | "Landroid/view/MotionEvent;"
             | "Landroid/view/KeyEvent;"
@@ -952,6 +991,31 @@ pub(crate) fn call(
         _ => 0,
     };
     Ok(match name {
+        "onClick" if pseudo_get(vm, this, P_POPUP_OWNER).is_some() => {
+            let popup = match pseudo_get(vm, this, P_POPUP_OWNER) {
+                Some(V::Ref(h)) => h,
+                _ => 0,
+            };
+            let pos = match pseudo_get(vm, this, P_POPUP_POS) {
+                Some(V::I32(i)) => i,
+                _ => 0,
+            };
+            let root = match pseudo_get(vm, popup, P_POPUP_ROOT) {
+                Some(v) => v,
+                _ => V::Ref(0),
+            };
+            let row = args.get(1).copied().unwrap_or(V::Ref(0));
+            if let V::Ref(listener) = lpw_field(vm, popup, "listener") {
+                if listener != 0 {
+                    let _ = vm.call_virtual(
+                        listener,
+                        "onItemClick",
+                        &[root, row, V::I32(pos), V::I64(pos as i64)],
+                    );
+                }
+            }
+            Some(None)
+        }
         // ---------- inflation ----------
         "<init>" if class.ends_with("LayoutParams;") => {
             lp_ctor(vm, class, sig, args);
@@ -1404,6 +1468,7 @@ pub(crate) fn call(
                 "setCheckable" => P_MENU_CKABLE,
                 "setChecked" => P_MENU_CHK,
                 "setTitle" | "setTitleCondensed" => P_TEXT,
+                "setActionView" => P_MENU_ACTION_VIEW,
                 _ => P_TAG,
             };
             let v = args.get(1).copied().unwrap_or(V::Ref(0));
@@ -1460,6 +1525,12 @@ pub(crate) fn call(
         "getSubMenu" if is_menuitem(vm, this) => Some(Some(
             pseudo_get(vm, this, P_ITEM_SUBMENU).unwrap_or(V::Ref(0)),
         )),
+        "getActionView" if is_menuitem(vm, this) => {
+            Some(Some(match pseudo_get(vm, this, P_MENU_ACTION_VIEW) {
+                Some(v @ V::Ref(_)) => v,
+                _ => V::Ref(0),
+            }))
+        }
         "isActionViewExpanded" | "expandActionView" | "collapseActionView"
             if is_menuitem(vm, this) =>
         {
@@ -1591,9 +1662,27 @@ pub(crate) fn call(
         "checkLayoutParams" => {
             let ok = match args.get(1).copied() {
                 Some(v @ V::Ref(lph)) if lph != 0 => {
-                    let got = class_of(vm, v);
-                    let want = lp_class_for(vm, this);
-                    got == want || desc_is_a(&got, &want) || vm.assignable_desc(&got, &want)
+                    // An invoke-super into ViewGroup has already passed the
+                    // dex override's own typed check; ViewGroup itself only
+                    // null-checks. Re-checking the canonical framework LP
+                    // name rejects R8-renamed inner LP classes
+                    // (CoordinatorLayout's `Lej0`) and addView then copies
+                    // the params, dropping their behavior. A dex subclass
+                    // that supers into FrameLayout still carries that owner,
+                    // so it keeps the refined type check below.
+                    if class == "Landroid/view/ViewGroup;"
+                        && vm.has_dex_virtual(
+                            this,
+                            "checkLayoutParams",
+                            &["Landroid/view/ViewGroup$LayoutParams;"],
+                        )
+                    {
+                        true
+                    } else {
+                        let got = class_of(vm, v);
+                        let want = lp_class_for(vm, this);
+                        got == want || desc_is_a(&got, &want) || vm.assignable_desc(&got, &want)
+                    }
                 }
                 _ => false,
             };
@@ -2044,6 +2133,79 @@ pub(crate) fn call(
             }
             Some(None)
         }
+        "isChecked" if is_marked(vm, this) => Some(Some(V::I32(pint(vm, this, P_CHECKED)))),
+        "setChecked" if is_marked(vm, this) => {
+            let checked = i32v(args.get(1).copied().unwrap_or(V::I32(0)));
+            pseudo_set(vm, this, P_CHECKED, V::I32((checked != 0) as i32));
+            if checked == 0 {
+                if let Some(V::Ref(parent)) = pseudo_get(vm, this, P_PARENT) {
+                    if pseudo_get(vm, parent, P_RADIO_CHECKED) == Some(V::I32(view_id(vm, this))) {
+                        pseudo_set(vm, parent, P_RADIO_CHECKED, V::I32(-1));
+                    }
+                }
+            }
+            if checked != 0 {
+                if let Some(V::Ref(parent)) = pseudo_get(vm, this, P_PARENT) {
+                    let cls = class_of(vm, V::Ref(parent));
+                    if cls == "Landroid/widget/RadioGroup;"
+                        || vm.assignable_desc(&cls, "Landroid/widget/RadioGroup;")
+                    {
+                        let id = view_id(vm, this);
+                        pseudo_set(vm, parent, P_RADIO_CHECKED, V::I32(id));
+                        for c in children(vm, parent) {
+                            if let V::Ref(ch) = c {
+                                if ch != this {
+                                    pseudo_set(vm, ch, P_CHECKED, V::I32(0));
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+            Some(None)
+        }
+        "check"
+            if {
+                let cls = class_of(vm, V::Ref(this));
+                cls == "Landroid/widget/RadioGroup;"
+                    || vm.assignable_desc(&cls, "Landroid/widget/RadioGroup;")
+            } =>
+        {
+            let id = i32v(args.get(1).copied().unwrap_or(V::I32(0)));
+            pseudo_set(vm, this, P_RADIO_CHECKED, V::I32(id));
+            for c in children(vm, this) {
+                if let V::Ref(ch) = c {
+                    pseudo_set(vm, ch, P_CHECKED, V::I32((view_id(vm, ch) == id) as i32));
+                }
+            }
+            Some(None)
+        }
+        "clearCheck"
+            if {
+                let cls = class_of(vm, V::Ref(this));
+                cls == "Landroid/widget/RadioGroup;"
+                    || vm.assignable_desc(&cls, "Landroid/widget/RadioGroup;")
+            } =>
+        {
+            pseudo_set(vm, this, P_RADIO_CHECKED, V::I32(-1));
+            for c in children(vm, this) {
+                if let V::Ref(ch) = c {
+                    pseudo_set(vm, ch, P_CHECKED, V::I32(0));
+                }
+            }
+            Some(None)
+        }
+        "getCheckedRadioButtonId"
+            if {
+                let cls = class_of(vm, V::Ref(this));
+                cls == "Landroid/widget/RadioGroup;"
+                    || vm.assignable_desc(&cls, "Landroid/widget/RadioGroup;")
+            } =>
+        {
+            Some(Some(
+                pseudo_get(vm, this, P_RADIO_CHECKED).unwrap_or(V::I32(-1)),
+            ))
+        }
         "setText" | "setTitle" | "setTextScaleX" => {
             if name != "setTextScaleX" {
                 pseudo_set(vm, this, P_TEXT, args.get(1).copied().unwrap_or(V::Ref(0)));
@@ -2130,12 +2292,17 @@ pub(crate) fn call(
             match pseudo_get(vm, this, P_LISTENER) {
                 Some(V::Ref(l)) if l != 0 => {
                     let down_target = vm.touch_gesture_target;
+                    if crate::dbg_flag("OVELO_TOUCHDBG") {
+                        eprintln!(
+                            "[touchdbg] base-ote h{this} action={action} listener={l} down={down_target} within={}",
+                            view_or_descendant(vm, this, down_target)
+                        );
+                    }
                     if action == 1 && down_target != 0 && view_or_descendant(vm, this, down_target)
                     {
-                        if let Err(e) = vm.call_virtual(l, "onClick", &[V::Ref(this)]) {
-                            if crate::dbg_flag("OVELO_TOUCHDBG") {
-                                eprintln!("[touchdbg] onClick error: {e:?}");
-                            }
+                        let cr = vm.call_virtual(l, "onClick", &[V::Ref(this)]);
+                        if crate::dbg_flag("OVELO_TOUCHDBG") {
+                            eprintln!("[touchdbg] onClick result: {cr:?}");
                         }
                         vm.touch_gesture_target = 0;
                     }
@@ -2571,8 +2738,38 @@ pub(crate) fn call(
         "getMeasuredWidthAndState" => Some(Some(V::I32(pint(vm, this, P_MEAS_W)))),
         "getMeasuredHeightAndState" => Some(Some(V::I32(pint(vm, this, P_MEAS_H)))),
         "getPaddingLeft" | "getPaddingTop" | "getPaddingRight" | "getPaddingBottom"
-        | "getPaddingStart" | "getPaddingEnd" | "getScrollX" | "getScrollY" => {
-            Some(Some(V::I32(0)))
+        | "getPaddingStart" | "getPaddingEnd" => Some(Some(V::I32(0))),
+        "getScrollX" => Some(Some(V::I32(pint(vm, this, P_SCROLL_X)))),
+        "getScrollY" => Some(Some(V::I32(pint(vm, this, P_SCROLL_Y)))),
+        "setScrollX" => {
+            pseudo_set(vm, this, P_SCROLL_X, V::I32(vint(args.get(1))));
+            Some(None)
+        }
+        "setScrollY" => {
+            pseudo_set(vm, this, P_SCROLL_Y, V::I32(vint(args.get(1))));
+            Some(None)
+        }
+        "scrollTo" => {
+            pseudo_set(vm, this, P_SCROLL_X, V::I32(vint(args.get(1))));
+            pseudo_set(vm, this, P_SCROLL_Y, V::I32(vint(args.get(2))));
+            Some(None)
+        }
+        "scrollBy" => {
+            let dx = vint(args.get(1));
+            let dy = vint(args.get(2));
+            pseudo_set(
+                vm,
+                this,
+                P_SCROLL_X,
+                V::I32(pint(vm, this, P_SCROLL_X) + dx),
+            );
+            pseudo_set(
+                vm,
+                this,
+                P_SCROLL_Y,
+                V::I32(pint(vm, this, P_SCROLL_Y) + dy),
+            );
+            Some(None)
         }
         "getMinimumWidth" => Some(Some(V::I32(min_dim(vm, this, P_MINW, "minWidth")))),
         "getMinimumHeight" => Some(Some(V::I32(min_dim(vm, this, P_MINH, "minHeight")))),
@@ -2638,6 +2835,28 @@ pub(crate) fn call(
             pseudo_set(vm, this, P_FOCUSED, V::I32(0));
             Some(None)
         }
+        "setCompoundDrawables"
+        | "setCompoundDrawablesRelative"
+        | "setCompoundDrawablesWithIntrinsicBounds"
+        | "setCompoundDrawablesRelativeWithIntrinsicBounds" => {
+            let vals: Vec<V> = (1..=4)
+                .map(|i| args.get(i).copied().unwrap_or(V::Ref(0)))
+                .collect();
+            let a = arr(vm, "Landroid/graphics/drawable/Drawable;", vals);
+            pseudo_set(vm, this, P_COMPOUND_DRAWABLES, a);
+            Some(None)
+        }
+        "getCompoundDrawables" | "getCompoundDrawablesRelative" => {
+            let out = match pseudo_get(vm, this, P_COMPOUND_DRAWABLES) {
+                Some(v @ V::Ref(_)) => v,
+                _ => arr(
+                    vm,
+                    "Landroid/graphics/drawable/Drawable;",
+                    vec![V::Ref(0); 4],
+                ),
+            };
+            Some(Some(out))
+        }
         "setAlpha"
         | "setPadding"
         | "setElevation"
@@ -2650,10 +2869,6 @@ pub(crate) fn call(
         | "setX"
         | "setY"
         | "setRotation"
-        | "setScrollX"
-        | "setScrollY"
-        | "scrollTo"
-        | "scrollBy"
         | "setSelected"
         | "setActivated"
         | "setPressed"
@@ -2698,14 +2913,12 @@ pub(crate) fn call(
         | "setEllipsize"
         | "setInputType"
         | "setImeOptions"
-        | "setCompoundDrawables"
         | "setError"
         | "setMovementMethod"
         | "setMarqueeRepeatLimit"
         | "setFilters"
         | "setEnabled_true"
         | "setCheckMarkDrawable"
-        | "setChecked"
         | "setOnCheckedChangeListener"
         | "setProgress"
         | "setMax"
@@ -2935,7 +3148,7 @@ pub(crate) fn textclock_update(vm: &mut Vm, this: u32) {
     let text = clock_pattern(&pat, now_ms());
     let cur = pseudo_get(vm, this, P_TEXT).and_then(|v| sv(vm, v));
     if cur.as_deref() != Some(text.as_str()) {
-        let text = jstr(vm, &text);
+        let text = jdynstr(vm, &text);
         pseudo_set(vm, this, P_TEXT, text);
     }
 }
@@ -3206,7 +3419,7 @@ fn make_view_named(vm: &mut Vm, tag: &str, attrs: V, ctx: V) -> V {
         "include" => VIEWGROUP.to_string(),
         "view" => {
             if !class_attr.is_empty() {
-                format!("L{class_attr};")
+                format!("L{};", class_attr.replace('.', "/"))
             } else {
                 VIEW.to_string()
             }
@@ -3255,7 +3468,304 @@ fn make_view_named(vm: &mut Vm, tag: &str, attrs: V, ctx: V) -> V {
     if !matches!(ctx, V::Ref(0) | V::I32(0)) {
         pseudo_set(vm, h, P_CONTEXT, ctx);
     }
+    if name == "fragment" {
+        if let V::Ref(_) = attrs {
+            if let Some(class_name) = attrset_value(vm, attrs, "name").and_then(|v| match v {
+                V::Ref(_) => sv(vm, v),
+                V::I32(id) if id > 0 => vm
+                    .apk_res
+                    .as_ref()
+                    .and_then(|r| r.entry_value(id as u32))
+                    .and_then(|e| e.string.clone()),
+                _ => None,
+            }) {
+                let id = attrset_value(vm, attrs, "id").map(i32v).unwrap_or(0);
+                inflate_static_fragment(vm, &class_name, id, ctx, h, attrs);
+            }
+        }
+    }
     V::Ref(h)
+}
+
+fn instance_refs(vm: &Vm, h: u32) -> Vec<u32> {
+    match vm.heap.get(h) {
+        Some(Obj::Instance { fields, .. }) | Some(Obj::Host { fields, .. }) => fields
+            .values()
+            .filter_map(|v| match v {
+                V::Ref(r) if *r != 0 => Some(*r),
+                _ => None,
+            })
+            .collect(),
+        _ => Vec::new(),
+    }
+}
+
+/// Breadth-first search through a small object graph for a class-name
+/// fragment. AndroidX class merging changes the owner of the exact
+/// fields, but the helper/manager object types themselves keep these
+/// names in the dex.
+fn find_named_object(vm: &Vm, root: u32, needle: &str) -> Option<u32> {
+    let mut todo = vec![(root, 0u32)];
+    let mut seen = std::collections::HashSet::new();
+    while let Some((h, depth)) = todo.pop() {
+        if h == 0 || depth > 4 || !seen.insert(h) || seen.len() > 128 {
+            continue;
+        }
+        if class_of(vm, V::Ref(h)).contains(needle) {
+            return Some(h);
+        }
+        for r in instance_refs(vm, h) {
+            todo.push((r, depth + 1));
+        }
+    }
+    None
+}
+
+fn set_named_field_all(vm: &mut Vm, h: u32, name: &str, ty: &str, v: V) {
+    let keys: Vec<u64> = vm
+        .field_keys_named(name, ty)
+        .into_iter()
+        .map(|(_, g)| g)
+        .collect();
+    if let Some(fields) = fields_mut(vm, h) {
+        for g in keys {
+            fields.insert(g, v);
+        }
+    }
+}
+
+fn push_fragment_unique(vm: &mut Vm, list: u32, frag: u32) -> bool {
+    if let Some(items) = list_mut(vm, list) {
+        if !items.contains(&V::Ref(frag)) {
+            items.push(V::Ref(frag));
+        }
+        return true;
+    }
+    false
+}
+
+/// Register in the FragmentStore's added-fragments ArrayList. The exact
+/// field names cover normal AndroidX dex; the one-level structural scan
+/// covers R8 class merging/renaming by looking for the store shape (a
+/// small object holding both a List and a HashMap-like object).
+fn register_static_fragment(vm: &mut Vm, manager: u32, frag: u32) -> bool {
+    if let Some(V::Ref(store)) = vm.get_object_field(
+        manager,
+        "Landroidx/fragment/app/FragmentManagerImpl;",
+        "mFragmentStore",
+    ) {
+        if let Some(V::Ref(list)) = vm.get_object_field(
+            store,
+            "Landroidx/emoji2/text/MetadataRepo;",
+            "mMetadataList",
+        ) {
+            if push_fragment_unique(vm, list, frag) {
+                return true;
+            }
+        }
+    }
+    let stores = instance_refs(vm, manager);
+    for store in stores {
+        let fields = instance_refs(vm, store);
+        let has_map = fields
+            .iter()
+            .any(|r| class_of(vm, V::Ref(*r)).contains("Map"));
+        if !has_map {
+            continue;
+        }
+        for list in fields {
+            if list_ref(vm, list).is_some() && push_fragment_unique(vm, list, frag) {
+                return true;
+            }
+        }
+    }
+    false
+}
+
+fn new_fragment_host_callbacks(vm: &mut Vm, activity: u32) -> Option<u32> {
+    let desc = "Landroidx/fragment/app/FragmentActivity$HostCallbacks;";
+    vm.type_index_of(desc)?;
+    let (midx, _) = vm
+        .ctor_list(desc)
+        .iter()
+        .find(|(_, ps)| ps.len() == 1)
+        .cloned()?;
+    vm.instantiate_ctor(desc, midx, &[V::Ref(activity)]).ok()
+}
+
+/// Instantiate and wire a static `<fragment>` enough for the dex
+/// FragmentManager's own lookup/lifecycle code to use it. AndroidX in
+/// these APKs is often class-merged or partially obfuscated, so the
+/// exact field writes are best-effort; the fragment list registration is
+/// the part `findFragmentById` depends on.
+fn inflate_static_fragment(
+    vm: &mut Vm,
+    class_name: &str,
+    id: i32,
+    ctx: V,
+    container: u32,
+    attrs: V,
+) {
+    let desc = format!("L{};", class_name.replace('.', "/"));
+    if vm.type_index_of(&desc).is_none() {
+        return;
+    }
+    let ctors = vm.ctor_list(&desc);
+    let Some((midx, _params)) = ctors.iter().find(|(_, ps)| ps.is_empty()).cloned() else {
+        return;
+    };
+    let Ok(frag) = vm.instantiate_ctor(&desc, midx, &[]) else {
+        return;
+    };
+    let mut host = 0u32;
+    let mut manager = 0u32;
+    if let V::Ref(act) = ctx {
+        if let Some(V::Ref(frags)) = vm.get_object_field(
+            act,
+            "Landroidx/appcompat/app/AppCompatActivity;",
+            "mFragments",
+        ) {
+            if let Some(V::Ref(hc)) =
+                vm.get_object_field(frags, "Landroidx/fragment/app/Fragment$7;", "this$0")
+            {
+                host = hc;
+                if let Some(V::Ref(m)) = vm.get_object_field(
+                    hc,
+                    "Landroidx/fragment/app/FragmentActivity$HostCallbacks;",
+                    "mFragmentManager",
+                ) {
+                    manager = m;
+                }
+            }
+        }
+        if host == 0 {
+            host = find_named_object(vm, act, "HostCallbacks").unwrap_or(0);
+        }
+        if manager == 0 {
+            if let Ok(Some(V::Ref(m))) = vm.call_virtual(act, "getSupportFragmentManager", &[]) {
+                manager = m;
+            }
+        }
+        if manager == 0 {
+            manager = find_named_object(vm, act, "FragmentManagerImpl").unwrap_or(0);
+        }
+        if manager == 0 && host != 0 {
+            manager = find_named_object(vm, host, "FragmentManagerImpl").unwrap_or(0);
+        }
+        if host == 0 {
+            if let Some(hc) = new_fragment_host_callbacks(vm, act) {
+                host = hc;
+                if manager == 0 {
+                    manager = find_named_object(vm, host, "FragmentManagerImpl").unwrap_or(0);
+                }
+            }
+        }
+    }
+
+    let fdesc = "Landroidx/fragment/app/Fragment;";
+    set_named_field_all(vm, frag, "mFragmentId", "I", V::I32(id));
+    set_named_field_all(vm, frag, "mContainerId", "I", V::I32(id));
+    if host != 0 {
+        set_named_field_all(
+            vm,
+            frag,
+            "mHost",
+            "Landroidx/fragment/app/FragmentActivity$HostCallbacks;",
+            V::Ref(host),
+        );
+    }
+    set_named_field_all(vm, frag, "mAdded", "Z", V::I32(1));
+    set_named_field_all(vm, frag, "mRemoving", "Z", V::I32(0));
+    set_named_field_all(vm, frag, "mDetached", "Z", V::I32(0));
+    if manager != 0 {
+        set_named_field_all(
+            vm,
+            frag,
+            "mFragmentManager",
+            "Landroidx/fragment/app/FragmentManagerImpl;",
+            V::Ref(manager),
+        );
+        register_static_fragment(vm, manager, frag);
+    }
+
+    if let Some(V::Ref(child_mgr)) = vm.get_object_field(frag, fdesc, "mChildFragmentManager") {
+        if host != 0 {
+            vm.set_object_field(
+                child_mgr,
+                "Landroidx/fragment/app/FragmentManagerImpl;",
+                "mHost",
+                V::Ref(host),
+            );
+        }
+        vm.set_object_field(
+            child_mgr,
+            "Landroidx/fragment/app/FragmentManagerImpl;",
+            "mParent",
+            V::Ref(frag),
+        );
+        let missing_nc = matches!(
+            vm.get_object_field(
+                child_mgr,
+                "Landroidx/fragment/app/FragmentManagerImpl;",
+                "mNonConfig",
+            ),
+            None | Some(V::Ref(0)) | Some(V::I32(0))
+        );
+        if missing_nc {
+            let ncd = "Landroidx/fragment/app/FragmentManagerViewModel;";
+            if let Some((ncctor, _)) = vm
+                .ctor_list(ncd)
+                .iter()
+                .find(|(_, ps)| ps.as_slice() == ["Z"])
+                .cloned()
+            {
+                if let Ok(nc) = vm.instantiate_ctor(ncd, ncctor, &[V::I32(0)]) {
+                    vm.set_object_field(
+                        child_mgr,
+                        "Landroidx/fragment/app/FragmentManagerImpl;",
+                        "mNonConfig",
+                        V::Ref(nc),
+                    );
+                }
+            }
+        }
+    }
+    let _ = vm.call_virtual_sig(
+        frag,
+        "onInflate",
+        &[
+            "Landroid/content/Context;",
+            "Landroid/util/AttributeSet;",
+            "Landroid/os/Bundle;",
+        ],
+        &[ctx, attrs, V::Ref(0)],
+    );
+    let ra = vm.call_virtual(frag, "onAttach", &[ctx]);
+    let rc = vm.call_virtual(frag, "onCreate", &[V::Ref(0)]);
+    if crate::dbg_flag("OVELO_FRAGDBG") {
+        eprintln!("[fragdbg] {class_name} frag h{frag} attach={ra:?} create={rc:?} host{host} mgr{manager}");
+    }
+    let inf = inflater(vm, Some(ctx));
+    let create_args = [inf, V::Ref(container), V::Ref(0)];
+    let performed = vm
+        .call_virtual(frag, "performCreateView", &create_args)
+        .is_ok();
+    let mut fv = match vm.get_object_field(frag, fdesc, "mView") {
+        Some(V::Ref(v)) if v != 0 => v,
+        _ => 0,
+    };
+    if fv == 0 || !performed {
+        if let Ok(Some(V::Ref(direct))) = vm.call_virtual(frag, "onCreateView", &create_args) {
+            fv = direct;
+            set_named_field_all(vm, frag, "mView", "Landroid/view/View;", V::Ref(fv));
+        }
+    }
+    if fv != 0 {
+        if pseudo_get(vm, fv, P_PARENT).is_none() {
+            attach_at(vm, container, V::Ref(fv), None, false, None);
+        }
+        let _ = vm.call_virtual(frag, "onViewCreated", &[V::Ref(fv), V::Ref(0)]);
+    }
 }
 
 /// `AttributeSet` host holding an element's XML attributes
@@ -3756,9 +4266,20 @@ fn attrset_value(vm: &mut Vm, set: V, name: &str) -> Option<V> {
 /// `android:orientation` attr (0=horizontal, 1=vertical); the AOSP
 /// documented default is horizontal — except `TableLayout`, whose
 /// constructor forces VERTICAL, and `TableRow`, forced HORIZONTAL.
-fn linear_vertical(vm: &mut Vm, this: u32) -> bool {
+fn linear_vertical(vm: &Vm, this: u32) -> bool {
     if let Some(V::I32(o)) = pseudo_get(vm, this, P_ORIENTATION) {
         return o != 0;
+    }
+    // AndroidX LinearLayoutCompat implements orientation dex-side, so
+    // the host setter never sees constructor-driven VERTICAL. Read the
+    // field across its possible declaring owners.
+    for owner in [
+        "Landroidx/appcompat/widget/LinearLayoutCompat;",
+        "Landroid/widget/LinearLayout;",
+    ] {
+        if let Some(V::I32(o)) = vm.get_object_field(this, owner, "mOrientation") {
+            return o != 0;
+        }
     }
     let dflt = vm
         .heap
@@ -3977,6 +4498,9 @@ fn measure_child(
     // Child dims/margins come from its LayoutParams; AOSP's
     // default LP is (WRAP, WRAP, 0 margins). `None` = field absent;
     // -2 can be a real WRAP_CONTENT, not a miss.
+    if pseudo_get(vm, child, P_POPUP_ROOT).is_some() {
+        return;
+    }
     let (mut lp_w, mut lp_h) = (None, None);
     let (mut ml, mut mt, mut mr, mut mb) = (0, 0, 0, 0);
     if let Some(V::Ref(lp)) = pseudo_get(vm, child, P_LP) {
@@ -4045,6 +4569,13 @@ fn measure_child(
             eprintln!("[viewdbg] measureChild h{child} err {e}");
         }
     }
+}
+
+fn view_is_gone(vm: &mut Vm, h: u32) -> bool {
+    if let Some(v) = pseudo_get(vm, h, P_VIS) {
+        return matches!(v, V::I32(8) | V::I32(2));
+    }
+    matches!(attr_find(vm, h, "visibility"), Some(V::I32(2)))
 }
 
 /// Generic `onMeasure` for framework skeleton containers: measure
@@ -4162,7 +4693,7 @@ fn group_measure_fallback(vm: &mut Vm, this: u32, pw: i32, ph: i32) {
     let (mut cw, mut chh) = (0i32, 0i32);
     for c in kids.iter().copied() {
         let V::Ref(ch) = c else { continue };
-        if ch == 0 {
+        if ch == 0 || view_is_gone(vm, ch) {
             continue;
         }
         // AOSP measureChildWithMargins: `heightUsed` is the running
@@ -4231,7 +4762,7 @@ fn group_measure_fallback(vm: &mut Vm, this: u32, pw: i32, ph: i32) {
             let mut shares: Vec<(u32, f32)> = Vec::new();
             for c in kids.iter().copied() {
                 let V::Ref(ch) = c else { continue };
-                if ch == 0 {
+                if ch == 0 || view_is_gone(vm, ch) {
                     continue;
                 }
                 let lp_obj = match pseudo_get(vm, ch, P_LP) {
@@ -4430,7 +4961,7 @@ fn group_measure_fallback(vm: &mut Vm, this: u32, pw: i32, ph: i32) {
                     let V::Ref(ch) = c else {
                         return (nm, mm);
                     };
-                    if ch == 0 {
+                    if ch == 0 || view_is_gone(vm, ch) {
                         return (nm, mm);
                     }
                     let lp_obj = match pseudo_get(vm, ch, P_LP) {
@@ -4465,7 +4996,7 @@ fn group_measure_fallback(vm: &mut Vm, this: u32, pw: i32, ph: i32) {
                     let V::Ref(ch) = c else {
                         return (nm, mm);
                     };
-                    if ch == 0 {
+                    if ch == 0 || view_is_gone(vm, ch) {
                         return (nm, mm);
                     }
                     let lp_obj = match pseudo_get(vm, ch, P_LP) {
@@ -4494,7 +5025,7 @@ fn group_measure_fallback(vm: &mut Vm, this: u32, pw: i32, ph: i32) {
             let match_w = (cw_in - nonmatch_w - match_margins_w).max(0);
             for c in kids.iter().copied() {
                 let V::Ref(ch) = c else { continue };
-                if ch == 0 {
+                if ch == 0 || view_is_gone(vm, ch) {
                     continue;
                 }
                 let lp_obj = match pseudo_get(vm, ch, P_LP) {
@@ -4565,7 +5096,7 @@ fn group_layout_fallback(vm: &mut Vm, this: u32, _l: i32, _t: i32, r: i32, b: i3
     let mut cur_l = pad_l;
     for c in children(vm, this) {
         let V::Ref(ch) = c else { continue };
-        if ch == 0 {
+        if ch == 0 || view_is_gone(vm, ch) || pseudo_get(vm, ch, P_POPUP_ROOT).is_some() {
             continue;
         }
         let (ml, mt, mr, mb) = if let Some(V::Ref(lp)) = pseudo_get(vm, ch, P_LP) {
@@ -4657,6 +5188,7 @@ struct RelKid {
     mb: i32,
     match_w: bool,
     match_h: bool,
+    gone: bool,
     rect: (i32, i32, i32, i32),
 }
 
@@ -4721,6 +5253,7 @@ fn relative_positions(vm: &mut Vm, this: u32, w: i32, h: i32) -> Vec<RelKid> {
             mb: margin(vm, ch, "bottomMargin"),
             match_w: lp_dim("width", "layout_width") == -1,
             match_h: lp_dim("height", "layout_height") == -1,
+            gone: view_is_gone(vm, ch),
             rect: (0, 0, 0, 0),
         });
     }
@@ -4729,6 +5262,25 @@ fn relative_positions(vm: &mut Vm, this: u32, w: i32, h: i32) -> Vec<RelKid> {
             return None;
         }
         ks.iter().position(|k| k.id == id)
+    };
+    let idx_visible = |vm: &Vm, id: i32, names: &[&str]| -> Option<usize> {
+        // AOSP RelativeLayout resolves an anchor chain through GONE
+        // intermediates: `below(goneHeader)` anchors at whatever the
+        // gone header itself was below, not at the parent origin.
+        let mut cur = id;
+        for _ in 0..16 {
+            let j = idx_of(cur)?;
+            if !ks[j].gone {
+                return Some(j);
+            }
+            cur = names
+                .iter()
+                .find_map(|n| match attr_find(vm, ks[j].ch, n) {
+                    Some(V::I32(next)) if next > 0 => Some(next),
+                    _ => None,
+                })?;
+        }
+        None
     };
     let truthy = |v: Option<V>| matches!(v, Some(V::I32(i)) if i != 0);
     let ref_id = |v: Option<V>| -> Option<i32> {
@@ -4780,10 +5332,11 @@ fn relative_positions(vm: &mut Vm, this: u32, w: i32, h: i32) -> Vec<RelKid> {
             } else {
                 (h, pad_t, pad_b)
             };
-            let sib_edge = |id: i32, trailing: bool| -> Option<Option<i32>> {
+            let sib_edge = |id: i32, trailing: bool, names: &[&str]| -> Option<Option<i32>> {
                 // Some(edge) = rule present; the inner Option is the
                 // sibling's resolved edge (None while unplaced).
-                Some(idx_of(id).and_then(|j| placed[j].map(|(a, b)| if trailing { b } else { a })))
+                idx_visible(vm, id, names)
+                    .map(|j| placed[j].map(|(a, b)| if trailing { b } else { a }))
             };
 
             let mut lead: Option<i32> = None;
@@ -4798,14 +5351,14 @@ fn relative_positions(vm: &mut Vm, this: u32, w: i32, h: i32) -> Vec<RelKid> {
                 lead = Some(pleading + mlead);
             }
             if let Some(dep) = ref_id(rule(vm, ch, lead_rules)) {
-                match sib_edge(dep, true) {
+                match sib_edge(dep, true, lead_rules) {
                     Some(Some(e)) => lead = Some(e + mlead),
                     Some(None) => pending = true,
                     None => {}
                 }
             }
             if let Some(dep) = ref_id(rule(vm, ch, lead_sib_rules)) {
-                match sib_edge(dep, false) {
+                match sib_edge(dep, false, lead_sib_rules) {
                     Some(Some(e)) => lead = Some(e + mlead),
                     Some(None) => pending = true,
                     None => {}
@@ -4825,7 +5378,7 @@ fn relative_positions(vm: &mut Vm, this: u32, w: i32, h: i32) -> Vec<RelKid> {
             };
             for (names, on_trailing) in [(trail_lead_anchor, false), (trail_trail_anchor, true)] {
                 if let Some(dep) = ref_id(rule(vm, ch, names)) {
-                    match sib_edge(dep, on_trailing) {
+                    match sib_edge(dep, on_trailing, names) {
                         Some(Some(e)) => trail = Some(e - mtrail),
                         Some(None) => pending = true,
                         None => {}
@@ -5389,7 +5942,10 @@ fn build_tree(vm: &mut Vm, elems: &[Element], ctx: V) -> V {
         // name) seed P_IMAGE; the renderer resolves the res-id. A dex
         // constructor that already set an image wins — in AOSP the
         // XML default only applies when the ctor leaves it unset.
-        if pseudo_get(vm, h, P_IMAGE).is_none() {
+        let image_unset = pseudo_get(vm, h, P_IMAGE)
+            .map(|v| is_null(v) || v == V::I32(0))
+            .unwrap_or(true);
+        if image_unset {
             if let Some(v) = el
                 .attrs
                 .iter()
@@ -5579,6 +6135,14 @@ pub(crate) fn dispatch_touch(
         (ox, oy)
     }
     let dbg = crate::dbg_flag("OVELO_TOUCHDBG");
+    // An outside-tap dismissal consumes the whole gesture. The DOWN is
+    // handled below; remember it with a sentinel so the paired UP cannot
+    // fall through to the newly exposed background and fire its click.
+    if (action == 1 || action == 3) && vm.touch_gesture_target == u32::MAX {
+        vm.touch_gesture_target = 0;
+        vm.touch_gesture_down_time = -1;
+        return Ok(true);
+    }
     let mut target = 0u32;
     for r in vm.view_roots.clone().iter().rev() {
         if dbg {
@@ -5627,6 +6191,58 @@ pub(crate) fn dispatch_touch(
             "[touchdbg] {x},{y} a{action} hit h{target} {}",
             vm.dbg_class_of(target)
         );
+    }
+    if action == 0 && is_edit_text(vm, target) {
+        clear_window_focus(vm);
+        pseudo_set(vm, target, P_FOCUSED, V::I32(1));
+    }
+    // Modal popup semantics: ACTION_DOWN outside an open popup dismisses
+    // it and is consumed instead of activating the background control.
+    if action == 0 {
+        let popups: Vec<(u32, u32)> = vm
+            .view_roots
+            .iter()
+            .filter_map(|r| match pseudo_get(vm, *r, P_POPUP_ROOT) {
+                Some(V::Ref(owner)) if owner != 0 => Some((owner, *r)),
+                _ => None,
+            })
+            .collect();
+        let mut consumed = false;
+        let inside_overlay = popups
+            .iter()
+            .any(|(_, proot)| view_or_descendant(vm, *proot, target));
+        for (popup, proot) in popups {
+            if inside_overlay {
+                break;
+            }
+            if !view_or_descendant(vm, proot, target) {
+                let cancelable = pseudo_get(vm, popup, P_DIALOG_CANCELABLE)
+                    .map(i32v)
+                    .unwrap_or(1);
+                if dbg {
+                    eprintln!("[touchdbg] outside tap dismiss popup h{popup} root h{proot}");
+                }
+                if cancelable != 0 {
+                    let popup_class = class_of(vm, V::Ref(popup));
+                    if desc_is_a(&popup_class, "Landroid/app/Dialog;")
+                        || vm.assignable_desc(&popup_class, "Landroid/app/Dialog;")
+                    {
+                        dialog_dismiss(vm, popup);
+                    } else {
+                        list_popup_dismiss(vm, popup);
+                    }
+                }
+                // Modal overlays consume outside touches even when they
+                // stay open; otherwise the tap falls through and activates
+                // a button behind a non-cancelable dialog.
+                consumed = true;
+            }
+        }
+        if consumed {
+            vm.touch_gesture_target = u32::MAX;
+            vm.touch_gesture_down_time = now_ms();
+            return Ok(true);
+        }
     }
     let V::Ref(evt) = host(vm, "Landroid/view/MotionEvent;", HostState::Empty) else {
         return Ok(false);
@@ -5831,12 +6447,56 @@ pub(crate) fn offer_input_connection(vm: &mut Vm, view: u32) -> ovelo_error::Res
     Ok(conn != 0)
 }
 
+fn is_edit_text(vm: &Vm, h: u32) -> bool {
+    if h == 0 {
+        return false;
+    }
+    let desc = class_of(vm, V::Ref(h));
+    desc.contains("EditText") || vm.extends_named(&desc, "EditText")
+}
+
 fn key_scan_roots(vm: &Vm) -> Vec<u32> {
+    // Decor first, then any inflated-but-detached roots. Fragment
+    // materialization can leave a real editor outside the synthetic
+    // decor while still rendering it as a view root; key input must not
+    // become unreachable merely because attachment is incomplete.
     let mut roots: Vec<u32> = vm.decor_roots.values().copied().collect();
-    if roots.is_empty() {
-        roots = vm.view_roots.clone();
+    for r in &vm.view_roots {
+        if !roots.contains(r) {
+            roots.push(*r);
+        }
     }
     roots
+}
+
+fn text_value_string(vm: &Vm, v: V) -> Option<String> {
+    match v {
+        V::I32(id) if id > 0 => vm
+            .apk_res
+            .as_ref()
+            .and_then(|r| r.string_of(id as u32))
+            .map(str::to_string),
+        _ => sv(vm, v),
+    }
+}
+
+fn focused_edit_text(vm: &Vm, h: u32, depth: usize) -> Option<u32> {
+    if depth > 40 || pint(vm, h, P_VIS) != 0 {
+        return None;
+    }
+    if pint(vm, h, P_FOCUSED) != 0 && is_edit_text(vm, h) {
+        return Some(h);
+    }
+    for c in children(vm, h) {
+        if let V::Ref(ch) = c {
+            if ch != 0 && ch != h {
+                if let Some(v) = focused_edit_text(vm, ch, depth + 1) {
+                    return Some(v);
+                }
+            }
+        }
+    }
+    None
 }
 
 /// Route a host key event into the top-most dex view root. Compose
@@ -5972,6 +6632,39 @@ pub(crate) fn dispatch_key(
     pseudo_set(vm, evt, P_KE_CODE, V::I32(keycode));
     pseudo_set(vm, evt, P_KE_UNICODE, V::I32(unicode));
     pseudo_set(vm, evt, P_KE_REPEAT, V::I32(repeat as i32));
+
+    // Classic EditText is a framework skeleton here, so it has no dex
+    // InputConnection implementation for `input_view` to discover. Give
+    // the focused editor the same visible editing behavior for host text
+    // keys; `getText` already reads P_TEXT in this runtime.
+    let focused_edit = key_scan_roots(vm)
+        .iter()
+        .rev()
+        .find_map(|r| focused_edit_text(vm, *r, 0));
+    if let Some(view) = focused_edit {
+        if action == 0 {
+            let mut text = pseudo_get(vm, view, P_TEXT)
+                .or_else(|| attr_find(vm, view, "text"))
+                .and_then(|v| text_value_string(vm, v))
+                .unwrap_or_default();
+            let mut changed = false;
+            if keycode == 67 {
+                changed = text.pop().is_some();
+            } else if unicode != 0 {
+                if let Some(ch) = char::from_u32(unicode as u32) {
+                    if !ch.is_control() {
+                        text.push(ch);
+                        changed = true;
+                    }
+                }
+            }
+            if changed {
+                let text = jdynstr(vm, &text);
+                pseudo_set(vm, view, P_TEXT, text);
+                return Ok(true);
+            }
+        }
+    }
 
     let mut ime_view = 0;
     for root in key_scan_roots(vm).iter().rev() {
@@ -6813,6 +7506,48 @@ fn menu_inflate_level(vm: &mut Vm, doc: &[Element], i: &mut usize, depth: usize,
             if i64v(visible) == 0 {
                 menu_item_visible(vm, ih, 0);
             }
+            if let Some(action_class) = el
+                .attrs
+                .iter()
+                .find(|a| a.name == "actionViewClass")
+                .and_then(|a| match &a.value {
+                    Value::Str(s) => Some(s.as_str()),
+                    _ => None,
+                })
+            {
+                let ctx = vm
+                    .get_object_field(
+                        menu_h,
+                        "Landroidx/appcompat/view/menu/MenuBuilder;",
+                        "mContext",
+                    )
+                    .filter(|v| !is_null(*v))
+                    .unwrap_or(V::Ref(vm.cur_activity));
+                let desc = format!("L{};", action_class.replace('.', "/"));
+                if let Some(av) = try_construct_view(vm, &desc, ctx, V::Ref(0)) {
+                    pseudo_set(vm, av, P_IS_VIEW, V::I32(1));
+                    if desc_is_a(&desc, VIEWGROUP) || vm.assignable_desc(&desc, VIEWGROUP) {
+                        pseudo_set(vm, av, P_IS_GROUP, V::I32(1));
+                    }
+                    pseudo_set(vm, av, P_CONTEXT, ctx);
+                    if vm
+                        .call_virtual_sig(
+                            ih,
+                            "setActionView",
+                            &["Landroid/view/View;"],
+                            &[V::Ref(av)],
+                        )
+                        .is_err()
+                    {
+                        vm.set_object_field(
+                            ih,
+                            "Landroidx/appcompat/view/menu/MenuItemImpl;",
+                            "mActionView",
+                            V::Ref(av),
+                        );
+                    }
+                }
+            }
         }
         if sub {
             let sub_h = match it {
@@ -6915,6 +7650,455 @@ pub(crate) fn set_content_view(vm: &mut Vm, activity: u32, content: V) {
 // host Menu (options menu, toolbar) or a dex `MenuBuilder`; item ops
 // themselves stay guest-side so the dex list remains authoritative.
 
+/// Lay out overflow-menu rows compactly when the popup cannot afford
+/// their natural heights. This is a host overlay approximation of the
+/// scrollable ListPopupWindow: keeping every row visible preserves
+/// reachability in the small desktop window, while the row content is
+/// still the app's real adapter view hierarchy.
+fn layout_popup_rows_compact(vm: &mut Vm, root: u32, width: i32, height: i32) {
+    let rows = children(vm, root);
+    if rows.is_empty() {
+        return;
+    }
+    let row_h = (height / rows.len() as i32).max(32);
+    for (pos, row) in rows.iter().copied().enumerate() {
+        let V::Ref(row_hnd) = row else { continue };
+        if row_hnd == 0 {
+            continue;
+        }
+        let y = pos as i32 * row_h;
+        let _ = vm.call_virtual(
+            row_hnd,
+            "layout",
+            &[V::I32(0), V::I32(y), V::I32(width), V::I32(y + row_h)],
+        );
+        let pad = lp_px(
+            vm,
+            attr_find(vm, row_hnd, "paddingLeft").unwrap_or(V::I32(0)),
+        )
+        .unwrap_or(12)
+        .min(width / 8);
+        let mut x = pad.max(6);
+        let kids = children(vm, row_hnd);
+        for child in kids.iter().copied() {
+            let V::Ref(ch) = child else { continue };
+            if ch == 0 {
+                continue;
+            }
+            let mw = pint(vm, ch, P_MEAS_W) & 0x00ff_ffff;
+            let mh = pint(vm, ch, P_MEAS_H) & 0x00ff_ffff;
+            let desc = class_of(vm, V::Ref(ch));
+            let is_image = desc.contains("ImageView") || pseudo_get(vm, ch, P_IMAGE).is_some();
+            let (cw, avail_w) = if is_image {
+                let side = (row_h - 8).max(20).min(mw.max(1));
+                (side, side)
+            } else {
+                (
+                    (width - x - pad.max(6)).max(24),
+                    (width - x - pad.max(6)).max(24),
+                )
+            };
+            let ch_h = if is_image {
+                cw
+            } else {
+                mh.max((row_h / 2).min(28)).min(row_h)
+            };
+            let cy = (row_h - ch_h).max(0) / 2;
+            let use_w = if is_image { avail_w } else { cw };
+            let _ = vm.call_virtual(
+                ch,
+                "layout",
+                &[V::I32(x), V::I32(cy), V::I32(x + use_w), V::I32(cy + ch_h)],
+            );
+            x += use_w + pad.max(6);
+        }
+    }
+}
+
+fn lpw_field(vm: &Vm, popup: u32, logical: &str) -> V {
+    // Release builds minify the bundled appcompat widget (`i`, `v`,
+    // `w`, …) while debug/unminified apps keep the source names. Accept
+    // both spellings of the same ListPopupWindow state.
+    let names: &[&str] = match logical {
+        "adapter" => &["i", "mAdapter"],
+        "width" => &["l", "mDropDownWidth"],
+        "context" => &["h", "mContext"],
+        "anchor" => &["v", "mDropDownAnchorView"],
+        "xoff" => &["m", "mDropDownHorizontalOffset"],
+        "yoff" => &["n", "mDropDownVerticalOffset"],
+        "listener" => &["w", "mItemClickListener"],
+        _ => &[logical],
+    };
+    for name in names {
+        if let Some(v) = field_get(
+            vm,
+            popup,
+            "Landroidx/appcompat/widget/ListPopupWindow;",
+            name,
+        ) {
+            return v;
+        }
+    }
+    V::Ref(0)
+}
+
+/// Materialize an appcompat ListPopupWindow as a simple vertical popup
+/// built from its real adapter rows. The platform PopupWindow display
+/// path is host-window functionality the dex implementation cannot
+/// provide; adapter `getView` still supplies the app's row layout,
+/// icons and labels.
+fn list_popup_show(vm: &mut Vm, popup: u32) {
+    if crate::dbg_flag("OVELO_TOUCHDBG") {
+        eprintln!("[touchdbg] listpopup enter h{popup}");
+    }
+    list_popup_dismiss(vm, popup);
+    let adapter = match lpw_field(vm, popup, "adapter") {
+        V::Ref(h) if h != 0 => h,
+        _ => return,
+    };
+    let mut count = vm
+        .call_virtual(adapter, "getCount", &[])
+        .ok()
+        .flatten()
+        .map(i32v)
+        .unwrap_or(0);
+    if count == 0 {
+        // Framework ArrayAdapter is a host skeleton, so its inherited
+        // getCount reports zero even though the dex subclass stores the
+        // real backing list in an instance field. Use the densest list
+        // field as the row source count; getView itself is dex code.
+        if let Some(Obj::Instance { fields, .. }) = vm.heap.get(adapter) {
+            count = fields
+                .values()
+                .filter_map(|v| match v {
+                    V::Ref(h) if *h != 0 => match vm.heap.get(*h) {
+                        Some(Obj::Host {
+                            state: HostState::List(l),
+                            ..
+                        }) => Some(l.len() as i32),
+                        Some(Obj::Array { data, .. }) => Some(data.len() as i32),
+                        _ => None,
+                    },
+                    _ => None,
+                })
+                .max()
+                .unwrap_or(0);
+        }
+    }
+    let count = count.clamp(0, 32);
+    if crate::dbg_flag("OVELO_TOUCHDBG") {
+        eprintln!("[touchdbg] listpopup count={count}");
+    }
+    if count == 0 {
+        return;
+    }
+    let width = match lpw_field(vm, popup, "width") {
+        V::I32(w) if w > 0 => w,
+        _ => 384,
+    };
+    let root = vm.alloc_host("Landroid/widget/LinearLayout;", HostState::Empty);
+    pseudo_set(vm, root, P_IS_VIEW, V::I32(1));
+    pseudo_set(vm, root, P_IS_GROUP, V::I32(1));
+    pseudo_set(vm, root, P_ORIENTATION, V::I32(1));
+    pseudo_set(vm, root, P_BGCOLOR, V::I32(0xff2b2b2bu32 as i32));
+    pseudo_set(vm, root, P_POPUP_ROOT, V::Ref(popup));
+    if let V::Ref(ctx) = lpw_field(vm, popup, "context") {
+        pseudo_set(vm, root, P_CONTEXT, V::Ref(ctx));
+    }
+
+    let mut rows = 0;
+    for pos in 0..count {
+        let row = vm
+            .call_virtual(adapter, "getView", &[V::I32(pos), V::Ref(0), V::Ref(root)])
+            .ok()
+            .flatten();
+        if crate::dbg_flag("OVELO_TOUCHDBG") {
+            eprintln!("[touchdbg] listpopup row{pos} view={row:?}");
+        }
+        let Some(V::Ref(row_h)) = row else { continue };
+        if row_h == 0 {
+            continue;
+        }
+        // inflate_res remembers detached adapter rows as search roots;
+        // once adopted by the popup they must not render/touch as
+        // independent roots as well.
+        vm.view_roots.retain(|r| *r != row_h);
+        attach_at(vm, root, V::Ref(row_h), None, false, None);
+        let click = vm.alloc_host("Lovelo/PopupRowClickListener;", HostState::Empty);
+        pseudo_set(vm, click, P_IS_VIEW, V::I32(1));
+        pseudo_set(vm, click, P_POPUP_OWNER, V::Ref(popup));
+        pseudo_set(vm, click, P_POPUP_POS, V::I32(pos));
+        pseudo_set(vm, row_h, P_LISTENER, V::Ref(click));
+        rows += 1;
+    }
+    if rows == 0 {
+        return;
+    }
+
+    if crate::dbg_flag("OVELO_TOUCHDBG") {
+        eprintln!("[touchdbg] listpopup measuring rows={rows}");
+    }
+    let spec_w = 0x4000_0000i32 | width;
+    let _ = vm.call_virtual(root, "measure", &[V::I32(spec_w), V::I32(0)]);
+    let measured_height = (pint(vm, root, P_MEAS_H) & 0x00ff_ffff).max(rows * 48);
+
+    let anchor = match lpw_field(vm, popup, "anchor") {
+        V::Ref(h) if h != 0 => h,
+        _ => 0,
+    };
+    let (ww, wh) = vm.window_size;
+    let ar = if anchor != 0 {
+        pint(vm, anchor, P_RIGHT)
+    } else {
+        ww
+    };
+    let at = if anchor != 0 {
+        pint(vm, anchor, P_TOP)
+    } else {
+        wh
+    };
+    let xoff = match lpw_field(vm, popup, "xoff") {
+        V::I32(v) => v,
+        _ => 0,
+    };
+    let yoff = match lpw_field(vm, popup, "yoff") {
+        V::I32(v) => v,
+        _ => 0,
+    };
+    let max_h = if at > 0 { at + yoff.max(0) } else { wh }.max(96);
+    let height = measured_height.min(max_h).min(wh);
+    let x = (ar - width + xoff).clamp(0, (ww - width).max(0));
+    let y = (at - height + yoff).clamp(0, (wh - height).max(0));
+    let compressed = measured_height > height;
+    let _ = vm.call_virtual(
+        root,
+        "layout",
+        &[V::I32(0), V::I32(0), V::I32(width), V::I32(height)],
+    );
+    if compressed {
+        layout_popup_rows_compact(vm, root, width, height);
+    }
+
+    let parent = activity_content(vm, vm.cur_activity).unwrap_or(0);
+    if parent == 0 {
+        return;
+    }
+    // Frames are parent-relative once attached. The activity content
+    // normally starts at the window origin, but subtract its origin so
+    // action-bar offsets do not shift the popup twice.
+    let pl = pint(vm, parent, P_LEFT);
+    let pt = pint(vm, parent, P_TOP);
+    frame_set(vm, root, x - pl, y - pt, x - pl + width, y - pt + height);
+    attach_at(vm, parent, V::Ref(root), None, false, None);
+    vm.view_roots.retain(|r| *r != root);
+    vm.view_roots.push(root);
+    pseudo_set(vm, popup, P_POPUP_ROOT, V::Ref(root));
+    if crate::dbg_flag("OVELO_TOUCHDBG") {
+        eprintln!("[touchdbg] listpopup show root h{root} rows={rows} at {x},{y} {width}x{height}");
+    }
+}
+
+fn list_popup_dismiss(vm: &mut Vm, popup: u32) {
+    let Some(V::Ref(root)) = pseudo_get(vm, popup, P_POPUP_ROOT) else {
+        return;
+    };
+    if root == 0 {
+        return;
+    }
+    if let Some(V::Ref(parent)) = pseudo_get(vm, root, P_PARENT) {
+        detach(vm, parent, V::Ref(root), false);
+    }
+    vm.view_roots.retain(|r| *r != root);
+    pseudo_set(vm, popup, P_POPUP_ROOT, V::Ref(0));
+    mark_layout_requested(vm, root);
+}
+
+fn ov_popup_show(vm: &mut Vm, a: &[V]) -> ovelo_error::Result<Option<V>> {
+    if let Some(V::Ref(popup)) = a.first().copied() {
+        list_popup_show(vm, popup);
+    }
+    Ok(None)
+}
+
+fn ov_popup_dismiss(vm: &mut Vm, a: &[V]) -> ovelo_error::Result<Option<V>> {
+    if let Some(V::Ref(popup)) = a.first().copied() {
+        list_popup_dismiss(vm, popup);
+    }
+    Ok(None)
+}
+
+fn dialog_view_scan(
+    vm: &Vm,
+    h: u32,
+    depth: usize,
+    seen: &mut std::collections::HashSet<u32>,
+) -> Option<(u32, i32)> {
+    if h == 0 || depth > 5 || !seen.insert(h) {
+        return None;
+    }
+    let desc = class_of(vm, V::Ref(h));
+    // Contexts/windows lead back to the activity content tree; a dialog
+    // scan must not adopt the main UI as its own content.
+    if depth > 0
+        && (desc == WINDOW
+            || desc.ends_with("Context;")
+            || desc.ends_with("Activity;")
+            || vm.assignable_desc(&desc, "Landroid/content/Context;"))
+    {
+        return None;
+    }
+    let mut best = if pseudo_get(vm, h, P_IS_VIEW).is_some() {
+        let mut score = 1;
+        if pseudo_get(vm, h, P_IS_GROUP).is_some() || desc.contains("Layout") {
+            score += 4;
+        }
+        if pseudo_get(vm, h, P_PARENT).is_none() {
+            score += 2;
+        }
+        Some((h, score))
+    } else {
+        None
+    };
+    let vals: Vec<V> = match vm.heap.get(h) {
+        Some(Obj::Instance { fields, .. }) | Some(Obj::Host { fields, .. }) => {
+            fields.values().copied().collect()
+        }
+        _ => Vec::new(),
+    };
+    for v in vals {
+        if let V::Ref(ch) = v {
+            if let Some(cand) = dialog_view_scan(vm, ch, depth + 1, seen) {
+                if best.is_none_or(|b| cand.1 > b.1) {
+                    best = Some(cand);
+                }
+            }
+        }
+    }
+    best
+}
+
+pub(crate) fn set_dialog_cancelable(vm: &mut Vm, dialog: u32, value: V) {
+    pseudo_set(vm, dialog, P_DIALOG_CANCELABLE, V::I32(i32v(value)));
+}
+
+/// Show a framework/appcompat dialog as a host overlay. Dex AlertDialog
+/// keeps its custom view inside the obfuscated AlertController fields
+/// rather than calling Dialog.setContentView, so scan the dialog object
+/// for the detached view it built and attach that as a centered layer.
+pub(crate) fn dialog_show(vm: &mut Vm, dialog: u32) {
+    dialog_dismiss(vm, dialog);
+    let explicit = match pseudo_get(vm, dialog, P_CONTENT) {
+        Some(V::Ref(h)) if h != 0 => Some(h),
+        _ => None,
+    };
+    let mut seen = std::collections::HashSet::new();
+    let Some(content) =
+        explicit.or_else(|| dialog_view_scan(vm, dialog, 0, &mut seen).map(|x| x.0))
+    else {
+        return;
+    };
+    // AlertDialog normally wraps custom content in the appcompat decor:
+    // an opaque panel, title area, and button bar. The runtime does not
+    // execute that decor construction, so give the content its opaque
+    // panel explicitly; otherwise transparent list rows draw directly
+    // over the activity behind them.
+    let root = match pseudo_get(vm, dialog, P_DIALOG_PANEL) {
+        Some(V::Ref(p)) if p != 0 => p,
+        _ => {
+            let p = vm.alloc_host("Landroid/widget/LinearLayout;", HostState::Empty);
+            pseudo_set(vm, p, P_IS_VIEW, V::I32(1));
+            pseudo_set(vm, p, P_IS_GROUP, V::I32(1));
+            pseudo_set(vm, p, P_ORIENTATION, V::I32(1));
+            pseudo_set(vm, p, P_BGCOLOR, V::I32(0xff202020u32 as i32));
+            pseudo_set(vm, dialog, P_DIALOG_PANEL, V::Ref(p));
+            p
+        }
+    };
+    if content != root {
+        // `setContentView` can replace the content between shows while
+        // the panel object is reused. Drop the prior child or both old
+        // and new content remain stacked in the same panel.
+        for child in children(vm, root) {
+            if child != V::Ref(content) {
+                detach(vm, root, child, true);
+            }
+        }
+        if let Some(V::Ref(old_parent)) = pseudo_get(vm, content, P_PARENT) {
+            if old_parent != 0 && old_parent != root {
+                detach(vm, old_parent, V::Ref(content), false);
+            }
+        }
+        if pseudo_get(vm, content, P_PARENT) != Some(V::Ref(root)) {
+            vm.view_roots.retain(|r| *r != content);
+            attach_at(vm, root, V::Ref(content), None, false, None);
+        }
+    }
+    let parent = activity_content(vm, vm.cur_activity).unwrap_or(0);
+    if parent == 0 {
+        return;
+    }
+    let (ww, wh) = vm.window_size;
+    let width = (ww * 4 / 5).clamp(360, 680);
+    let height = (wh * 3 / 5).clamp(260, 460);
+    let spec_w = 0x4000_0000i32 | width;
+    let spec_h = 0x4000_0000i32 | height;
+    let _ = vm.call_virtual(root, "measure", &[V::I32(spec_w), V::I32(spec_h)]);
+    let _ = vm.call_virtual(
+        root,
+        "layout",
+        &[V::I32(0), V::I32(0), V::I32(width), V::I32(height)],
+    );
+    if content != root {
+        // Measure wrap-style custom content at most to the panel. Only a
+        // dimension that remains empty is expanded: fixed-size content
+        // must keep its bounds or its touch target would cover the panel.
+        let aw = 0x8000_0000u32 as i32 | width;
+        let ah = 0x8000_0000u32 as i32 | height;
+        let _ = vm.call_virtual(content, "measure", &[V::I32(aw), V::I32(ah)]);
+        let cw = pint(vm, content, P_MEAS_W).clamp(0, width);
+        let ch = pint(vm, content, P_MEAS_H).clamp(0, height);
+        let cw = if cw == 0 { width } else { cw };
+        let ch = if ch == 0 { height } else { ch };
+        let _ = vm.call_virtual(
+            content,
+            "layout",
+            &[V::I32(0), V::I32(0), V::I32(cw), V::I32(ch)],
+        );
+    }
+    let x = ((ww - width) / 2).max(0);
+    let y = ((wh - height) / 2).max(0);
+    let pl = pint(vm, parent, P_LEFT);
+    let pt = pint(vm, parent, P_TOP);
+    frame_set(vm, root, x - pl, y - pt, x - pl + width, y - pt + height);
+    if let Some(V::Ref(old_parent)) = pseudo_get(vm, root, P_PARENT) {
+        if old_parent != 0 {
+            detach(vm, old_parent, V::Ref(root), false);
+        }
+    }
+    attach_at(vm, parent, V::Ref(root), None, false, None);
+    vm.view_roots.retain(|r| *r != root);
+    vm.view_roots.push(root);
+    pseudo_set(vm, root, P_POPUP_ROOT, V::Ref(dialog));
+    pseudo_set(vm, dialog, P_POPUP_ROOT, V::Ref(root));
+    mark_layout_requested(vm, root);
+}
+
+/// Remove the overlay attached by `dialog_show`.
+pub(crate) fn dialog_dismiss(vm: &mut Vm, dialog: u32) {
+    let Some(V::Ref(root)) = pseudo_get(vm, dialog, P_POPUP_ROOT) else {
+        return;
+    };
+    if root == 0 {
+        return;
+    }
+    if let Some(V::Ref(parent)) = pseudo_get(vm, root, P_PARENT) {
+        detach(vm, parent, V::Ref(root), false);
+    }
+    vm.view_roots.retain(|r| *r != root);
+    pseudo_set(vm, dialog, P_POPUP_ROOT, V::Ref(0));
+    mark_layout_requested(vm, root);
+}
+
 fn ov_menu_inflate(vm: &mut Vm, a: &[V]) -> ovelo_error::Result<Option<V>> {
     if let Some(V::Ref(mh)) = a.get(2).copied() {
         menu_inflate(vm, a.get(1).copied(), mh);
@@ -6926,11 +8110,87 @@ fn ov_menu_inflate(vm: &mut Vm, a: &[V]) -> ovelo_error::Result<Option<V>> {
 /// entries through `MenuBuilder.add`, so `findItem`, `getVisibleItems`
 /// and `MenuItemImpl` casts all work against the dex list.
 pub(crate) fn register_menu_overrides(vm: &mut Vm) {
+    let popup_show: HostCall = std::rc::Rc::new(std::cell::RefCell::new(ov_popup_show));
+    let popup_dismiss: HostCall = std::rc::Rc::new(std::cell::RefCell::new(ov_popup_dismiss));
+    let show_ok = vm.register_host(
+        "Landroidx/appcompat/widget/ListPopupWindow;",
+        "show",
+        "()V",
+        popup_show,
+    );
+    if crate::dbg_flag("OVELO_TOUCHDBG") {
+        eprintln!("[touchdbg] listpopup register show={show_ok:?}");
+    }
+    let _ = vm.register_host(
+        "Landroidx/appcompat/widget/ListPopupWindow;",
+        "dismiss",
+        "()V",
+        popup_dismiss,
+    );
     use std::cell::RefCell;
     use std::rc::Rc;
     let mk = |f: fn(&mut Vm, &[V]) -> ovelo_error::Result<Option<V>>| -> HostCall {
         Rc::new(RefCell::new(f))
     };
+    // AppCompat's dex ResourceManagerInternal can construct a
+    // VectorDrawableCompat shell whose dex draw implementation the host
+    // ImageView cannot execute. Resource lookup itself is host-backed, so
+    // answer the compatibility entry point with the rasterized drawable.
+    let _ = vm.register_host(
+        "Landroidx/appcompat/widget/ResourceManagerInternal;",
+        "getDrawable",
+        "(Landroid/content/Context;I)Landroid/graphics/drawable/Drawable;",
+        Rc::new(RefCell::new(|vm: &mut Vm, a: &[V]| {
+            let res = a.get(2).copied().map(i64v).unwrap_or(0);
+            Ok(Some(if res > 0 {
+                super::vector::drawable_for_res(vm, res as u32)
+            } else {
+                V::Ref(0)
+            }))
+        })) as HostCall,
+    );
+    // Material's NavigationBarItemView wraps menu icons in a
+    // StateListDrawable copy chain implemented in dex. That copy loses
+    // host pseudo bitmap state, so bind the original rasterized icon to
+    // the item ImageView directly; checked-state recoloring is secondary
+    // to rendering the icon at all.
+    let _ = vm.register_host(
+        "Lcom/google/android/material/navigation/NavigationBarItemView;",
+        "setIcon",
+        "(Landroid/graphics/drawable/Drawable;)V",
+        Rc::new(RefCell::new(|vm: &mut Vm, a: &[V]| {
+            let this = match a.first().copied() {
+                Some(V::Ref(h)) => h,
+                _ => 0,
+            };
+            let icon = a.get(1).copied().unwrap_or(V::Ref(0));
+            if let Some(V::Ref(iv)) = vm.get_object_field(
+                this,
+                "Lcom/google/android/material/navigation/NavigationBarItemView;",
+                "A",
+            ) {
+                pseudo_set(vm, iv, P_IMAGE, icon);
+            }
+            Ok(None)
+        })) as HostCall,
+    );
+    for class in [
+        "Landroid/app/Activity;",
+        "Landroidx/fragment/app/FragmentActivity;",
+        "Landroidx/appcompat/app/AppCompatActivity;",
+    ] {
+        let _ = vm.register_host(
+            class,
+            "setTheme",
+            "(I)V",
+            Rc::new(RefCell::new(|vm: &mut Vm, a: &[V]| {
+                if let Some(v) = a.get(1).copied() {
+                    vm.theme_id = i32v(v) as u32;
+                }
+                Ok(None)
+            })) as HostCall,
+        );
+    }
     for class in [
         "Landroid/view/MenuInflater;",
         "Landroidx/appcompat/view/SupportMenuInflater;",

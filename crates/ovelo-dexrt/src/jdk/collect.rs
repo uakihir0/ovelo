@@ -1356,12 +1356,96 @@ fn list_call(vm: &mut Vm, name: &str, sig: &str, args: &[V]) -> Rt<Option<Option
 // ---------------------------------------------------------------------
 // Map (covers Bundle/ContentValues keyed ops too)
 
+fn java_props_space(c: char) -> bool {
+    (char::is_whitespace(c) && !matches!(c, '\u{a0}' | '\u{2007}' | '\u{202f}'))
+        || matches!(c, '\u{1c}'..='\u{1f}')
+}
+
+fn parse_properties_line(line: &str) -> Option<(String, String)> {
+    let chars: Vec<char> = line.chars().collect();
+    let mut i = 0usize;
+    while i < chars.len() && java_props_space(chars[i]) {
+        i += 1;
+    }
+    if i >= chars.len() || chars[i] == '#' || chars[i] == '!' {
+        return None;
+    }
+    let mut key = String::new();
+    let mut escaped = false;
+    while i < chars.len() {
+        let c = chars[i];
+        if escaped {
+            key.push(match c {
+                't' => '\t',
+                'n' => '\n',
+                'r' => '\r',
+                'f' => '\x0c',
+                other => other,
+            });
+            escaped = false;
+            i += 1;
+            continue;
+        }
+        if c == '\\' {
+            escaped = true;
+            i += 1;
+            continue;
+        }
+        if c == '=' || c == ':' || java_props_space(c) {
+            break;
+        }
+        key.push(c);
+        i += 1;
+    }
+    while i < chars.len() && java_props_space(chars[i]) {
+        i += 1;
+    }
+    if i < chars.len() && (chars[i] == '=' || chars[i] == ':') {
+        i += 1;
+        while i < chars.len() && java_props_space(chars[i]) {
+            i += 1;
+        }
+    }
+    let value: String = chars[i..].iter().collect();
+    Some((key, value.trim_end().to_string()))
+}
+
 fn map_call(vm: &mut Vm, name: &str, sig: &str, args: &[V]) -> Rt<Option<Option<V>>> {
     let V::Ref(h) = args.first().copied().unwrap_or(V::Ref(0)) else {
         return Ok(None);
     };
     let class = class_of(vm, args[0]);
     Ok(match name {
+        "getProperty" if class == "Ljava/util/Properties;" => {
+            let out = map_get(vm, h, args[1]).or_else(|| args.get(2).copied());
+            Some(Some(out.unwrap_or(V::Ref(0))))
+        }
+        "load" if class == "Ljava/util/Properties;" => {
+            let bytes = match args.get(1).copied() {
+                Some(V::Ref(sh)) => match vm.heap.get_mut(sh) {
+                    Some(Obj::Host {
+                        state: HostState::Bytes(b, pos),
+                        ..
+                    }) => {
+                        let out = b[*pos..].to_vec();
+                        *pos = b.len();
+                        out
+                    }
+                    _ => Vec::new(),
+                },
+                _ => Vec::new(),
+            };
+            // Properties.load(InputStream) is ISO-8859-1, not UTF-8.
+            let text: String = bytes.iter().map(|b| *b as char).collect();
+            for line in text.split('\n') {
+                let line = line.trim_end_matches('\r');
+                if let Some((k, v)) = parse_properties_line(line) {
+                    let (k, v) = (jstr(vm, &k), jstr(vm, &v));
+                    map_put(vm, h, k, v);
+                }
+            }
+            Some(None)
+        }
         "<init>" => {
             // Copy ctor HashMap(Map)/LinkedHashMap(Map) — kotlin
             // `Map.toMap` materializes its copy through it; without a
@@ -2990,7 +3074,7 @@ fn strtokenizer_call(vm: &mut Vm, name: &str, args: &[V]) -> Rt<Option<Option<V>
                         ..
                     }) => {
                         let t2 = t.clone();
-                        let mut it = t2.splitn(2, |c: char| c.is_whitespace() || c == ',');
+                        let mut it = t2.splitn(2, |c: char| java_props_space(c) || c == ',');
                         let tok = it.next().unwrap_or("").to_string();
                         *t = it.next().unwrap_or("").to_string();
                         tok

@@ -173,7 +173,10 @@ pub(crate) fn call(
                     }
                 }
                 None => {
-                    // Wrapper reader: remember the delegate.
+                    // Wrapper reader: remember the delegate. P_DATA is
+                    // authoritative because JDK-private `in` fields are
+                    // commonly absent from the app's dex field table.
+                    pseudo_set(vm, this, P_DATA, arg);
                     for owner in ["Ljava/io/FilterReader;", "Ljava/io/Reader;"] {
                         field_set(vm, this, owner, "in", arg);
                     }
@@ -743,21 +746,32 @@ fn stream_call(vm: &mut Vm, name: &str, args: &[V]) -> Rt<Option<Option<V>>> {
     // catch blocks see it.
     if matches!(
         name,
-        "read" | "available" | "skip" | "mark" | "reset" | "markSupported" | "ready" | "close"
+        "read"
+            | "readLine"
+            | "available"
+            | "skip"
+            | "mark"
+            | "reset"
+            | "markSupported"
+            | "ready"
+            | "close"
     ) {
-        let inner = [
-            "Ljava/io/FilterInputStream;",
-            "Ljava/io/FilterReader;",
-            "Ljava/io/Reader;",
-            "Ljava/io/BufferedReader;",
-            "Ljava/io/InputStreamReader;",
-        ]
-        .iter()
-        .find_map(|owner| field_get(vm, this, owner, "in"))
-        .and_then(|v| match v {
-            V::Ref(h) => Some(h),
-            _ => None,
-        });
+        let inner = pseudo_get(vm, this, P_DATA)
+            .or_else(|| {
+                [
+                    "Ljava/io/FilterInputStream;",
+                    "Ljava/io/FilterReader;",
+                    "Ljava/io/Reader;",
+                    "Ljava/io/BufferedReader;",
+                    "Ljava/io/InputStreamReader;",
+                ]
+                .iter()
+                .find_map(|owner| field_get(vm, this, owner, "in"))
+            })
+            .and_then(|v| match v {
+                V::Ref(h) => Some(h),
+                _ => None,
+            });
         if let Some(inner) = inner {
             if inner != 0 && inner != this {
                 if crate::dbg_flag("OVELO_STREAMDBG") {
@@ -972,7 +986,39 @@ fn stream_call(vm: &mut Vm, name: &str, args: &[V]) -> Rt<Option<Option<V>>> {
             Some(Some(V::I32(-1)))
         }
         "available" => Some(Some(V::I32(0))),
-        "readLine" => Some(Some(V::Ref(0))),
+        "readLine" => {
+            let found = if let Some(Obj::Host {
+                state: HostState::Chars(chars, pos, _),
+                ..
+            }) = vm.heap.get_mut(this)
+            {
+                if *pos >= chars.len() {
+                    None
+                } else {
+                    let start = *pos;
+                    let mut end = start;
+                    while end < chars.len() && chars[end] != 10 && chars[end] != 13 {
+                        end += 1;
+                    }
+                    let line = String::from_utf16_lossy(&chars[start..end]);
+                    if end < chars.len() {
+                        let nl = chars[end];
+                        end += 1;
+                        if nl == 13 && end < chars.len() && chars[end] == 10 {
+                            end += 1;
+                        }
+                    }
+                    *pos = end;
+                    Some(line)
+                }
+            } else {
+                None
+            };
+            Some(Some(match found {
+                Some(line) => jstr(vm, &line),
+                None => V::Ref(0),
+            }))
+        }
         "ready" | "markSupported" => Some(Some(V::I32(0))),
         "skip" => Some(Some(V::I64(0))),
         "write" | "flush" | "close" | "mark" | "reset" => Some(None),
