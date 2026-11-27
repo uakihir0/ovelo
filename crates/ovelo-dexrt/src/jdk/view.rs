@@ -5996,7 +5996,7 @@ fn text_value_string(vm: &Vm, v: V) -> Option<String> {
 }
 
 fn focused_edit_text(vm: &Vm, h: u32, depth: usize) -> Option<u32> {
-    if depth > 40 {
+    if depth > 40 || pint(vm, h, P_VIS) != 0 {
         return None;
     }
     if pint(vm, h, P_FOCUSED) != 0 && is_edit_text(vm, h) {
