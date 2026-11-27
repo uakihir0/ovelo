@@ -417,6 +417,20 @@ fn attr_find(vm: &Vm, h: u32, name: &str) -> Option<V> {
     None
 }
 
+fn xml_value_bool(vm: &Vm, v: &Value) -> Option<bool> {
+    match v {
+        Value::Int(i) => Some(*i != 0),
+        Value::Str(t) => Some(t.trim() != "false" && t.trim() != "0"),
+        Value::Reference(id) => attr_bool_ref(vm, *id),
+        Value::Other { data_type, data } => match data_type {
+            0x12 | 0x10 | 0x11 | 0x04 => Some(*data != 0),
+            0x01 => attr_bool_ref(vm, *data),
+            _ => None,
+        },
+        _ => None,
+    }
+}
+
 /// `@bool/x` (possibly chained) → the boolean it holds.
 fn attr_bool_ref(vm: &Vm, id: u32) -> Option<bool> {
     let res = vm.apk_res.as_ref()?;
@@ -6136,6 +6150,11 @@ fn build_tree(vm: &mut Vm, elems: &[Element], ctx: V) -> V {
         if let Some(Value::Str(t)) = el.android("text") {
             let v = jstr(vm, t);
             pseudo_set(vm, h, P_TEXT, v);
+        }
+        if is_compound_desc(vm, &class_of(vm, V::Ref(h))) {
+            if let Some(checked) = el.android("checked").and_then(|v| xml_value_bool(vm, v)) {
+                pseudo_set(vm, h, P_CHECKED, V::I32(checked as i32));
+            }
         }
         // ImageView sources declared in XML (`android:src` /
         // `app:srcCompat` — different namespaces, so match by local
