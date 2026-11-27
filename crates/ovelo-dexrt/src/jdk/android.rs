@@ -1828,7 +1828,7 @@ fn dialog_call(vm: &mut Vm, name: &str, args: &[V]) -> Rt<Option<Option<V>>> {
             }
             None
         }
-        "dismiss" | "cancel" => {
+        "dismiss" | "cancel" | "hide" => {
             if let Some(V::Ref(this)) = args.first().copied() {
                 view::dialog_dismiss(vm, this);
             }
@@ -1840,8 +1840,7 @@ fn dialog_call(vm: &mut Vm, name: &str, args: &[V]) -> Rt<Option<Option<V>>> {
             }
             None
         }
-        "hide"
-        | "create"
+        "create"
         | "onCreate"
         | "onStart"
         | "onStop"
