@@ -376,6 +376,7 @@ fn make_dex_view(vm: &Vm, info: &ovelo_dexrt::DexViewInfo, fonts: &Rc<FontSet>) 
     } else if info.desc.contains("Button") {
         GuestView::Btn(Button::new("", 16.0, dark, fonts.clone()))
     } else if info.text.is_some()
+        || info.compound_checked.is_some()
         || info.desc.contains("TextView")
         || info.desc.contains("EditText")
         // Name checks miss TextView descendants whose names don't

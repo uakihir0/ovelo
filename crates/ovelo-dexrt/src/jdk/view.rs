@@ -4771,8 +4771,22 @@ fn group_measure_fallback(vm: &mut Vm, this: u32, pw: i32, ph: i32) {
             .and_then(|v| image_pixels(vm, v))
             .map(|(w, h, _)| (w as i32, h as i32))
             .unwrap_or((0, 0));
+        let leaf_desc = class_of(vm, V::Ref(this));
+        let is_compound = leaf_desc.contains("CompoundButton")
+            || leaf_desc.contains("CheckBox")
+            || leaf_desc.contains("Checkbox")
+            || leaf_desc.contains("RadioButton")
+            || leaf_desc.contains("Switch")
+            || vm.extends_named(&leaf_desc, "CompoundButton");
         let (cw, chh) = if text.is_empty() {
-            (iw, ih)
+            if is_compound {
+                // CompoundButton's button drawable has an intrinsic
+                // affordance even when the label is empty; without it a
+                // wrap_content CheckBox measures to zero width.
+                (iw.max(28), ih.max(28))
+            } else {
+                (iw, ih)
+            }
         } else {
             // Wrapping: when the unbroken text overflows the available
             // width it folds to `ceil(cw/avail)` lines — a single-line
