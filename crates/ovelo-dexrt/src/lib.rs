@@ -4008,16 +4008,6 @@ impl Vm {
             // (skipping `RuntimeException` — `catch (RuntimeException)`
             // must not catch these).
             "Ljava/security/GeneralSecurityException;"
-            | "Ljava/security/NoSuchAlgorithmException;"
-            | "Ljava/security/NoSuchProviderException;"
-            | "Ljava/security/InvalidKeyException;"
-            | "Ljava/security/SignatureException;"
-            | "Ljava/security/KeyException;"
-            | "Ljava/security/cert/CertificateException;"
-            | "Ljavax/crypto/BadPaddingException;"
-            | "Ljavax/crypto/IllegalBlockSizeException;"
-            | "Ljavax/crypto/NoSuchPaddingException;"
-            | "Ljavax/crypto/ShortBufferException;"
             | "Ljava/text/ParseException;"
             | "Ljava/lang/instrument/IllegalClassFormatException;"
             | "Ljava/lang/InterruptedException;"
@@ -4034,6 +4024,27 @@ impl Vm {
             | "Ljava/util/zip/DataFormatException;"
             | "Ljava/net/URISyntaxException;"
             | "Landroid/os/RemoteException;" => &[
+                "Ljava/lang/Exception;",
+                "Ljava/lang/Throwable;",
+                "Ljava/lang/Object;",
+            ],
+            "Ljava/security/NoSuchAlgorithmException;"
+            | "Ljava/security/NoSuchProviderException;"
+            | "Ljava/security/SignatureException;"
+            | "Ljava/security/KeyException;"
+            | "Ljava/security/cert/CertificateException;"
+            | "Ljavax/crypto/BadPaddingException;"
+            | "Ljavax/crypto/IllegalBlockSizeException;"
+            | "Ljavax/crypto/NoSuchPaddingException;"
+            | "Ljavax/crypto/ShortBufferException;" => &[
+                "Ljava/security/GeneralSecurityException;",
+                "Ljava/lang/Exception;",
+                "Ljava/lang/Throwable;",
+                "Ljava/lang/Object;",
+            ],
+            "Ljava/security/InvalidKeyException;" => &[
+                "Ljava/security/KeyException;",
+                "Ljava/security/GeneralSecurityException;",
                 "Ljava/lang/Exception;",
                 "Ljava/lang/Throwable;",
                 "Ljava/lang/Object;",

@@ -4721,6 +4721,19 @@ fn mac_input_bytes(vm: &Vm, args: &[V]) -> Vec<u8> {
     }
 }
 
+fn mac_initialized(vm: &Vm, args: &[V]) -> bool {
+    match args.first() {
+        Some(V::Ref(h)) => match vm.heap.get(*h) {
+            Some(Obj::Host {
+                state: HostState::Mac { key, .. },
+                ..
+            }) => !key.is_empty(),
+            _ => false,
+        },
+        _ => false,
+    }
+}
+
 fn mac_call(vm: &mut Vm, name: &str, args: &[V]) -> Rt<Option<Option<V>>> {
     Ok(Some(match name {
         "getInstance" => {
@@ -4768,6 +4781,11 @@ fn mac_call(vm: &mut Vm, name: &str, args: &[V]) -> Rt<Option<Option<V>>> {
             None
         }
         "update" => {
+            if !mac_initialized(vm, args) {
+                return Err(
+                    vm.throw_builtin("Ljava/lang/IllegalStateException;", "Mac not initialized")
+                );
+            }
             let bytes = mac_input_bytes(vm, args);
             consume_mac_input(vm, args, bytes.len());
             if let Some(V::Ref(h)) = args.first() {
@@ -4782,6 +4800,11 @@ fn mac_call(vm: &mut Vm, name: &str, args: &[V]) -> Rt<Option<Option<V>>> {
             None
         }
         "doFinal" => {
+            if !mac_initialized(vm, args) {
+                return Err(
+                    vm.throw_builtin("Ljava/lang/IllegalStateException;", "Mac not initialized")
+                );
+            }
             let output_target = args.len() == 3;
             if output_target {
                 let required = match args.first() {
