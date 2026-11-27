@@ -133,10 +133,14 @@ fn find_attr<'a>(
     vm: &Vm,
 ) -> Option<&'a ovelo_apk::manifest::Attribute> {
     if args.len() >= 4 {
+        let want_ns = args.get(1).and_then(|a| sv(vm, *a));
         let want = args.get(2).and_then(|a| sv(vm, *a));
-        el.attrs
-            .iter()
-            .find(|a| Some(a.name.as_str()) == want.as_deref())
+        let want_ns = want_ns.as_deref().unwrap_or("");
+        el.attrs.iter().find(|a| {
+            Some(a.name.as_str()) == want.as_deref()
+                && (a.ns == want_ns
+                    || (want_ns == "http://schemas.android.com/apk/res/android" && a.ns.is_empty()))
+        })
     } else {
         let i = args.get(1).map(|v| i64v(*v)).unwrap_or(0);
         el.attrs.get(i.max(0) as usize)
@@ -217,10 +221,18 @@ pub(crate) fn pull_call(
                 cur_el(&els, e).and_then(|el| match args.get(1).copied() {
                     Some(V::I32(i)) => el.attrs.get(i as usize).and_then(|a| attr_s(&a.value)),
                     _ => {
+                        let want_ns = args.get(1).and_then(|a| sv(vm, *a));
                         let want = args.get(2).and_then(|a| sv(vm, *a));
                         el.attrs
                             .iter()
-                            .find(|a| Some(a.name.as_str()) == want.as_deref())
+                            .find(|a| {
+                                let want_ns = want_ns.as_deref().unwrap_or("");
+                                Some(a.name.as_str()) == want.as_deref()
+                                    && (a.ns == want_ns
+                                        || (want_ns
+                                            == "http://schemas.android.com/apk/res/android"
+                                            && a.ns.is_empty()))
+                            })
                             .and_then(|a| attr_s(&a.value))
                     }
                 })
@@ -231,11 +243,12 @@ pub(crate) fn pull_call(
             let found = cur(vm, h).and_then(|(els, e)| {
                 cur_el(&els, e)
                     .and_then(|el| find_attr(el, args, vm))
-                    .map(|a| match &a.value {
-                        Value::Reference(r) => *r as i64,
-                        Value::Int(v) => *v,
-                        Value::Bool(b) => *b as i64,
-                        _ => 0,
+                    .and_then(|a| match &a.value {
+                        Value::Reference(r) => Some(*r as i64),
+                        Value::Int(v) if name != "getAttributeResourceValue" => Some(*v),
+                        Value::Bool(b) if name != "getAttributeResourceValue" => Some(*b as i64),
+                        _ if name != "getAttributeResourceValue" => Some(0),
+                        _ => None,
                     })
             });
             // Signature: index args + a default last.
