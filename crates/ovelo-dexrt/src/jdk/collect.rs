@@ -2910,11 +2910,26 @@ fn arrays_static(vm: &mut Vm, name: &str, _sig: &str, args: &[V]) -> Rt<Option<O
         "binarySearch" => {
             let idx = match args[0] {
                 V::Ref(h) => match vm.heap.get(h) {
-                    Some(Obj::Array { data, .. }) => data
-                        .iter()
-                        .position(|e| value_eq(vm, *e, args[1]))
-                        .map(|i| i as i32)
-                        .unwrap_or(-1),
+                    Some(Obj::Array { data, .. }) => {
+                        let data = data.clone();
+                        let key = args[1];
+                        let mut low = 0usize;
+                        let mut high = data.len();
+                        let mut hit = None;
+                        while low < high {
+                            let mid = (low + high) / 2;
+                            let c = natural_cmp(vm, data[mid], key).cmp(&0) as i32;
+                            if c < 0 {
+                                low = mid + 1;
+                            } else if c > 0 {
+                                high = mid;
+                            } else {
+                                hit = Some(mid);
+                                break;
+                            }
+                        }
+                        hit.map(|i| i as i32).unwrap_or(-((low + 1) as i32))
+                    }
                     _ => -1,
                 },
                 _ => -1,
