@@ -450,12 +450,24 @@ pub(crate) fn render_vector(rv: RCtx<'_>, res_id: u32) -> Option<(u32, u32, Rc<V
     if vw <= 0.0 || vh <= 0.0 || !vw.is_finite() || !vh.is_finite() {
         return None;
     }
-    let out_w = ((vw * OUT_SCALE).round() as u32).clamp(1, 1024);
-    let out_h = ((vh * OUT_SCALE).round() as u32).clamp(1, 1024);
+    // `android:width`/`height` are the drawable's intrinsic physical
+    // size (dp converted through resources). Rasterizing every 24-unit
+    // viewport at a fixed 96px made wrap-content ImageViews twice as
+    // large on this runtime's 2x density; only use the fixed supersize
+    // as a fallback when the XML omits dimensions.
+    let out_w = xml_dimen_attr(rv, root, "width")
+        .unwrap_or(vw * OUT_SCALE)
+        .round()
+        .clamp(1.0, 1024.0) as u32;
+    let out_h = xml_dimen_attr(rv, root, "height")
+        .unwrap_or(vh * OUT_SCALE)
+        .round()
+        .clamp(1.0, 1024.0) as u32;
     let rw = (out_w * SS) as usize;
     let rh = (out_h * SS) as usize;
-    // viewport → raster: viewport unit * OUT_SCALE * SS.
-    let k = OUT_SCALE * SS as f32;
+    // viewport → raster, preserving a non-square aspect ratio.
+    let kx = out_w as f32 / vw * SS as f32;
+    let ky = out_h as f32 / vh * SS as f32;
     let mut any = false;
 
     // Composite buffer at raster res; each `<path>` paints stroke over fill
@@ -476,7 +488,7 @@ pub(crate) fn render_vector(rv: RCtx<'_>, res_id: u32) -> Option<(u32, u32, Rc<V
             "path" => {
                 let m = xf.iter().fold(Mat::IDENT, |acc, (_, m)| acc.then(m));
                 let Some(data) = path_attr(el) else { continue };
-                let tr = Mat::scale(k, k).then(&m);
+                let tr = Mat::scale(kx, ky).then(&m);
                 let subs = parse_path(&data);
                 let polys: Vec<Vec<(f32, f32)>> = subs
                     .iter()
@@ -503,7 +515,7 @@ pub(crate) fn render_vector(rv: RCtx<'_>, res_id: u32) -> Option<(u32, u32, Rc<V
                 }
                 if let Some(c) = stroke {
                     let argb = mul_alpha(c, f32_attr(el, "strokeAlpha").unwrap_or(1.0));
-                    let sw = f32_attr(el, "strokeWidth").unwrap_or(1.0) * k;
+                    let sw = f32_attr(el, "strokeWidth").unwrap_or(1.0) * (kx + ky) * 0.5;
                     let polys: Vec<Vec<(f32, f32)>> = subs
                         .iter()
                         .flat_map(|s| {
