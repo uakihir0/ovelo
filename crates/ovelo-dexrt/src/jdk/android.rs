@@ -5575,9 +5575,10 @@ fn res_misc(vm: &mut Vm, class: &str, name: &str, args: &[V]) -> Rt<Option<Optio
 // ---------------------------------------------------------------------
 // Handler / Looper — run posted work inline (single looper model)
 
-fn handler_message_matches(vm: &Vm, r: u32, target: u32, what: V) -> bool {
+fn handler_message_matches(vm: &Vm, r: u32, target: u32, what: V, obj: Option<V>) -> bool {
     pseudo_get(vm, r, P_MSG_TARGET) == Some(V::Ref(target))
         && pseudo_get(vm, r, P_MSG_WHAT) == Some(what)
+        && obj.is_none_or(|o| pseudo_get(vm, r, P_MSG_OBJ) == Some(o))
 }
 
 fn handler_call(vm: &mut Vm, name: &str, args: &[V]) -> Rt<Option<Option<V>>> {
@@ -5660,12 +5661,16 @@ fn handler_call(vm: &mut Vm, name: &str, args: &[V]) -> Rt<Option<Option<V>>> {
                 let pending_match: Vec<bool> = vm
                     .pending_runnables
                     .iter()
-                    .map(|(r, _)| handler_message_matches(vm, *r, target, what))
+                    .map(|(r, _)| {
+                        handler_message_matches(vm, *r, target, what, args.get(2).copied())
+                    })
                     .collect();
                 let delayed_match: Vec<bool> = vm
                     .delayed_runnables
                     .iter()
-                    .map(|(r, _, _)| handler_message_matches(vm, *r, target, what))
+                    .map(|(r, _, _)| {
+                        handler_message_matches(vm, *r, target, what, args.get(2).copied())
+                    })
                     .collect();
                 let mut pi = 0;
                 vm.pending_runnables.retain(|_| {
@@ -5685,13 +5690,11 @@ fn handler_call(vm: &mut Vm, name: &str, args: &[V]) -> Rt<Option<Option<V>>> {
         "removeCallbacks" | "removeCallbacksAndMessages" | "removeEqualMessages" => Some(None),
         "hasMessages" => {
             let found = if let (Some(&V::Ref(target)), Some(&what)) = (args.first(), args.get(1)) {
-                vm.pending_runnables
-                    .iter()
-                    .any(|(r, _)| handler_message_matches(vm, *r, target, what))
-                    || vm
-                        .delayed_runnables
-                        .iter()
-                        .any(|(r, _, _)| handler_message_matches(vm, *r, target, what))
+                vm.pending_runnables.iter().any(|(r, _)| {
+                    handler_message_matches(vm, *r, target, what, args.get(2).copied())
+                }) || vm.delayed_runnables.iter().any(|(r, _, _)| {
+                    handler_message_matches(vm, *r, target, what, args.get(2).copied())
+                })
             } else {
                 false
             };
