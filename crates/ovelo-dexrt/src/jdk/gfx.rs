@@ -313,7 +313,7 @@ fn raster_stroke_to_bitmap(
     let radius = if hairline { 0.5 } else { paint.stroke_w / 2.0 };
     let scan_scale = mat_max_scale(inverse_m);
     let mut out = base.as_ref().clone();
-    let mut covered = vec![false; (bw * bh) as usize];
+    let mut coverage = vec![0u8; (bw * bh) as usize];
     for (src_pts, dst_pts) in src_contours.iter().zip(dst_contours) {
         for (src_seg, dst_seg) in src_pts.windows(2).zip(dst_pts.windows(2)) {
             let (sa, sb) = (src_seg[0], src_seg[1]);
@@ -347,28 +347,32 @@ fn raster_stroke_to_bitmap(
                         }
                     } else {
                         let mut hits = 0u32;
-                        for fy in [0.25, 0.75] {
-                            for fx in [0.25, 0.75] {
-                                let (sx, sy) =
-                                    inv_mat_point(inverse_m, xx as f32 + fx, yy as f32 + fy);
-                                if stroke_seg_dist(sx, sy, sa, sb) <= radius {
-                                    hits += 1;
-                                }
+                        for (si, (fx, fy)) in
+                            [(0.25, 0.25), (0.75, 0.25), (0.25, 0.75), (0.75, 0.75)]
+                                .into_iter()
+                                .enumerate()
+                        {
+                            let (sx, sy) = inv_mat_point(inverse_m, xx as f32 + fx, yy as f32 + fy);
+                            if stroke_seg_dist(sx, sy, sa, sb) <= radius {
+                                hits |= 1 << si;
                             }
                         }
                         hits
                     };
                     let pi = (yy as u32 * bw + xx as u32) as usize;
-                    if !covered[pi] && inside != 0 {
-                        covered[pi] = true;
-                        if hairline {
-                            blend_px(&mut out, pi * 4, paint.draw_argb());
-                        } else {
-                            blend_px_coverage(&mut out, pi * 4, paint.draw_argb(), inside, 4);
-                        }
-                    }
+                    coverage[pi] |= inside as u8;
                 }
             }
+        }
+    }
+    for (pi, mask) in coverage.into_iter().enumerate() {
+        if mask == 0 {
+            continue;
+        }
+        if hairline {
+            blend_px(&mut out, pi * 4, paint.draw_argb());
+        } else {
+            blend_px_coverage(&mut out, pi * 4, paint.draw_argb(), mask.count_ones(), 4);
         }
     }
     if let Some(Obj::Host {
