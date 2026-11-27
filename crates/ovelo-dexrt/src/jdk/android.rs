@@ -1971,7 +1971,12 @@ fn intent_call(vm: &mut Vm, name: &str, sig: &str, args: &[V]) -> Rt<Option<Opti
             // the *Context* — the component is the Class arg.
             if let Some(a) = args.get(1) {
                 match sv(vm, *a) {
-                    Some(_) => pseudo_set(vm, h, P_ACTION, *a),
+                    Some(_) => {
+                        pseudo_set(vm, h, P_ACTION, *a);
+                        if let Some(uri) = args.get(2).copied().filter(|v| *v != V::Ref(0)) {
+                            pseudo_set(vm, h, P_DATA, uri);
+                        }
+                    }
                     None => {
                         let target = args.get(2).copied().unwrap_or(*a);
                         pseudo_set(vm, h, P_COMPONENT, target);
