@@ -364,8 +364,9 @@ pub struct DexViewInfo {
     /// `android:maxLines` — caps wrapped line count; overflowing text
     /// truncates to the first `n` lines.
     pub max_lines: Option<i32>,
-    /// Horizontal/vertical scroll offsets (`scrollTo`/`setScrollX`).
+    /// Horizontal scroll offset (`scrollTo`/`setScrollX`).
     pub scroll_x: i32,
+    /// Vertical scroll offset (`scrollTo`/`setScrollY`).
     pub scroll_y: i32,
 }
 
