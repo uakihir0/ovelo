@@ -822,29 +822,11 @@ pub(crate) fn frame_set(vm: &mut Vm, h: u32, l: i32, t: i32, r: i32, b: i32) -> 
 fn len_v(vm: &Vm, v: V) -> i32 {
     match v {
         V::I32(i) if i <= 0 => i.max(-2),
-        V::I32(id) => {
-            let id = id as u32;
-            let Some(res) = vm.apk_res.as_ref() else {
-                return -2;
-            };
-            if res.type_name(id) == Some("attr") {
-                if let Some(ev) = theme_attr_entry(vm, id) {
-                    if (0x05..=0x06).contains(&ev.data_type) {
-                        return crate::res::typed_px(&ev) as i32;
-                    }
-                    if ev.data_type == 0x01 {
-                        return res.dimen(ev.data).map(|d| d as i32).unwrap_or(-2);
-                    }
-                }
-                return -2;
-            }
-            res.dimen(id).map(|d| d as i32).unwrap_or(-2)
-        }
+        V::I32(_) => lp_px(vm, v).unwrap_or(-2),
         V::F32(f) => f as i32,
         _ => -2,
     }
 }
-
 /// Snapshot a dex view-tree node for host-side rendering.
 pub(crate) fn dex_view_info(vm: &Vm, h: u32) -> Option<DexViewInfo> {
     if h == 0 || pseudo_get(vm, h, P_IS_VIEW).is_none() {
@@ -4952,11 +4934,32 @@ fn lp_px(vm: &Vm, v: V) -> Option<i32> {
         // literal px dim: it lands in `getChildMeasureSpec` as
         // `EXACTLY|0x7fxxxxxx`, producing ~1e9-px measured heights
         // that push the whole content subtree off-screen.
-        return vm
-            .apk_res
-            .as_ref()
-            .and_then(|r| r.dimen(i as u32))
-            .map(|d| d as i32);
+        let id = i as u32;
+        let res = vm.apk_res.as_ref()?;
+        if let Some(d) = res.dimen(id) {
+            return Some(d as i32);
+        }
+        // `?attr/foo` (including framework attrs absent from the app's
+        // type table) is theme state rather than a dimen resource. XML
+        // decoding loses the TYPE_ATTRIBUTE tag, but values in this id
+        // range are never literal pixels; resolving a missing theme item
+        // to None is still the safe outcome.
+        let mut ev = theme_attr_entry(vm, id)?.clone();
+        for _ in 0..8 {
+            match ev.data_type {
+                0x05..=0x06 => return Some(crate::res::typed_px(&ev) as i32),
+                0x04 | 0x10 | 0x11 | 0x12 => return Some(crate::res::typed_px(&ev) as i32),
+                0x01 => {
+                    if let Some(d) = res.dimen(ev.data) {
+                        return Some(d as i32);
+                    }
+                    ev = res.entry_value(ev.data)?.clone();
+                }
+                0x02 => ev = theme_attr_entry(vm, ev.data)?.clone(),
+                _ => return None,
+            }
+        }
+        return None;
     }
     Some(i)
 }
