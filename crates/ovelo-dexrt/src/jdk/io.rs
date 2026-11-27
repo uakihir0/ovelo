@@ -972,7 +972,39 @@ fn stream_call(vm: &mut Vm, name: &str, args: &[V]) -> Rt<Option<Option<V>>> {
             Some(Some(V::I32(-1)))
         }
         "available" => Some(Some(V::I32(0))),
-        "readLine" => Some(Some(V::Ref(0))),
+        "readLine" => {
+            let found = if let Some(Obj::Host {
+                state: HostState::Chars(chars, pos, _),
+                ..
+            }) = vm.heap.get_mut(this)
+            {
+                if *pos >= chars.len() {
+                    None
+                } else {
+                    let start = *pos;
+                    let mut end = start;
+                    while end < chars.len() && chars[end] != 10 && chars[end] != 13 {
+                        end += 1;
+                    }
+                    let line = String::from_utf16_lossy(&chars[start..end]);
+                    if end < chars.len() {
+                        let nl = chars[end];
+                        end += 1;
+                        if nl == 13 && end < chars.len() && chars[end] == 10 {
+                            end += 1;
+                        }
+                    }
+                    *pos = end;
+                    Some(line)
+                }
+            } else {
+                None
+            };
+            Some(Some(match found {
+                Some(line) => jstr(vm, &line),
+                None => V::Ref(0),
+            }))
+        }
         "ready" | "markSupported" => Some(Some(V::I32(0))),
         "skip" => Some(Some(V::I64(0))),
         "write" | "flush" | "close" | "mark" | "reset" => Some(None),
