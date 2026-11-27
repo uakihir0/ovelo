@@ -2500,6 +2500,14 @@ pub(crate) fn call(
         "getText" | "getTitle" => Some(Some(
             pseudo_get(vm, this, P_TEXT).unwrap_or_else(|| jstr(vm, "")),
         )),
+        "length" => {
+            let len = pseudo_get(vm, this, P_TEXT)
+                .or_else(|| attr_find(vm, this, "text"))
+                .and_then(|v| text_value_string(vm, v))
+                .map(|t| t.chars().count() as i32)
+                .unwrap_or(0);
+            Some(Some(V::I32(len)))
+        }
         "getContentDescription" => Some(Some(
             pseudo_get(vm, this, P_CDESC).unwrap_or_else(|| jstr(vm, "")),
         )),
