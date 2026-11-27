@@ -1043,6 +1043,36 @@ impl GuestUi {
                 tv.invalidate();
                 Ok(None)
             });
+            Self::on(
+                ui,
+                vm,
+                cls,
+                "setTextColor",
+                "(Landroid/content/res/ColorStateList;)V",
+                |ui, vm, a| {
+                    let this = ref_arg(a, 0)?;
+                    let raw = match a.get(1) {
+                        Some(V::Ref(h)) => match vm.host_slot(*h) {
+                            Some(V::I32(c)) => c,
+                            _ => 0,
+                        },
+                        Some(V::I32(c)) => *c,
+                        _ => return Err(crate::err("guest.arg.type")),
+                    };
+                    let Some(rc) = ui.views.get(&this).cloned() else {
+                        ovelo_dexrt::pseudo_set(vm, this, ovelo_dexrt::P_TCOLOR, V::I32(raw));
+                        return Ok(None);
+                    };
+                    let color = argb(raw);
+                    let mut g = rc.borrow_mut();
+                    let tv = g
+                        .text_mut()
+                        .ok_or_else(|| crate::err("guest.setTextColor.not_text"))?;
+                    tv.color = color;
+                    tv.invalidate();
+                    Ok(None)
+                },
+            );
         }
     }
 

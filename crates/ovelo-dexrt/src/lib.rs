@@ -3286,6 +3286,11 @@ impl Vm {
             .collect()
     }
 
+    /// Read the scalar/reference payload of a host slot object.
+    pub fn host_slot(&self, h: u32) -> Option<V> {
+        jdk::slot_of(self, h)
+    }
+
     /// Resolve `name` on `ci`'s chain for `args`, retrying with each
     /// scalar boxed into its `Number` mirror (`HostState::Slot`) when
     /// the plain image misses. A raw `V::I64` out of a JSON map fed

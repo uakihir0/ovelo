@@ -2498,11 +2498,18 @@ fn context_call(
             }
             Some(Some(r))
         }
-        "getColorStateList" => Some(Some(host(
-            vm,
-            "Landroid/content/res/ColorStateList;",
-            HostState::Empty,
-        ))),
+        "getColorStateList" => {
+            // A color resource is often a selector XML. Until stateful
+            // resolution exists, carry its default/flat color in the
+            // slot so getDefaultColor does not collapse text to black.
+            let id = i64v(args.get(1).copied().unwrap_or(V::I32(0))) as u32;
+            let color = resolve_color_id(vm, id) as i32;
+            Some(Some(host(
+                vm,
+                "Landroid/content/res/ColorStateList;",
+                HostState::Slot(V::I32(color)),
+            )))
+        }
         "getSystemService" => {
             // Hand out a typed placeholder per service name so calls on
             // it resolve (void stubs) and instanceof/cast work; real
@@ -3789,11 +3796,18 @@ fn resources_call(vm: &mut Vm, name: &str, args: &[V]) -> Rt<Option<Option<V>>> 
             };
             Some(Some(d))
         }
-        "getColorStateList" => Some(Some(host(
-            vm,
-            "Landroid/content/res/ColorStateList;",
-            HostState::Empty,
-        ))),
+        "getColorStateList" => {
+            // A color resource is often a selector XML. Until stateful
+            // resolution exists, carry its default/flat color in the
+            // slot so getDefaultColor does not collapse text to black.
+            let id = i64v(args.get(1).copied().unwrap_or(V::I32(0))) as u32;
+            let color = resolve_color_id(vm, id) as i32;
+            Some(Some(host(
+                vm,
+                "Landroid/content/res/ColorStateList;",
+                HostState::Slot(V::I32(color)),
+            )))
+        }
         "getFont" => Some(Some(host(
             vm,
             "Landroid/graphics/Typeface;",
