@@ -2444,20 +2444,29 @@ fn json_dump_d(vm: &Vm, v: V, depth: u32) -> String {
 
 fn json_coerce_number(vm: &Vm, v: V, name: &str) -> V {
     let parsed = sv(vm, v);
-    let int_bits = parsed
-        .as_deref()
-        .and_then(|s| s.parse::<i64>().ok())
-        .unwrap_or_else(|| i64v(v));
-    let double_bits = parsed
-        .as_deref()
-        .and_then(|s| s.parse::<f64>().ok())
-        .unwrap_or_else(|| f64v(v));
+    let string_num = parsed.as_deref().and_then(|s| s.parse::<f64>().ok());
     if name.ends_with("Int") {
-        V::I32(int_bits as i32)
+        let out = match v {
+            V::I32(i) => i,
+            // Long.intValue is a narrowing integer conversion.
+            V::I64(i) => i as i32,
+            // Floating-point intValue clamps out-of-range values.
+            V::F32(f) => f as i32,
+            V::F64(f) => f as i32,
+            _ => string_num.map(|f| f as i32).unwrap_or(0),
+        };
+        V::I32(out)
     } else if name.ends_with("Long") {
-        V::I64(int_bits)
+        let out = match v {
+            V::I32(i) => i as i64,
+            V::I64(i) => i,
+            V::F32(f) => f as i64,
+            V::F64(f) => f as i64,
+            _ => string_num.map(|f| f as i64).unwrap_or(0),
+        };
+        V::I64(out)
     } else if name.ends_with("Double") {
-        V::F64(double_bits)
+        V::F64(string_num.unwrap_or_else(|| f64v(v)))
     } else {
         let truthy = parsed
             .as_deref()
