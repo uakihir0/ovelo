@@ -532,13 +532,25 @@ pub(crate) fn call(
                 Some(None)
             }
             "submit" => {
-                if let V::Ref(r) = args[1] {
-                    vm.enqueue_runnable(r, false);
-                }
+                // `submit(Callable)` must invoke `call`, not `run`: media3
+                // resolves fast media ids through such futures. Running it
+                // inline also gives `Future.get` the produced value instead
+                // of the permanent null an unobserved queue slot yielded.
+                let out = if let V::Ref(r) = args[1] {
+                    match vm.call_virtual_rt(r, "call", &[]) {
+                        Ok(v) => v,
+                        Err(_) => {
+                            let _ = vm.call_virtual_rt(r, "run", &[]);
+                            None
+                        }
+                    }
+                } else {
+                    None
+                };
                 Some(Some(host(
                     vm,
                     "Ljava/util/concurrent/Future;",
-                    HostState::Empty,
+                    HostState::Slot(out.unwrap_or(V::Ref(0))),
                 )))
             }
             "isShutdown" | "isTerminated" => Some(Some(V::I32(0))),
@@ -569,7 +581,27 @@ pub(crate) fn call(
                 }
                 Some(Some(v))
             }
-            "get" | "call" => Some(Some(V::Ref(0))),
+            "get" | "call" => {
+                if name == "get" {
+                    let sv = match args.first().copied().unwrap_or(V::Ref(0)) {
+                        V::Ref(h) => match vm.heap.get(h) {
+                            Some(Obj::Host {
+                                state: HostState::Slot(v),
+                                ..
+                            }) => Some(*v),
+                            Some(Obj::Instance { fields, .. }) | Some(Obj::Host { fields, .. }) => {
+                                fields.get(&P_SLOT).copied()
+                            }
+                            _ => None,
+                        },
+                        _ => None,
+                    };
+                    if let Some(v) = sv {
+                        return Ok(Some(Some(v)));
+                    }
+                }
+                Some(Some(V::Ref(0)))
+            }
             "isDone" | "isCancelled" => Some(Some(V::I32(1))),
             "cancel" => Some(Some(V::I32(1))),
             "park" | "parkNanos" | "parkUntil" => {
