@@ -55,6 +55,13 @@ pub(crate) const P_IS_VIEW: u32 = u32::MAX - 14;
 pub(crate) const P_IS_GROUP: u32 = u32::MAX - 15;
 const P_DECOR: u32 = u32::MAX - 16;
 const P_LISTENER: u32 = u32::MAX - 17;
+/// `setOnLongClickListener` target — distinct from the click listener;
+/// row layouts commonly register both and the long-click lambda must not
+/// overwrite the click lambda.
+const P_LONG_LISTENER: u32 = u32::MAX - 71;
+const P_FOCUS_LISTENER: u32 = u32::MAX - 72;
+const P_KEY_LISTENER: u32 = u32::MAX - 73;
+const P_ATTACH_LISTENER: u32 = u32::MAX - 74;
 /// The `Context` a view was constructed with — read by `getContext`.
 /// pub(crate): `call_builtin` sets it for host-registered ctors too.
 pub(crate) const P_CONTEXT: u32 = u32::MAX - 18;
@@ -2610,12 +2617,16 @@ pub(crate) fn call(
         | "setOnKeyListener"
         | "setOnAttachStateChangeListener"
         | "addOnAttachStateChangeListener" => {
-            pseudo_set(
-                vm,
-                this,
-                P_LISTENER,
-                args.get(1).copied().unwrap_or(V::Ref(0)),
-            );
+            let key = match name {
+                "setOnLongClickListener" => P_LONG_LISTENER,
+                "setOnFocusChangeListener" => P_FOCUS_LISTENER,
+                "setOnKeyListener" => P_KEY_LISTENER,
+                "setOnAttachStateChangeListener" | "addOnAttachStateChangeListener" => {
+                    P_ATTACH_LISTENER
+                }
+                _ => P_LISTENER,
+            };
+            pseudo_set(vm, this, key, args.get(1).copied().unwrap_or(V::Ref(0)));
             Some(match ret(sig) {
                 "V" => None,
                 _ => Some(V::I32(1)),
@@ -7269,7 +7280,10 @@ pub(crate) fn dispatch_touch(
                     // the parent row and fires the row's action.
                     if up_inside {
                         if dbg {
-                            eprintln!("[touchdbg] h{v} performClick listener={listener:?}");
+                            eprintln!(
+                                "[touchdbg] h{v} performClick listener={listener:?} class={}",
+                                listener.map(|h| vm.dbg_class_of(h)).unwrap_or_default()
+                            );
                         }
                         if let Err(e) = vm.call_virtual(v, "performClick", &[]) {
                             if crate::dbg_flag("OVELO_TOUCHDBG") {
