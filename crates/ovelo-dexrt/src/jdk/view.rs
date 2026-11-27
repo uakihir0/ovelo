@@ -129,6 +129,8 @@ const P_ITEM_SUBMENU: u32 = 0xFFFD_FFF0;
 /// callbacks must be skipped.
 pub(crate) const P_FINISHED: u32 = 0xFFFD_FFEF;
 pub(crate) const P_INTENT: u32 = 0xFFFD_FFEE;
+pub(crate) const P_RESULT_CODE: u32 = 0xFFFD_FFE7;
+pub(crate) const P_RESULT_INTENT: u32 = 0xFFFD_FFE6;
 
 // TypedArray backing — below the `tag_key` band (which bottoms out at
 // ~u32::MAX - 0x10014).

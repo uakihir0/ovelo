@@ -3197,6 +3197,19 @@ fn context_call(
                         _ => None,
                     };
                     if let Some(d) = desc {
+                        let request = match name {
+                            "startActivityForResult" => args.get(2).map(|v| i32v(*v)),
+                            "startActivityFromChild" | "startActivityFromFragment" => {
+                                args.get(3).map(|v| i32v(*v))
+                            }
+                            _ => None,
+                        };
+                        vm.pending_activity_caller = request.and_then(|request_code| {
+                            (request_code >= 0).then(|| match args[0] {
+                                V::Ref(caller) => (caller, request_code),
+                                _ => (0, request_code),
+                            })
+                        });
                         vm.pending_activity = Some((d, clone_intent(vm, ih)));
                     }
                 }
@@ -3454,12 +3467,25 @@ fn context_call(
             }
             Some(None)
         }
+        "setResult" => {
+            if let V::Ref(h) = args[0] {
+                pseudo_set(
+                    vm,
+                    h,
+                    view::P_RESULT_CODE,
+                    args.get(1).copied().unwrap_or(V::I32(0)),
+                );
+                if let Some(intent) = args.get(2).copied() {
+                    pseudo_set(vm, h, view::P_RESULT_INTENT, intent);
+                }
+            }
+            Some(None)
+        }
         "setIntent"
         | "requestWindowFeature"
         | "setTitle"
         | "setTitleColor"
         | "setVisible"
-        | "setResult"
         | "setRequestedOrientation"
         | "setTaskDescription"
         | "setVolumeControlStream"

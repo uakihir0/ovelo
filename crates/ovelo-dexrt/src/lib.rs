@@ -622,6 +622,12 @@ pub struct Vm {
     /// descriptor, the Intent the caller passed). The runner drains
     /// it into a real second-Activity dispatch.
     pub pending_activity: Option<(String, V)>,
+    /// Caller activities awaiting a finished child activity.
+    pub activity_back: Vec<u32>,
+    /// Caller/request code associated with the next pending activity launch.
+    pub pending_activity_caller: Option<(u32, i32)>,
+    /// Child activity handle → caller activity and request code.
+    pub activity_callers: HashMap<u32, (u32, i32)>,
     /// canonical class_idx → `java.lang.Class` mirror handle — Class
     /// objects are singletons (`Foo.class == x.getClass()`).
     class_mirrors: HashMap<GIdx, u32>,
@@ -893,6 +899,9 @@ impl Vm {
             theme_id: 0,
             total_steps: 0,
             pending_activity: None,
+            activity_back: Vec::new(),
+            pending_activity_caller: None,
+            activity_callers: HashMap::new(),
             pending_runnables: std::collections::VecDeque::new(),
             single_executors: hashbrown::HashSet::new(),
             executor_queues: HashMap::new(),
@@ -3191,6 +3200,17 @@ impl Vm {
             Some(V::I32(res)) if res > 0 => Some(self.drawable_for_res(res as u32)),
             _ => None,
         }
+    }
+
+    /// Result code and data recorded by `Activity.setResult`.
+    pub fn activity_result(&self, activity: u32) -> (i32, Option<V>) {
+        (
+            match jdk::pseudo_get(self, activity, jdk::view::P_RESULT_CODE) {
+                Some(v) => jdk::i32v(v),
+                None => 0,
+            },
+            jdk::pseudo_get(self, activity, jdk::view::P_RESULT_INTENT),
+        )
     }
 
     /// Whether the guest called `finish()` on this Activity — remaining

@@ -1213,7 +1213,15 @@ fn drain_pending_activity(
         match vm.instantiate(&next) {
             Ok(h2) => {
                 println!("activity {} (started)", disp(&next));
+                if *this != 0 && *this != h2 && !vm.is_finishing(*this) {
+                    vm.activity_back.push(*this);
+                }
                 vm.set_activity_intent(h2, intent);
+                if let Some(caller) = vm.pending_activity_caller.take() {
+                    vm.activity_callers.insert(h2, caller);
+                } else {
+                    vm.activity_callers.remove(&h2);
+                }
                 *this = h2;
                 run_activity_cbs(vm, *this, callbacks);
             }
@@ -1224,6 +1232,41 @@ fn drain_pending_activity(
             }
         }
     }
+}
+
+/// Restore the top unfinished caller after Activity.finish(). The
+/// runtime keeps a single window, so finishing is a back-stack pop plus
+/// retargeting materialization at the previous activity's tree.
+fn pop_finished_activity(vm: &mut ovelo_dexrt::Vm, this: &mut u32) -> bool {
+    if !vm.is_finishing(*this) {
+        return false;
+    }
+    while let Some(prev) = vm.activity_back.pop() {
+        if !vm.is_finishing(prev) {
+            let finished = *this;
+            *this = prev;
+            vm.set_activity(prev);
+            if let Some((caller, request_code)) = vm.activity_callers.remove(&finished) {
+                if caller == prev {
+                    let (result_code, data) = vm.activity_result(finished);
+                    let intent = data.unwrap_or(ovelo_dexrt::V::Ref(0));
+                    if let Err(e) = vm.call_virtual(
+                        prev,
+                        "onActivityResult",
+                        &[
+                            ovelo_dexrt::V::I32(request_code),
+                            ovelo_dexrt::V::I32(result_code),
+                            intent,
+                        ],
+                    ) {
+                        println!("onActivityResult crashed: {e}");
+                    }
+                }
+            }
+            return true;
+        }
+    }
+    false
 }
 
 /// Deliver the queued lifecycle callbacks to a guest Activity:
@@ -1894,6 +1937,9 @@ fn run_app(store: &InstallStore, package: &str) -> Result<(), OveloError> {
         // Apps that inflate layout xml (setContentView(res)) live in the
         // VM's dex view tree — materialize it into drawable host views.
         if let Some((vm, this)) = &mut guest {
+            if pop_finished_activity(vm, this) {
+                println!("activity finished — restoring previous");
+            }
             // One lock for the whole tick — drain_runnables, GC and
             // the layout pass all touch the heap between invokes, and
             // guest-pthread JNI calls must not alias them.
