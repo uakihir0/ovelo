@@ -2456,8 +2456,8 @@ pub(crate) fn ifield(vm: &Vm, h: u32, owner: &str, name: &str) -> Option<V> {
         ("Landroid/util/DisplayMetrics;", "density") => Some(V::F32(1.0)),
         ("Landroid/util/DisplayMetrics;", "densityDpi") => Some(V::I32(160)),
         ("Landroid/util/DisplayMetrics;", "scaledDensity") => Some(V::F32(1.0)),
-        ("Landroid/util/DisplayMetrics;", "widthPixels") => Some(V::I32(1080)),
-        ("Landroid/util/DisplayMetrics;", "heightPixels") => Some(V::I32(1920)),
+        ("Landroid/util/DisplayMetrics;", "widthPixels") => Some(V::I32(vm.window_size.0)),
+        ("Landroid/util/DisplayMetrics;", "heightPixels") => Some(V::I32(vm.window_size.1)),
         ("Landroid/util/DisplayMetrics;", "xdpi" | "ydpi") => Some(V::F32(160.0)),
         // androidx.startup reads `getProviderInfo(...).metaData` for the
         // manifest <meta-data> bundle — the handle our CLI attaches.
