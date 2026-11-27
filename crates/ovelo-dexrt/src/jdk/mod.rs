@@ -1971,16 +1971,48 @@ pub(crate) fn sfield(vm: &mut Vm, owner: &str, name: &str, ftype: &str) -> Optio
             return Some(host(vm, owner, HostState::Slot(V::F64(10.0))));
         }
         ("Ljava/math/MathContext;", "UNLIMITED") => {
-            return Some(host(vm, owner, HostState::Slot(V::I32(0))));
+            return Some(host(vm, owner, HostState::List(vec![V::I32(0), V::I32(4)])));
         }
         ("Ljava/math/MathContext;", "DECIMAL32") => {
-            return Some(host(vm, owner, HostState::Slot(V::I32(7))));
+            return Some(host(vm, owner, HostState::List(vec![V::I32(7), V::I32(6)])));
         }
         ("Ljava/math/MathContext;", "DECIMAL64") => {
-            return Some(host(vm, owner, HostState::Slot(V::I32(16))));
+            return Some(host(
+                vm,
+                owner,
+                HostState::List(vec![V::I32(16), V::I32(6)]),
+            ));
         }
         ("Ljava/math/MathContext;", "DECIMAL128") => {
-            return Some(host(vm, owner, HostState::Slot(V::I32(34))));
+            return Some(host(
+                vm,
+                owner,
+                HostState::List(vec![V::I32(34), V::I32(6)]),
+            ));
+        }
+        ("Ljava/math/RoundingMode;", "UP") => {
+            return Some(host(vm, owner, HostState::Slot(V::I32(0))));
+        }
+        ("Ljava/math/RoundingMode;", "DOWN") => {
+            return Some(host(vm, owner, HostState::Slot(V::I32(1))));
+        }
+        ("Ljava/math/RoundingMode;", "CEILING") => {
+            return Some(host(vm, owner, HostState::Slot(V::I32(2))));
+        }
+        ("Ljava/math/RoundingMode;", "FLOOR") => {
+            return Some(host(vm, owner, HostState::Slot(V::I32(3))));
+        }
+        ("Ljava/math/RoundingMode;", "HALF_UP") => {
+            return Some(host(vm, owner, HostState::Slot(V::I32(4))));
+        }
+        ("Ljava/math/RoundingMode;", "HALF_DOWN") => {
+            return Some(host(vm, owner, HostState::Slot(V::I32(5))));
+        }
+        ("Ljava/math/RoundingMode;", "HALF_EVEN") => {
+            return Some(host(vm, owner, HostState::Slot(V::I32(6))));
+        }
+        ("Ljava/math/RoundingMode;", "UNNECESSARY") => {
+            return Some(host(vm, owner, HostState::Slot(V::I32(7))));
         }
         ("Ljava/lang/Math;", "PI") => V::F64(std::f64::consts::PI),
         ("Ljava/lang/Math;", "E") => V::F64(std::f64::consts::E),

@@ -7,6 +7,14 @@ use crate::{Rt, Vm};
 
 use super::{host, jdynstr, sv};
 
+const ROUND_UP: i32 = 0;
+const ROUND_DOWN: i32 = 1;
+const ROUND_CEILING: i32 = 2;
+const ROUND_FLOOR: i32 = 3;
+const ROUND_HALF_UP: i32 = 4;
+const ROUND_HALF_DOWN: i32 = 5;
+const ROUND_HALF_EVEN: i32 = 6;
+
 pub(crate) fn bd_of(vm: &Vm, h: u32) -> Option<f64> {
     match vm.heap.get(h) {
         Some(Obj::Host {
@@ -82,13 +90,102 @@ pub(crate) fn fmt_bd(f: f64) -> String {
     s
 }
 
-fn round_scale(f: f64, scale: i32) -> f64 {
-    let p = 10f64.powi(scale.clamp(-300, 300));
-    if scale >= 0 {
-        (f * p).round() / p
-    } else {
-        (f / p).round() * p
+fn rounding_mode(vm: &Vm, v: V) -> i32 {
+    match v {
+        V::I32(i) => i,
+        V::I64(i) => i as i32,
+        V::Ref(h) => match vm.heap.get(h) {
+            Some(Obj::Host {
+                state: HostState::Slot(s),
+                ..
+            }) => i32v(*s),
+            _ => ROUND_HALF_UP,
+        },
+        _ => ROUND_HALF_UP,
     }
+}
+
+fn round_unit(x: f64, mode: i32) -> f64 {
+    match mode {
+        ROUND_UP => x.signum() * x.abs().ceil(),
+        ROUND_DOWN => x.trunc(),
+        ROUND_CEILING => x.ceil(),
+        ROUND_FLOOR => x.floor(),
+        ROUND_HALF_DOWN => {
+            if (x.fract().abs() - 0.5).abs() < 1e-12 {
+                x.trunc()
+            } else {
+                x.round()
+            }
+        }
+        ROUND_HALF_EVEN => {
+            let floor = x.floor();
+            let diff = x - floor;
+            if diff < 0.5 {
+                floor
+            } else if diff > 0.5 {
+                floor + 1.0
+            } else if (floor / 2.0).fract() == 0.0 {
+                floor
+            } else {
+                floor + 1.0
+            }
+        }
+        _ => x.round(),
+    }
+}
+
+fn round_scale_mode(f: f64, scale: i32, mode: i32) -> f64 {
+    let scale = scale.clamp(-300, 300);
+    let p = 10f64.powi(scale.abs());
+    let scaled = if scale >= 0 { f * p } else { f / p };
+    let rounded = round_unit(scaled, mode);
+    if scale >= 0 {
+        rounded / p
+    } else {
+        rounded * p
+    }
+}
+
+fn mc_parts(vm: &Vm, v: V) -> Option<(i32, i32)> {
+    let V::Ref(h) = v else { return None };
+    match vm.heap.get(h) {
+        Some(Obj::Host {
+            desc,
+            state: HostState::List(parts),
+            ..
+        }) if desc == "Ljava/math/MathContext;" => Some((
+            parts.first().map(|v| i32v(*v)).unwrap_or(0),
+            parts.get(1).map(|v| i32v(*v)).unwrap_or(ROUND_HALF_UP),
+        )),
+        _ => None,
+    }
+}
+
+fn round_precision(f: f64, precision: i32, mode: i32) -> f64 {
+    if precision <= 0 || f == 0.0 || !f.is_finite() {
+        return f;
+    }
+    let exponent = f.abs().log10().floor() as i32;
+    let scale = precision - 1 - exponent;
+    round_scale_mode(f, scale, mode)
+}
+
+fn apply_mc(vm: &Vm, args: &[V], f: f64) -> f64 {
+    for a in args.iter().skip(1) {
+        if let Some((precision, mode)) = mc_parts(vm, *a) {
+            return round_precision(f, precision, mode);
+        }
+    }
+    f
+}
+
+fn rounding_obj(vm: &mut Vm, mode: i32) -> V {
+    host(
+        vm,
+        "Ljava/math/RoundingMode;",
+        HostState::Slot(V::I32(mode)),
+    )
 }
 
 pub(crate) fn call(
@@ -101,26 +198,29 @@ pub(crate) fn call(
     if class == "Ljava/math/MathContext;" {
         return Ok(match name {
             "<init>" => {
-                if let (V::Ref(h), Some(p)) = (
-                    args.first().copied().unwrap_or(V::Ref(0)),
-                    args.get(1).copied(),
-                ) {
+                if let V::Ref(h) = args.first().copied().unwrap_or(V::Ref(0)) {
+                    let precision = args.get(1).map(|v| i32v(*v)).unwrap_or(0);
+                    let rounding = args
+                        .get(2)
+                        .map(|v| rounding_mode(vm, *v))
+                        .unwrap_or(ROUND_HALF_UP);
                     if let Some(Obj::Host { state, .. }) = vm.heap.get_mut(h) {
-                        *state = HostState::Slot(p);
+                        *state = HostState::List(vec![V::I32(precision), V::I32(rounding)]);
                     }
                 }
                 Some(None)
             }
-            "getPrecision" => Some(Some(match args.first().copied().unwrap_or(V::Ref(0)) {
-                V::Ref(h) => match vm.heap.get(h) {
-                    Some(Obj::Host {
-                        state: HostState::Slot(v),
-                        ..
-                    }) => *v,
-                    _ => V::I32(0),
-                },
-                _ => V::I32(0),
-            })),
+            "getPrecision" => Some(Some(V::I32(
+                mc_parts(vm, args.first().copied().unwrap_or(V::Ref(0)))
+                    .map(|(p, _)| p)
+                    .unwrap_or(0),
+            ))),
+            "getRoundingMode" => {
+                let mode = mc_parts(vm, args.first().copied().unwrap_or(V::Ref(0)))
+                    .map(|(_, r)| r)
+                    .unwrap_or(ROUND_HALF_UP);
+                Some(Some(rounding_obj(vm, mode)))
+            }
             "toString" => Some(Some(jdynstr(vm, "MathContext"))),
             _ => None,
         });
@@ -140,7 +240,7 @@ pub(crate) fn call(
         "<init>" => {
             if let V::Ref(h) = this {
                 let f = args.get(1).copied().map(|v| num(vm, v)).unwrap_or(0.0);
-                set_bd(vm, h, f);
+                set_bd(vm, h, apply_mc(vm, args, f));
             }
             Some(None)
         }
@@ -149,36 +249,57 @@ pub(crate) fn call(
             let scale = args.get(1).map(|v| i32v(*v)).unwrap_or(0);
             Some(Some(new_bd(vm, unscaled / 10f64.powi(scale))))
         }
-        "add" => Some(Some(new_bd(vm, tf + num(vm, args[1])))),
-        "subtract" => Some(Some(new_bd(vm, tf - num(vm, args[1])))),
-        "multiply" => Some(Some(new_bd(vm, tf * num(vm, args[1])))),
+        "add" => Some(Some(new_bd(vm, apply_mc(vm, args, tf + num(vm, args[1]))))),
+        "subtract" => Some(Some(new_bd(vm, apply_mc(vm, args, tf - num(vm, args[1]))))),
+        "multiply" => Some(Some(new_bd(vm, apply_mc(vm, args, tf * num(vm, args[1]))))),
         "divide" => {
             let d = num(vm, args[1]);
             if d == 0.0 {
                 return Err(vm.throw_builtin("Ljava/lang/ArithmeticException;", "Division by zero"));
             }
-            Some(Some(new_bd(vm, tf / d)))
+            let raw = tf / d;
+            let rounded = if args.len() >= 4 {
+                round_scale_mode(raw, i32v(args[2]), rounding_mode(vm, args[3]))
+            } else {
+                apply_mc(vm, args, raw)
+            };
+            Some(Some(new_bd(vm, rounded)))
         }
         "remainder" => {
             let d = num(vm, args[1]);
             if d == 0.0 {
                 return Err(vm.throw_builtin("Ljava/lang/ArithmeticException;", "Division by zero"));
             }
-            Some(Some(new_bd(vm, tf % d)))
+            Some(Some(new_bd(vm, apply_mc(vm, args, tf % d))))
         }
-        "divideToIntegralValue" => Some(Some(new_bd(vm, (tf / num(vm, args[1])).trunc()))),
+        "divideToIntegralValue" => {
+            let d = num(vm, args[1]);
+            if d == 0.0 {
+                return Err(vm.throw_builtin("Ljava/lang/ArithmeticException;", "Division by zero"));
+            }
+            Some(Some(new_bd(vm, apply_mc(vm, args, (tf / d).trunc()))))
+        }
         "pow" => Some(Some(new_bd(
             vm,
-            tf.powi(i32v(args.get(1).copied().unwrap_or(V::I32(0)))),
+            apply_mc(
+                vm,
+                args,
+                tf.powi(i32v(args.get(1).copied().unwrap_or(V::I32(0)))),
+            ),
         ))),
-        "sqrt" => Some(Some(new_bd(vm, tf.sqrt()))),
+        "sqrt" => Some(Some(new_bd(vm, apply_mc(vm, args, tf.sqrt())))),
         "negate" => Some(Some(new_bd(vm, -tf))),
         "abs" => Some(Some(new_bd(vm, tf.abs()))),
-        "plus" => Some(Some(new_bd(vm, tf))),
-        "round" | "stripTrailingZeros" => Some(Some(new_bd(vm, tf))),
+        "plus" => Some(Some(new_bd(vm, apply_mc(vm, args, tf)))),
+        "round" => Some(Some(new_bd(vm, apply_mc(vm, args, tf)))),
+        "stripTrailingZeros" => Some(Some(new_bd(vm, tf))),
         "setScale" => {
             let scale = i32v(args.get(1).copied().unwrap_or(V::I32(0)));
-            Some(Some(new_bd(vm, round_scale(tf, scale))))
+            let mode = args
+                .get(2)
+                .map(|v| rounding_mode(vm, *v))
+                .unwrap_or(ROUND_HALF_UP);
+            Some(Some(new_bd(vm, round_scale_mode(tf, scale, mode))))
         }
         "scale" => {
             let s = fmt_bd(tf);
