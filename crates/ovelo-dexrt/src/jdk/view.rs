@@ -4870,8 +4870,18 @@ fn measure_child(
             attr_find(vm, parent, "paddingBottom").unwrap_or(V::I32(0)),
         )
         .unwrap_or(0);
-    let ws = child_measure_spec(pw, pad_w + ml + mr + w_used, lp_w);
-    let hs = child_measure_spec(ph, pad_h + mt + mb + h_used, lp_h);
+    let mut ws = child_measure_spec(pw, pad_w + ml + mr + w_used, lp_w);
+    let mut hs = child_measure_spec(ph, pad_h + mt + mb + h_used, lp_h);
+    // ScrollView measures its content with an unbounded scroll axis:
+    // the child must be allowed to become taller than the viewport and
+    // scroll, rather than compressing wrap_content descendants into the
+    // space left over inside the viewport.
+    let parent_desc = class_of(vm, V::Ref(parent));
+    if parent_desc.contains("HorizontalScrollView") {
+        ws = 0;
+    } else if parent_desc.contains("ScrollView") {
+        hs = 0;
+    }
     if crate::dbg_flag("OVELO_VIEWDBG") {
         eprintln!(
             "[viewdbg] measureChild h{child} lp={lp_w}x{lp_h} used={w_used},{h_used} in={pw:#x}/{ph:#x} -> {ws:#x}/{hs:#x}"
