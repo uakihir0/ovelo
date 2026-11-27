@@ -309,21 +309,22 @@ impl TextView {
     }
 
     fn measure_text(&self, max_w: Option<i32>) -> Size {
+        let box_w = if self.checked.is_some() {
+            28 + if self.text.is_empty() { 0 } else { 8 }
+        } else {
+            0
+        };
+        let text_max_w = max_w.map(|w| (w - box_w).max(0));
         let t = ovelo_ui::layout(
             &self.text,
             TextStyle {
                 size_px: self.text_size,
             },
             &self.fonts,
-            max_w,
+            text_max_w,
             false,
         );
         let (pl, pt, pr, pb) = self.view.padding;
-        let box_w = if self.checked.is_some() {
-            28 + if self.text.is_empty() { 0 } else { 8 }
-        } else {
-            0
-        };
         Size {
             w: t.width + pl + pr + box_w,
             h: (t.height + pt + pb).max(if self.checked.is_some() { 28 } else { 0 }),
@@ -392,13 +393,18 @@ impl Drawable for TextView {
                 );
             }
         }
+        let compound_w = if self.checked.is_some() && !self.text.is_empty() {
+            36
+        } else {
+            0
+        };
         let t = ovelo_ui::layout(
             &self.text,
             TextStyle {
                 size_px: self.text_size,
             },
             &self.fonts,
-            Some((s.w - self.view.padding.0 - self.view.padding.2).max(0)),
+            Some((s.w - self.view.padding.0 - self.view.padding.2 - compound_w).max(0)),
             false,
         );
         let lh = t.ascent + t.descent;
@@ -416,11 +422,6 @@ impl Drawable for TextView {
             0x10 => self.view.top + pt + (s.h - pt - pb - text_h) / 2,
             0x50 => self.view.top + s.h - pb - text_h,
             _ => self.view.top + pt,
-        };
-        let compound_w = if self.checked.is_some() && !self.text.is_empty() {
-            36
-        } else {
-            0
         };
         let mut baseline = vy + t.ascent;
         for line in lines {
