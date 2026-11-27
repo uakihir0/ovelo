@@ -3072,10 +3072,16 @@ pub(crate) fn natural_cmp(vm: &mut Vm, a: V, b: V) -> i32 {
         (V::Ref(0), _) => -1,
         (_, V::Ref(0)) => 1,
         (V::Ref(x), V::Ref(y)) => {
+            let ca = class_of(vm, V::Ref(x));
+            let cb = class_of(vm, V::Ref(y));
+            if ca == cb && vm.assignable_desc(&ca, "Ljava/lang/Enum;") {
+                return (lang::enum_ordinal(vm, V::Ref(x)) - lang::enum_ordinal(vm, V::Ref(y)))
+                    .signum();
+            }
             let sa = s(vm, x);
             let sb = s(vm, y);
             match (sa, sb) {
-                (Some(pa), Some(pb)) => pa.cmp(&pb) as i32,
+                (Some(pa), Some(pb)) => pa.encode_utf16().cmp(pb.encode_utf16()) as i32,
                 _ => {
                     // Guest objects with a real `compareTo` (okio
                     // ByteString, HttpUrl, …) must order by it —
