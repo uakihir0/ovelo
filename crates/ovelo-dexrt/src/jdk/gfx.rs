@@ -319,7 +319,19 @@ fn raster_stroke_to_bitmap(
                     let px = xx as f32 + 0.5;
                     let py = yy as f32 + 0.5;
                     let inside = if hairline {
-                        stroke_seg_dist(px, py, da, db) <= radius
+                        if da.1 == db.1 {
+                            let row = da.1.floor() as i32;
+                            let x0 = da.0.min(db.0) - 0.5;
+                            let x1 = da.0.max(db.0) + 0.5;
+                            yy == row && px >= x0 && px <= x1
+                        } else if da.0 == db.0 {
+                            let col = da.0.floor() as i32;
+                            let y0 = da.1.min(db.1) - 0.5;
+                            let y1 = da.1.max(db.1) + 0.5;
+                            xx == col && py >= y0 && py <= y1
+                        } else {
+                            stroke_seg_dist(px, py, da, db) < radius
+                        }
                     } else {
                         let (sx, sy) = inv_mat_point(inverse_m, px, py);
                         stroke_seg_dist(sx, sy, sa, sb) <= radius
