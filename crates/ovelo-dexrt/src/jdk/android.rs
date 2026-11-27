@@ -13,6 +13,7 @@ const P_SCR_CURR_Y: u32 = u32::MAX - 305;
 const P_SCR_START_T: u32 = u32::MAX - 306;
 const P_SCR_DURATION: u32 = u32::MAX - 307;
 const P_SCR_STATE: u32 = u32::MAX - 308;
+const P_TASK_CANCELLED: u64 = 0xFFFD_FD00;
 
 pub(crate) fn call(
     vm: &mut Vm,
@@ -757,12 +758,33 @@ pub(crate) fn call(
                 .unwrap_or(V::Ref(0));
                 let _ = vm.call_virtual_rt(this, "onPreExecute", &[])?;
                 if let Some(result) = vm.call_virtual_rt(this, "doInBackground", &[params])? {
-                    let _ = vm.call_virtual_rt(this, "onPostExecute", &[result])?;
+                    let cancelled = pseudo_get(vm, this, P_TASK_CANCELLED)
+                        .map(i32v)
+                        .unwrap_or(0)
+                        != 0;
+                    if cancelled {
+                        let _ = vm.call_virtual_rt(this, "onCancelled", &[result])?;
+                    } else {
+                        let _ = vm.call_virtual_rt(this, "onPostExecute", &[result])?;
+                    }
                 }
                 Some(Some(args[0]))
             }
-            "cancel" => Some(Some(V::I32(1))),
-            "isCancelled" => Some(Some(V::I32(0))),
+            "cancel" => {
+                if let Some(V::Ref(this)) = args.first().copied() {
+                    pseudo_set(vm, this, P_TASK_CANCELLED, V::I32(1));
+                }
+                Some(Some(V::I32(1)))
+            }
+            "isCancelled" => {
+                let cancelled = match args.first().copied() {
+                    Some(V::Ref(this)) => pseudo_get(vm, this, P_TASK_CANCELLED)
+                        .map(i32v)
+                        .unwrap_or(0),
+                    _ => 0,
+                };
+                Some(Some(V::I32((cancelled != 0) as i32)))
+            }
             "getStatus" => Some(Some(V::Ref(0))),
             "get" => Some(Some(V::Ref(0))),
             _ => None,
