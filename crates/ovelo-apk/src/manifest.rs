@@ -558,7 +558,7 @@ pub fn parse_manifest(b: &[u8]) -> Result<ManifestInfo> {
             // Pop finished elements; when an intent-filter finishes, evaluate.
             let popped = stack.pop().unwrap();
             if popped == "intent-filter" && in_filter {
-                if filter_main && filter_launcher {
+                if filter_main && filter_launcher && !filter_owner_is_receiver {
                     if let Some(act) = &filter_owner {
                         if info.launcher_activity.is_none() {
                             info.launcher_activity = Some(qualify(&info.package, act));
@@ -792,7 +792,7 @@ pub fn parse_manifest(b: &[u8]) -> Result<ManifestInfo> {
     // Close remaining open elements.
     while let Some(popped) = stack.pop() {
         if popped == "intent-filter" && in_filter {
-            if filter_main && filter_launcher {
+            if filter_main && filter_launcher && !filter_owner_is_receiver {
                 if let Some(act) = &filter_owner {
                     if info.launcher_activity.is_none() {
                         info.launcher_activity = Some(qualify(&info.package, act));
