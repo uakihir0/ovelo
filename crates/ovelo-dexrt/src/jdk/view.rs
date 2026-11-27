@@ -4873,22 +4873,9 @@ fn measure_child(
     }
     let (lp_w, lp_h) = (lp_w.unwrap_or(-2), lp_h.unwrap_or(-2));
     // Parent padding halves the space handed to children.
-    let pad_w = lp_px(
-        vm,
-        attr_find(vm, parent, "paddingLeft").unwrap_or(V::I32(0)),
-    )
-    .unwrap_or(0)
-        + lp_px(
-            vm,
-            attr_find(vm, parent, "paddingRight").unwrap_or(V::I32(0)),
-        )
-        .unwrap_or(0);
-    let pad_h = lp_px(vm, attr_find(vm, parent, "paddingTop").unwrap_or(V::I32(0))).unwrap_or(0)
-        + lp_px(
-            vm,
-            attr_find(vm, parent, "paddingBottom").unwrap_or(V::I32(0)),
-        )
-        .unwrap_or(0);
+    let (pl, pt, pr, pb) = view_padding(vm, parent);
+    let pad_w = pl + pr;
+    let pad_h = pt + pb;
     let mut ws = child_measure_spec(pw, pad_w + ml + mr + w_used, lp_w);
     let mut hs = child_measure_spec(ph, pad_h + mt + mb + h_used, lp_h);
     // ScrollView measures its content with an unbounded scroll axis:
