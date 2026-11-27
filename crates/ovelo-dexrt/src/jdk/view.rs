@@ -822,12 +822,24 @@ pub(crate) fn frame_set(vm: &mut Vm, h: u32, l: i32, t: i32, r: i32, b: i32) -> 
 fn len_v(vm: &Vm, v: V) -> i32 {
     match v {
         V::I32(i) if i <= 0 => i.max(-2),
-        V::I32(id) => vm
-            .apk_res
-            .as_ref()
-            .and_then(|r| r.dimen(id as u32))
-            .map(|d| d as i32)
-            .unwrap_or(-2),
+        V::I32(id) => {
+            let id = id as u32;
+            let Some(res) = vm.apk_res.as_ref() else {
+                return -2;
+            };
+            if res.type_name(id) == Some("attr") {
+                if let Some(ev) = theme_attr_entry(vm, id) {
+                    if (0x05..=0x06).contains(&ev.data_type) {
+                        return crate::res::typed_px(&ev) as i32;
+                    }
+                    if ev.data_type == 0x01 {
+                        return res.dimen(ev.data).map(|d| d as i32).unwrap_or(-2);
+                    }
+                }
+                return -2;
+            }
+            res.dimen(id).map(|d| d as i32).unwrap_or(-2)
+        }
         V::F32(f) => f as i32,
         _ => -2,
     }
@@ -4316,7 +4328,7 @@ pub(crate) fn ta_lookup(vm: &mut Vm, h: u32, index: usize) -> Option<V> {
 /// theme (parents walked by `style_item`), chasing `?attr/`
 /// indirections, and return the raw entry so the caller keeps the
 /// exact TypedValue type (`TYPE_INT_BOOLEAN` etc.).
-pub(crate) fn theme_attr_entry(vm: &mut Vm, attr_id: u32) -> Option<ovelo_apk::arsc::EntryValue> {
+pub(crate) fn theme_attr_entry(vm: &Vm, attr_id: u32) -> Option<ovelo_apk::arsc::EntryValue> {
     let res = vm.apk_res.as_ref()?;
     let mut ev = res.style_item(vm.theme_id, attr_id)?.clone();
     for _ in 0..8 {
