@@ -5751,7 +5751,13 @@ pub(crate) fn dispatch_touch(
             })
             .collect();
         let mut consumed = false;
+        let inside_overlay = popups
+            .iter()
+            .any(|(_, proot)| view_or_descendant(vm, *proot, target));
         for (popup, proot) in popups {
+            if inside_overlay {
+                break;
+            }
             if !view_or_descendant(vm, proot, target) {
                 let cancelable = pseudo_get(vm, popup, P_DIALOG_CANCELABLE)
                     .map(i32v)
