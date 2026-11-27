@@ -23,6 +23,8 @@ pub(crate) fn call(
         zip_file_call(vm, class, name, args)
     } else if class == "Ljava/util/jar/JarEntry;" || class == "Ljava/util/zip/ZipEntry;" {
         zip_entry_call(vm, name, args)
+    } else if class == "Landroid/util/AtomicFile;" {
+        atomic_file_call(vm, name, args)?
     } else if class == "Ljava/security/CodeSigner;"
         || class == "Ljava/security/cert/CertPath;"
         || class == "Ljava/security/cert/Certificate;"
@@ -88,6 +90,10 @@ pub(crate) fn call(
             }
         }
         Some(None)
+    } else if class == "Ljava/io/ObjectOutputStream;" {
+        object_output_call(vm, name, args)?
+    } else if class == "Ljava/io/ObjectInputStream;" {
+        object_input_call(vm, name, args)?
     } else if class == "Ljava/io/ByteArrayInputStream;" && name == "<init>" {
         // ByteArrayInputStream(byte[]) / (byte[], off, len): store the
         // payload so reads serve the real bytes.
@@ -505,6 +511,180 @@ fn writer_text(vm: &mut Vm, v: V, lo_v: Option<V>, hi_v: Option<V>, len_mode: bo
             }
         }
     }
+}
+
+const OVELO_SER_MAGIC: &[u8; 8] = b"OVLSER1\0";
+
+fn object_output_call(vm: &mut Vm, name: &str, args: &[V]) -> Rt<Option<Option<V>>> {
+    let this = match args.first().copied() {
+        Some(V::Ref(h)) => h,
+        _ => 0,
+    };
+    Ok(Some(match name {
+        "<init>" => {
+            pseudo_set(vm, this, P_DATA, args.get(1).copied().unwrap_or(V::Ref(0)));
+            None
+        }
+        "writeObject" => {
+            let obj = args.get(1).copied().unwrap_or(V::Ref(0));
+            let h = match obj {
+                V::Ref(h) => h,
+                _ => 0,
+            };
+            let mut bytes = OVELO_SER_MAGIC.to_vec();
+            bytes.extend_from_slice(&h.to_le_bytes());
+            let arr_v = byte_arr(vm, &bytes);
+            if let Some(sink) = pseudo_get(vm, this, P_DATA) {
+                let write_args = [sink, arr_v, V::I32(0), V::I32(bytes.len() as i32)];
+                let _ = stream_call(vm, "write", &write_args)?;
+            }
+            None
+        }
+        "flush" | "close" => {
+            if let Some(sink) = pseudo_get(vm, this, P_DATA) {
+                let close_args = [sink];
+                let _ = stream_call(vm, name, &close_args)?;
+            }
+            None
+        }
+        _ => return Ok(None),
+    }))
+}
+
+fn object_input_call(vm: &mut Vm, name: &str, args: &[V]) -> Rt<Option<Option<V>>> {
+    let this = match args.first().copied() {
+        Some(V::Ref(h)) => h,
+        _ => 0,
+    };
+    Ok(Some(match name {
+        "<init>" => {
+            pseudo_set(vm, this, P_DATA, args.get(1).copied().unwrap_or(V::Ref(0)));
+            None
+        }
+        "readObject" => {
+            let source = pseudo_get(vm, this, P_DATA).unwrap_or(V::Ref(0));
+            let bytes = match source {
+                V::Ref(sh) => match vm.heap.get(sh) {
+                    Some(Obj::Host {
+                        state: HostState::Bytes(b, p),
+                        ..
+                    }) => b[*p..].to_vec(),
+                    _ => Vec::new(),
+                },
+                _ => Vec::new(),
+            };
+            if bytes.len() >= 12 && bytes[..8] == OVELO_SER_MAGIC[..] {
+                let h = u32::from_le_bytes([bytes[8], bytes[9], bytes[10], bytes[11]]);
+                Some(shallow_clone_object(vm, h))
+            } else {
+                Some(V::Ref(0))
+            }
+        }
+        "close" => None,
+        _ => return Ok(None),
+    }))
+}
+
+/// Serialization-roundtrip object copy used by ObjectInputStream above.
+/// Copying the instance field map gives the deep-clone callers the
+/// object identity and assignability they need while immutable leaves
+/// (strings, UUID placeholders) can safely stay shared.
+fn shallow_clone_object(vm: &mut Vm, h: u32) -> V {
+    let cloned = match vm.heap.get(h) {
+        Some(Obj::Instance { class_idx, fields }) => Some((*class_idx, fields.clone())),
+        _ => None,
+    };
+    if let Some((class_idx, fields)) = cloned {
+        return V::Ref(vm.heap.alloc(Obj::Instance { class_idx, fields }));
+    }
+    V::Ref(h)
+}
+
+/// android.util.AtomicFile. Aegis uses this for vault persistence; the
+/// compatibility implementation writes the base file directly (no backup
+/// rename dance), which preserves the API contract apps rely on.
+fn atomic_file_call(vm: &mut Vm, name: &str, args: &[V]) -> Rt<Option<Option<V>>> {
+    let this = match args.first().copied() {
+        Some(V::Ref(h)) => h,
+        _ => 0,
+    };
+    let path_of = |vm: &Vm| -> String {
+        match vm.heap.get(this) {
+            Some(Obj::Host {
+                state: HostState::Path(p),
+                ..
+            }) => p.clone(),
+            _ => pseudo_get(vm, this, P_DATA)
+                .and_then(|v| stream_arg_path(vm, v))
+                .unwrap_or_default(),
+        }
+    };
+    Ok(Some(match name {
+        "<init>" => {
+            let file = args.get(1).copied().unwrap_or(V::Ref(0));
+            if let Some(path) = stream_arg_path(vm, file) {
+                replace_host_state(
+                    vm,
+                    args[0],
+                    "Landroid/util/AtomicFile;",
+                    HostState::Path(path),
+                );
+                pseudo_set(vm, this, P_DATA, file);
+            }
+            None
+        }
+        "getBaseFile" => Some(pseudo_get(vm, this, P_DATA).unwrap_or(V::Ref(0))),
+        "startWrite" => {
+            let guest = path_of(vm);
+            let path = fspath(vm, &guest);
+            if let Some(parent) = path.parent() {
+                let _ = std::fs::create_dir_all(parent);
+            }
+            let file = std::fs::OpenOptions::new()
+                .write(true)
+                .create(true)
+                .truncate(true)
+                .open(path)
+                .ok();
+            let Some(file) = file else {
+                return Err(
+                    vm.throw_builtin("Ljava/io/IOException;", "AtomicFile startWrite failed")
+                );
+            };
+            Some(host(
+                vm,
+                "Ljava/io/FileOutputStream;",
+                HostState::File(file),
+            ))
+        }
+        "finishWrite" => {
+            if let Some(V::Ref(h)) = args.get(1).copied() {
+                let close_args = [V::Ref(h)];
+                let _ = stream_call(vm, "close", &close_args)?;
+            }
+            None
+        }
+        "failWrite" => {
+            if let Some(V::Ref(h)) = args.get(1).copied() {
+                let close_args = [V::Ref(h)];
+                let _ = stream_call(vm, "close", &close_args)?;
+            }
+            let guest = path_of(vm);
+            let _ = std::fs::remove_file(fspath(vm, &guest));
+            None
+        }
+        "readFully" => {
+            let guest = path_of(vm);
+            let bytes = std::fs::read(fspath(vm, &guest)).unwrap_or_default();
+            Some(byte_arr(vm, &bytes))
+        }
+        "delete" => {
+            let guest = path_of(vm);
+            let _ = std::fs::remove_file(fspath(vm, &guest));
+            None
+        }
+        _ => return Ok(None),
+    }))
 }
 
 fn stream_call(vm: &mut Vm, name: &str, args: &[V]) -> Rt<Option<Option<V>>> {
