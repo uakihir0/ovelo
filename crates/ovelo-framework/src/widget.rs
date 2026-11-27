@@ -161,8 +161,9 @@ impl Drawable for ViewGroup {
     fn dispatch_touch(&mut self, down: bool, x: i32, y: i32) -> bool {
         if down {
             // Topmost first: later-drawn children get the first shot.
+            let (cx, cy) = (x + self.scroll_x, y + self.scroll_y);
             for (i, ch) in self.children.iter_mut().enumerate().rev() {
-                if ch.dispatch_touch(true, x, y) {
+                if ch.dispatch_touch(true, cx, cy) {
                     self.pressed_child = Some(i);
                     return true;
                 }
@@ -213,10 +214,14 @@ impl Drawable for ViewGroup {
                 }
                 c.save();
                 c.clip_rect(Rect::new(self.view.left, self.view.top, s.w, s.h));
+                c.translate(-self.scroll_x, -self.scroll_y);
                 ch.draw(c);
                 c.restore();
             } else {
+                c.save();
+                c.translate(-self.scroll_x, -self.scroll_y);
                 ch.draw(c);
+                c.restore();
             }
         }
     }

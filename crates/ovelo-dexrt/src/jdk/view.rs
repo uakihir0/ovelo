@@ -164,6 +164,8 @@ const P_ORIENTATION: u32 = 0xFFFD_FFDD;
 /// CompoundButton checked state / RadioGroup's checked child id.
 const P_CHECKED: u32 = 0xFFFD_FFDC;
 const P_RADIO_CHECKED: u32 = 0xFFFD_FFDB;
+const P_SCROLL_X: u32 = 0xFFFD_FFD9;
+const P_SCROLL_Y: u32 = 0xFFFD_FFD8;
 /// TextView compound drawables in start/top/end/bottom order.
 const P_COMPOUND_DRAWABLES: u32 = 0xFFFD_FFDA;
 /// Live `setTextColor` ARGB — written by the guest bridge's
@@ -362,6 +364,9 @@ pub struct DexViewInfo {
     /// `android:maxLines` — caps wrapped line count; overflowing text
     /// truncates to the first `n` lines.
     pub max_lines: Option<i32>,
+    /// Horizontal/vertical scroll offsets (`scrollTo`/`setScrollX`).
+    pub scroll_x: i32,
+    pub scroll_y: i32,
 }
 
 /// The activity's content view handle (what `setContentView` attached).
@@ -784,6 +789,8 @@ pub(crate) fn dex_view_info(vm: &Vm, h: u32) -> Option<DexViewInfo> {
                 _ => true,
             },
         },
+        scroll_x: pint(vm, h, P_SCROLL_X),
+        scroll_y: pint(vm, h, P_SCROLL_Y),
         max_lines: match attr_find(vm, h, "maxLines").or_else(|| attr_find(vm, h, "lines")) {
             Some(V::I32(n)) if n > 0 => Some(n),
             Some(V::Ref(r)) => s(vm, r)
@@ -2724,8 +2731,38 @@ pub(crate) fn call(
         "getMeasuredWidthAndState" => Some(Some(V::I32(pint(vm, this, P_MEAS_W)))),
         "getMeasuredHeightAndState" => Some(Some(V::I32(pint(vm, this, P_MEAS_H)))),
         "getPaddingLeft" | "getPaddingTop" | "getPaddingRight" | "getPaddingBottom"
-        | "getPaddingStart" | "getPaddingEnd" | "getScrollX" | "getScrollY" => {
-            Some(Some(V::I32(0)))
+        | "getPaddingStart" | "getPaddingEnd" => Some(Some(V::I32(0))),
+        "getScrollX" => Some(Some(V::I32(pint(vm, this, P_SCROLL_X)))),
+        "getScrollY" => Some(Some(V::I32(pint(vm, this, P_SCROLL_Y)))),
+        "setScrollX" => {
+            pseudo_set(vm, this, P_SCROLL_X, V::I32(vint(args.get(1))));
+            Some(None)
+        }
+        "setScrollY" => {
+            pseudo_set(vm, this, P_SCROLL_Y, V::I32(vint(args.get(1))));
+            Some(None)
+        }
+        "scrollTo" => {
+            pseudo_set(vm, this, P_SCROLL_X, V::I32(vint(args.get(1))));
+            pseudo_set(vm, this, P_SCROLL_Y, V::I32(vint(args.get(2))));
+            Some(None)
+        }
+        "scrollBy" => {
+            let dx = vint(args.get(1));
+            let dy = vint(args.get(2));
+            pseudo_set(
+                vm,
+                this,
+                P_SCROLL_X,
+                V::I32(pint(vm, this, P_SCROLL_X) + dx),
+            );
+            pseudo_set(
+                vm,
+                this,
+                P_SCROLL_Y,
+                V::I32(pint(vm, this, P_SCROLL_Y) + dy),
+            );
+            Some(None)
         }
         "getMinimumWidth" => Some(Some(V::I32(min_dim(vm, this, P_MINW, "minWidth")))),
         "getMinimumHeight" => Some(Some(V::I32(min_dim(vm, this, P_MINH, "minHeight")))),
@@ -2825,10 +2862,6 @@ pub(crate) fn call(
         | "setX"
         | "setY"
         | "setRotation"
-        | "setScrollX"
-        | "setScrollY"
-        | "scrollTo"
-        | "scrollBy"
         | "setSelected"
         | "setActivated"
         | "setPressed"
