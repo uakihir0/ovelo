@@ -754,6 +754,9 @@ pub(crate) fn resolve_ref_color(rv: RCtx<'_>, id: u32) -> Option<u32> {
             return Some(c);
         }
     }
+    if let Some(c) = crate::res::framework_color(id) {
+        return Some(c);
+    }
     let mut cur = id;
     for _ in 0..8 {
         let ev = res.style_item(rv.theme, cur)?;

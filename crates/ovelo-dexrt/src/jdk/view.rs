@@ -374,6 +374,8 @@ pub struct DexViewInfo {
     pub scroll_y: i32,
     /// LinearLayout orientation: true for vertical, false for horizontal.
     pub linear_vertical: bool,
+    /// CompoundButton checked state, when this view is checkable.
+    pub compound_checked: Option<bool>,
 }
 
 /// The activity's content view handle (what `setContentView` attached).
@@ -764,6 +766,12 @@ pub(crate) fn dex_view_info(vm: &Vm, h: u32) -> Option<DexViewInfo> {
         _ => None,
     };
     let (pad_l, pad_t, pad_r, pad_b) = view_padding(vm, h);
+    let is_compound = desc.contains("CompoundButton")
+        || desc.contains("CheckBox")
+        || desc.contains("Checkbox")
+        || desc.contains("RadioButton")
+        || desc.contains("Switch")
+        || vm.extends_named(&desc, "CompoundButton");
     Some(DexViewInfo {
         desc,
         is_group,
@@ -813,6 +821,11 @@ pub(crate) fn dex_view_info(vm: &Vm, h: u32) -> Option<DexViewInfo> {
                 .and_then(|t| t.parse::<i32>().ok())
                 .filter(|n| *n > 0),
             _ => None,
+        },
+        compound_checked: if is_compound {
+            Some(matches!(pseudo_get(vm, h, P_CHECKED), Some(V::I32(v)) if v != 0))
+        } else {
+            None
         },
     })
 }
@@ -910,14 +923,14 @@ fn tint_image(
     let (w, h, px) = image;
     let mut out = px.as_ref().clone();
     let (tr, tg, tb) = ((tint >> 16) & 0xff, (tint >> 8) & 0xff, tint & 0xff);
+    let ta = (tint >> 24) & 0xff;
     for p in out.as_chunks_mut::<4>().0 {
-        let sa = p[3] as u32;
-        p[0] = tr as u8;
-        p[1] = tg as u8;
-        p[2] = tb as u8;
-        // SRC_ATOP tinting preserves the source alpha; a transparent
-        // tint changes color channels but must not erase the image.
-        p[3] = sa as u8;
+        // SRC_ATOP keeps the destination alpha, but the tint color only
+        // covers the source in proportion to the tint alpha. A fully
+        // transparent tint therefore leaves the original color intact.
+        p[0] = ((tr * ta + p[0] as u32 * (255 - ta)) / 255) as u8;
+        p[1] = ((tg * ta + p[1] as u32 * (255 - ta)) / 255) as u8;
+        p[2] = ((tb * ta + p[2] as u32 * (255 - ta)) / 255) as u8;
     }
     (w, h, std::rc::Rc::new(out))
 }
@@ -4756,7 +4769,7 @@ fn group_measure_fallback(vm: &mut Vm, this: u32, pw: i32, ph: i32) {
         // through resolveSize below), never the parent's spec size.
         let (iw, ih) = pseudo_get(vm, this, P_IMAGE)
             .and_then(|v| image_pixels(vm, v))
-            .map(|(w, h, _)| (w as i32 + pad_w, h as i32 + pad_h))
+            .map(|(w, h, _)| (w as i32, h as i32))
             .unwrap_or((0, 0));
         let (cw, chh) = if text.is_empty() {
             (iw, ih)
