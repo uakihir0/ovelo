@@ -6592,14 +6592,6 @@ fn build_tree(vm: &mut Vm, elems: &[Element], ctx: V) -> V {
                     eprintln!("[viewdbg] attach h{h} -> parent h{p}");
                 }
                 attach(vm, p, V::Ref(h));
-                let child_cls = class_of(vm, V::Ref(h));
-                let cls = class_of(vm, V::Ref(p));
-                let radio_in_group = is_radio_desc(vm, &child_cls)
-                    && (cls == "Landroid/widget/RadioGroup;"
-                        || vm.assignable_desc(&cls, "Landroid/widget/RadioGroup;"));
-                if radio_in_group && pint(vm, h, P_CHECKED) != 0 {
-                    set_compound_checked(vm, h, 1);
-                }
                 // A parent with XML children is a container.
                 pseudo_set(vm, p, P_IS_GROUP, V::I32(1));
             }
@@ -7452,6 +7444,17 @@ pub(crate) fn attach_at(
     }
     if let V::Ref(ch) = child {
         pseudo_set(vm, ch, P_PARENT, V::Ref(parent));
+        let parent_cls = class_of(vm, V::Ref(parent));
+        let child_cls = class_of(vm, V::Ref(ch));
+        if ch != 0
+            && pint(vm, ch, P_CHECKED) != 0
+            && is_radio_desc(vm, &child_cls)
+            && (parent_cls == "Landroid/widget/RadioGroup;"
+                || vm.assignable_desc(&parent_cls, "Landroid/widget/RadioGroup;"))
+        {
+            let id = view_id(vm, ch);
+            radio_group_set_checked(vm, parent, id);
+        }
         if crate::dbg_flag("OVELO_VIEWDBG") {
             eprintln!(
                 "[viewdbg] attach_at h{ch} <- h{parent} parent_att={} cls={}",
@@ -7770,6 +7773,12 @@ fn notify_checked_listener(vm: &mut Vm, this: u32, arg: V) {
     }
 }
 
+fn radio_group_checked_id(vm: &Vm, group: u32) -> i32 {
+    pseudo_get(vm, group, P_RADIO_CHECKED)
+        .map(i32v)
+        .unwrap_or(-1)
+}
+
 fn radio_child(vm: &Vm, group: u32, id: i32) -> u32 {
     for c in children(vm, group) {
         if let V::Ref(ch) = c {
@@ -7803,7 +7812,7 @@ fn notify_group_checked_listener(vm: &mut Vm, group: u32, id: i32) {
 }
 
 fn radio_group_set_checked(vm: &mut Vm, group: u32, id: i32) {
-    let old = pint(vm, group, P_RADIO_CHECKED);
+    let old = radio_group_checked_id(vm, group);
     if id != -1 && id == old {
         return;
     }
@@ -7842,7 +7851,7 @@ fn set_compound_checked(vm: &mut Vm, this: u32, checked: i32) {
         let id = view_id(vm, this);
         if checked != 0 {
             radio_group_set_checked(vm, parent, id);
-        } else if pint(vm, parent, P_RADIO_CHECKED) == id {
+        } else if radio_group_checked_id(vm, parent) == id {
             radio_group_set_checked(vm, parent, -1);
         }
     }
