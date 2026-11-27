@@ -6766,7 +6766,7 @@ fn menu_inflate_level(vm: &mut Vm, doc: &[Element], i: &mut usize, depth: usize,
         if el.depth < depth {
             break;
         }
-        if el.depth > depth || el.name != "item" {
+        if el.name != "item" {
             *i += 1;
             continue;
         }
