@@ -228,6 +228,24 @@ pub(crate) fn drawable_for_res(vm: &mut Vm, res_id: u32) -> V {
                     HostState::Bitmap { w, h, rgba },
                 );
                 pseudo_set(vm, dh, P_BITMAP_SLOT, V::Ref(bmp));
+                // VectorDrawableCompat.newDrawable() shares the guest
+                // ConstantState object rather than copying our host pseudo
+                // field. Seed that nested state too or menu duplication
+                // produces a blank icon.
+                let nested: Vec<u32> = match vm.heap.get(dh) {
+                    Some(crate::value::Obj::Instance { fields, .. })
+                    | Some(crate::value::Obj::Host { fields, .. }) => fields
+                        .values()
+                        .filter_map(|v| match v {
+                            V::Ref(h) if *h != 0 && *h != dh => Some(*h),
+                            _ => None,
+                        })
+                        .collect(),
+                    _ => Vec::new(),
+                };
+                for hnd in nested {
+                    pseudo_set(vm, hnd, P_BITMAP_SLOT, V::Ref(bmp));
+                }
             }
             d
         }
