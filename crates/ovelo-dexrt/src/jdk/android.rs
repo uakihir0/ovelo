@@ -1831,13 +1831,9 @@ fn uri_call(vm: &mut Vm, name: &str, args: &[V]) -> Rt<Option<Option<V>>> {
 // Intent — map + pseudo fields for action/data/component
 
 fn clone_intent(vm: &mut Vm, h: u32) -> V {
-    let m: Vec<(V, V)> = match vm.heap.get(h) {
-        Some(Obj::Host {
-            state: HostState::Map(m),
-            ..
-        }) => m.clone(),
-        _ => vec![],
-    };
+    // Intent subclasses keep their guest-map extras in a backing store;
+    // map_pairs_of resolves either representation.
+    let m = map_pairs_of(vm, h);
     let nh = vm.alloc_host("Landroid/content/Intent;", HostState::Map(m));
     for k in [P_ACTION, P_DATA, P_FLAGS, P_COMPONENT] {
         if let Some(v) = pseudo_get(vm, h, k) {
