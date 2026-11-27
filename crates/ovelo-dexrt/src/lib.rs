@@ -1898,6 +1898,7 @@ impl Vm {
                 let mut inflate = false;
                 let mut mirrored = false;
                 let mut theme = false;
+                let mut animatable = false;
                 for m in cd.direct_methods.iter().chain(cd.virtual_methods.iter()) {
                     let Ok(mid) = d.method(m.method_idx) else {
                         continue;
@@ -1906,10 +1907,17 @@ impl Vm {
                         Ok(n) if n == "inflate" => inflate = true,
                         Ok(n) if n == "isAutoMirrored" => mirrored = true,
                         Ok(n) if n == "canApplyTheme" => theme = true,
+                        Ok(n) if n == "isRunning" || n == "start" || n == "stop" => {
+                            animatable = true
+                        }
                         _ => {}
                     }
                 }
-                if inflate && mirrored && theme {
+                // AnimatedVectorDrawableCompat shares the same inflate /
+                // automirrored / theme surface but fails AppCompat's exact
+                // VectorDrawableCompat self-test (and often has no zero-arg
+                // ctor for us to instantiate).
+                if inflate && mirrored && theme && !animatable {
                     return Some(desc.to_string());
                 }
             }
