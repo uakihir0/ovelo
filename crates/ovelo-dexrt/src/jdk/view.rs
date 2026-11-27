@@ -980,12 +980,7 @@ pub(crate) fn call(
                 _ => V::Ref(0),
             };
             let row = args.get(1).copied().unwrap_or(V::Ref(0));
-            if let Some(V::Ref(listener)) = field_get(
-                vm,
-                popup,
-                "Landroidx/appcompat/widget/ListPopupWindow;",
-                "w",
-            ) {
+            if let V::Ref(listener) = lpw_field(vm, popup, "listener") {
                 if listener != 0 {
                     let _ = vm.call_virtual(
                         listener,
@@ -7030,14 +7025,31 @@ fn layout_popup_rows_compact(vm: &mut Vm, root: u32, width: i32, height: i32) {
     }
 }
 
-fn lpw_field(vm: &Vm, popup: u32, name: &str) -> V {
-    field_get(
-        vm,
-        popup,
-        "Landroidx/appcompat/widget/ListPopupWindow;",
-        name,
-    )
-    .unwrap_or(V::Ref(0))
+fn lpw_field(vm: &Vm, popup: u32, logical: &str) -> V {
+    // Release builds minify the bundled appcompat widget (`i`, `v`,
+    // `w`, …) while debug/unminified apps keep the source names. Accept
+    // both spellings of the same ListPopupWindow state.
+    let names: &[&str] = match logical {
+        "adapter" => &["i", "mAdapter"],
+        "width" => &["l", "mDropDownWidth"],
+        "context" => &["h", "mContext"],
+        "anchor" => &["v", "mDropDownAnchorView"],
+        "xoff" => &["m", "mDropDownHorizontalOffset"],
+        "yoff" => &["n", "mDropDownVerticalOffset"],
+        "listener" => &["w", "mItemClickListener"],
+        _ => &[logical],
+    };
+    for name in names {
+        if let Some(v) = field_get(
+            vm,
+            popup,
+            "Landroidx/appcompat/widget/ListPopupWindow;",
+            name,
+        ) {
+            return v;
+        }
+    }
+    V::Ref(0)
 }
 
 /// Materialize an appcompat ListPopupWindow as a simple vertical popup
@@ -7050,7 +7062,7 @@ fn list_popup_show(vm: &mut Vm, popup: u32) {
         eprintln!("[touchdbg] listpopup enter h{popup}");
     }
     list_popup_dismiss(vm, popup);
-    let adapter = match lpw_field(vm, popup, "i") {
+    let adapter = match lpw_field(vm, popup, "adapter") {
         V::Ref(h) if h != 0 => h,
         _ => return,
     };
@@ -7090,7 +7102,7 @@ fn list_popup_show(vm: &mut Vm, popup: u32) {
     if count == 0 {
         return;
     }
-    let width = match lpw_field(vm, popup, "l") {
+    let width = match lpw_field(vm, popup, "width") {
         V::I32(w) if w > 0 => w,
         _ => 384,
     };
@@ -7100,7 +7112,7 @@ fn list_popup_show(vm: &mut Vm, popup: u32) {
     pseudo_set(vm, root, P_ORIENTATION, V::I32(1));
     pseudo_set(vm, root, P_BGCOLOR, V::I32(0xff2b2b2bu32 as i32));
     pseudo_set(vm, root, P_POPUP_ROOT, V::I32(1));
-    if let V::Ref(ctx) = lpw_field(vm, popup, "h") {
+    if let V::Ref(ctx) = lpw_field(vm, popup, "context") {
         pseudo_set(vm, root, P_CONTEXT, V::Ref(ctx));
     }
 
@@ -7140,7 +7152,7 @@ fn list_popup_show(vm: &mut Vm, popup: u32) {
     let _ = vm.call_virtual(root, "measure", &[V::I32(spec_w), V::I32(0)]);
     let measured_height = (pint(vm, root, P_MEAS_H) & 0x00ff_ffff).max(rows * 48);
 
-    let anchor = match lpw_field(vm, popup, "v") {
+    let anchor = match lpw_field(vm, popup, "anchor") {
         V::Ref(h) if h != 0 => h,
         _ => 0,
     };
@@ -7155,11 +7167,11 @@ fn list_popup_show(vm: &mut Vm, popup: u32) {
     } else {
         wh
     };
-    let xoff = match lpw_field(vm, popup, "m") {
+    let xoff = match lpw_field(vm, popup, "xoff") {
         V::I32(v) => v,
         _ => 0,
     };
-    let yoff = match lpw_field(vm, popup, "n") {
+    let yoff = match lpw_field(vm, popup, "yoff") {
         V::I32(v) => v,
         _ => 0,
     };
