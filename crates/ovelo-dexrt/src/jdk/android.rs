@@ -3355,11 +3355,15 @@ fn context_call(
         }
         "setWallpaper" | "clearWallpaper" => Some(None),
         // ----- Activity instance methods
-        "getIntent" => Some(Some(host(
-            vm,
-            "Landroid/content/Intent;",
-            HostState::Map(vec![]),
-        ))),
+        "getIntent" => {
+            let i = match args[0] {
+                V::Ref(h) => view::activity_intent(vm, h),
+                _ => None,
+            };
+            Some(Some(i.unwrap_or_else(|| {
+                host(vm, "Landroid/content/Intent;", HostState::Map(vec![]))
+            })))
+        }
         "requestPermissions" => {
             // (String[] perms, int requestCode): model "user grants
             // everything asked" — dangerous permissions join the
