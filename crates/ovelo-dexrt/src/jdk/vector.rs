@@ -69,6 +69,7 @@ pub(crate) fn drawable_bitmap(rv: RCtx<'_>, res_id: u32) -> Option<(u32, u32, Rc
     }
     let out = render_vector(rv, res_id)
         .or_else(|| render_adaptive(rv, res_id))
+        .or_else(|| render_layer_list(rv, res_id))
         .or_else(|| {
             let bytes = rv.res.file_path(res_id).and_then(|p| rv.res.read(p))?;
             let img = image::load_from_memory(&bytes).ok()?;
@@ -186,7 +187,7 @@ pub(crate) fn package_icon_drawable(vm: &mut Vm, pkg: &str) -> Option<V> {
 /// else a bare `Drawable` placeholder so callers keep flowing.
 pub(crate) fn drawable_for_res(vm: &mut Vm, res_id: u32) -> V {
     // All `&vm.apk_res` reads finish before any `&mut vm` host alloc.
-    let (bitmap, color, is_vector) = match rctx(vm) {
+    let (bitmap, color, is_vector, is_layer) = match rctx(vm) {
         Some(rv) => (
             drawable_bitmap(rv, res_id),
             // Not gated on type "color": a `drawable-night` bucket may
@@ -194,13 +195,20 @@ pub(crate) fn drawable_for_res(vm: &mut Vm, res_id: u32) -> V {
             // walks the winning value's reference chain and only yields
             // a color when the chain actually ends at one.
             resolve_ref_color(rv, res_id),
-            render_vector(rv, res_id).is_some(),
+            root_is(rv, res_id, "vector"),
+            root_is(rv, res_id, "layer-list"),
         ),
-        None => (None, None, false),
+        None => (None, None, false, false),
     };
     match bitmap {
         Some((w, h, rgba)) => {
-            let d = if is_vector {
+            let d = if is_layer {
+                host(
+                    vm,
+                    "Landroid/graphics/drawable/LayerDrawable;",
+                    HostState::Empty,
+                )
+            } else if is_vector {
                 [
                     "Landroidx/vectordrawable/graphics/drawable/VectorDrawableCompat;".to_string(),
                     "Landroid/support/graphics/drawable/VectorDrawableCompat;".to_string(),
@@ -253,6 +261,13 @@ pub(crate) fn drawable_for_res(vm: &mut Vm, res_id: u32) -> V {
             // A `res/color` id handed to getDrawable becomes a
             // ColorDrawable: carry the resolved ARGB so `draw` can
             // emit a fill for it.
+            if is_layer {
+                return host(
+                    vm,
+                    "Landroid/graphics/drawable/LayerDrawable;",
+                    HostState::Empty,
+                );
+            }
             if let Some(argb) = color {
                 let d = host(
                     vm,
@@ -282,12 +297,138 @@ const OUT_SCALE: f32 = 4.0;
 /// Supersample factor inside the output raster (AA).
 const SS: u32 = 4;
 
+fn xml_dimen(rv: RCtx<'_>, v: &Value) -> Option<f32> {
+    match v {
+        Value::Reference(id) => rv.res.dimen(*id),
+        Value::Float(f) => Some(*f),
+        Value::Int(i) => Some(*i as f32),
+        Value::Other { data_type, data } => {
+            Some(crate::res::typed_px(&ovelo_apk::arsc::EntryValue {
+                data_type: *data_type,
+                data: *data,
+                string: None,
+            }))
+        }
+        _ => None,
+    }
+}
+
+fn xml_dimen_attr(rv: RCtx<'_>, el: &Element, name: &str) -> Option<f32> {
+    xml_dimen(rv, el.android(name)?)
+}
+
+fn blend_px(dst: &mut [u8], x: usize, y: usize, w: usize, argb: u32) {
+    if x >= w {
+        return;
+    }
+    let idx = (y * w + x) * 4;
+    if idx + 3 >= dst.len() {
+        return;
+    }
+    let [sa, sr, sg, sb] = argb.to_be_bytes();
+    let a = sa as u32;
+    let inv = 255 - a;
+    for (k, sc) in [sr, sg, sb, sa].into_iter().enumerate() {
+        dst[idx + k] = ((sc as u32 * a + dst[idx + k] as u32 * inv) / 255) as u8;
+    }
+}
+
+/// Render a `<layer-list>` into a small composite bitmap. The runtime
+/// uses this both for visual fidelity and because guest code may cast
+/// these resources to `android.graphics.drawable.LayerDrawable`.
+fn render_layer_list(rv: RCtx<'_>, res_id: u32) -> Option<(u32, u32, Rc<Vec<u8>>)> {
+    if rv.depth >= 16 {
+        return None;
+    }
+    let els = rv.res.document(res_id)?;
+    if !els.iter().any(|e| e.depth == 0 && e.name == "layer-list") {
+        return None;
+    }
+    const SZ: usize = 96;
+    let mut canvas = vec![0u8; SZ * SZ * 4];
+    let mut any = false;
+    for (i, item) in els.iter().enumerate() {
+        if item.depth != 1 || item.name != "item" {
+            continue;
+        }
+        let end = els[i + 1..]
+            .iter()
+            .position(|e| e.depth <= 1)
+            .map(|p| i + 1 + p)
+            .unwrap_or(els.len());
+        let l = xml_dimen_attr(rv, item, "left")
+            .unwrap_or(0.0)
+            .round()
+            .max(0.0) as usize;
+        let t = xml_dimen_attr(rv, item, "top")
+            .unwrap_or(0.0)
+            .round()
+            .max(0.0) as usize;
+        let r = xml_dimen_attr(rv, item, "right")
+            .unwrap_or(0.0)
+            .round()
+            .max(0.0) as usize;
+        let b = xml_dimen_attr(rv, item, "bottom")
+            .unwrap_or(0.0)
+            .round()
+            .max(0.0) as usize;
+        if l >= SZ || t >= SZ || l + r >= SZ || t + b >= SZ {
+            continue;
+        }
+        let (x0, y0, tw, th) = (l, t, SZ - l - r, SZ - t - b);
+        if let Some(Value::Reference(child)) = item.android("drawable") {
+            if let Some((w, h, px)) = drawable_bitmap(
+                RCtx {
+                    depth: rv.depth + 1,
+                    ..rv
+                },
+                *child,
+            ) {
+                blit_scaled(&mut canvas, SZ, &px, w as usize, h as usize, x0, y0, tw, th);
+                any = true;
+            }
+            continue;
+        }
+        let Some(shape) = els[i + 1..end].iter().find(|e| e.name == "shape") else {
+            continue;
+        };
+        let oval = matches!(shape.android("shape"), Some(Value::Int(1)));
+        let solid = els[i + 1..end]
+            .iter()
+            .find(|e| e.name == "solid")
+            .and_then(|e| color_attr(rv, e, "color"));
+        let Some(argb) = solid else { continue };
+        for y in y0..y0 + th {
+            for x in x0..x0 + tw {
+                let inside = !oval || {
+                    let nx = (x - x0) as f32 + 0.5 - tw as f32 / 2.0;
+                    let ny = (y - y0) as f32 + 0.5 - th as f32 / 2.0;
+                    let rx = tw as f32 / 2.0;
+                    let ry = th as f32 / 2.0;
+                    rx > 0.0 && ry > 0.0 && (nx * nx) / (rx * rx) + (ny * ny) / (ry * ry) <= 1.0
+                };
+                if inside {
+                    blend_px(&mut canvas, x, y, SZ, argb);
+                }
+            }
+        }
+        any = true;
+    }
+    any.then_some((SZ as u32, SZ as u32, Rc::new(canvas)))
+}
+
+fn root_is(rv: RCtx<'_>, res_id: u32, name: &str) -> bool {
+    rv.res
+        .document(res_id)
+        .is_some_and(|els| els.iter().any(|e| e.depth == 0 && e.name == name))
+}
+
 /// Render `res_id` when its XML document is a `<vector>` drawable.
 /// Returns `(w, h, rgba8)` or `None` when it is not a vector.
 pub(crate) fn render_vector(rv: RCtx<'_>, res_id: u32) -> Option<(u32, u32, Rc<Vec<u8>>)> {
     let res = rv.res;
     let els = res.document(res_id)?;
-    let root = els.iter().find(|e| e.name == "vector")?;
+    let root = els.iter().find(|e| e.depth == 0 && e.name == "vector")?;
     let vw = f32_attr(root, "viewportWidth").unwrap_or(24.0);
     let vh = f32_attr(root, "viewportHeight").unwrap_or(24.0);
     if vw <= 0.0 || vh <= 0.0 || !vw.is_finite() || !vh.is_finite() {
