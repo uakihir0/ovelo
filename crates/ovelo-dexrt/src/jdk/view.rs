@@ -4089,6 +4089,13 @@ fn measure_child(
     }
 }
 
+fn view_is_gone(vm: &mut Vm, h: u32) -> bool {
+    if pint(vm, h, P_VIS) == 2 {
+        return true;
+    }
+    matches!(attr_find(vm, h, "visibility"), Some(V::I32(2)))
+}
+
 /// Generic `onMeasure` for framework skeleton containers: measure
 /// each child with margins, then fold the measured content size
 /// against the spec via `resolveSize`. The `measure` arm pre-seeds
@@ -4204,7 +4211,7 @@ fn group_measure_fallback(vm: &mut Vm, this: u32, pw: i32, ph: i32) {
     let (mut cw, mut chh) = (0i32, 0i32);
     for c in kids.iter().copied() {
         let V::Ref(ch) = c else { continue };
-        if ch == 0 {
+        if ch == 0 || view_is_gone(vm, ch) {
             continue;
         }
         // AOSP measureChildWithMargins: `heightUsed` is the running
@@ -4273,7 +4280,7 @@ fn group_measure_fallback(vm: &mut Vm, this: u32, pw: i32, ph: i32) {
             let mut shares: Vec<(u32, f32)> = Vec::new();
             for c in kids.iter().copied() {
                 let V::Ref(ch) = c else { continue };
-                if ch == 0 {
+                if ch == 0 || view_is_gone(vm, ch) {
                     continue;
                 }
                 let lp_obj = match pseudo_get(vm, ch, P_LP) {
@@ -4607,7 +4614,7 @@ fn group_layout_fallback(vm: &mut Vm, this: u32, _l: i32, _t: i32, r: i32, b: i3
     let mut cur_l = pad_l;
     for c in children(vm, this) {
         let V::Ref(ch) = c else { continue };
-        if ch == 0 || pseudo_get(vm, ch, P_POPUP_ROOT).is_some() {
+        if ch == 0 || view_is_gone(vm, ch) || pseudo_get(vm, ch, P_POPUP_ROOT).is_some() {
             continue;
         }
         let (ml, mt, mr, mb) = if let Some(V::Ref(lp)) = pseudo_get(vm, ch, P_LP) {
