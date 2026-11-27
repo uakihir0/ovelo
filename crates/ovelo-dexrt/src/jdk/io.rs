@@ -743,7 +743,15 @@ fn stream_call(vm: &mut Vm, name: &str, args: &[V]) -> Rt<Option<Option<V>>> {
     // catch blocks see it.
     if matches!(
         name,
-        "read" | "available" | "skip" | "mark" | "reset" | "markSupported" | "ready" | "close"
+        "read"
+            | "readLine"
+            | "available"
+            | "skip"
+            | "mark"
+            | "reset"
+            | "markSupported"
+            | "ready"
+            | "close"
     ) {
         let inner = [
             "Ljava/io/FilterInputStream;",
