@@ -6965,6 +6965,71 @@ pub(crate) fn set_content_view(vm: &mut Vm, activity: u32, content: V) {
 // host Menu (options menu, toolbar) or a dex `MenuBuilder`; item ops
 // themselves stay guest-side so the dex list remains authoritative.
 
+/// Lay out overflow-menu rows compactly when the popup cannot afford
+/// their natural heights. This is a host overlay approximation of the
+/// scrollable ListPopupWindow: keeping every row visible preserves
+/// reachability in the small desktop window, while the row content is
+/// still the app's real adapter view hierarchy.
+fn layout_popup_rows_compact(vm: &mut Vm, root: u32, width: i32, height: i32) {
+    let rows = children(vm, root);
+    if rows.is_empty() {
+        return;
+    }
+    let row_h = (height / rows.len() as i32).max(32);
+    for (pos, row) in rows.iter().copied().enumerate() {
+        let V::Ref(row_hnd) = row else { continue };
+        if row_hnd == 0 {
+            continue;
+        }
+        let y = pos as i32 * row_h;
+        let _ = vm.call_virtual(
+            row_hnd,
+            "layout",
+            &[V::I32(0), V::I32(y), V::I32(width), V::I32(y + row_h)],
+        );
+        let pad = lp_px(
+            vm,
+            attr_find(vm, row_hnd, "paddingLeft").unwrap_or(V::I32(0)),
+        )
+        .unwrap_or(12)
+        .min(width / 8);
+        let mut x = pad.max(6);
+        let kids = children(vm, row_hnd);
+        for child in kids.iter().copied() {
+            let V::Ref(ch) = child else { continue };
+            if ch == 0 {
+                continue;
+            }
+            let mw = pint(vm, ch, P_MEAS_W) & 0x00ff_ffff;
+            let mh = pint(vm, ch, P_MEAS_H) & 0x00ff_ffff;
+            let desc = class_of(vm, V::Ref(ch));
+            let is_image = desc.contains("ImageView") || pseudo_get(vm, ch, P_IMAGE).is_some();
+            let (cw, avail_w) = if is_image {
+                let side = (row_h - 8).max(20).min(mw.max(1));
+                (side, side)
+            } else {
+                (
+                    (width - x - pad.max(6)).max(24),
+                    (width - x - pad.max(6)).max(24),
+                )
+            };
+            let ch_h = if is_image {
+                cw
+            } else {
+                mh.max((row_h / 2).min(28)).min(row_h)
+            };
+            let cy = (row_h - ch_h).max(0) / 2;
+            let use_w = if is_image { avail_w } else { cw };
+            let _ = vm.call_virtual(
+                ch,
+                "layout",
+                &[V::I32(x), V::I32(cy), V::I32(x + use_w), V::I32(cy + ch_h)],
+            );
+            x += use_w + pad.max(6);
+        }
+    }
+}
+
 fn lpw_field(vm: &Vm, popup: u32, name: &str) -> V {
     field_get(
         vm,
@@ -7102,11 +7167,15 @@ fn list_popup_show(vm: &mut Vm, popup: u32) {
     let height = measured_height.min(max_h).min(wh);
     let x = (ar - width + xoff).clamp(0, (ww - width).max(0));
     let y = (at - height + yoff).clamp(0, (wh - height).max(0));
+    let compressed = measured_height > height;
     let _ = vm.call_virtual(
         root,
         "layout",
         &[V::I32(0), V::I32(0), V::I32(width), V::I32(height)],
     );
+    if compressed {
+        layout_popup_rows_compact(vm, root, width, height);
+    }
 
     let parent = activity_content(vm, vm.cur_activity).unwrap_or(0);
     if parent == 0 {
