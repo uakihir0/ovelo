@@ -1912,6 +1912,17 @@ fn mime_matches(pattern: &str, actual: &str) -> bool {
     pt.eq_ignore_ascii_case(at) && (ps == "*" || asub == "*" || ps.eq_ignore_ascii_case(asub))
 }
 
+fn uri_scheme(uri: &str) -> &str {
+    let Some(colon) = uri.find(':') else {
+        return "";
+    };
+    if uri[..colon].contains(['/', '?', '#']) {
+        ""
+    } else {
+        &uri[..colon]
+    }
+}
+
 /// Resolve an implicit activity Intent against the manifest filters the
 /// launcher installed on the VM. This intentionally implements the
 /// small Android data test most apps rely on: action + DEFAULT category
@@ -1927,11 +1938,7 @@ fn resolve_implicit_activity(vm: &mut Vm, ih: u32) -> Option<String> {
     let data = pseudo_get(vm, ih, P_DATA)
         .and_then(|v| sv(vm, v))
         .unwrap_or_default();
-    let scheme = data
-        .split([':', '/'])
-        .next()
-        .unwrap_or_default()
-        .to_string();
+    let scheme = uri_scheme(&data).to_string();
     if let Some(package) = pseudo_get(vm, ih, P_PACKAGE).and_then(|v| sv(vm, v)) {
         if !package.is_empty() && vm.guest_package.as_deref() != Some(package.as_str()) {
             return None;
