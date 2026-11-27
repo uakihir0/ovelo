@@ -3525,7 +3525,11 @@ fn context_call(
                     }
                     cn
                 };
-                let connected = vm.call_virtual(conn, "onServiceConnected", &[component, binder]);
+                let connected = if binder == V::Ref(0) {
+                    vm.call_virtual(conn, "onNullBinding", &[component])
+                } else {
+                    vm.call_virtual(conn, "onServiceConnected", &[component, binder])
+                };
                 if crate::dbg_flag("OVELO_BINDDBG") {
                     eprintln!("[binddbg] conn=h{conn} binder={binder:?} connected={connected:?}");
                 }
