@@ -842,7 +842,7 @@ fn list_call(vm: &mut Vm, name: &str, sig: &str, args: &[V]) -> Rt<Option<Option
             } else if dup {
                 Some(Some(V::I32(0)))
             } else {
-                if crate::dbg_flag("OVELO_ITERDBG") && matches!(args[1], V::Ref(0)) {
+                if crate::dbg_flag("OVELO_ITERDBG") && is_null(args[1]) {
                     eprintln!("[iterdbg] add(null) on h{h} len={}", l.len());
                 }
                 l.push(args[1]);
@@ -1279,6 +1279,19 @@ fn list_call(vm: &mut Vm, name: &str, sig: &str, args: &[V]) -> Rt<Option<Option
         }
         "toArray" => {
             let items: Vec<V> = list_snapshot(vm, h).unwrap_or_default();
+            if crate::dbg_flag("OVELO_ITERDBG") && items.iter().any(|v| is_null(*v)) {
+                let caller = vm
+                    .stack
+                    .last()
+                    .map(|&m| vm.describe_method(m).to_string())
+                    .unwrap_or_default();
+                eprintln!(
+                    "[iterdbg] toArray h{h} {} len={} nulls={} @{caller}",
+                    vm.dbg_class_of(h),
+                    items.len(),
+                    items.iter().filter(|v| is_null(**v)).count()
+                );
+            }
             let elem = match args.get(1) {
                 Some(V::Ref(ah)) => match vm.heap.get(*ah) {
                     Some(Obj::Array { elem, .. }) => elem.clone(),

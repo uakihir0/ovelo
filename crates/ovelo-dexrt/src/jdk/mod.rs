@@ -1145,13 +1145,38 @@ pub(crate) fn guest_list_backing(
             _ => {}
         }
     }
-    let cands: Vec<u32> = fields
+    let mut cands: Vec<u32> = fields
         .values()
         .filter_map(|v| match v {
             V::Ref(x) if *x != 0 && *x != h => Some(*x),
             _ => None,
         })
         .collect();
+    // Immutable hash collections keep both the dense element array and
+    // a sparse hash-table array in sibling fields. HashMap iteration order
+    // must not decide which one is the backing store: when a logical size
+    // is known, prefer the candidate whose first window is densest.
+    if let Some(n) = size_field {
+        let holes = |x: u32| -> usize {
+            match vm.heap.get(x) {
+                Some(Obj::Array { data, .. }) => data
+                    .iter()
+                    .take(n)
+                    .filter(|v| matches!(v, V::Ref(0) | V::I32(0)))
+                    .count(),
+                Some(Obj::Host {
+                    state: HostState::List(l),
+                    ..
+                }) => l
+                    .iter()
+                    .take(n)
+                    .filter(|v| matches!(v, V::Ref(0) | V::I32(0)))
+                    .count(),
+                _ => usize::MAX,
+            }
+        };
+        cands.sort_by_key(|&x| holes(x));
+    }
     for &x in &cands {
         let len = match vm.heap.get(x) {
             Some(Obj::Host {
