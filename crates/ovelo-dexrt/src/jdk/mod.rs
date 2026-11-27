@@ -1148,7 +1148,7 @@ pub(crate) fn guest_list_backing(
                 // assignment by how many null slots its window reads —
                 // a live ring/queue window is dense, the stale prefix
                 // isn't. `modCount` keeps its real name even under R8.
-                let ints: Vec<usize> = fields
+                let mut ints: Vec<usize> = fields
                     .iter()
                     .filter_map(|(g, v)| match v {
                         V::I32(n)
@@ -1160,6 +1160,13 @@ pub(crate) fn guest_list_backing(
                         _ => None,
                     })
                     .collect();
+                // Zero-valued primitive fields are absent from the sparse
+                // instance map. Obfuscated ring buffers therefore expose
+                // only one of (head, size) when the other is zero; include
+                // that implicit zero before scoring the two assignments.
+                if ints.len() == 1 {
+                    ints.push(0);
+                }
                 if ints.len() == 2 {
                     let nulls = |off: usize, n: usize| -> usize {
                         let n = n.min(len);
