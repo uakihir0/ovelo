@@ -813,7 +813,9 @@ pub(crate) fn dex_view_info(vm: &Vm, h: u32) -> Option<DexViewInfo> {
         listener,
         frame,
         layout_requested: layout_requested(vm, h),
-        image: pseudo_get(vm, h, P_IMAGE).and_then(|v| image_pixels(vm, v)),
+        image: pseudo_get(vm, h, P_IMAGE)
+            .and_then(|v| image_pixels(vm, v))
+            .map(|img| tint_image(vm, h, img)),
         padding: (pad_l, pad_t, pad_r, pad_b),
         parent: match pseudo_get(vm, h, P_PARENT) {
             Some(V::Ref(p)) => p,
@@ -907,6 +909,45 @@ fn image_drawable(vm: &mut Vm, this: u32) -> V {
 /// Resolve an `ImageView` image value to pixels: a Bitmap host, an
 /// object holding a bitmap in any ref field (BitmapDrawable, Glide
 /// drawables), a res-id, or a file/Uri path the runtime can open.
+fn xml_image_tint(vm: &Vm, h: u32) -> Option<u32> {
+    let raw = attr_find(vm, h, "tint").or_else(|| attr_find(vm, h, "drawableTint"))?;
+    let V::I32(raw) = raw else { return None };
+    let u = raw as u32;
+    if raw >= 0 && (0x0101_0000..0x0102_0000).contains(&u) {
+        crate::theme_color(vm, u)
+    } else if raw >= 0 && u >= 0x0100_0000 {
+        super::vector::rctx(vm).and_then(|r| super::vector::resolve_ref_color(r, u))
+    } else {
+        Some(u)
+    }
+}
+
+fn tint_image(
+    vm: &Vm,
+    view: u32,
+    image: (u32, u32, std::rc::Rc<Vec<u8>>),
+) -> (u32, u32, std::rc::Rc<Vec<u8>>) {
+    let Some(tint) = xml_image_tint(vm, view) else {
+        return image;
+    };
+    let (w, h, px) = image;
+    let mut out = px.as_ref().clone();
+    let (tr, tg, tb, ta) = (
+        ((tint >> 16) & 0xff) as u32,
+        ((tint >> 8) & 0xff) as u32,
+        (tint & 0xff) as u32,
+        ((tint >> 24) & 0xff) as u32,
+    );
+    for p in out.as_chunks_mut::<4>().0 {
+        let sa = p[3] as u32;
+        p[0] = tr as u8;
+        p[1] = tg as u8;
+        p[2] = tb as u8;
+        p[3] = (sa * ta / 255) as u8;
+    }
+    (w, h, std::rc::Rc::new(out))
+}
+
 fn image_pixels(vm: &Vm, v: V) -> Option<(u32, u32, std::rc::Rc<Vec<u8>>)> {
     image_pixels_at(vm, v, 0)
 }
