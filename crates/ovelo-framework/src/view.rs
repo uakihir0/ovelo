@@ -176,8 +176,9 @@ pub struct ViewGroup {
     /// `android:clipChildren` — when true (default) each child draws
     /// clipped to its own bounds; false lets children overflow.
     pub clip_children: bool,
-    /// View scroll offsets; child drawing shifts opposite these values.
+    /// Horizontal scroll offset; child drawing shifts opposite it.
     pub scroll_x: i32,
+    /// Vertical scroll offset; child drawing shifts opposite it.
     pub scroll_y: i32,
 }
 
