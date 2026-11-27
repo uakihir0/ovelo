@@ -640,6 +640,19 @@ fn atomic_file_call(vm: &mut Vm, name: &str, args: &[V]) -> Rt<Option<Option<V>>
             if let Some(parent) = path.parent() {
                 let _ = std::fs::create_dir_all(parent);
             }
+            // Preserve the last complete file until the replacement is
+            // finished. AtomicFile's contract is exactly this recovery
+            // dance; truncating in place would lose the vault on error.
+            let bak = fspath(vm, &format!("{guest}.bak"));
+            if path.exists() {
+                let _ = std::fs::remove_file(&bak);
+                if std::fs::rename(&path, &bak).is_err() {
+                    return Err(vm.throw_builtin(
+                        "Ljava/io/IOException;",
+                        "AtomicFile backup rename failed",
+                    ));
+                }
+            }
             let file = std::fs::OpenOptions::new()
                 .write(true)
                 .create(true)
@@ -662,6 +675,8 @@ fn atomic_file_call(vm: &mut Vm, name: &str, args: &[V]) -> Rt<Option<Option<V>>
                 let close_args = [V::Ref(h)];
                 let _ = stream_call(vm, "close", &close_args)?;
             }
+            let guest = path_of(vm);
+            let _ = std::fs::remove_file(fspath(vm, &format!("{guest}.bak")));
             None
         }
         "failWrite" => {
@@ -670,7 +685,12 @@ fn atomic_file_call(vm: &mut Vm, name: &str, args: &[V]) -> Rt<Option<Option<V>>
                 let _ = stream_call(vm, "close", &close_args)?;
             }
             let guest = path_of(vm);
-            let _ = std::fs::remove_file(fspath(vm, &guest));
+            let path = fspath(vm, &guest);
+            let bak = fspath(vm, &format!("{guest}.bak"));
+            let _ = std::fs::remove_file(&path);
+            if bak.exists() {
+                let _ = std::fs::rename(&bak, &path);
+            }
             None
         }
         "readFully" => {
@@ -681,6 +701,7 @@ fn atomic_file_call(vm: &mut Vm, name: &str, args: &[V]) -> Rt<Option<Option<V>>
         "delete" => {
             let guest = path_of(vm);
             let _ = std::fs::remove_file(fspath(vm, &guest));
+            let _ = std::fs::remove_file(fspath(vm, &format!("{guest}.bak")));
             None
         }
         _ => return Ok(None),
