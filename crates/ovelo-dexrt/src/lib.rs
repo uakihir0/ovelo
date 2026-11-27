@@ -288,6 +288,7 @@ pub struct Vm {
     pub(crate) window_size: (i32, i32),
     /// Down time of the currently active single-pointer touch gesture.
     pub(crate) touch_gesture_down_time: i64,
+    pub(crate) touch_gesture_target: u32,
     /// Interned host enum constants, keyed (desc, ordinal) — so
     /// `Month.of(1) == Month.JANUARY` and `date.getMonth()` return the
     /// same handle the static constant did.
@@ -865,6 +866,7 @@ impl Vm {
             content_frames: HashMap::new(),
             window_size: (720, 1280),
             touch_gesture_down_time: -1,
+            touch_gesture_target: 0,
             enum_cache: HashMap::new(),
             enum_name_cache: HashMap::new(),
             bool_cache: [0, 0],

@@ -2108,10 +2108,23 @@ pub(crate) fn call(
                 },
                 _ => -1,
             };
+            if let Some(V::Ref(l)) = pseudo_get(vm, this, P_TOUCH_L) {
+                if l != 0
+                    && matches!(
+                        vm.call_virtual(l, "onTouch", &[V::Ref(this), args[1]]),
+                        Ok(Some(rv)) if i32v(rv) != 0
+                    )
+                {
+                    return Ok(Some(Some(V::I32(1))));
+                }
+            }
             match pseudo_get(vm, this, P_LISTENER) {
                 Some(V::Ref(l)) if l != 0 => {
-                    if action == 1 {
+                    let down_target = vm.touch_gesture_target;
+                    if action == 1 && down_target != 0 && view_or_descendant(vm, this, down_target)
+                    {
                         let _ = vm.call_virtual(l, "onClick", &[V::Ref(this)]);
+                        vm.touch_gesture_target = 0;
                     }
                     Some(Some(V::I32(1)))
                 }
@@ -5452,6 +5465,22 @@ fn view_id(vm: &Vm, h: u32) -> i32 {
 /// `onTouchEvent` first, then a registered `OnTouchListener`. Without
 /// this bridge, dex-materialized views (games: libGDX's input view)
 /// never see host input.
+fn view_or_descendant(vm: &Vm, ancestor: u32, mut view: u32) -> bool {
+    for _ in 0..32 {
+        if view == 0 {
+            return false;
+        }
+        if view == ancestor {
+            return true;
+        }
+        view = match pseudo_get(vm, view, P_PARENT) {
+            Some(V::Ref(p)) => p,
+            _ => return false,
+        };
+    }
+    false
+}
+
 pub(crate) fn dispatch_touch(
     vm: &mut Vm,
     x: i32,
@@ -5573,6 +5602,7 @@ pub(crate) fn dispatch_touch(
     let now = now_ms();
     if action == 0 {
         vm.touch_gesture_down_time = now;
+        vm.touch_gesture_target = target;
     }
     let down_time = if vm.touch_gesture_down_time >= 0 {
         vm.touch_gesture_down_time
@@ -5583,6 +5613,9 @@ pub(crate) fn dispatch_touch(
     pseudo_set(vm, evt, P_ME_EVENT_TIME, V::I64(now));
     if action == 1 || action == 3 {
         vm.touch_gesture_down_time = -1;
+        if action == 3 {
+            vm.touch_gesture_target = 0;
+        }
     }
     pseudo_set(vm, evt, P_ME_RAWX, V::F32(x as f32));
     pseudo_set(vm, evt, P_ME_RAWY, V::F32(y as f32));
@@ -5607,6 +5640,11 @@ pub(crate) fn dispatch_touch(
             if matches!(dr, Ok(Some(rv)) if i32v(rv) != 0) {
                 return Ok(true);
             }
+            v = match pseudo_get(vm, v, P_PARENT) {
+                Some(V::Ref(p)) => p,
+                _ => break,
+            };
+            continue;
         }
         if vm.has_dex_virtual(v, "onTouchEvent", &["Landroid/view/MotionEvent;"]) {
             if dbg {
@@ -5637,11 +5675,13 @@ pub(crate) fn dispatch_touch(
         // The deepest ancestor with a listener wins.
         if action == 1 {
             if let Some(V::Ref(l)) = pseudo_get(vm, v, P_LISTENER) {
-                if l != 0 {
+                let down_target = vm.touch_gesture_target;
+                if l != 0 && down_target != 0 && view_or_descendant(vm, v, down_target) {
                     if dbg {
                         eprintln!("[touchdbg] h{v} OnClickListener.onClick l{l}");
                     }
                     let _ = vm.call_virtual(l, "onClick", &[V::Ref(v)]);
+                    vm.touch_gesture_target = 0;
                     return Ok(true);
                 }
             }
