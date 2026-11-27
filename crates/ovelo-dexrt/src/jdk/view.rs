@@ -3321,7 +3321,156 @@ fn make_view_named(vm: &mut Vm, tag: &str, attrs: V, ctx: V) -> V {
     if !matches!(ctx, V::Ref(0) | V::I32(0)) {
         pseudo_set(vm, h, P_CONTEXT, ctx);
     }
+    if name == "fragment" {
+        if let V::Ref(_) = attrs {
+            if let Some(class_name) = attrset_value(vm, attrs, "name").and_then(|v| match v {
+                V::Ref(_) => sv(vm, v),
+                V::I32(id) if id > 0 => vm
+                    .apk_res
+                    .as_ref()
+                    .and_then(|r| r.entry_value(id as u32))
+                    .and_then(|e| e.string.clone()),
+                _ => None,
+            }) {
+                let id = attrset_value(vm, attrs, "id").map(i32v).unwrap_or(0);
+                inflate_static_fragment(vm, &class_name, id, ctx, h);
+            }
+        }
+    }
     V::Ref(h)
+}
+
+/// Instantiate and wire a static `<fragment>` enough for the dex
+/// FragmentManager's own lookup/lifecycle code to use it. AndroidX in
+/// these APKs is often class-merged or partially obfuscated, so the
+/// exact field writes are best-effort; the fragment list registration is
+/// the part `findFragmentById` depends on.
+fn inflate_static_fragment(vm: &mut Vm, class_name: &str, id: i32, ctx: V, container: u32) {
+    let desc = format!("L{};", class_name.replace('.', "/"));
+    if vm.type_index_of(&desc).is_none() {
+        return;
+    }
+    let ctors = vm.ctor_list(&desc);
+    let Some((midx, _params)) = ctors.iter().find(|(_, ps)| ps.is_empty()).cloned() else {
+        return;
+    };
+    let Ok(frag) = vm.instantiate_ctor(&desc, midx, &[]) else {
+        return;
+    };
+    let mut host = 0u32;
+    let mut manager = 0u32;
+    if let V::Ref(act) = ctx {
+        if let Some(V::Ref(frags)) = vm.get_object_field(
+            act,
+            "Landroidx/appcompat/app/AppCompatActivity;",
+            "mFragments",
+        ) {
+            if let Some(V::Ref(hc)) =
+                vm.get_object_field(frags, "Landroidx/fragment/app/Fragment$7;", "this$0")
+            {
+                host = hc;
+                if let Some(V::Ref(m)) = vm.get_object_field(
+                    hc,
+                    "Landroidx/fragment/app/FragmentActivity$HostCallbacks;",
+                    "mFragmentManager",
+                ) {
+                    manager = m;
+                }
+            }
+        }
+        if manager == 0 {
+            if let Ok(Some(V::Ref(m))) = vm.call_virtual(act, "getSupportFragmentManager", &[]) {
+                manager = m;
+            }
+        }
+    }
+
+    let fdesc = "Landroidx/fragment/app/Fragment;";
+    vm.set_object_field(frag, fdesc, "mFragmentId", V::I32(id));
+    vm.set_object_field(frag, fdesc, "mContainerId", V::I32(id));
+    if host != 0 {
+        vm.set_object_field(frag, fdesc, "mHost", V::Ref(host));
+    }
+    if manager != 0 {
+        vm.set_object_field(frag, fdesc, "mFragmentManager", V::Ref(manager));
+        if let Some(V::Ref(store)) = vm.get_object_field(
+            manager,
+            "Landroidx/fragment/app/FragmentManagerImpl;",
+            "mFragmentStore",
+        ) {
+            if let Some(V::Ref(list)) = vm.get_object_field(
+                store,
+                "Landroidx/emoji2/text/MetadataRepo;",
+                "mMetadataList",
+            ) {
+                if let Some(items) = list_mut(vm, list) {
+                    if !items.contains(&V::Ref(frag)) {
+                        items.push(V::Ref(frag));
+                    }
+                }
+            }
+        }
+    }
+
+    if let Some(V::Ref(child_mgr)) = vm.get_object_field(frag, fdesc, "mChildFragmentManager") {
+        if host != 0 {
+            vm.set_object_field(
+                child_mgr,
+                "Landroidx/fragment/app/FragmentManagerImpl;",
+                "mHost",
+                V::Ref(host),
+            );
+        }
+        vm.set_object_field(
+            child_mgr,
+            "Landroidx/fragment/app/FragmentManagerImpl;",
+            "mParent",
+            V::Ref(frag),
+        );
+        let missing_nc = matches!(
+            vm.get_object_field(
+                child_mgr,
+                "Landroidx/fragment/app/FragmentManagerImpl;",
+                "mNonConfig",
+            ),
+            None | Some(V::Ref(0)) | Some(V::I32(0))
+        );
+        if missing_nc {
+            let ncd = "Landroidx/fragment/app/FragmentManagerViewModel;";
+            if let Some((ncctor, _)) = vm
+                .ctor_list(ncd)
+                .iter()
+                .find(|(_, ps)| ps.as_slice() == ["Z"])
+                .cloned()
+            {
+                if let Ok(nc) = vm.instantiate_ctor(ncd, ncctor, &[V::I32(0)]) {
+                    vm.set_object_field(
+                        child_mgr,
+                        "Landroidx/fragment/app/FragmentManagerImpl;",
+                        "mNonConfig",
+                        V::Ref(nc),
+                    );
+                }
+            }
+        }
+    }
+    let ra = vm.call_virtual(frag, "onAttach", &[ctx]);
+    let rc = vm.call_virtual(frag, "onCreate", &[V::Ref(0)]);
+    if crate::dbg_flag("OVELO_FRAGDBG") {
+        eprintln!("[fragdbg] {class_name} frag h{frag} attach={ra:?} create={rc:?} host{host} mgr{manager}");
+    }
+    let inf = inflater(vm, Some(ctx));
+    if let Ok(Some(V::Ref(fv))) =
+        vm.call_virtual(frag, "onCreateView", &[inf, V::Ref(container), V::Ref(0)])
+    {
+        if fv != 0 {
+            vm.set_object_field(frag, fdesc, "mView", V::Ref(fv));
+            if pseudo_get(vm, fv, P_PARENT).is_none() {
+                attach_at(vm, container, V::Ref(fv), None, false, None);
+            }
+            let _ = vm.call_virtual(frag, "onViewCreated", &[V::Ref(fv), V::Ref(0)]);
+        }
+    }
 }
 
 /// `AttributeSet` host holding an element's XML attributes
