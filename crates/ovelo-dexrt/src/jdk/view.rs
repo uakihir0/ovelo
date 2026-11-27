@@ -4745,9 +4745,20 @@ fn apply_ctor_style(vm: &mut Vm, this: u32, args: &[V]) {
             || attr_find(vm, this, axis).is_some()
             || relative.is_some_and(|rel| attr_find(vm, this, rel).is_some());
         if pseudo_get(vm, this, key).is_none() && !xml_has_padding {
-            let px = ctor_style_value(vm, xml_style, def_attr, def_res, attr_id)
-                .and_then(|v| lp_px(vm, v))
-                .unwrap_or(fallback);
+            let mut styled = ctor_style_value(vm, xml_style, def_attr, def_res, attr_id);
+            if styled.is_none() {
+                let relative_id = if key == P_PAD_L {
+                    0x0101_03b3
+                } else if key == P_PAD_R {
+                    0x0101_03b4
+                } else {
+                    0
+                };
+                if relative_id != 0 {
+                    styled = ctor_style_value(vm, xml_style, def_attr, def_res, relative_id);
+                }
+            }
+            let px = styled.and_then(|v| lp_px(vm, v)).unwrap_or(fallback);
             if px != 0 {
                 pseudo_set(vm, this, key, V::I32(px));
             }
