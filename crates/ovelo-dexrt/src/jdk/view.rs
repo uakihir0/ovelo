@@ -880,6 +880,9 @@ fn image_pixels_at(vm: &Vm, v: V, depth: u32) -> Option<(u32, u32, std::rc::Rc<V
         }
         V::Ref(h) => super::android::bitmap_pixels(vm, v)
             .or_else(|| {
+                pseudo_get(vm, h, P_BITMAP_SLOT).and_then(|bmp| image_pixels_at(vm, bmp, depth + 1))
+            })
+            .or_else(|| {
                 let path = image_source_path(vm, v)?;
                 decode_image(&std::fs::read(io::fspath(vm, &path)).ok()?)
             })
@@ -8129,6 +8132,65 @@ pub(crate) fn register_menu_overrides(vm: &mut Vm) {
     let mk = |f: fn(&mut Vm, &[V]) -> ovelo_error::Result<Option<V>>| -> HostCall {
         Rc::new(RefCell::new(f))
     };
+    // AppCompat's dex ResourceManagerInternal can construct a
+    // VectorDrawableCompat shell whose dex draw implementation the host
+    // ImageView cannot execute. Resource lookup itself is host-backed, so
+    // answer the compatibility entry point with the rasterized drawable.
+    let _ = vm.register_host(
+        "Landroidx/appcompat/widget/ResourceManagerInternal;",
+        "getDrawable",
+        "(Landroid/content/Context;I)Landroid/graphics/drawable/Drawable;",
+        Rc::new(RefCell::new(|vm: &mut Vm, a: &[V]| {
+            let res = a.get(2).copied().map(i64v).unwrap_or(0);
+            Ok(Some(if res > 0 {
+                super::vector::drawable_for_res(vm, res as u32)
+            } else {
+                V::Ref(0)
+            }))
+        })) as HostCall,
+    );
+    // Material's NavigationBarItemView wraps menu icons in a
+    // StateListDrawable copy chain implemented in dex. That copy loses
+    // host pseudo bitmap state, so bind the original rasterized icon to
+    // the item ImageView directly; checked-state recoloring is secondary
+    // to rendering the icon at all.
+    let _ = vm.register_host(
+        "Lcom/google/android/material/navigation/NavigationBarItemView;",
+        "setIcon",
+        "(Landroid/graphics/drawable/Drawable;)V",
+        Rc::new(RefCell::new(|vm: &mut Vm, a: &[V]| {
+            let this = match a.first().copied() {
+                Some(V::Ref(h)) => h,
+                _ => 0,
+            };
+            let icon = a.get(1).copied().unwrap_or(V::Ref(0));
+            if let Some(V::Ref(iv)) = vm.get_object_field(
+                this,
+                "Lcom/google/android/material/navigation/NavigationBarItemView;",
+                "A",
+            ) {
+                pseudo_set(vm, iv, P_IMAGE, icon);
+            }
+            Ok(None)
+        })) as HostCall,
+    );
+    for class in [
+        "Landroid/app/Activity;",
+        "Landroidx/fragment/app/FragmentActivity;",
+        "Landroidx/appcompat/app/AppCompatActivity;",
+    ] {
+        let _ = vm.register_host(
+            class,
+            "setTheme",
+            "(I)V",
+            Rc::new(RefCell::new(|vm: &mut Vm, a: &[V]| {
+                if let Some(v) = a.get(1).copied() {
+                    vm.theme_id = i32v(v) as u32;
+                }
+                Ok(None)
+            })) as HostCall,
+        );
+    }
     for class in [
         "Landroid/view/MenuInflater;",
         "Landroidx/appcompat/view/SupportMenuInflater;",
