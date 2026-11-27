@@ -2528,7 +2528,7 @@ pub(crate) fn call(
             };
             let scale = match unit {
                 0 => 1.0,
-                1 | 2 => 2.0,
+                1 | 2 => 1.0,
                 _ => 1.0,
             };
             pseudo_set(vm, this, P_TSIZE, V::F32(size * scale));
