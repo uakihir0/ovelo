@@ -84,6 +84,8 @@ const P_IMAGE_PLACEHOLDER: u32 = u32::MAX - 30;
 const P_POPUP_ROOT: u32 = u32::MAX - 31;
 const P_POPUP_OWNER: u32 = u32::MAX - 32;
 const P_POPUP_POS: u32 = u32::MAX - 33;
+/// Dialog cancelable flag (`setCancelable(false)` stores 0).
+const P_DIALOG_CANCELABLE: u32 = u32::MAX - 34;
 /// Pseudo key: a view's lazily-minted `Menu` (Toolbar.getMenu() etc.) /
 /// the menuish marker on the Menu itself (`I32(1)`).
 const P_MENU: u32 = 0xFFFD_FFF8;
@@ -5751,10 +5753,23 @@ pub(crate) fn dispatch_touch(
         let mut consumed = false;
         for (popup, proot) in popups {
             if !view_or_descendant(vm, proot, target) {
+                let cancelable = pseudo_get(vm, popup, P_DIALOG_CANCELABLE)
+                    .map(i32v)
+                    .unwrap_or(1);
+                if cancelable == 0 {
+                    continue;
+                }
                 if dbg {
                     eprintln!("[touchdbg] outside tap dismiss popup h{popup} root h{proot}");
                 }
-                list_popup_dismiss(vm, popup);
+                let popup_class = class_of(vm, V::Ref(popup));
+                if desc_is_a(&popup_class, "Landroid/app/Dialog;")
+                    || vm.assignable_desc(&popup_class, "Landroid/app/Dialog;")
+                {
+                    dialog_dismiss(vm, popup);
+                } else {
+                    list_popup_dismiss(vm, popup);
+                }
                 consumed = true;
             }
         }
@@ -7453,6 +7468,10 @@ fn dialog_view_scan(
         }
     }
     best
+}
+
+pub(crate) fn set_dialog_cancelable(vm: &mut Vm, dialog: u32, value: V) {
+    pseudo_set(vm, dialog, P_DIALOG_CANCELABLE, V::I32(i32v(value)));
 }
 
 /// Show a framework/appcompat dialog as a host overlay. Dex AlertDialog

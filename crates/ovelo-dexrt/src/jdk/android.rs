@@ -1834,6 +1834,12 @@ fn dialog_call(vm: &mut Vm, name: &str, args: &[V]) -> Rt<Option<Option<V>>> {
             }
             None
         }
+        "setCancelable" => {
+            if let Some(V::Ref(this)) = args.first().copied() {
+                view::set_dialog_cancelable(vm, this, args.get(1).copied().unwrap_or(V::I32(1)));
+            }
+            None
+        }
         "hide"
         | "create"
         | "onCreate"
@@ -1842,7 +1848,6 @@ fn dialog_call(vm: &mut Vm, name: &str, args: &[V]) -> Rt<Option<Option<V>>> {
         | "onAttachedToWindow"
         | "onDetachedFromWindow"
         | "setTitle"
-        | "setCancelable"
         | "setCanceledOnTouchOutside"
         | "setOnCancelListener"
         | "setOnDismissListener"
