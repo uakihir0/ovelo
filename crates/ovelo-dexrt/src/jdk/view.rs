@@ -420,6 +420,7 @@ fn attr_find(vm: &Vm, h: u32, name: &str) -> Option<V> {
 fn xml_value_bool(vm: &Vm, v: &Value) -> Option<bool> {
     match v {
         Value::Int(i) => Some(*i != 0),
+        Value::Bool(b) => Some(*b),
         Value::Str(t) => Some(t.trim() != "false" && t.trim() != "0"),
         Value::Reference(id) => attr_bool_ref(vm, *id),
         Value::Other { data_type, data } => match data_type {
