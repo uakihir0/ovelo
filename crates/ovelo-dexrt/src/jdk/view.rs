@@ -8566,7 +8566,13 @@ fn menu_item_action_view(vm: &mut Vm, ih: u32, view: V) {
     pseudo_set(vm, ih, P_MENU_ACTION_VIEW, view);
     if matches!(vm.heap.get(ih), Some(Obj::Instance { .. }))
         && vm
-            .call_virtual_direct(ih, "setActionView", &[view])
+            .call_exact_direct(
+                ih,
+                "Landroidx/appcompat/view/menu/MenuItemImpl;",
+                "setActionView",
+                "(Landroid/view/View;)Landroid/view/MenuItem;",
+                &[view],
+            )
             .is_err()
     {
         vm.set_object_field(
