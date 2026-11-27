@@ -1891,7 +1891,7 @@ fn intent_map_remove(vm: &mut Vm, h: u32, k: V) {
 fn clone_intent(vm: &mut Vm, h: u32) -> V {
     let m = intent_map_pairs(vm, h);
     let nh = vm.alloc_host("Landroid/content/Intent;", HostState::Map(m));
-    for k in [P_ACTION, P_DATA, P_TYPE, P_FLAGS, P_COMPONENT] {
+    for k in [P_ACTION, P_DATA, P_TYPE, P_PACKAGE, P_FLAGS, P_COMPONENT] {
         if let Some(v) = pseudo_get(vm, h, k) {
             pseudo_set(vm, nh, k, v);
         }
@@ -1932,6 +1932,11 @@ fn resolve_implicit_activity(vm: &mut Vm, ih: u32) -> Option<String> {
         .next()
         .unwrap_or_default()
         .to_string();
+    if let Some(package) = pseudo_get(vm, ih, P_PACKAGE).and_then(|v| sv(vm, v)) {
+        if !package.is_empty() && vm.guest_package.as_deref() != Some(package.as_str()) {
+            return None;
+        }
+    }
     vm.activity_intent_filters.iter().find_map(|filter| {
         if !filter.actions.iter().any(|a| a == &action) {
             return None;
@@ -2026,10 +2031,15 @@ fn intent_call(vm: &mut Vm, name: &str, sig: &str, args: &[V]) -> Rt<Option<Opti
             pseudo_set(vm, h, P_FLAGS, V::I32(i32v(args[1])));
             Some(Some(args[0]))
         }
-        "setPackage" | "addCategory" | "removeCategory" | "setSelector" | "setClipData"
-        | "setSourceBounds" | "setIdentifier" => Some(Some(args[0])),
+        "setPackage" => {
+            pseudo_set(vm, h, P_PACKAGE, args[1]);
+            Some(Some(args[0]))
+        }
+        "addCategory" | "removeCategory" | "setSelector" | "setClipData" | "setSourceBounds"
+        | "setIdentifier" => Some(Some(args[0])),
         "getPackage" | "getCategories" | "getFlags" | "getSelector" | "getClipData"
         | "getSourceBounds" | "getIdentifier" => Some(Some(match name {
+            "getPackage" => pseudo_get(vm, h, P_PACKAGE).unwrap_or(V::Ref(0)),
             "getFlags" => pseudo_get(vm, h, P_FLAGS).unwrap_or(V::I32(0)),
             "getCategories" => {
                 return Ok(Some(Some(host(
