@@ -3411,6 +3411,7 @@ fn context_call(
                         h
                     }
                 };
+                vm.service_started.insert(sh);
                 vm.service_seq += 1;
                 let sid = vm.service_seq;
                 vm.service_start_id.insert(sh, sid);
@@ -3439,6 +3440,7 @@ fn context_call(
             }
             if vm.services.values().any(|sh| *sh == this) {
                 vm.services.retain(|_, sh| *sh != this);
+                vm.service_started.remove(&this);
                 vm.service_start_id.remove(&this);
             } else {
                 // Self-stop before startService registered the handle
@@ -3525,6 +3527,10 @@ fn context_call(
                     }
                     cn
                 };
+                vm.service_bindings.insert(conn, sh);
+                *vm.service_bind_counts.entry(sh).or_insert(0) += 1;
+                let bind_intent = clone_intent(vm, ih);
+                vm.service_bind_intents.insert(conn, bind_intent);
                 let connected = if binder == V::Ref(0) {
                     vm.call_virtual(conn, "onNullBinding", &[component])
                 } else {
@@ -3558,6 +3564,7 @@ fn context_call(
                 });
             if let Some(desc) = desc {
                 if let Some(sh) = vm.services.remove(&desc) {
+                    vm.service_started.remove(&sh);
                     vm.service_start_id.remove(&sh);
                     // Same deferred-teardown rule as stopSelf: the
                     // caller may be this service's own callback.
@@ -3568,8 +3575,33 @@ fn context_call(
             }
             Some(Some(V::I32(1)))
         }
-        "unbindService"
-        | "sendBroadcast"
+        "unbindService" => {
+            if let Some(V::Ref(conn)) = args.get(1).copied() {
+                if let Some(sh) = vm.service_bindings.remove(&conn) {
+                    let intent = vm.service_bind_intents.remove(&conn).unwrap_or(V::Ref(0));
+                    let _ = vm.call_virtual(sh, "onUnbind", &[intent]);
+                    let remaining = vm
+                        .service_bind_counts
+                        .get(&sh)
+                        .copied()
+                        .unwrap_or(1)
+                        .saturating_sub(1);
+                    if remaining == 0 {
+                        vm.service_bind_counts.remove(&sh);
+                        if !vm.service_started.contains(&sh) {
+                            vm.services.retain(|_, live| *live != sh);
+                            if !vm.pending_destroy.contains(&sh) {
+                                vm.pending_destroy.push(sh);
+                            }
+                        }
+                    } else {
+                        vm.service_bind_counts.insert(sh, remaining);
+                    }
+                }
+            }
+            Some(None)
+        }
+        "sendBroadcast"
         | "sendOrderedBroadcast"
         | "sendStickyBroadcast"
         | "registerReceiver"

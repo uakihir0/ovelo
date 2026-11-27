@@ -351,6 +351,15 @@ pub struct Vm {
     /// delivers decoded bitmaps as drawables — coil's own coroutine
     /// pipeline suspends on a dispatcher our loop never resumes.
     pub(crate) coil_jobs: Vec<(u64, u32)>,
+    /// Services with an active start request — a bound service is only
+    /// destroyed after unbinding when no started lifecycle keeps it up.
+    pub(crate) service_started: hashbrown::HashSet<u32>,
+    /// ServiceConnection handle -> bound service handle.
+    pub(crate) service_bindings: HashMap<u32, u32>,
+    /// Live binding count per service handle.
+    pub(crate) service_bind_counts: HashMap<u32, usize>,
+    /// ServiceConnection handle -> intent copy delivered to `onUnbind`.
+    pub(crate) service_bind_intents: HashMap<u32, V>,
     /// Last `startId` delivered to each running Service — `stopSelf(id)`
     /// only stops when the id matches the most recent request.
     pub(crate) service_start_id: HashMap<u32, i64>,
@@ -925,6 +934,10 @@ impl Vm {
             bundled_h: 0,
             services: HashMap::new(),
             coil_jobs: Vec::new(),
+            service_started: hashbrown::HashSet::new(),
+            service_bindings: HashMap::new(),
+            service_bind_counts: HashMap::new(),
+            service_bind_intents: HashMap::new(),
             service_start_id: HashMap::new(),
             service_seq: 0,
             service_stop_pending: hashbrown::HashSet::new(),
@@ -2580,6 +2593,11 @@ impl Vm {
         // collected and drain_runnables prunes the stale handle.
         roots.extend(self.db_handles.values().copied());
         roots.extend(self.services.values().copied());
+        roots.extend(self.service_bindings.keys().copied());
+        roots.extend(self.service_bind_intents.values().filter_map(|v| match v {
+            V::Ref(h) if *h != 0 => Some(*h),
+            _ => None,
+        }));
         // Stopped services and coil delivery targets must survive until
         // the drain runs their onDestroy / attaches the drawable —
         // collecting either first silently drops the delivery.
