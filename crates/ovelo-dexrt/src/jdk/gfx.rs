@@ -270,18 +270,12 @@ fn stroke_seg_dist(px: f32, py: f32, a: (f32, f32), b: (f32, f32)) -> f32 {
     ((px - x).powi(2) + (py - y).powi(2)).sqrt()
 }
 
-fn mat_stroke_segment_scale(inverse_m: [f32; 6], a: (f32, f32), b: (f32, f32)) -> f32 {
-    let dx = b.0 - a.0;
-    let dy = b.1 - a.1;
-    let len = (dx * dx + dy * dy).sqrt();
-    if len <= f32::EPSILON {
-        return 1.0;
-    }
-    let ux = dx / len;
-    let uy = dy / len;
-    let tx = inverse_m[0] * ux + inverse_m[1] * uy;
-    let ty = inverse_m[3] * ux + inverse_m[4] * uy;
-    (tx * tx + ty * ty).sqrt().max(1.0)
+fn mat_max_scale(m: [f32; 6]) -> f32 {
+    let s11 = m[0] * m[0] + m[3] * m[3];
+    let s22 = m[1] * m[1] + m[4] * m[4];
+    let s12 = m[0] * m[1] + m[3] * m[4];
+    let disc = ((s11 - s22).powi(2) + 4.0 * s12 * s12).sqrt();
+    (((s11 + s22 + disc) / 2.0).sqrt()).max(1.0)
 }
 
 fn raster_stroke_to_bitmap(
@@ -303,14 +297,14 @@ fn raster_stroke_to_bitmap(
         return;
     }
     let radius = (paint.stroke_w / 2.0).max(0.5);
+    let scan_scale = mat_max_scale(inverse_m);
     let mut out = base.as_ref().clone();
     let mut covered = vec![false; (bw * bh) as usize];
     for (src_pts, dst_pts) in src_contours.iter().zip(dst_contours) {
         for (src_seg, dst_seg) in src_pts.windows(2).zip(dst_pts.windows(2)) {
             let (sa, sb) = (src_seg[0], src_seg[1]);
             let (da, db) = (dst_seg[0], dst_seg[1]);
-            let scale = mat_stroke_segment_scale(inverse_m, sa, sb);
-            let scan_radius = radius * scale;
+            let scan_radius = radius * scan_scale;
             let minx = ((da.0.min(db.0) - scan_radius).floor() as i32).max(0);
             let maxx = ((da.0.max(db.0) + scan_radius).ceil() as i32).min(bw as i32 - 1);
             let miny = ((da.1.min(db.1) - scan_radius).floor() as i32).max(0);
