@@ -4296,6 +4296,17 @@ fn res_misc(vm: &mut Vm, class: &str, name: &str, args: &[V]) -> Rt<Option<Optio
         ) => Some(Some(V::F32(
             f64v(args.get(1).copied().unwrap_or(V::F32(0.0))) as f32,
         ))),
+        ("Landroid/content/res/ColorStateList;", "<init>") => {
+            // ColorStateList(int[][] states, int[] colors): the default
+            // color is the first color entry. Keep it in the object slot
+            // even though state matching itself is still simplified.
+            if let (Some(V::Ref(this)), Some(V::Ref(colors))) = (args.first(), args.get(2)) {
+                if let Some(c) = list_get(vm, *colors, 0) {
+                    slot_put(vm, *this, c);
+                }
+            }
+            Some(None)
+        }
         ("Landroid/content/res/ColorStateList;", "valueOf") => {
             Some(Some(host(vm, class, HostState::Slot(args[0]))))
         }
