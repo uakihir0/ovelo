@@ -6184,9 +6184,11 @@ fn build_tree(vm: &mut Vm, elems: &[Element], ctx: V) -> V {
                 }
                 attach(vm, p, V::Ref(h));
                 if pint(vm, h, P_CHECKED) != 0 {
+                    let child_cls = class_of(vm, V::Ref(h));
                     let cls = class_of(vm, V::Ref(p));
-                    if cls == "Landroid/widget/RadioGroup;"
-                        || vm.assignable_desc(&cls, "Landroid/widget/RadioGroup;")
+                    if is_radio_desc(vm, &child_cls)
+                        && (cls == "Landroid/widget/RadioGroup;"
+                            || vm.assignable_desc(&cls, "Landroid/widget/RadioGroup;"))
                     {
                         pseudo_set(vm, p, P_RADIO_CHECKED, V::I32(view_id(vm, h)));
                     }
@@ -7311,6 +7313,10 @@ fn is_compound_desc(vm: &Vm, desc: &str) -> bool {
         || desc.contains("RadioButton")
         || desc.contains("Switch")
         || vm.assignable_desc(desc, "Landroid/widget/CompoundButton;")
+}
+
+fn is_radio_desc(vm: &Vm, desc: &str) -> bool {
+    desc.contains("RadioButton") || vm.assignable_desc(desc, "Landroid/widget/RadioButton;")
 }
 
 fn set_compound_checked(vm: &mut Vm, this: u32, checked: i32) {
