@@ -743,8 +743,21 @@ pub(crate) fn call(
     } else if desc_is_a(class, "Landroid/os/AsyncTask;") {
         match name {
             "execute" | "executeOnExecutor" => {
-                // inline: doInBackground → onPostExecute is the real
-                // contract; just run doInBackground and return this.
+                // Run the task contract inline on this cooperative VM:
+                // the no-op stub left every AsyncTask permanently pending.
+                let this = match args.first() {
+                    Some(V::Ref(h)) if *h != 0 => *h,
+                    _ => return Ok(Some(Some(args[0]))),
+                };
+                let params = if name == "executeOnExecutor" {
+                    args.get(2).copied()
+                } else {
+                    args.get(1).copied()
+                }
+                .unwrap_or(V::Ref(0));
+                if let Some(result) = vm.call_virtual_rt(this, "doInBackground", &[params])? {
+                    let _ = vm.call_virtual_rt(this, "onPostExecute", &[result])?;
+                }
                 Some(Some(args[0]))
             }
             "cancel" => Some(Some(V::I32(1))),
