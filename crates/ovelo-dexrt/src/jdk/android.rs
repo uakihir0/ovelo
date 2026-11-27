@@ -5575,6 +5575,11 @@ fn res_misc(vm: &mut Vm, class: &str, name: &str, args: &[V]) -> Rt<Option<Optio
 // ---------------------------------------------------------------------
 // Handler / Looper — run posted work inline (single looper model)
 
+fn handler_message_matches(vm: &Vm, r: u32, target: u32, what: V) -> bool {
+    pseudo_get(vm, r, P_MSG_TARGET) == Some(V::Ref(target))
+        && pseudo_get(vm, r, P_MSG_WHAT) == Some(what)
+}
+
 fn handler_call(vm: &mut Vm, name: &str, args: &[V]) -> Rt<Option<Option<V>>> {
     Ok(match name {
         "post"
@@ -5652,14 +5657,15 @@ fn handler_call(vm: &mut Vm, name: &str, args: &[V]) -> Rt<Option<Option<V>>> {
         }
         "removeMessages" => {
             if let (Some(&V::Ref(target)), Some(&what)) = (args.first(), args.get(1)) {
-                let matches = |r: &u32| {
-                    pseudo_get(vm, *r, P_MSG_TARGET) == Some(V::Ref(target))
-                        && pseudo_get(vm, *r, P_MSG_WHAT) == Some(what)
-                };
                 let pending_match: Vec<bool> = vm
                     .pending_runnables
                     .iter()
-                    .map(|(r, _)| matches(r))
+                    .map(|(r, _)| handler_message_matches(vm, *r, target, what))
+                    .collect();
+                let delayed_match: Vec<bool> = vm
+                    .delayed_runnables
+                    .iter()
+                    .map(|(r, _, _)| handler_message_matches(vm, *r, target, what))
                     .collect();
                 let mut pi = 0;
                 vm.pending_runnables.retain(|_| {
@@ -5667,11 +5673,6 @@ fn handler_call(vm: &mut Vm, name: &str, args: &[V]) -> Rt<Option<Option<V>>> {
                     pi += 1;
                     !hit
                 });
-                let delayed_match: Vec<bool> = vm
-                    .delayed_runnables
-                    .iter()
-                    .map(|(r, _, _)| matches(r))
-                    .collect();
                 let mut di = 0;
                 vm.delayed_runnables.retain(|_| {
                     let hit = delayed_match[di];
@@ -5684,12 +5685,13 @@ fn handler_call(vm: &mut Vm, name: &str, args: &[V]) -> Rt<Option<Option<V>>> {
         "removeCallbacks" | "removeCallbacksAndMessages" | "removeEqualMessages" => Some(None),
         "hasMessages" => {
             let found = if let (Some(&V::Ref(target)), Some(&what)) = (args.first(), args.get(1)) {
-                let matches = |r: &u32| {
-                    pseudo_get(vm, *r, P_MSG_TARGET) == Some(V::Ref(target))
-                        && pseudo_get(vm, *r, P_MSG_WHAT) == Some(what)
-                };
-                vm.pending_runnables.iter().any(|(r, _)| matches(r))
-                    || vm.delayed_runnables.iter().any(|(r, _, _)| matches(r))
+                vm.pending_runnables
+                    .iter()
+                    .any(|(r, _)| handler_message_matches(vm, *r, target, what))
+                    || vm
+                        .delayed_runnables
+                        .iter()
+                        .any(|(r, _, _)| handler_message_matches(vm, *r, target, what))
             } else {
                 false
             };
