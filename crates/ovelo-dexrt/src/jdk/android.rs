@@ -5593,7 +5593,24 @@ fn handler_call(vm: &mut Vm, name: &str, args: &[V]) -> Rt<Option<Option<V>>> {
         | "postAsIdle"
         | "executeOrSendMessage"
         | "sendToTarget" => {
-            if let Some(V::Ref(r)) = args.get(1).copied() {
+            let mut message = None;
+            if name.starts_with("sendEmpty") {
+                if let (Some(&V::Ref(target)), Some(&what)) = (args.first(), args.get(1)) {
+                    let m = host(vm, "Landroid/os/Message;", HostState::Empty);
+                    if let V::Ref(mh) = m {
+                        pseudo_set(vm, mh, P_MSG_TARGET, V::Ref(target));
+                        pseudo_set(vm, mh, P_MSG_WHAT, what);
+                        message = Some(V::Ref(mh));
+                    }
+                }
+            }
+            if let Some(r) = args
+                .get(1)
+                .copied()
+                .filter(|v| matches!(v, V::Ref(_)))
+                .or(message)
+                .and_then(|v| if let V::Ref(h) = v { Some(h) } else { None })
+            {
                 // Handler posts land on the main looper — deferred so a
                 // re-posting callback can't spin inside its own frame.
                 // For sendMessage* the posted object is a Message —
