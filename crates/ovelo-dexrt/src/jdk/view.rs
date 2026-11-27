@@ -368,6 +368,8 @@ pub struct DexViewInfo {
     pub scroll_x: i32,
     /// Vertical scroll offset (`scrollTo`/`setScrollY`).
     pub scroll_y: i32,
+    /// LinearLayout orientation: true for vertical, false for horizontal.
+    pub linear_vertical: bool,
 }
 
 /// The activity's content view handle (what `setContentView` attached).
@@ -790,6 +792,7 @@ pub(crate) fn dex_view_info(vm: &Vm, h: u32) -> Option<DexViewInfo> {
                 _ => true,
             },
         },
+        linear_vertical: linear_vertical(vm, h),
         scroll_x: pint(vm, h, P_SCROLL_X),
         scroll_y: pint(vm, h, P_SCROLL_Y),
         max_lines: match attr_find(vm, h, "maxLines").or_else(|| attr_find(vm, h, "lines")) {
@@ -4260,7 +4263,7 @@ fn attrset_value(vm: &mut Vm, set: V, name: &str) -> Option<V> {
 /// `android:orientation` attr (0=horizontal, 1=vertical); the AOSP
 /// documented default is horizontal — except `TableLayout`, whose
 /// constructor forces VERTICAL, and `TableRow`, forced HORIZONTAL.
-fn linear_vertical(vm: &mut Vm, this: u32) -> bool {
+fn linear_vertical(vm: &Vm, this: u32) -> bool {
     if let Some(V::I32(o)) = pseudo_get(vm, this, P_ORIENTATION) {
         return o != 0;
     }

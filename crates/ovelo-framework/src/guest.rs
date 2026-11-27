@@ -371,6 +371,7 @@ fn make_dex_view(vm: &Vm, info: &ovelo_dexrt::DexViewInfo, fonts: &Rc<FontSet>) 
         g.clip_children = info.clip_children;
         g.scroll_x = info.scroll_x;
         g.scroll_y = info.scroll_y;
+        g.horizontal = !info.linear_vertical;
         GuestView::Group(g)
     } else if info.desc.contains("Button") {
         GuestView::Btn(Button::new("", 16.0, dark, fonts.clone()))
@@ -418,6 +419,10 @@ fn update_dex_view(g: &mut GuestView, info: &ovelo_dexrt::DexViewInfo) {
     if let GuestView::Group(gr) = g {
         if gr.clip_children != info.clip_children {
             gr.clip_children = info.clip_children;
+            gr.invalidate();
+        }
+        if gr.horizontal != !info.linear_vertical {
+            gr.horizontal = !info.linear_vertical;
             gr.invalidate();
         }
         if gr.scroll_x != info.scroll_x || gr.scroll_y != info.scroll_y {

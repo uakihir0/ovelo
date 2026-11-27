@@ -180,6 +180,8 @@ pub struct ViewGroup {
     pub scroll_x: i32,
     /// Vertical scroll offset; child drawing shifts opposite it.
     pub scroll_y: i32,
+    /// Linear children flow horizontally instead of vertically.
+    pub horizontal: bool,
 }
 
 impl ViewGroup {
@@ -193,6 +195,7 @@ impl ViewGroup {
             clip_children: true,
             scroll_x: 0,
             scroll_y: 0,
+            horizontal: false,
         }
     }
 
@@ -215,11 +218,16 @@ impl ViewGroup {
                 MeasureSpec::for_child(w, lp_w),
                 MeasureSpec::for_child(h, lp_h),
             );
-            mw = mw.max(cs.w);
-            if self.overlay {
+            if self.horizontal && !self.overlay {
+                mw += cs.w;
                 mh = mh.max(cs.h);
             } else {
-                mh += cs.h;
+                mw = mw.max(cs.w);
+                if self.overlay {
+                    mh = mh.max(cs.h);
+                } else {
+                    mh += cs.h;
+                }
             }
         }
         self.view.desired = Size { w: mw, h: mh };
@@ -231,16 +239,22 @@ impl ViewGroup {
     pub fn layout(&mut self, left: i32, top: i32) {
         self.view.layout(left, top);
         let mut y = top;
+        let mut x = left;
         for c in &mut self.children {
             // A guest-laid-out child carries its own rect relative to
             // this parent — stack offsets would double-position it.
             let (cl, ct) = match c.dex_frame() {
                 Some((fl, ft, _, _)) => (left + fl, top + ft),
+                None if self.horizontal && !self.overlay => (x, top),
                 None => (left, y),
             };
             c.layout(cl, ct);
             if !self.overlay {
-                y += c.measured().h;
+                if self.horizontal {
+                    x += c.measured().w;
+                } else {
+                    y += c.measured().h;
+                }
             }
         }
     }
