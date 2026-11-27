@@ -7013,13 +7013,19 @@ pub(crate) fn dispatch_touch(
                 let vw = pint(vm, v, P_RIGHT) - pint(vm, v, P_LEFT);
                 let vh = pint(vm, v, P_BOTTOM) - pint(vm, v, P_TOP);
                 let up_inside = x >= vx && x < vx + vw && y >= vy && y < vy + vh;
-                if up_inside && down_target != 0 && view_or_descendant(vm, v, down_target) {
-                    if dbg {
-                        eprintln!("[touchdbg] h{v} performClick listener={listener:?}");
-                    }
-                    if let Err(e) = vm.call_virtual(v, "performClick", &[]) {
-                        if crate::dbg_flag("OVELO_TOUCHDBG") {
-                            eprintln!("[touchdbg] performClick error: {e:?}");
+                if down_target != 0 && view_or_descendant(vm, v, down_target) {
+                    // The first clickable owner of the DOWN gesture
+                    // consumes UP even when the release is outside it;
+                    // otherwise cancelling a child button bubbles into
+                    // the parent row and fires the row's action.
+                    if up_inside {
+                        if dbg {
+                            eprintln!("[touchdbg] h{v} performClick listener={listener:?}");
+                        }
+                        if let Err(e) = vm.call_virtual(v, "performClick", &[]) {
+                            if crate::dbg_flag("OVELO_TOUCHDBG") {
+                                eprintln!("[touchdbg] performClick error: {e:?}");
+                            }
                         }
                     }
                     vm.touch_gesture_target = 0;
