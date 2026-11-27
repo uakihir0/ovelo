@@ -7009,7 +7009,11 @@ pub(crate) fn dispatch_touch(
                 || is_compound_desc(vm, &class_of(vm, V::Ref(v)));
             if clickable {
                 let down_target = vm.touch_gesture_target;
-                if down_target != 0 && view_or_descendant(vm, v, down_target) {
+                let (vx, vy) = abs_origin(vm, v);
+                let vw = pint(vm, v, P_RIGHT) - pint(vm, v, P_LEFT);
+                let vh = pint(vm, v, P_BOTTOM) - pint(vm, v, P_TOP);
+                let up_inside = x >= vx && x < vx + vw && y >= vy && y < vy + vh;
+                if up_inside && down_target != 0 && view_or_descendant(vm, v, down_target) {
                     if dbg {
                         eprintln!("[touchdbg] h{v} performClick listener={listener:?}");
                     }
