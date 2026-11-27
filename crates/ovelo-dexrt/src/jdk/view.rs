@@ -92,6 +92,7 @@ const P_DIALOG_BUTTON_WHICH: u32 = u32::MAX - 55;
 const P_DIALOG_HAS_BUTTONS: u32 = u32::MAX - 56;
 const P_DIALOG_POS_LISTENER: u32 = u32::MAX - 57;
 const P_DIALOG_NEG_LISTENER: u32 = u32::MAX - 58;
+const P_DIALOG_CONTENT: u32 = u32::MAX - 59;
 /// Dialog cancelable flag (`setCancelable(false)` stores 0).
 const P_DIALOG_CANCELABLE: u32 = u32::MAX - 34;
 /// Synthetic AlertDialog panel wrapping custom content.
@@ -8334,6 +8335,19 @@ fn layout_dialog_buttons(vm: &mut Vm, root: u32, width: i32, height: i32) {
     if buttons.is_empty() {
         return;
     }
+    if let Some(V::Ref(content)) = pseudo_get(vm, root, P_DIALOG_CONTENT) {
+        if content != 0 {
+            let content_h = (height - 52).max(0);
+            let spec = 0x4000_0000i32 | content_h;
+            let spec_w = 0x4000_0000i32 | width;
+            let _ = vm.call_virtual(content, "measure", &[V::I32(spec_w), V::I32(spec)]);
+            let _ = vm.call_virtual(
+                content,
+                "layout",
+                &[V::I32(0), V::I32(0), V::I32(width), V::I32(content_h)],
+            );
+        }
+    }
     let bw = 104;
     let bh = 42;
     let bottom = height - 8;
@@ -8509,6 +8523,7 @@ pub(crate) fn dialog_show(vm: &mut Vm, dialog: u32) {
         any_buttons = true;
     }
     pseudo_set(vm, root, P_DIALOG_HAS_BUTTONS, V::I32(any_buttons as i32));
+    pseudo_set(vm, root, P_DIALOG_CONTENT, V::Ref(content));
     let parent = activity_content(vm, vm.cur_activity).unwrap_or(0);
     if parent == 0 {
         return;
@@ -8528,13 +8543,18 @@ pub(crate) fn dialog_show(vm: &mut Vm, dialog: u32) {
         // Measure wrap-style custom content at most to the panel. Only a
         // dimension that remains empty is expanded: fixed-size content
         // must keep its bounds or its touch target would cover the panel.
+        let content_limit = if any_buttons {
+            (height - 52).max(1)
+        } else {
+            height
+        };
         let aw = 0x8000_0000u32 as i32 | width;
-        let ah = 0x8000_0000u32 as i32 | height;
+        let ah = 0x8000_0000u32 as i32 | content_limit;
         let _ = vm.call_virtual(content, "measure", &[V::I32(aw), V::I32(ah)]);
         let cw = pint(vm, content, P_MEAS_W).clamp(0, width);
-        let ch = pint(vm, content, P_MEAS_H).clamp(0, height);
+        let ch = pint(vm, content, P_MEAS_H).clamp(0, content_limit);
         let cw = if cw == 0 { width } else { cw };
-        let ch = if ch == 0 { height } else { ch };
+        let ch = if ch == 0 { content_limit } else { ch };
         let _ = vm.call_virtual(
             content,
             "layout",
