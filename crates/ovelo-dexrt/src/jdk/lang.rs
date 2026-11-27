@@ -200,8 +200,60 @@ fn java_str_hash(t: &str) -> i32 {
 // String
 
 fn string_call(vm: &mut Vm, name: &str, sig: &str, args: &[V]) -> Option<Option<V>> {
-    let t = sv(vm, args[0]).unwrap_or_default();
     let p = params(sig);
+    if name == "<init>" {
+        let V::Ref(h) = args.first().copied().unwrap_or(V::Ref(0)) else {
+            return Some(None);
+        };
+        let text = match p.first().copied().unwrap_or("") {
+            "[C" => {
+                let (arr_v, off, len) = if p.len() == 3 {
+                    (
+                        args.get(1).copied().unwrap_or(V::Ref(0)),
+                        i32v(args.get(2).copied().unwrap_or(V::I32(0))).max(0) as usize,
+                        i32v(args.get(3).copied().unwrap_or(V::I32(0))).max(0) as usize,
+                    )
+                } else {
+                    (args.get(1).copied().unwrap_or(V::Ref(0)), 0, usize::MAX)
+                };
+                match arr_v {
+                    V::Ref(ah) => match vm.heap.get(ah) {
+                        Some(Obj::Array { data, .. }) => {
+                            let units: Vec<u16> = data
+                                .iter()
+                                .skip(off)
+                                .take(len)
+                                .map(|v| i32v(*v) as u16)
+                                .collect();
+                            String::from_utf16_lossy(&units)
+                        }
+                        _ => String::new(),
+                    },
+                    _ => String::new(),
+                }
+            }
+            "[B" => {
+                let bytes = match args.get(1).copied().unwrap_or(V::Ref(0)) {
+                    V::Ref(ah) => match vm.heap.get(ah) {
+                        Some(Obj::Array { data, .. }) => {
+                            data.iter().map(|v| i32v(*v) as u8).collect::<Vec<u8>>()
+                        }
+                        _ => Vec::new(),
+                    },
+                    _ => Vec::new(),
+                };
+                String::from_utf8_lossy(&bytes).into_owned()
+            }
+            "Ljava/lang/String;" | "Ljava/lang/StringBuilder;" | "Ljava/lang/StringBuffer;" => {
+                sv(vm, args.get(1).copied().unwrap_or(V::Ref(0))).unwrap_or_default()
+            }
+            _ => String::new(),
+        };
+        let copy = jdynstr(vm, &text);
+        pseudo_set(vm, h, P_DATA, copy);
+        return Some(None);
+    }
+    let t = sv(vm, args[0]).unwrap_or_default();
     let r: Option<V> = match name {
         "length" => Some(V::I32(t.chars().count() as i32)),
         "isEmpty" => Some(V::I32(t.is_empty() as i32)),
