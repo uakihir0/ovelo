@@ -2579,6 +2579,7 @@ impl Vm {
         // by its view-tree parent; once detached and unreferenced it is
         // collected and drain_runnables prunes the stale handle.
         roots.extend(self.db_handles.values().copied());
+        roots.extend(self.services.values().copied());
         // Stopped services and coil delivery targets must survive until
         // the drain runs their onDestroy / attaches the drawable —
         // collecting either first silently drops the delivery.
