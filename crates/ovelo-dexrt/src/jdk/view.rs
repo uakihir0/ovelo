@@ -76,6 +76,9 @@ const P_VTO: u32 = u32::MAX - 25;
 /// `ImageView`'s current image: a `Bitmap` handle, a `Drawable`
 /// handle, or a `Uri`/res-id the renderer resolves.
 const P_IMAGE: u32 = u32::MAX - 27;
+/// Stable placeholder returned by `getDrawable()` before any image is
+/// set. Kept separate from P_IMAGE so it does not suppress XML src.
+const P_IMAGE_PLACEHOLDER: u32 = u32::MAX - 30;
 /// Pseudo key: a view's lazily-minted `Menu` (Toolbar.getMenu() etc.) /
 /// the menuish marker on the Menu itself (`I32(1)`).
 const P_MENU: u32 = 0xFFFD_FFF8;
@@ -783,13 +786,18 @@ fn image_drawable(vm: &mut Vm, this: u32) -> V {
     let Some(raw) = pseudo_get(vm, this, P_IMAGE) else {
         // No image was ever set (icon plumbing not wired). Android
         // allows null here, but Kotlin `!!`/mutate() chains NPE on
-        // it — hand back a stable placeholder drawable instead.
+        // it — hand back a stable placeholder drawable instead. Keep it
+        // out of P_IMAGE: constructors that probe getDrawable() before
+        // inflation must not suppress the XML src/srcCompat default.
+        if let Some(d) = pseudo_get(vm, this, P_IMAGE_PLACEHOLDER) {
+            return d;
+        }
         let d = host(
             vm,
             "Landroid/graphics/drawable/BitmapDrawable;",
             HostState::Empty,
         );
-        pseudo_set(vm, this, P_IMAGE, d);
+        pseudo_set(vm, this, P_IMAGE_PLACEHOLDER, d);
         return d;
     };
     if is_null(raw) || raw == V::I32(0) {
@@ -5389,13 +5397,18 @@ fn build_tree(vm: &mut Vm, elems: &[Element], ctx: V) -> V {
         // name) seed P_IMAGE; the renderer resolves the res-id. A dex
         // constructor that already set an image wins — in AOSP the
         // XML default only applies when the ctor leaves it unset.
-        if let Some(v) = el
-            .attrs
-            .iter()
-            .find(|a| a.name == "src" || a.name == "srcCompat")
-            .map(|a| attr_v(vm, &a.value))
-        {
-            pseudo_set(vm, h, P_IMAGE, v);
+        let image_unset = pseudo_get(vm, h, P_IMAGE)
+            .map(|v| is_null(v) || v == V::I32(0))
+            .unwrap_or(true);
+        if image_unset {
+            if let Some(v) = el
+                .attrs
+                .iter()
+                .find(|a| a.name == "src" || a.name == "srcCompat")
+                .map(|a| attr_v(vm, &a.value))
+            {
+                pseudo_set(vm, h, P_IMAGE, v);
+            }
         }
         while stack.last().is_some_and(|(d, _)| *d >= el.depth) {
             stack.pop();
