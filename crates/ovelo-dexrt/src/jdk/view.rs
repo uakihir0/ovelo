@@ -7152,11 +7152,11 @@ pub(crate) fn dispatch_touch(
             if matches!(dr, Ok(Some(rv)) if i32v(rv) != 0) {
                 return Ok(true);
             }
-            // AOSP dispatch already tries the view's own listener and
-            // onTouchEvent. Dex ViewGroup dispatch can legitimately
-            // decline before those paths in this reduced runtime (most
-            // importantly RecyclerView scrolling), so fall through and
-            // offer the event to them here as well.
+            v = match pseudo_get(vm, v, P_PARENT) {
+                Some(V::Ref(p)) => p,
+                _ => break,
+            };
+            continue;
         }
         if let Some(V::Ref(l)) = pseudo_get(vm, v, P_TOUCH_L) {
             if l != 0 {
