@@ -2658,6 +2658,16 @@ impl Vm {
     /// Run up to `max` queued runnables (main + worker queues).
     /// Returns how many completed — re-parked workers don't count.
     pub fn drain_runnables(&mut self, max: usize) -> usize {
+        self.drain_runnables_impl(max, false)
+    }
+
+    /// Drain only worker-side tasks. Blocking future waits must not
+    /// run unrelated main-loop callbacks ahead of their natural turn.
+    pub(crate) fn drain_worker_runnables(&mut self, max: usize) -> usize {
+        self.drain_runnables_impl(max, true)
+    }
+
+    fn drain_runnables_impl(&mut self, max: usize, workers_only: bool) -> usize {
         if self.draining {
             return 0;
         }
@@ -2778,22 +2788,28 @@ impl Vm {
             // enough main-queue work that a queued IO worker can remain
             // behind it indefinitely. Alternate sides when both are
             // present; fall back to whichever side has work.
-            let preferred = self.pending_runnables.iter().position(|(_, on_main)| {
-                if self.sched_prefer_worker {
-                    !on_main
-                } else {
-                    *on_main
-                }
-            });
-            let idx = preferred.or_else(|| {
-                self.pending_runnables.iter().position(|(_, on_main)| {
+            let idx = if workers_only {
+                self.pending_runnables
+                    .iter()
+                    .position(|(_, on_main)| !on_main)
+            } else {
+                let preferred = self.pending_runnables.iter().position(|(_, on_main)| {
                     if self.sched_prefer_worker {
-                        *on_main
-                    } else {
                         !on_main
+                    } else {
+                        *on_main
                     }
+                });
+                preferred.or_else(|| {
+                    self.pending_runnables.iter().position(|(_, on_main)| {
+                        if self.sched_prefer_worker {
+                            *on_main
+                        } else {
+                            !on_main
+                        }
+                    })
                 })
-            });
+            };
             let Some((r, on_main)) = idx.and_then(|i| self.pending_runnables.remove(i)) else {
                 break;
             };

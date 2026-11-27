@@ -35,7 +35,7 @@ pub(crate) fn call(
     vm: &mut Vm,
     class: &str,
     name: &str,
-    _sig: &str,
+    sig: &str,
     args: &[V],
 ) -> Rt<Option<Option<V>>> {
     Ok(
@@ -298,12 +298,52 @@ pub(crate) fn call(
                             // `get` blocks in Java; pump the cooperative
                             // scheduler for a bounded interval so the queued
                             // wrapper can complete before reading the slot.
-                            for _ in 0..64 {
-                                if !matches!(pseudo_get(vm, *h, P_FUTURE_DONE), Some(V::I32(0))) {
-                                    break;
+                            let timeout_ms =
+                                if sig == "(JLjava/util/concurrent/TimeUnit;)Ljava/lang/Object;" {
+                                    let unit =
+                                        lang::enum_ordinal(vm, *args.get(2).unwrap_or(&V::Ref(0)));
+                                    let d = i64v(args.get(1).copied().unwrap_or(V::I64(0)));
+                                    match unit {
+                                        0 => d / 1_000_000,
+                                        1 => d / 1_000,
+                                        2 => d,
+                                        3 => d.saturating_mul(1_000),
+                                        4 => d.saturating_mul(60_000),
+                                        5 => d.saturating_mul(3_600_000),
+                                        6 => d.saturating_mul(86_400_000),
+                                        _ => d,
+                                    }
+                                } else {
+                                    i64::MAX
+                                };
+                            if timeout_ms == 0 {
+                                if matches!(pseudo_get(vm, *h, P_FUTURE_DONE), Some(V::I32(0))) {
+                                    return Err(vm.throw_builtin(
+                                        "Ljava/util/concurrent/TimeoutException;",
+                                        "future not complete",
+                                    ));
                                 }
-                                if vm.drain_runnables(16) == 0 {
-                                    break;
+                            } else {
+                                let wait_ms = if sig == "()Ljava/lang/Object;" {
+                                    1_000
+                                } else {
+                                    timeout_ms.max(0)
+                                };
+                                let deadline = now_ms() + wait_ms;
+                                loop {
+                                    if !matches!(pseudo_get(vm, *h, P_FUTURE_DONE), Some(V::I32(0)))
+                                    {
+                                        break;
+                                    }
+                                    if now_ms() >= deadline || vm.drain_worker_runnables(16) == 0 {
+                                        if sig != "()Ljava/lang/Object;" {
+                                            return Err(vm.throw_builtin(
+                                                "Ljava/util/concurrent/TimeoutException;",
+                                                "future not complete",
+                                            ));
+                                        }
+                                        break;
+                                    }
                                 }
                             }
                         }
