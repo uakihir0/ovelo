@@ -7483,9 +7483,13 @@ impl Vm {
                         self.describe_method(fr.loc.midx)
                     );
                 }
-                match self.heap.get_mut(h) {
+                let message_obj = match self.heap.get_mut(h) {
                     Some(Obj::Instance { fields, .. }) | Some(Obj::Host { fields, .. }) => {
                         fields.insert(f, r(0)?);
+                        matches!(
+                            self.heap.get(h),
+                            Some(Obj::Host { desc, .. }) if desc == "Landroid/os/Message;"
+                        ) && self.dbg_field_name(f) == "Landroid/os/Message;.obj"
                     }
                     _ => {
                         return Err(E::Vm(errd(
@@ -7497,6 +7501,9 @@ impl Vm {
                             ),
                         )))
                     }
+                };
+                if message_obj {
+                    jdk::pseudo_set(self, h, jdk::P_MSG_OBJ, r(0)?);
                 }
             }
             // ---- static fields ----

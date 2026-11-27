@@ -5578,7 +5578,9 @@ fn res_misc(vm: &mut Vm, class: &str, name: &str, args: &[V]) -> Rt<Option<Optio
 fn handler_message_matches(vm: &Vm, r: u32, target: u32, what: V, obj: Option<V>) -> bool {
     pseudo_get(vm, r, P_MSG_TARGET) == Some(V::Ref(target))
         && pseudo_get(vm, r, P_MSG_WHAT) == Some(what)
-        && obj.is_none_or(|o| pseudo_get(vm, r, P_MSG_OBJ) == Some(o))
+        && obj.is_none_or(|o| {
+            matches!(o, V::Ref(0) | V::I32(0)) || pseudo_get(vm, r, P_MSG_OBJ) == Some(o)
+        })
 }
 
 fn handler_call(vm: &mut Vm, name: &str, args: &[V]) -> Rt<Option<Option<V>>> {
