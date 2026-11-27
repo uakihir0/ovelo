@@ -1672,7 +1672,7 @@ impl Vm {
     /// `args`' slot count. Used by the layout inflater: custom view
     /// classes (and bundled libs like material's NavigationView) get
     /// real constructor state, not an opaque host stub.
-    pub(crate) fn instantiate_with(&mut self, class_desc: &str, args: &[V]) -> Result<u32> {
+    pub fn instantiate_with(&mut self, class_desc: &str, args: &[V]) -> Result<u32> {
         let ty = self
             .type_index_of(class_desc)
             .ok_or_else(|| errd("dexrt.class.missing", class_desc.to_string()))?;
@@ -5258,6 +5258,12 @@ impl Vm {
             InvokeKind::Static | InvokeKind::Direct => match self.resolve_defined(midx) {
                 Ok(l) => l,
                 Err(_) => {
+                    if crate::dbg_flag("OVELO_STUBDBG") {
+                        eprintln!(
+                            "[stubdbg] unresolved direct/static {}",
+                            self.describe_method(midx)
+                        );
+                    }
                     return self.call_builtin(midx, &args, matches!(kind, InvokeKind::Direct));
                 }
             },
@@ -6060,6 +6066,56 @@ impl Vm {
     pub fn get_static_named(&mut self, owner: &str, name: &str) -> Option<V> {
         let g = self.field_index_of(owner, name)?;
         self.sget_pub(g)
+    }
+
+    /// Find a declared field by its type rather than its source-level
+    /// name. R8/ProGuard rename exactly the singleton/state fields this
+    /// is used for, while their declared types remain stable.
+    pub fn find_field_by_type(
+        &self,
+        owner: &str,
+        type_desc: &str,
+        is_static: bool,
+    ) -> Option<GIdx> {
+        let ty = self.type_index_of(owner)?;
+        let (cg, _) = self.def_loc_of(ty)?;
+        let cd = self.class_data_of(cg).ok()??;
+        let it = if is_static {
+            &cd.static_fields
+        } else {
+            &cd.instance_fields
+        };
+        it.iter()
+            .map(|f| gx(gd(cg), f.field_idx))
+            .find(|g| self.field_type_desc(*g).as_deref() == Some(type_desc))
+            .map(|g| self.canon_field(g))
+    }
+
+    /// Read/write a static selected by declared type (obfuscation-safe).
+    pub fn get_static_typed(&mut self, owner: &str, type_desc: &str) -> Option<V> {
+        let f = self.find_field_by_type(owner, type_desc, true)?;
+        self.sget_pub(f)
+    }
+
+    /// Write a static selected by declared type; returns false when the
+    /// owner declares no field of that type.
+    pub fn set_static_typed(&mut self, owner: &str, type_desc: &str, v: V) -> bool {
+        let Some(f) = self.find_field_by_type(owner, type_desc, true) else {
+            return false;
+        };
+        self.sput_pub(f, v);
+        true
+    }
+
+    /// Read an instance field selected by declared type.
+    pub fn get_object_field_typed(&self, h: u32, owner: &str, type_desc: &str) -> Option<V> {
+        let f = self.canon_field(self.find_field_by_type(owner, type_desc, false)?);
+        match self.heap.get(h) {
+            Some(Obj::Instance { fields, .. }) | Some(Obj::Host { fields, .. }) => {
+                fields.get(&f).copied()
+            }
+            _ => None,
+        }
     }
 
     /// Reflective static read for `Field.get(null)`. Unlike `sget`, a

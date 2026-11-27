@@ -781,16 +781,33 @@ fn register_compat_shims(
         "getInstance",
         "(Landroid/content/Context;)Landroidx/startup/AppInitializer;",
         Rc::new(RefCell::new(move |vm: &mut ovelo_dexrt::Vm, a: &[V]| {
-            // Provider ran: return the guest's own singleton — its
-            // mDiscovered/mInitialized carry the discovered state.
-            if provider_ran.get() {
-                if let Some(V::Ref(h)) =
-                    vm.get_static_named("Landroidx/startup/AppInitializer;", "sInstance")
+            // Return the guest's singleton when present. R8 renames
+            // sInstance in shipped apps, so select it by type rather
+            // than by its unobfuscated source name.
+            let owner = "Landroidx/startup/AppInitializer;";
+            if let Some(V::Ref(h)) = vm.get_static_typed(owner, owner) {
+                if h != 0 {
+                    return Ok(Some(V::Ref(h)));
+                }
+            }
+            let ctx = a.first().copied().unwrap_or(V::Ref(0));
+            // Prefer the dex constructor: obfuscated builds still use
+            // it to initialize the context/discovered/initialized
+            // fields under their real names. Populate the discovered
+            // HashSet through its guest API instead of writing named
+            // fields that no longer exist after R8.
+            if let Ok(aih) = vm.instantiate_with(owner, &[ctx]) {
+                vm.set_static_typed(owner, owner, V::Ref(aih));
+                if let Some(V::Ref(sh)) = vm
+                    .get_object_field_typed(aih, owner, "Ljava/util/HashSet;")
+                    .or_else(|| vm.get_object_field_typed(aih, owner, "Ljava/util/Set;"))
                 {
-                    if h != 0 {
-                        return Ok(Some(V::Ref(h)));
+                    for d in &discovered {
+                        let ch = vm.class_handle(d);
+                        let _ = vm.call_virtual(sh, "add", &[V::Ref(ch)]);
                     }
                 }
+                return Ok(Some(V::Ref(aih)));
             }
             let set = discovered
                 .iter()
