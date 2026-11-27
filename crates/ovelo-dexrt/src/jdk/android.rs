@@ -1830,6 +1830,23 @@ fn uri_call(vm: &mut Vm, name: &str, args: &[V]) -> Rt<Option<Option<V>>> {
 // ---------------------------------------------------------------------
 // Intent — map + pseudo fields for action/data/component
 
+fn clone_intent(vm: &mut Vm, h: u32) -> V {
+    let m: Vec<(V, V)> = match vm.heap.get(h) {
+        Some(Obj::Host {
+            state: HostState::Map(m),
+            ..
+        }) => m.clone(),
+        _ => vec![],
+    };
+    let nh = vm.alloc_host("Landroid/content/Intent;", HostState::Map(m));
+    for k in [P_ACTION, P_DATA, P_FLAGS, P_COMPONENT] {
+        if let Some(v) = pseudo_get(vm, h, k) {
+            pseudo_set(vm, nh, k, v);
+        }
+    }
+    V::Ref(nh)
+}
+
 fn intent_call(vm: &mut Vm, name: &str, sig: &str, args: &[V]) -> Rt<Option<Option<V>>> {
     let V::Ref(h) = args.first().copied().unwrap_or(V::Ref(0)) else {
         return Ok(None);
@@ -1958,22 +1975,7 @@ fn intent_call(vm: &mut Vm, name: &str, sig: &str, args: &[V]) -> Rt<Option<Opti
             }
             Some(Some(args[0]))
         }
-        "clone" => {
-            let m: Vec<(V, V)> = match vm.heap.get(h) {
-                Some(Obj::Host {
-                    state: HostState::Map(m),
-                    ..
-                }) => m.clone(),
-                _ => vec![],
-            };
-            let nh = vm.alloc_host("Landroid/content/Intent;", HostState::Map(m));
-            for k in [P_ACTION, P_DATA, P_FLAGS, P_COMPONENT] {
-                if let Some(v) = pseudo_get(vm, h, k) {
-                    pseudo_set(vm, nh, k, v);
-                }
-            }
-            Some(Some(V::Ref(nh)))
-        }
+        "clone" => Some(Some(clone_intent(vm, h))),
         "fillIn" | "filterEquals" | "filterHashCode" => Some(Some(V::I32(0))),
         "toUri" | "toInsecureString" | "toShortString" => Some(Some(jstr(vm, ""))),
         "getIntExtra" => Some(Some(
@@ -3155,7 +3157,7 @@ fn context_call(
                         _ => None,
                     };
                     if let Some(d) = desc {
-                        vm.pending_activity = Some((d, V::Ref(ih)));
+                        vm.pending_activity = Some((d, clone_intent(vm, ih)));
                     }
                 }
             }
