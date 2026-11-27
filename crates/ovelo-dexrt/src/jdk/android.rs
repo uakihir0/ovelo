@@ -1957,8 +1957,21 @@ fn job_call(vm: &mut Vm, class: &str, name: &str, args: &[V]) -> Rt<Option<Optio
             }
             Some(Some(V::I32(1)))
         }
-        ("Landroid/app/job/JobScheduler;", "cancel")
-        | ("Landroid/app/job/JobScheduler;", "cancelAll") => Some(None),
+        ("Landroid/app/job/JobScheduler;", "cancel") => {
+            let id = i32v(args.get(1).copied().unwrap_or(V::I32(0)));
+            let jobs = std::mem::take(&mut vm.pending_jobs);
+            vm.pending_jobs = jobs
+                .into_iter()
+                .filter(|(jh, _, _)| {
+                    pseudo_get(vm, *jh, P_FLAGS).unwrap_or(V::I32(0)) != V::I32(id)
+                })
+                .collect();
+            Some(None)
+        }
+        ("Landroid/app/job/JobScheduler;", "cancelAll") => {
+            vm.pending_jobs.clear();
+            Some(None)
+        }
         ("Landroid/app/job/JobService;", "jobFinished") => Some(None),
         _ => None,
     })
