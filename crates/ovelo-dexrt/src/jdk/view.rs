@@ -4709,8 +4709,10 @@ fn apply_ctor_style(vm: &mut Vm, this: u32, args: &[V]) {
         }
     }
     if pseudo_get(vm, this, P_TSIZE).is_none() && attr_find(vm, this, "textSize").is_none() {
-        if let Some(v) = ctor_style_value(vm, def_attr, def_res, 0x0101_0095) {
-            pseudo_set(vm, this, P_TSIZE, v);
+        if let Some(px) =
+            ctor_style_value(vm, def_attr, def_res, 0x0101_0095).and_then(|v| lp_px(vm, v))
+        {
+            pseudo_set(vm, this, P_TSIZE, V::F32(px as f32));
         }
     }
 }
