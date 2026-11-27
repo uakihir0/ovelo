@@ -214,6 +214,9 @@ impl Drawable for ViewGroup {
                 }
                 c.save();
                 c.clip_rect(Rect::new(self.view.left, self.view.top, s.w, s.h));
+                let (cl, ct) = ch.origin();
+                let cs = ch.measured();
+                c.clip_rect(Rect::new(cl, ct, cs.w, cs.h));
                 c.translate(-self.scroll_x, -self.scroll_y);
                 ch.draw(c);
                 c.restore();
