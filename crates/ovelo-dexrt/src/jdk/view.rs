@@ -1554,6 +1554,14 @@ pub(crate) fn call(
             Some(Some(v))
         }
         "generateDefaultLayoutParams" => Some(Some(default_lp(vm, this))),
+        // AOSP ViewGroup.checkLayoutParams is only `p != null`. Dex
+        // groups such as CoordinatorLayout invoke this exact base method;
+        // returning the void/stub default instead makes every generated
+        // LP look foreign and the subsequent copy-constructor wrap drops
+        // subclass state such as CoordinatorLayout's behavior reference.
+        "checkLayoutParams" => Some(Some(V::I32(
+            matches!(args.get(1), Some(V::Ref(h)) if *h != 0) as i32,
+        ))),
         "getChildCount" => {
             let n = children(vm, this).len();
             if crate::dbg_flag("OVELO_VIEWDBG") {
