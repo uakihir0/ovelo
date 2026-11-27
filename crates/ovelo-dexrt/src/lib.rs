@@ -2895,9 +2895,10 @@ impl Vm {
         child: u32,
         idx: Option<usize>,
         lp: Option<V>,
+        notify: bool,
     ) {
         if parent != 0 && child != 0 {
-            jdk::view::attach_at(self, parent, V::Ref(child), idx, true, lp);
+            jdk::view::attach_at(self, parent, V::Ref(child), idx, notify, lp);
         }
     }
 

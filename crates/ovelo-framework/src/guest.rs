@@ -670,7 +670,7 @@ impl GuestUi {
                     "(Landroid/view/View;ILandroid/view/ViewGroup$LayoutParams;)V",
                 ),
             ] {
-                Self::on_rc(ui, vm, cls, name, sig, |ui, vm, a| {
+                Self::on_rc(ui, vm, cls, name, sig, move |ui, vm, a| {
                     let this = ref_arg(a, 0)?;
                     let child = ref_arg(a, 1)?;
                     // Boolean-returning overloads must produce a value
@@ -718,7 +718,13 @@ impl GuestUi {
                     // siblings added meanwhile. Fresh calls (including
                     // legit re-attaches that move the child) always run.
                     if !(vm.host_retrying() && vm.view_parent_of(child) == Some(this)) {
-                        vm.view_tree_attach_at(this, child, idx, lp);
+                        vm.view_tree_attach_at(
+                            this,
+                            child,
+                            idx,
+                            lp,
+                            !matches!(name, "attachViewToParent" | "attachViewToParentInLayout"),
+                        );
                     }
                     // Bridged parents adopt dex-view-tree children too —
                     // materialize them so e.g. ViewPager2's empty
