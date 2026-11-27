@@ -630,6 +630,8 @@ pub struct Vm {
     pub activity_callers: HashMap<u32, (u32, i32)>,
     /// Theme resource selected while each activity is foregrounded.
     pub activity_themes: HashMap<u32, u32>,
+    /// Activities whose options menu was already created.
+    pub activity_menu_created: hashbrown::HashSet<u32>,
     /// canonical class_idx → `java.lang.Class` mirror handle — Class
     /// objects are singletons (`Foo.class == x.getClass()`).
     class_mirrors: HashMap<GIdx, u32>,
@@ -905,6 +907,7 @@ impl Vm {
             pending_activity_caller: None,
             activity_callers: HashMap::new(),
             activity_themes: HashMap::new(),
+            activity_menu_created: hashbrown::HashSet::new(),
             pending_runnables: std::collections::VecDeque::new(),
             single_executors: hashbrown::HashSet::new(),
             executor_queues: HashMap::new(),

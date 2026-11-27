@@ -4567,8 +4567,22 @@ fn array_bytes(vm: &Vm, array: V, offset: usize, len: Option<usize>) -> Vec<u8> 
 fn key_spec_call(vm: &mut Vm, name: &str, args: &[V]) -> Rt<Option<Option<V>>> {
     Ok(Some(match name {
         "<init>" => {
-            let bytes = array_bytes(vm, args.get(1).copied().unwrap_or(V::Ref(0)), 0, None);
-            let algorithm = args.get(2).and_then(|v| sv(vm, *v)).unwrap_or_default();
+            let (bytes, algorithm) = if args.len() >= 5 {
+                (
+                    array_bytes(
+                        vm,
+                        args.get(1).copied().unwrap_or(V::Ref(0)),
+                        i32v(args[2]).max(0) as usize,
+                        Some(i32v(args[3]).max(0) as usize),
+                    ),
+                    args.get(4).and_then(|v| sv(vm, *v)).unwrap_or_default(),
+                )
+            } else {
+                (
+                    array_bytes(vm, args.get(1).copied().unwrap_or(V::Ref(0)), 0, None),
+                    args.get(2).and_then(|v| sv(vm, *v)).unwrap_or_default(),
+                )
+            };
             replace_host_state(
                 vm,
                 args[0],
@@ -4648,7 +4662,13 @@ fn mac_compute(algorithm: &str, key: &[u8], data: &[u8]) -> Option<Vec<u8>> {
 fn mac_input_bytes(vm: &Vm, args: &[V]) -> Vec<u8> {
     match args.len() {
         2 => match args.get(1).copied().unwrap_or(V::I32(0)) {
-            v @ V::Ref(_) => array_bytes(vm, v, 0, None),
+            v @ V::Ref(h) => match vm.heap.get(h) {
+                Some(Obj::Host {
+                    state: HostState::Slot(V::Ref(_)),
+                    ..
+                }) => bb_bytes(vm, h).0,
+                _ => array_bytes(vm, v, 0, None),
+            },
             v => vec![i32v(v) as u8],
         },
         4 => array_bytes(
@@ -4721,6 +4741,7 @@ fn mac_call(vm: &mut Vm, name: &str, args: &[V]) -> Rt<Option<Option<V>>> {
             None
         }
         "doFinal" => {
+            let output_target = args.len() == 3;
             if args.len() == 2 {
                 let bytes = mac_input_bytes(vm, args);
                 if let Some(V::Ref(h)) = args.first() {
@@ -4758,7 +4779,21 @@ fn mac_call(vm: &mut Vm, name: &str, args: &[V]) -> Rt<Option<Option<V>>> {
                 );
             }
             let out = mac_compute(&state.0, &state.1, &state.2).unwrap_or_default();
-            Some(byte_arr(vm, &out))
+            if output_target {
+                let offset = i32v(args[2]).max(0) as usize;
+                if let V::Ref(array_h) = args[1] {
+                    if let Some(Obj::Array { data, .. }) = vm.heap.get_mut(array_h) {
+                        for (i, byte) in out.iter().enumerate() {
+                            if let Some(slot) = data.get_mut(offset + i) {
+                                *slot = V::I32(*byte as i8 as i32);
+                            }
+                        }
+                    }
+                }
+                None
+            } else {
+                Some(byte_arr(vm, &out))
+            }
         }
         "reset" => {
             if let Some(V::Ref(h)) = args.first() {

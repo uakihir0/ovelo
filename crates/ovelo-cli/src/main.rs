@@ -1291,6 +1291,9 @@ fn run_activity_cbs(vm: &mut ovelo_dexrt::Vm, this: u32, callbacks: &[String]) {
         if cb == "onResume" {
             let menu = vm.menu_for(this);
             for menu_cb in ["onCreateOptionsMenu", "onPrepareOptionsMenu"] {
+                if menu_cb == "onCreateOptionsMenu" && !vm.activity_menu_created.insert(this) {
+                    continue;
+                }
                 vm.call_virtual(this, menu_cb, &[menu])
                     .inspect_err(|e| println!("callback {menu_cb} crashed: {e}"))
                     .ok();
