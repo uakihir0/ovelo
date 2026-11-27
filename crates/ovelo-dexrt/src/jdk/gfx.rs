@@ -149,6 +149,16 @@ fn mat_point(m: [f32; 6], x: f32, y: f32) -> (f32, f32) {
     (m[0] * x + m[1] * y + m[2], m[3] * x + m[4] * y + m[5])
 }
 
+fn inv_mat_point(m: [f32; 6], x: f32, y: f32) -> (f32, f32) {
+    let det = m[0] * m[4] - m[1] * m[3];
+    if det.abs() <= f32::EPSILON {
+        return (f32::INFINITY, f32::INFINITY);
+    }
+    let x = x - m[2];
+    let y = y - m[5];
+    ((m[4] * x - m[1] * y) / det, (-m[3] * x + m[0] * y) / det)
+}
+
 fn flatten_path_cmds(cmds: &[PathCmd], m: [f32; 6]) -> Vec<Vec<(f32, f32)>> {
     let mut out: Vec<Vec<(f32, f32)>> = Vec::new();
     let mut cur = (0.0f32, 0.0f32);
@@ -260,10 +270,26 @@ fn stroke_seg_dist(px: f32, py: f32, a: (f32, f32), b: (f32, f32)) -> f32 {
     ((px - x).powi(2) + (py - y).powi(2)).sqrt()
 }
 
+fn mat_stroke_segment_scale(inverse_m: [f32; 6], a: (f32, f32), b: (f32, f32)) -> f32 {
+    let dx = b.0 - a.0;
+    let dy = b.1 - a.1;
+    let len = (dx * dx + dy * dy).sqrt();
+    if len <= f32::EPSILON {
+        return 1.0;
+    }
+    let ux = dx / len;
+    let uy = dy / len;
+    let tx = inverse_m[0] * ux + inverse_m[1] * uy;
+    let ty = inverse_m[3] * ux + inverse_m[4] * uy;
+    (tx * tx + ty * ty).sqrt().max(1.0)
+}
+
 fn raster_stroke_to_bitmap(
     vm: &mut Vm,
     dst_h: u32,
-    contours: &[Vec<(f32, f32)>],
+    src_contours: &[Vec<(f32, f32)>],
+    dst_contours: &[Vec<(f32, f32)>],
+    inverse_m: [f32; 6],
     paint: PaintState,
 ) {
     let (bw, bh, base) = match vm.heap.get(dst_h) {
@@ -279,19 +305,23 @@ fn raster_stroke_to_bitmap(
     let radius = (paint.stroke_w / 2.0).max(0.5);
     let mut out = base.as_ref().clone();
     let mut covered = vec![false; (bw * bh) as usize];
-    for pts in contours {
-        for seg in pts.windows(2) {
-            let (a, b) = (seg[0], seg[1]);
-            let minx = ((a.0.min(b.0) - radius).floor() as i32).max(0);
-            let maxx = ((a.0.max(b.0) + radius).ceil() as i32).min(bw as i32 - 1);
-            let miny = ((a.1.min(b.1) - radius).floor() as i32).max(0);
-            let maxy = ((a.1.max(b.1) + radius).ceil() as i32).min(bh as i32 - 1);
+    for (src_pts, dst_pts) in src_contours.iter().zip(dst_contours) {
+        for (src_seg, dst_seg) in src_pts.windows(2).zip(dst_pts.windows(2)) {
+            let (sa, sb) = (src_seg[0], src_seg[1]);
+            let (da, db) = (dst_seg[0], dst_seg[1]);
+            let scale = mat_stroke_segment_scale(inverse_m, sa, sb);
+            let scan_radius = radius * scale;
+            let minx = ((da.0.min(db.0) - scan_radius).floor() as i32).max(0);
+            let maxx = ((da.0.max(db.0) + scan_radius).ceil() as i32).min(bw as i32 - 1);
+            let miny = ((da.1.min(db.1) - scan_radius).floor() as i32).max(0);
+            let maxy = ((da.1.max(db.1) + scan_radius).ceil() as i32).min(bh as i32 - 1);
             for yy in miny..=maxy {
                 for xx in minx..=maxx {
                     let px = xx as f32 + 0.5;
                     let py = yy as f32 + 0.5;
+                    let (sx, sy) = inv_mat_point(inverse_m, px, py);
                     let pi = (yy as u32 * bw + xx as u32) as usize;
-                    if !covered[pi] && stroke_seg_dist(px, py, a, b) <= radius {
+                    if !covered[pi] && stroke_seg_dist(sx, sy, sa, sb) <= radius {
                         covered[pi] = true;
                         blend_px(&mut out, pi * 4, paint.draw_argb());
                     }
@@ -306,12 +336,6 @@ fn raster_stroke_to_bitmap(
     {
         *dst = std::rc::Rc::new(out);
     }
-}
-
-fn mat_stroke_scale(m: [f32; 6]) -> f32 {
-    let sx = (m[0] * m[0] + m[3] * m[3]).sqrt();
-    let sy = (m[1] * m[1] + m[4] * m[4]).sqrt();
-    ((sx + sy) / 2.0).max(f32::EPSILON)
 }
 
 fn raster_path_to_bitmap(
@@ -336,10 +360,9 @@ fn raster_path_to_bitmap(
     if contours.is_empty() {
         return;
     }
-    let mut stroke_paint = paint;
-    stroke_paint.stroke_w *= mat_stroke_scale(m);
+    let src_contours = flatten_path_cmds(cmds, [1.0, 0.0, 0.0, 0.0, 1.0, 0.0]);
     if paint.style == 1 {
-        raster_stroke_to_bitmap(vm, dst_h, &contours, stroke_paint);
+        raster_stroke_to_bitmap(vm, dst_h, &src_contours, &contours, m, paint);
         return;
     }
     let even_odd = fill_type % 2 == 1;
@@ -390,7 +413,7 @@ fn raster_path_to_bitmap(
         *dst = std::rc::Rc::new(out);
     }
     if paint.style != 0 {
-        raster_stroke_to_bitmap(vm, dst_h, &contours, stroke_paint);
+        raster_stroke_to_bitmap(vm, dst_h, &src_contours, &contours, m, paint);
     }
 }
 
