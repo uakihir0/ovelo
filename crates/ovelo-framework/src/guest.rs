@@ -373,13 +373,16 @@ fn make_dex_view(vm: &Vm, info: &ovelo_dexrt::DexViewInfo, fonts: &Rc<FontSet>) 
         g.scroll_y = info.scroll_y;
         g.horizontal = !info.linear_vertical;
         GuestView::Group(g)
-    } else if info.compound_checked.is_some()
-        || info.desc.contains("CompoundButton")
+    } else if info.desc.contains("CompoundButton")
         || info.desc.contains("CheckBox")
         || info.desc.contains("RadioButton")
         || info.desc.contains("Switch")
         || vm.extends_named(&info.desc, "CompoundButton")
-        || info.text.is_some()
+    {
+        GuestView::Text(TextView::new("", 16.0, dark, fonts.clone()))
+    } else if info.desc.contains("Button") {
+        GuestView::Btn(Button::new("", 16.0, dark, fonts.clone()))
+    } else if info.text.is_some()
         || info.desc.contains("TextView")
         || info.desc.contains("EditText")
         // Name checks miss TextView descendants whose names don't
@@ -388,8 +391,6 @@ fn make_dex_view(vm: &Vm, info: &ovelo_dexrt::DexViewInfo, fonts: &Rc<FontSet>) 
         || vm.extends_named(&info.desc, "TextView")
     {
         GuestView::Text(TextView::new("", 16.0, dark, fonts.clone()))
-    } else if info.desc.contains("Button") {
-        GuestView::Btn(Button::new("", 16.0, dark, fonts.clone()))
     } else {
         GuestView::Plain(View::new(lp.0, lp.1, Size::default()))
     }
