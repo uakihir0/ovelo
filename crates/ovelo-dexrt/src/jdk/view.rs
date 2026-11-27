@@ -8516,17 +8516,25 @@ fn menu_add_entry(
         // callback point through which ActionMenuPresenter materializes
         // toolbar items. Mirror the resulting item into the host backing
         // store only for compatibility queries (`findItem`, `size`).
-        match vm.call_virtual_direct(
+        // `add` has an `(IIII)` resource-id overload with the same arity
+        // as `(IIILjava/lang/CharSequence;)`; the loose name/arity resolver
+        // can pick the former and turn every title into the empty string.
+        let sig = if sub {
+            "(IIILjava/lang/CharSequence;)Landroid/view/SubMenu;"
+        } else {
+            "(IIILjava/lang/CharSequence;)Landroid/view/MenuItem;"
+        };
+        match vm.call_exact_direct(
             menu_h,
+            "Landroidx/appcompat/view/menu/MenuBuilder;",
             m,
+            sig,
             &[V::I32(group), V::I32(id), V::I32(order), title_v],
         ) {
             Ok(Some(it)) => {
-                // Host compatibility accessors (`getTitleCondensed` and
-                // friends) sit in front of the dex item, so mirror the
-                // constructor-time metadata that MenuBuilder.add set on
-                // its real fields. ActionMenuItemView.initialize depends
-                // on that title to size and draw the action button.
+                // Mirror constructor metadata for the host compatibility
+                // store (`findItem`/`size`); the dex fields remain the
+                // authoritative state consumed by ActionMenuPresenter.
                 if let V::Ref(ih) = it {
                     pseudo_set(vm, ih, P_MENU_ID, V::I32(id));
                     pseudo_set(vm, ih, P_MENU_GROUP, V::I32(group));
