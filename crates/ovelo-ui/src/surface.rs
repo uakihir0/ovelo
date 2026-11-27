@@ -304,11 +304,11 @@ impl Surface {
         let (dx, dy) = ((x1 - x0) as f32, (y1 - y0) as f32);
         let len2 = dx * dx + dy * dy;
         let minx = ((x0.min(x1) as f32 - half).floor() as i32).max(clip.x);
-        let maxx = ((x0.max(x1) as f32 + half).ceil() as i32).min(clip.x1);
+        let maxx = ((x0.max(x1) as f32 + half).ceil() as i32).min(clip.x1 - 1);
         let miny = ((y0.min(y1) as f32 - half).floor() as i32).max(clip.y);
-        let maxy = ((y0.max(y1) as f32 + half).ceil() as i32).min(clip.y1);
-        for y in miny..maxy {
-            for x in minx..maxx {
+        let maxy = ((y0.max(y1) as f32 + half).ceil() as i32).min(clip.y1 - 1);
+        for y in miny..=maxy {
+            for x in minx..=maxx {
                 let t = if len2 == 0.0 {
                     0.0
                 } else {
