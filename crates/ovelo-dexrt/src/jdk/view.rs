@@ -5139,6 +5139,34 @@ fn measure_child(
             eprintln!("[viewdbg] measureChild h{child} err {e}");
         }
     }
+    // AOSP ScrollView fillViewport: when the content is smaller than
+    // the viewport, remeasure it at the viewport extent so match_parent
+    // weighted content still fills the visible window.
+    let fill_viewport = matches!(attr_find(vm, parent, "fillViewport"), Some(V::I32(v)) if v != 0);
+    if fill_viewport && parent_desc.contains("ScrollView") {
+        const EXACTLY: i32 = 1 << 30;
+        const SIZE_MASK: i32 = 0x3FFF_FFFF;
+        let horizontal = parent_desc.contains("HorizontalScrollView");
+        let (spec, measured, margin) = if horizontal {
+            (
+                (pw & SIZE_MASK) - pad_w - ml - mr,
+                pint(vm, child, P_MEAS_W) & 0x00FF_FFFF,
+                ml + mr,
+            )
+        } else {
+            (
+                (ph & SIZE_MASK) - pad_h - mt - mb,
+                pint(vm, child, P_MEAS_H) & 0x00FF_FFFF,
+                mt + mb,
+            )
+        };
+        let viewport = (spec + margin).max(0);
+        if measured < viewport {
+            let fs = EXACTLY | viewport;
+            let (rws, rhs) = if horizontal { (fs, hs) } else { (ws, fs) };
+            let _ = vm.call_virtual(child, "measure", &[V::I32(rws), V::I32(rhs)]);
+        }
+    }
 }
 
 fn view_is_gone(vm: &mut Vm, h: u32) -> bool {
@@ -5478,135 +5506,165 @@ fn group_measure_fallback(vm: &mut Vm, this: u32, pw: i32, ph: i32) {
         let axis_size = (if linear_v { ph } else { pw }) & 0x3FFF_FFFF;
         let axis_total = if linear_v { chh } else { cw };
         let axis_pad = if linear_v { pad_h } else { pad_w };
-        let remaining = (axis_size - axis_pad - axis_total).max(0);
-        if remaining > 0 {
-            let mut total_weight = 0f32;
-            let mut shares: Vec<(u32, f32)> = Vec::new();
-            for c in kids.iter().copied() {
-                let V::Ref(ch) = c else { continue };
-                if ch == 0 || view_is_gone(vm, ch) {
+        struct WeightedChild {
+            ch: u32,
+            weight: f32,
+            axis_dim: i32,
+            old_axis: i32,
+            old_total: i32,
+            margin: i32,
+            ml: i32,
+            mv: i32,
+        }
+        let mut total_weight = 0f32;
+        let mut weighted_total = 0i32;
+        let mut shares: Vec<WeightedChild> = Vec::new();
+        for c in kids.iter().copied() {
+            let V::Ref(ch) = c else { continue };
+            if ch == 0 || view_is_gone(vm, ch) {
+                continue;
+            }
+            let lp_obj = match pseudo_get(vm, ch, P_LP) {
+                Some(V::Ref(l)) => l,
+                _ => 0,
+            };
+            let weight = lp_field_t(vm, lp_obj, "weight", "F")
+                .map(|v| match v {
+                    V::F32(f) => f,
+                    V::F64(f) => f as f32,
+                    V::I32(i) => f32::from_bits(i as u32),
+                    V::I64(l) => f64::from_bits(l as u64) as f32,
+                    _ => 0.0,
+                })
+                .or_else(|| {
+                    lp_field(vm, lp_obj, "weight")
+                        .or_else(|| attr_find(vm, ch, "layout_weight"))
+                        .map(|v| match v {
+                            V::F32(f) => f,
+                            V::I32(i) => i as f32,
+                            _ => 0.0,
+                        })
+                })
+                .unwrap_or(0.0);
+            if weight <= 0.0 {
+                continue;
+            }
+            let lp_dim = |field: &str, xml: &str| -> i32 {
+                lp_field(vm, lp_obj, field)
+                    .and_then(|v| lp_px(vm, v))
+                    .or_else(|| attr_find(vm, ch, xml).map(|v| len_v(vm, v)))
+                    .unwrap_or(-2)
+            };
+            let axis_dim = if linear_v {
+                lp_dim("height", "layout_height")
+            } else {
+                lp_dim("width", "layout_width")
+            };
+            let ml = lp_field(vm, lp_obj, "leftMargin")
+                .and_then(|f| lp_px(vm, f))
+                .unwrap_or(0)
+                + lp_field(vm, lp_obj, "rightMargin")
+                    .and_then(|f| lp_px(vm, f))
+                    .unwrap_or(0);
+            let mv = lp_field(vm, lp_obj, "topMargin")
+                .and_then(|f| lp_px(vm, f))
+                .unwrap_or(0)
+                + lp_field(vm, lp_obj, "bottomMargin")
+                    .and_then(|f| lp_px(vm, f))
+                    .unwrap_or(0);
+            let margin = if linear_v { mv } else { ml };
+            let old_axis = if linear_v {
+                pint(vm, ch, P_MEAS_H) & 0x00FF_FFFF
+            } else {
+                pint(vm, ch, P_MEAS_W) & 0x00FF_FFFF
+            };
+            let old_total = old_axis + margin;
+            // MATCH_PARENT/zero weighted children are initially measured
+            // at the whole parent extent. Exclude that speculative extent
+            // from the free-space calculation; their real extent is the
+            // proportional share assigned below.
+            if matches!(axis_dim, -1 | 0) {
+                weighted_total += old_total;
+            }
+            shares.push(WeightedChild {
+                ch,
+                weight,
+                axis_dim,
+                old_axis,
+                old_total,
+                margin,
+                ml,
+                mv,
+            });
+            total_weight += weight;
+        }
+        if total_weight > 0.0 {
+            let base_total = axis_total - weighted_total;
+            let distributable = (axis_size - axis_pad - base_total).max(0);
+            let wsum = attr_find(vm, this, "weightSum")
+                .map(|v| match v {
+                    V::F32(f) => f,
+                    V::I32(i) => i as f32,
+                    _ => 0.0,
+                })
+                .unwrap_or(0.0);
+            let wsum = if wsum > 0.0 { wsum } else { total_weight };
+            let mut final_total = base_total;
+            for item in shares {
+                if item.axis_dim > 0 {
+                    final_total += item.old_total;
                     continue;
                 }
-                let lp_obj = match pseudo_get(vm, ch, P_LP) {
-                    Some(V::Ref(l)) => l,
-                    _ => 0,
+                let share = (distributable as f32 * item.weight / wsum) as i32;
+                let new_axis = if matches!(item.axis_dim, -1 | 0) {
+                    share
+                } else {
+                    item.old_axis + share
                 };
-                // `weight` is a float LP field — try F first so a
-                // runtime `lp.weight = 0` overrides the XML attr. Dex
-                // registers are untyped: an F field write can land as
-                // raw I32 bits — reinterpret via from_bits (1065353216
-                // must read as 1.0, not a billion).
-                let w = lp_field_t(vm, lp_obj, "weight", "F")
-                    .map(|v| match v {
-                        V::F32(f) => f,
-                        V::F64(f) => f as f32,
-                        V::I32(i) => f32::from_bits(i as u32),
-                        V::I64(l) => f64::from_bits(l as u64) as f32,
-                        _ => 0.0,
-                    })
-                    .or_else(|| {
-                        lp_field(vm, lp_obj, "weight")
-                            .or_else(|| attr_find(vm, ch, "layout_weight"))
-                            .map(|v| match v {
-                                V::F32(f) => f,
-                                V::I32(i) => i as f32,
-                                _ => 0.0,
-                            })
-                    })
-                    .unwrap_or(0.0);
-                if w > 0.0 {
-                    shares.push((ch, w));
-                    total_weight += w;
-                }
-            }
-            if total_weight > 0.0 {
-                let wsum = attr_find(vm, this, "weightSum")
-                    .map(|v| match v {
-                        V::F32(f) => f,
-                        V::I32(i) => i as f32,
-                        _ => 0.0,
-                    })
-                    .unwrap_or(0.0);
-                let wsum = if wsum > 0.0 { wsum } else { total_weight };
-                let mut added = 0i32;
-                for (ch, w) in shares {
-                    let share = (remaining as f32 * w / wsum) as i32;
-                    if share <= 0 {
-                        continue;
-                    }
-                    let lp_obj = match pseudo_get(vm, ch, P_LP) {
+                let lp_dim = |field: &str, xml: &str| -> i32 {
+                    let lp_obj = match pseudo_get(vm, item.ch, P_LP) {
                         Some(V::Ref(l)) => l,
                         _ => 0,
                     };
-                    let lp_dim = |field: &str, xml: &str| -> i32 {
-                        lp_field(vm, lp_obj, field)
-                            .and_then(|v| lp_px(vm, v))
-                            .or_else(|| attr_find(vm, ch, xml).map(|v| len_v(vm, v)))
-                            .unwrap_or(-2)
-                    };
-                    let ml = lp_field(vm, lp_obj, "leftMargin")
-                        .and_then(|f| lp_px(vm, f))
-                        .unwrap_or(0)
-                        + lp_field(vm, lp_obj, "rightMargin")
-                            .and_then(|f| lp_px(vm, f))
-                            .unwrap_or(0);
-                    let mv = lp_field(vm, lp_obj, "topMargin")
-                        .and_then(|f| lp_px(vm, f))
-                        .unwrap_or(0)
-                        + lp_field(vm, lp_obj, "bottomMargin")
-                            .and_then(|f| lp_px(vm, f))
-                            .unwrap_or(0);
-                    // AOSP: `skippedMeasure` (axis lp dim == 0) gets
-                    // EXACTLY(share); a fixed axis dim wins via
-                    // getChildMeasureSpec and is left alone; a
-                    // wrap/match axis grows by content + share.
-                    let axis_dim = if linear_v {
-                        lp_dim("height", "layout_height")
-                    } else {
-                        lp_dim("width", "layout_width")
-                    };
-                    if axis_dim > 0 {
-                        continue;
-                    }
-                    let old_axis = if linear_v {
-                        pint(vm, ch, P_MEAS_H) & 0x00FF_FFFF
-                    } else {
-                        pint(vm, ch, P_MEAS_W) & 0x00FF_FFFF
-                    };
-                    let new_axis = old_axis + share;
-                    let (ws, hs) = if linear_v {
-                        (
-                            child_measure_spec(pw, pad_w + ml, lp_dim("width", "layout_width")),
-                            EXACTLY | new_axis,
-                        )
-                    } else {
-                        (
-                            EXACTLY | new_axis,
-                            child_measure_spec(ph, pad_h + mv, lp_dim("height", "layout_height")),
-                        )
-                    };
-                    if vm
-                        .call_virtual(ch, "measure", &[V::I32(ws), V::I32(hs)])
-                        .is_ok()
-                    {
-                        added += new_axis - old_axis;
-                        let new_cross = if linear_v {
-                            pint(vm, ch, P_MEAS_W) & 0x00FF_FFFF
-                        } else {
-                            pint(vm, ch, P_MEAS_H) & 0x00FF_FFFF
-                        };
-                        if linear_v {
-                            cw = cw.max(new_cross + ml);
-                        } else {
-                            chh = chh.max(new_cross + mv);
-                        }
-                    }
-                }
-                if linear_v {
-                    chh += added;
+                    lp_field(vm, lp_obj, field)
+                        .and_then(|v| lp_px(vm, v))
+                        .or_else(|| attr_find(vm, item.ch, xml).map(|v| len_v(vm, v)))
+                        .unwrap_or(-2)
+                };
+                let (ws, hs) = if linear_v {
+                    (
+                        child_measure_spec(pw, pad_w + item.ml, lp_dim("width", "layout_width")),
+                        EXACTLY | new_axis.max(0),
+                    )
                 } else {
-                    cw += added;
+                    (
+                        EXACTLY | new_axis.max(0),
+                        child_measure_spec(ph, pad_h + item.mv, lp_dim("height", "layout_height")),
+                    )
+                };
+                if vm
+                    .call_virtual(item.ch, "measure", &[V::I32(ws), V::I32(hs)])
+                    .is_ok()
+                {
+                    final_total += new_axis.max(0) + item.margin;
+                    let new_cross = if linear_v {
+                        pint(vm, item.ch, P_MEAS_W) & 0x00FF_FFFF
+                    } else {
+                        pint(vm, item.ch, P_MEAS_H) & 0x00FF_FFFF
+                    };
+                    if linear_v {
+                        cw = cw.max(new_cross + item.ml);
+                    } else {
+                        chh = chh.max(new_cross + item.mv);
+                    }
+                } else {
+                    final_total += item.old_total;
                 }
+            }
+            if linear_v {
+                chh = final_total;
+            } else {
+                cw = final_total;
             }
         }
     }
