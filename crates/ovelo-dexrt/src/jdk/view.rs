@@ -79,6 +79,11 @@ const P_IMAGE: u32 = u32::MAX - 27;
 /// Stable placeholder returned by `getDrawable()` before any image is
 /// set. Kept separate from P_IMAGE so it does not suppress XML src.
 const P_IMAGE_PLACEHOLDER: u32 = u32::MAX - 30;
+/// Internal popup state: root view attached over the activity and the
+/// ListPopupWindow/row position carried by synthetic row listeners.
+const P_POPUP_ROOT: u32 = u32::MAX - 31;
+const P_POPUP_OWNER: u32 = u32::MAX - 32;
+const P_POPUP_POS: u32 = u32::MAX - 33;
 /// Pseudo key: a view's lazily-minted `Menu` (Toolbar.getMenu() etc.) /
 /// the menuish marker on the Menu itself (`I32(1)`).
 const P_MENU: u32 = 0xFFFD_FFF8;
@@ -917,6 +922,7 @@ pub(crate) fn is_viewish(vm: &Vm, class: &str, args: &[V]) -> bool {
             | "Landroidx/appcompat/view/SupportMenuInflater;"
             | "Landroidx/appcompat/view/menu/MenuBuilder;"
             | "Landroidx/appcompat/view/menu/MenuItemImpl;"
+            | "Landroidx/appcompat/widget/ListPopupWindow;"
             | "Landroid/view/ViewTreeObserver;"
             | "Landroid/view/MotionEvent;"
             | "Landroid/view/KeyEvent;"
@@ -960,6 +966,36 @@ pub(crate) fn call(
         _ => 0,
     };
     Ok(match name {
+        "onClick" if pseudo_get(vm, this, P_POPUP_OWNER).is_some() => {
+            let popup = match pseudo_get(vm, this, P_POPUP_OWNER) {
+                Some(V::Ref(h)) => h,
+                _ => 0,
+            };
+            let pos = match pseudo_get(vm, this, P_POPUP_POS) {
+                Some(V::I32(i)) => i,
+                _ => 0,
+            };
+            let root = match pseudo_get(vm, popup, P_POPUP_ROOT) {
+                Some(v) => v,
+                _ => V::Ref(0),
+            };
+            let row = args.get(1).copied().unwrap_or(V::Ref(0));
+            if let Some(V::Ref(listener)) = field_get(
+                vm,
+                popup,
+                "Landroidx/appcompat/widget/ListPopupWindow;",
+                "w",
+            ) {
+                if listener != 0 {
+                    let _ = vm.call_virtual(
+                        listener,
+                        "onItemClick",
+                        &[root, row, V::I32(pos), V::I64(pos as i64)],
+                    );
+                }
+            }
+            Some(None)
+        }
         // ---------- inflation ----------
         "<init>" if class.ends_with("LayoutParams;") => {
             lp_ctor(vm, class, sig, args);
@@ -3985,6 +4021,9 @@ fn measure_child(
     // Child dims/margins come from its LayoutParams; AOSP's
     // default LP is (WRAP, WRAP, 0 margins). `None` = field absent;
     // -2 can be a real WRAP_CONTENT, not a miss.
+    if pseudo_get(vm, child, P_POPUP_ROOT).is_some() {
+        return;
+    }
     let (mut lp_w, mut lp_h) = (None, None);
     let (mut ml, mut mt, mut mr, mut mb) = (0, 0, 0, 0);
     if let Some(V::Ref(lp)) = pseudo_get(vm, child, P_LP) {
@@ -4573,7 +4612,7 @@ fn group_layout_fallback(vm: &mut Vm, this: u32, _l: i32, _t: i32, r: i32, b: i3
     let mut cur_l = pad_l;
     for c in children(vm, this) {
         let V::Ref(ch) = c else { continue };
-        if ch == 0 {
+        if ch == 0 || pseudo_get(vm, ch, P_POPUP_ROOT).is_some() {
             continue;
         }
         let (ml, mt, mr, mb) = if let Some(V::Ref(lp)) = pseudo_get(vm, ch, P_LP) {
@@ -6926,6 +6965,197 @@ pub(crate) fn set_content_view(vm: &mut Vm, activity: u32, content: V) {
 // host Menu (options menu, toolbar) or a dex `MenuBuilder`; item ops
 // themselves stay guest-side so the dex list remains authoritative.
 
+fn lpw_field(vm: &Vm, popup: u32, name: &str) -> V {
+    field_get(
+        vm,
+        popup,
+        "Landroidx/appcompat/widget/ListPopupWindow;",
+        name,
+    )
+    .unwrap_or(V::Ref(0))
+}
+
+/// Materialize an appcompat ListPopupWindow as a simple vertical popup
+/// built from its real adapter rows. The platform PopupWindow display
+/// path is host-window functionality the dex implementation cannot
+/// provide; adapter `getView` still supplies the app's row layout,
+/// icons and labels.
+fn list_popup_show(vm: &mut Vm, popup: u32) {
+    if crate::dbg_flag("OVELO_TOUCHDBG") {
+        eprintln!("[touchdbg] listpopup enter h{popup}");
+    }
+    list_popup_dismiss(vm, popup);
+    let adapter = match lpw_field(vm, popup, "i") {
+        V::Ref(h) if h != 0 => h,
+        _ => return,
+    };
+    let mut count = vm
+        .call_virtual(adapter, "getCount", &[])
+        .ok()
+        .flatten()
+        .map(i32v)
+        .unwrap_or(0);
+    if count == 0 {
+        // Framework ArrayAdapter is a host skeleton, so its inherited
+        // getCount reports zero even though the dex subclass stores the
+        // real backing list in an instance field. Use the densest list
+        // field as the row source count; getView itself is dex code.
+        if let Some(Obj::Instance { fields, .. }) = vm.heap.get(adapter) {
+            count = fields
+                .values()
+                .filter_map(|v| match v {
+                    V::Ref(h) if *h != 0 => match vm.heap.get(*h) {
+                        Some(Obj::Host {
+                            state: HostState::List(l),
+                            ..
+                        }) => Some(l.len() as i32),
+                        Some(Obj::Array { data, .. }) => Some(data.len() as i32),
+                        _ => None,
+                    },
+                    _ => None,
+                })
+                .max()
+                .unwrap_or(0);
+        }
+    }
+    let count = count.clamp(0, 32);
+    if crate::dbg_flag("OVELO_TOUCHDBG") {
+        eprintln!("[touchdbg] listpopup count={count}");
+    }
+    if count == 0 {
+        return;
+    }
+    let width = match lpw_field(vm, popup, "l") {
+        V::I32(w) if w > 0 => w,
+        _ => 384,
+    };
+    let root = vm.alloc_host("Landroid/widget/LinearLayout;", HostState::Empty);
+    pseudo_set(vm, root, P_IS_VIEW, V::I32(1));
+    pseudo_set(vm, root, P_IS_GROUP, V::I32(1));
+    pseudo_set(vm, root, P_ORIENTATION, V::I32(1));
+    pseudo_set(vm, root, P_BGCOLOR, V::I32(0xff2b2b2bu32 as i32));
+    pseudo_set(vm, root, P_POPUP_ROOT, V::I32(1));
+    if let V::Ref(ctx) = lpw_field(vm, popup, "h") {
+        pseudo_set(vm, root, P_CONTEXT, V::Ref(ctx));
+    }
+
+    let mut rows = 0;
+    for pos in 0..count {
+        let row = vm
+            .call_virtual(adapter, "getView", &[V::I32(pos), V::Ref(0), V::Ref(root)])
+            .ok()
+            .flatten();
+        if crate::dbg_flag("OVELO_TOUCHDBG") {
+            eprintln!("[touchdbg] listpopup row{pos} view={row:?}");
+        }
+        let Some(V::Ref(row_h)) = row else { continue };
+        if row_h == 0 {
+            continue;
+        }
+        // inflate_res remembers detached adapter rows as search roots;
+        // once adopted by the popup they must not render/touch as
+        // independent roots as well.
+        vm.view_roots.retain(|r| *r != row_h);
+        attach_at(vm, root, V::Ref(row_h), None, false, None);
+        let click = vm.alloc_host("Lovelo/PopupRowClickListener;", HostState::Empty);
+        pseudo_set(vm, click, P_IS_VIEW, V::I32(1));
+        pseudo_set(vm, click, P_POPUP_OWNER, V::Ref(popup));
+        pseudo_set(vm, click, P_POPUP_POS, V::I32(pos));
+        pseudo_set(vm, row_h, P_LISTENER, V::Ref(click));
+        rows += 1;
+    }
+    if rows == 0 {
+        return;
+    }
+
+    if crate::dbg_flag("OVELO_TOUCHDBG") {
+        eprintln!("[touchdbg] listpopup measuring rows={rows}");
+    }
+    let spec_w = 0x4000_0000i32 | width;
+    let _ = vm.call_virtual(root, "measure", &[V::I32(spec_w), V::I32(0)]);
+    let measured_height = (pint(vm, root, P_MEAS_H) & 0x00ff_ffff).max(rows * 48);
+
+    let anchor = match lpw_field(vm, popup, "v") {
+        V::Ref(h) if h != 0 => h,
+        _ => 0,
+    };
+    let (ww, wh) = vm.window_size;
+    let ar = if anchor != 0 {
+        pint(vm, anchor, P_RIGHT)
+    } else {
+        ww
+    };
+    let at = if anchor != 0 {
+        pint(vm, anchor, P_TOP)
+    } else {
+        wh
+    };
+    let xoff = match lpw_field(vm, popup, "m") {
+        V::I32(v) => v,
+        _ => 0,
+    };
+    let yoff = match lpw_field(vm, popup, "n") {
+        V::I32(v) => v,
+        _ => 0,
+    };
+    let max_h = if at > 0 { at + yoff.max(0) } else { wh }.max(96);
+    let height = measured_height.min(max_h).min(wh);
+    let x = (ar - width + xoff).clamp(0, (ww - width).max(0));
+    let y = (at - height + yoff).clamp(0, (wh - height).max(0));
+    let _ = vm.call_virtual(
+        root,
+        "layout",
+        &[V::I32(0), V::I32(0), V::I32(width), V::I32(height)],
+    );
+
+    let parent = activity_content(vm, vm.cur_activity).unwrap_or(0);
+    if parent == 0 {
+        return;
+    }
+    // Frames are parent-relative once attached. The activity content
+    // normally starts at the window origin, but subtract its origin so
+    // action-bar offsets do not shift the popup twice.
+    let pl = pint(vm, parent, P_LEFT);
+    let pt = pint(vm, parent, P_TOP);
+    frame_set(vm, root, x - pl, y - pt, x - pl + width, y - pt + height);
+    attach_at(vm, parent, V::Ref(root), None, false, None);
+    vm.view_roots.retain(|r| *r != root);
+    vm.view_roots.push(root);
+    pseudo_set(vm, popup, P_POPUP_ROOT, V::Ref(root));
+    if crate::dbg_flag("OVELO_TOUCHDBG") {
+        eprintln!("[touchdbg] listpopup show root h{root} rows={rows} at {x},{y} {width}x{height}");
+    }
+}
+
+fn list_popup_dismiss(vm: &mut Vm, popup: u32) {
+    let Some(V::Ref(root)) = pseudo_get(vm, popup, P_POPUP_ROOT) else {
+        return;
+    };
+    if root == 0 {
+        return;
+    }
+    if let Some(V::Ref(parent)) = pseudo_get(vm, root, P_PARENT) {
+        detach(vm, parent, V::Ref(root), false);
+    }
+    vm.view_roots.retain(|r| *r != root);
+    pseudo_set(vm, popup, P_POPUP_ROOT, V::Ref(0));
+    mark_layout_requested(vm, root);
+}
+
+fn ov_popup_show(vm: &mut Vm, a: &[V]) -> ovelo_error::Result<Option<V>> {
+    if let Some(V::Ref(popup)) = a.first().copied() {
+        list_popup_show(vm, popup);
+    }
+    Ok(None)
+}
+
+fn ov_popup_dismiss(vm: &mut Vm, a: &[V]) -> ovelo_error::Result<Option<V>> {
+    if let Some(V::Ref(popup)) = a.first().copied() {
+        list_popup_dismiss(vm, popup);
+    }
+    Ok(None)
+}
+
 fn ov_menu_inflate(vm: &mut Vm, a: &[V]) -> ovelo_error::Result<Option<V>> {
     if let Some(V::Ref(mh)) = a.get(2).copied() {
         menu_inflate(vm, a.get(1).copied(), mh);
@@ -6937,6 +7167,23 @@ fn ov_menu_inflate(vm: &mut Vm, a: &[V]) -> ovelo_error::Result<Option<V>> {
 /// entries through `MenuBuilder.add`, so `findItem`, `getVisibleItems`
 /// and `MenuItemImpl` casts all work against the dex list.
 pub(crate) fn register_menu_overrides(vm: &mut Vm) {
+    let popup_show: HostCall = std::rc::Rc::new(std::cell::RefCell::new(ov_popup_show));
+    let popup_dismiss: HostCall = std::rc::Rc::new(std::cell::RefCell::new(ov_popup_dismiss));
+    let show_ok = vm.register_host(
+        "Landroidx/appcompat/widget/ListPopupWindow;",
+        "show",
+        "()V",
+        popup_show,
+    );
+    if crate::dbg_flag("OVELO_TOUCHDBG") {
+        eprintln!("[touchdbg] listpopup register show={show_ok:?}");
+    }
+    let _ = vm.register_host(
+        "Landroidx/appcompat/widget/ListPopupWindow;",
+        "dismiss",
+        "()V",
+        popup_dismiss,
+    );
     use std::cell::RefCell;
     use std::rc::Rc;
     let mk = |f: fn(&mut Vm, &[V]) -> ovelo_error::Result<Option<V>>| -> HostCall {
