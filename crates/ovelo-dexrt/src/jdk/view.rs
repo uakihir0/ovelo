@@ -5984,6 +5984,17 @@ fn key_scan_roots(vm: &Vm) -> Vec<u32> {
     roots
 }
 
+fn text_value_string(vm: &Vm, v: V) -> Option<String> {
+    match v {
+        V::I32(id) if id > 0 => vm
+            .apk_res
+            .as_ref()
+            .and_then(|r| r.string_of(id as u32))
+            .map(str::to_string),
+        _ => sv(vm, v),
+    }
+}
+
 fn focused_edit_text(vm: &Vm, h: u32, depth: usize) -> Option<u32> {
     if depth > 40 {
         return None;
@@ -6148,7 +6159,8 @@ pub(crate) fn dispatch_key(
     if let Some(view) = focused_edit {
         if action == 0 {
             let mut text = pseudo_get(vm, view, P_TEXT)
-                .and_then(|v| sv(vm, v))
+                .or_else(|| attr_find(vm, view, "text"))
+                .and_then(|v| text_value_string(vm, v))
                 .unwrap_or_default();
             if keycode == 67 {
                 text.pop();
