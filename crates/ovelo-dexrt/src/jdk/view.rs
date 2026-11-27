@@ -7551,6 +7551,18 @@ pub(crate) fn dialog_show(vm: &mut Vm, dialog: u32) {
         "layout",
         &[V::I32(0), V::I32(0), V::I32(width), V::I32(height)],
     );
+    if content != root {
+        // A custom-view dialog often supplies a bare leaf whose XML-free
+        // layout params are wrap_content. Measured inside the synthetic
+        // panel it would collapse to its intrinsic 0×0, while the real
+        // AlertDialog custom panel still gives it the panel extent.
+        let _ = vm.call_virtual(content, "measure", &[V::I32(spec_w), V::I32(spec_h)]);
+        let _ = vm.call_virtual(
+            content,
+            "layout",
+            &[V::I32(0), V::I32(0), V::I32(width), V::I32(height)],
+        );
+    }
     let x = ((ww - width) / 2).max(0);
     let y = ((wh - height) / 2).max(0);
     let pl = pint(vm, parent, P_LEFT);
