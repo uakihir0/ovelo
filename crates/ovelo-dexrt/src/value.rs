@@ -119,6 +119,24 @@ pub enum HostState {
     Path(String),
     /// A streaming `java.security.MessageDigest`.
     Digest(Box<DigestState>),
+    /// A `javax.crypto.Mac`: algorithm plus the key/data inputs. The
+    /// concrete HMAC is computed at doFinal so one state type covers all
+    /// digest widths.
+    Mac {
+        /// JCA algorithm name.
+        algorithm: String,
+        /// Initialized key bytes; empty means uninitialized.
+        key: Vec<u8>,
+        /// Buffered input bytes.
+        data: Vec<u8>,
+    },
+    /// Raw key bytes (`javax.crypto.spec.SecretKeySpec`).
+    Key {
+        /// JCA key algorithm.
+        algorithm: String,
+        /// Encoded key bytes.
+        bytes: Vec<u8>,
+    },
     /// A regex pattern string (`java.util.regex.Pattern`).
     Regex(String),
     /// A readable byte stream (`InputStream` over real bytes — raw

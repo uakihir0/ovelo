@@ -3,6 +3,7 @@
 use super::rx::{full_match, Rx};
 use super::*;
 use crate::value::{DigestState, HostState, Obj, V};
+use hmac::Mac as _;
 use sha2::Digest as _;
 
 pub(crate) fn call(
@@ -19,6 +20,10 @@ pub(crate) fn call(
         print_call(vm, name, sig, args)
     } else if class == "Ljava/security/MessageDigest;" {
         digest_call(vm, name, args)?
+    } else if class == "Ljavax/crypto/Mac;" {
+        mac_call(vm, name, args)?
+    } else if class == "Ljavax/crypto/spec/SecretKeySpec;" {
+        key_spec_call(vm, name, args)?
     } else if class == "Ljava/util/jar/JarFile;" || class == "Ljava/util/zip/ZipFile;" {
         zip_file_call(vm, class, name, args)
     } else if class == "Ljava/util/jar/JarEntry;" || class == "Ljava/util/zip/ZipEntry;" {
@@ -4557,6 +4562,244 @@ fn array_bytes(vm: &Vm, array: V, offset: usize, len: Option<usize>) -> Vec<u8> 
         .map(|len| start.saturating_add(len).min(data.len()))
         .unwrap_or(data.len());
     data[start..end].iter().map(|v| i32v(*v) as u8).collect()
+}
+
+fn key_spec_call(vm: &mut Vm, name: &str, args: &[V]) -> Rt<Option<Option<V>>> {
+    Ok(Some(match name {
+        "<init>" => {
+            let bytes = array_bytes(vm, args.get(1).copied().unwrap_or(V::Ref(0)), 0, None);
+            let algorithm = args.get(2).and_then(|v| sv(vm, *v)).unwrap_or_default();
+            replace_host_state(
+                vm,
+                args[0],
+                "Ljavax/crypto/spec/SecretKeySpec;",
+                HostState::Key { algorithm, bytes },
+            );
+            None
+        }
+        "getEncoded" => {
+            let bytes = match args.first() {
+                Some(V::Ref(h)) => match vm.heap.get(*h) {
+                    Some(Obj::Host {
+                        state: HostState::Key { bytes, .. },
+                        ..
+                    }) => bytes.clone(),
+                    _ => Vec::new(),
+                },
+                _ => Vec::new(),
+            };
+            Some(byte_arr(vm, &bytes))
+        }
+        "getAlgorithm" => {
+            let algorithm = match args.first() {
+                Some(V::Ref(h)) => match vm.heap.get(*h) {
+                    Some(Obj::Host {
+                        state: HostState::Key { algorithm, .. },
+                        ..
+                    }) => algorithm.clone(),
+                    _ => String::new(),
+                },
+                _ => String::new(),
+            };
+            Some(jstr(vm, &algorithm))
+        }
+        _ => return Ok(None),
+    }))
+}
+
+fn mac_algorithm(algorithm: &str) -> Option<String> {
+    let normalized = algorithm.to_ascii_uppercase().replace(['-', '_'], "");
+    matches!(
+        normalized.as_str(),
+        "HMACSHA1" | "HMACSHA256" | "HMACSHA384" | "HMACSHA512"
+    )
+    .then_some(normalized)
+}
+
+fn mac_output_len(algorithm: &str) -> usize {
+    match algorithm {
+        "HMACMD5" => 16,
+        "HMACSHA1" => 20,
+        "HMACSHA256" => 32,
+        "HMACSHA384" => 48,
+        "HMACSHA512" => 64,
+        _ => 0,
+    }
+}
+
+fn mac_compute(algorithm: &str, key: &[u8], data: &[u8]) -> Option<Vec<u8>> {
+    macro_rules! compute {
+        ($digest:ty) => {{
+            let mut mac = hmac::Hmac::<$digest>::new_from_slice(key).ok()?;
+            mac.update(data);
+            Some(mac.finalize().into_bytes().to_vec())
+        }};
+    }
+    match algorithm {
+        "HMACMD5" => compute!(md5::Md5),
+        "HMACSHA1" => compute!(sha1::Sha1),
+        "HMACSHA256" => compute!(sha2::Sha256),
+        "HMACSHA384" => compute!(sha2::Sha384),
+        "HMACSHA512" => compute!(sha2::Sha512),
+        _ => None,
+    }
+}
+
+fn mac_input_bytes(vm: &Vm, args: &[V]) -> Vec<u8> {
+    match args.len() {
+        2 => match args.get(1).copied().unwrap_or(V::I32(0)) {
+            v @ V::Ref(_) => array_bytes(vm, v, 0, None),
+            v => vec![i32v(v) as u8],
+        },
+        4 => array_bytes(
+            vm,
+            args.get(1).copied().unwrap_or(V::Ref(0)),
+            i32v(args[2]).max(0) as usize,
+            Some(i32v(args[3]).max(0) as usize),
+        ),
+        _ => Vec::new(),
+    }
+}
+
+fn mac_call(vm: &mut Vm, name: &str, args: &[V]) -> Rt<Option<Option<V>>> {
+    Ok(Some(match name {
+        "getInstance" => {
+            let algorithm = args.first().and_then(|v| sv(vm, *v)).unwrap_or_default();
+            let Some(algorithm) = mac_algorithm(&algorithm) else {
+                return Err(vm.throw_builtin(
+                    "Ljava/security/NoSuchAlgorithmException;",
+                    "unsupported Mac algorithm",
+                ));
+            };
+            Some(host(
+                vm,
+                "Ljavax/crypto/Mac;",
+                HostState::Mac {
+                    algorithm,
+                    key: Vec::new(),
+                    data: Vec::new(),
+                },
+            ))
+        }
+        "init" => {
+            let key = match args.get(1).copied() {
+                Some(V::Ref(h)) => match vm.heap.get(h) {
+                    Some(Obj::Host {
+                        state: HostState::Key { bytes, .. },
+                        ..
+                    }) => bytes.clone(),
+                    _ => Vec::new(),
+                },
+                _ => Vec::new(),
+            };
+            if key.is_empty() {
+                return Err(vm.throw_builtin("Ljava/security/InvalidKeyException;", "empty key"));
+            }
+            if let Some(V::Ref(h)) = args.first() {
+                if let Some(Obj::Host {
+                    state: HostState::Mac { key: k, data, .. },
+                    ..
+                }) = vm.heap.get_mut(*h)
+                {
+                    *k = key;
+                    data.clear();
+                }
+            }
+            None
+        }
+        "update" => {
+            let bytes = mac_input_bytes(vm, args);
+            if let Some(V::Ref(h)) = args.first() {
+                if let Some(Obj::Host {
+                    state: HostState::Mac { data, .. },
+                    ..
+                }) = vm.heap.get_mut(*h)
+                {
+                    data.extend_from_slice(&bytes);
+                }
+            }
+            None
+        }
+        "doFinal" => {
+            if args.len() == 2 {
+                let bytes = mac_input_bytes(vm, args);
+                if let Some(V::Ref(h)) = args.first() {
+                    if let Some(Obj::Host {
+                        state: HostState::Mac { data, .. },
+                        ..
+                    }) = vm.heap.get_mut(*h)
+                    {
+                        data.extend_from_slice(&bytes);
+                    }
+                }
+            }
+            let state = match args.first() {
+                Some(V::Ref(h)) => match vm.heap.get_mut(*h) {
+                    Some(Obj::Host {
+                        state:
+                            HostState::Mac {
+                                algorithm,
+                                key,
+                                data,
+                            },
+                        ..
+                    }) => {
+                        let state = (algorithm.clone(), key.clone(), data.clone());
+                        data.clear();
+                        state
+                    }
+                    _ => (String::new(), Vec::new(), Vec::new()),
+                },
+                _ => (String::new(), Vec::new(), Vec::new()),
+            };
+            if state.1.is_empty() {
+                return Err(
+                    vm.throw_builtin("Ljava/lang/IllegalStateException;", "Mac not initialized")
+                );
+            }
+            let out = mac_compute(&state.0, &state.1, &state.2).unwrap_or_default();
+            Some(byte_arr(vm, &out))
+        }
+        "reset" => {
+            if let Some(V::Ref(h)) = args.first() {
+                if let Some(Obj::Host {
+                    state: HostState::Mac { data, .. },
+                    ..
+                }) = vm.heap.get_mut(*h)
+                {
+                    data.clear();
+                }
+            }
+            None
+        }
+        "getAlgorithm" => {
+            let algorithm = match args.first() {
+                Some(V::Ref(h)) => match vm.heap.get(*h) {
+                    Some(Obj::Host {
+                        state: HostState::Mac { algorithm, .. },
+                        ..
+                    }) => algorithm.clone(),
+                    _ => String::new(),
+                },
+                _ => String::new(),
+            };
+            Some(jstr(vm, &algorithm))
+        }
+        "getMacLength" => {
+            let len = match args.first() {
+                Some(V::Ref(h)) => match vm.heap.get(*h) {
+                    Some(Obj::Host {
+                        state: HostState::Mac { algorithm, .. },
+                        ..
+                    }) => mac_output_len(algorithm),
+                    _ => 0,
+                },
+                _ => 0,
+            };
+            Some(V::I32(len as i32))
+        }
+        _ => return Ok(None),
+    }))
 }
 
 fn digest_call(vm: &mut Vm, name: &str, args: &[V]) -> Rt<Option<Option<V>>> {
