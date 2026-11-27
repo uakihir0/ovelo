@@ -3060,8 +3060,8 @@ fn parse_uuid_text(text: &str) -> Option<(i64, i64)> {
     Some((msb, lsb))
 }
 
-fn uuid_from_bytes(mut bytes: [u8; 16]) -> (i64, i64) {
-    bytes[6] = (bytes[6] & 0x0f) | 0x40;
+fn uuid_from_bytes(mut bytes: [u8; 16], version: u8) -> (i64, i64) {
+    bytes[6] = (bytes[6] & 0x0f) | (version << 4);
     bytes[8] = (bytes[8] & 0x3f) | 0x80;
     let msb = i64::from_be_bytes(bytes[..8].try_into().unwrap_or([0; 8]));
     let lsb = i64::from_be_bytes(bytes[8..].try_into().unwrap_or([0; 8]));
@@ -3079,7 +3079,7 @@ fn random_uuid_bits() -> (i64, i64) {
         bytes[..8].copy_from_slice(&seed.to_be_bytes());
         bytes[8..].copy_from_slice(&seed.rotate_left(23).to_be_bytes());
     }
-    uuid_from_bytes(bytes)
+    uuid_from_bytes(bytes, 4)
 }
 
 fn uuid_obj(vm: &mut Vm, msb: i64, lsb: i64) -> V {
@@ -3107,20 +3107,23 @@ fn uuid_call(vm: &mut Vm, name: &str, args: &[V]) -> Option<Option<V>> {
             Some(Some(uuid_obj(vm, msb, lsb)))
         }
         "fromString" => {
-            let text = args.get(1).and_then(|v| sv(vm, *v)).unwrap_or_default();
+            let text = args.first().and_then(|v| sv(vm, *v)).unwrap_or_default();
             let (msb, lsb) = parse_uuid_text(&text).unwrap_or((0, 0));
             Some(Some(uuid_obj(vm, msb, lsb)))
         }
         "nameUUIDFromBytes" => {
+            let input: Vec<u8> = match args.first() {
+                Some(V::Ref(h)) => match vm.heap.get(*h) {
+                    Some(Obj::Array { data, .. }) => data.iter().map(|v| i32v(*v) as u8).collect(),
+                    _ => Vec::new(),
+                },
+                _ => Vec::new(),
+            };
+            use md5::Digest as _;
+            let digest = md5::Md5::digest(&input);
             let mut bytes = [0u8; 16];
-            if let Some(V::Ref(h)) = args.get(1) {
-                if let Some(Obj::Array { data, .. }) = vm.heap.get(*h) {
-                    for (i, v) in data.iter().take(16).enumerate() {
-                        bytes[i] = i32v(*v) as u8;
-                    }
-                }
-            }
-            let (msb, lsb) = uuid_from_bytes(bytes);
+            bytes.copy_from_slice(&digest[..16]);
+            let (msb, lsb) = uuid_from_bytes(bytes, 3);
             Some(Some(uuid_obj(vm, msb, lsb)))
         }
         "toString" => {
@@ -3183,7 +3186,18 @@ fn uuid_call(vm: &mut Vm, name: &str, args: &[V]) -> Option<Option<V>> {
         }))),
         "variant" => Some(Some(V::I64(match args.first() {
             Some(V::Ref(h)) => uuid_bits(vm, *h)
-                .map(|(_, lsb)| ((lsb as u64) >> 62) as i64)
+                .map(|(_, lsb)| {
+                    let bits = lsb as u64;
+                    if bits & 0x8000_0000_0000_0000 == 0 {
+                        0
+                    } else if bits & 0x4000_0000_0000_0000 == 0 {
+                        1
+                    } else if bits & 0x2000_0000_0000_0000 == 0 {
+                        2
+                    } else {
+                        3
+                    }
+                })
                 .unwrap_or(0),
             _ => 0,
         }))),

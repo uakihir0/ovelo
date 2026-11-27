@@ -1650,6 +1650,12 @@ pub(crate) fn call(
 
 /// Methods that mean the same thing on every object.
 fn universal(vm: &mut Vm, class: &str, name: &str, sig: &str, args: &[V]) -> Rt<Option<Option<V>>> {
+    // UUID implements these object operations from its 128-bit value in
+    // the collections module; the generic identity/object-id versions
+    // would make equal UUIDs and serialized UUID strings unusable.
+    if class == "Ljava/util/UUID;" && matches!(name, "toString" | "hashCode" | "equals") {
+        return Ok(None);
+    }
     Ok(match name {
         "toString" if ret(sig) == STRING && class != STRING => {
             // JSON containers serialize through `json_dump_v`, not the
