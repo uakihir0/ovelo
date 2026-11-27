@@ -2562,8 +2562,12 @@ fn thread_call(vm: &mut Vm, name: &str, _sig: &str, args: &[V]) -> Rt<Option<Opt
                 if rem == 0 {
                     break;
                 }
-                if vm.park_drain_within(rem).is_err() {
-                    break;
+                // Join waits for a Java Thread runnable, which belongs to
+                // the worker side of the cooperative scheduler. Draining
+                // the whole queue here would let main-loop callbacks
+                // interpose inside a caller that is already blocked.
+                if vm.drain_worker_runnables(16) == 0 {
+                    std::thread::sleep(std::time::Duration::from_millis(rem.min(1)));
                 }
             }
             Some(None)
