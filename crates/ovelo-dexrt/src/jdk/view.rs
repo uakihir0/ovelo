@@ -2858,6 +2858,7 @@ pub(crate) fn call(
                         i32v(args.get(2).copied().unwrap_or(V::I32(0))),
                     );
                 }
+                text_input_measure_fixup(vm, this, i32v(args.get(2).copied().unwrap_or(V::I32(0))));
             } else {
                 // Framework skeleton container — no dex onMeasure
                 // exists, so measure the children generically or they
@@ -2930,6 +2931,7 @@ pub(crate) fn call(
                 group_layout_fallback(vm, this, l, t, r, b);
                 pseudo_set(vm, this, P_LAYOUT_REQ, V::I32(0));
             }
+            text_input_layout_fixup(vm, this, r - l, b - t);
             if pseudo_get(vm, this, P_POPUP_COMPACT) == Some(V::I32(1)) {
                 layout_popup_rows_compact(vm, this, r - l, b - t);
             }
@@ -5142,6 +5144,69 @@ fn estimated_text_width(text: &str, ts: f32) -> i32 {
     (text.chars().map(em_width).sum::<f32>() * 1.15)
         .mul_add(ts, 0.0)
         .ceil() as i32
+}
+
+fn direct_edit_child(vm: &Vm, h: u32) -> Option<u32> {
+    children(vm, h).into_iter().find_map(|c| {
+        let V::Ref(ch) = c else { return None };
+        let desc = class_of(vm, V::Ref(ch));
+        (desc.contains("EditText") || vm.extends_named(&desc, "EditText")).then_some(ch)
+    })
+}
+
+fn is_text_input_layout(vm: &Vm, h: u32) -> bool {
+    let desc = class_of(vm, V::Ref(h));
+    desc.contains("TextInputLayout") && direct_edit_child(vm, h).is_some()
+}
+
+/// Material's TextInputLayout measurement depends on a large amount of
+/// text/box-controller state. Keep the dex result when it is sane, but
+/// collapse the runaway empty-label case back to one input row plus the
+/// floating-label inset.
+fn text_input_measure_fixup(vm: &mut Vm, this: u32, ph: i32) {
+    if !is_text_input_layout(vm, this) {
+        return;
+    }
+    let Some(edit) = direct_edit_child(vm, this) else {
+        return;
+    };
+    let edit_h = (pint(vm, edit, P_MEAS_H) & 0x00FF_FFFF).max(1);
+    let desired = edit_h + 32;
+    let cur = pint(vm, this, P_MEAS_H) & 0x00FF_FFFF;
+    if cur > desired {
+        pseudo_set(vm, this, P_MEAS_H, V::I32(resolve_size(desired, ph, true)));
+    }
+}
+
+/// TextInputLayout's end-icon container is an overlay within the input
+/// row, not a row of its own above the editor. Dex layout can stack it
+/// there when pieces of Material's box controller are missing; correct
+/// only that recognizable geometry.
+fn text_input_layout_fixup(vm: &mut Vm, this: u32, width: i32, height: i32) {
+    if !is_text_input_layout(vm, this) || width <= 0 || height <= 0 {
+        return;
+    }
+    let Some(edit) = direct_edit_child(vm, this) else {
+        return;
+    };
+    let edit_h = (pint(vm, edit, P_MEAS_H) & 0x00FF_FFFF).min(height).max(1);
+    let input_top = (height - edit_h).max(0);
+    let mut end_w = 0;
+    for c in children(vm, this) {
+        let V::Ref(ch) = c else { continue };
+        if ch == edit || view_is_gone(vm, ch) {
+            continue;
+        }
+        let cw = (pint(vm, ch, P_MEAS_W) & 0x00FF_FFFF).min(width);
+        let chh = (pint(vm, ch, P_MEAS_H) & 0x00FF_FFFF).min(edit_h);
+        if cw <= 0 || chh <= 0 {
+            continue;
+        }
+        end_w = end_w.max(cw);
+        let y = input_top + ((edit_h - chh) / 2).max(0);
+        frame_set(vm, ch, width - cw, y, width, y + chh);
+    }
+    frame_set(vm, edit, 0, input_top, width - end_w, height);
 }
 
 /// Generic `onMeasure` for framework skeleton containers: measure
