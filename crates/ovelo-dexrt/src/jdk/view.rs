@@ -955,6 +955,7 @@ pub(crate) fn dex_view_info(vm: &Vm, h: u32) -> Option<DexViewInfo> {
         || desc.contains("RadioButton")
         || desc.contains("Switch")
         || vm.extends_named(&desc, "CompoundButton");
+    let icon_only = text.as_deref().is_none_or(str::is_empty);
     Some(DexViewInfo {
         desc,
         is_group,
@@ -970,6 +971,17 @@ pub(crate) fn dex_view_info(vm: &Vm, h: u32) -> Option<DexViewInfo> {
         layout_requested: layout_requested(vm, h),
         image: pseudo_get(vm, h, P_IMAGE)
             .and_then(|v| image_pixels(vm, v))
+            .or_else(|| {
+                // MaterialButton's `app:icon` is a compound drawable rather
+                // than an ImageView src. The host materialization has one
+                // centered image slot, which is correct for the common
+                // icon-only button; text+icon layout needs real compound
+                // drawable support and is intentionally not approximated.
+                if !icon_only {
+                    return None;
+                }
+                attr_find(vm, h, "icon").and_then(|v| image_pixels(vm, v))
+            })
             .map(|img| tint_image(vm, h, img)),
         padding: (pad_l, pad_t, pad_r, pad_b),
         scale_type: match attr_find(vm, h, "scaleType") {
@@ -1074,25 +1086,37 @@ fn image_drawable(vm: &mut Vm, this: u32) -> V {
 /// object holding a bitmap in any ref field (BitmapDrawable, Glide
 /// drawables), a res-id, or a file/Uri path the runtime can open.
 fn xml_image_tint(vm: &Vm, h: u32) -> Option<u32> {
-    let raw = attr_find(vm, h, "tint").or_else(|| attr_find(vm, h, "drawableTint"))?;
-    let V::I32(raw) = raw else { return None };
-    let u = raw as u32;
-    if raw >= 0 && (0x0101_0000..0x0102_0000).contains(&u) {
-        crate::theme_color(vm, u)
-    } else if raw >= 0 && u >= 0x0100_0000 {
-        let is_attr = vm
-            .apk_res
-            .as_ref()
-            .and_then(|r| r.type_name(u).map(|t| t == "attr"))
-            .unwrap_or(false);
-        if is_attr {
+    if let Some(V::I32(raw)) = attr_find(vm, h, "tint").or_else(|| attr_find(vm, h, "drawableTint"))
+    {
+        let u = raw as u32;
+        return if raw >= 0 && (0x0101_0000..0x0102_0000).contains(&u) {
             crate::theme_color(vm, u)
+        } else if raw >= 0 && u >= 0x0100_0000 {
+            let is_attr = vm
+                .apk_res
+                .as_ref()
+                .and_then(|r| r.type_name(u).map(|t| t == "attr"))
+                .unwrap_or(false);
+            if is_attr {
+                crate::theme_color(vm, u)
+            } else {
+                super::vector::rctx(vm).and_then(|r| super::vector::resolve_ref_color(r, u))
+            }
         } else {
-            super::vector::rctx(vm).and_then(|r| super::vector::resolve_ref_color(r, u))
-        }
-    } else {
-        Some(u)
+            Some(u)
+        };
     }
+    // MaterialButton styles carry `iconTint` rather than ImageView's
+    // `android:tint`; resolve it through the same style/theme-overlay path.
+    let style = match attr_find(vm, h, "style") {
+        Some(V::I32(style)) if style > 0 => style as u32,
+        _ => return None,
+    };
+    let attr = vm
+        .apk_res
+        .as_ref()
+        .and_then(|r| r.attr_id_named("iconTint"))?;
+    style_attr_color(vm, style, attr).map(|c| c as u32)
 }
 
 fn tint_image(
