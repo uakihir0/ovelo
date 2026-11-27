@@ -755,6 +755,7 @@ pub(crate) fn call(
                     args.get(1).copied()
                 }
                 .unwrap_or(V::Ref(0));
+                let _ = vm.call_virtual_rt(this, "onPreExecute", &[])?;
                 if let Some(result) = vm.call_virtual_rt(this, "doInBackground", &[params])? {
                     let _ = vm.call_virtual_rt(this, "onPostExecute", &[result])?;
                 }
