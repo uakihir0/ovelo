@@ -1479,14 +1479,7 @@ fn file_call(vm: &mut Vm, name: &str, args: &[V]) -> Option<Option<V>> {
                 .is_ok() as i32,
         )),
         "renameTo" => {
-            let to = s(
-                vm,
-                match args[1] {
-                    V::Ref(h) => h,
-                    _ => 0,
-                },
-            )
-            .unwrap_or_default();
+            let to = sv(vm, args.get(1).copied().unwrap_or(V::Ref(0))).unwrap_or_default();
             Some(V::I32(
                 std::fs::rename(&std_path, fspath(vm, &to)).is_ok() as i32
             ))
