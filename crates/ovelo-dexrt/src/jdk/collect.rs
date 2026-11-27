@@ -535,7 +535,13 @@ pub(crate) fn call(
                 // `submit(Callable)` must invoke `call`, not `run`: media3
                 // resolves fast media ids through such futures. This
                 // executor shim completes the task inline so Future.get can
-                // expose the produced value.
+                // expose the value; first drain earlier single-executor
+                // work so the submission cannot overtake it.
+                if let V::Ref(ex) = args[0] {
+                    if vm.single_executors.contains(&ex) {
+                        drain_single_executor_sync(vm, ex);
+                    }
+                }
                 let out = if let V::Ref(r) = args[1] {
                     match vm.call_virtual_rt(r, "call", &[]) {
                         Ok(Some(v)) => Some(v),
@@ -850,6 +856,32 @@ fn write_sorted_list(vm: &mut Vm, h: u32, items: Vec<V>) {
             }
         }
         _ => {}
+    }
+}
+
+fn drain_single_executor_sync(vm: &mut Vm, ex: u32) {
+    while let Some(r) = vm.executor_active.get(&ex).copied() {
+        // A task submitting back into its own executor is still active;
+        // it must finish before later work can start, so leave the queue
+        // ordered instead of re-entering it recursively.
+        if r == vm.cur_runnable {
+            break;
+        }
+        if let Some(i) = vm.pending_runnables.iter().position(|(h, _)| *h == r) {
+            vm.pending_runnables.remove(i);
+        }
+        let _ = run_on_worker(vm, r);
+        vm.runnable_executor.remove(&r);
+        if vm.executor_active.get(&ex) == Some(&r) {
+            let next = vm.executor_queues.get_mut(&ex).and_then(|q| q.pop_front());
+            if let Some(next) = next {
+                vm.executor_active.insert(ex, next);
+                vm.runnable_executor.insert(next, ex);
+            } else {
+                vm.executor_active.remove(&ex);
+                vm.executor_queues.remove(&ex);
+            }
+        }
     }
 }
 
