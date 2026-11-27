@@ -5673,6 +5673,31 @@ pub(crate) fn dispatch_touch(
             vm.dbg_class_of(target)
         );
     }
+    // Modal popup semantics: ACTION_DOWN outside an open popup dismisses
+    // it and is consumed instead of activating the background control.
+    if action == 0 {
+        let popups: Vec<(u32, u32)> = vm
+            .view_roots
+            .iter()
+            .filter_map(|r| match pseudo_get(vm, *r, P_POPUP_ROOT) {
+                Some(V::Ref(owner)) if owner != 0 => Some((owner, *r)),
+                _ => None,
+            })
+            .collect();
+        let mut consumed = false;
+        for (popup, proot) in popups {
+            if !view_or_descendant(vm, proot, target) {
+                if dbg {
+                    eprintln!("[touchdbg] outside tap dismiss popup h{popup} root h{proot}");
+                }
+                list_popup_dismiss(vm, popup);
+                consumed = true;
+            }
+        }
+        if consumed {
+            return Ok(true);
+        }
+    }
     let V::Ref(evt) = host(vm, "Landroid/view/MotionEvent;", HostState::Empty) else {
         return Ok(false);
     };
@@ -7111,7 +7136,7 @@ fn list_popup_show(vm: &mut Vm, popup: u32) {
     pseudo_set(vm, root, P_IS_GROUP, V::I32(1));
     pseudo_set(vm, root, P_ORIENTATION, V::I32(1));
     pseudo_set(vm, root, P_BGCOLOR, V::I32(0xff2b2b2bu32 as i32));
-    pseudo_set(vm, root, P_POPUP_ROOT, V::I32(1));
+    pseudo_set(vm, root, P_POPUP_ROOT, V::Ref(popup));
     if let V::Ref(ctx) = lpw_field(vm, popup, "context") {
         pseudo_set(vm, root, P_CONTEXT, V::Ref(ctx));
     }
