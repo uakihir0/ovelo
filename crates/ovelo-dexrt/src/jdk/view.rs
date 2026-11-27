@@ -8479,15 +8479,31 @@ pub(crate) fn dialog_show(vm: &mut Vm, dialog: u32) {
             }
         }
     }
+    // The scan knows the canonical strings but not their declaring fields
+    // after R8 minification. When only one action exists, prefer that sole
+    // label even if it is spelled "Cancel"; otherwise reserve that spelling
+    // for the negative action.
+    let sole_cancel_positive =
+        pos_listener != 0 && neg_listener == 0 && pos_label.is_none() && neg_label.is_some();
+    let positive_label = if sole_cancel_positive {
+        neg_label.clone()
+    } else {
+        pos_label.clone()
+    };
+    let negative_label = if sole_cancel_positive {
+        None
+    } else {
+        neg_label.clone()
+    };
     let mut any_buttons = false;
-    if pos_label.is_some() || pos_listener != 0 {
-        let label = pos_label.as_deref().unwrap_or("OK");
+    if positive_label.is_some() || pos_listener != 0 {
+        let label = positive_label.as_deref().unwrap_or("OK");
         let button = dialog_button(vm, dialog, -1, label);
         attach_at(vm, root, V::Ref(button), None, false, None);
         any_buttons = true;
     }
-    if neg_label.is_some() || neg_listener != 0 {
-        let label = neg_label.as_deref().unwrap_or("Cancel");
+    if negative_label.is_some() || neg_listener != 0 {
+        let label = negative_label.as_deref().unwrap_or("Cancel");
         let button = dialog_button(vm, dialog, -2, label);
         attach_at(vm, root, V::Ref(button), None, false, None);
         any_buttons = true;
