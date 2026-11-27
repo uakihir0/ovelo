@@ -405,6 +405,18 @@ fn is_set_obj(vm: &Vm, v: V) -> bool {
     }
 }
 
+fn enqueue_executor_task(vm: &mut Vm, ex: u32, r: u32) {
+    if vm.single_executors.contains(&ex) && vm.executor_active.contains_key(&ex) {
+        vm.executor_queues.entry(ex).or_default().push_back(r);
+    } else {
+        if vm.single_executors.contains(&ex) {
+            vm.executor_active.insert(ex, r);
+            vm.runnable_executor.insert(r, ex);
+        }
+        vm.enqueue_runnable(r, false);
+    }
+}
+
 pub(crate) fn call(
     vm: &mut Vm,
     class: &str,
@@ -519,48 +531,38 @@ pub(crate) fn call(
                     // (they run on a worker thread at the next drain).
                     // A single-thread executor additionally serializes
                     // those jobs instead of admitting them all at once.
-                    if vm.single_executors.contains(&ex) && vm.executor_active.contains_key(&ex) {
-                        vm.executor_queues.entry(ex).or_default().push_back(r);
-                    } else {
-                        if vm.single_executors.contains(&ex) {
-                            vm.executor_active.insert(ex, r);
-                            vm.runnable_executor.insert(r, ex);
-                        }
-                        vm.enqueue_runnable(r, false);
-                    }
+                    enqueue_executor_task(vm, ex, r);
                 }
                 Some(None)
             }
             "submit" => {
-                // `submit(Callable)` must invoke `call`, not `run`: media3
-                // resolves fast media ids through such futures. This
-                // executor shim completes the task inline so Future.get can
-                // expose the value; first drain earlier single-executor
-                // work so the submission cannot overtake it.
-                if let V::Ref(ex) = args[0] {
-                    if vm.single_executors.contains(&ex) {
-                        drain_single_executor_sync(vm, ex);
+                // Submit is asynchronous and ordered through the same executor
+                // queue as execute. The wrapper completes the returned future
+                // when the worker drain reaches it.
+                if let (V::Ref(ex), V::Ref(task)) = (args[0], args[1]) {
+                    let future_v = host(
+                        vm,
+                        "Ljava/util/concurrent/Future;",
+                        HostState::Slot(V::Ref(0)),
+                    );
+                    let wrapper_v = host(vm, "Ljava/lang/Runnable;", HostState::Empty);
+                    if let (V::Ref(future), V::Ref(wrapper)) = (future_v, wrapper_v) {
+                        pseudo_set(vm, wrapper, P_FUTURE_TARGET, V::Ref(task));
+                        pseudo_set(vm, wrapper, P_FUTURE, V::Ref(future));
+                        pseudo_set(
+                            vm,
+                            wrapper,
+                            P_FUTURE_CALLABLE,
+                            V::I32(sig.contains("Callable") as i32),
+                        );
+                        enqueue_executor_task(vm, ex, wrapper);
                     }
+                    return Ok(Some(Some(future_v)));
                 }
-                let out = if let V::Ref(r) = args[1] {
-                    match vm.call_virtual_rt(r, "call", &[]) {
-                        Ok(Some(v)) => Some(v),
-                        Ok(None) => {
-                            let _ = vm.call_virtual_rt(r, "run", &[]);
-                            None
-                        }
-                        Err(_) => {
-                            let _ = vm.call_virtual_rt(r, "run", &[]);
-                            None
-                        }
-                    }
-                } else {
-                    None
-                };
                 Some(Some(host(
                     vm,
                     "Ljava/util/concurrent/Future;",
-                    HostState::Slot(out.unwrap_or(V::Ref(0))),
+                    HostState::Slot(V::Ref(0)),
                 )))
             }
             "isShutdown" | "isTerminated" => Some(Some(V::I32(0))),
@@ -595,8 +597,27 @@ pub(crate) fn call(
                 // The inline submit future is already complete, so its
                 // listener can run immediately. Dropping it breaks media3's
                 // Futures.transform chain that resolves media ids to URIs.
-                if let V::Ref(r) = args.get(1).copied().unwrap_or(V::Ref(0)) {
-                    let _ = vm.call_virtual_rt(r, "run", &[]);
+                if let (Some(&V::Ref(future)), Some(&V::Ref(r))) = (args.first(), args.get(1)) {
+                    if matches!(pseudo_get(vm, future, P_FUTURE_DONE), Some(V::I32(1))) {
+                        let _ = vm.call_virtual_rt(r, "run", &[]);
+                    } else {
+                        let lh = match pseudo_get(vm, future, P_FUTURE_LISTENERS) {
+                            Some(V::Ref(h)) => h,
+                            _ => {
+                                let v = host(vm, "Ljava/util/ArrayList;", HostState::List(vec![]));
+                                let V::Ref(h) = v else { unreachable!() };
+                                pseudo_set(vm, future, P_FUTURE_LISTENERS, V::Ref(h));
+                                h
+                            }
+                        };
+                        if let Some(Obj::Host {
+                            state: HostState::List(items),
+                            ..
+                        }) = vm.heap.get_mut(lh)
+                        {
+                            items.push(V::Ref(r));
+                        }
+                    }
                 }
                 Some(None)
             }
@@ -856,32 +877,6 @@ fn write_sorted_list(vm: &mut Vm, h: u32, items: Vec<V>) {
             }
         }
         _ => {}
-    }
-}
-
-fn drain_single_executor_sync(vm: &mut Vm, ex: u32) {
-    while let Some(r) = vm.executor_active.get(&ex).copied() {
-        // A task submitting back into its own executor is still active;
-        // it must finish before later work can start, so leave the queue
-        // ordered instead of re-entering it recursively.
-        if r == vm.cur_runnable {
-            break;
-        }
-        if let Some(i) = vm.pending_runnables.iter().position(|(h, _)| *h == r) {
-            vm.pending_runnables.remove(i);
-        }
-        let _ = run_on_worker(vm, r);
-        vm.runnable_executor.remove(&r);
-        if vm.executor_active.get(&ex) == Some(&r) {
-            let next = vm.executor_queues.get_mut(&ex).and_then(|q| q.pop_front());
-            if let Some(next) = next {
-                vm.executor_active.insert(ex, next);
-                vm.runnable_executor.insert(next, ex);
-            } else {
-                vm.executor_active.remove(&ex);
-                vm.executor_queues.remove(&ex);
-            }
-        }
     }
 }
 

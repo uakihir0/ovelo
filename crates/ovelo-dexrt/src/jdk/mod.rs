@@ -167,6 +167,12 @@ pub(crate) const P_CSL_STATES: u64 = 0xFFFD_FEF8;
 pub(crate) const P_CSL_COLORS: u64 = 0xFFFD_FEF9;
 /// Resting enabled/unchecked color chosen from a ColorStateList.
 pub(crate) const P_CSL_RESTING: u64 = 0xFFFD_FEFA;
+/// Host future-completion bookkeeping for ExecutorService.submit.
+pub(crate) const P_FUTURE_TARGET: u64 = 0xFFFD_FEFB;
+pub(crate) const P_FUTURE: u64 = 0xFFFD_FEFC;
+pub(crate) const P_FUTURE_CALLABLE: u64 = 0xFFFD_FEFD;
+pub(crate) const P_FUTURE_DONE: u64 = 0xFFFD_FEFE;
+pub(crate) const P_FUTURE_LISTENERS: u64 = 0xFFFD_FEFF;
 
 pub(crate) fn now_ms() -> i64 {
     std::time::SystemTime::now()
@@ -431,7 +437,42 @@ fn is_message(vm: &Vm, h: u32) -> bool {
 /// else `call()` — Callable-only tasks (RxJava `ScheduledDirectTask`)
 /// have no `run`, and the builtin `Runnable` fallback would sink the
 /// call into a silent no-op, dropping the real work.
+fn complete_host_future(vm: &mut Vm, future: u32, value: V) {
+    if let Some(Obj::Host { state, .. }) = vm.heap.get_mut(future) {
+        *state = HostState::Slot(value);
+    }
+    pseudo_set(vm, future, P_FUTURE_DONE, V::I32(1));
+    let listeners = pseudo_get(vm, future, P_FUTURE_LISTENERS)
+        .and_then(|v| if let V::Ref(h) = v { Some(h) } else { None })
+        .and_then(|h| match vm.heap.get(h) {
+            Some(Obj::Host {
+                state: HostState::List(items),
+                ..
+            }) => Some(items.clone()),
+            _ => None,
+        })
+        .unwrap_or_default();
+    for listener in listeners {
+        if let V::Ref(l) = listener {
+            let _ = vm.call_virtual_rt(l, "run", &[]);
+        }
+    }
+}
+
 fn dispatch_task(vm: &mut Vm, r: u32) -> std::result::Result<Option<V>, ovelo_error::OveloError> {
+    if let Some(V::Ref(target)) = pseudo_get(vm, r, P_FUTURE_TARGET) {
+        let callable = matches!(pseudo_get(vm, r, P_FUTURE_CALLABLE), Some(V::I32(1)));
+        let out = if callable {
+            vm.call_virtual(target, "call", &[])?
+        } else {
+            vm.call_virtual(target, "run", &[])?;
+            None
+        };
+        if let Some(V::Ref(future)) = pseudo_get(vm, r, P_FUTURE) {
+            complete_host_future(vm, future, out.unwrap_or(V::Ref(0)));
+        }
+        return Ok(None);
+    }
     if let Some(ci) = vm.heap.class_of(r) {
         let has_run = vm
             .find_method_on_chain(ci, "run", 0, Some(&[]))
