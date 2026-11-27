@@ -308,6 +308,12 @@ fn raster_stroke_to_bitmap(
     }
 }
 
+fn mat_stroke_scale(m: [f32; 6]) -> f32 {
+    let sx = (m[0] * m[0] + m[3] * m[3]).sqrt();
+    let sy = (m[1] * m[1] + m[4] * m[4]).sqrt();
+    ((sx + sy) / 2.0).max(f32::EPSILON)
+}
+
 fn raster_path_to_bitmap(
     vm: &mut Vm,
     dst_h: u32,
@@ -330,8 +336,10 @@ fn raster_path_to_bitmap(
     if contours.is_empty() {
         return;
     }
+    let mut stroke_paint = paint;
+    stroke_paint.stroke_w *= mat_stroke_scale(m);
     if paint.style == 1 {
-        raster_stroke_to_bitmap(vm, dst_h, &contours, paint);
+        raster_stroke_to_bitmap(vm, dst_h, &contours, stroke_paint);
         return;
     }
     let even_odd = fill_type % 2 == 1;
@@ -382,7 +390,7 @@ fn raster_path_to_bitmap(
         *dst = std::rc::Rc::new(out);
     }
     if paint.style != 0 {
-        raster_stroke_to_bitmap(vm, dst_h, &contours, paint);
+        raster_stroke_to_bitmap(vm, dst_h, &contours, stroke_paint);
     }
 }
 
