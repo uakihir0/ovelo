@@ -131,6 +131,8 @@ pub(crate) const P_FINISHED: u32 = 0xFFFD_FFEF;
 pub(crate) const P_INTENT: u32 = 0xFFFD_FFEE;
 pub(crate) const P_RESULT_CODE: u32 = 0xFFFD_FFE7;
 pub(crate) const P_RESULT_INTENT: u32 = 0xFFFD_FFE6;
+const P_PROGRESS: u32 = 0xFFFD_FFE5;
+const P_PROGRESS_MAX: u32 = 0xFFFD_FFE4;
 
 // TypedArray backing — below the `tag_key` band (which bottoms out at
 // ~u32::MAX - 0x10014).
@@ -3197,6 +3199,28 @@ pub(crate) fn call(
             };
             Some(Some(out))
         }
+        "setProgress" => {
+            pseudo_set(
+                vm,
+                this,
+                P_PROGRESS,
+                args.get(1).copied().unwrap_or(V::I32(0)),
+            );
+            Some(None)
+        }
+        "getProgress" => Some(Some(pseudo_get(vm, this, P_PROGRESS).unwrap_or(V::I32(0)))),
+        "setMax" => {
+            pseudo_set(
+                vm,
+                this,
+                P_PROGRESS_MAX,
+                args.get(1).copied().unwrap_or(V::I32(0)),
+            );
+            Some(None)
+        }
+        "getMax" => Some(Some(
+            pseudo_get(vm, this, P_PROGRESS_MAX).unwrap_or(V::I32(100)),
+        )),
         "setAlpha"
         | "setElevation"
         | "setShowDividers"
@@ -3258,8 +3282,6 @@ pub(crate) fn call(
         | "setFilters"
         | "setEnabled_true"
         | "setCheckMarkDrawable"
-        | "setProgress"
-        | "setMax"
         | "setIndeterminate"
         | "setOnItemClickListener"
         | "setMinWidth"
