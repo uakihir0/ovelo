@@ -82,10 +82,20 @@ pub(crate) fn point_write(vm: &mut Vm, h: u32, x: i32, y: i32) {
 }
 
 pub(crate) fn point_xy(vm: &Vm, h: u32) -> (i32, i32) {
-    (
-        i32v(pseudo_get(vm, h, P_POINT_X).unwrap_or(V::I32(0))),
-        i32v(pseudo_get(vm, h, P_POINT_Y).unwrap_or(V::I32(0))),
-    )
+    let read = |name: &str, key: u32| -> i32 {
+        if let Some(f) = vm
+            .field_index_of("Landroid/graphics/Point;", name)
+            .map(|g| vm.canon_field(g))
+        {
+            if let Some(Obj::Instance { fields, .. } | Obj::Host { fields, .. }) = vm.heap.get(h) {
+                if let Some(v) = fields.get(&f) {
+                    return i32v(*v);
+                }
+            }
+        }
+        i32v(pseudo_get(vm, h, key).unwrap_or(V::I32(0)))
+    };
+    (read("x", P_POINT_X), read("y", P_POINT_Y))
 }
 pub(crate) const P_BOUNDS: u32 = u32::MAX - 11;
 /// Thread was `start()`ed once — JVM forbids a second start.
@@ -1780,8 +1790,10 @@ fn universal(vm: &mut Vm, class: &str, name: &str, sig: &str, args: &[V]) -> Rt<
     // UUID implements these object operations from its 128-bit value in
     // the collections module; the generic identity/object-id versions
     // would make equal UUIDs and serialized UUID strings unusable.
-    if matches!(class, "Ljava/util/UUID;" | "Ljava/math/BigDecimal;")
-        && matches!(name, "toString" | "hashCode" | "equals")
+    if matches!(
+        class,
+        "Ljava/util/UUID;" | "Ljava/math/BigDecimal;" | "Landroid/graphics/Point;"
+    ) && matches!(name, "toString" | "hashCode" | "equals")
     {
         return Ok(None);
     }

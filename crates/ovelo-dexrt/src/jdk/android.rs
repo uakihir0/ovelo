@@ -6808,6 +6808,9 @@ fn graphics_call(
                 "<init>" => {
                     if args.len() >= 3 {
                         point_write(vm, this, i32v(args[1]), i32v(args[2]));
+                    } else if let Some(V::Ref(src)) = args.get(1).copied() {
+                        let (x, y) = point_xy(vm, src);
+                        point_write(vm, this, x, y);
                     }
                     Some(None)
                 }
@@ -6831,13 +6834,16 @@ fn graphics_call(
                     Some(None)
                 }
                 _ => {
-                    let other = match args.get(1).copied() {
-                        Some(V::Ref(h)) => h,
-                        _ => 0,
+                    let (x, y) = point_xy(vm, this);
+                    let eq = if args.len() >= 3 {
+                        x == i32v(args[1]) && y == i32v(args[2])
+                    } else {
+                        match args.get(1).copied() {
+                            Some(V::Ref(other)) if other != 0 => (x, y) == point_xy(vm, other),
+                            _ => false,
+                        }
                     };
-                    Some(Some(V::I32(
-                        (other != 0 && point_xy(vm, this) == point_xy(vm, other)) as i32,
-                    )))
+                    Some(Some(V::I32(eq as i32)))
                 }
             }
         }
