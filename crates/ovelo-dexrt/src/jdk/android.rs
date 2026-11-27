@@ -4901,13 +4901,17 @@ fn graphics_call(
             };
             let cloned = src.and_then(|v| match v {
                 V::Ref(h) => {
-                    let (desc, fields) = match vm.heap.get(h) {
+                    let (desc, mut fields) = match vm.heap.get(h) {
                         Some(Obj::Host { desc, fields, .. }) => (desc.clone(), fields.clone()),
                         _ => (
                             "Landroid/graphics/drawable/Drawable;".to_string(),
                             Default::default(),
                         ),
                     };
+                    // Bounds live in a Rect object; copying the field map
+                    // would share that Rect between original and clone.
+                    // ConstantState creates an unbound drawable, so drop it.
+                    fields.remove(&(P_BOUNDS as u64));
                     let out = host(vm, &desc, HostState::Empty);
                     if let V::Ref(oh) = out {
                         if let Some(dst) = fields_mut(vm, oh) {
