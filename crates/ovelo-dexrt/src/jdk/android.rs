@@ -3686,6 +3686,25 @@ fn context_call(
             );
             Some(None)
         }
+        "onMenuItemSelected" => {
+            // AOSP Activity dispatches panel-menu items to the activity's
+            // options-item callback. ComponentActivity/AppCompatActivity
+            // call this framework implementation through super, so leaving
+            // it as an empty lifecycle default makes every toolbar action
+            // report unhandled before the guest override is consulted.
+            let this = match args.first() {
+                Some(V::Ref(h)) => *h,
+                _ => 0,
+            };
+            let feature = i32v(args.get(1).copied().unwrap_or(V::I32(0)));
+            let item = args.get(2).copied().unwrap_or(V::Ref(0));
+            let handled = (feature == 0 || feature == 8)
+                && matches!(
+                    vm.call_virtual(this, "onOptionsItemSelected", &[item]),
+                    Ok(Some(V::I32(v))) if v != 0
+                );
+            Some(Some(V::I32(handled as i32)))
+        }
         "onCreate"
         | "onStart"
         | "onResume"
