@@ -2664,7 +2664,19 @@ impl Vm {
     /// Drain only worker-side tasks. Blocking future waits must not
     /// run unrelated main-loop callbacks ahead of their natural turn.
     pub(crate) fn drain_worker_runnables(&mut self, max: usize) -> usize {
-        self.drain_runnables_impl(max, true)
+        if !self.draining {
+            return self.drain_runnables_impl(max, true);
+        }
+        if self.park_depth >= 8 {
+            return 0;
+        }
+        self.park_depth += 1;
+        let was = self.draining;
+        self.draining = false;
+        let ran = self.drain_runnables_impl(max, true);
+        self.draining = was;
+        self.park_depth -= 1;
+        ran
     }
 
     fn drain_runnables_impl(&mut self, max: usize, workers_only: bool) -> usize {
@@ -2684,101 +2696,103 @@ impl Vm {
             self.pending_runnables.push_back((r, on_main));
         }
         self.draining = true;
-        // Host-side async deliveries before guest work: finished coil
-        // image fetches become drawables, and services that stopped
-        // since the last pass get their onDestroy here — not inline
-        // inside their own callback. Runs AFTER the draining flag is
-        // set so a nested drain from a delivered callback early-returns
-        // instead of running an unbounded inner pass.
-        jdk::http::drain_coil(self);
-        jdk::android::drain_jobs(self);
-        // Retry host calls that lost the borrow race during the last
-        // pass — the outer callback has released by now, so the bridge
-        // runs its host-side effects (GuestUi wiring etc.). attach_at
-        // dedupes the dex side it already did via the builtin fallback.
-        self.in_host_retry = true;
-        for (midx, args) in std::mem::take(&mut self.pending_host_retry) {
-            let host = self
-                .hosts
-                .get(&midx)
-                .cloned()
-                .or_else(|| self.host_named(midx).ok().flatten());
-            if let Some(f) = host {
-                if let Ok(mut g) = f.try_borrow_mut() {
-                    let _ = g(self, &args);
+        let dbg = crate::dbg_flag("OVELO_DRAINDBG");
+        if !workers_only {
+            // Host-side async deliveries before guest work: finished coil
+            // image fetches become drawables, and services that stopped
+            // since the last pass get their onDestroy here — not inline
+            // inside their own callback. Runs AFTER the draining flag is
+            // set so a nested drain from a delivered callback early-returns
+            // instead of running an unbounded inner pass.
+            jdk::http::drain_coil(self);
+            jdk::android::drain_jobs(self);
+            // Retry host calls that lost the borrow race during the last
+            // pass — the outer callback has released by now, so the bridge
+            // runs its host-side effects (GuestUi wiring etc.). attach_at
+            // dedupes the dex side it already did via the builtin fallback.
+            self.in_host_retry = true;
+            for (midx, args) in std::mem::take(&mut self.pending_host_retry) {
+                let host = self
+                    .hosts
+                    .get(&midx)
+                    .cloned()
+                    .or_else(|| self.host_named(midx).ok().flatten());
+                if let Some(f) = host {
+                    if let Ok(mut g) = f.try_borrow_mut() {
+                        let _ = g(self, &args);
+                    }
                 }
             }
-        }
-        self.in_host_retry = false;
-        for (holder, cb, tries) in std::mem::take(&mut self.pending_surface) {
-            let (mut sw, mut sh) = surface_holder_size(self, holder);
-            if sw <= 0 || sh <= 0 {
-                if tries < 240 {
-                    // Not laid out yet — retry next tick so the guest
-                    // never builds a projection over a 0x0 surface.
-                    self.pending_surface.push((holder, cb, tries + 1));
-                    continue;
+            self.in_host_retry = false;
+            for (holder, cb, tries) in std::mem::take(&mut self.pending_surface) {
+                let (mut sw, mut sh) = surface_holder_size(self, holder);
+                if sw <= 0 || sh <= 0 {
+                    if tries < 240 {
+                        // Not laid out yet — retry next tick so the guest
+                        // never builds a projection over a 0x0 surface.
+                        self.pending_surface.push((holder, cb, tries + 1));
+                        continue;
+                    }
+                    // View never laid out (hidden SurfaceView etc.) —
+                    // report the window default rather than 0x0.
+                    (sw, sh) = (720, 1280);
                 }
-                // View never laid out (hidden SurfaceView etc.) —
-                // report the window default rather than 0x0.
-                (sw, sh) = (720, 1280);
-            }
-            let wh = V::Ref(holder);
-            if crate::dbg_flag("OVELO_DRAWDBG") {
-                eprintln!("[gldbg] surfaceCreated+Changed h{holder} cb{cb} {sw}x{sh}");
-            }
-            let _ = self.call_virtual(cb, "surfaceCreated", &[wh]);
-            let _ = self.call_virtual(
-                cb,
-                "surfaceChanged",
-                &[wh, V::I32(0), V::I32(sw), V::I32(sh)],
-            );
-            self.surface_sizes.insert(holder, (sw, sh));
-        }
-        // Redispatch `surfaceChanged` on registered holders whose owning
-        // view's size changed (first layout, rotation, ...).
-        for (holder, cb) in std::mem::take(&mut self.surface_cbs) {
-            let (sw, sh) = surface_holder_size(self, holder);
-            if sw > 0 && sh > 0 && self.surface_sizes.get(&holder) != Some(&(sw, sh)) {
-                self.surface_sizes.insert(holder, (sw, sh));
+                let wh = V::Ref(holder);
+                if crate::dbg_flag("OVELO_DRAWDBG") {
+                    eprintln!("[gldbg] surfaceCreated+Changed h{holder} cb{cb} {sw}x{sh}");
+                }
+                let _ = self.call_virtual(cb, "surfaceCreated", &[wh]);
                 let _ = self.call_virtual(
                     cb,
                     "surfaceChanged",
-                    &[V::Ref(holder), V::I32(0), V::I32(sw), V::I32(sh)],
+                    &[wh, V::I32(0), V::I32(sw), V::I32(sh)],
+                );
+                self.surface_sizes.insert(holder, (sw, sh));
+            }
+            // Redispatch `surfaceChanged` on registered holders whose owning
+            // view's size changed (first layout, rotation, ...).
+            for (holder, cb) in std::mem::take(&mut self.surface_cbs) {
+                let (sw, sh) = surface_holder_size(self, holder);
+                if sw > 0 && sh > 0 && self.surface_sizes.get(&holder) != Some(&(sw, sh)) {
+                    self.surface_sizes.insert(holder, (sw, sh));
+                    let _ = self.call_virtual(
+                        cb,
+                        "surfaceChanged",
+                        &[V::Ref(holder), V::I32(0), V::I32(sw), V::I32(sh)],
+                    );
+                }
+                self.surface_cbs.push((holder, cb));
+            }
+            for h in std::mem::take(&mut self.pending_destroy) {
+                let _ = self.call_virtual(h, "onDestroy", &[]);
+            }
+            jdk::view::deliver_attach_callbacks(self);
+            // Choreographer frame callbacks — `drain_runnables` runs once
+            // per frame tick, so a due callback fires on the next pass; one
+            // that reposts itself lands in `frame_callbacks` again (the
+            // Recomposer's loop works exactly that way).
+            let frame_nanos = V::I64(jdk::now_nanos());
+            let due_cbs: Vec<_> = self
+                .frame_callbacks
+                .extract_if(.., |(_, t)| *t <= now)
+                .collect();
+            if dbg && !due_cbs.is_empty() {
+                eprintln!(
+                    "[drain] framecb due={} pending={}",
+                    due_cbs.len(),
+                    self.frame_callbacks.len()
                 );
             }
-            self.surface_cbs.push((holder, cb));
-        }
-        for h in std::mem::take(&mut self.pending_destroy) {
-            let _ = self.call_virtual(h, "onDestroy", &[]);
-        }
-        jdk::view::deliver_attach_callbacks(self);
-        // Choreographer frame callbacks — `drain_runnables` runs once
-        // per frame tick, so a due callback fires on the next pass; one
-        // that reposts itself lands in `frame_callbacks` again (the
-        // Recomposer's loop works exactly that way).
-        let frame_nanos = V::I64(jdk::now_nanos());
-        let due_cbs: Vec<_> = self
-            .frame_callbacks
-            .extract_if(.., |(_, t)| *t <= now)
-            .collect();
-        let dbg = crate::dbg_flag("OVELO_DRAINDBG");
-        if dbg && !due_cbs.is_empty() {
-            eprintln!(
-                "[drain] framecb due={} pending={}",
-                due_cbs.len(),
-                self.frame_callbacks.len()
-            );
-        }
-        for (cb, _) in due_cbs {
-            let before_steps = self.total_steps;
-            let out = self.call_virtual(cb, "doFrame", &[frame_nanos]);
-            if dbg {
-                eprintln!(
-                    "[drain] doFrame h{cb} steps={} out={:?}",
-                    self.total_steps - before_steps,
-                    out
-                );
+            for (cb, _) in due_cbs {
+                let before_steps = self.total_steps;
+                let out = self.call_virtual(cb, "doFrame", &[frame_nanos]);
+                if dbg {
+                    eprintln!(
+                        "[drain] doFrame h{cb} steps={} out={:?}",
+                        self.total_steps - before_steps,
+                        out
+                    );
+                }
             }
         }
         let mut ran = 0usize;
@@ -3007,28 +3021,30 @@ impl Vm {
                 }
             }
         }
-        // TextClock tick: AOSP reschedules the ticker runnable every
-        // second; the drain cadence is our clock signal. Handles are
-        // re-validated against the class chain — a GC'd slot recycled
-        // for a non-clock object must be dropped, not overwritten.
-        if !self.clock_views.is_empty() {
-            let mut live: Vec<u32> = Vec::with_capacity(self.clock_views.len());
-            for i in 0..self.clock_views.len() {
-                let h = self.clock_views[i];
-                // Same classification the registration site uses —
-                // `jdk::class_of` covers host-backed clocks whose
-                // class_idx is GX_NONE, which `heap.class_of` misses.
-                let is_clock = self.heap.get(h).is_some()
-                    && self.assignable_desc(
-                        &jdk::class_of(self, V::Ref(h)),
-                        "Landroid/widget/TextClock;",
-                    );
-                if is_clock {
-                    live.push(h);
-                    jdk::view::textclock_update(self, h);
+        if !workers_only {
+            // TextClock tick: AOSP reschedules the ticker runnable every
+            // second; the drain cadence is our clock signal. Handles are
+            // re-validated against the class chain — a GC'd slot recycled
+            // for a non-clock object must be dropped, not overwritten.
+            if !self.clock_views.is_empty() {
+                let mut live: Vec<u32> = Vec::with_capacity(self.clock_views.len());
+                for i in 0..self.clock_views.len() {
+                    let h = self.clock_views[i];
+                    // Same classification the registration site uses —
+                    // `jdk::class_of` covers host-backed clocks whose
+                    // class_idx is GX_NONE, which `heap.class_of` misses.
+                    let is_clock = self.heap.get(h).is_some()
+                        && self.assignable_desc(
+                            &jdk::class_of(self, V::Ref(h)),
+                            "Landroid/widget/TextClock;",
+                        );
+                    if is_clock {
+                        live.push(h);
+                        jdk::view::textclock_update(self, h);
+                    }
                 }
+                self.clock_views = live;
             }
-            self.clock_views = live;
         }
         self.draining = false;
         ran
