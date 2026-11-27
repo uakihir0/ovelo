@@ -626,7 +626,12 @@ pub(crate) fn dex_view_info(vm: &Vm, h: u32) -> Option<DexViewInfo> {
         // P_TCOLOR only carries setTextColor args — packed ARGB.
         Some(V::I32(c)) => Some(c),
         Some(v) => color_v(vm, v),
-        _ => attr_find(vm, h, "textColor").and_then(|v| color_v(vm, v)),
+        _ => attr_find(vm, h, "textColor")
+            .and_then(|v| color_v(vm, v))
+            // TextView's default style takes its normal color from the
+            // theme when XML/runtime didn't set one. Without this every
+            // theme-colored label falls back to the renderer's black.
+            .or_else(|| crate::theme_color(vm, 0x0101_0036).map(|c| c as i32)),
     };
     let bg_color = match pseudo_get(vm, h, P_BGCOLOR) {
         // P_BGCOLOR only carries setBackgroundColor args — packed
