@@ -1630,9 +1630,22 @@ pub(crate) fn call(
         "checkLayoutParams" => {
             let ok = match args.get(1).copied() {
                 Some(v @ V::Ref(lph)) if lph != 0 => {
-                    let got = class_of(vm, v);
-                    let want = lp_class_for(vm, this);
-                    got == want || desc_is_a(&got, &want) || vm.assignable_desc(&got, &want)
+                    // A dex override reaches this host method only through
+                    // invoke-super after performing its own typed check.
+                    // Re-checking against the canonical framework LP name
+                    // rejects R8-renamed inner LP classes (CoordinatorLayout's
+                    // `Lej0`), causing addView to copy them and drop behavior.
+                    if vm.has_dex_virtual(
+                        this,
+                        "checkLayoutParams",
+                        &["Landroid/view/ViewGroup$LayoutParams;"],
+                    ) {
+                        true
+                    } else {
+                        let got = class_of(vm, v);
+                        let want = lp_class_for(vm, this);
+                        got == want || desc_is_a(&got, &want) || vm.assignable_desc(&got, &want)
+                    }
                 }
                 _ => false,
             };
