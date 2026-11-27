@@ -1079,12 +1079,18 @@ impl GuestUi {
                     let this = ref_arg(a, 0)?;
                     let raw = match a.get(1) {
                         Some(V::Ref(h)) => match vm.color_state_list_resting(*h) {
-                            Some(V::I32(c)) => c,
-                            _ => 0,
+                            // Transparent black is the failure value of an
+                            // unresolved list, not a usable preference title
+                            // color. Fall back to the theme's primary text
+                            // color so an unsupported selector does not make
+                            // the text invisible.
+                            Some(V::I32(c)) if c != 0 => Some(c),
+                            _ => ovelo_dexrt::theme_color(vm, 0x01010036).map(|c| c as i32),
                         },
-                        Some(V::I32(c)) => *c,
+                        Some(V::I32(c)) => Some(*c),
                         _ => return Err(crate::err("guest.arg.type")),
                     };
+                    let Some(raw) = raw else { return Ok(None) };
                     ovelo_dexrt::pseudo_set(vm, this, ovelo_dexrt::P_TCOLOR, V::I32(raw));
                     let Some(rc) = ui
                         .try_borrow()
