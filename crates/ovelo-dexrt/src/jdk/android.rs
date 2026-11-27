@@ -3698,11 +3698,14 @@ fn context_call(
             };
             let feature = i32v(args.get(1).copied().unwrap_or(V::I32(0)));
             let item = args.get(2).copied().unwrap_or(V::Ref(0));
-            let handled = (feature == 0 || feature == 8)
-                && matches!(
-                    vm.call_virtual(this, "onOptionsItemSelected", &[item]),
-                    Ok(Some(V::I32(v))) if v != 0
-                );
+            let handled = if feature == 0 || feature == 8 {
+                matches!(
+                    vm.call_virtual_rt(this, "onOptionsItemSelected", &[item])?,
+                    Some(V::I32(v)) if v != 0
+                )
+            } else {
+                false
+            };
             Some(Some(V::I32(handled as i32)))
         }
         "onCreate"
