@@ -2121,13 +2121,28 @@ pub(crate) fn call(
         "setChecked" if is_marked(vm, this) => {
             let checked = i32v(args.get(1).copied().unwrap_or(V::I32(0)));
             pseudo_set(vm, this, P_CHECKED, V::I32((checked != 0) as i32));
+            if checked == 0 {
+                if let Some(V::Ref(parent)) = pseudo_get(vm, this, P_PARENT) {
+                    if pseudo_get(vm, parent, P_RADIO_CHECKED) == Some(V::I32(view_id(vm, this))) {
+                        pseudo_set(vm, parent, P_RADIO_CHECKED, V::I32(-1));
+                    }
+                }
+            }
             if checked != 0 {
                 if let Some(V::Ref(parent)) = pseudo_get(vm, this, P_PARENT) {
                     let cls = class_of(vm, V::Ref(parent));
                     if cls == "Landroid/widget/RadioGroup;"
                         || vm.assignable_desc(&cls, "Landroid/widget/RadioGroup;")
                     {
-                        pseudo_set(vm, parent, P_RADIO_CHECKED, V::I32(view_id(vm, this)));
+                        let id = view_id(vm, this);
+                        pseudo_set(vm, parent, P_RADIO_CHECKED, V::I32(id));
+                        for c in children(vm, parent) {
+                            if let V::Ref(ch) = c {
+                                if ch != this {
+                                    pseudo_set(vm, ch, P_CHECKED, V::I32(0));
+                                }
+                            }
+                        }
                     }
                 }
             }
