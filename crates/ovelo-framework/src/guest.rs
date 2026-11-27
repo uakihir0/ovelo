@@ -373,6 +373,13 @@ fn make_dex_view(vm: &Vm, info: &ovelo_dexrt::DexViewInfo, fonts: &Rc<FontSet>) 
         g.scroll_y = info.scroll_y;
         g.horizontal = !info.linear_vertical;
         GuestView::Group(g)
+    } else if info.desc.contains("CompoundButton")
+        || info.desc.contains("CheckBox")
+        || info.desc.contains("RadioButton")
+        || info.desc.contains("Switch")
+        || vm.extends_named(&info.desc, "CompoundButton")
+    {
+        GuestView::Text(TextView::new("", 16.0, dark, fonts.clone()))
     } else if info.desc.contains("Button") {
         GuestView::Btn(Button::new("", 16.0, dark, fonts.clone()))
     } else if info.text.is_some()
@@ -413,6 +420,14 @@ fn update_dex_view(g: &mut GuestView, info: &ovelo_dexrt::DexViewInfo) {
         };
         if img_changed {
             v.image = info.image.clone();
+            changed = true;
+        }
+        if v.padding != info.padding {
+            v.padding = info.padding;
+            changed = true;
+        }
+        if v.scale_type != info.scale_type {
+            v.scale_type = info.scale_type;
             changed = true;
         }
     }
@@ -457,6 +472,10 @@ fn update_dex_view(g: &mut GuestView, info: &ovelo_dexrt::DexViewInfo) {
         if tv.max_lines != info.max_lines {
             tv.max_lines = info.max_lines;
             tv.invalidate();
+        }
+        if tv.checked != info.compound_checked {
+            tv.checked = info.compound_checked;
+            tv.set_text(tv.text.clone());
         }
     }
     if changed {
@@ -1079,12 +1098,16 @@ impl GuestUi {
                     let this = ref_arg(a, 0)?;
                     let raw = match a.get(1) {
                         Some(V::Ref(h)) => match vm.color_state_list_resting(*h) {
-                            Some(V::I32(c)) => c,
-                            _ => 0,
+                            // A resolved zero is a valid transparent color;
+                            // only an absent/unresolved list falls back to
+                            // the theme's primary text color.
+                            Some(V::I32(c)) => Some(c),
+                            _ => ovelo_dexrt::theme_color(vm, 0x01010036).map(|c| c as i32),
                         },
-                        Some(V::I32(c)) => *c,
+                        Some(V::I32(c)) => Some(*c),
                         _ => return Err(crate::err("guest.arg.type")),
                     };
+                    let Some(raw) = raw else { return Ok(None) };
                     ovelo_dexrt::pseudo_set(vm, this, ovelo_dexrt::P_TCOLOR, V::I32(raw));
                     let Some(rc) = ui
                         .try_borrow()
@@ -1694,7 +1717,10 @@ pub fn drive_dex_layout_pass(vm: &mut Vm, activity: u32, frame: u32, win_w: i32,
         // reports a dex parent (the `android.R.id.content` frame the
         // decor wraps it in), so `!parent_is_dex` alone would skip
         // every node and no frame would ever be set.
-        let parent_is_dex = depth != 0 && info.parent != 0 && vm.is_dex_view(info.parent);
+        let parent_is_dex = depth != 0
+            && info.parent != 0
+            && vm.is_dex_view(info.parent)
+            && !ovelo_dexrt::is_popup_root(vm, h);
         let root_size_changed = depth == 0
             && info
                 .frame

@@ -115,6 +115,18 @@ pub(crate) fn cur_attr_value(vm: &mut Vm, h: u32, name: &str) -> Option<V> {
         .map(|a| view::attr_v(vm, &a.value))
 }
 
+/// Same attribute without erasing its binary-XML type. Color resolution
+/// needs this: a literal can numerically equal a framework resource id,
+/// and TYPE_ATTRIBUTE must not be confused with TYPE_REFERENCE.
+pub(crate) fn cur_attr_raw(vm: &Vm, h: u32, name: &str) -> Option<Value> {
+    let (els, ev) = cur(vm, h)?;
+    let el = cur_el(&els, ev)?;
+    el.attrs
+        .iter()
+        .find(|a| a.name == name)
+        .map(|a| a.value.clone())
+}
+
 pub(crate) fn pull_call(
     vm: &mut Vm,
     class: &str,

@@ -3341,12 +3341,19 @@ pub(crate) fn host_supers(d: &str) -> &'static [&'static str] {
         "Landroid/widget/ImageButton;" => {
             &["Landroid/widget/ImageView;", "Landroid/view/View;", OBJ]
         }
-        "Landroid/widget/CheckBox;" | "Landroid/widget/RadioButton;" => {
-            &["Landroid/widget/Button;", "Landroid/widget/TextView;", OBJ]
-        }
-        "Landroid/widget/CompoundButton;" => {
-            &["Landroid/widget/Button;", "Landroid/widget/TextView;", OBJ]
-        }
+        "Landroid/widget/CheckBox;" | "Landroid/widget/RadioButton;" => &[
+            "Landroid/widget/CompoundButton;",
+            "Landroid/widget/Button;",
+            "Landroid/widget/TextView;",
+            "Landroid/view/View;",
+            OBJ,
+        ],
+        "Landroid/widget/CompoundButton;" => &[
+            "Landroid/widget/Button;",
+            "Landroid/widget/TextView;",
+            "Landroid/view/View;",
+            OBJ,
+        ],
         "Landroid/widget/Switch;" => &[
             "Landroid/widget/CompoundButton;",
             "Landroid/widget/Button;",

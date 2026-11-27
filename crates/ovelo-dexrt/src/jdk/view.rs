@@ -84,6 +84,15 @@ const P_IMAGE_PLACEHOLDER: u32 = u32::MAX - 30;
 const P_POPUP_ROOT: u32 = u32::MAX - 31;
 const P_POPUP_OWNER: u32 = u32::MAX - 32;
 const P_POPUP_POS: u32 = u32::MAX - 33;
+/// Overflow popup whose rows were compressed to fit the available height.
+const P_POPUP_COMPACT: u32 = u32::MAX - 53;
+/// Synthetic dialog button state: target dialog, button which, and marker.
+const P_DIALOG_BUTTON_DIALOG: u32 = u32::MAX - 54;
+const P_DIALOG_BUTTON_WHICH: u32 = u32::MAX - 55;
+const P_DIALOG_HAS_BUTTONS: u32 = u32::MAX - 56;
+const P_DIALOG_POS_LISTENER: u32 = u32::MAX - 57;
+const P_DIALOG_NEG_LISTENER: u32 = u32::MAX - 58;
+const P_DIALOG_CONTENT: u32 = u32::MAX - 59;
 /// Dialog cancelable flag (`setCancelable(false)` stores 0).
 const P_DIALOG_CANCELABLE: u32 = u32::MAX - 34;
 /// Synthetic AlertDialog panel wrapping custom content.
@@ -127,11 +136,11 @@ pub(crate) const P_TA_ATTRS: u32 = 0xFFFD_FFFE;
 pub(crate) const P_TA_SET: u32 = 0xFFFD_FFFF;
 /// Pseudo key: explicit style res id on a `TypedArray`
 /// (`obtainStyledAttributes(resId, attrs)`).
-const P_TA_STYLE: u32 = 0xFFFD_FFFD;
+pub(crate) const P_TA_STYLE: u32 = 0xFFFD_FFFD;
 /// Pseudo key: `defStyleAttr` res id on a `TypedArray`.
-const P_TA_DEF_ATTR: u32 = 0xFFFD_FFFC;
+pub(crate) const P_TA_DEF_ATTR: u32 = 0xFFFD_FFFC;
 /// Pseudo key: `defStyleRes` res id on a `TypedArray`.
-const P_TA_DEF_RES: u32 = 0xFFFD_FFFB;
+pub(crate) const P_TA_DEF_RES: u32 = 0xFFFD_FFFB;
 /// Pseudo key: the `AttributeSet` a view was inflated with (for
 /// `getLayoutParams` re-parse).
 const P_ATTRS: u32 = 0xFFFD_FFFA;
@@ -350,6 +359,10 @@ pub struct DexViewInfo {
     /// `setImage*`-attached pixels (`w`, `h`, RGBA8) after resolving
     /// Bitmap hosts, drawable field chains, res-ids and file/Uri paths.
     pub image: Option<(u32, u32, std::rc::Rc<Vec<u8>>)>,
+    /// Content padding `(left, top, right, bottom)` in px.
+    pub padding: (i32, i32, i32, i32),
+    /// ImageView scaleType enum (0 matrix, 1 fitXY, 3 fitCenter).
+    pub scale_type: i32,
     /// Parent view handle (0 = detached/root).
     pub parent: u32,
     /// Child view handles, in z-order.
@@ -370,6 +383,8 @@ pub struct DexViewInfo {
     pub scroll_y: i32,
     /// LinearLayout orientation: true for vertical, false for horizontal.
     pub linear_vertical: bool,
+    /// CompoundButton checked state, when this view is checkable.
+    pub compound_checked: Option<bool>,
 }
 
 /// The activity's content view handle (what `setContentView` attached).
@@ -411,6 +426,21 @@ fn attr_find(vm: &Vm, h: u32, name: &str) -> Option<V> {
     None
 }
 
+fn xml_value_bool(vm: &Vm, v: &Value) -> Option<bool> {
+    match v {
+        Value::Int(i) => Some(*i != 0),
+        Value::Bool(b) => Some(*b),
+        Value::Str(t) => Some(t.trim() != "false" && t.trim() != "0"),
+        Value::Reference(id) => attr_bool_ref(vm, *id),
+        Value::Other { data_type, data } => match data_type {
+            0x12 | 0x10 | 0x11 | 0x04 => Some(*data != 0),
+            0x01 => attr_bool_ref(vm, *data),
+            _ => None,
+        },
+        _ => None,
+    }
+}
+
 /// `@bool/x` (possibly chained) → the boolean it holds.
 fn attr_bool_ref(vm: &Vm, id: u32) -> Option<bool> {
     let res = vm.apk_res.as_ref()?;
@@ -436,11 +466,173 @@ fn attr_bool_ref(vm: &Vm, id: u32) -> Option<bool> {
 /// Resolve an attribute out of the explicit XML `style` reference.
 /// `attr_find` only sees direct tag attributes, while Android applies
 /// style items before falling back to the theme's default text color.
+fn themed_attr_entry(
+    res: &crate::res::ApkResources,
+    theme: u32,
+    overlay: Option<u32>,
+    attr: u32,
+    depth: u32,
+) -> Option<ovelo_apk::arsc::EntryValue> {
+    if depth >= 8 {
+        return None;
+    }
+    let ev = overlay
+        .and_then(|o| res.style_item(o, attr))
+        .or_else(|| res.style_item(theme, attr))?
+        .clone();
+    if ev.data_type == 0x02 {
+        themed_attr_entry(res, theme, overlay, ev.data, depth + 1)
+    } else {
+        Some(ev)
+    }
+}
+
+fn themed_value_color(
+    res: &crate::res::ApkResources,
+    theme: u32,
+    overlay: Option<u32>,
+    v: &Value,
+    depth: u32,
+) -> Option<u32> {
+    if depth >= 12 {
+        return None;
+    }
+    match v {
+        Value::Str(s) => vector::parse_color(s),
+        Value::Int(i) => Some(*i as u32),
+        Value::Other { data_type, data } if (0x1c..=0x1f).contains(data_type) => Some(*data),
+        Value::Other {
+            data_type: 0x02,
+            data,
+        } => {
+            let ev = themed_attr_entry(res, theme, overlay, *data, depth + 1)?;
+            themed_entry_color(res, theme, overlay, &ev, depth + 1)
+        }
+        Value::Reference(r) => themed_color_resource(res, theme, overlay, *r, depth + 1),
+        _ => None,
+    }
+}
+
+fn themed_entry_color(
+    res: &crate::res::ApkResources,
+    theme: u32,
+    overlay: Option<u32>,
+    ev: &ovelo_apk::arsc::EntryValue,
+    depth: u32,
+) -> Option<u32> {
+    if depth >= 12 {
+        return None;
+    }
+    match ev.data_type {
+        0x1c..=0x1f | 0x10 | 0x11 | 0x04 => Some(ev.data),
+        0x01 => themed_color_resource(res, theme, overlay, ev.data, depth + 1),
+        0x02 => {
+            let next = themed_attr_entry(res, theme, overlay, ev.data, depth + 1)?;
+            themed_entry_color(res, theme, overlay, &next, depth + 1)
+        }
+        0x03 => ev.string.as_deref().and_then(vector::parse_color),
+        _ => None,
+    }
+}
+
+fn themed_selector_color(
+    res: &crate::res::ApkResources,
+    theme: u32,
+    overlay: Option<u32>,
+    res_id: u32,
+    depth: u32,
+) -> Option<u32> {
+    let els = res.document(res_id)?;
+    for el in &els {
+        if el.name != "item" {
+            continue;
+        }
+        let stateful = el.attrs.iter().any(|a| {
+            if !a.name.starts_with("state_") {
+                return false;
+            }
+            if a.name == "state_enabled" {
+                matches!(&a.value, Value::Bool(false) | Value::Int(0))
+            } else {
+                true
+            }
+        });
+        if stateful {
+            continue;
+        }
+        if let Some(v) = el.android("color") {
+            if let Some(c) = themed_value_color(res, theme, overlay, v, depth + 1) {
+                return Some(c);
+            }
+        }
+    }
+    None
+}
+
+fn themed_color_resource(
+    res: &crate::res::ApkResources,
+    theme: u32,
+    overlay: Option<u32>,
+    res_id: u32,
+    depth: u32,
+) -> Option<u32> {
+    if depth >= 12 {
+        return None;
+    }
+    if let Some(ev) = res.entry_value(res_id).cloned() {
+        if ev.data_type == 0x03 && ev.string.as_deref().is_some_and(|s| s.starts_with("res/")) {
+            if let Some(c) = themed_selector_color(res, theme, overlay, res_id, depth + 1) {
+                return Some(c);
+            }
+        }
+        return themed_entry_color(res, theme, overlay, &ev, depth + 1).or_else(|| {
+            vector::drawable_flat_color(
+                vector::RCtx {
+                    res,
+                    theme,
+                    depth: depth.min(15) as u8,
+                },
+                res_id,
+            )
+        });
+    }
+    crate::res::framework_color(res_id)
+}
+
+fn overlay_aware_style_color(vm: &Vm, style: u32, color_res: u32) -> Option<u32> {
+    let res = vm.apk_res.as_ref()?;
+    let overlay_attr = res.attr_id_named("materialThemeOverlay")?;
+    let overlay = match res.style_item(style, overlay_attr) {
+        Some(ev) if ev.data_type == 0x01 => Some(ev.data),
+        _ => None,
+    }?;
+    themed_color_resource(res, vm.theme_id, Some(overlay), color_res, 0)
+}
+
+fn view_content_image(
+    vm: &Vm,
+    h: u32,
+    icon_only: bool,
+) -> Option<(u32, u32, std::rc::Rc<Vec<u8>>)> {
+    pseudo_get(vm, h, P_IMAGE)
+        .and_then(|v| image_pixels(vm, v))
+        .or_else(|| {
+            // MaterialButton's `app:icon` is a compound drawable rather
+            // than an ImageView src. The host materialization has one
+            // centered image slot, which is correct for the common
+            // icon-only button; text+icon layout needs real compound
+            // drawable support and is intentionally not approximated.
+            icon_only.then(|| attr_find(vm, h, "icon").and_then(|v| image_pixels(vm, v)))?
+        })
+}
+
 fn style_attr_color(vm: &Vm, style: u32, attr_id: u32) -> Option<i32> {
     let res = vm.apk_res.as_ref()?;
     let ev = res.style_item(style, attr_id)?;
     match ev.data_type {
-        0x01 => color_v(vm, V::I32(ev.data as i32)),
+        0x01 => overlay_aware_style_color(vm, style, ev.data)
+            .map(|c| c as i32)
+            .or_else(|| color_v(vm, V::I32(ev.data as i32))),
         0x02 => crate::theme_color(vm, ev.data).map(|c| c as i32),
         0x1c..=0x1f | 0x10 | 0x11 | 0x04 => Some(ev.data as i32),
         0x03 => ev
@@ -596,6 +788,11 @@ pub(crate) fn layout_requested(vm: &Vm, h: u32) -> bool {
     pint(vm, h, P_LAYOUT_REQ) != 0
 }
 
+/// True for a root view owned by a popup or dialog overlay.
+pub fn is_popup_root(vm: &Vm, h: u32) -> bool {
+    h != 0 && pseudo_get(vm, h, P_POPUP_ROOT).is_some()
+}
+
 /// Store a view frame; returns whether it changed (View.setFrame's
 /// contract and `layout`'s `changed` argument).
 pub(crate) fn frame_set(vm: &mut Vm, h: u32, l: i32, t: i32, r: i32, b: i32) -> bool {
@@ -690,7 +887,16 @@ pub(crate) fn dex_view_info(vm: &Vm, h: u32) -> Option<DexViewInfo> {
         Some(v) => color_v(vm, v),
         _ => match pseudo_get(vm, h, P_BGRES) {
             Some(v) => color_v(vm, v),
-            None => attr_find(vm, h, "background").and_then(|v| color_v(vm, v)),
+            None => attr_find(vm, h, "background")
+                .and_then(|v| color_v(vm, v))
+                .or_else(|| match attr_find(vm, h, "style") {
+                    Some(V::I32(style)) if style > 0 => vm
+                        .apk_res
+                        .as_ref()
+                        .and_then(|r| r.attr_id_named("backgroundTint"))
+                        .and_then(|attr| style_attr_color(vm, style as u32, attr)),
+                    _ => None,
+                }),
         },
     };
     let lp_w = attr_find(vm, h, "layout_width")
@@ -759,6 +965,14 @@ pub(crate) fn dex_view_info(vm: &Vm, h: u32) -> Option<DexViewInfo> {
         (Some(V::I32(l)), Some(V::I32(t)), Some(V::I32(r)), Some(V::I32(b))) => Some((l, t, r, b)),
         _ => None,
     };
+    let (pad_l, pad_t, pad_r, pad_b) = view_padding(vm, h);
+    let is_compound = desc.contains("CompoundButton")
+        || desc.contains("CheckBox")
+        || desc.contains("Checkbox")
+        || desc.contains("RadioButton")
+        || desc.contains("Switch")
+        || vm.extends_named(&desc, "CompoundButton");
+    let icon_only = text.as_deref().is_none_or(str::is_empty);
     Some(DexViewInfo {
         desc,
         is_group,
@@ -772,7 +986,12 @@ pub(crate) fn dex_view_info(vm: &Vm, h: u32) -> Option<DexViewInfo> {
         listener,
         frame,
         layout_requested: layout_requested(vm, h),
-        image: pseudo_get(vm, h, P_IMAGE).and_then(|v| image_pixels(vm, v)),
+        image: view_content_image(vm, h, icon_only).map(|img| tint_image(vm, h, img)),
+        padding: (pad_l, pad_t, pad_r, pad_b),
+        scale_type: match attr_find(vm, h, "scaleType") {
+            Some(V::I32(v)) => v,
+            _ => 3,
+        },
         parent: match pseudo_get(vm, h, P_PARENT) {
             Some(V::Ref(p)) => p,
             _ => 0,
@@ -801,6 +1020,11 @@ pub(crate) fn dex_view_info(vm: &Vm, h: u32) -> Option<DexViewInfo> {
                 .and_then(|t| t.parse::<i32>().ok())
                 .filter(|n| *n > 0),
             _ => None,
+        },
+        compound_checked: if is_compound {
+            Some(matches!(pseudo_get(vm, h, P_CHECKED), Some(V::I32(v)) if v != 0))
+        } else {
+            None
         },
     })
 }
@@ -865,6 +1089,63 @@ fn image_drawable(vm: &mut Vm, this: u32) -> V {
 /// Resolve an `ImageView` image value to pixels: a Bitmap host, an
 /// object holding a bitmap in any ref field (BitmapDrawable, Glide
 /// drawables), a res-id, or a file/Uri path the runtime can open.
+fn xml_image_tint(vm: &Vm, h: u32) -> Option<u32> {
+    if let Some(V::I32(raw)) = attr_find(vm, h, "tint").or_else(|| attr_find(vm, h, "drawableTint"))
+    {
+        let u = raw as u32;
+        return if raw >= 0 && (0x0101_0000..0x0102_0000).contains(&u) {
+            crate::theme_color(vm, u)
+        } else if raw >= 0 && u >= 0x0100_0000 {
+            let is_attr = vm
+                .apk_res
+                .as_ref()
+                .and_then(|r| r.type_name(u).map(|t| t == "attr"))
+                .unwrap_or(false);
+            if is_attr {
+                crate::theme_color(vm, u)
+            } else {
+                super::vector::rctx(vm).and_then(|r| super::vector::resolve_ref_color(r, u))
+            }
+        } else {
+            Some(u)
+        };
+    }
+    // MaterialButton styles carry `iconTint` rather than ImageView's
+    // `android:tint`; resolve it through the same style/theme-overlay path.
+    let style = match attr_find(vm, h, "style") {
+        Some(V::I32(style)) if style > 0 => style as u32,
+        _ => return None,
+    };
+    let attr = vm
+        .apk_res
+        .as_ref()
+        .and_then(|r| r.attr_id_named("iconTint"))?;
+    style_attr_color(vm, style, attr).map(|c| c as u32)
+}
+
+fn tint_image(
+    vm: &Vm,
+    view: u32,
+    image: (u32, u32, std::rc::Rc<Vec<u8>>),
+) -> (u32, u32, std::rc::Rc<Vec<u8>>) {
+    let Some(tint) = xml_image_tint(vm, view) else {
+        return image;
+    };
+    let (w, h, px) = image;
+    let mut out = px.as_ref().clone();
+    let (tr, tg, tb) = ((tint >> 16) & 0xff, (tint >> 8) & 0xff, tint & 0xff);
+    let ta = (tint >> 24) & 0xff;
+    for p in out.as_chunks_mut::<4>().0 {
+        // SRC_ATOP keeps the destination alpha, but the tint color only
+        // covers the source in proportion to the tint alpha. A fully
+        // transparent tint therefore leaves the original color intact.
+        p[0] = ((tr * ta + p[0] as u32 * (255 - ta)) / 255) as u8;
+        p[1] = ((tg * ta + p[1] as u32 * (255 - ta)) / 255) as u8;
+        p[2] = ((tb * ta + p[2] as u32 * (255 - ta)) / 255) as u8;
+    }
+    (w, h, std::rc::Rc::new(out))
+}
+
 fn image_pixels(vm: &Vm, v: V) -> Option<(u32, u32, std::rc::Rc<Vec<u8>>)> {
     image_pixels_at(vm, v, 0)
 }
@@ -2136,32 +2417,7 @@ pub(crate) fn call(
         "isChecked" if is_marked(vm, this) => Some(Some(V::I32(pint(vm, this, P_CHECKED)))),
         "setChecked" if is_marked(vm, this) => {
             let checked = i32v(args.get(1).copied().unwrap_or(V::I32(0)));
-            pseudo_set(vm, this, P_CHECKED, V::I32((checked != 0) as i32));
-            if checked == 0 {
-                if let Some(V::Ref(parent)) = pseudo_get(vm, this, P_PARENT) {
-                    if pseudo_get(vm, parent, P_RADIO_CHECKED) == Some(V::I32(view_id(vm, this))) {
-                        pseudo_set(vm, parent, P_RADIO_CHECKED, V::I32(-1));
-                    }
-                }
-            }
-            if checked != 0 {
-                if let Some(V::Ref(parent)) = pseudo_get(vm, this, P_PARENT) {
-                    let cls = class_of(vm, V::Ref(parent));
-                    if cls == "Landroid/widget/RadioGroup;"
-                        || vm.assignable_desc(&cls, "Landroid/widget/RadioGroup;")
-                    {
-                        let id = view_id(vm, this);
-                        pseudo_set(vm, parent, P_RADIO_CHECKED, V::I32(id));
-                        for c in children(vm, parent) {
-                            if let V::Ref(ch) = c {
-                                if ch != this {
-                                    pseudo_set(vm, ch, P_CHECKED, V::I32(0));
-                                }
-                            }
-                        }
-                    }
-                }
-            }
+            set_compound_checked(vm, this, checked);
             Some(None)
         }
         "check"
@@ -2175,7 +2431,10 @@ pub(crate) fn call(
             pseudo_set(vm, this, P_RADIO_CHECKED, V::I32(id));
             for c in children(vm, this) {
                 if let V::Ref(ch) = c {
-                    pseudo_set(vm, ch, P_CHECKED, V::I32((view_id(vm, ch) == id) as i32));
+                    let child_cls = class_of(vm, V::Ref(ch));
+                    if is_radio_desc(vm, &child_cls) {
+                        pseudo_set(vm, ch, P_CHECKED, V::I32((view_id(vm, ch) == id) as i32));
+                    }
                 }
             }
             Some(None)
@@ -2347,12 +2606,33 @@ pub(crate) fn call(
             })
         }
         "performClick" | "callOnClick" => {
+            if let (Some(V::Ref(dialog)), Some(which_v)) = (
+                pseudo_get(vm, this, P_DIALOG_BUTTON_DIALOG),
+                pseudo_get(vm, this, P_DIALOG_BUTTON_WHICH),
+            ) {
+                let which = i32v(which_v);
+                let listener = if which == -1 {
+                    pseudo_get(vm, dialog, P_DIALOG_POS_LISTENER)
+                } else {
+                    pseudo_get(vm, dialog, P_DIALOG_NEG_LISTENER)
+                };
+                if let Some(V::Ref(l)) = listener {
+                    if l != 0 {
+                        let _ = vm.call_virtual(l, "onClick", &[V::Ref(dialog), V::I32(which)]);
+                    }
+                }
+                dialog_dismiss(vm, dialog);
+                return Ok(Some(Some(V::I32(1))));
+            }
+            let desc = class_of(vm, V::Ref(this));
+            if is_compound_desc(vm, &desc) {
+                let checked = pint(vm, this, P_CHECKED) == 0;
+                set_compound_checked(vm, this, checked as i32);
+            }
             let mut fired = match pseudo_get(vm, this, P_LISTENER) {
-                Some(V::Ref(l)) if l != 0 => vm
-                    .call_virtual(l, "onClick", &[V::Ref(this)])
-                    .ok()
-                    .flatten()
-                    .is_some(),
+                // OnClickListener.onClick returns void: a normal dex
+                // completion is `Ok(None)`, not a missing invocation.
+                Some(V::Ref(l)) if l != 0 => vm.call_virtual(l, "onClick", &[V::Ref(this)]).is_ok(),
                 _ => false,
             };
             // `android:onClick="method"` in layout XML: AOSP's
@@ -2625,6 +2905,12 @@ pub(crate) fn call(
                 // generically or they keep their 0×0 frames.
                 group_layout_fallback(vm, this, l, t, r, b);
                 pseudo_set(vm, this, P_LAYOUT_REQ, V::I32(0));
+            }
+            if pseudo_get(vm, this, P_POPUP_COMPACT) == Some(V::I32(1)) {
+                layout_popup_rows_compact(vm, this, r - l, b - t);
+            }
+            if pseudo_get(vm, this, P_DIALOG_HAS_BUTTONS) == Some(V::I32(1)) {
+                layout_dialog_buttons(vm, this, r - l, b - t);
             }
             Some(None)
         }
@@ -4264,11 +4550,23 @@ fn attrset_value(vm: &mut Vm, set: V, name: &str) -> Option<V> {
 
 /// `LinearLayout` orientation: `setOrientation` wins, else the
 /// `android:orientation` attr (0=horizontal, 1=vertical); the AOSP
-/// documented default is horizontal — except `TableLayout`, whose
-/// constructor forces VERTICAL, and `TableRow`, forced HORIZONTAL.
+/// documented default is horizontal — except `TableLayout` and
+/// `RadioGroup`, whose constructors force VERTICAL, and `TableRow`,
+/// forced HORIZONTAL.
 fn linear_vertical(vm: &Vm, this: u32) -> bool {
     if let Some(V::I32(o)) = pseudo_get(vm, this, P_ORIENTATION) {
         return o != 0;
+    }
+    // XML orientation overrides the constructor default. RadioGroup's
+    // constructor always starts VERTICAL; its zero-initialized host/dex
+    // field must not erase that default when the constructor body is not
+    // executed through the host shim.
+    if let Some(v) = attr_find(vm, this, "orientation") {
+        return i32v(v) != 0;
+    }
+    let desc = class_of(vm, V::Ref(this));
+    if desc.contains("RadioGroup") {
+        return true;
     }
     // AndroidX LinearLayoutCompat implements orientation dex-side, so
     // the host setter never sees constructor-driven VERTICAL. Read the
@@ -4281,15 +4579,7 @@ fn linear_vertical(vm: &Vm, this: u32) -> bool {
             return o != 0;
         }
     }
-    let dflt = vm
-        .heap
-        .class_of(this)
-        .and_then(|ci| vm.type_desc_of(ci).ok())
-        .map(|d| d.contains("TableLayout"))
-        .unwrap_or(false);
-    attr_find(vm, this, "orientation")
-        .map(|v| i32v(v) != 0)
-        .unwrap_or(dflt)
+    desc.contains("TableLayout")
 }
 
 /// `getMinimum*`/`getSuggestedMinimum*`: explicit `setMinimum*` wins,
@@ -4477,6 +4767,29 @@ fn lp_px(vm: &Vm, v: V) -> Option<i32> {
     Some(i)
 }
 
+fn padding_component(vm: &Vm, h: u32, exact: &str, relative: Option<&str>, base: i32) -> i32 {
+    if let Some(v) = attr_find(vm, h, exact) {
+        return lp_px(vm, v).unwrap_or(0).max(0);
+    }
+    if let Some(rel) = relative {
+        if let Some(v) = attr_find(vm, h, rel) {
+            return lp_px(vm, v).unwrap_or(0).max(0);
+        }
+    }
+    base.max(0)
+}
+
+/// View padding in physical LTR order, including uniform `android:padding`.
+fn view_padding(vm: &Vm, h: u32) -> (i32, i32, i32, i32) {
+    let base = lp_px(vm, attr_find(vm, h, "padding").unwrap_or(V::I32(0))).unwrap_or(0);
+    (
+        padding_component(vm, h, "paddingLeft", Some("paddingStart"), base),
+        padding_component(vm, h, "paddingTop", None, base),
+        padding_component(vm, h, "paddingRight", Some("paddingEnd"), base),
+        padding_component(vm, h, "paddingBottom", None, base),
+    )
+}
+
 /// Shared `measureChild(WithMargins)` core: reads the child's
 /// LayoutParams, builds the child spec per AOSP
 /// `getChildMeasureSpec`, and drives `child.measure`. Used by the
@@ -4557,8 +4870,18 @@ fn measure_child(
             attr_find(vm, parent, "paddingBottom").unwrap_or(V::I32(0)),
         )
         .unwrap_or(0);
-    let ws = child_measure_spec(pw, pad_w + ml + mr + w_used, lp_w);
-    let hs = child_measure_spec(ph, pad_h + mt + mb + h_used, lp_h);
+    let mut ws = child_measure_spec(pw, pad_w + ml + mr + w_used, lp_w);
+    let mut hs = child_measure_spec(ph, pad_h + mt + mb + h_used, lp_h);
+    // ScrollView measures its content with an unbounded scroll axis:
+    // the child must be allowed to become taller than the viewport and
+    // scroll, rather than compressing wrap_content descendants into the
+    // space left over inside the viewport.
+    let parent_desc = class_of(vm, V::Ref(parent));
+    if parent_desc.contains("HorizontalScrollView") {
+        ws = 0;
+    } else if parent_desc.contains("ScrollView") {
+        hs = 0;
+    }
     if crate::dbg_flag("OVELO_VIEWDBG") {
         eprintln!(
             "[viewdbg] measureChild h{child} lp={lp_w}x{lp_h} used={w_used},{h_used} in={pw:#x}/{ph:#x} -> {ws:#x}/{hs:#x}"
@@ -4578,6 +4901,36 @@ fn view_is_gone(vm: &mut Vm, h: u32) -> bool {
     matches!(attr_find(vm, h, "visibility"), Some(V::I32(2)))
 }
 
+/// Rough proportional-text advance in em units. The runtime cannot use
+/// the host font shaper from dexrt's measure fallback, but a flat wide
+/// factor both clips narrow text and reserves far too much width for
+/// labels made of narrow glyphs. These classes track common Latin font
+/// metrics closely enough for wrap_content layout.
+fn em_width(c: char) -> f32 {
+    match c {
+        ' ' => 0.30,
+        'i' | 'j' | 'l' | 'I' | '\'' | '`' | '.' | ',' | ':' | ';' | '!' | '|' => 0.34,
+        'f' | 'r' | 't' | '(' | ')' | '[' | ']' | '{' | '}' => 0.43,
+        'm' | 'w' => 0.86,
+        'M' | 'W' => 0.92,
+        'A'..='Z' => 0.70,
+        '0'..='9' => 0.60,
+        'a'..='z' => 0.56,
+        c if c.is_ascii_punctuation() => 0.48,
+        c if c.is_ascii() => 0.56,
+        // CJK and most emoji/cyrillic fallback glyphs occupy close to a
+        // full em in the fonts the host renderer substitutes.
+        c if !c.is_ascii() => 1.0,
+        _ => 0.56,
+    }
+}
+
+fn estimated_text_width(text: &str, ts: f32) -> i32 {
+    (text.chars().map(em_width).sum::<f32>() * 1.15)
+        .mul_add(ts, 0.0)
+        .ceil() as i32
+}
+
 /// Generic `onMeasure` for framework skeleton containers: measure
 /// each child with margins, then fold the measured content size
 /// against the spec via `resolveSize`. The `measure` arm pre-seeds
@@ -4586,14 +4939,12 @@ fn view_is_gone(vm: &mut Vm, h: u32) -> bool {
 /// fill) — Framework containers must report their content extent
 /// there or every ancestor's measured height collapses to padding.
 fn group_measure_fallback(vm: &mut Vm, this: u32, pw: i32, ph: i32) {
-    let pad_w = lp_px(vm, attr_find(vm, this, "paddingLeft").unwrap_or(V::I32(0))).unwrap_or(0)
-        + lp_px(vm, attr_find(vm, this, "paddingRight").unwrap_or(V::I32(0))).unwrap_or(0);
-    let pad_h = lp_px(vm, attr_find(vm, this, "paddingTop").unwrap_or(V::I32(0))).unwrap_or(0)
-        + lp_px(
-            vm,
-            attr_find(vm, this, "paddingBottom").unwrap_or(V::I32(0)),
-        )
-        .unwrap_or(0);
+    // Start/end padding resolves to physical left/right in LTR layouts;
+    // XML that only uses paddingStart/End otherwise measures a padded
+    // TextView as if it had no horizontal padding at all.
+    let (pad_l, pad_t, pad_r, pad_b) = view_padding(vm, this);
+    let pad_w = pad_l + pad_r;
+    let pad_h = pad_t + pad_b;
     let kids = children(vm, this);
     if kids.is_empty() {
         // Leaf view (TextView/Button with no dex onMeasure): report
@@ -4629,21 +4980,42 @@ fn group_measure_fallback(vm: &mut Vm, this: u32, pw: i32, ph: i32) {
             text
         };
         let ts = match pseudo_get(vm, this, P_TSIZE) {
-            Some(V::F32(f)) => f,
-            Some(V::I32(b)) => f32::from_bits(b as u32),
-            _ => 14.0,
+            Some(V::F32(f)) => Some(f),
+            Some(V::I32(b)) => Some(f32::from_bits(b as u32)),
+            _ => None,
         }
+        .or_else(|| {
+            attr_find(vm, this, "textSize").and_then(|v| match v {
+                V::F32(f) => Some(f),
+                V::I32(id) if id > 0 => vm.apk_res.as_ref().and_then(|r| r.dimen(id as u32)),
+                _ => None,
+            })
+        })
+        .unwrap_or(14.0)
         .abs()
         .max(1.0);
         // An ImageView's content is its drawable: AOSP ImageView.
         // onMeasure reports the drawable's intrinsic size (still folded
         // through resolveSize below), never the parent's spec size.
-        let (iw, ih) = pseudo_get(vm, this, P_IMAGE)
-            .and_then(|v| image_pixels(vm, v))
+        let (iw, ih) = view_content_image(vm, this, text.is_empty())
             .map(|(w, h, _)| (w as i32, h as i32))
             .unwrap_or((0, 0));
+        let leaf_desc = class_of(vm, V::Ref(this));
+        let is_compound = leaf_desc.contains("CompoundButton")
+            || leaf_desc.contains("CheckBox")
+            || leaf_desc.contains("Checkbox")
+            || leaf_desc.contains("RadioButton")
+            || leaf_desc.contains("Switch")
+            || vm.extends_named(&leaf_desc, "CompoundButton");
         let (cw, chh) = if text.is_empty() {
-            (iw, ih)
+            if is_compound {
+                // CompoundButton's button drawable has an intrinsic
+                // affordance even when the label is empty; without it a
+                // wrap_content CheckBox measures to zero width.
+                (iw.max(28), ih.max(28))
+            } else {
+                (iw, ih)
+            }
         } else {
             // Wrapping: when the unbroken text overflows the available
             // width it folds to `ceil(cw/avail)` lines — a single-line
@@ -4653,16 +5025,27 @@ fn group_measure_fallback(vm: &mut Vm, this: u32, pw: i32, ph: i32) {
             // check uses a fatter factor than the extent itself or a
             // frame measured "one line" renders two.
             let line_h = (ts * 1.3) as i32;
-            let raw_w = (text.chars().count() as f32 * ts * 0.6) as i32;
-            let avail = (pw & 0x3FFF_FFFF) - pad_w;
-            let frame_w = if avail > 0 { raw_w.min(avail) } else { raw_w };
-            let real_w = (text.chars().count() as f32 * ts * 0.85) as i32;
+            // Measure each explicit paragraph separately: `split('\n')`
+            // keeps the trailing empty paragraph, so `a\n` correctly
+            // reserves two line heights even without a width constraint.
+            let paragraphs: Vec<&str> = text.split('\n').collect();
+            let widths: Vec<i32> = paragraphs
+                .iter()
+                .map(|p| estimated_text_width(p, ts))
+                .collect();
+            let real_w = widths.iter().copied().max().unwrap_or(0);
+            let button_w = if is_compound { 28 } else { 0 };
+            let avail = (pw & 0x3FFF_FFFF) - pad_w - button_w;
+            let frame_w = if avail > 0 { real_w.min(avail) } else { real_w };
             let lines = if frame_w > 0 {
-                ((real_w + frame_w - 1) / frame_w).max(1)
+                widths
+                    .iter()
+                    .map(|w| ((*w + frame_w - 1) / frame_w).max(1))
+                    .sum()
             } else {
-                1
+                paragraphs.len() as i32
             };
-            (frame_w, line_h * lines)
+            (frame_w + button_w, (line_h * lines).max(button_w))
         };
         // resolveSize semantics on the desired extent (content or
         // drawable intrinsic): AT_MOST → min(desired, spec). An empty
@@ -4686,7 +5069,9 @@ fn group_measure_fallback(vm: &mut Vm, this: u32, pw: i32, ph: i32) {
     // LinearLayout` stacks vertically even when its name doesn't say
     // so (matches the layout-side check below).
     let desc = class_of(vm, V::Ref(this));
-    let linear = desc.contains("LinearLayout") || vm.extends_named(&desc, "LinearLayout");
+    let linear = desc.contains("LinearLayout")
+        || desc.contains("RadioGroup")
+        || vm.extends_named(&desc, "LinearLayout");
     let linear_v = linear && linear_vertical(vm, this);
     let linear_h = linear && !linear_v;
     let relative = !linear && vm.extends_named(&desc, "RelativeLayout");
@@ -4739,12 +5124,12 @@ fn group_measure_fallback(vm: &mut Vm, this: u32, pw: i32, ph: i32) {
         // child (FrameLayout semantics).
         if linear_v {
             chh += hh + mv;
-            cw = cw.max(w);
+            cw = cw.max(w + mh);
         } else if linear_h {
             cw += w + mh;
             chh = chh.max(hh + mv);
         } else {
-            cw = cw.max(w);
+            cw = cw.max(w + mh);
             chh = chh.max(hh + mv);
         }
     }
@@ -5078,11 +5463,67 @@ fn group_measure_fallback(vm: &mut Vm, this: u32, pw: i32, ph: i32) {
 /// Generic `onLayout` for framework skeleton containers: FrameLayout
 /// semantics (children at the parent's content origin plus their
 /// margins, at measured size); LinearLayout stacks vertically.
+fn gravity_of(vm: &Vm, view: u32) -> i32 {
+    attr_find(vm, view, "layout_gravity")
+        .map(i32v)
+        .unwrap_or(-1)
+}
+
+fn horizontal_gravity(gravity: i32) -> i32 {
+    if gravity & 0x800003 == 0x800003 {
+        3
+    } else if gravity & 0x800005 == 0x800005 {
+        5
+    } else {
+        gravity & 0x7
+    }
+}
+
+fn gravity_x(
+    gravity: i32,
+    pad_l: i32,
+    pad_r: i32,
+    width: i32,
+    child: i32,
+    ml: i32,
+    mr: i32,
+) -> i32 {
+    match horizontal_gravity(gravity) {
+        1 => pad_l + ml + ((width - pad_l - pad_r - ml - mr - child) / 2).max(0),
+        5 => width - pad_r - mr - child,
+        _ => pad_l + ml,
+    }
+}
+
+fn gravity_y(
+    gravity: i32,
+    pad_t: i32,
+    pad_b: i32,
+    height: i32,
+    child: i32,
+    mt: i32,
+    mb: i32,
+) -> i32 {
+    match gravity & 0x70 {
+        0x10 => pad_t + mt + ((height - pad_t - pad_b - mt - mb - child) / 2).max(0),
+        0x50 => height - pad_b - mb - child,
+        _ => pad_t + mt,
+    }
+}
+
 fn group_layout_fallback(vm: &mut Vm, this: u32, _l: i32, _t: i32, r: i32, b: i32) {
     let pad_l = lp_px(vm, attr_find(vm, this, "paddingLeft").unwrap_or(V::I32(0))).unwrap_or(0);
     let pad_t = lp_px(vm, attr_find(vm, this, "paddingTop").unwrap_or(V::I32(0))).unwrap_or(0);
+    let pad_r = lp_px(vm, attr_find(vm, this, "paddingRight").unwrap_or(V::I32(0))).unwrap_or(0);
+    let pad_b = lp_px(
+        vm,
+        attr_find(vm, this, "paddingBottom").unwrap_or(V::I32(0)),
+    )
+    .unwrap_or(0);
     let desc = class_of(vm, V::Ref(this));
-    let linear = desc.contains("LinearLayout") || vm.extends_named(&desc, "LinearLayout");
+    let linear = desc.contains("LinearLayout")
+        || desc.contains("RadioGroup")
+        || vm.extends_named(&desc, "LinearLayout");
     let linear_h = linear && !linear_vertical(vm, this);
     if !linear && vm.extends_named(&desc, "RelativeLayout") {
         relative_layout_fallback(vm, this, r - _l, b - _t);
@@ -5123,12 +5564,24 @@ fn group_layout_fallback(vm: &mut Vm, this: u32, _l: i32, _t: i32, r: i32, b: i3
         };
         let cw = pint(vm, ch, P_MEAS_W) & 0x00FF_FFFF;
         let chh = pint(vm, ch, P_MEAS_H) & 0x00FF_FFFF;
+        let gravity = gravity_of(vm, ch);
+        let width = r - _l;
+        let height = b - _t;
         let (cl, ct) = if linear_h {
-            (cur_l + ml, pad_t + mt)
+            (
+                cur_l + ml,
+                gravity_y(gravity, pad_t, pad_b, height, chh, mt, mb),
+            )
         } else if linear {
-            (pad_l + ml, cur_t + mt)
+            (
+                gravity_x(gravity, pad_l, pad_r, width, cw, ml, mr),
+                cur_t + mt,
+            )
         } else {
-            (pad_l + ml, pad_t + mt)
+            (
+                gravity_x(gravity, pad_l, pad_r, width, cw, ml, mr),
+                gravity_y(gravity, pad_t, pad_b, height, chh, mt, mb),
+            )
         };
         if crate::dbg_flag("OVELO_VIEWDBG") {
             eprintln!("[viewdbg] groupLayout h{ch} meas={cw}x{chh} at {cl},{ct}");
@@ -5937,6 +6390,11 @@ fn build_tree(vm: &mut Vm, elems: &[Element], ctx: V) -> V {
             let v = jstr(vm, t);
             pseudo_set(vm, h, P_TEXT, v);
         }
+        if is_compound_desc(vm, &class_of(vm, V::Ref(h))) {
+            if let Some(checked) = el.android("checked").and_then(|v| xml_value_bool(vm, v)) {
+                pseudo_set(vm, h, P_CHECKED, V::I32(checked as i32));
+            }
+        }
         // ImageView sources declared in XML (`android:src` /
         // `app:srcCompat` — different namespaces, so match by local
         // name) seed P_IMAGE; the renderer resolves the res-id. A dex
@@ -5965,6 +6423,16 @@ fn build_tree(vm: &mut Vm, elems: &[Element], ctx: V) -> V {
                     eprintln!("[viewdbg] attach h{h} -> parent h{p}");
                 }
                 attach(vm, p, V::Ref(h));
+                if pint(vm, h, P_CHECKED) != 0 {
+                    let child_cls = class_of(vm, V::Ref(h));
+                    let cls = class_of(vm, V::Ref(p));
+                    if is_radio_desc(vm, &child_cls)
+                        && (cls == "Landroid/widget/RadioGroup;"
+                            || vm.assignable_desc(&cls, "Landroid/widget/RadioGroup;"))
+                    {
+                        set_compound_checked(vm, h, 1);
+                    }
+                }
                 // A parent with XML children is a container.
                 pseudo_set(vm, p, P_IS_GROUP, V::I32(1));
             }
@@ -6323,15 +6791,21 @@ pub(crate) fn dispatch_touch(
         // and `performClick` fires the OnClickListener on ACTION_UP.
         // The deepest ancestor with a listener wins.
         if action == 1 {
-            if let Some(V::Ref(l)) = pseudo_get(vm, v, P_LISTENER) {
+            let listener = match pseudo_get(vm, v, P_LISTENER) {
+                Some(V::Ref(l)) if l != 0 => Some(l),
+                _ => None,
+            };
+            let clickable =
+                listener.is_some() || pseudo_get(vm, v, P_DIALOG_BUTTON_WHICH).is_some();
+            if clickable {
                 let down_target = vm.touch_gesture_target;
-                if l != 0 && down_target != 0 && view_or_descendant(vm, v, down_target) {
+                if down_target != 0 && view_or_descendant(vm, v, down_target) {
                     if dbg {
-                        eprintln!("[touchdbg] h{v} OnClickListener.onClick l{l}");
+                        eprintln!("[touchdbg] h{v} performClick listener={listener:?}");
                     }
-                    if let Err(e) = vm.call_virtual(l, "onClick", &[V::Ref(v)]) {
+                    if let Err(e) = vm.call_virtual(v, "performClick", &[]) {
                         if crate::dbg_flag("OVELO_TOUCHDBG") {
-                            eprintln!("[touchdbg] onClick error: {e:?}");
+                            eprintln!("[touchdbg] performClick error: {e:?}");
                         }
                     }
                     vm.touch_gesture_target = 0;
@@ -7076,6 +7550,49 @@ fn find_in_tree_at(vm: &Vm, root: u32, id: i32, depth: u32) -> Option<u32> {
         }
     }
     None
+}
+
+fn is_compound_desc(vm: &Vm, desc: &str) -> bool {
+    desc.contains("CompoundButton")
+        || desc.contains("CheckBox")
+        || desc.contains("Checkbox")
+        || desc.contains("RadioButton")
+        || desc.contains("Switch")
+        || vm.assignable_desc(desc, "Landroid/widget/CompoundButton;")
+}
+
+fn is_radio_desc(vm: &Vm, desc: &str) -> bool {
+    desc.contains("RadioButton") || vm.assignable_desc(desc, "Landroid/widget/RadioButton;")
+}
+
+fn set_compound_checked(vm: &mut Vm, this: u32, checked: i32) {
+    pseudo_set(vm, this, P_CHECKED, V::I32((checked != 0) as i32));
+    if checked == 0 {
+        if let Some(V::Ref(parent)) = pseudo_get(vm, this, P_PARENT) {
+            if pseudo_get(vm, parent, P_RADIO_CHECKED) == Some(V::I32(view_id(vm, this))) {
+                pseudo_set(vm, parent, P_RADIO_CHECKED, V::I32(-1));
+            }
+        }
+    }
+    if checked != 0 {
+        if let Some(V::Ref(parent)) = pseudo_get(vm, this, P_PARENT) {
+            let cls = class_of(vm, V::Ref(parent));
+            if cls == "Landroid/widget/RadioGroup;"
+                || vm.assignable_desc(&cls, "Landroid/widget/RadioGroup;")
+            {
+                let id = view_id(vm, this);
+                pseudo_set(vm, parent, P_RADIO_CHECKED, V::I32(id));
+                for c in children(vm, parent) {
+                    if let V::Ref(ch) = c {
+                        let child_cls = class_of(vm, V::Ref(ch));
+                        if ch != this && is_radio_desc(vm, &child_cls) {
+                            pseudo_set(vm, ch, P_CHECKED, V::I32(0));
+                        }
+                    }
+                }
+            }
+        }
+    }
 }
 
 fn is_marked(vm: &Vm, h: u32) -> bool {
@@ -7875,6 +8392,7 @@ fn list_popup_show(vm: &mut Vm, popup: u32) {
         "layout",
         &[V::I32(0), V::I32(0), V::I32(width), V::I32(height)],
     );
+    pseudo_set(vm, root, P_POPUP_COMPACT, V::I32(compressed as i32));
     if compressed {
         layout_popup_rows_compact(vm, root, width, height);
     }
@@ -7925,6 +8443,124 @@ fn ov_popup_dismiss(vm: &mut Vm, a: &[V]) -> ovelo_error::Result<Option<V>> {
         list_popup_dismiss(vm, popup);
     }
     Ok(None)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn dialog_scan_buttons(
+    vm: &Vm,
+    h: u32,
+    depth: usize,
+    seen: &mut std::collections::HashSet<u32>,
+    pos_listener: &mut u32,
+    neg_listener: &mut u32,
+    pos_label: &mut Option<String>,
+    neg_label: &mut Option<String>,
+) {
+    if h == 0 || depth > 5 || !seen.insert(h) {
+        return;
+    }
+    let desc = class_of(vm, V::Ref(h));
+    if depth > 0
+        && (pseudo_get(vm, h, P_IS_VIEW).is_some()
+            || desc == WINDOW
+            || vm.assignable_desc(&desc, "Landroid/content/Context;"))
+    {
+        return;
+    }
+    if desc == "Landroid/os/Message;" {
+        let what = pseudo_get(vm, h, P_MSG_WHAT).map(i32v).unwrap_or(0);
+        if let Some(V::Ref(listener)) = pseudo_get(vm, h, P_MSG_OBJ) {
+            if listener != 0 {
+                if what == -1 && *pos_listener == 0 {
+                    *pos_listener = listener;
+                } else if what == -2 && *neg_listener == 0 {
+                    *neg_listener = listener;
+                }
+            }
+        }
+    }
+    let vals: Vec<V> = match vm.heap.get(h) {
+        Some(Obj::Instance { fields, .. }) | Some(Obj::Host { fields, .. }) => {
+            fields.values().copied().collect()
+        }
+        _ => Vec::new(),
+    };
+    for v in vals {
+        match v {
+            V::Ref(ch) if ch != 0 => {
+                if let Some(Obj::Str(text)) = vm.heap.get(ch) {
+                    if text.eq_ignore_ascii_case("ok") {
+                        pos_label.get_or_insert(text.clone());
+                    } else if text.eq_ignore_ascii_case("cancel") {
+                        neg_label.get_or_insert(text.clone());
+                    }
+                }
+                dialog_scan_buttons(
+                    vm,
+                    ch,
+                    depth + 1,
+                    seen,
+                    pos_listener,
+                    neg_listener,
+                    pos_label,
+                    neg_label,
+                );
+            }
+            _ => {}
+        }
+    }
+}
+
+fn dialog_button(vm: &mut Vm, dialog: u32, which: i32, label: &str) -> u32 {
+    let b = vm.alloc_host("Landroid/widget/Button;", HostState::Empty);
+    pseudo_set(vm, b, P_IS_VIEW, V::I32(1));
+    let text = jstr(vm, label);
+    pseudo_set(vm, b, P_TEXT, text);
+    pseudo_set(vm, b, P_TCOLOR, V::I32(0xff8ab4f8u32 as i32));
+    pseudo_set(vm, b, P_TSIZE, V::F32(15.0));
+    pseudo_set(vm, b, P_DIALOG_BUTTON_DIALOG, V::Ref(dialog));
+    pseudo_set(vm, b, P_DIALOG_BUTTON_WHICH, V::I32(which));
+    b
+}
+
+fn layout_dialog_buttons(vm: &mut Vm, root: u32, width: i32, height: i32) {
+    let buttons: Vec<u32> = children(vm, root)
+        .into_iter()
+        .filter_map(|v| match v {
+            V::Ref(h) if h != 0 && pseudo_get(vm, h, P_DIALOG_BUTTON_WHICH).is_some() => Some(h),
+            _ => None,
+        })
+        .collect();
+    if buttons.is_empty() {
+        return;
+    }
+    if let Some(V::Ref(content)) = pseudo_get(vm, root, P_DIALOG_CONTENT) {
+        if content != 0 && content != root {
+            let content_h = (height - 52).max(0);
+            let spec = 0x4000_0000i32 | content_h;
+            let spec_w = 0x4000_0000i32 | width;
+            let _ = vm.call_virtual(content, "measure", &[V::I32(spec_w), V::I32(spec)]);
+            let _ = vm.call_virtual(
+                content,
+                "layout",
+                &[V::I32(0), V::I32(0), V::I32(width), V::I32(content_h)],
+            );
+        }
+    }
+    let bw = 104;
+    let bh = 42;
+    let bottom = height - 8;
+    let mut right = width - 12;
+    for b in buttons.iter().rev().copied() {
+        let l = (right - bw).max(0);
+        let t = (bottom - bh).max(0);
+        let _ = vm.call_virtual(
+            b,
+            "layout",
+            &[V::I32(l), V::I32(t), V::I32(l + bw), V::I32(t + bh)],
+        );
+        right = l - 8;
+    }
 }
 
 fn dialog_view_scan(
@@ -8033,6 +8669,60 @@ pub(crate) fn dialog_show(vm: &mut Vm, dialog: u32) {
             attach_at(vm, root, V::Ref(content), None, false, None);
         }
     }
+    let mut pos_listener = 0;
+    let mut neg_listener = 0;
+    let mut pos_label = None;
+    let mut neg_label = None;
+    dialog_scan_buttons(
+        vm,
+        dialog,
+        0,
+        &mut std::collections::HashSet::new(),
+        &mut pos_listener,
+        &mut neg_listener,
+        &mut pos_label,
+        &mut neg_label,
+    );
+    pseudo_set(vm, dialog, P_DIALOG_POS_LISTENER, V::Ref(pos_listener));
+    pseudo_set(vm, dialog, P_DIALOG_NEG_LISTENER, V::Ref(neg_listener));
+    for child in children(vm, root) {
+        if let V::Ref(ch) = child {
+            if pseudo_get(vm, ch, P_DIALOG_BUTTON_WHICH).is_some() {
+                detach(vm, root, child, true);
+            }
+        }
+    }
+    // The scan knows the canonical strings but not their declaring fields
+    // after R8 minification. When only one action exists, prefer that sole
+    // label even if it is spelled "Cancel"; otherwise reserve that spelling
+    // for the negative action.
+    let sole_cancel_positive =
+        pos_listener != 0 && neg_listener == 0 && pos_label.is_none() && neg_label.is_some();
+    let positive_label = if sole_cancel_positive {
+        neg_label.clone()
+    } else {
+        pos_label.clone()
+    };
+    let negative_label = if sole_cancel_positive {
+        None
+    } else {
+        neg_label.clone()
+    };
+    let mut any_buttons = false;
+    if positive_label.is_some() || pos_listener != 0 {
+        let label = positive_label.as_deref().unwrap_or("OK");
+        let button = dialog_button(vm, dialog, -1, label);
+        attach_at(vm, root, V::Ref(button), None, false, None);
+        any_buttons = true;
+    }
+    if negative_label.is_some() || neg_listener != 0 {
+        let label = negative_label.as_deref().unwrap_or("Cancel");
+        let button = dialog_button(vm, dialog, -2, label);
+        attach_at(vm, root, V::Ref(button), None, false, None);
+        any_buttons = true;
+    }
+    pseudo_set(vm, root, P_DIALOG_HAS_BUTTONS, V::I32(any_buttons as i32));
+    pseudo_set(vm, root, P_DIALOG_CONTENT, V::Ref(content));
     let parent = activity_content(vm, vm.cur_activity).unwrap_or(0);
     if parent == 0 {
         return;
@@ -8052,13 +8742,18 @@ pub(crate) fn dialog_show(vm: &mut Vm, dialog: u32) {
         // Measure wrap-style custom content at most to the panel. Only a
         // dimension that remains empty is expanded: fixed-size content
         // must keep its bounds or its touch target would cover the panel.
+        let content_limit = if any_buttons {
+            (height - 52).max(1)
+        } else {
+            height
+        };
         let aw = 0x8000_0000u32 as i32 | width;
-        let ah = 0x8000_0000u32 as i32 | height;
+        let ah = 0x8000_0000u32 as i32 | content_limit;
         let _ = vm.call_virtual(content, "measure", &[V::I32(aw), V::I32(ah)]);
         let cw = pint(vm, content, P_MEAS_W).clamp(0, width);
-        let ch = pint(vm, content, P_MEAS_H).clamp(0, height);
+        let ch = pint(vm, content, P_MEAS_H).clamp(0, content_limit);
         let cw = if cw == 0 { width } else { cw };
-        let ch = if ch == 0 { height } else { ch };
+        let ch = if ch == 0 { content_limit } else { ch };
         let _ = vm.call_virtual(
             content,
             "layout",

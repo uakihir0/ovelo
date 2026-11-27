@@ -2132,6 +2132,155 @@ fn component_call(vm: &mut Vm, name: &str, args: &[V]) -> Rt<Option<Option<V>>> 
 /// hops and `?attr` indirection through the bound theme, then through
 /// `android.R.color` ids (`0x0106xxxx`) via the framework table.
 /// Unresolvable attrs fall back to opaque black so text stays visible.
+fn resource_or_attr_color(vm: &mut Vm, id: u32) -> i32 {
+    let is_attr = vm
+        .apk_res
+        .as_ref()
+        .and_then(|r| r.type_name(id).map(|t| t == "attr"))
+        .unwrap_or(false);
+    if is_attr {
+        crate::theme_color(vm, id).unwrap_or(0xff00_0000) as i32
+    } else {
+        resolve_color_id(vm, id) as i32
+    }
+}
+
+fn typed_entry_color(vm: &mut Vm, ev: &ovelo_apk::arsc::EntryValue) -> Option<i32> {
+    match ev.data_type {
+        0x01 => Some(resolve_color_id(vm, ev.data) as i32),
+        0x10 | 0x11 | 0x1c..=0x1f => Some(ev.data as i32),
+        0x03 => ev
+            .string
+            .as_deref()
+            .and_then(vector::parse_color)
+            .map(|c| c as i32),
+        _ => None,
+    }
+}
+
+/// Resolve a color while it still carries typed-value provenance. Once a
+/// TypedArray stores a bare i32, a literal such as #01060000 is
+/// indistinguishable from `@android:color/darker_gray`; inspect the XML
+/// value or arsc entry before that conversion instead.
+fn typed_array_color(vm: &mut Vm, h: u32, index: i32) -> Option<i32> {
+    let attr_id = match pseudo_get(vm, h, view::P_TA_ATTRS) {
+        Some(V::Ref(ah)) => match vm.heap.get(ah) {
+            Some(Obj::Array { data, .. }) => {
+                data.get(index.max(0) as usize).map(|v| i32v(*v) as u32)
+            }
+            _ => None,
+        },
+        _ => None,
+    }?;
+    let name = vm
+        .apk_res
+        .as_ref()?
+        .attr_name(attr_id)
+        .map(|s| s.to_string());
+
+    if let Some(name) = name {
+        if let Some(V::Ref(set_h)) = pseudo_get(vm, h, view::P_TA_SET) {
+            use ovelo_apk::manifest::Value;
+            if let Some(raw) = xml::cur_attr_raw(vm, set_h, &name) {
+                return match raw {
+                    Value::Reference(r) => Some(resolve_color_id(vm, r) as i32),
+                    Value::Other {
+                        data_type: 0x02,
+                        data,
+                    } => crate::theme_color(vm, data).map(|c| c as i32),
+                    Value::Other {
+                        data_type: 0x10 | 0x11 | 0x1c..=0x1f,
+                        data,
+                    } => Some(data as i32),
+                    Value::Int(v) => Some(v as i32),
+                    Value::Str(s) => vector::parse_color(&s).map(|c| c as i32),
+                    _ => None,
+                };
+            }
+            // Layout inflation stores the same AttributeSet as a host Map.
+            // That explicit value still outranks style/theme defaults even
+            // though its original binary type was erased during conversion.
+            if let Some(Obj::Host {
+                state: HostState::Map(m),
+                ..
+            }) = vm.heap.get(set_h)
+            {
+                if let Some(v) = m.iter().find_map(|(k, v)| {
+                    if sv(vm, *k).as_deref() == Some(name.as_str()) {
+                        Some(*v)
+                    } else {
+                        None
+                    }
+                }) {
+                    return match v {
+                        V::I32(raw) => {
+                            let u = raw as u32;
+                            if raw >= 0 && (0x0101_0000..0x0102_0000).contains(&u) {
+                                Some(
+                                    crate::theme_color(vm, u)
+                                        .unwrap_or_else(|| resolve_color_id(vm, u))
+                                        as i32,
+                                )
+                            } else if raw >= 0
+                                && (u >= 0x7f00_0000 || (0x0106_0000..0x0107_0000).contains(&u))
+                            {
+                                Some(resource_or_attr_color(vm, u))
+                            } else {
+                                Some(raw)
+                            }
+                        }
+                        V::Ref(s) => sv(vm, V::Ref(s))
+                            .and_then(|s| vector::parse_color(&s))
+                            .map(|c| c as i32),
+                        _ => None,
+                    };
+                }
+            }
+        }
+    }
+
+    let theme = vm.theme_id;
+    let res = vm.apk_res.as_ref()?;
+    macro_rules! chase {
+        ($ev:expr) => {{
+            let mut ev = $ev.clone();
+            for _ in 0..8 {
+                if ev.data_type != 0x02 {
+                    break;
+                }
+                match res.style_item(theme, ev.data) {
+                    Some(next) => ev = next.clone(),
+                    None => break,
+                }
+            }
+            if ev.data_type != 0x02 {
+                return typed_entry_color(vm, &ev);
+            }
+        }};
+    }
+    if let Some(V::I32(style)) = pseudo_get(vm, h, view::P_TA_STYLE) {
+        if let Some(ev) = res.style_item(style as u32, attr_id) {
+            chase!(ev);
+        }
+    }
+    if let Some(V::I32(attr)) = pseudo_get(vm, h, view::P_TA_DEF_ATTR) {
+        if let Some(style_ref) = res.style_item(theme, attr as u32).map(|ev| ev.data) {
+            if let Some(ev) = res.style_item(style_ref, attr_id) {
+                chase!(ev);
+            }
+        }
+    }
+    if let Some(V::I32(style)) = pseudo_get(vm, h, view::P_TA_DEF_RES) {
+        if let Some(ev) = res.style_item(style as u32, attr_id) {
+            chase!(ev);
+        }
+    }
+    if let Some(ev) = res.style_item(theme, attr_id) {
+        chase!(ev);
+    }
+    None
+}
+
 fn resolve_color_id(vm: &mut Vm, res_id: u32) -> u32 {
     let mut id = res_id;
     let mut data = 0xFF00_0000u32;
@@ -4303,9 +4452,52 @@ fn res_misc(vm: &mut Vm, class: &str, name: &str, args: &[V]) -> Rt<Option<Optio
             };
             Some(Some(d))
         }
-        ("Landroid/content/res/TypedArray;", "getFont" | "getColorStateList") => {
-            Some(Some(V::Ref(0)))
+        ("Landroid/content/res/TypedArray;", "getColorStateList") => {
+            // TypedArray styleable values carry the color/resource id.
+            // Resolve selectors to their resting/default color in the
+            // object slot; importantly a real 0x00000000 color remains
+            // Some(0), distinguishable from an absent attribute.
+            let csl = match ta_index(vm, args) {
+                Some((h, i)) => {
+                    if let Some(color) = typed_array_color(vm, h, i as i32) {
+                        host(
+                            vm,
+                            "Landroid/content/res/ColorStateList;",
+                            HostState::Slot(V::I32(color)),
+                        )
+                    } else {
+                        match view::ta_lookup(vm, h, i) {
+                            Some(V::I32(raw)) => {
+                                // Runtime-map values have already lost
+                                // their binary type; this range split is
+                                // only the legacy fallback.
+                                let u = raw as u32;
+                                let color = if raw >= 0 && (0x0101_0000..0x0102_0000).contains(&u) {
+                                    crate::theme_color(vm, u)
+                                        .unwrap_or_else(|| resolve_color_id(vm, u))
+                                        as i32
+                                } else if raw >= 0
+                                    && (u >= 0x7f00_0000 || (0x0106_0000..0x0107_0000).contains(&u))
+                                {
+                                    resource_or_attr_color(vm, u)
+                                } else {
+                                    raw
+                                };
+                                host(
+                                    vm,
+                                    "Landroid/content/res/ColorStateList;",
+                                    HostState::Slot(V::I32(color)),
+                                )
+                            }
+                            _ => V::Ref(0),
+                        }
+                    }
+                }
+                _ => V::Ref(0),
+            };
+            Some(Some(csl))
         }
+        ("Landroid/content/res/TypedArray;", "getFont") => Some(Some(V::Ref(0))),
         ("Landroid/content/res/TypedArray;", "hasValue" | "hasValueOrEmpty") => {
             let yes = ta_index(vm, args).is_some_and(|(h, i)| {
                 if view::ta_lookup(vm, h, i).is_some() {

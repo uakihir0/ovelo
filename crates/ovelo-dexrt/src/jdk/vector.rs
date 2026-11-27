@@ -297,11 +297,34 @@ const OUT_SCALE: f32 = 4.0;
 /// Supersample factor inside the output raster (AA).
 const SS: u32 = 4;
 
+fn theme_dimen(res: &ApkResources, theme: u32, attr: u32, depth: u8) -> Option<f32> {
+    if depth >= 8 {
+        return None;
+    }
+    let ev = res.style_item(theme, attr)?;
+    match ev.data_type {
+        // TYPE_ATTRIBUTE in a theme points at another theme attribute;
+        // TYPE_REFERENCE may point either at a concrete dimen or at a
+        // theme-provided indirection.
+        0x02 => theme_dimen(res, theme, ev.data, depth + 1),
+        0x01 => res
+            .dimen(ev.data)
+            .or_else(|| theme_dimen(res, theme, ev.data, depth + 1)),
+        _ => Some(crate::res::typed_px(ev)),
+    }
+}
+
 fn xml_dimen(rv: RCtx<'_>, v: &Value) -> Option<f32> {
     match v {
-        Value::Reference(id) => rv.res.dimen(*id),
+        Value::Reference(id) => rv
+            .res
+            .dimen(*id)
+            .or_else(|| theme_dimen(rv.res, rv.theme, *id, 0)),
         Value::Float(f) => Some(*f),
         Value::Int(i) => Some(*i as f32),
+        Value::Other { data_type, data } if *data_type == 0x02 => {
+            theme_dimen(rv.res, rv.theme, *data, 0)
+        }
         Value::Other { data_type, data } => {
             Some(crate::res::typed_px(&ovelo_apk::arsc::EntryValue {
                 data_type: *data_type,
@@ -353,8 +376,42 @@ fn render_layer_list(rv: RCtx<'_>, res_id: u32) -> Option<(u32, u32, Rc<Vec<u8>>
     if !els.iter().any(|e| e.depth == 0 && e.name == "layer-list") {
         return None;
     }
-    const SZ: usize = 96;
-    let mut canvas = vec![0u8; SZ * SZ * 4];
+    // A layer-list's intrinsic extent is the largest child extent plus
+    // that item's insets. A fixed 96px canvas discarded layers whose
+    // theme-resolved margins alone reached 96px even though the child
+    // remained visible in a correctly sized drawable.
+    let (mut cw, mut ch) = (96usize, 96usize);
+    for item in els.iter().filter(|e| e.depth == 1 && e.name == "item") {
+        let l = xml_dimen_attr(rv, item, "left")
+            .unwrap_or(0.0)
+            .round()
+            .max(0.0) as usize;
+        let t = xml_dimen_attr(rv, item, "top")
+            .unwrap_or(0.0)
+            .round()
+            .max(0.0) as usize;
+        let r = xml_dimen_attr(rv, item, "right")
+            .unwrap_or(0.0)
+            .round()
+            .max(0.0) as usize;
+        let b = xml_dimen_attr(rv, item, "bottom")
+            .unwrap_or(0.0)
+            .round()
+            .max(0.0) as usize;
+        if let Some(Value::Reference(child)) = item.android("drawable") {
+            if let Some((w, h, _)) = drawable_bitmap(
+                RCtx {
+                    depth: rv.depth + 1,
+                    ..rv
+                },
+                *child,
+            ) {
+                cw = cw.max(l + w as usize + r).min(1024);
+                ch = ch.max(t + h as usize + b).min(1024);
+            }
+        }
+    }
+    let mut canvas = vec![0u8; cw * ch * 4];
     let mut any = false;
     for (i, item) in els.iter().enumerate() {
         if item.depth != 1 || item.name != "item" {
@@ -381,10 +438,10 @@ fn render_layer_list(rv: RCtx<'_>, res_id: u32) -> Option<(u32, u32, Rc<Vec<u8>>
             .unwrap_or(0.0)
             .round()
             .max(0.0) as usize;
-        if l >= SZ || t >= SZ || l + r >= SZ || t + b >= SZ {
+        if l >= cw || t >= ch || l + r >= cw || t + b >= ch {
             continue;
         }
-        let (x0, y0, tw, th) = (l, t, SZ - l - r, SZ - t - b);
+        let (x0, y0, tw, th) = (l, t, cw - l - r, ch - t - b);
         if let Some(Value::Reference(child)) = item.android("drawable") {
             if let Some((w, h, px)) = drawable_bitmap(
                 RCtx {
@@ -393,12 +450,12 @@ fn render_layer_list(rv: RCtx<'_>, res_id: u32) -> Option<(u32, u32, Rc<Vec<u8>>
                 },
                 *child,
             ) {
-                blit_scaled(&mut canvas, SZ, &px, w as usize, h as usize, x0, y0, tw, th);
+                blit_scaled(&mut canvas, cw, &px, w as usize, h as usize, x0, y0, tw, th);
                 any = true;
             } else if let Some(argb) = resolve_ref_color(rv, *child) {
                 for y in y0..y0 + th {
                     for x in x0..x0 + tw {
-                        blend_px(&mut canvas, x, y, SZ, argb);
+                        blend_px(&mut canvas, x, y, cw, argb);
                     }
                 }
                 any = true;
@@ -424,13 +481,13 @@ fn render_layer_list(rv: RCtx<'_>, res_id: u32) -> Option<(u32, u32, Rc<Vec<u8>>
                     rx > 0.0 && ry > 0.0 && (nx * nx) / (rx * rx) + (ny * ny) / (ry * ry) <= 1.0
                 };
                 if inside {
-                    blend_px(&mut canvas, x, y, SZ, argb);
+                    blend_px(&mut canvas, x, y, cw, argb);
                 }
             }
         }
         any = true;
     }
-    any.then_some((SZ as u32, SZ as u32, Rc::new(canvas)))
+    any.then_some((cw as u32, ch as u32, Rc::new(canvas)))
 }
 
 fn root_is(rv: RCtx<'_>, res_id: u32, name: &str) -> bool {
@@ -445,17 +502,29 @@ pub(crate) fn render_vector(rv: RCtx<'_>, res_id: u32) -> Option<(u32, u32, Rc<V
     let res = rv.res;
     let els = res.document(res_id)?;
     let root = els.iter().find(|e| e.depth == 0 && e.name == "vector")?;
-    let vw = f32_attr(root, "viewportWidth").unwrap_or(24.0);
-    let vh = f32_attr(root, "viewportHeight").unwrap_or(24.0);
+    let vw = f32_attr(rv, root, "viewportWidth").unwrap_or(24.0);
+    let vh = f32_attr(rv, root, "viewportHeight").unwrap_or(24.0);
     if vw <= 0.0 || vh <= 0.0 || !vw.is_finite() || !vh.is_finite() {
         return None;
     }
-    let out_w = ((vw * OUT_SCALE).round() as u32).clamp(1, 1024);
-    let out_h = ((vh * OUT_SCALE).round() as u32).clamp(1, 1024);
+    // `android:width`/`height` are the drawable's intrinsic physical
+    // size (dp converted through resources). Rasterizing every 24-unit
+    // viewport at a fixed 96px made wrap-content ImageViews twice as
+    // large on this runtime's 2x density; only use the fixed supersize
+    // as a fallback when the XML omits dimensions.
+    let out_w = xml_dimen_attr(rv, root, "width")
+        .unwrap_or(vw * OUT_SCALE)
+        .round()
+        .clamp(1.0, 1024.0) as u32;
+    let out_h = xml_dimen_attr(rv, root, "height")
+        .unwrap_or(vh * OUT_SCALE)
+        .round()
+        .clamp(1.0, 1024.0) as u32;
     let rw = (out_w * SS) as usize;
     let rh = (out_h * SS) as usize;
-    // viewport → raster: viewport unit * OUT_SCALE * SS.
-    let k = OUT_SCALE * SS as f32;
+    // viewport → raster, preserving a non-square aspect ratio.
+    let kx = out_w as f32 / vw * SS as f32;
+    let ky = out_h as f32 / vh * SS as f32;
     let mut any = false;
 
     // Composite buffer at raster res; each `<path>` paints stroke over fill
@@ -469,14 +538,14 @@ pub(crate) fn render_vector(rv: RCtx<'_>, res_id: u32) -> Option<(u32, u32, Rc<V
         }
         match el.name.as_str() {
             "group" => {
-                let m = group_mat(el);
+                let m = group_mat(rv, el);
                 let parent = xf.iter().fold(Mat::IDENT, |acc, (_, m)| acc.then(m));
                 xf.push((el.depth, parent.then(&m)));
             }
             "path" => {
                 let m = xf.iter().fold(Mat::IDENT, |acc, (_, m)| acc.then(m));
                 let Some(data) = path_attr(el) else { continue };
-                let tr = Mat::scale(k, k).then(&m);
+                let tr = Mat::scale(kx, ky).then(&m);
                 let subs = parse_path(&data);
                 let polys: Vec<Vec<(f32, f32)>> = subs
                     .iter()
@@ -491,7 +560,7 @@ pub(crate) fn render_vector(rv: RCtx<'_>, res_id: u32) -> Option<(u32, u32, Rc<V
                 // No fill attr + stroke → transparent fill; no fill and no
                 // stroke → the vector spec fills black.
                 let fill_argb = match fill {
-                    Some(c) => Some(mul_alpha(c, f32_attr(el, "fillAlpha").unwrap_or(1.0))),
+                    Some(c) => Some(mul_alpha(c, f32_attr(rv, el, "fillAlpha").unwrap_or(1.0))),
                     None if stroke.is_none() => Some(0xff00_0000),
                     None => None,
                 };
@@ -502,8 +571,8 @@ pub(crate) fn render_vector(rv: RCtx<'_>, res_id: u32) -> Option<(u32, u32, Rc<V
                     any = true;
                 }
                 if let Some(c) = stroke {
-                    let argb = mul_alpha(c, f32_attr(el, "strokeAlpha").unwrap_or(1.0));
-                    let sw = f32_attr(el, "strokeWidth").unwrap_or(1.0) * k;
+                    let argb = mul_alpha(c, f32_attr(rv, el, "strokeAlpha").unwrap_or(1.0));
+                    let sw = f32_attr(rv, el, "strokeWidth").unwrap_or(1.0) * (kx + ky) * 0.5;
                     let polys: Vec<Vec<(f32, f32)>> = subs
                         .iter()
                         .flat_map(|s| {
@@ -613,14 +682,14 @@ impl Mat {
 }
 
 /// `<group>` transform: T(pivot)·R(rot)·S(sx,sy)·T(translate)·T(-pivot).
-fn group_mat(el: &Element) -> Mat {
-    let px = f32_attr(el, "pivotX").unwrap_or(0.0);
-    let py = f32_attr(el, "pivotY").unwrap_or(0.0);
-    let rot = f32_attr(el, "rotation").unwrap_or(0.0);
-    let sx = f32_attr(el, "scaleX").unwrap_or(1.0);
-    let sy = f32_attr(el, "scaleY").unwrap_or(1.0);
-    let tx = f32_attr(el, "translateX").unwrap_or(0.0);
-    let ty = f32_attr(el, "translateY").unwrap_or(0.0);
+fn group_mat(rv: RCtx<'_>, el: &Element) -> Mat {
+    let px = f32_attr(rv, el, "pivotX").unwrap_or(0.0);
+    let py = f32_attr(rv, el, "pivotY").unwrap_or(0.0);
+    let rot = f32_attr(rv, el, "rotation").unwrap_or(0.0);
+    let sx = f32_attr(rv, el, "scaleX").unwrap_or(1.0);
+    let sy = f32_attr(rv, el, "scaleY").unwrap_or(1.0);
+    let tx = f32_attr(rv, el, "translateX").unwrap_or(0.0);
+    let ty = f32_attr(rv, el, "translateY").unwrap_or(0.0);
     Mat::translate(px, py)
         .then(&Mat::rotate(rot))
         .then(&Mat::scale(sx, sy))
@@ -628,12 +697,21 @@ fn group_mat(el: &Element) -> Mat {
         .then(&Mat::translate(-px, -py))
 }
 
-fn f32_attr(el: &Element, name: &str) -> Option<f32> {
+fn f32_attr(rv: RCtx<'_>, el: &Element, name: &str) -> Option<f32> {
     match el.android(name) {
         Some(Value::Float(f)) => Some(*f),
         Some(Value::Int(i)) => Some(*i as f32),
         Some(Value::Str(s)) => s.trim().parse().ok(),
-        Some(Value::Other { data, .. }) => Some(f32::from_bits(*data)),
+        Some(Value::Other { data_type, data }) => match data_type {
+            0x02 => theme_dimen(rv.res, rv.theme, *data, 0),
+            0x04 => Some(f32::from_bits(*data)),
+            0x05 | 0x06 => Some(crate::res::typed_px(&ovelo_apk::arsc::EntryValue {
+                data_type: *data_type,
+                data: *data,
+                string: None,
+            })),
+            _ => None,
+        },
         _ => None,
     }
 }
@@ -659,6 +737,10 @@ fn color_of(rv: RCtx<'_>, v: &Value) -> Option<u32> {
         Value::Str(s) => parse_color(s),
         Value::Int(i) => Some(*i as u32),
         Value::Other { data_type, data } if (0x1c..=0x1f).contains(data_type) => Some(*data),
+        Value::Other {
+            data_type: 0x02,
+            data,
+        } => resolve_ref_color(rv, *data),
         Value::Reference(r) => resolve_ref_color(rv, *r),
         _ => None,
     }
@@ -671,6 +753,9 @@ pub(crate) fn resolve_ref_color(rv: RCtx<'_>, id: u32) -> Option<u32> {
         if let Some(c) = entry_color(res, ev) {
             return Some(c);
         }
+    }
+    if let Some(c) = crate::res::framework_color(id) {
+        return Some(c);
     }
     let mut cur = id;
     for _ in 0..8 {
