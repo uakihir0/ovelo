@@ -7490,9 +7490,12 @@ pub(crate) fn dialog_show(vm: &mut Vm, dialog: u32) {
     let pl = pint(vm, parent, P_LEFT);
     let pt = pint(vm, parent, P_TOP);
     frame_set(vm, root, x - pl, y - pt, x - pl + width, y - pt + height);
-    if pseudo_get(vm, root, P_PARENT).is_none() {
-        attach_at(vm, parent, V::Ref(root), None, false, None);
+    if let Some(V::Ref(old_parent)) = pseudo_get(vm, root, P_PARENT) {
+        if old_parent != 0 {
+            detach(vm, old_parent, V::Ref(root), false);
+        }
     }
+    attach_at(vm, parent, V::Ref(root), None, false, None);
     vm.view_roots.retain(|r| *r != root);
     vm.view_roots.push(root);
     pseudo_set(vm, root, P_POPUP_ROOT, V::Ref(dialog));
