@@ -6549,9 +6549,9 @@ pub(crate) fn dispatch_touch(
                     if dbg {
                         eprintln!("[touchdbg] h{v} OnClickListener.onClick l{l}");
                     }
-                    if let Err(e) = vm.call_virtual(l, "onClick", &[V::Ref(v)]) {
+                    if let Err(e) = vm.call_virtual(v, "performClick", &[]) {
                         if crate::dbg_flag("OVELO_TOUCHDBG") {
-                            eprintln!("[touchdbg] onClick error: {e:?}");
+                            eprintln!("[touchdbg] performClick error: {e:?}");
                         }
                     }
                     vm.touch_gesture_target = 0;
