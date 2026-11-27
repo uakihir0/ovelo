@@ -4928,13 +4928,31 @@ fn res_misc(vm: &mut Vm, class: &str, name: &str, args: &[V]) -> Rt<Option<Optio
             let Some(v) = found else {
                 return Ok(Some(Some(V::I32(0))));
             };
+            // Theme binding resolves `?attr/x` and nested @color/@dimen
+            // references before exposing the TypedValue. Keeping the
+            // intermediate TYPE_REFERENCE makes color-valued attrs look
+            // like array resources (Material ProgressIndicator then
+            // reads them with getIntArray and crashes).
+            let resolved = match v {
+                V::I32(id) if (id as u32) >> 24 == 0x7f || (id as u32) >> 24 == 0x01 => {
+                    view::resolve_ta_id(vm, id as u32)
+                }
+                _ => None,
+            };
+            let fill = |vm: &mut Vm, tv: V| {
+                if let Some((rid, ev)) = resolved.clone() {
+                    fill_typed_value_ev(vm, tv, &ev, rid);
+                } else {
+                    fill_typed_value(vm, tv, v);
+                }
+            };
             if name == "peekValue" {
                 let t = host(vm, "Landroid/util/TypedValue;", HostState::Empty);
-                fill_typed_value(vm, t, v);
+                fill(vm, t);
                 return Ok(Some(Some(t)));
             }
             if let Some(tv) = args.get(2).copied() {
-                fill_typed_value(vm, tv, v);
+                fill(vm, tv);
             }
             Some(Some(V::I32(1)))
         }

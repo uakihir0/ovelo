@@ -4402,7 +4402,16 @@ pub(crate) fn resolve_ta_id(vm: &mut Vm, id: u32) -> Option<(u32, ovelo_apk::ars
         rid = ev.data;
         match vm.apk_res.as_ref().and_then(|r| r.entry_value(rid)) {
             Some(next) => ev = next.clone(),
-            None => break,
+            None => {
+                if let Some(color) = crate::res::framework_color(rid) {
+                    ev = ovelo_apk::arsc::EntryValue {
+                        data_type: 0x1c,
+                        data: color,
+                        string: None,
+                    };
+                }
+                break;
+            }
         }
     }
     Some((rid, ev))
