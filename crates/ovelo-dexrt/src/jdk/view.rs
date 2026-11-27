@@ -3034,6 +3034,14 @@ pub(crate) fn call(
         "getPaddingTop" => Some(Some(V::I32(view_padding(vm, this).1))),
         "getPaddingRight" | "getPaddingEnd" => Some(Some(V::I32(view_padding(vm, this).2))),
         "getPaddingBottom" => Some(Some(V::I32(view_padding(vm, this).3))),
+        // No host-side compound drawable insets yet; until those exist
+        // the compound padding is the view padding. Material's
+        // TextInputLayout copies these values straight back through
+        // setPadding during measurement, so returning 0 erases padding.
+        "getCompoundPaddingLeft" => Some(Some(V::I32(view_padding(vm, this).0))),
+        "getCompoundPaddingTop" => Some(Some(V::I32(view_padding(vm, this).1))),
+        "getCompoundPaddingRight" => Some(Some(V::I32(view_padding(vm, this).2))),
+        "getCompoundPaddingBottom" => Some(Some(V::I32(view_padding(vm, this).3))),
         "setPadding" | "setPaddingRelative" => {
             pseudo_set(vm, this, P_PAD_L, V::I32(vint(args.get(1))));
             pseudo_set(vm, this, P_PAD_T, V::I32(vint(args.get(2))));
