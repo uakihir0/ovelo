@@ -3493,11 +3493,18 @@ fn context_call(
                         h
                     }
                 };
-                let bind_result = vm.call_virtual(sh, "onBind", &[V::Ref(ih)]);
-                if crate::dbg_flag("OVELO_BINDDBG") {
-                    eprintln!("[binddbg] service={desc} h{sh} onBind={bind_result:?}");
-                }
-                let binder = bind_result.ok().flatten().unwrap_or(V::Ref(0));
+                let binder = if let Some(rebind_intent) = vm.service_rebind.remove(&sh) {
+                    let _ = vm.call_virtual(sh, "onRebind", &[rebind_intent]);
+                    vm.service_binders.get(&sh).copied().unwrap_or(V::Ref(0))
+                } else {
+                    let bind_result = vm.call_virtual(sh, "onBind", &[V::Ref(ih)]);
+                    if crate::dbg_flag("OVELO_BINDDBG") {
+                        eprintln!("[binddbg] service={desc} h{sh} onBind={bind_result:?}");
+                    }
+                    let binder = bind_result.ok().flatten().unwrap_or(V::Ref(0));
+                    vm.service_binders.insert(sh, binder);
+                    binder
+                };
                 let conn = args.iter().skip(2).find_map(|v| match v {
                     V::Ref(h)
                         if *h != 0
@@ -3596,7 +3603,10 @@ fn context_call(
                         .saturating_sub(1);
                     if remaining == 0 {
                         vm.service_bind_counts.remove(&sh);
-                        let _ = vm.call_virtual(sh, "onUnbind", &[intent]);
+                        let unbind = vm.call_virtual(sh, "onUnbind", &[intent]);
+                        if matches!(unbind, Ok(Some(V::I32(v))) if v != 0) {
+                            vm.service_rebind.insert(sh, intent);
+                        }
                         if !vm.service_started.contains(&sh) {
                             vm.services.retain(|_, live| *live != sh);
                             if !vm.pending_destroy.contains(&sh) {

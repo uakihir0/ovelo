@@ -360,6 +360,10 @@ pub struct Vm {
     pub(crate) service_bind_counts: HashMap<u32, usize>,
     /// ServiceConnection handle -> intent copy delivered to `onUnbind`.
     pub(crate) service_bind_intents: HashMap<u32, V>,
+    /// Binder returned by each service's active `onBind` lifecycle.
+    pub(crate) service_binders: HashMap<u32, V>,
+    /// Intent awaiting `onRebind` after `onUnbind` returned true.
+    pub(crate) service_rebind: HashMap<u32, V>,
     /// Last `startId` delivered to each running Service — `stopSelf(id)`
     /// only stops when the id matches the most recent request.
     pub(crate) service_start_id: HashMap<u32, i64>,
@@ -938,6 +942,8 @@ impl Vm {
             service_bindings: HashMap::new(),
             service_bind_counts: HashMap::new(),
             service_bind_intents: HashMap::new(),
+            service_binders: HashMap::new(),
+            service_rebind: HashMap::new(),
             service_start_id: HashMap::new(),
             service_seq: 0,
             service_stop_pending: hashbrown::HashSet::new(),
@@ -2595,6 +2601,14 @@ impl Vm {
         roots.extend(self.services.values().copied());
         roots.extend(self.service_bindings.keys().copied());
         roots.extend(self.service_bind_intents.values().filter_map(|v| match v {
+            V::Ref(h) if *h != 0 => Some(*h),
+            _ => None,
+        }));
+        roots.extend(self.service_binders.values().filter_map(|v| match v {
+            V::Ref(h) if *h != 0 => Some(*h),
+            _ => None,
+        }));
+        roots.extend(self.service_rebind.values().filter_map(|v| match v {
             V::Ref(h) if *h != 0 => Some(*h),
             _ => None,
         }));
