@@ -4785,7 +4785,8 @@ fn group_measure_fallback(vm: &mut Vm, this: u32, pw: i32, ph: i32) {
                 .map(|p| estimated_text_width(p, ts))
                 .collect();
             let real_w = widths.iter().copied().max().unwrap_or(0);
-            let avail = (pw & 0x3FFF_FFFF) - pad_w;
+            let button_w = if is_compound { 28 } else { 0 };
+            let avail = (pw & 0x3FFF_FFFF) - pad_w - button_w;
             let frame_w = if avail > 0 { real_w.min(avail) } else { real_w };
             let lines = if frame_w > 0 {
                 widths
@@ -4795,7 +4796,7 @@ fn group_measure_fallback(vm: &mut Vm, this: u32, pw: i32, ph: i32) {
             } else {
                 paragraphs.len() as i32
             };
-            (frame_w, line_h * lines)
+            (frame_w + button_w, (line_h * lines).max(button_w))
         };
         // resolveSize semantics on the desired extent (content or
         // drawable intrinsic): AT_MOST → min(desired, spec). An empty
