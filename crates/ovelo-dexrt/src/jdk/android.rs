@@ -2160,6 +2160,53 @@ fn resolve_color_id(vm: &mut Vm, res_id: u32) -> u32 {
     data
 }
 
+fn csl_state_has(vm: &Vm, state_set: Option<u32>, attr: u32) -> bool {
+    match state_set {
+        Some(h) => {
+            let n = list_len(vm, h).unwrap_or(0);
+            (0..n).any(|i| matches!(list_get(vm, h, i), Some(V::I32(x)) if x as u32 == attr))
+        }
+        // The common resting state used by text rendering: enabled,
+        // unchecked, unpressed, unselected.
+        None => attr == 0x0101009e,
+    }
+}
+
+fn csl_spec_matches(vm: &Vm, spec: u32, state_set: Option<u32>) -> bool {
+    let n = list_len(vm, spec).unwrap_or(0);
+    (0..n).all(|i| match list_get(vm, spec, i) {
+        Some(V::I32(x)) if x >= 0 => csl_state_has(vm, state_set, x as u32),
+        Some(V::I32(x)) => !csl_state_has(vm, state_set, x.unsigned_abs()),
+        _ => false,
+    })
+}
+
+fn color_state_list_match(vm: &Vm, h: u32, state_set: Option<u32>) -> Option<V> {
+    let (Some(V::Ref(states)), Some(V::Ref(colors))) = (
+        pseudo_get(vm, h, P_CSL_STATES),
+        pseudo_get(vm, h, P_CSL_COLORS),
+    ) else {
+        return None;
+    };
+    let n = list_len(vm, states).unwrap_or(0);
+    for row in 0..n {
+        let matches = match list_get(vm, states, row) {
+            Some(V::Ref(spec)) => csl_spec_matches(vm, spec, state_set),
+            _ => false,
+        };
+        if matches {
+            return list_get(vm, colors, row);
+        }
+    }
+    None
+}
+
+/// Resolve a ColorStateList in the normal enabled/unchecked state,
+/// falling back to its constructor default when no state row matches.
+pub(crate) fn color_state_list_resting_color(vm: &Vm, h: u32) -> Option<V> {
+    color_state_list_match(vm, h, None).or_else(|| slot_of(vm, h))
+}
+
 fn active_network(vm: &mut Vm, connectivity: V) -> V {
     let h = match connectivity {
         V::Ref(h) => h,
@@ -4299,10 +4346,17 @@ fn res_misc(vm: &mut Vm, class: &str, name: &str, args: &[V]) -> Rt<Option<Optio
         ("Landroid/content/res/ColorStateList;", "<init>") => {
             // ColorStateList(int[][] states, int[] colors): the default
             // color is the first color entry. Keep it in the object slot
-            // even though state matching itself is still simplified.
-            if let (Some(V::Ref(this)), Some(V::Ref(colors))) = (args.first(), args.get(2)) {
+            // and keep the parallel state/color rows for state matching.
+            if let (Some(V::Ref(this)), Some(states), Some(V::Ref(colors))) =
+                (args.first(), args.get(1).copied(), args.get(2))
+            {
+                pseudo_set(vm, *this, P_CSL_STATES, states);
+                pseudo_set(vm, *this, P_CSL_COLORS, V::Ref(*colors));
                 if let Some(c) = list_get(vm, *colors, 0) {
                     slot_put(vm, *this, c);
+                }
+                if let Some(c) = color_state_list_resting_color(vm, *this) {
+                    pseudo_set(vm, *this, P_CSL_RESTING, c);
                 }
             }
             Some(None)
@@ -4315,7 +4369,15 @@ fn res_misc(vm: &mut Vm, class: &str, name: &str, args: &[V]) -> Rt<Option<Optio
             v => v,
         })),
         ("Landroid/content/res/ColorStateList;", "getColorForState") => Some(Some(match args[0] {
-            V::Ref(h) => slot_of(vm, h).unwrap_or(V::I32(0)),
+            V::Ref(h) => {
+                let state_set = match args.get(1) {
+                    Some(V::Ref(s)) if *s != 0 => Some(*s),
+                    _ => None,
+                };
+                color_state_list_match(vm, h, state_set)
+                    .or_else(|| args.get(2).copied())
+                    .unwrap_or(V::I32(0))
+            }
             _ => V::I32(0),
         })),
         (

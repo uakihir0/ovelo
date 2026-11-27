@@ -152,6 +152,12 @@ pub(crate) const P_TLS: u64 = 0xFFFD_FEF4;
 pub(crate) const P_SUBLIST_PARENT: u64 = 0xFFFD_FEF5;
 pub(crate) const P_SUBLIST_START: u64 = 0xFFFD_FEF6;
 pub(crate) const P_SUBLIST_END: u64 = 0xFFFD_FEF7;
+/// ColorStateList constructor state-array argument.
+pub(crate) const P_CSL_STATES: u64 = 0xFFFD_FEF8;
+/// ColorStateList constructor color-array argument.
+pub(crate) const P_CSL_COLORS: u64 = 0xFFFD_FEF9;
+/// Resting enabled/unchecked color chosen from a ColorStateList.
+pub(crate) const P_CSL_RESTING: u64 = 0xFFFD_FEFA;
 
 pub(crate) fn now_ms() -> i64 {
     std::time::SystemTime::now()

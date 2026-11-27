@@ -3291,6 +3291,12 @@ impl Vm {
         jdk::slot_of(self, h)
     }
 
+    /// Resolve a ColorStateList in the resting enabled/unchecked state.
+    pub fn color_state_list_resting(&self, h: u32) -> Option<V> {
+        jdk::pseudo_get(self, h, jdk::P_CSL_RESTING)
+            .or_else(|| jdk::android::color_state_list_resting_color(self, h))
+    }
+
     /// Resolve `name` on `ci`'s chain for `args`, retrying with each
     /// scalar boxed into its `Number` mirror (`HostState::Slot`) when
     /// the plain image misses. A raw `V::I64` out of a JSON map fed

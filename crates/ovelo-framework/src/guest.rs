@@ -1060,7 +1060,7 @@ impl GuestUi {
                 |ui, vm, a| {
                     let this = ref_arg(a, 0)?;
                     let raw = match a.get(1) {
-                        Some(V::Ref(h)) => match vm.host_slot(*h) {
+                        Some(V::Ref(h)) => match vm.color_state_list_resting(*h) {
                             Some(V::I32(c)) => c,
                             _ => 0,
                         },
