@@ -5389,7 +5389,10 @@ fn build_tree(vm: &mut Vm, elems: &[Element], ctx: V) -> V {
         // name) seed P_IMAGE; the renderer resolves the res-id. A dex
         // constructor that already set an image wins — in AOSP the
         // XML default only applies when the ctor leaves it unset.
-        if pseudo_get(vm, h, P_IMAGE).is_none() {
+        let image_unset = pseudo_get(vm, h, P_IMAGE)
+            .map(|v| is_null(v) || v == V::I32(0))
+            .unwrap_or(true);
+        if image_unset {
             if let Some(v) = el
                 .attrs
                 .iter()
