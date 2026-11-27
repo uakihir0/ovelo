@@ -2506,6 +2506,7 @@ impl Vm {
             self.main_dispatcher_h,
             self.app_h,
             self.cur_activity,
+            self.json_null_h,
         ]);
         roots.extend(self.view_roots.iter().copied());
         roots.extend(self.prefs_files.values().copied());
