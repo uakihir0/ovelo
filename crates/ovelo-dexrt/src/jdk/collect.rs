@@ -1537,6 +1537,7 @@ fn map_call(vm: &mut Vm, name: &str, sig: &str, args: &[V]) -> Rt<Option<Option<
         | "putShort"
         | "putByte"
         | "putParcelable"
+        | "putBinder"
         | "putSerializable"
         | "putBundle"
         | "putCharSequence"
@@ -1614,6 +1615,7 @@ fn map_call(vm: &mut Vm, name: &str, sig: &str, args: &[V]) -> Rt<Option<Option<
         }
         "getString"
         | "getParcelable"
+        | "getBinder"
         | "getSerializable"
         | "getBundle"
         | "getCharSequence"
