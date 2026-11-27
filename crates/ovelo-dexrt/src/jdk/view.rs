@@ -1465,6 +1465,12 @@ pub(crate) fn call(
                         pseudo_set(vm, this, P_CONTEXT, V::Ref(c));
                     }
                 }
+                if let Some(V::Ref(attrs)) = args.get(2).copied() {
+                    if attrs != 0 && pseudo_get(vm, this, P_ATTRS).is_none() {
+                        pseudo_set(vm, this, P_ATTRS, V::Ref(attrs));
+                    }
+                }
+                apply_ctor_style(vm, this, args);
             }
             Some(None)
         }
@@ -4608,6 +4614,107 @@ fn min_dim(vm: &mut Vm, this: u32, key: u32, attr: &str) -> i32 {
         .unwrap_or(0)
 }
 
+fn ctor_style_value(vm: &mut Vm, def_attr: u32, def_res: u32, attr_id: u32) -> Option<V> {
+    let res = vm.apk_res.as_ref()?;
+    let mut styles = Vec::new();
+    if def_attr != 0 {
+        // Theme attrs often indirect through another attr (`textInputStyle`
+        // = `?attr/textInputOutlinedStyle`) before landing on the style
+        // reference. Chase that chain here; only the final reference is a
+        // style resource id.
+        let mut cur = res.style_item(vm.theme_id, def_attr).cloned();
+        for _ in 0..8 {
+            let Some(ev) = cur else { break };
+            if ev.data_type != 0x02 {
+                if ev.data != 0 {
+                    styles.push(ev.data);
+                }
+                break;
+            }
+            cur = res.style_item(vm.theme_id, ev.data).cloned();
+        }
+    }
+    if def_res != 0 {
+        styles.push(def_res);
+    }
+    for style in styles {
+        let Some(first) = res.style_item(style, attr_id) else {
+            continue;
+        };
+        let mut ev = first.clone();
+        for _ in 0..8 {
+            if ev.data_type != 0x02 {
+                break;
+            }
+            match res.style_item(vm.theme_id, ev.data) {
+                Some(next) => ev = next.clone(),
+                None => break,
+            }
+        }
+        if ev.data_type != 0x02 {
+            return Some(entry_v(vm, &ev));
+        }
+    }
+    None
+}
+
+/// Apply the constructor-default style values that the real framework
+/// View/TextView constructors read from `defStyleAttr`/`defStyleRes`.
+/// Appcompat widgets pass `editTextStyle`/`buttonStyle`/… down to their
+/// framework super constructor; without this the XML inflation path only
+/// sees attributes written literally in the layout.
+fn apply_ctor_style(vm: &mut Vm, this: u32, args: &[V]) {
+    if args.len() < 4 {
+        return;
+    }
+    let def_attr = i32v(args.get(3).copied().unwrap_or(V::I32(0))) as u32;
+    let def_res = i32v(args.get(4).copied().unwrap_or(V::I32(0))) as u32;
+    if def_attr == 0 && def_res == 0 {
+        return;
+    }
+    for (attr_id, key, name) in [
+        (0x0101_013f, P_MINW, "minWidth"),
+        (0x0101_0140, P_MINH, "minHeight"),
+    ] {
+        if pseudo_get(vm, this, key).is_none() && attr_find(vm, this, name).is_none() {
+            if let Some(px) =
+                ctor_style_value(vm, def_attr, def_res, attr_id).and_then(|v| lp_px(vm, v))
+            {
+                pseudo_set(vm, this, key, V::I32(px));
+            }
+        }
+    }
+    let base = ctor_style_value(vm, def_attr, def_res, 0x0101_00d5)
+        .and_then(|v| lp_px(vm, v))
+        .unwrap_or(0);
+    let horizontal = ctor_style_value(vm, def_attr, def_res, 0x0101_053d)
+        .and_then(|v| lp_px(vm, v))
+        .unwrap_or(base);
+    let vertical = ctor_style_value(vm, def_attr, def_res, 0x0101_053e)
+        .and_then(|v| lp_px(vm, v))
+        .unwrap_or(base);
+    for (attr_id, key, name, fallback) in [
+        (0x0101_00d6, P_PAD_L, "paddingLeft", horizontal),
+        (0x0101_00d7, P_PAD_T, "paddingTop", vertical),
+        (0x0101_00d8, P_PAD_R, "paddingRight", horizontal),
+        (0x0101_00d9, P_PAD_B, "paddingBottom", vertical),
+    ] {
+        if pseudo_get(vm, this, key).is_none() && attr_find(vm, this, name).is_none() {
+            let px = ctor_style_value(vm, def_attr, def_res, attr_id)
+                .and_then(|v| lp_px(vm, v))
+                .unwrap_or(fallback);
+            if px != 0 {
+                pseudo_set(vm, this, key, V::I32(px));
+            }
+        }
+    }
+    if pseudo_get(vm, this, P_TSIZE).is_none() && attr_find(vm, this, "textSize").is_none() {
+        if let Some(v) = ctor_style_value(vm, def_attr, def_res, 0x0101_0095) {
+            pseudo_set(vm, this, P_TSIZE, v);
+        }
+    }
+}
+
 /// AOSP `View.resolveSize` / `View.getDefaultSize`: fold a view's
 /// content size against the spec mode. `resolve=true` picks the
 /// resolveSize rule (AT_MOST → min(size, specSize)); getDefaultSize
@@ -5054,20 +5161,22 @@ fn group_measure_fallback(vm: &mut Vm, this: u32, pw: i32, ph: i32) {
             (frame_w + button_w, (line_h * lines).max(button_w))
         };
         // resolveSize semantics on the desired extent (content or
-        // drawable intrinsic): AT_MOST → min(desired, spec). An empty
-        // leaf stays 0 — an ImageView without a drawable and an empty
-        // TextView both measure to their padding in AOSP too.
+        // drawable intrinsic): AT_MOST → min(desired, spec). A leaf's
+        // requested minimum is part of that desired extent — otherwise
+        // wrap_content ignores android:minWidth/minHeight entirely.
+        let desired_w = (cw + pad_w).max(min_dim(vm, this, P_MINW, "minWidth"));
+        let desired_h = (chh + pad_h).max(min_dim(vm, this, P_MINH, "minHeight"));
         pseudo_set(
             vm,
             this,
             P_MEAS_W,
-            V::I32(resolve_size(cw + pad_w, pw, true)),
+            V::I32(resolve_size(desired_w, pw, true)),
         );
         pseudo_set(
             vm,
             this,
             P_MEAS_H,
-            V::I32(resolve_size(chh + pad_h, ph, true)),
+            V::I32(resolve_size(desired_h, ph, true)),
         );
         return;
     }
