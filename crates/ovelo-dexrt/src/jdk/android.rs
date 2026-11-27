@@ -5626,7 +5626,7 @@ fn handler_call(vm: &mut Vm, name: &str, args: &[V]) -> Rt<Option<Option<V>>> {
                 let delay = if name.contains("Delayed") {
                     args.get(2).copied().map(i64v).unwrap_or(0)
                 } else if name.contains("AtTime") {
-                    args.get(2).copied().map(i64v).unwrap_or(0) - now_ms()
+                    args.get(2).copied().map(i64v).unwrap_or(0) - crate::jdk::now_mono_ms()
                 } else {
                     0
                 };
@@ -5650,11 +5650,52 @@ fn handler_call(vm: &mut Vm, name: &str, args: &[V]) -> Rt<Option<Option<V>>> {
             }
             Some(None)
         }
-        "removeCallbacks"
-        | "removeMessages"
-        | "removeCallbacksAndMessages"
-        | "removeEqualMessages" => Some(None),
-        "hasMessages" | "hasCallbacks" | "hasEqualMessages" => Some(Some(V::I32(0))),
+        "removeMessages" => {
+            if let (Some(&V::Ref(target)), Some(&what)) = (args.first(), args.get(1)) {
+                let matches = |r: &u32| {
+                    pseudo_get(vm, *r, P_MSG_TARGET) == Some(V::Ref(target))
+                        && pseudo_get(vm, *r, P_MSG_WHAT) == Some(what)
+                };
+                let pending_match: Vec<bool> = vm
+                    .pending_runnables
+                    .iter()
+                    .map(|(r, _)| matches(r))
+                    .collect();
+                let mut pi = 0;
+                vm.pending_runnables.retain(|_| {
+                    let hit = pending_match[pi];
+                    pi += 1;
+                    !hit
+                });
+                let delayed_match: Vec<bool> = vm
+                    .delayed_runnables
+                    .iter()
+                    .map(|(r, _, _)| matches(r))
+                    .collect();
+                let mut di = 0;
+                vm.delayed_runnables.retain(|_| {
+                    let hit = delayed_match[di];
+                    di += 1;
+                    !hit
+                });
+            }
+            Some(None)
+        }
+        "removeCallbacks" | "removeCallbacksAndMessages" | "removeEqualMessages" => Some(None),
+        "hasMessages" => {
+            let found = if let (Some(&V::Ref(target)), Some(&what)) = (args.first(), args.get(1)) {
+                let matches = |r: &u32| {
+                    pseudo_get(vm, *r, P_MSG_TARGET) == Some(V::Ref(target))
+                        && pseudo_get(vm, *r, P_MSG_WHAT) == Some(what)
+                };
+                vm.pending_runnables.iter().any(|(r, _)| matches(r))
+                    || vm.delayed_runnables.iter().any(|(r, _, _)| matches(r))
+            } else {
+                false
+            };
+            Some(Some(V::I32(found as i32)))
+        }
+        "hasCallbacks" | "hasEqualMessages" => Some(Some(V::I32(0))),
         "obtainMessage" => {
             // obtainMessage(what[, obj|arg1,arg2,obj]) — target is `this`.
             let m = host(vm, "Landroid/os/Message;", HostState::Empty);
