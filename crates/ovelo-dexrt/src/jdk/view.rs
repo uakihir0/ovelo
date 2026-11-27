@@ -3333,11 +3333,117 @@ fn make_view_named(vm: &mut Vm, tag: &str, attrs: V, ctx: V) -> V {
                 _ => None,
             }) {
                 let id = attrset_value(vm, attrs, "id").map(i32v).unwrap_or(0);
-                inflate_static_fragment(vm, &class_name, id, ctx, h);
+                inflate_static_fragment(vm, &class_name, id, ctx, h, attrs);
             }
         }
     }
     V::Ref(h)
+}
+
+fn instance_refs(vm: &Vm, h: u32) -> Vec<u32> {
+    match vm.heap.get(h) {
+        Some(Obj::Instance { fields, .. }) | Some(Obj::Host { fields, .. }) => fields
+            .values()
+            .filter_map(|v| match v {
+                V::Ref(r) if *r != 0 => Some(*r),
+                _ => None,
+            })
+            .collect(),
+        _ => Vec::new(),
+    }
+}
+
+/// Breadth-first search through a small object graph for a class-name
+/// fragment. AndroidX class merging changes the owner of the exact
+/// fields, but the helper/manager object types themselves keep these
+/// names in the dex.
+fn find_named_object(vm: &Vm, root: u32, needle: &str) -> Option<u32> {
+    let mut todo = vec![(root, 0u32)];
+    let mut seen = std::collections::HashSet::new();
+    while let Some((h, depth)) = todo.pop() {
+        if h == 0 || depth > 4 || !seen.insert(h) || seen.len() > 128 {
+            continue;
+        }
+        if class_of(vm, V::Ref(h)).contains(needle) {
+            return Some(h);
+        }
+        for r in instance_refs(vm, h) {
+            todo.push((r, depth + 1));
+        }
+    }
+    None
+}
+
+fn set_named_field_all(vm: &mut Vm, h: u32, name: &str, ty: &str, v: V) {
+    let keys: Vec<u64> = vm
+        .field_keys_named(name, ty)
+        .into_iter()
+        .map(|(_, g)| g)
+        .collect();
+    if let Some(fields) = fields_mut(vm, h) {
+        for g in keys {
+            fields.insert(g, v);
+        }
+    }
+}
+
+fn push_fragment_unique(vm: &mut Vm, list: u32, frag: u32) -> bool {
+    if let Some(items) = list_mut(vm, list) {
+        if !items.contains(&V::Ref(frag)) {
+            items.push(V::Ref(frag));
+        }
+        return true;
+    }
+    false
+}
+
+/// Register in the FragmentStore's added-fragments ArrayList. The exact
+/// field names cover normal AndroidX dex; the one-level structural scan
+/// covers R8 class merging/renaming by looking for the store shape (a
+/// small object holding both a List and a HashMap-like object).
+fn register_static_fragment(vm: &mut Vm, manager: u32, frag: u32) -> bool {
+    if let Some(V::Ref(store)) = vm.get_object_field(
+        manager,
+        "Landroidx/fragment/app/FragmentManagerImpl;",
+        "mFragmentStore",
+    ) {
+        if let Some(V::Ref(list)) = vm.get_object_field(
+            store,
+            "Landroidx/emoji2/text/MetadataRepo;",
+            "mMetadataList",
+        ) {
+            if push_fragment_unique(vm, list, frag) {
+                return true;
+            }
+        }
+    }
+    let stores = instance_refs(vm, manager);
+    for store in stores {
+        let fields = instance_refs(vm, store);
+        let has_map = fields
+            .iter()
+            .any(|r| class_of(vm, V::Ref(*r)).contains("Map"));
+        if !has_map {
+            continue;
+        }
+        for list in fields {
+            if list_ref(vm, list).is_some() && push_fragment_unique(vm, list, frag) {
+                return true;
+            }
+        }
+    }
+    false
+}
+
+fn new_fragment_host_callbacks(vm: &mut Vm, activity: u32) -> Option<u32> {
+    let desc = "Landroidx/fragment/app/FragmentActivity$HostCallbacks;";
+    vm.type_index_of(desc)?;
+    let (midx, _) = vm
+        .ctor_list(desc)
+        .iter()
+        .find(|(_, ps)| ps.len() == 1)
+        .cloned()?;
+    vm.instantiate_ctor(desc, midx, &[V::Ref(activity)]).ok()
 }
 
 /// Instantiate and wire a static `<fragment>` enough for the dex
@@ -3345,7 +3451,14 @@ fn make_view_named(vm: &mut Vm, tag: &str, attrs: V, ctx: V) -> V {
 /// these APKs is often class-merged or partially obfuscated, so the
 /// exact field writes are best-effort; the fragment list registration is
 /// the part `findFragmentById` depends on.
-fn inflate_static_fragment(vm: &mut Vm, class_name: &str, id: i32, ctx: V, container: u32) {
+fn inflate_static_fragment(
+    vm: &mut Vm,
+    class_name: &str,
+    id: i32,
+    ctx: V,
+    container: u32,
+    attrs: V,
+) {
     let desc = format!("L{};", class_name.replace('.', "/"));
     if vm.type_index_of(&desc).is_none() {
         return;
@@ -3378,38 +3491,54 @@ fn inflate_static_fragment(vm: &mut Vm, class_name: &str, id: i32, ctx: V, conta
                 }
             }
         }
+        if host == 0 {
+            host = find_named_object(vm, act, "HostCallbacks").unwrap_or(0);
+        }
         if manager == 0 {
             if let Ok(Some(V::Ref(m))) = vm.call_virtual(act, "getSupportFragmentManager", &[]) {
                 manager = m;
             }
         }
-    }
-
-    let fdesc = "Landroidx/fragment/app/Fragment;";
-    vm.set_object_field(frag, fdesc, "mFragmentId", V::I32(id));
-    vm.set_object_field(frag, fdesc, "mContainerId", V::I32(id));
-    if host != 0 {
-        vm.set_object_field(frag, fdesc, "mHost", V::Ref(host));
-    }
-    if manager != 0 {
-        vm.set_object_field(frag, fdesc, "mFragmentManager", V::Ref(manager));
-        if let Some(V::Ref(store)) = vm.get_object_field(
-            manager,
-            "Landroidx/fragment/app/FragmentManagerImpl;",
-            "mFragmentStore",
-        ) {
-            if let Some(V::Ref(list)) = vm.get_object_field(
-                store,
-                "Landroidx/emoji2/text/MetadataRepo;",
-                "mMetadataList",
-            ) {
-                if let Some(items) = list_mut(vm, list) {
-                    if !items.contains(&V::Ref(frag)) {
-                        items.push(V::Ref(frag));
-                    }
+        if manager == 0 {
+            manager = find_named_object(vm, act, "FragmentManagerImpl").unwrap_or(0);
+        }
+        if manager == 0 && host != 0 {
+            manager = find_named_object(vm, host, "FragmentManagerImpl").unwrap_or(0);
+        }
+        if host == 0 {
+            if let Some(hc) = new_fragment_host_callbacks(vm, act) {
+                host = hc;
+                if manager == 0 {
+                    manager = find_named_object(vm, host, "FragmentManagerImpl").unwrap_or(0);
                 }
             }
         }
+    }
+
+    let fdesc = "Landroidx/fragment/app/Fragment;";
+    set_named_field_all(vm, frag, "mFragmentId", "I", V::I32(id));
+    set_named_field_all(vm, frag, "mContainerId", "I", V::I32(id));
+    if host != 0 {
+        set_named_field_all(
+            vm,
+            frag,
+            "mHost",
+            "Landroidx/fragment/app/FragmentActivity$HostCallbacks;",
+            V::Ref(host),
+        );
+    }
+    set_named_field_all(vm, frag, "mAdded", "Z", V::I32(1));
+    set_named_field_all(vm, frag, "mRemoving", "Z", V::I32(0));
+    set_named_field_all(vm, frag, "mDetached", "Z", V::I32(0));
+    if manager != 0 {
+        set_named_field_all(
+            vm,
+            frag,
+            "mFragmentManager",
+            "Landroidx/fragment/app/FragmentManagerImpl;",
+            V::Ref(manager),
+        );
+        register_static_fragment(vm, manager, frag);
     }
 
     if let Some(V::Ref(child_mgr)) = vm.get_object_field(frag, fdesc, "mChildFragmentManager") {
@@ -3454,22 +3583,41 @@ fn inflate_static_fragment(vm: &mut Vm, class_name: &str, id: i32, ctx: V, conta
             }
         }
     }
+    let _ = vm.call_virtual_sig(
+        frag,
+        "onInflate",
+        &[
+            "Landroid/content/Context;",
+            "Landroid/util/AttributeSet;",
+            "Landroid/os/Bundle;",
+        ],
+        &[ctx, attrs, V::Ref(0)],
+    );
     let ra = vm.call_virtual(frag, "onAttach", &[ctx]);
     let rc = vm.call_virtual(frag, "onCreate", &[V::Ref(0)]);
     if crate::dbg_flag("OVELO_FRAGDBG") {
         eprintln!("[fragdbg] {class_name} frag h{frag} attach={ra:?} create={rc:?} host{host} mgr{manager}");
     }
     let inf = inflater(vm, Some(ctx));
-    if let Ok(Some(V::Ref(fv))) =
-        vm.call_virtual(frag, "onCreateView", &[inf, V::Ref(container), V::Ref(0)])
-    {
-        if fv != 0 {
-            vm.set_object_field(frag, fdesc, "mView", V::Ref(fv));
-            if pseudo_get(vm, fv, P_PARENT).is_none() {
-                attach_at(vm, container, V::Ref(fv), None, false, None);
-            }
-            let _ = vm.call_virtual(frag, "onViewCreated", &[V::Ref(fv), V::Ref(0)]);
+    let create_args = [inf, V::Ref(container), V::Ref(0)];
+    let performed = vm
+        .call_virtual(frag, "performCreateView", &create_args)
+        .is_ok();
+    let mut fv = match vm.get_object_field(frag, fdesc, "mView") {
+        Some(V::Ref(v)) if v != 0 => v,
+        _ => 0,
+    };
+    if fv == 0 || !performed {
+        if let Ok(Some(V::Ref(direct))) = vm.call_virtual(frag, "onCreateView", &create_args) {
+            fv = direct;
+            set_named_field_all(vm, frag, "mView", "Landroid/view/View;", V::Ref(fv));
         }
+    }
+    if fv != 0 {
+        if pseudo_get(vm, fv, P_PARENT).is_none() {
+            attach_at(vm, container, V::Ref(fv), None, false, None);
+        }
+        let _ = vm.call_virtual(frag, "onViewCreated", &[V::Ref(fv), V::Ref(0)]);
     }
 }
 
