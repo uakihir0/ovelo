@@ -14,6 +14,7 @@ use std::collections::VecDeque;
 
 use ovelo_error::{ErrorCategory, OveloError, Phase, Result};
 use winit::application::ApplicationHandler;
+use winit::dpi::LogicalSize;
 use winit::event::{ElementState, MouseButton, WindowEvent};
 use winit::event_loop::{ActiveEventLoop, EventLoop};
 use winit::window::{Window, WindowId};
@@ -110,7 +111,13 @@ impl ApplicationHandler for HostWindow {
         if self.window.is_some() {
             return;
         }
-        let attrs = Window::default_attributes().with_title(&self.title);
+        let attrs = Window::default_attributes()
+            .with_title(&self.title)
+            // Android applications are overwhelmingly designed around a
+            // portrait phone window. Winit otherwise picks a small
+            // landscape desktop default, which squeezes vertical
+            // RecyclerViews out of existence before apps even run.
+            .with_inner_size(LogicalSize::new(360.0, 640.0));
         let w = Rc::new(el.create_window(attrs).expect("window"));
         self.sb_ctx = Some(softbuffer::Context::new(w.clone()).expect("sb context"));
         self.sb_surf = Some(
