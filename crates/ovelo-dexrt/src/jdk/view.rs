@@ -4699,7 +4699,23 @@ fn apply_ctor_style(vm: &mut Vm, this: u32, args: &[V]) {
         (0x0101_00d8, P_PAD_R, "paddingRight", horizontal),
         (0x0101_00d9, P_PAD_B, "paddingBottom", vertical),
     ] {
-        if pseudo_get(vm, this, key).is_none() && attr_find(vm, this, name).is_none() {
+        let axis = if name == "paddingLeft" || name == "paddingRight" {
+            "paddingHorizontal"
+        } else {
+            "paddingVertical"
+        };
+        let relative = if name == "paddingLeft" {
+            Some("paddingStart")
+        } else if name == "paddingRight" {
+            Some("paddingEnd")
+        } else {
+            None
+        };
+        let xml_has_padding = attr_find(vm, this, name).is_some()
+            || attr_find(vm, this, "padding").is_some()
+            || attr_find(vm, this, axis).is_some()
+            || relative.is_some_and(|rel| attr_find(vm, this, rel).is_some());
+        if pseudo_get(vm, this, key).is_none() && !xml_has_padding {
             let px = ctor_style_value(vm, def_attr, def_res, attr_id)
                 .and_then(|v| lp_px(vm, v))
                 .unwrap_or(fallback);
