@@ -303,8 +303,12 @@ impl Surface {
         let clip = *self.clips.last().unwrap();
         let (dx, dy) = ((x1 - x0) as f32, (y1 - y0) as f32);
         let len2 = dx * dx + dy * dy;
-        for y in clip.y..clip.y1 {
-            for x in clip.x..clip.x1 {
+        let minx = ((x0.min(x1) as f32 - half).floor() as i32).max(clip.x);
+        let maxx = ((x0.max(x1) as f32 + half).ceil() as i32).min(clip.x1);
+        let miny = ((y0.min(y1) as f32 - half).floor() as i32).max(clip.y);
+        let maxy = ((y0.max(y1) as f32 + half).ceil() as i32).min(clip.y1);
+        for y in miny..maxy {
+            for x in minx..maxx {
                 let t = if len2 == 0.0 {
                     0.0
                 } else {

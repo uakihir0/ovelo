@@ -41,6 +41,8 @@ const PK_MATSTACK: u32 = 0xFFFD_FF19;
 /// six of nine values: x' = m0·x + m1·y + m2, y' = m3·x + m4·y + m5.
 /// Perspective row stays [0,0,1].
 const PK_M0: u32 = 0xFFFD_FF20;
+/// Dex `Path` subclass → backing host GraphicsPath handle.
+const PK_PATHDATA: u32 = 0xFFFD_FF40;
 
 fn flt(v: V) -> f32 {
     f64v(v) as f32
@@ -236,6 +238,68 @@ fn blend_px(out: &mut [u8], i: usize, argb: i32) {
     out[i + 3] = (a + (out[i + 3] as u32 * ia) / 255) as u8;
 }
 
+fn stroke_seg_dist(px: f32, py: f32, a: (f32, f32), b: (f32, f32)) -> f32 {
+    let vx = b.0 - a.0;
+    let vy = b.1 - a.1;
+    let len2 = vx * vx + vy * vy;
+    if len2 == 0.0 {
+        return ((px - a.0).powi(2) + (py - a.1).powi(2)).sqrt();
+    }
+    let t = (((px - a.0) * vx + (py - a.1) * vy) / len2).clamp(0.0, 1.0);
+    let x = a.0 + vx * t;
+    let y = a.1 + vy * t;
+    ((px - x).powi(2) + (py - y).powi(2)).sqrt()
+}
+
+fn raster_stroke_to_bitmap(
+    vm: &mut Vm,
+    dst_h: u32,
+    contours: &[Vec<(f32, f32)>],
+    paint: PaintState,
+) {
+    let (bw, bh, base) = match vm.heap.get(dst_h) {
+        Some(Obj::Host {
+            state: HostState::Bitmap { w, h, rgba },
+            ..
+        }) => (*w, *h, rgba.clone()),
+        _ => return,
+    };
+    if bw == 0 || bh == 0 {
+        return;
+    }
+    let radius = (paint.stroke_w / 2.0).max(0.5);
+    let mut out = base.as_ref().clone();
+    for pts in contours {
+        for seg in pts.windows(2) {
+            let (a, b) = (seg[0], seg[1]);
+            let minx = ((a.0.min(b.0) - radius).floor() as i32).max(0);
+            let maxx = ((a.0.max(b.0) + radius).ceil() as i32).min(bw as i32 - 1);
+            let miny = ((a.1.min(b.1) - radius).floor() as i32).max(0);
+            let maxy = ((a.1.max(b.1) + radius).ceil() as i32).min(bh as i32 - 1);
+            for yy in miny..=maxy {
+                for xx in minx..=maxx {
+                    let px = xx as f32 + 0.5;
+                    let py = yy as f32 + 0.5;
+                    if stroke_seg_dist(px, py, a, b) <= radius {
+                        blend_px(
+                            &mut out,
+                            ((yy as u32 * bw + xx as u32) * 4) as usize,
+                            paint.draw_argb(),
+                        );
+                    }
+                }
+            }
+        }
+    }
+    if let Some(Obj::Host {
+        state: HostState::Bitmap { rgba: dst, .. },
+        ..
+    }) = vm.heap.get_mut(dst_h)
+    {
+        *dst = std::rc::Rc::new(out);
+    }
+}
+
 fn raster_path_to_bitmap(
     vm: &mut Vm,
     dst_h: u32,
@@ -251,11 +315,17 @@ fn raster_path_to_bitmap(
         }) => (*w, *h, rgba.clone()),
         _ => return,
     };
-    if bw == 0 || bh == 0 || paint.style == 1 {
+    if bw == 0 || bh == 0 {
         return;
     }
     let contours = flatten_path_cmds(cmds, m);
     if contours.is_empty() {
+        return;
+    }
+    if paint.style != 0 {
+        raster_stroke_to_bitmap(vm, dst_h, &contours, paint);
+    }
+    if paint.style == 1 {
         return;
     }
     let even_odd = fill_type % 2 == 1;
@@ -1721,8 +1791,35 @@ fn path_positions(cmds: &[PathCmd]) -> ((f32, f32), (f32, f32)) {
     (cur, start)
 }
 
+fn backing_path_h(vm: &mut Vm, h: u32) -> Option<u32> {
+    if matches!(
+        vm.heap.get(h),
+        Some(Obj::Host {
+            state: HostState::GraphicsPath(_),
+            ..
+        })
+    ) {
+        return Some(h);
+    }
+    if let Some(V::Ref(ph)) = pseudo_get(vm, h, PK_PATHDATA) {
+        if ph != 0 {
+            return Some(ph);
+        }
+    }
+    let V::Ref(ph) = host(
+        vm,
+        "Landroid/graphics/Path;",
+        HostState::GraphicsPath(Vec::new()),
+    ) else {
+        return None;
+    };
+    pseudo_set(vm, h, PK_PATHDATA, V::Ref(ph));
+    Some(ph)
+}
+
 fn with_path<T>(vm: &mut Vm, h: u32, f: impl FnOnce(&mut Vec<PathCmd>) -> T) -> Option<T> {
-    match vm.heap.get_mut(h) {
+    let bh = backing_path_h(vm, h)?;
+    match vm.heap.get_mut(bh) {
         Some(Obj::Host {
             state: HostState::GraphicsPath(cmds),
             ..
@@ -1732,7 +1829,21 @@ fn with_path<T>(vm: &mut Vm, h: u32, f: impl FnOnce(&mut Vec<PathCmd>) -> T) -> 
 }
 
 fn path_clone(vm: &Vm, h: u32) -> Option<(Vec<PathCmd>, i32)> {
-    match vm.heap.get(h) {
+    let bh = if matches!(
+        vm.heap.get(h),
+        Some(Obj::Host {
+            state: HostState::GraphicsPath(_),
+            ..
+        })
+    ) {
+        h
+    } else {
+        match pseudo_get(vm, h, PK_PATHDATA) {
+            Some(V::Ref(ph)) if ph != 0 => ph,
+            _ => return None,
+        }
+    };
+    match vm.heap.get(bh) {
         Some(Obj::Host {
             state: HostState::GraphicsPath(cmds),
             ..
