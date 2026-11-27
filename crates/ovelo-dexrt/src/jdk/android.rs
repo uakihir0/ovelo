@@ -1987,18 +1987,33 @@ fn intent_field_eq(vm: &Vm, a: V, b: V) -> bool {
     }
 }
 
+fn component_class_key(vm: &Vm, v: V) -> Option<String> {
+    let V::Ref(h) = v else { return None };
+    if h == 0 {
+        return None;
+    }
+    let d = pseudo_get(vm, h, P_DATA)
+        .and_then(|v| sv(vm, v))
+        .or_else(|| vm.class_descriptor_of(h))
+        .or_else(|| sv(vm, V::Ref(h)))?;
+    Some(if d.starts_with('L') && d.ends_with(';') {
+        d
+    } else {
+        format!("L{};", d.replace('.', "/"))
+    })
+}
+
 /// The intent identity Android uses for bind/rebind matching: action,
 /// data, type, package and component — not flags or extras.
 fn intents_match(vm: &Vm, a: u32, b: u32) -> bool {
-    [P_ACTION, P_DATA, P_TYPE, P_PACKAGE, P_COMPONENT]
-        .iter()
-        .all(|&k| {
-            intent_field_eq(
-                vm,
-                pseudo_get(vm, a, k).unwrap_or(V::Ref(0)),
-                pseudo_get(vm, b, k).unwrap_or(V::Ref(0)),
-            )
-        })
+    [P_ACTION, P_DATA, P_TYPE, P_PACKAGE].iter().all(|&k| {
+        intent_field_eq(
+            vm,
+            pseudo_get(vm, a, k).unwrap_or(V::Ref(0)),
+            pseudo_get(vm, b, k).unwrap_or(V::Ref(0)),
+        )
+    }) && component_class_key(vm, pseudo_get(vm, a, P_COMPONENT).unwrap_or(V::Ref(0)))
+        == component_class_key(vm, pseudo_get(vm, b, P_COMPONENT).unwrap_or(V::Ref(0)))
 }
 
 fn mime_matches(pattern: &str, actual: &str) -> bool {
