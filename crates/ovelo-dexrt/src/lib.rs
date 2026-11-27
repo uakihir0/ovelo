@@ -3009,6 +3009,11 @@ impl Vm {
         }
     }
 
+    /// Record a click listener on a dex-materialized view.
+    pub fn set_dex_click_listener(&mut self, view: u32, listener: V) {
+        jdk::view::set_click_listener(self, view, listener);
+    }
+
     /// Snapshot one node of the dex view tree for host rendering —
     /// text, colors, layout params, visibility, listener, children.
     pub fn dex_view(&self, h: u32) -> Option<jdk::view::DexViewInfo> {

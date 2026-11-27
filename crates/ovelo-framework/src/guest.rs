@@ -933,7 +933,7 @@ impl GuestUi {
                 cls,
                 "setOnClickListener",
                 "(Landroid/view/View$OnClickListener;)V",
-                |ui, _vm, a| {
+                |ui, vm, a| {
                     let this = ref_arg(a, 0)?;
                     // A null listener clears the click handler; a
                     // const/4'd null can arrive as I32(0).
@@ -943,8 +943,11 @@ impl GuestUi {
                         _ => return Err(crate::err("guest.arg.type")),
                     };
                     let q = ui.clicks.clone();
+                    // Dex-materialized views read the listener from VM
+                    // pseudo state; host widgets additionally queue clicks
+                    // through their host on_click closure.
+                    vm.set_dex_click_listener(this, V::Ref(listener));
                     let Some(rc) = ui.views.get(&this).cloned() else {
-                        // Not a GuestView (dex-inflated) — setters no-op.
                         return Ok(None);
                     };
                     if listener == 0 {

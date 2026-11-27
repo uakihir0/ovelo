@@ -2096,6 +2096,28 @@ pub(crate) fn call(
                 _ => Some(V::I32(1)),
             })
         }
+        "dispatchTouchEvent" => {
+            // A clickable plain View consumes the gesture and performs
+            // the click on ACTION_UP. The previous blanket `true` made
+            // BottomNavigationItemView swallow taps without dispatching
+            // its listener.
+            let action = match args.get(1) {
+                Some(V::Ref(ev)) => match pseudo_get(vm, *ev, P_ME_ACTION) {
+                    Some(v) => i32v(v),
+                    _ => -1,
+                },
+                _ => -1,
+            };
+            match pseudo_get(vm, this, P_LISTENER) {
+                Some(V::Ref(l)) if l != 0 => {
+                    if action == 1 {
+                        let _ = vm.call_virtual(l, "onClick", &[V::Ref(this)]);
+                    }
+                    Some(Some(V::I32(1)))
+                }
+                _ => Some(Some(V::I32(0))),
+            }
+        }
         "setOnClickListener"
         | "setOnLongClickListener"
         | "setOnFocusChangeListener"
@@ -2671,7 +2693,6 @@ pub(crate) fn call(
         | "setAutofillHints"
         | "setScreenReaderFocusable"
         | "dispatchKeyEvent"
-        | "dispatchTouchEvent"
         | "dispatchGenericMotionEvent" => Some(match ret(sig) {
             "V" => None,
             "Z" => Some(V::I32(if name == "setRefreshing" { 0 } else { 1 })),
@@ -5582,10 +5603,8 @@ pub(crate) fn dispatch_touch(
                     vm.dbg_class_of(v)
                 );
             }
-            if vm
-                .call_virtual(v, "dispatchTouchEvent", &[V::Ref(evt)])
-                .is_ok()
-            {
+            let dr = vm.call_virtual(v, "dispatchTouchEvent", &[V::Ref(evt)]);
+            if matches!(dr, Ok(Some(rv)) if i32v(rv) != 0) {
                 return Ok(true);
             }
         }
@@ -5593,16 +5612,24 @@ pub(crate) fn dispatch_touch(
             if dbg {
                 eprintln!("[touchdbg] h{v} dex onTouchEvent {}", vm.dbg_class_of(v));
             }
-            let _ = vm.call_virtual(v, "onTouchEvent", &[V::Ref(evt)]);
-            return Ok(true);
+            if matches!(
+                vm.call_virtual(v, "onTouchEvent", &[V::Ref(evt)]),
+                Ok(Some(rv)) if i32v(rv) != 0
+            ) {
+                return Ok(true);
+            }
         }
         if let Some(V::Ref(l)) = pseudo_get(vm, v, P_TOUCH_L) {
             if l != 0 {
                 if dbg {
                     eprintln!("[touchdbg] h{v} OnTouchListener.onTouch l{l}");
                 }
-                let _ = vm.call_virtual(l, "onTouch", &[V::Ref(v), V::Ref(evt)]);
-                return Ok(true);
+                if matches!(
+                    vm.call_virtual(l, "onTouch", &[V::Ref(v), V::Ref(evt)]),
+                    Ok(Some(rv)) if i32v(rv) != 0
+                ) {
+                    return Ok(true);
+                }
             }
         }
         // AOSP `View.onTouchEvent`: a clickable view consumes the touch
@@ -5662,6 +5689,13 @@ pub(crate) fn dispatch_touch(
     // listener, and no activity hook — the host tree may hold the
     // handler (host-materialized views keep listeners host-side).
     Ok(false)
+}
+
+/// Record a click listener on a dex view when the high-level UI bridge
+/// has no host widget for it. Dispatch/materialization both read this
+/// same pseudo state.
+pub(crate) fn set_click_listener(vm: &mut Vm, view: u32, listener: V) {
+    pseudo_set(vm, view, P_LISTENER, listener);
 }
 
 pub(crate) fn has_input_connection(vm: &Vm, view: u32) -> bool {
