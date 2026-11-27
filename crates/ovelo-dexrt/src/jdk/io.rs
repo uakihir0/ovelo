@@ -4550,6 +4550,16 @@ fn digest_finish(state: &mut DigestState) -> Vec<u8> {
     }
 }
 
+fn array_len(vm: &Vm, array: V) -> usize {
+    let V::Ref(h) = array else {
+        return 0;
+    };
+    match vm.heap.get(h) {
+        Some(Obj::Array { data, .. }) => data.len(),
+        _ => 0,
+    }
+}
+
 fn array_bytes(vm: &Vm, array: V, offset: usize, len: Option<usize>) -> Vec<u8> {
     let V::Ref(h) = array else {
         return Vec::new();
@@ -4568,13 +4578,23 @@ fn key_spec_call(vm: &mut Vm, name: &str, args: &[V]) -> Rt<Option<Option<V>>> {
     Ok(Some(match name {
         "<init>" => {
             let (bytes, algorithm) = if args.len() >= 5 {
+                let array = args.get(1).copied().unwrap_or(V::Ref(0));
+                let offset = i32v(args[2]);
+                let len = i32v(args[3]);
+                let array_len = array_len(vm, array);
+                let start = offset.max(0) as usize;
+                if offset < 0
+                    || len < 0
+                    || start > array_len
+                    || len as usize > array_len.saturating_sub(start)
+                {
+                    return Err(vm.throw_builtin(
+                        "Ljava/lang/IllegalArgumentException;",
+                        "key range outside array",
+                    ));
+                }
                 (
-                    array_bytes(
-                        vm,
-                        args.get(1).copied().unwrap_or(V::Ref(0)),
-                        i32v(args[2]).max(0) as usize,
-                        Some(i32v(args[3]).max(0) as usize),
-                    ),
+                    array_bytes(vm, array, start, Some(len as usize)),
                     args.get(4).and_then(|v| sv(vm, *v)).unwrap_or_default(),
                 )
             } else {
@@ -4659,6 +4679,26 @@ fn mac_compute(algorithm: &str, key: &[u8], data: &[u8]) -> Option<Vec<u8>> {
     }
 }
 
+fn consume_mac_input(vm: &mut Vm, args: &[V], consumed: usize) {
+    if args.len() != 2 {
+        return;
+    }
+    let Some(V::Ref(h)) = args.get(1).copied() else {
+        return;
+    };
+    let is_buffer = matches!(
+        vm.heap.get(h),
+        Some(Obj::Host {
+            state: HostState::Slot(V::Ref(_)),
+            ..
+        })
+    );
+    if is_buffer {
+        let (_, pos) = bb_bytes(vm, h);
+        pseudo_set(vm, h, P_BBUF_POS, V::I32((pos + consumed) as i32));
+    }
+}
+
 fn mac_input_bytes(vm: &Vm, args: &[V]) -> Vec<u8> {
     match args.len() {
         2 => match args.get(1).copied().unwrap_or(V::I32(0)) {
@@ -4729,6 +4769,7 @@ fn mac_call(vm: &mut Vm, name: &str, args: &[V]) -> Rt<Option<Option<V>>> {
         }
         "update" => {
             let bytes = mac_input_bytes(vm, args);
+            consume_mac_input(vm, args, bytes.len());
             if let Some(V::Ref(h)) = args.first() {
                 if let Some(Obj::Host {
                     state: HostState::Mac { data, .. },
@@ -4742,8 +4783,32 @@ fn mac_call(vm: &mut Vm, name: &str, args: &[V]) -> Rt<Option<Option<V>>> {
         }
         "doFinal" => {
             let output_target = args.len() == 3;
+            if output_target {
+                let required = match args.first() {
+                    Some(V::Ref(h)) => match vm.heap.get(*h) {
+                        Some(Obj::Host {
+                            state: HostState::Mac { algorithm, .. },
+                            ..
+                        }) => mac_output_len(algorithm),
+                        _ => 0,
+                    },
+                    _ => 0,
+                };
+                let offset = i32v(args[2]);
+                let capacity = array_len(vm, args[1]);
+                if offset < 0
+                    || offset as usize > capacity
+                    || required > capacity.saturating_sub(offset as usize)
+                {
+                    return Err(vm.throw_builtin(
+                        "Ljavax/crypto/ShortBufferException;",
+                        "output buffer too small",
+                    ));
+                }
+            }
             if args.len() == 2 {
                 let bytes = mac_input_bytes(vm, args);
+                consume_mac_input(vm, args, bytes.len());
                 if let Some(V::Ref(h)) = args.first() {
                     if let Some(Obj::Host {
                         state: HostState::Mac { data, .. },
