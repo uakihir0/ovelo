@@ -1869,6 +1869,12 @@ pub fn drive_dex_layout_pass(vm: &mut Vm, activity: u32, frame: u32, win_w: i32,
                 eprintln!("[viewdbg] recycler {h} fields: {fields:?}");
             }
         }
+        // Android's View.draw pipeline calls computeScroll() while a
+        // Scroller is active. The host renderer snapshots dex state
+        // without executing View.draw, so drive the override at layout
+        // boundaries instead; otherwise ViewPager smooth-scrolls start a
+        // Scroller whose curr position never advances.
+        ovelo_dexrt::drive_compute_scroll(vm, h);
         // Re-snapshot: the layout pass may have attached children.
         let kids = vm.dex_view(h).map(|i| i.children).unwrap_or_default();
         for ch in kids {

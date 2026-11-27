@@ -228,10 +228,14 @@ impl Drawable for ViewGroup {
                 }
                 c.save();
                 c.clip_rect(Rect::new(self.view.left, self.view.top, s.w, s.h));
+                c.translate(-self.scroll_x, -self.scroll_y);
                 let (cl, ct) = ch.origin();
                 let cs = ch.measured();
+                // Child bounds scroll with the child content. Clipping
+                // before applying that translation keeps the clip in the
+                // unscrolled coordinate space and makes a fully scrolled
+                // page intersect nothing.
                 c.clip_rect(Rect::new(cl, ct, cs.w, cs.h));
-                c.translate(-self.scroll_x, -self.scroll_y);
                 ch.draw(c);
                 c.restore();
             } else {

@@ -785,6 +785,21 @@ pub(crate) fn clear_layout_requested(vm: &mut Vm, h: u32) {
     pseudo_set(vm, h, P_LAYOUT_REQ, V::I32(0));
 }
 
+/// Drive a dex `computeScroll` override at host traversal boundaries.
+/// Android reaches this through `View.draw`; the host renderer snapshots
+/// dex state without executing that pipeline, so scrolling containers
+/// otherwise start a Scroller whose position never advances.
+pub fn drive_compute_scroll(vm: &mut Vm, h: u32) {
+    if !vm.has_dex_virtual(h, "computeScroll", &[]) {
+        return;
+    }
+    if let Err(e) = vm.call_virtual(h, "computeScroll", &[]) {
+        if crate::dbg_flag("OVELO_VIEWDBG") {
+            eprintln!("[viewdbg] computeScroll h{h} err {e}");
+        }
+    }
+}
+
 /// Mark a view and its ancestors as layout-requested, matching
 /// `View.requestLayout`'s upward propagation through the parent chain.
 pub fn mark_layout_requested(vm: &mut Vm, h: u32) {
@@ -823,6 +838,12 @@ pub(crate) fn frame_set(vm: &mut Vm, h: u32, l: i32, t: i32, r: i32, b: i32) -> 
         || pint(vm, h, P_BOTTOM) != b
         || pseudo_get(vm, h, P_RIGHT).is_none();
     if changed {
+        if crate::dbg_flag("OVELO_FRAMEDBG") {
+            eprintln!(
+                "[framedbg] h{h} {} {l},{t},{r},{b}",
+                class_of(vm, V::Ref(h))
+            );
+        }
         pseudo_set(vm, h, P_LEFT, V::I32(l));
         pseudo_set(vm, h, P_TOP, V::I32(t));
         pseudo_set(vm, h, P_RIGHT, V::I32(r));
