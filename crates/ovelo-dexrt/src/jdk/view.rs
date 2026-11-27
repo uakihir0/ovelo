@@ -4090,8 +4090,8 @@ fn measure_child(
 }
 
 fn view_is_gone(vm: &mut Vm, h: u32) -> bool {
-    if pint(vm, h, P_VIS) == 2 {
-        return true;
+    if let Some(v) = pseudo_get(vm, h, P_VIS) {
+        return matches!(v, V::I32(8) | V::I32(2));
     }
     matches!(attr_find(vm, h, "visibility"), Some(V::I32(2)))
 }
@@ -4479,7 +4479,7 @@ fn group_measure_fallback(vm: &mut Vm, this: u32, pw: i32, ph: i32) {
                     let V::Ref(ch) = c else {
                         return (nm, mm);
                     };
-                    if ch == 0 {
+                    if ch == 0 || view_is_gone(vm, ch) {
                         return (nm, mm);
                     }
                     let lp_obj = match pseudo_get(vm, ch, P_LP) {
@@ -4514,7 +4514,7 @@ fn group_measure_fallback(vm: &mut Vm, this: u32, pw: i32, ph: i32) {
                     let V::Ref(ch) = c else {
                         return (nm, mm);
                     };
-                    if ch == 0 {
+                    if ch == 0 || view_is_gone(vm, ch) {
                         return (nm, mm);
                     }
                     let lp_obj = match pseudo_get(vm, ch, P_LP) {
@@ -4543,7 +4543,7 @@ fn group_measure_fallback(vm: &mut Vm, this: u32, pw: i32, ph: i32) {
             let match_w = (cw_in - nonmatch_w - match_margins_w).max(0);
             for c in kids.iter().copied() {
                 let V::Ref(ch) = c else { continue };
-                if ch == 0 {
+                if ch == 0 || view_is_gone(vm, ch) {
                     continue;
                 }
                 let lp_obj = match pseudo_get(vm, ch, P_LP) {
@@ -4730,7 +4730,7 @@ fn relative_positions(vm: &mut Vm, this: u32, w: i32, h: i32) -> Vec<RelKid> {
     let kids: Vec<u32> = children(vm, this)
         .into_iter()
         .filter_map(|v| match v {
-            V::Ref(h) if h != 0 => Some(h),
+            V::Ref(h) if h != 0 && !view_is_gone(vm, h) => Some(h),
             _ => None,
         })
         .collect();
