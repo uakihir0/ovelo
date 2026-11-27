@@ -3531,10 +3531,12 @@ fn context_call(
                     }
                     cn
                 };
-                vm.service_bindings.insert(conn, sh);
-                *vm.service_bind_counts.entry(sh).or_insert(0) += 1;
-                let bind_intent = clone_intent(vm, ih);
-                vm.service_bind_intents.insert(conn, bind_intent);
+                if !vm.service_bindings.contains_key(&conn) {
+                    vm.service_bindings.insert(conn, sh);
+                    *vm.service_bind_counts.entry(sh).or_insert(0) += 1;
+                    let bind_intent = clone_intent(vm, ih);
+                    vm.service_bind_intents.insert(conn, bind_intent);
+                }
                 let connected = if binder == V::Ref(0) {
                     vm.call_virtual(conn, "onNullBinding", &[component])
                 } else {
