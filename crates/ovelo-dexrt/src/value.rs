@@ -115,6 +115,13 @@ pub enum HostState {
     Millis(i64),
     /// One mutable slot (`Atomic*` holders, boxed primitives).
     Slot(V),
+    /// A `java.util.UUID` as most/least significant bits.
+    Uuid {
+        /// Most significant 64 bits.
+        msb: i64,
+        /// Least significant 64 bits.
+        lsb: i64,
+    },
     /// A filesystem path (`java.io.File`).
     Path(String),
     /// A streaming `java.security.MessageDigest`.

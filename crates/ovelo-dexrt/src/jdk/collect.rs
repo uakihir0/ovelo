@@ -3028,25 +3028,166 @@ fn random_call(vm: &mut Vm, name: &str, args: &[V], secure: bool) -> Option<Opti
     }))
 }
 
+fn uuid_bits(vm: &Vm, h: u32) -> Option<(i64, i64)> {
+    match vm.heap.get(h) {
+        Some(Obj::Host {
+            state: HostState::Uuid { msb, lsb },
+            ..
+        }) => Some((*msb, *lsb)),
+        _ => None,
+    }
+}
+
+fn uuid_text(msb: i64, lsb: i64) -> String {
+    let hex = format!("{:016x}{:016x}", msb as u64, lsb as u64);
+    format!(
+        "{}-{}-{}-{}-{}",
+        &hex[..8],
+        &hex[8..12],
+        &hex[12..16],
+        &hex[16..20],
+        &hex[20..]
+    )
+}
+
+fn parse_uuid_text(text: &str) -> Option<(i64, i64)> {
+    let hex: String = text.chars().filter(|c| *c != '-').collect();
+    if hex.len() != 32 || !hex.chars().all(|c| c.is_ascii_hexdigit()) {
+        return None;
+    }
+    let msb = u64::from_str_radix(&hex[..16], 16).ok()? as i64;
+    let lsb = u64::from_str_radix(&hex[16..], 16).ok()? as i64;
+    Some((msb, lsb))
+}
+
+fn uuid_from_bytes(mut bytes: [u8; 16]) -> (i64, i64) {
+    bytes[6] = (bytes[6] & 0x0f) | 0x40;
+    bytes[8] = (bytes[8] & 0x3f) | 0x80;
+    let msb = i64::from_be_bytes(bytes[..8].try_into().unwrap_or([0; 8]));
+    let lsb = i64::from_be_bytes(bytes[8..].try_into().unwrap_or([0; 8]));
+    (msb, lsb)
+}
+
+fn random_uuid_bits() -> (i64, i64) {
+    use std::io::Read;
+    let mut bytes = [0u8; 16];
+    if std::fs::File::open("/dev/urandom")
+        .and_then(|mut f| f.read_exact(&mut bytes))
+        .is_err()
+    {
+        let seed = now_ms() as u64;
+        bytes[..8].copy_from_slice(&seed.to_be_bytes());
+        bytes[8..].copy_from_slice(&seed.rotate_left(23).to_be_bytes());
+    }
+    uuid_from_bytes(bytes)
+}
+
+fn uuid_obj(vm: &mut Vm, msb: i64, lsb: i64) -> V {
+    host(vm, "Ljava/util/UUID;", HostState::Uuid { msb, lsb })
+}
+
 fn uuid_call(vm: &mut Vm, name: &str, args: &[V]) -> Option<Option<V>> {
     match name {
-        "randomUUID" => Some(Some(host(
-            vm,
-            "Ljava/util/UUID;",
-            HostState::Slot(V::I64(now_ms())),
-        ))),
-        "toString" => Some(Some(jstr(
-            vm,
-            &format!("{:08x}-0000-4000-8000-000000000000", now_ms() & 0xffffffff),
-        ))),
-        "nameUUIDFromBytes" => Some(Some(host(vm, "Ljava/util/UUID;", HostState::Slot(args[0])))),
-        "fromString" => Some(Some(host(
-            vm,
-            "Ljava/util/UUID;",
-            HostState::Slot(V::I64(0)),
-        ))),
-        "getMostSignificantBits" | "getLeastSignificantBits" => Some(Some(V::I64(0))),
-        "version" | "variant" | "timestamp" | "clockSequence" | "node" => Some(Some(V::I64(0))),
+        "<init>" => {
+            if let (Some(V::Ref(h)), Some(msb), Some(lsb)) =
+                (args.first(), args.get(1), args.get(2))
+            {
+                let bits = (i64v(*msb), i64v(*lsb));
+                if let Some(Obj::Host { state, .. }) = vm.heap.get_mut(*h) {
+                    *state = HostState::Uuid {
+                        msb: bits.0,
+                        lsb: bits.1,
+                    };
+                }
+            }
+            Some(None)
+        }
+        "randomUUID" => {
+            let (msb, lsb) = random_uuid_bits();
+            Some(Some(uuid_obj(vm, msb, lsb)))
+        }
+        "fromString" => {
+            let text = args.get(1).and_then(|v| sv(vm, *v)).unwrap_or_default();
+            let (msb, lsb) = parse_uuid_text(&text).unwrap_or((0, 0));
+            Some(Some(uuid_obj(vm, msb, lsb)))
+        }
+        "nameUUIDFromBytes" => {
+            let mut bytes = [0u8; 16];
+            if let Some(V::Ref(h)) = args.get(1) {
+                if let Some(Obj::Array { data, .. }) = vm.heap.get(*h) {
+                    for (i, v) in data.iter().take(16).enumerate() {
+                        bytes[i] = i32v(*v) as u8;
+                    }
+                }
+            }
+            let (msb, lsb) = uuid_from_bytes(bytes);
+            Some(Some(uuid_obj(vm, msb, lsb)))
+        }
+        "toString" => {
+            let text = match args.first() {
+                Some(V::Ref(h)) => uuid_bits(vm, *h)
+                    .map(|(msb, lsb)| uuid_text(msb, lsb))
+                    .unwrap_or_else(|| uuid_text(0, 0)),
+                _ => uuid_text(0, 0),
+            };
+            Some(Some(jstr(vm, &text)))
+        }
+        "getMostSignificantBits" => Some(Some(V::I64(match args.first() {
+            Some(V::Ref(h)) => uuid_bits(vm, *h).map(|v| v.0).unwrap_or(0),
+            _ => 0,
+        }))),
+        "getLeastSignificantBits" => Some(Some(V::I64(match args.first() {
+            Some(V::Ref(h)) => uuid_bits(vm, *h).map(|v| v.1).unwrap_or(0),
+            _ => 0,
+        }))),
+        "equals" => {
+            let eq = match (args.first(), args.get(1)) {
+                (Some(V::Ref(a)), Some(V::Ref(b))) => {
+                    match (uuid_bits(vm, *a), uuid_bits(vm, *b)) {
+                        (Some(x), Some(y)) => x == y,
+                        _ => false,
+                    }
+                }
+                _ => false,
+            };
+            Some(Some(V::I32(eq as i32)))
+        }
+        "hashCode" => {
+            let hash = match args.first() {
+                Some(V::Ref(h)) => uuid_bits(vm, *h)
+                    .map(|(msb, lsb)| {
+                        ((msb >> 32) as i32) ^ (msb as i32) ^ ((lsb >> 32) as i32) ^ (lsb as i32)
+                    })
+                    .unwrap_or(0),
+                _ => 0,
+            };
+            Some(Some(V::I32(hash)))
+        }
+        "compareTo" => {
+            let cmp = match (args.first(), args.get(1)) {
+                (Some(V::Ref(a)), Some(V::Ref(b))) => {
+                    match (uuid_bits(vm, *a), uuid_bits(vm, *b)) {
+                        (Some(x), Some(y)) => x.cmp(&y) as i32,
+                        _ => 0,
+                    }
+                }
+                _ => 0,
+            };
+            Some(Some(V::I32(cmp)))
+        }
+        "version" => Some(Some(V::I64(match args.first() {
+            Some(V::Ref(h)) => uuid_bits(vm, *h)
+                .map(|(msb, _)| (msb >> 12) & 0xf)
+                .unwrap_or(0),
+            _ => 0,
+        }))),
+        "variant" => Some(Some(V::I64(match args.first() {
+            Some(V::Ref(h)) => uuid_bits(vm, *h)
+                .map(|(_, lsb)| ((lsb as u64) >> 62) as i64)
+                .unwrap_or(0),
+            _ => 0,
+        }))),
+        "timestamp" | "clockSequence" | "node" => Some(Some(V::I64(0))),
         _ => None,
     }
 }
