@@ -4550,11 +4550,23 @@ fn attrset_value(vm: &mut Vm, set: V, name: &str) -> Option<V> {
 
 /// `LinearLayout` orientation: `setOrientation` wins, else the
 /// `android:orientation` attr (0=horizontal, 1=vertical); the AOSP
-/// documented default is horizontal — except `TableLayout`, whose
-/// constructor forces VERTICAL, and `TableRow`, forced HORIZONTAL.
+/// documented default is horizontal — except `TableLayout` and
+/// `RadioGroup`, whose constructors force VERTICAL, and `TableRow`,
+/// forced HORIZONTAL.
 fn linear_vertical(vm: &Vm, this: u32) -> bool {
     if let Some(V::I32(o)) = pseudo_get(vm, this, P_ORIENTATION) {
         return o != 0;
+    }
+    // XML orientation overrides the constructor default. RadioGroup's
+    // constructor always starts VERTICAL; its zero-initialized host/dex
+    // field must not erase that default when the constructor body is not
+    // executed through the host shim.
+    if let Some(v) = attr_find(vm, this, "orientation") {
+        return i32v(v) != 0;
+    }
+    let desc = class_of(vm, V::Ref(this));
+    if desc.contains("RadioGroup") {
+        return true;
     }
     // AndroidX LinearLayoutCompat implements orientation dex-side, so
     // the host setter never sees constructor-driven VERTICAL. Read the
@@ -4567,15 +4579,7 @@ fn linear_vertical(vm: &Vm, this: u32) -> bool {
             return o != 0;
         }
     }
-    let dflt = vm
-        .heap
-        .class_of(this)
-        .and_then(|ci| vm.type_desc_of(ci).ok())
-        .map(|d| d.contains("TableLayout"))
-        .unwrap_or(false);
-    attr_find(vm, this, "orientation")
-        .map(|v| i32v(v) != 0)
-        .unwrap_or(dflt)
+    desc.contains("TableLayout")
 }
 
 /// `getMinimum*`/`getSuggestedMinimum*`: explicit `setMinimum*` wins,
