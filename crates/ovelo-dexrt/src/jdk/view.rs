@@ -6185,6 +6185,14 @@ fn build_tree(vm: &mut Vm, elems: &[Element], ctx: V) -> V {
                     eprintln!("[viewdbg] attach h{h} -> parent h{p}");
                 }
                 attach(vm, p, V::Ref(h));
+                if pint(vm, h, P_CHECKED) != 0 {
+                    let cls = class_of(vm, V::Ref(p));
+                    if cls == "Landroid/widget/RadioGroup;"
+                        || vm.assignable_desc(&cls, "Landroid/widget/RadioGroup;")
+                    {
+                        pseudo_set(vm, p, P_RADIO_CHECKED, V::I32(view_id(vm, h)));
+                    }
+                }
                 // A parent with XML children is a container.
                 pseudo_set(vm, p, P_IS_GROUP, V::I32(1));
             }
