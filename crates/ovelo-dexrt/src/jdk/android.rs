@@ -4031,6 +4031,22 @@ fn resources_call(vm: &mut Vm, name: &str, args: &[V]) -> Rt<Option<Option<V>>> 
                     if let Some(ev) = vm.apk_res.as_ref().and_then(|r| r.entry_value(id)) {
                         let ev = ev.clone();
                         fill_typed_value_ev(vm, tv, &ev, id);
+                    } else if let Some(color) = crate::res::framework_color(id) {
+                        // android.R.color entries live in the framework
+                        // table, not the APK arsc. ResourcesCompat still
+                        // expects getValue to report them as colors; an
+                        // unfilled TypedValue makes it parse the id as XML
+                        // and eventually return no ColorStateList.
+                        fill_typed_value_ev(
+                            vm,
+                            tv,
+                            &ovelo_apk::arsc::EntryValue {
+                                data_type: 0x1c,
+                                data: color,
+                                string: None,
+                            },
+                            id,
+                        );
                     }
                 }
                 Some(None)
