@@ -581,6 +581,15 @@ pub(crate) fn call(
                 }
                 Some(Some(v))
             }
+            "addListener" => {
+                // The inline submit future is already complete, so its
+                // listener can run immediately. Dropping it breaks media3's
+                // Futures.transform chain that resolves media ids to URIs.
+                if let V::Ref(r) = args.get(1).copied().unwrap_or(V::Ref(0)) {
+                    let _ = vm.call_virtual_rt(r, "run", &[]);
+                }
+                Some(None)
+            }
             "get" | "call" => {
                 if name == "get" {
                     let sv = match args.first().copied().unwrap_or(V::Ref(0)) {
