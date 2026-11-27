@@ -5059,7 +5059,9 @@ fn group_measure_fallback(vm: &mut Vm, this: u32, pw: i32, ph: i32) {
     // LinearLayout` stacks vertically even when its name doesn't say
     // so (matches the layout-side check below).
     let desc = class_of(vm, V::Ref(this));
-    let linear = desc.contains("LinearLayout") || vm.extends_named(&desc, "LinearLayout");
+    let linear = desc.contains("LinearLayout")
+        || desc.contains("RadioGroup")
+        || vm.extends_named(&desc, "LinearLayout");
     let linear_v = linear && linear_vertical(vm, this);
     let linear_h = linear && !linear_v;
     let relative = !linear && vm.extends_named(&desc, "RelativeLayout");
@@ -5509,7 +5511,9 @@ fn group_layout_fallback(vm: &mut Vm, this: u32, _l: i32, _t: i32, r: i32, b: i3
     )
     .unwrap_or(0);
     let desc = class_of(vm, V::Ref(this));
-    let linear = desc.contains("LinearLayout") || vm.extends_named(&desc, "LinearLayout");
+    let linear = desc.contains("LinearLayout")
+        || desc.contains("RadioGroup")
+        || vm.extends_named(&desc, "LinearLayout");
     let linear_h = linear && !linear_vertical(vm, this);
     if !linear && vm.extends_named(&desc, "RelativeLayout") {
         relative_layout_fallback(vm, this, r - _l, b - _t);
