@@ -8336,7 +8336,7 @@ fn layout_dialog_buttons(vm: &mut Vm, root: u32, width: i32, height: i32) {
         return;
     }
     if let Some(V::Ref(content)) = pseudo_get(vm, root, P_DIALOG_CONTENT) {
-        if content != 0 {
+        if content != 0 && content != root {
             let content_h = (height - 52).max(0);
             let spec = 0x4000_0000i32 | content_h;
             let spec_w = 0x4000_0000i32 | width;
