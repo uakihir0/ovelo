@@ -1270,6 +1270,13 @@ fn pop_finished_activity(vm: &mut ovelo_dexrt::Vm, this: &mut u32) -> bool {
             }
             let resume = ["onStart".to_string(), "onResume".to_string()];
             run_activity_cbs(vm, prev, &resume);
+            // Result callbacks often mutate adapter data without the
+            // dex RecyclerView's requestLayout reaching the host root.
+            // Resuming an activity is exactly the point where those
+            // mutations become visible, so force one fresh layout pass.
+            if let Some(root) = vm.activity_content(prev) {
+                ovelo_dexrt::mark_layout_requested(vm, root);
+            }
             vm.retire_activity(finished);
             return true;
         }
