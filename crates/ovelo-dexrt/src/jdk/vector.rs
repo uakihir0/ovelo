@@ -376,8 +376,30 @@ fn render_layer_list(rv: RCtx<'_>, res_id: u32) -> Option<(u32, u32, Rc<Vec<u8>>
     if !els.iter().any(|e| e.depth == 0 && e.name == "layer-list") {
         return None;
     }
-    const SZ: usize = 96;
-    let mut canvas = vec![0u8; SZ * SZ * 4];
+    // A layer-list's intrinsic extent is the largest child extent plus
+    // that item's insets. A fixed 96px canvas discarded layers whose
+    // theme-resolved margins alone reached 96px even though the child
+    // remained visible in a correctly sized drawable.
+    let (mut cw, mut ch) = (96usize, 96usize);
+    for item in els.iter().filter(|e| e.depth == 1 && e.name == "item") {
+        let l = xml_dimen_attr(rv, item, "left").unwrap_or(0.0).max(0.0) as usize;
+        let t = xml_dimen_attr(rv, item, "top").unwrap_or(0.0).max(0.0) as usize;
+        let r = xml_dimen_attr(rv, item, "right").unwrap_or(0.0).max(0.0) as usize;
+        let b = xml_dimen_attr(rv, item, "bottom").unwrap_or(0.0).max(0.0) as usize;
+        if let Some(Value::Reference(child)) = item.android("drawable") {
+            if let Some((w, h, _)) = drawable_bitmap(
+                RCtx {
+                    depth: rv.depth + 1,
+                    ..rv
+                },
+                *child,
+            ) {
+                cw = cw.max(l + w as usize + r).min(1024);
+                ch = ch.max(t + h as usize + b).min(1024);
+            }
+        }
+    }
+    let mut canvas = vec![0u8; cw * ch * 4];
     let mut any = false;
     for (i, item) in els.iter().enumerate() {
         if item.depth != 1 || item.name != "item" {
@@ -404,10 +426,10 @@ fn render_layer_list(rv: RCtx<'_>, res_id: u32) -> Option<(u32, u32, Rc<Vec<u8>>
             .unwrap_or(0.0)
             .round()
             .max(0.0) as usize;
-        if l >= SZ || t >= SZ || l + r >= SZ || t + b >= SZ {
+        if l >= cw || t >= ch || l + r >= cw || t + b >= ch {
             continue;
         }
-        let (x0, y0, tw, th) = (l, t, SZ - l - r, SZ - t - b);
+        let (x0, y0, tw, th) = (l, t, cw - l - r, ch - t - b);
         if let Some(Value::Reference(child)) = item.android("drawable") {
             if let Some((w, h, px)) = drawable_bitmap(
                 RCtx {
@@ -416,12 +438,12 @@ fn render_layer_list(rv: RCtx<'_>, res_id: u32) -> Option<(u32, u32, Rc<Vec<u8>>
                 },
                 *child,
             ) {
-                blit_scaled(&mut canvas, SZ, &px, w as usize, h as usize, x0, y0, tw, th);
+                blit_scaled(&mut canvas, cw, &px, w as usize, h as usize, x0, y0, tw, th);
                 any = true;
             } else if let Some(argb) = resolve_ref_color(rv, *child) {
                 for y in y0..y0 + th {
                     for x in x0..x0 + tw {
-                        blend_px(&mut canvas, x, y, SZ, argb);
+                        blend_px(&mut canvas, x, y, cw, argb);
                     }
                 }
                 any = true;
@@ -447,13 +469,13 @@ fn render_layer_list(rv: RCtx<'_>, res_id: u32) -> Option<(u32, u32, Rc<Vec<u8>>
                     rx > 0.0 && ry > 0.0 && (nx * nx) / (rx * rx) + (ny * ny) / (ry * ry) <= 1.0
                 };
                 if inside {
-                    blend_px(&mut canvas, x, y, SZ, argb);
+                    blend_px(&mut canvas, x, y, cw, argb);
                 }
             }
         }
         any = true;
     }
-    any.then_some((SZ as u32, SZ as u32, Rc::new(canvas)))
+    any.then_some((cw as u32, ch as u32, Rc::new(canvas)))
 }
 
 fn root_is(rv: RCtx<'_>, res_id: u32, name: &str) -> bool {
