@@ -1356,6 +1356,55 @@ fn list_call(vm: &mut Vm, name: &str, sig: &str, args: &[V]) -> Rt<Option<Option
 // ---------------------------------------------------------------------
 // Map (covers Bundle/ContentValues keyed ops too)
 
+fn parse_properties_line(line: &str) -> Option<(String, String)> {
+    let chars: Vec<char> = line.chars().collect();
+    let mut i = 0usize;
+    while i < chars.len() && chars[i].is_whitespace() {
+        i += 1;
+    }
+    if i >= chars.len() || chars[i] == '#' || chars[i] == '!' {
+        return None;
+    }
+    let mut key = String::new();
+    let mut escaped = false;
+    while i < chars.len() {
+        let c = chars[i];
+        if escaped {
+            key.push(match c {
+                't' => '\t',
+                'n' => '\n',
+                'r' => '\r',
+                'f' => '\x0c',
+                other => other,
+            });
+            escaped = false;
+            i += 1;
+            continue;
+        }
+        if c == '\\' {
+            escaped = true;
+            i += 1;
+            continue;
+        }
+        if c == '=' || c == ':' || c.is_whitespace() {
+            break;
+        }
+        key.push(c);
+        i += 1;
+    }
+    while i < chars.len() && chars[i].is_whitespace() {
+        i += 1;
+    }
+    if i < chars.len() && (chars[i] == '=' || chars[i] == ':') {
+        i += 1;
+        while i < chars.len() && chars[i].is_whitespace() {
+            i += 1;
+        }
+    }
+    let value: String = chars[i..].iter().collect();
+    Some((key, value.trim_end().to_string()))
+}
+
 fn map_call(vm: &mut Vm, name: &str, sig: &str, args: &[V]) -> Rt<Option<Option<V>>> {
     let V::Ref(h) = args.first().copied().unwrap_or(V::Ref(0)) else {
         return Ok(None);
@@ -1381,21 +1430,14 @@ fn map_call(vm: &mut Vm, name: &str, sig: &str, args: &[V]) -> Rt<Option<Option<
                 },
                 _ => Vec::new(),
             };
-            let text = String::from_utf8_lossy(&bytes).into_owned();
+            // Properties.load(InputStream) is ISO-8859-1, not UTF-8.
+            let text: String = bytes.iter().map(|b| *b as char).collect();
             for line in text.split('\n') {
-                let line = line.trim_end_matches('\r').trim();
-                if line.is_empty() || line.starts_with('#') || line.starts_with('!') {
-                    continue;
+                let line = line.trim_end_matches('\r');
+                if let Some((k, v)) = parse_properties_line(line) {
+                    let (k, v) = (jstr(vm, &k), jstr(vm, &v));
+                    map_put(vm, h, k, v);
                 }
-                let cut = line
-                    .find(['=', ':'])
-                    .or_else(|| line.find(char::is_whitespace));
-                let (k, v) = match cut {
-                    Some(i) => (line[..i].trim(), line[i + 1..].trim()),
-                    None => (line, ""),
-                };
-                let (k, v) = (jstr(vm, k), jstr(vm, v));
-                map_put(vm, h, k, v);
             }
             Some(None)
         }
