@@ -205,13 +205,14 @@ impl Drawable for ViewGroup {
         // with clipChildren=false (overflowing menus, FABs, …).
         for ch in &mut self.children {
             if self.clip_children {
-                let (cl, ct) = ch.origin();
-                let cs = ch.measured();
                 if dbg_flag("OVELO_CLIPDBG") {
-                    eprintln!("[clipdbg] kid clip {cl},{ct} {cs:?}");
+                    eprintln!(
+                        "[clipdbg] parent clip {},{} {s:?}",
+                        self.view.left, self.view.top
+                    );
                 }
                 c.save();
-                c.clip_rect(Rect::new(cl, ct, cs.w, cs.h));
+                c.clip_rect(Rect::new(self.view.left, self.view.top, s.w, s.h));
                 ch.draw(c);
                 c.restore();
             } else {
