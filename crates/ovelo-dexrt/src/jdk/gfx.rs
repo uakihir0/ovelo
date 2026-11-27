@@ -296,7 +296,8 @@ fn raster_stroke_to_bitmap(
     if bw == 0 || bh == 0 {
         return;
     }
-    let radius = (paint.stroke_w / 2.0).max(0.5);
+    let hairline = paint.stroke_w == 0.0;
+    let radius = if hairline { 0.5 } else { paint.stroke_w / 2.0 };
     let scan_scale = mat_max_scale(inverse_m);
     let mut out = base.as_ref().clone();
     let mut covered = vec![false; (bw * bh) as usize];
@@ -304,7 +305,11 @@ fn raster_stroke_to_bitmap(
         for (src_seg, dst_seg) in src_pts.windows(2).zip(dst_pts.windows(2)) {
             let (sa, sb) = (src_seg[0], src_seg[1]);
             let (da, db) = (dst_seg[0], dst_seg[1]);
-            let scan_radius = radius * scan_scale;
+            let scan_radius = if hairline {
+                radius
+            } else {
+                radius * scan_scale
+            };
             let minx = ((da.0.min(db.0) - scan_radius).floor() as i32).max(0);
             let maxx = ((da.0.max(db.0) + scan_radius).ceil() as i32).min(bw as i32 - 1);
             let miny = ((da.1.min(db.1) - scan_radius).floor() as i32).max(0);
@@ -313,9 +318,14 @@ fn raster_stroke_to_bitmap(
                 for xx in minx..=maxx {
                     let px = xx as f32 + 0.5;
                     let py = yy as f32 + 0.5;
-                    let (sx, sy) = inv_mat_point(inverse_m, px, py);
+                    let inside = if hairline {
+                        stroke_seg_dist(px, py, da, db) <= radius
+                    } else {
+                        let (sx, sy) = inv_mat_point(inverse_m, px, py);
+                        stroke_seg_dist(sx, sy, sa, sb) <= radius
+                    };
                     let pi = (yy as u32 * bw + xx as u32) as usize;
-                    if !covered[pi] && stroke_seg_dist(sx, sy, sa, sb) <= radius {
+                    if !covered[pi] && inside {
                         covered[pi] = true;
                         blend_px(&mut out, pi * 4, paint.draw_argb());
                     }
