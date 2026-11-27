@@ -540,6 +540,28 @@ pub(crate) fn call(
                 // queue as execute. The wrapper completes the returned future
                 // when the worker drain reaches it.
                 if let (V::Ref(ex), V::Ref(task)) = (args[0], args[1]) {
+                    // AbstractExecutorService.submit is defined in terms of
+                    // virtual newTaskFor/execute. Dex subclasses such as
+                    // Guava's listening decorator override those methods and
+                    // require the returned RunnableFuture to implement their
+                    // ListenableFuture interface; a host Future cannot pass
+                    // that check-cast. Preserve the virtual dispatch for dex
+                    // executor instances, falling back to the host future for
+                    // plain executor host objects.
+                    if matches!(vm.heap.get(ex), Some(Obj::Instance { .. })) {
+                        let callable = sig.contains("Callable");
+                        let nt_args: Vec<V> = if callable {
+                            vec![V::Ref(task)]
+                        } else {
+                            vec![V::Ref(task), args.get(2).copied().unwrap_or(V::Ref(0))]
+                        };
+                        if let Some(future @ V::Ref(_)) =
+                            vm.call_virtual_rt(ex, "newTaskFor", &nt_args)?
+                        {
+                            vm.call_virtual_rt(ex, "execute", &[future])?;
+                            return Ok(Some(Some(future)));
+                        }
+                    }
                     let future_v = host(
                         vm,
                         "Ljava/util/concurrent/Future;",
