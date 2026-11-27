@@ -8113,7 +8113,7 @@ fn find_toolbar(vm: &Vm, h: u32, depth: usize) -> Option<u32> {
         return None;
     }
     let desc = class_of(vm, V::Ref(h));
-    if desc.contains("Toolbar") || vm.extends_named(&desc, "Toolbar") {
+    if vm.extends_named(&desc, "Toolbar") {
         return Some(h);
     }
     for c in children(vm, h) {
