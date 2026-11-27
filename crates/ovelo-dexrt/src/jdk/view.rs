@@ -175,6 +175,10 @@ const P_CHECKED: u32 = 0xFFFD_FFDC;
 const P_RADIO_CHECKED: u32 = 0xFFFD_FFDB;
 const P_SCROLL_X: u32 = 0xFFFD_FFD9;
 const P_SCROLL_Y: u32 = 0xFFFD_FFD8;
+const P_PAD_L: u32 = 0xFFFD_FFD7;
+const P_PAD_T: u32 = 0xFFFD_FFD6;
+const P_PAD_R: u32 = 0xFFFD_FFD5;
+const P_PAD_B: u32 = 0xFFFD_FFD4;
 /// TextView compound drawables in start/top/end/bottom order.
 const P_COMPOUND_DRAWABLES: u32 = 0xFFFD_FFDA;
 /// Live `setTextColor` ARGB — written by the guest bridge's
@@ -3023,8 +3027,18 @@ pub(crate) fn call(
         }
         "getMeasuredWidthAndState" => Some(Some(V::I32(pint(vm, this, P_MEAS_W)))),
         "getMeasuredHeightAndState" => Some(Some(V::I32(pint(vm, this, P_MEAS_H)))),
-        "getPaddingLeft" | "getPaddingTop" | "getPaddingRight" | "getPaddingBottom"
-        | "getPaddingStart" | "getPaddingEnd" => Some(Some(V::I32(0))),
+        "getPaddingLeft" | "getPaddingStart" => Some(Some(V::I32(view_padding(vm, this).0))),
+        "getPaddingTop" => Some(Some(V::I32(view_padding(vm, this).1))),
+        "getPaddingRight" | "getPaddingEnd" => Some(Some(V::I32(view_padding(vm, this).2))),
+        "getPaddingBottom" => Some(Some(V::I32(view_padding(vm, this).3))),
+        "setPadding" | "setPaddingRelative" => {
+            pseudo_set(vm, this, P_PAD_L, V::I32(vint(args.get(1))));
+            pseudo_set(vm, this, P_PAD_T, V::I32(vint(args.get(2))));
+            pseudo_set(vm, this, P_PAD_R, V::I32(vint(args.get(3))));
+            pseudo_set(vm, this, P_PAD_B, V::I32(vint(args.get(4))));
+            mark_layout_requested(vm, this);
+            Some(None)
+        }
         "getScrollX" => Some(Some(V::I32(pint(vm, this, P_SCROLL_X)))),
         "getScrollY" => Some(Some(V::I32(pint(vm, this, P_SCROLL_Y)))),
         "setScrollX" => {
@@ -3144,7 +3158,6 @@ pub(crate) fn call(
             Some(Some(out))
         }
         "setAlpha"
-        | "setPadding"
         | "setElevation"
         | "setShowDividers"
         | "setTranslationX"
@@ -4782,11 +4795,17 @@ fn padding_component(vm: &Vm, h: u32, exact: &str, relative: Option<&str>, base:
 /// View padding in physical LTR order, including uniform `android:padding`.
 fn view_padding(vm: &Vm, h: u32) -> (i32, i32, i32, i32) {
     let base = lp_px(vm, attr_find(vm, h, "padding").unwrap_or(V::I32(0))).unwrap_or(0);
-    (
+    let xml = (
         padding_component(vm, h, "paddingLeft", Some("paddingStart"), base),
         padding_component(vm, h, "paddingTop", None, base),
         padding_component(vm, h, "paddingRight", Some("paddingEnd"), base),
         padding_component(vm, h, "paddingBottom", None, base),
+    );
+    (
+        pseudo_get(vm, h, P_PAD_L).map(i32v).unwrap_or(xml.0),
+        pseudo_get(vm, h, P_PAD_T).map(i32v).unwrap_or(xml.1),
+        pseudo_get(vm, h, P_PAD_R).map(i32v).unwrap_or(xml.2),
+        pseudo_get(vm, h, P_PAD_B).map(i32v).unwrap_or(xml.3),
     )
 }
 
