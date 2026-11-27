@@ -114,6 +114,8 @@ const P_MENU_GROUP: u32 = 0xFFFD_FFF3;
 const P_MENU_CKABLE: u32 = 0xFFFD_FFF2;
 /// Pseudo key: a MenuItem's inflated action view.
 const P_MENU_ACTION_VIEW: u32 = 0xFFFD_FFEC;
+/// Pseudo key: a MenuItem's showAsAction flags (host-item fallback).
+const P_MENU_SHOW_AS: u32 = 0xFFFD_FFEB;
 
 /// Backing store key on a dex menu object (`Obj::Instance` — e.g.
 /// androidx `MenuBuilder`): the item list lives on a lazily-minted host
@@ -1733,6 +1735,14 @@ pub(crate) fn call(
             }
             Some(None)
         }
+        "setShowAsAction" | "setShowAsActionFlags" if is_menuitem(vm, this) => {
+            menu_item_show_as(vm, this, i32v(args.get(1).copied().unwrap_or(V::I32(0))));
+            Some(Some(V::Ref(this)))
+        }
+        "setActionView" if is_menuitem(vm, this) => {
+            menu_item_action_view(vm, this, args.get(1).copied().unwrap_or(V::Ref(0)));
+            Some(Some(V::Ref(this)))
+        }
         "setVisible"
         | "setEnabled"
         | "setChecked"
@@ -1740,9 +1750,6 @@ pub(crate) fn call(
         | "setTitle"
         | "setTitleCondensed"
         | "setIcon"
-        | "setShowAsAction"
-        | "setShowAsActionFlags"
-        | "setActionView"
         | "setIntent"
         | "setAlphabeticShortcut"
         | "setNumericShortcut"
@@ -8416,6 +8423,15 @@ fn menu_inflate_level(vm: &mut Vm, doc: &[Element], i: &mut usize, depth: usize,
             if i64v(visible) == 0 {
                 menu_item_visible(vm, ih, 0);
             }
+            let show_as = el
+                .attrs
+                .iter()
+                .find(|a| a.name == "showAsAction")
+                .map(|a| i32v(attr_v(vm, &a.value)))
+                .unwrap_or(0);
+            if show_as != 0 {
+                menu_item_show_as(vm, ih, show_as);
+            }
             if let Some(action_class) = el
                 .attrs
                 .iter()
@@ -8440,22 +8456,7 @@ fn menu_inflate_level(vm: &mut Vm, doc: &[Element], i: &mut usize, depth: usize,
                         pseudo_set(vm, av, P_IS_GROUP, V::I32(1));
                     }
                     pseudo_set(vm, av, P_CONTEXT, ctx);
-                    if vm
-                        .call_virtual_sig(
-                            ih,
-                            "setActionView",
-                            &["Landroid/view/View;"],
-                            &[V::Ref(av)],
-                        )
-                        .is_err()
-                    {
-                        vm.set_object_field(
-                            ih,
-                            "Landroidx/appcompat/view/menu/MenuItemImpl;",
-                            "mActionView",
-                            V::Ref(av),
-                        );
-                    }
+                    menu_item_action_view(vm, ih, V::Ref(av));
                 }
             }
         }
@@ -8520,11 +8521,36 @@ fn menu_add_entry(
 
 /// `setVisible` on a minted host item or a dex `MenuItemImpl`.
 fn menu_item_visible(vm: &mut Vm, ih: u32, vis: i32) {
-    match vm.heap.get(ih) {
-        Some(Obj::Instance { .. }) => {
-            let _ = vm.call_virtual(ih, "setVisible", &[V::I32(vis)]);
-        }
-        _ => pseudo_set(vm, ih, P_MENU_VIS, V::I32(vis)),
+    pseudo_set(vm, ih, P_MENU_VIS, V::I32(vis));
+    if matches!(vm.heap.get(ih), Some(Obj::Instance { .. })) {
+        let _ = vm.call_virtual_direct(ih, "setVisible", &[V::I32(vis)]);
+    }
+}
+
+/// Forward showAsAction to a real dex MenuItemImpl. The host fallback
+/// store alone is invisible to ActionMenuPresenter's item partitioning.
+fn menu_item_show_as(vm: &mut Vm, ih: u32, flags: i32) {
+    pseudo_set(vm, ih, P_MENU_SHOW_AS, V::I32(flags));
+    if matches!(vm.heap.get(ih), Some(Obj::Instance { .. })) {
+        let _ = vm.call_virtual_direct(ih, "setShowAsAction", &[V::I32(flags)]);
+    }
+}
+
+/// Forward an inflated action view to MenuItemImpl so collapseActionView
+/// items expand through the same dex state the presenter reads.
+fn menu_item_action_view(vm: &mut Vm, ih: u32, view: V) {
+    pseudo_set(vm, ih, P_MENU_ACTION_VIEW, view);
+    if matches!(vm.heap.get(ih), Some(Obj::Instance { .. }))
+        && vm
+            .call_virtual_direct(ih, "setActionView", &[view])
+            .is_err()
+    {
+        vm.set_object_field(
+            ih,
+            "Landroidx/appcompat/view/menu/MenuItemImpl;",
+            "mActionView",
+            view,
+        );
     }
 }
 
