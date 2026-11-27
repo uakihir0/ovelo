@@ -161,6 +161,9 @@ const P_MINW: u32 = 0xFFFD_FFDF;
 const P_MINH: u32 = 0xFFFD_FFDE;
 /// `LinearLayout.setOrientation` — 0=HORIZONTAL, 1=VERTICAL.
 const P_ORIENTATION: u32 = 0xFFFD_FFDD;
+/// CompoundButton checked state / RadioGroup's checked child id.
+const P_CHECKED: u32 = 0xFFFD_FFDC;
+const P_RADIO_CHECKED: u32 = 0xFFFD_FFDB;
 /// Live `setTextColor` ARGB — written by the guest bridge's
 /// fallthrough for dex-inflated views.
 pub const P_TCOLOR: u32 = 0xFFFD_FFE3;
@@ -2114,6 +2117,64 @@ pub(crate) fn call(
             }
             Some(None)
         }
+        "isChecked" if is_marked(vm, this) => Some(Some(V::I32(pint(vm, this, P_CHECKED)))),
+        "setChecked" if is_marked(vm, this) => {
+            let checked = i32v(args.get(1).copied().unwrap_or(V::I32(0)));
+            pseudo_set(vm, this, P_CHECKED, V::I32((checked != 0) as i32));
+            if checked != 0 {
+                if let Some(V::Ref(parent)) = pseudo_get(vm, this, P_PARENT) {
+                    let cls = class_of(vm, V::Ref(parent));
+                    if cls == "Landroid/widget/RadioGroup;"
+                        || vm.assignable_desc(&cls, "Landroid/widget/RadioGroup;")
+                    {
+                        pseudo_set(vm, parent, P_RADIO_CHECKED, V::I32(view_id(vm, this)));
+                    }
+                }
+            }
+            Some(None)
+        }
+        "check"
+            if {
+                let cls = class_of(vm, V::Ref(this));
+                cls == "Landroid/widget/RadioGroup;"
+                    || vm.assignable_desc(&cls, "Landroid/widget/RadioGroup;")
+            } =>
+        {
+            let id = i32v(args.get(1).copied().unwrap_or(V::I32(0)));
+            pseudo_set(vm, this, P_RADIO_CHECKED, V::I32(id));
+            for c in children(vm, this) {
+                if let V::Ref(ch) = c {
+                    pseudo_set(vm, ch, P_CHECKED, V::I32((view_id(vm, ch) == id) as i32));
+                }
+            }
+            Some(None)
+        }
+        "clearCheck"
+            if {
+                let cls = class_of(vm, V::Ref(this));
+                cls == "Landroid/widget/RadioGroup;"
+                    || vm.assignable_desc(&cls, "Landroid/widget/RadioGroup;")
+            } =>
+        {
+            pseudo_set(vm, this, P_RADIO_CHECKED, V::I32(-1));
+            for c in children(vm, this) {
+                if let V::Ref(ch) = c {
+                    pseudo_set(vm, ch, P_CHECKED, V::I32(0));
+                }
+            }
+            Some(None)
+        }
+        "getCheckedRadioButtonId"
+            if {
+                let cls = class_of(vm, V::Ref(this));
+                cls == "Landroid/widget/RadioGroup;"
+                    || vm.assignable_desc(&cls, "Landroid/widget/RadioGroup;")
+            } =>
+        {
+            Some(Some(
+                pseudo_get(vm, this, P_RADIO_CHECKED).unwrap_or(V::I32(-1)),
+            ))
+        }
         "setText" | "setTitle" | "setTextScaleX" => {
             if name != "setTextScaleX" {
                 pseudo_set(vm, this, P_TEXT, args.get(1).copied().unwrap_or(V::Ref(0)));
@@ -2780,7 +2841,6 @@ pub(crate) fn call(
         | "setFilters"
         | "setEnabled_true"
         | "setCheckMarkDrawable"
-        | "setChecked"
         | "setOnCheckedChangeListener"
         | "setProgress"
         | "setMax"

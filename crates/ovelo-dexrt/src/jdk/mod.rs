@@ -3354,6 +3354,12 @@ pub(crate) fn host_supers(d: &str) -> &'static [&'static str] {
             OBJ,
         ],
         "Landroid/widget/ProgressBar;" => &["Landroid/view/View;", OBJ],
+        "Landroid/widget/RadioGroup;" => &[
+            "Landroid/widget/LinearLayout;",
+            "Landroid/view/ViewGroup;",
+            "Landroid/view/View;",
+            OBJ,
+        ],
         "Landroid/widget/SeekBar;" | "Landroid/widget/RatingBar;" => {
             &["Landroid/widget/ProgressBar;", "Landroid/view/View;", OBJ]
         }
@@ -3468,7 +3474,6 @@ pub(crate) fn host_supers(d: &str) -> &'static [&'static str] {
         | "Landroid/widget/AnalogClock;"
         | "Landroid/widget/ExpandableListView;"
         | "Landroid/widget/QuickContactBadge;"
-        | "Landroid/widget/RadioGroup;"
         | "Landroid/widget/SimpleAdapter;"
         | "Landroid/widget/CursorAdapter;"
         | "Landroid/widget/ResourceCursorAdapter;"
