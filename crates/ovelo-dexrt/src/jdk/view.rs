@@ -7200,6 +7200,40 @@ fn menu_inflate_level(vm: &mut Vm, doc: &[Element], i: &mut usize, depth: usize,
             if i64v(visible) == 0 {
                 menu_item_visible(vm, ih, 0);
             }
+            if let Some(action_class) = el
+                .attrs
+                .iter()
+                .find(|a| a.name == "actionViewClass")
+                .and_then(|a| match &a.value {
+                    Value::Str(s) => Some(s.as_str()),
+                    _ => None,
+                })
+            {
+                let ctx = vm
+                    .get_object_field(
+                        menu_h,
+                        "Landroidx/appcompat/view/menu/MenuBuilder;",
+                        "mContext",
+                    )
+                    .filter(|v| !is_null(*v))
+                    .unwrap_or(V::Ref(vm.cur_activity));
+                let desc = format!("L{};", action_class.replace('.', "/"));
+                if let Some(av) = try_construct_view(vm, &desc, ctx, V::Ref(0)) {
+                    pseudo_set(vm, av, P_IS_VIEW, V::I32(1));
+                    if desc_is_a(&desc, VIEWGROUP) || vm.assignable_desc(&desc, VIEWGROUP) {
+                        pseudo_set(vm, av, P_IS_GROUP, V::I32(1));
+                    }
+                    pseudo_set(vm, av, P_CONTEXT, ctx);
+                    if vm.call_virtual(ih, "setActionView", &[V::Ref(av)]).is_err() {
+                        vm.set_object_field(
+                            ih,
+                            "Landroidx/appcompat/view/menu/MenuItemImpl;",
+                            "mActionView",
+                            V::Ref(av),
+                        );
+                    }
+                }
+            }
         }
         if sub {
             let sub_h = match it {
