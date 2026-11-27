@@ -5756,20 +5756,22 @@ pub(crate) fn dispatch_touch(
                 let cancelable = pseudo_get(vm, popup, P_DIALOG_CANCELABLE)
                     .map(i32v)
                     .unwrap_or(1);
-                if cancelable == 0 {
-                    continue;
-                }
                 if dbg {
                     eprintln!("[touchdbg] outside tap dismiss popup h{popup} root h{proot}");
                 }
-                let popup_class = class_of(vm, V::Ref(popup));
-                if desc_is_a(&popup_class, "Landroid/app/Dialog;")
-                    || vm.assignable_desc(&popup_class, "Landroid/app/Dialog;")
-                {
-                    dialog_dismiss(vm, popup);
-                } else {
-                    list_popup_dismiss(vm, popup);
+                if cancelable != 0 {
+                    let popup_class = class_of(vm, V::Ref(popup));
+                    if desc_is_a(&popup_class, "Landroid/app/Dialog;")
+                        || vm.assignable_desc(&popup_class, "Landroid/app/Dialog;")
+                    {
+                        dialog_dismiss(vm, popup);
+                    } else {
+                        list_popup_dismiss(vm, popup);
+                    }
                 }
+                // Modal overlays consume outside touches even when they
+                // stay open; otherwise the tap falls through and activates
+                // a button behind a non-cancelable dialog.
                 consumed = true;
             }
         }
