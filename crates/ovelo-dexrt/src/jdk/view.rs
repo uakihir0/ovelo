@@ -5176,7 +5176,7 @@ fn group_measure_fallback(vm: &mut Vm, this: u32, pw: i32, ph: i32) {
             || vm.extends_named(&leaf_desc, "CompoundButton");
         let is_text_leaf = leaf_desc.contains("TextView")
             || leaf_desc.contains("EditText")
-            || vm.extends_named(&leaf_desc, "Landroid/widget/TextView;");
+            || vm.extends_named(&leaf_desc, "TextView");
         let (cw, chh) = if text.is_empty() {
             if is_compound {
                 // CompoundButton's button drawable has an intrinsic
