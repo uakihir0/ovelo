@@ -933,10 +933,10 @@ fn tint_image(
     let (w, h, px) = image;
     let mut out = px.as_ref().clone();
     let (tr, tg, tb, ta) = (
-        ((tint >> 16) & 0xff) as u32,
-        ((tint >> 8) & 0xff) as u32,
-        (tint & 0xff) as u32,
-        ((tint >> 24) & 0xff) as u32,
+        (tint >> 16) & 0xff,
+        (tint >> 8) & 0xff,
+        tint & 0xff,
+        (tint >> 24) & 0xff,
     );
     for p in out.as_chunks_mut::<4>().0 {
         let sa = p[3] as u32;
