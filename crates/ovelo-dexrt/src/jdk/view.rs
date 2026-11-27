@@ -4603,9 +4603,7 @@ fn em_width(c: char) -> f32 {
 }
 
 fn estimated_text_width(text: &str, ts: f32) -> i32 {
-    text.chars()
-        .map(em_width)
-        .sum::<f32>()
+    (text.chars().map(em_width).sum::<f32>() * 1.15)
         .mul_add(ts, 0.0)
         .ceil() as i32
 }
