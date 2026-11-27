@@ -3133,7 +3133,7 @@ fn uuid_call(vm: &mut Vm, name: &str, args: &[V]) -> Option<Option<V>> {
                     .unwrap_or_else(|| uuid_text(0, 0)),
                 _ => uuid_text(0, 0),
             };
-            Some(Some(jstr(vm, &text)))
+            Some(Some(jdynstr(vm, &text)))
         }
         "getMostSignificantBits" => Some(Some(V::I64(match args.first() {
             Some(V::Ref(h)) => uuid_bits(vm, *h).map(|v| v.0).unwrap_or(0),
