@@ -329,13 +329,13 @@ pub(crate) fn call(
                                 } else {
                                     timeout_ms.max(0)
                                 };
-                                let deadline = now_ms() + wait_ms;
+                                let deadline = now_ms().saturating_add(wait_ms);
                                 loop {
                                     if !matches!(pseudo_get(vm, *h, P_FUTURE_DONE), Some(V::I32(0)))
                                     {
                                         break;
                                     }
-                                    if now_ms() >= deadline || vm.drain_worker_runnables(16) == 0 {
+                                    if now_ms() >= deadline {
                                         if sig != "()Ljava/lang/Object;" {
                                             return Err(vm.throw_builtin(
                                                 "Ljava/util/concurrent/TimeoutException;",
@@ -343,6 +343,12 @@ pub(crate) fn call(
                                             ));
                                         }
                                         break;
+                                    }
+                                    if vm.drain_worker_runnables(16) == 0 {
+                                        if sig == "()Ljava/lang/Object;" {
+                                            break;
+                                        }
+                                        std::thread::sleep(std::time::Duration::from_millis(1));
                                     }
                                 }
                             }
