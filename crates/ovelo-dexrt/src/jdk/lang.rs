@@ -2007,8 +2007,11 @@ fn class_call(vm: &mut Vm, name: &str, _sig: &str, args: &[V]) -> Rt<Option<Opti
                 }
             }
         }
+        "getResourceAsStream" => {
+            let name = args.get(1).and_then(|v| sv(vm, *v)).unwrap_or_default();
+            Some(Some(apk_resource_stream(vm, &name)))
+        }
         "getResource"
-        | "getResourceAsStream"
         | "getProtectionDomain"
         | "getEnclosingMethod"
         | "getEnclosingConstructor"
@@ -2104,6 +2107,48 @@ fn class_call(vm: &mut Vm, name: &str, _sig: &str, args: &[V]) -> Rt<Option<Opti
     })
 }
 
+/// Open a classpath resource packaged in the installed APK. Android
+/// library resources such as zxcvbn's dictionary text files are raw zip
+/// entries beside the dex files, not host filesystem paths.
+fn apk_resource_stream(vm: &mut Vm, name: &str) -> V {
+    let wanted = name.trim_start_matches('/');
+    if wanted.is_empty() {
+        return V::Ref(0);
+    }
+    let paths: Vec<std::path::PathBuf> = if let Some(pkg) = vm.guest_package.as_ref() {
+        vm.installed_apk_paths
+            .get(pkg)
+            .cloned()
+            .into_iter()
+            .collect()
+    } else {
+        vm.installed_apk_paths.values().cloned().collect()
+    };
+    for path in paths {
+        let Ok(bytes) = std::fs::read(path) else {
+            continue;
+        };
+        let Ok(entries) =
+            ovelo_apk::zip::parse_central_directory(&bytes, &ovelo_apk::zip::ZipLimits::default())
+        else {
+            continue;
+        };
+        for entry in entries.1 {
+            if entry.name == wanted {
+                if let Ok(data) = ovelo_apk::zip::read_entry(&bytes, &entry) {
+                    return host(
+                        vm,
+                        "Ljava/io/ByteArrayInputStream;",
+                        HostState::Bytes(std::rc::Rc::new(data), 0),
+                    );
+                }
+                break;
+            }
+        }
+    }
+    V::Ref(0)
+}
+
 fn classloader_call(vm: &mut Vm, name: &str, args: &[V]) -> Option<Option<V>> {
     match name {
         "getSystemClassLoader" | "getPlatformClassLoader" | "getParent" | "getClassLoader" => {
@@ -2119,11 +2164,13 @@ fn classloader_call(vm: &mut Vm, name: &str, args: &[V]) -> Option<Option<V>> {
             }
             Some(Some(class_obj(vm, d)))
         }
-        "getResource"
-        | "getResourceAsStream"
-        | "getDefinedPackage"
-        | "getName"
-        | "getUnnamedModule" => Some(Some(V::Ref(0))),
+        "getResourceAsStream" => {
+            let name = args.get(1).and_then(|v| sv(vm, *v)).unwrap_or_default();
+            Some(Some(apk_resource_stream(vm, &name)))
+        }
+        "getResource" | "getDefinedPackage" | "getName" | "getUnnamedModule" => {
+            Some(Some(V::Ref(0)))
+        }
         "getResources" => Some(Some(host(
             vm,
             "Ljava/util/Enumeration;",
