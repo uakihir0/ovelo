@@ -127,11 +127,11 @@ pub(crate) const P_TA_ATTRS: u32 = 0xFFFD_FFFE;
 pub(crate) const P_TA_SET: u32 = 0xFFFD_FFFF;
 /// Pseudo key: explicit style res id on a `TypedArray`
 /// (`obtainStyledAttributes(resId, attrs)`).
-const P_TA_STYLE: u32 = 0xFFFD_FFFD;
+pub(crate) const P_TA_STYLE: u32 = 0xFFFD_FFFD;
 /// Pseudo key: `defStyleAttr` res id on a `TypedArray`.
-const P_TA_DEF_ATTR: u32 = 0xFFFD_FFFC;
+pub(crate) const P_TA_DEF_ATTR: u32 = 0xFFFD_FFFC;
 /// Pseudo key: `defStyleRes` res id on a `TypedArray`.
-const P_TA_DEF_RES: u32 = 0xFFFD_FFFB;
+pub(crate) const P_TA_DEF_RES: u32 = 0xFFFD_FFFB;
 /// Pseudo key: the `AttributeSet` a view was inflated with (for
 /// `getLayoutParams` re-parse).
 const P_ATTRS: u32 = 0xFFFD_FFFA;

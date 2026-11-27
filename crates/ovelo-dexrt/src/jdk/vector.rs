@@ -728,6 +728,10 @@ fn color_of(rv: RCtx<'_>, v: &Value) -> Option<u32> {
         Value::Str(s) => parse_color(s),
         Value::Int(i) => Some(*i as u32),
         Value::Other { data_type, data } if (0x1c..=0x1f).contains(data_type) => Some(*data),
+        Value::Other {
+            data_type: 0x02,
+            data,
+        } => resolve_ref_color(rv, *data),
         Value::Reference(r) => resolve_ref_color(rv, *r),
         _ => None,
     }

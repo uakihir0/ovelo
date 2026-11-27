@@ -2132,6 +2132,103 @@ fn component_call(vm: &mut Vm, name: &str, args: &[V]) -> Rt<Option<Option<V>>> 
 /// hops and `?attr` indirection through the bound theme, then through
 /// `android.R.color` ids (`0x0106xxxx`) via the framework table.
 /// Unresolvable attrs fall back to opaque black so text stays visible.
+fn typed_entry_color(vm: &mut Vm, ev: &ovelo_apk::arsc::EntryValue) -> Option<i32> {
+    match ev.data_type {
+        0x01 => Some(resolve_color_id(vm, ev.data) as i32),
+        0x10 | 0x11 | 0x1c..=0x1f => Some(ev.data as i32),
+        0x03 => ev
+            .string
+            .as_deref()
+            .and_then(vector::parse_color)
+            .map(|c| c as i32),
+        _ => None,
+    }
+}
+
+/// Resolve a color while it still carries typed-value provenance. Once a
+/// TypedArray stores a bare i32, a literal such as #01060000 is
+/// indistinguishable from `@android:color/darker_gray`; inspect the XML
+/// value or arsc entry before that conversion instead.
+fn typed_array_color(vm: &mut Vm, h: u32, index: i32) -> Option<i32> {
+    let attr_id = match pseudo_get(vm, h, view::P_TA_ATTRS) {
+        Some(V::Ref(ah)) => match vm.heap.get(ah) {
+            Some(Obj::Array { data, .. }) => {
+                data.get(index.max(0) as usize).map(|v| i32v(*v) as u32)
+            }
+            _ => None,
+        },
+        _ => None,
+    }?;
+    let name = vm
+        .apk_res
+        .as_ref()?
+        .attr_name(attr_id)
+        .map(|s| s.to_string());
+
+    if let Some(name) = name {
+        if let Some(V::Ref(set_h)) = pseudo_get(vm, h, view::P_TA_SET) {
+            use ovelo_apk::manifest::Value;
+            if let Some(raw) = xml::cur_attr_raw(vm, set_h, &name) {
+                return match raw {
+                    Value::Reference(r) => Some(resolve_color_id(vm, r) as i32),
+                    Value::Other {
+                        data_type: 0x02,
+                        data,
+                    } => crate::theme_color(vm, data).map(|c| c as i32),
+                    Value::Other {
+                        data_type: 0x10 | 0x11 | 0x1c..=0x1f,
+                        data,
+                    } => Some(data as i32),
+                    Value::Int(v) => Some(v as i32),
+                    Value::Str(s) => vector::parse_color(&s).map(|c| c as i32),
+                    _ => None,
+                };
+            }
+        }
+    }
+
+    let theme = vm.theme_id;
+    let res = vm.apk_res.as_ref()?;
+    macro_rules! chase {
+        ($ev:expr) => {{
+            let mut ev = $ev.clone();
+            for _ in 0..8 {
+                if ev.data_type != 0x02 {
+                    break;
+                }
+                match res.style_item(theme, ev.data) {
+                    Some(next) => ev = next.clone(),
+                    None => break,
+                }
+            }
+            if ev.data_type != 0x02 {
+                return typed_entry_color(vm, &ev);
+            }
+        }};
+    }
+    if let Some(V::I32(style)) = pseudo_get(vm, h, view::P_TA_STYLE) {
+        if let Some(ev) = res.style_item(style as u32, attr_id) {
+            chase!(ev);
+        }
+    }
+    if let Some(V::I32(attr)) = pseudo_get(vm, h, view::P_TA_DEF_ATTR) {
+        if let Some(style_ref) = res.style_item(theme, attr as u32).map(|ev| ev.data) {
+            if let Some(ev) = res.style_item(style_ref, attr_id) {
+                chase!(ev);
+            }
+        }
+    }
+    if let Some(V::I32(style)) = pseudo_get(vm, h, view::P_TA_DEF_RES) {
+        if let Some(ev) = res.style_item(style as u32, attr_id) {
+            chase!(ev);
+        }
+    }
+    if let Some(ev) = res.style_item(theme, attr_id) {
+        chase!(ev);
+    }
+    None
+}
+
 fn resolve_color_id(vm: &mut Vm, res_id: u32) -> u32 {
     let mut id = res_id;
     let mut data = 0xFF00_0000u32;
@@ -4308,7 +4405,11 @@ fn res_misc(vm: &mut Vm, class: &str, name: &str, args: &[V]) -> Rt<Option<Optio
             // Resolve selectors to their resting/default color in the
             // object slot; importantly a real 0x00000000 color remains
             // Some(0), distinguishable from an absent attribute.
-            let csl = match ta_index(vm, args).and_then(|(h, i)| view::ta_lookup(vm, h, i)) {
+            let csl = match ta_index(vm, args).and_then(|(h, i)| {
+                typed_array_color(vm, h, i as i32)
+                    .map(V::I32)
+                    .or_else(|| view::ta_lookup(vm, h, i))
+            }) {
                 Some(V::I32(raw)) => {
                     // Runtime values lose the binary-XML type bit. Framework
                     // attrs live in 0x0101xxxx and app resource ids in
