@@ -466,6 +466,10 @@ fn update_dex_view(g: &mut GuestView, info: &ovelo_dexrt::DexViewInfo) {
             tv.max_lines = info.max_lines;
             tv.invalidate();
         }
+        if tv.checked != info.compound_checked {
+            tv.checked = info.compound_checked;
+            tv.set_text(tv.text.clone());
+        }
     }
     if changed {
         g.invalidate();

@@ -281,6 +281,9 @@ pub struct TextView {
     pub gravity: i32,
     /// `android:maxLines` — draws at most this many wrapped lines.
     pub max_lines: Option<i32>,
+    /// CompoundButton checked state; `Some` reserves and draws the
+    /// button-box affordance even when the label is empty.
+    pub checked: Option<bool>,
 }
 
 impl TextView {
@@ -295,6 +298,7 @@ impl TextView {
             padding: 0,
             gravity: 0,
             max_lines: None,
+            checked: None,
         };
         v.view.desired = v.measure_text(None);
         v
@@ -317,9 +321,14 @@ impl TextView {
             max_w,
             false,
         );
+        let box_w = if self.checked.is_some() {
+            28 + if self.text.is_empty() { 0 } else { 8 }
+        } else {
+            0
+        };
         Size {
-            w: t.width + self.padding * 2,
-            h: t.height + self.padding * 2,
+            w: t.width + self.padding * 2 + box_w,
+            h: (t.height + self.padding * 2).max(if self.checked.is_some() { 28 } else { 0 }),
         }
     }
 }
@@ -350,6 +359,38 @@ impl Drawable for TextView {
                 Rect::new(self.view.left, self.view.top, s.w, s.h),
                 Paint::color(bg),
             );
+        }
+        if let Some(checked) = self.checked {
+            let box_sz = 20;
+            let bx = self.view.left + self.padding + 4;
+            let by = self.view.top + (s.h - box_sz) / 2;
+            if checked {
+                let accent = Paint::color(Color::srgb(0x66, 0xbb, 0x6a));
+                c.draw_round_rect(Rect::new(bx, by, box_sz, box_sz), 3, accent);
+                let white = Paint::color(Color::srgb(0xff, 0xff, 0xff));
+                c.draw_line(bx + 4, by + 10, bx + 8, by + 15, 2, white);
+                c.draw_line(bx + 8, by + 15, bx + 16, by + 5, 2, white);
+            } else {
+                let border = Paint::color(Color::srgb(0xaa, 0xaa, 0xaa));
+                c.draw_line(bx, by, bx + box_sz - 1, by, 2, border);
+                c.draw_line(
+                    bx,
+                    by + box_sz - 1,
+                    bx + box_sz - 1,
+                    by + box_sz - 1,
+                    2,
+                    border,
+                );
+                c.draw_line(bx, by, bx, by + box_sz - 1, 2, border);
+                c.draw_line(
+                    bx + box_sz - 1,
+                    by,
+                    bx + box_sz - 1,
+                    by + box_sz - 1,
+                    2,
+                    border,
+                );
+            }
         }
         let t = ovelo_ui::layout(
             &self.text,
@@ -382,7 +423,15 @@ impl Drawable for TextView {
             let tx = match self.gravity & 0x7 {
                 0x1 => self.view.left + (s.w - line.width) / 2,
                 0x5 => self.view.left + s.w - self.padding - line.width,
-                _ => self.view.left + self.padding,
+                _ => {
+                    self.view.left
+                        + self.padding
+                        + if self.checked.is_some() && !self.text.is_empty() {
+                            36
+                        } else {
+                            0
+                        }
+                }
             };
             if dbg_flag("OVELO_POSDBG") && !self.text.is_empty() {
                 eprintln!(
