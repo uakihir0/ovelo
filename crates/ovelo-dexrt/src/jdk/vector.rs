@@ -395,6 +395,13 @@ fn render_layer_list(rv: RCtx<'_>, res_id: u32) -> Option<(u32, u32, Rc<Vec<u8>>
             ) {
                 blit_scaled(&mut canvas, SZ, &px, w as usize, h as usize, x0, y0, tw, th);
                 any = true;
+            } else if let Some(argb) = resolve_ref_color(rv, *child) {
+                for y in y0..y0 + th {
+                    for x in x0..x0 + tw {
+                        blend_px(&mut canvas, x, y, SZ, argb);
+                    }
+                }
+                any = true;
             }
             continue;
         }
