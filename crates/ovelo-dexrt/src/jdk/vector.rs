@@ -326,11 +326,20 @@ fn blend_px(dst: &mut [u8], x: usize, y: usize, w: usize, argb: u32) {
         return;
     }
     let [sa, sr, sg, sb] = argb.to_be_bytes();
-    let a = sa as u32;
-    let inv = 255 - a;
-    for (k, sc) in [sr, sg, sb, sa].into_iter().enumerate() {
-        dst[idx + k] = ((sc as u32 * a + dst[idx + k] as u32 * inv) / 255) as u8;
+    let (sa, sr, sg, sb) = (sa as u32, sr as u32, sg as u32, sb as u32);
+    let da = dst[idx + 3] as u32;
+    let inv = 255 - sa;
+    let out_a = sa + da * inv / 255;
+    if out_a == 0 {
+        return;
     }
+    // Non-premultiplied src-over. On a transparent destination this
+    // preserves the source alpha instead of squaring it.
+    for (k, sc) in [sr, sg, sb].into_iter().enumerate() {
+        let dc = dst[idx + k] as u32;
+        dst[idx + k] = ((sc * sa + dc * da * inv / 255) / out_a) as u8;
+    }
+    dst[idx + 3] = out_a as u8;
 }
 
 /// Render a `<layer-list>` into a small composite bitmap. The runtime
