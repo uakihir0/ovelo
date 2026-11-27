@@ -415,6 +415,10 @@ fn update_dex_view(g: &mut GuestView, info: &ovelo_dexrt::DexViewInfo) {
             v.image = info.image.clone();
             changed = true;
         }
+        if v.padding != info.padding {
+            v.padding = info.padding;
+            changed = true;
+        }
     }
     if let GuestView::Group(gr) = g {
         if gr.clip_children != info.clip_children {

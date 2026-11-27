@@ -84,8 +84,10 @@ pub struct View {
     /// `setBackgroundColor` — drawn under `draw` when set.
     pub background: Option<Color>,
     /// `setImage*` — decoded pixels (w, h, RGBA8), scaled into the
-    /// measured rect at draw.
+    /// measured content rect at draw.
     pub image: Option<(u32, u32, std::rc::Rc<Vec<u8>>)>,
+    /// Content padding `(left, top, right, bottom)` in px.
+    pub padding: (i32, i32, i32, i32),
     /// `setOnClickListener` — fired on tap inside the laid-out rect.
     pub on_click: Option<Box<dyn FnMut()>>,
     /// Guest `onDraw(Canvas)` ops recorded by the dexrt materializer —
@@ -114,6 +116,7 @@ impl View {
             top: 0,
             background: None,
             image: None,
+            padding: (0, 0, 0, 0),
             on_click: None,
             custom_ops: None,
             raw_custom_ops: None,

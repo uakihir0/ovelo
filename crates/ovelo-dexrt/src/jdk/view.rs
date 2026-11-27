@@ -350,6 +350,8 @@ pub struct DexViewInfo {
     /// `setImage*`-attached pixels (`w`, `h`, RGBA8) after resolving
     /// Bitmap hosts, drawable field chains, res-ids and file/Uri paths.
     pub image: Option<(u32, u32, std::rc::Rc<Vec<u8>>)>,
+    /// Content padding `(left, top, right, bottom)` in px.
+    pub padding: (i32, i32, i32, i32),
     /// Parent view handle (0 = detached/root).
     pub parent: u32,
     /// Child view handles, in z-order.
@@ -759,6 +761,45 @@ pub(crate) fn dex_view_info(vm: &Vm, h: u32) -> Option<DexViewInfo> {
         (Some(V::I32(l)), Some(V::I32(t)), Some(V::I32(r)), Some(V::I32(b))) => Some((l, t, r, b)),
         _ => None,
     };
+    let pad_base = lp_px(vm, attr_find(vm, h, "padding").unwrap_or(V::I32(0))).unwrap_or(0);
+    let pad_l = lp_px(vm, attr_find(vm, h, "paddingLeft").unwrap_or(V::I32(0)))
+        .unwrap_or(0)
+        .max(0)
+        + if pad_base != 0
+            && attr_find(vm, h, "paddingLeft").is_none()
+            && attr_find(vm, h, "paddingStart").is_none()
+        {
+            pad_base
+        } else {
+            0
+        };
+    let pad_t = lp_px(vm, attr_find(vm, h, "paddingTop").unwrap_or(V::I32(0)))
+        .unwrap_or(0)
+        .max(0)
+        + if pad_base != 0 && attr_find(vm, h, "paddingTop").is_none() {
+            pad_base
+        } else {
+            0
+        };
+    let pad_r = lp_px(vm, attr_find(vm, h, "paddingRight").unwrap_or(V::I32(0)))
+        .unwrap_or(0)
+        .max(0)
+        + if pad_base != 0
+            && attr_find(vm, h, "paddingRight").is_none()
+            && attr_find(vm, h, "paddingEnd").is_none()
+        {
+            pad_base
+        } else {
+            0
+        };
+    let pad_b = lp_px(vm, attr_find(vm, h, "paddingBottom").unwrap_or(V::I32(0)))
+        .unwrap_or(0)
+        .max(0)
+        + if pad_base != 0 && attr_find(vm, h, "paddingBottom").is_none() {
+            pad_base
+        } else {
+            0
+        };
     Some(DexViewInfo {
         desc,
         is_group,
@@ -773,6 +814,7 @@ pub(crate) fn dex_view_info(vm: &Vm, h: u32) -> Option<DexViewInfo> {
         frame,
         layout_requested: layout_requested(vm, h),
         image: pseudo_get(vm, h, P_IMAGE).and_then(|v| image_pixels(vm, v)),
+        padding: (pad_l, pad_t, pad_r, pad_b),
         parent: match pseudo_get(vm, h, P_PARENT) {
             Some(V::Ref(p)) => p,
             _ => 0,
