@@ -466,11 +466,156 @@ fn attr_bool_ref(vm: &Vm, id: u32) -> Option<bool> {
 /// Resolve an attribute out of the explicit XML `style` reference.
 /// `attr_find` only sees direct tag attributes, while Android applies
 /// style items before falling back to the theme's default text color.
+fn themed_attr_entry(
+    res: &crate::res::ApkResources,
+    theme: u32,
+    overlay: Option<u32>,
+    attr: u32,
+    depth: u32,
+) -> Option<ovelo_apk::arsc::EntryValue> {
+    if depth >= 8 {
+        return None;
+    }
+    let ev = overlay
+        .and_then(|o| res.style_item(o, attr))
+        .or_else(|| res.style_item(theme, attr))?
+        .clone();
+    if ev.data_type == 0x02 {
+        themed_attr_entry(res, theme, overlay, ev.data, depth + 1)
+    } else {
+        Some(ev)
+    }
+}
+
+fn themed_value_color(
+    res: &crate::res::ApkResources,
+    theme: u32,
+    overlay: Option<u32>,
+    v: &Value,
+    depth: u32,
+) -> Option<u32> {
+    if depth >= 12 {
+        return None;
+    }
+    match v {
+        Value::Str(s) => vector::parse_color(s),
+        Value::Int(i) => Some(*i as u32),
+        Value::Other { data_type, data } if (0x1c..=0x1f).contains(data_type) => Some(*data),
+        Value::Other {
+            data_type: 0x02,
+            data,
+        } => {
+            let ev = themed_attr_entry(res, theme, overlay, *data, depth + 1)?;
+            themed_entry_color(res, theme, overlay, &ev, depth + 1)
+        }
+        Value::Reference(r) => themed_color_resource(res, theme, overlay, *r, depth + 1),
+        _ => None,
+    }
+}
+
+fn themed_entry_color(
+    res: &crate::res::ApkResources,
+    theme: u32,
+    overlay: Option<u32>,
+    ev: &ovelo_apk::arsc::EntryValue,
+    depth: u32,
+) -> Option<u32> {
+    if depth >= 12 {
+        return None;
+    }
+    match ev.data_type {
+        0x1c..=0x1f | 0x10 | 0x11 | 0x04 => Some(ev.data),
+        0x01 => themed_color_resource(res, theme, overlay, ev.data, depth + 1),
+        0x02 => {
+            let next = themed_attr_entry(res, theme, overlay, ev.data, depth + 1)?;
+            themed_entry_color(res, theme, overlay, &next, depth + 1)
+        }
+        0x03 => ev.string.as_deref().and_then(vector::parse_color),
+        _ => None,
+    }
+}
+
+fn themed_selector_color(
+    res: &crate::res::ApkResources,
+    theme: u32,
+    overlay: Option<u32>,
+    res_id: u32,
+    depth: u32,
+) -> Option<u32> {
+    let els = res.document(res_id)?;
+    for el in &els {
+        if el.name != "item" {
+            continue;
+        }
+        let stateful = el.attrs.iter().any(|a| {
+            if !a.name.starts_with("state_") {
+                return false;
+            }
+            if a.name == "state_enabled" {
+                matches!(&a.value, Value::Bool(false) | Value::Int(0))
+            } else {
+                true
+            }
+        });
+        if stateful {
+            continue;
+        }
+        if let Some(v) = el.android("color") {
+            if let Some(c) = themed_value_color(res, theme, overlay, v, depth + 1) {
+                return Some(c);
+            }
+        }
+    }
+    None
+}
+
+fn themed_color_resource(
+    res: &crate::res::ApkResources,
+    theme: u32,
+    overlay: Option<u32>,
+    res_id: u32,
+    depth: u32,
+) -> Option<u32> {
+    if depth >= 12 {
+        return None;
+    }
+    if let Some(ev) = res.entry_value(res_id).cloned() {
+        if ev.data_type == 0x03 && ev.string.as_deref().is_some_and(|s| s.starts_with("res/")) {
+            if let Some(c) = themed_selector_color(res, theme, overlay, res_id, depth + 1) {
+                return Some(c);
+            }
+        }
+        return themed_entry_color(res, theme, overlay, &ev, depth + 1).or_else(|| {
+            vector::drawable_flat_color(
+                vector::RCtx {
+                    res,
+                    theme,
+                    depth: depth.min(15) as u8,
+                },
+                res_id,
+            )
+        });
+    }
+    crate::res::framework_color(res_id)
+}
+
+fn overlay_aware_style_color(vm: &Vm, style: u32, color_res: u32) -> Option<u32> {
+    let res = vm.apk_res.as_ref()?;
+    let overlay_attr = res.attr_id_named("materialThemeOverlay")?;
+    let overlay = match res.style_item(style, overlay_attr) {
+        Some(ev) if ev.data_type == 0x01 => Some(ev.data),
+        _ => None,
+    }?;
+    themed_color_resource(res, vm.theme_id, Some(overlay), color_res, 0)
+}
+
 fn style_attr_color(vm: &Vm, style: u32, attr_id: u32) -> Option<i32> {
     let res = vm.apk_res.as_ref()?;
     let ev = res.style_item(style, attr_id)?;
     match ev.data_type {
-        0x01 => color_v(vm, V::I32(ev.data as i32)),
+        0x01 => overlay_aware_style_color(vm, style, ev.data)
+            .map(|c| c as i32)
+            .or_else(|| color_v(vm, V::I32(ev.data as i32))),
         0x02 => crate::theme_color(vm, ev.data).map(|c| c as i32),
         0x1c..=0x1f | 0x10 | 0x11 | 0x04 => Some(ev.data as i32),
         0x03 => ev
@@ -725,7 +870,16 @@ pub(crate) fn dex_view_info(vm: &Vm, h: u32) -> Option<DexViewInfo> {
         Some(v) => color_v(vm, v),
         _ => match pseudo_get(vm, h, P_BGRES) {
             Some(v) => color_v(vm, v),
-            None => attr_find(vm, h, "background").and_then(|v| color_v(vm, v)),
+            None => attr_find(vm, h, "background")
+                .and_then(|v| color_v(vm, v))
+                .or_else(|| match attr_find(vm, h, "style") {
+                    Some(V::I32(style)) if style > 0 => vm
+                        .apk_res
+                        .as_ref()
+                        .and_then(|r| r.attr_id_named("backgroundTint"))
+                        .and_then(|attr| style_attr_color(vm, style as u32, attr)),
+                    _ => None,
+                }),
         },
     };
     let lp_w = attr_find(vm, h, "layout_width")
