@@ -4303,9 +4303,30 @@ fn res_misc(vm: &mut Vm, class: &str, name: &str, args: &[V]) -> Rt<Option<Optio
             };
             Some(Some(d))
         }
-        ("Landroid/content/res/TypedArray;", "getFont" | "getColorStateList") => {
-            Some(Some(V::Ref(0)))
+        ("Landroid/content/res/TypedArray;", "getColorStateList") => {
+            // TypedArray styleable values carry the color/resource id.
+            // Resolve selectors to their resting/default color in the
+            // object slot; importantly a real 0x00000000 color remains
+            // Some(0), distinguishable from an absent attribute.
+            let csl = match ta_index(vm, args).and_then(|(h, i)| view::ta_lookup(vm, h, i)) {
+                Some(V::I32(res)) if res > 0 => {
+                    let color = resolve_color_id(vm, res as u32) as i32;
+                    host(
+                        vm,
+                        "Landroid/content/res/ColorStateList;",
+                        HostState::Slot(V::I32(color)),
+                    )
+                }
+                Some(V::I32(c)) => host(
+                    vm,
+                    "Landroid/content/res/ColorStateList;",
+                    HostState::Slot(V::I32(c)),
+                ),
+                _ => V::Ref(0),
+            };
+            Some(Some(csl))
         }
+        ("Landroid/content/res/TypedArray;", "getFont") => Some(Some(V::Ref(0))),
         ("Landroid/content/res/TypedArray;", "hasValue" | "hasValueOrEmpty") => {
             let yes = ta_index(vm, args).is_some_and(|(h, i)| {
                 if view::ta_lookup(vm, h, i).is_some() {
