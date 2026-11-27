@@ -1356,10 +1356,15 @@ fn list_call(vm: &mut Vm, name: &str, sig: &str, args: &[V]) -> Rt<Option<Option
 // ---------------------------------------------------------------------
 // Map (covers Bundle/ContentValues keyed ops too)
 
+fn java_props_space(c: char) -> bool {
+    (char::is_whitespace(c) && !matches!(c, '\u{a0}' | '\u{2007}' | '\u{202f}'))
+        || matches!(c, '\u{1c}'..='\u{1f}')
+}
+
 fn parse_properties_line(line: &str) -> Option<(String, String)> {
     let chars: Vec<char> = line.chars().collect();
     let mut i = 0usize;
-    while i < chars.len() && chars[i].is_whitespace() {
+    while i < chars.len() && java_props_space(chars[i]) {
         i += 1;
     }
     if i >= chars.len() || chars[i] == '#' || chars[i] == '!' {
@@ -1386,18 +1391,18 @@ fn parse_properties_line(line: &str) -> Option<(String, String)> {
             i += 1;
             continue;
         }
-        if c == '=' || c == ':' || c.is_whitespace() {
+        if c == '=' || c == ':' || java_props_space(c) {
             break;
         }
         key.push(c);
         i += 1;
     }
-    while i < chars.len() && chars[i].is_whitespace() {
+    while i < chars.len() && java_props_space(chars[i]) {
         i += 1;
     }
     if i < chars.len() && (chars[i] == '=' || chars[i] == ':') {
         i += 1;
-        while i < chars.len() && chars[i].is_whitespace() {
+        while i < chars.len() && java_props_space(chars[i]) {
             i += 1;
         }
     }
@@ -3069,7 +3074,7 @@ fn strtokenizer_call(vm: &mut Vm, name: &str, args: &[V]) -> Rt<Option<Option<V>
                         ..
                     }) => {
                         let t2 = t.clone();
-                        let mut it = t2.splitn(2, |c: char| c.is_whitespace() || c == ',');
+                        let mut it = t2.splitn(2, |c: char| java_props_space(c) || c == ',');
                         let tok = it.next().unwrap_or("").to_string();
                         *t = it.next().unwrap_or("").to_string();
                         tok
