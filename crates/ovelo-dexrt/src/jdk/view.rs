@@ -5171,7 +5171,8 @@ fn text_input_measure_fixup(vm: &mut Vm, this: u32, ph: i32) {
         return;
     };
     let edit_h = (pint(vm, edit, P_MEAS_H) & 0x00FF_FFFF).max(1);
-    let desired = edit_h + 32;
+    let (_, pad_t, _, pad_b) = view_padding(vm, this);
+    let desired = edit_h + 32 + pad_t + pad_b;
     let cur = pint(vm, this, P_MEAS_H) & 0x00FF_FFFF;
     if cur > desired {
         pseudo_set(vm, this, P_MEAS_H, V::I32(resolve_size(desired, ph, true)));
@@ -5190,7 +5191,8 @@ fn text_input_layout_fixup(vm: &mut Vm, this: u32, width: i32, height: i32) {
         return;
     };
     let edit_h = (pint(vm, edit, P_MEAS_H) & 0x00FF_FFFF).min(height).max(1);
-    let input_top = (height - edit_h).max(0);
+    let (pad_l, pad_t, pad_r, pad_b) = view_padding(vm, this);
+    let input_top = pad_t + (height - pad_t - pad_b - edit_h).max(0);
     let mut end_w = 0;
     for c in children(vm, this) {
         let V::Ref(ch) = c else { continue };
@@ -5204,9 +5206,16 @@ fn text_input_layout_fixup(vm: &mut Vm, this: u32, width: i32, height: i32) {
         }
         end_w = end_w.max(cw);
         let y = input_top + ((edit_h - chh) / 2).max(0);
-        frame_set(vm, ch, width - cw, y, width, y + chh);
+        frame_set(vm, ch, width - pad_r - cw, y, width - pad_r, y + chh);
     }
-    frame_set(vm, edit, 0, input_top, width - end_w, height);
+    frame_set(
+        vm,
+        edit,
+        pad_l,
+        input_top,
+        width - pad_r - end_w,
+        height - pad_b,
+    );
 }
 
 /// Generic `onMeasure` for framework skeleton containers: measure
