@@ -102,6 +102,24 @@ pub(crate) fn call(
                 | "min" | "max" | "sorted" | "distinct" | "limit" | "skip" | "peek" | "onClose"
                 | "close" | "isParallel" | "sequential" | "parallel" | "unordered"
                 | "iterator0" | "spliterator" => {
+                    if matches!(name, "forEach" | "forEachOrdered") {
+                        let items = match args.first().copied().unwrap_or(V::Ref(0)) {
+                            V::Ref(h) => match vm.heap.get(h) {
+                                Some(crate::value::Obj::Host {
+                                    state: crate::value::HostState::List(items),
+                                    ..
+                                }) => items.clone(),
+                                _ => vec![],
+                            },
+                            _ => vec![],
+                        };
+                        if let Some(V::Ref(consumer)) = args.get(1).copied() {
+                            for item in items {
+                                vm.call_virtual_rt(consumer, "accept", &[item])?;
+                            }
+                        }
+                        return Ok(Some(None));
+                    }
                     if matches!(
                         name,
                         "count" | "anyMatch" | "allMatch" | "noneMatch" | "isParallel"

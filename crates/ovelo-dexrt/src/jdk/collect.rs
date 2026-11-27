@@ -1334,10 +1334,11 @@ fn list_call(vm: &mut Vm, name: &str, sig: &str, args: &[V]) -> Rt<Option<Option
                 write_sorted_list(vm, h, items);
                 Some(None)
             } else if name.ends_with("stream") || name.ends_with("Stream") {
+                let items = list_snapshot(vm, h).unwrap_or_default();
                 Some(Some(host(
                     vm,
                     "Ljava/util/stream/Stream;",
-                    HostState::Empty,
+                    HostState::List(items),
                 )))
             } else {
                 Some(None)
@@ -2784,11 +2785,20 @@ fn arrays_static(vm: &mut Vm, name: &str, _sig: &str, args: &[V]) -> Rt<Option<O
         }
         "compare" | "mismatch" => Some(Some(V::I32(0))),
         "equals0" => Some(Some(V::I32(1))),
-        "stream" => Some(Some(host(
-            vm,
-            "Ljava/util/stream/Stream;",
-            HostState::Empty,
-        ))),
+        "stream" => {
+            let items = match args.first().copied().unwrap_or(V::Ref(0)) {
+                V::Ref(h) => match vm.heap.get(h) {
+                    Some(Obj::Array { data, .. }) => data.clone(),
+                    _ => vec![],
+                },
+                _ => vec![],
+            };
+            Some(Some(host(
+                vm,
+                "Ljava/util/stream/Stream;",
+                HostState::List(items),
+            )))
+        }
         "copyOf0" => Some(Some(args[0])),
         _ => None,
     })
