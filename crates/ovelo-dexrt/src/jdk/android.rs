@@ -1988,6 +1988,9 @@ fn intent_call(vm: &mut Vm, name: &str, sig: &str, args: &[V]) -> Rt<Option<Opti
                         if let Some(uri) = args.get(2).copied().filter(|v| *v != V::Ref(0)) {
                             pseudo_set(vm, h, P_DATA, uri);
                         }
+                        if args.len() > 4 {
+                            pseudo_set(vm, h, P_COMPONENT, args[4]);
+                        }
                     }
                     None => {
                         let target = args.get(2).copied().unwrap_or(*a);
