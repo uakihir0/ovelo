@@ -165,6 +165,21 @@ pub type HostCall = std::rc::Rc<std::cell::RefCell<dyn FnMut(&mut Vm, &[V]) -> R
 /// for platform classes), its class descriptor, and the call itself.
 type NamedHost = (GIdx, String, HostCall);
 
+/// Manifest-declared activity intent filter used for implicit launches.
+#[derive(Debug, Clone, Default)]
+pub struct ActivityIntentFilter {
+    /// Qualified activity class name (dotted Java form).
+    pub activity: String,
+    /// Declared action names.
+    pub actions: Vec<String>,
+    /// Declared category names.
+    pub categories: Vec<String>,
+    /// Declared data MIME types.
+    pub mime_types: Vec<String>,
+    /// Declared data schemes.
+    pub schemes: Vec<String>,
+}
+
 /// DEX interpreter over one or more [`DexFile`]s (multi-dex apps).
 pub struct Vm {
     dexes: Vec<DexFile>,
@@ -211,6 +226,9 @@ pub struct Vm {
     /// store — `PackageManager.queryIntentActivities` enumerates them
     /// for launchers, `getLaunchIntentForPackage` resolves per package.
     pub installed_launchers: Vec<(String, String)>,
+    /// Current app's activity intent filters, used to resolve implicit
+    /// intra-app ACTION_VIEW-style launches.
+    pub activity_intent_filters: Vec<ActivityIntentFilter>,
     /// On-disk path per installed package — `loadIcon` /
     /// `getApplicationIcon` read and decode the APK lazily, so a
     /// non-launcher app doesn't pin every installed APK in memory.
@@ -864,6 +882,7 @@ impl Vm {
                 .join("emulated")
                 .join("0"),
             installed_launchers: Vec::new(),
+            activity_intent_filters: Vec::new(),
             installed_apk_paths: std::collections::BTreeMap::new(),
             depth: 0,
             stack: Vec::new(),

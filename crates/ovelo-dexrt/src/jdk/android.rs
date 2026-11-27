@@ -1891,12 +1891,73 @@ fn intent_map_remove(vm: &mut Vm, h: u32, k: V) {
 fn clone_intent(vm: &mut Vm, h: u32) -> V {
     let m = intent_map_pairs(vm, h);
     let nh = vm.alloc_host("Landroid/content/Intent;", HostState::Map(m));
-    for k in [P_ACTION, P_DATA, P_FLAGS, P_COMPONENT] {
+    for k in [P_ACTION, P_DATA, P_TYPE, P_FLAGS, P_COMPONENT] {
         if let Some(v) = pseudo_get(vm, h, k) {
             pseudo_set(vm, nh, k, v);
         }
     }
     V::Ref(nh)
+}
+
+fn mime_matches(pattern: &str, actual: &str) -> bool {
+    let Some((pt, ps)) = pattern.split_once('/') else {
+        return false;
+    };
+    let Some((at, _)) = actual.split_once('/') else {
+        return false;
+    };
+    (ps == "*" && pt.eq_ignore_ascii_case(at))
+        || pattern.eq_ignore_ascii_case(actual)
+        || (pt == "*" && ps == "*")
+}
+
+/// Resolve an implicit activity Intent against the manifest filters the
+/// launcher installed on the VM. This intentionally implements the
+/// small Android data test most apps rely on: action + DEFAULT category
+/// plus MIME wildcards and an optional scheme constraint.
+fn resolve_implicit_activity(vm: &mut Vm, ih: u32) -> Option<String> {
+    let action = pseudo_get(vm, ih, P_ACTION).and_then(|v| sv(vm, v))?;
+    if action.is_empty() {
+        return None;
+    }
+    let mime = pseudo_get(vm, ih, P_TYPE)
+        .and_then(|v| sv(vm, v))
+        .unwrap_or_default();
+    let data = pseudo_get(vm, ih, P_DATA)
+        .and_then(|v| sv(vm, v))
+        .unwrap_or_default();
+    let scheme = data
+        .split([':', '/'])
+        .next()
+        .unwrap_or_default()
+        .to_string();
+    vm.activity_intent_filters.iter().find_map(|filter| {
+        if !filter.actions.iter().any(|a| a == &action) {
+            return None;
+        }
+        if !filter
+            .categories
+            .iter()
+            .any(|c| c == "android.intent.category.DEFAULT")
+        {
+            return None;
+        }
+        if !filter.schemes.is_empty()
+            && (scheme.is_empty() || !filter.schemes.iter().any(|s| s == &scheme))
+        {
+            return None;
+        }
+        let mime_ok = if mime.is_empty() {
+            filter.mime_types.is_empty()
+        } else {
+            filter.mime_types.iter().any(|m| mime_matches(m, &mime))
+        };
+        if !mime_ok {
+            return None;
+        }
+        let activity = filter.activity.replace('.', "/");
+        Some(format!("L{activity};"))
+    })
 }
 
 fn intent_call(vm: &mut Vm, name: &str, sig: &str, args: &[V]) -> Rt<Option<Option<V>>> {
@@ -1924,16 +1985,21 @@ fn intent_call(vm: &mut Vm, name: &str, sig: &str, args: &[V]) -> Rt<Option<Opti
             Some(Some(args[0]))
         }
         "getAction" => Some(Some(pseudo_get(vm, h, P_ACTION).unwrap_or(V::Ref(0)))),
-        "setData" | "setDataAndType" | "setDataAndNormalize" => {
+        "setData" | "setDataAndNormalize" => {
             pseudo_set(vm, h, P_DATA, args[1]);
+            Some(Some(args[0]))
+        }
+        "setDataAndType" | "setDataAndTypeAndNormalize" => {
+            pseudo_set(vm, h, P_DATA, args[1]);
+            pseudo_set(vm, h, P_TYPE, args.get(2).copied().unwrap_or(V::Ref(0)));
             Some(Some(args[0]))
         }
         "getData" | "getDataString" => Some(Some(pseudo_get(vm, h, P_DATA).unwrap_or(V::Ref(0)))),
         "setType" => {
-            pseudo_set(vm, h, P_FLAGS, args[1]);
+            pseudo_set(vm, h, P_TYPE, args[1]);
             Some(Some(args[0]))
         }
-        "getType" => Some(Some(pseudo_get(vm, h, P_FLAGS).unwrap_or(V::Ref(0)))),
+        "getType" => Some(Some(pseudo_get(vm, h, P_TYPE).unwrap_or(V::Ref(0)))),
         "setComponent" => {
             pseudo_set(vm, h, P_COMPONENT, args[1]);
             Some(Some(args[0]))
@@ -1945,13 +2011,20 @@ fn intent_call(vm: &mut Vm, name: &str, sig: &str, args: &[V]) -> Rt<Option<Opti
             Some(Some(args[0]))
         }
         "getComponent" => Some(Some(pseudo_get(vm, h, P_COMPONENT).unwrap_or(V::Ref(0)))),
-        "setPackage" | "addCategory" | "removeCategory" | "addFlags" | "setFlags"
-        | "setSelector" | "setClipData" | "setSourceBounds" | "setIdentifier" => {
+        "addFlags" => {
+            let cur = pseudo_get(vm, h, P_FLAGS).map(i32v).unwrap_or(0);
+            pseudo_set(vm, h, P_FLAGS, V::I32(cur | i32v(args[1])));
             Some(Some(args[0]))
         }
+        "setFlags" => {
+            pseudo_set(vm, h, P_FLAGS, V::I32(i32v(args[1])));
+            Some(Some(args[0]))
+        }
+        "setPackage" | "addCategory" | "removeCategory" | "setSelector" | "setClipData"
+        | "setSourceBounds" | "setIdentifier" => Some(Some(args[0])),
         "getPackage" | "getCategories" | "getFlags" | "getSelector" | "getClipData"
         | "getSourceBounds" | "getIdentifier" => Some(Some(match name {
-            "getFlags" => V::I32(0),
+            "getFlags" => pseudo_get(vm, h, P_FLAGS).unwrap_or(V::I32(0)),
             "getCategories" => {
                 return Ok(Some(Some(host(
                     vm,
@@ -3183,8 +3256,9 @@ fn context_call(
             // Intent travels with the launch so the target's getIntent
             // sees the caller's extras/URI.
             if let Some(V::Ref(ih)) = args.get(1).copied() {
+                let mut desc = None;
                 if let Some(c) = pseudo_get(vm, ih, P_COMPONENT) {
-                    let desc = match c {
+                    desc = match c {
                         // A ComponentName carries the target class
                         // dotted in P_DATA; Class mirrors and bare
                         // class-name strings resolve through their
@@ -3202,22 +3276,25 @@ fn context_call(
                             }),
                         _ => None,
                     };
-                    if let Some(d) = desc {
-                        let request = match name {
-                            "startActivityForResult" => args.get(2).map(|v| i32v(*v)),
-                            "startActivityFromChild" | "startActivityFromFragment" => {
-                                args.get(3).map(|v| i32v(*v))
-                            }
-                            _ => None,
-                        };
-                        vm.pending_activity_caller = request.and_then(|request_code| {
-                            (request_code >= 0).then(|| match args[0] {
-                                V::Ref(caller) => (caller, request_code),
-                                _ => (0, request_code),
-                            })
-                        });
-                        vm.pending_activity = Some((d, clone_intent(vm, ih)));
-                    }
+                }
+                if desc.is_none() {
+                    desc = resolve_implicit_activity(vm, ih);
+                }
+                if let Some(d) = desc {
+                    let request = match name {
+                        "startActivityForResult" => args.get(2).map(|v| i32v(*v)),
+                        "startActivityFromChild" | "startActivityFromFragment" => {
+                            args.get(3).map(|v| i32v(*v))
+                        }
+                        _ => None,
+                    };
+                    vm.pending_activity_caller = request.and_then(|request_code| {
+                        (request_code >= 0).then(|| match args[0] {
+                            V::Ref(caller) => (caller, request_code),
+                            _ => (0, request_code),
+                        })
+                    });
+                    vm.pending_activity = Some((d, clone_intent(vm, ih)));
                 }
             }
             Some(Some(V::I32(0)))

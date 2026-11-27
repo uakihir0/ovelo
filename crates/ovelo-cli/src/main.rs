@@ -1572,6 +1572,18 @@ fn run_app(store: &InstallStore, package: &str) -> Result<(), OveloError> {
                 // handler (an empty answer sends them to a setup screen).
                 v.guest_package = Some(rec.app.package.clone());
                 v.guest_app_class = info.manifest.application_class.clone();
+                v.activity_intent_filters = info
+                    .manifest
+                    .activity_intent_filters
+                    .iter()
+                    .map(|f| ovelo_dexrt::ActivityIntentFilter {
+                        activity: f.activity.clone(),
+                        actions: f.actions.clone(),
+                        categories: f.categories.clone(),
+                        mime_types: f.mime_types.clone(),
+                        schemes: f.schemes.clone(),
+                    })
+                    .collect();
                 // Launcher queries (home screen) enumerate every
                 // installed app's launcher activity — parse each
                 // record's manifest once at startup.
