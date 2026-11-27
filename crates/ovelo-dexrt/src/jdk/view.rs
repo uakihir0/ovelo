@@ -1630,16 +1630,21 @@ pub(crate) fn call(
         "checkLayoutParams" => {
             let ok = match args.get(1).copied() {
                 Some(v @ V::Ref(lph)) if lph != 0 => {
-                    // A dex override reaches this host method only through
-                    // invoke-super after performing its own typed check.
-                    // Re-checking against the canonical framework LP name
-                    // rejects R8-renamed inner LP classes (CoordinatorLayout's
-                    // `Lej0`), causing addView to copy them and drop behavior.
-                    if vm.has_dex_virtual(
-                        this,
-                        "checkLayoutParams",
-                        &["Landroid/view/ViewGroup$LayoutParams;"],
-                    ) {
+                    // An invoke-super into ViewGroup has already passed the
+                    // dex override's own typed check; ViewGroup itself only
+                    // null-checks. Re-checking the canonical framework LP
+                    // name rejects R8-renamed inner LP classes
+                    // (CoordinatorLayout's `Lej0`) and addView then copies
+                    // the params, dropping their behavior. A dex subclass
+                    // that supers into FrameLayout still carries that owner,
+                    // so it keeps the refined type check below.
+                    if class == "Landroid/view/ViewGroup;"
+                        && vm.has_dex_virtual(
+                            this,
+                            "checkLayoutParams",
+                            &["Landroid/view/ViewGroup$LayoutParams;"],
+                        )
+                    {
                         true
                     } else {
                         let got = class_of(vm, v);
