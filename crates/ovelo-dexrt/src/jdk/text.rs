@@ -46,8 +46,9 @@ pub(crate) fn call(
         "Landroid/text/SpannableString;"
         | "Landroid/text/SpannableStringBuilder;"
         | "Landroid/text/Spannable;"
-        | "Landroid/text/Spanned;" => Ok(spannable_call(vm, name, args)),
-        "Landroid/text/Editable;" | "Landroid/text/GetChars;" => {
+        | "Landroid/text/Spanned;"
+        | "Landroid/text/Editable;"
+        | "Landroid/text/GetChars;" => {
             if name == "getChars" {
                 getchars_call(vm, args)
             } else {
@@ -120,14 +121,18 @@ fn spannable_call(vm: &mut Vm, name: &str, args: &[V]) -> Option<Option<V>> {
             }
             Some(None)
         }
-        "length" => Some(Some(V::I32(cs_text(vm, this).chars().count() as i32))),
+        "length" => Some(Some(
+            V::I32(cs_text(vm, this).encode_utf16().count() as i32),
+        )),
         "charAt" => {
             let t = cs_text(vm, this);
-            let ix = args.get(1).map(|v| i64v(*v)).unwrap_or(0) as usize;
-            Some(Some(V::I32(t.chars().nth(ix).unwrap_or('\0') as i32)))
+            let ix = args.get(1).map(|v| i64v(*v)).unwrap_or(0).max(0) as usize;
+            Some(Some(V::I32(
+                t.encode_utf16().nth(ix).map(|u| u as i32).unwrap_or(0),
+            )))
         }
         "subSequence" => {
-            let t: Vec<char> = cs_text(vm, this).chars().collect();
+            let t: Vec<u16> = cs_text(vm, this).encode_utf16().collect();
             let (a, b) = (
                 args.get(1).map(|v| i64v(*v)).unwrap_or(0).max(0) as usize,
                 args.get(2)
@@ -137,7 +142,7 @@ fn spannable_call(vm: &mut Vm, name: &str, args: &[V]) -> Option<Option<V>> {
             );
             Some(Some(jstr(
                 vm,
-                &t[a.min(t.len())..b.min(t.len())].iter().collect::<String>(),
+                &String::from_utf16_lossy(&t[a.min(t.len())..b.min(t.len())]),
             )))
         }
         "toString" => Some(Some(jstr(vm, &cs_text(vm, this)))),
