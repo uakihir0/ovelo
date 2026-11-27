@@ -502,8 +502,8 @@ pub(crate) fn render_vector(rv: RCtx<'_>, res_id: u32) -> Option<(u32, u32, Rc<V
     let res = rv.res;
     let els = res.document(res_id)?;
     let root = els.iter().find(|e| e.depth == 0 && e.name == "vector")?;
-    let vw = f32_attr(root, "viewportWidth").unwrap_or(24.0);
-    let vh = f32_attr(root, "viewportHeight").unwrap_or(24.0);
+    let vw = f32_attr(rv, root, "viewportWidth").unwrap_or(24.0);
+    let vh = f32_attr(rv, root, "viewportHeight").unwrap_or(24.0);
     if vw <= 0.0 || vh <= 0.0 || !vw.is_finite() || !vh.is_finite() {
         return None;
     }
@@ -538,7 +538,7 @@ pub(crate) fn render_vector(rv: RCtx<'_>, res_id: u32) -> Option<(u32, u32, Rc<V
         }
         match el.name.as_str() {
             "group" => {
-                let m = group_mat(el);
+                let m = group_mat(rv, el);
                 let parent = xf.iter().fold(Mat::IDENT, |acc, (_, m)| acc.then(m));
                 xf.push((el.depth, parent.then(&m)));
             }
@@ -560,7 +560,7 @@ pub(crate) fn render_vector(rv: RCtx<'_>, res_id: u32) -> Option<(u32, u32, Rc<V
                 // No fill attr + stroke → transparent fill; no fill and no
                 // stroke → the vector spec fills black.
                 let fill_argb = match fill {
-                    Some(c) => Some(mul_alpha(c, f32_attr(el, "fillAlpha").unwrap_or(1.0))),
+                    Some(c) => Some(mul_alpha(c, f32_attr(rv, el, "fillAlpha").unwrap_or(1.0))),
                     None if stroke.is_none() => Some(0xff00_0000),
                     None => None,
                 };
@@ -571,8 +571,8 @@ pub(crate) fn render_vector(rv: RCtx<'_>, res_id: u32) -> Option<(u32, u32, Rc<V
                     any = true;
                 }
                 if let Some(c) = stroke {
-                    let argb = mul_alpha(c, f32_attr(el, "strokeAlpha").unwrap_or(1.0));
-                    let sw = f32_attr(el, "strokeWidth").unwrap_or(1.0) * (kx + ky) * 0.5;
+                    let argb = mul_alpha(c, f32_attr(rv, el, "strokeAlpha").unwrap_or(1.0));
+                    let sw = f32_attr(rv, el, "strokeWidth").unwrap_or(1.0) * (kx + ky) * 0.5;
                     let polys: Vec<Vec<(f32, f32)>> = subs
                         .iter()
                         .flat_map(|s| {
@@ -682,14 +682,14 @@ impl Mat {
 }
 
 /// `<group>` transform: T(pivot)·R(rot)·S(sx,sy)·T(translate)·T(-pivot).
-fn group_mat(el: &Element) -> Mat {
-    let px = f32_attr(el, "pivotX").unwrap_or(0.0);
-    let py = f32_attr(el, "pivotY").unwrap_or(0.0);
-    let rot = f32_attr(el, "rotation").unwrap_or(0.0);
-    let sx = f32_attr(el, "scaleX").unwrap_or(1.0);
-    let sy = f32_attr(el, "scaleY").unwrap_or(1.0);
-    let tx = f32_attr(el, "translateX").unwrap_or(0.0);
-    let ty = f32_attr(el, "translateY").unwrap_or(0.0);
+fn group_mat(rv: RCtx<'_>, el: &Element) -> Mat {
+    let px = f32_attr(rv, el, "pivotX").unwrap_or(0.0);
+    let py = f32_attr(rv, el, "pivotY").unwrap_or(0.0);
+    let rot = f32_attr(rv, el, "rotation").unwrap_or(0.0);
+    let sx = f32_attr(rv, el, "scaleX").unwrap_or(1.0);
+    let sy = f32_attr(rv, el, "scaleY").unwrap_or(1.0);
+    let tx = f32_attr(rv, el, "translateX").unwrap_or(0.0);
+    let ty = f32_attr(rv, el, "translateY").unwrap_or(0.0);
     Mat::translate(px, py)
         .then(&Mat::rotate(rot))
         .then(&Mat::scale(sx, sy))
@@ -697,12 +697,21 @@ fn group_mat(el: &Element) -> Mat {
         .then(&Mat::translate(-px, -py))
 }
 
-fn f32_attr(el: &Element, name: &str) -> Option<f32> {
+fn f32_attr(rv: RCtx<'_>, el: &Element, name: &str) -> Option<f32> {
     match el.android(name) {
         Some(Value::Float(f)) => Some(*f),
         Some(Value::Int(i)) => Some(*i as f32),
         Some(Value::Str(s)) => s.trim().parse().ok(),
-        Some(Value::Other { data, .. }) => Some(f32::from_bits(*data)),
+        Some(Value::Other { data_type, data }) => match data_type {
+            0x02 => theme_dimen(rv.res, rv.theme, *data, 0),
+            0x04 => Some(f32::from_bits(*data)),
+            0x05 | 0x06 => Some(crate::res::typed_px(&ovelo_apk::arsc::EntryValue {
+                data_type: *data_type,
+                data: *data,
+                string: None,
+            })),
+            _ => None,
+        },
         _ => None,
     }
 }

@@ -2184,6 +2184,45 @@ fn typed_array_color(vm: &mut Vm, h: u32, index: i32) -> Option<i32> {
                     _ => None,
                 };
             }
+            // Layout inflation stores the same AttributeSet as a host Map.
+            // That explicit value still outranks style/theme defaults even
+            // though its original binary type was erased during conversion.
+            if let Some(Obj::Host {
+                state: HostState::Map(m),
+                ..
+            }) = vm.heap.get(set_h)
+            {
+                if let Some(v) = m.iter().find_map(|(k, v)| {
+                    if sv(vm, *k).as_deref() == Some(name.as_str()) {
+                        Some(*v)
+                    } else {
+                        None
+                    }
+                }) {
+                    return match v {
+                        V::I32(raw) => {
+                            let u = raw as u32;
+                            if raw >= 0 && (0x0101_0000..0x0102_0000).contains(&u) {
+                                Some(
+                                    crate::theme_color(vm, u)
+                                        .unwrap_or_else(|| resolve_color_id(vm, u))
+                                        as i32,
+                                )
+                            } else if raw >= 0
+                                && (u >= 0x7f00_0000 || (0x0106_0000..0x0107_0000).contains(&u))
+                            {
+                                Some(resolve_color_id(vm, u) as i32)
+                            } else {
+                                Some(raw)
+                            }
+                        }
+                        V::Ref(s) => sv(vm, V::Ref(s))
+                            .and_then(|s| vector::parse_color(&s))
+                            .map(|c| c as i32),
+                        _ => None,
+                    };
+                }
+            }
         }
     }
 
@@ -4405,31 +4444,41 @@ fn res_misc(vm: &mut Vm, class: &str, name: &str, args: &[V]) -> Rt<Option<Optio
             // Resolve selectors to their resting/default color in the
             // object slot; importantly a real 0x00000000 color remains
             // Some(0), distinguishable from an absent attribute.
-            let csl = match ta_index(vm, args).and_then(|(h, i)| {
-                typed_array_color(vm, h, i as i32)
-                    .map(V::I32)
-                    .or_else(|| view::ta_lookup(vm, h, i))
-            }) {
-                Some(V::I32(raw)) => {
-                    // Runtime values lose the binary-XML type bit. Framework
-                    // attrs live in 0x0101xxxx and app resource ids in
-                    // 0x7fxxxxxx; positive values outside those ranges are
-                    // literal colors such as #66ffffff, not resource ids.
-                    let u = raw as u32;
-                    let color = if raw >= 0 && (0x0101_0000..0x0102_0000).contains(&u) {
-                        crate::theme_color(vm, u).unwrap_or_else(|| resolve_color_id(vm, u)) as i32
-                    } else if raw >= 0
-                        && (u >= 0x7f00_0000 || (0x0106_0000..0x0107_0000).contains(&u))
-                    {
-                        resolve_color_id(vm, u) as i32
+            let csl = match ta_index(vm, args) {
+                Some((h, i)) => {
+                    if let Some(color) = typed_array_color(vm, h, i as i32) {
+                        host(
+                            vm,
+                            "Landroid/content/res/ColorStateList;",
+                            HostState::Slot(V::I32(color)),
+                        )
                     } else {
-                        raw
-                    };
-                    host(
-                        vm,
-                        "Landroid/content/res/ColorStateList;",
-                        HostState::Slot(V::I32(color)),
-                    )
+                        match view::ta_lookup(vm, h, i) {
+                            Some(V::I32(raw)) => {
+                                // Runtime-map values have already lost
+                                // their binary type; this range split is
+                                // only the legacy fallback.
+                                let u = raw as u32;
+                                let color = if raw >= 0 && (0x0101_0000..0x0102_0000).contains(&u) {
+                                    crate::theme_color(vm, u)
+                                        .unwrap_or_else(|| resolve_color_id(vm, u))
+                                        as i32
+                                } else if raw >= 0
+                                    && (u >= 0x7f00_0000 || (0x0106_0000..0x0107_0000).contains(&u))
+                                {
+                                    resolve_color_id(vm, u) as i32
+                                } else {
+                                    raw
+                                };
+                                host(
+                                    vm,
+                                    "Landroid/content/res/ColorStateList;",
+                                    HostState::Slot(V::I32(color)),
+                                )
+                            }
+                            _ => V::Ref(0),
+                        }
+                    }
                 }
                 _ => V::Ref(0),
             };
