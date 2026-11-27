@@ -6162,18 +6162,22 @@ pub(crate) fn dispatch_key(
                 .or_else(|| attr_find(vm, view, "text"))
                 .and_then(|v| text_value_string(vm, v))
                 .unwrap_or_default();
+            let mut changed = false;
             if keycode == 67 {
-                text.pop();
+                changed = text.pop().is_some();
             } else if unicode != 0 {
                 if let Some(ch) = char::from_u32(unicode as u32) {
                     if !ch.is_control() {
                         text.push(ch);
+                        changed = true;
                     }
                 }
             }
-            let text = jstr(vm, &text);
-            pseudo_set(vm, view, P_TEXT, text);
-            return Ok(true);
+            if changed {
+                let text = jdynstr(vm, &text);
+                pseudo_set(vm, view, P_TEXT, text);
+                return Ok(true);
+            }
         }
     }
 
