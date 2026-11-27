@@ -1948,9 +1948,15 @@ fn resolve_implicit_activity(vm: &mut Vm, ih: u32) -> Option<String> {
         {
             return None;
         }
-        if !filter.schemes.is_empty()
-            && (scheme.is_empty() || !filter.schemes.iter().any(|s| s == &scheme))
-        {
+        if filter.schemes.is_empty() {
+            if filter.mime_types.is_empty() {
+                if !data.is_empty() || !mime.is_empty() {
+                    return None;
+                }
+            } else if !matches!(scheme.as_str(), "" | "content" | "file") {
+                return None;
+            }
+        } else if scheme.is_empty() || !filter.schemes.iter().any(|s| s == &scheme) {
             return None;
         }
         let mime_ok = if mime.is_empty() {
