@@ -16,6 +16,8 @@ const FRAMELAYOUT: &str = "Landroid/widget/FrameLayout;";
 const WINDOW: &str = "Landroid/view/Window;";
 const INFLATER: &str = "Landroid/view/LayoutInflater;";
 const CHOR: &str = "Landroid/view/Choreographer;";
+const DISPLAY_MODE_WIDTH: u32 = u32::MAX - 500;
+const DISPLAY_MODE_HEIGHT: u32 = u32::MAX - 501;
 
 // Pseudo keys for view-tree state (see mod.rs for the other P_* slots).
 const P_VIEW_ID: u32 = u32::MAX - 7;
@@ -1270,6 +1272,7 @@ pub(crate) fn is_viewish(vm: &Vm, class: &str, args: &[V]) -> bool {
             | "Landroid/view/KeyEvent;"
             | "Landroid/view/WindowManager;"
             | "Landroid/view/Display;"
+            | "Landroid/view/Display$Mode;"
             | "Landroid/view/SurfaceHolder;"
             | "Landroid/view/WindowMetrics;"
             | "Landroid/view/WindowInsets;"
@@ -1357,11 +1360,31 @@ pub(crate) fn call(
             })))
         }
         "getHeight" if class == "Landroid/view/Display;" => Some(Some(V::I32(vm.window_size.1))),
-        "getRotation" | "getFlags" | "getRefreshRate" | "getMode" | "getState"
+        "getRotation" | "getFlags" | "getRefreshRate" | "getState"
             if class == "Landroid/view/Display;" =>
         {
             Some(Some(match ret(sig) {
                 "F" => V::F32(60.0),
+                _ => V::I32(0),
+            }))
+        }
+        "getMode" if class == "Landroid/view/Display;" => {
+            let mode = host(vm, "Landroid/view/Display$Mode;", HostState::Empty);
+            if let V::Ref(h) = mode {
+                pseudo_set(vm, h, DISPLAY_MODE_WIDTH, V::I32(vm.window_size.0));
+                pseudo_set(vm, h, DISPLAY_MODE_HEIGHT, V::I32(vm.window_size.1));
+            }
+            Some(Some(mode))
+        }
+        "getPhysicalWidth" if class == "Landroid/view/Display$Mode;" => {
+            Some(Some(match args.first().copied() {
+                Some(V::Ref(h)) => pseudo_get(vm, h, DISPLAY_MODE_WIDTH).unwrap_or(V::I32(0)),
+                _ => V::I32(0),
+            }))
+        }
+        "getPhysicalHeight" if class == "Landroid/view/Display$Mode;" => {
+            Some(Some(match args.first().copied() {
+                Some(V::Ref(h)) => pseudo_get(vm, h, DISPLAY_MODE_HEIGHT).unwrap_or(V::I32(0)),
                 _ => V::I32(0),
             }))
         }
