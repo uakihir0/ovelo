@@ -557,8 +557,7 @@ pub(crate) fn rec(vm: &mut Vm, canvas: V, op: CanvasOp) {
 /// A rect-ish arg (`Rect`/`RectF` object) → edges.
 fn rect_edges_of(vm: &Vm, v: V) -> Option<(f32, f32, f32, f32)> {
     let V::Ref(h) = v else { return None };
-    let (l, t, r, b) = android::rect_edges(vm, h);
-    Some((l as f32, t as f32, r as f32, b as f32))
+    Some(mat_rectf_edges(vm, h))
 }
 
 fn canvas_call(vm: &mut Vm, name: &str, sig: &str, args: &[V]) -> Rt<Option<Option<V>>> {
