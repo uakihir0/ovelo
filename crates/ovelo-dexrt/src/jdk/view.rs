@@ -4767,9 +4767,27 @@ fn try_construct_view(vm: &mut Vm, desc: &str, ctx: V, attrs: V) -> Option<u32> 
         return None;
     }
     let mut ctors = vm.ctor_list(desc);
-    // Score: params needing typed placeholders (fewer is better), then
-    // longer signatures (more real state wired up) preferred.
-    ctors.sort_by_key(|(_, ps)| (fill_count(ps), usize::MAX - ps.len()));
+    // LayoutInflater constructs views through the two-arg
+    // `(Context, AttributeSet)` overload. Preferring the four-arg overload
+    // bypasses Kotlin/Java default-constructor chaining and supplies zero
+    // style ids directly; libraries such as IndicatorFastScroll then reject
+    // their required styled attrs before the real two-arg ctor is tried.
+    ctors.sort_by_key(|(_, ps)| {
+        let inflation_rank = if ps.len() == 2
+            && ps[0] == "Landroid/content/Context;"
+            && ps[1] == "Landroid/util/AttributeSet;"
+        {
+            0
+        } else if ps.starts_with(&[
+            "Landroid/content/Context;".to_string(),
+            "Landroid/util/AttributeSet;".to_string(),
+        ]) {
+            1
+        } else {
+            2
+        };
+        (inflation_rank, fill_count(ps), usize::MAX - ps.len())
+    });
     for (midx, params) in ctors {
         let args: Vec<V> = params.iter().map(|t| ctor_arg(vm, t, ctx, attrs)).collect();
         match vm.instantiate_ctor(desc, midx, &args) {
@@ -7674,11 +7692,11 @@ pub(crate) fn dispatch_touch(
             if matches!(dr, Ok(Some(rv)) if i32v(rv) != 0) {
                 return Ok(true);
             }
-            v = match pseudo_get(vm, v, P_PARENT) {
-                Some(V::Ref(p)) => p,
-                _ => break,
-            };
-            continue;
+            // AOSP `View.dispatchTouchEvent` delegates unhandled events to
+            // the view's own listener/onTouchEvent path. Guest overrides in
+            // Material/Fossify widgets generally call `super`, whose host
+            // view implementation is the fallback below; skipping it makes
+            // visibly clickable widgets such as FABs swallow the gesture.
         }
         if let Some(V::Ref(l)) = pseudo_get(vm, v, P_TOUCH_L) {
             if l != 0 {
