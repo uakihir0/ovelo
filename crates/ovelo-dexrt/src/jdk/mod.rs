@@ -54,6 +54,7 @@ pub(crate) const P_METH: u32 = u32::MAX - 44;
 pub(crate) const P_PAINT: u32 = u32::MAX - 37;
 /// The `P_TARGET` pseudo key (ResolveInfo's `*Info` member, ...).
 pub const P_TARGET: u32 = u32::MAX - 5;
+pub(crate) const P_MONITOR_GEN: u32 = u32::MAX - 401;
 pub(crate) const P_EDIT_PARENT: u32 = u32::MAX - 6;
 // Rect pseudo-fields (left/top/right/bottom ints) + a Drawable's
 // cached bounds Rect handle.
@@ -1897,31 +1898,65 @@ fn universal(vm: &mut Vm, class: &str, name: &str, sig: &str, args: &[V]) -> Rt<
         // dispatcher itself.
         "getImmediate" => Some(Some(args[0])),
         "notify" | "notifyAll" => {
-            // A notify can cut a wait(ms) short — promote sleepers
-            // the same way LockSupport.unpark promotes parked ones.
+            // Generation-count the target so an in-line waiter can observe
+            // the notification without unwinding its Java stack. Waking
+            // sleepers remains necessary for runnables parked by older
+            // scheduling paths.
+            if let V::Ref(h) = args[0] {
+                if h != 0 {
+                    let gen = i64v(pseudo_get(vm, h, P_MONITOR_GEN).unwrap_or(V::I64(0)));
+                    pseudo_set(vm, h, P_MONITOR_GEN, V::I64(gen + 1));
+                }
+            }
             vm.wake_parked();
             Some(None)
         }
         "finalize" => Some(None),
         "wait" => {
-            // A worker thread's `wait()` can't really suspend — yield
-            // with ovelo.park so the drain lets other runnables (the
-            // render task that will set the flag it waits on) run, then
-            // re-enter. On the main thread stay a no-op.
+            // Preserve the dex stack across the wait. Parking unwinds a
+            // logical Java Thread back to the top of run(); blocking users
+            // such as Glide's RequestFutureTarget.get() then submit the
+            // same work again every time they wake. Java permits spurious
+            // wakeups, so wait out only a short slice while interleaving
+            // other queued work, then let the caller re-check its condition
+            // in the same activation.
             if vm.cur_thread != 0 && vm.cur_thread != vm.main_thread_h {
-                // wait() / wait(ms): record a wake deadline — with no
-                // timeout use a short retry slice.
-                let ms = match args.get(1).copied().unwrap_or(V::I64(1)) {
-                    V::I64(m) => m.max(1),
-                    V::I32(m) => (m as i64).max(1),
-                    _ => 1,
+                let timeout_ms = match args.get(1).copied() {
+                    Some(V::I64(m)) => m.max(0),
+                    Some(V::I32(m)) => (m as i64).max(0),
+                    _ => 0,
                 };
-                let due = (now_ms().saturating_add(ms)).max(0) as u64;
-                if vm.cur_runnable != 0 {
-                    vm.sleep_until.insert(vm.cur_runnable, due);
-                    vm.park_waiters.insert(vm.cur_runnable);
+                let slice = if timeout_ms == 0 {
+                    10
+                } else {
+                    timeout_ms.clamp(1, 10)
+                };
+                let target = match args[0] {
+                    V::Ref(h) => h,
+                    _ => 0,
+                };
+                let start_gen = if target != 0 {
+                    i64v(pseudo_get(vm, target, P_MONITOR_GEN).unwrap_or(V::I64(0)))
+                } else {
+                    0
+                };
+                let deadline = now_ms().saturating_add(slice) as u64;
+                while (now_ms() as u64) < deadline {
+                    if target != 0
+                        && i64v(pseudo_get(vm, target, P_MONITOR_GEN).unwrap_or(V::I64(0)))
+                            != start_gen
+                    {
+                        break;
+                    }
+                    let remain = deadline.saturating_sub(now_ms() as u64);
+                    match vm.park_drain_within(remain.min(5)) {
+                        Ok(()) => {}
+                        Err(crate::E::Vm(e)) if e.cause() == "ovelo.park" => {
+                            std::thread::sleep(std::time::Duration::from_millis(1));
+                        }
+                        Err(e) => return Err(e),
+                    }
                 }
-                return Err(crate::E::Vm(crate::err("ovelo.park")));
             }
             Some(None)
         }
