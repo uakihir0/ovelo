@@ -70,6 +70,10 @@ pub(crate) const P_RECTF_L: u32 = u32::MAX - 337;
 pub(crate) const P_RECTF_T: u32 = u32::MAX - 338;
 pub(crate) const P_RECTF_R: u32 = u32::MAX - 339;
 pub(crate) const P_RECTF_B: u32 = u32::MAX - 340;
+pub(crate) const P_INTERP_A: u32 = u32::MAX - 450;
+pub(crate) const P_INTERP_B: u32 = u32::MAX - 451;
+pub(crate) const P_INTERP_C: u32 = u32::MAX - 452;
+pub(crate) const P_INTERP_D: u32 = u32::MAX - 453;
 
 pub(crate) fn point_write(vm: &mut Vm, h: u32, x: i32, y: i32) {
     pseudo_set(vm, h, P_POINT_X, V::I32(x));
@@ -3837,6 +3841,12 @@ pub(crate) fn host_supers(d: &str) -> &'static [&'static str] {
         | "Landroid/view/animation/Animation;"
         | "Landroid/view/animation/AnimationUtils;"
         | "Landroid/view/animation/Interpolator;"
+        | "Landroid/view/animation/BaseInterpolator;"
+        | "Landroid/view/animation/LinearInterpolator;"
+        | "Landroid/view/animation/AccelerateInterpolator;"
+        | "Landroid/view/animation/DecelerateInterpolator;"
+        | "Landroid/view/animation/OvershootInterpolator;"
+        | "Landroid/view/animation/PathInterpolator;"
         | "Landroid/view/ViewPropertyAnimator;"
         | "Landroid/animation/ValueAnimator;"
         | "Landroid/animation/ObjectAnimator;"

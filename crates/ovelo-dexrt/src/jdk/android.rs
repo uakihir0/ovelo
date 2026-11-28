@@ -1070,6 +1070,128 @@ pub(crate) fn call(
             "sleep" | "setCurrentTimeMillis" => Some(None),
             _ => None,
         }
+    } else if matches!(
+        class,
+        "Landroid/view/animation/BaseInterpolator;"
+            | "Landroid/view/animation/LinearInterpolator;"
+            | "Landroid/view/animation/AccelerateInterpolator;"
+            | "Landroid/view/animation/DecelerateInterpolator;"
+            | "Landroid/view/animation/OvershootInterpolator;"
+            | "Landroid/view/animation/PathInterpolator;"
+    ) {
+        fn fv(v: Option<&V>) -> f32 {
+            v.map(|v| f64v(*v) as f32).unwrap_or(0.0)
+        }
+        if name == "<init>" {
+            if let Some(&V::Ref(this)) = args.first() {
+                let vals = match class {
+                    "Landroid/view/animation/AccelerateInterpolator;"
+                    | "Landroid/view/animation/DecelerateInterpolator;"
+                    | "Landroid/view/animation/OvershootInterpolator;" => {
+                        [fv(args.get(1)), 0.0, 0.0, 0.0]
+                    }
+                    "Landroid/view/animation/PathInterpolator;" => {
+                        if args.len() == 3 {
+                            let qx = fv(args.get(1));
+                            let qy = fv(args.get(2));
+                            [
+                                2.0 * qx / 3.0,
+                                2.0 * qy / 3.0,
+                                (qx + 1.0) / 3.0,
+                                (qy + 1.0) / 3.0,
+                            ]
+                        } else {
+                            [
+                                fv(args.get(1)),
+                                fv(args.get(2)),
+                                fv(args.get(3)),
+                                fv(args.get(4)),
+                            ]
+                        }
+                    }
+                    _ => [0.0; 4],
+                };
+                for (key, v) in [
+                    (P_INTERP_A, vals[0]),
+                    (P_INTERP_B, vals[1]),
+                    (P_INTERP_C, vals[2]),
+                    (P_INTERP_D, vals[3]),
+                ] {
+                    pseudo_set(vm, this, key, V::F32(v));
+                }
+            }
+            Some(None)
+        } else if name == "getInterpolation" {
+            let input = fv(args.get(1)).clamp(0.0, 1.0);
+            let out = match class {
+                "Landroid/view/animation/AccelerateInterpolator;" => {
+                    let factor = match args.first() {
+                        Some(&V::Ref(this)) => {
+                            f64v(pseudo_get(vm, this, P_INTERP_A).unwrap_or(V::F32(1.0))) as f32
+                        }
+                        _ => 1.0,
+                    };
+                    input.powf(if factor == 0.0 { 2.0 } else { 2.0 * factor })
+                }
+                "Landroid/view/animation/DecelerateInterpolator;" => {
+                    let factor = match args.first() {
+                        Some(&V::Ref(this)) => {
+                            f64v(pseudo_get(vm, this, P_INTERP_A).unwrap_or(V::F32(1.0))) as f32
+                        }
+                        _ => 1.0,
+                    };
+                    let factor = if factor == 0.0 { 1.0 } else { factor };
+                    1.0 - (1.0 - input).powf(2.0 * factor)
+                }
+                "Landroid/view/animation/OvershootInterpolator;" => {
+                    let tension = match args.first() {
+                        Some(&V::Ref(this)) => {
+                            let t = f64v(pseudo_get(vm, this, P_INTERP_A).unwrap_or(V::F32(2.0)))
+                                as f32;
+                            if t == 0.0 {
+                                2.0
+                            } else {
+                                t
+                            }
+                        }
+                        _ => 2.0,
+                    };
+                    let t = input - 1.0;
+                    t * t * ((tension + 1.0) * t + tension) + 1.0
+                }
+                "Landroid/view/animation/PathInterpolator;" => {
+                    let (x1, y1, x2, y2) = match args.first() {
+                        Some(&V::Ref(this)) => (
+                            f64v(pseudo_get(vm, this, P_INTERP_A).unwrap_or(V::F32(0.0))) as f32,
+                            f64v(pseudo_get(vm, this, P_INTERP_B).unwrap_or(V::F32(0.0))) as f32,
+                            f64v(pseudo_get(vm, this, P_INTERP_C).unwrap_or(V::F32(1.0))) as f32,
+                            f64v(pseudo_get(vm, this, P_INTERP_D).unwrap_or(V::F32(1.0))) as f32,
+                        ),
+                        _ => (0.0, 0.0, 1.0, 1.0),
+                    };
+                    let bez = |t: f32, a: f32, b: f32| {
+                        let u = 1.0 - t;
+                        3.0 * u * u * t * a + 3.0 * u * t * t * b + t * t * t
+                    };
+                    let mut lo = 0.0f32;
+                    let mut hi = 1.0f32;
+                    let mut t = input;
+                    for _ in 0..24 {
+                        t = (lo + hi) * 0.5;
+                        if bez(t, x1, x2) < input {
+                            lo = t;
+                        } else {
+                            hi = t;
+                        }
+                    }
+                    bez(t, y1, y2)
+                }
+                _ => input,
+            };
+            Some(Some(V::F32(out)))
+        } else {
+            Some(None)
+        }
     } else if class == "Landroid/view/animation/AnimationUtils;" {
         match name {
             "currentAnimationTimeMillis" => Some(Some(V::I64(crate::jdk::now_mono_ms()))),
