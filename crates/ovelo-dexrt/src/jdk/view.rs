@@ -2841,7 +2841,14 @@ pub(crate) fn call(
                     }
                     Some(Some(V::I32(1)))
                 }
-                _ => Some(Some(V::I32(0))),
+                _ => {
+                    if action == 1 && class_of(vm, V::Ref(this)).contains("ActionMenuItemView") {
+                        let _ = vm.call_virtual(this, "onClick", &[V::Ref(this)]);
+                        Some(Some(V::I32(1)))
+                    } else {
+                        Some(Some(V::I32(0)))
+                    }
+                }
             }
         }
         "dispatchTouchEvent" => {
