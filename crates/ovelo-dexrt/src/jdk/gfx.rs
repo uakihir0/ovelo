@@ -641,32 +641,40 @@ fn canvas_call(vm: &mut Vm, name: &str, sig: &str, args: &[V]) -> Rt<Option<Opti
         }
         "scale" => {
             let (sx, sy) = (flt(arg(args, 1)), flt(arg(args, 2)));
+            let m = mat_op("Scale", sx, sy, 0.0, 0.0);
             if let V::Ref(h) = this {
                 let cur = mat_read(vm, h);
-                mat_write(vm, h, mat_mul(cur, mat_op("Scale", sx, sy, 0.0, 0.0)));
+                mat_write(vm, h, mat_mul(cur, m));
             }
+            rec(vm, this, CanvasOp::Matrix { m });
             Some(None)
         }
         "rotate" => {
             let deg = flt(arg(args, 1));
+            let m = mat_op("Rotate", deg, 0.0, 0.0, 0.0);
             if let V::Ref(h) = this {
                 let cur = mat_read(vm, h);
-                mat_write(vm, h, mat_mul(cur, mat_op("Rotate", deg, 0.0, 0.0, 0.0)));
+                mat_write(vm, h, mat_mul(cur, m));
             }
+            rec(vm, this, CanvasOp::Matrix { m });
             Some(None)
         }
         "skew" => {
             let (sx, sy) = (flt(arg(args, 1)), flt(arg(args, 2)));
+            let m = mat_op("Skew", sx, sy, 0.0, 0.0);
             if let V::Ref(h) = this {
                 let cur = mat_read(vm, h);
-                mat_write(vm, h, mat_mul(cur, mat_op("Skew", sx, sy, 0.0, 0.0)));
+                mat_write(vm, h, mat_mul(cur, m));
             }
+            rec(vm, this, CanvasOp::Matrix { m });
             Some(None)
         }
         "concat" => {
             if let (V::Ref(h), V::Ref(mh)) = (this, arg(args, 1)) {
                 let cur = mat_read(vm, h);
-                mat_write(vm, h, mat_mul(cur, mat_read(vm, mh)));
+                let m = mat_read(vm, mh);
+                mat_write(vm, h, mat_mul(cur, m));
+                rec(vm, this, CanvasOp::Matrix { m });
             }
             Some(None)
         }

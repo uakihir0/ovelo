@@ -265,6 +265,11 @@ pub enum CanvasOp {
         /// Vertical shift px.
         dy: f32,
     },
+    /// Affine matrix concat/scale/rotate/skew (`[a,b,c,d,e,f]`).
+    Matrix {
+        /// Row-major affine coefficients.
+        m: [f32; 6],
+    },
     /// `clipRect(l, t, r, b)` (intersect).
     ClipRect {
         /// Left edge.

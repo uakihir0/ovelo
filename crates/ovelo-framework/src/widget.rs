@@ -684,6 +684,40 @@ fn flatten_path(cmds: &[ovelo_dexrt::PathCmd]) -> Vec<Vec<f32>> {
     out
 }
 
+fn affine_mul(l: [f32; 6], r: [f32; 6]) -> [f32; 6] {
+    [
+        l[0] * r[0] + l[1] * r[3],
+        l[0] * r[1] + l[1] * r[4],
+        l[0] * r[2] + l[1] * r[5] + l[2],
+        l[3] * r[0] + l[4] * r[3],
+        l[3] * r[1] + l[4] * r[4],
+        l[3] * r[2] + l[4] * r[5] + l[5],
+    ]
+}
+
+fn affine_pt(m: [f32; 6], x: f32, y: f32) -> (f32, f32) {
+    (m[0] * x + m[1] * y + m[2], m[3] * x + m[4] * y + m[5])
+}
+
+fn affine_scale(m: [f32; 6]) -> f32 {
+    (((m[0] * m[0] + m[3] * m[3]).sqrt() + (m[1] * m[1] + m[4] * m[4]).sqrt()) / 2.0).max(0.0001)
+}
+
+fn affine_rect(m: [f32; 6], l: f32, t: f32, r: f32, b: f32) -> (f32, f32, f32, f32) {
+    let pts = [
+        affine_pt(m, l, t),
+        affine_pt(m, r, t),
+        affine_pt(m, r, b),
+        affine_pt(m, l, b),
+    ];
+    (
+        pts.iter().map(|p| p.0).fold(f32::INFINITY, f32::min),
+        pts.iter().map(|p| p.1).fold(f32::INFINITY, f32::min),
+        pts.iter().map(|p| p.0).fold(f32::NEG_INFINITY, f32::max),
+        pts.iter().map(|p| p.1).fold(f32::NEG_INFINITY, f32::max),
+    )
+}
+
 /// Replay a guest `onDraw` recording: each [`ovelo_dexrt::CanvasOp`]
 /// maps onto the `Canvas` subset (already translated to the view's
 /// absolute origin by the caller). Stroke-styled shapes approximate
@@ -718,17 +752,35 @@ fn replay_guest_ops(c: &mut Canvas, ops: &[ovelo_dexrt::CanvasOp]) {
             c.draw_rect(r, col);
         }
     };
+    let mut mat = [1.0f32, 0.0, 0.0, 0.0, 1.0, 0.0];
+    let mut mats: Vec<[f32; 6]> = Vec::new();
     for op in ops {
         match op {
-            O::Save => c.save(),
-            O::Restore => c.restore(),
-            O::Translate { dx, dy } => c.translate(*dx as i32, *dy as i32),
-            O::ClipRect { l, t, r, b } => c.clip_rect(Rect::new(
-                *l as i32,
-                *t as i32,
-                (*r - *l) as i32,
-                (*b - *t) as i32,
-            )),
+            O::Save => {
+                mats.push(mat);
+                c.save()
+            }
+            O::Restore => {
+                if let Some(m) = mats.pop() {
+                    mat = m;
+                }
+                c.restore()
+            }
+            O::Translate { dx, dy } => {
+                mat = affine_mul(mat, [1.0, 0.0, *dx, 0.0, 1.0, *dy]);
+            }
+            O::Matrix { m } => {
+                mat = affine_mul(mat, *m);
+            }
+            O::ClipRect { l, t, r, b } => {
+                let (l, t, r, b) = affine_rect(mat, *l, *t, *r, *b);
+                c.clip_rect(Rect::new(
+                    l as i32,
+                    t as i32,
+                    (r - l).max(0.0) as i32,
+                    (b - t).max(0.0) as i32,
+                ))
+            }
             O::Color { argb } => c.draw_color(Color::from_srgb8(
                 (argb >> 16) as u8,
                 (argb >> 8) as u8,
@@ -742,7 +794,8 @@ fn replay_guest_ops(c: &mut Canvas, ops: &[ovelo_dexrt::CanvasOp]) {
                 b,
                 paint: p,
             } => {
-                let r = Rect::new(*l as i32, *t as i32, (*r - *l) as i32, (*b - *t) as i32);
+                let (l, t, r, b) = affine_rect(mat, *l, *t, *r, *b);
+                let r = Rect::new(l as i32, t as i32, (r - l) as i32, (b - t) as i32);
                 stroke_or_fill(c, r, p, 0);
             }
             O::RoundRect {
@@ -754,8 +807,10 @@ fn replay_guest_ops(c: &mut Canvas, ops: &[ovelo_dexrt::CanvasOp]) {
                 ry,
                 paint: p,
             } => {
-                let r = Rect::new(*l as i32, *t as i32, (*r - *l) as i32, (*b - *t) as i32);
-                stroke_or_fill(c, r, p, rx.max(*ry) as i32);
+                let (l, t, r, b) = affine_rect(mat, *l, *t, *r, *b);
+                let sc = affine_scale(mat);
+                let r = Rect::new(l as i32, t as i32, (r - l) as i32, (b - t) as i32);
+                stroke_or_fill(c, r, p, (rx.max(*ry) * sc) as i32);
             }
             O::Oval {
                 l,
@@ -764,7 +819,8 @@ fn replay_guest_ops(c: &mut Canvas, ops: &[ovelo_dexrt::CanvasOp]) {
                 b,
                 paint: p,
             } => {
-                let r = Rect::new(*l as i32, *t as i32, (*r - *l) as i32, (*b - *t) as i32);
+                let (l, t, r, b) = affine_rect(mat, *l, *t, *r, *b);
+                let r = Rect::new(l as i32, t as i32, (r - l) as i32, (b - t) as i32);
                 if p.style == 1 {
                     // STROKE — a real ring, not a rect outline.
                     c.stroke_oval(r, p.stroke_w.max(1.0) as i32, paint(p));
@@ -779,11 +835,14 @@ fn replay_guest_ops(c: &mut Canvas, ops: &[ovelo_dexrt::CanvasOp]) {
                 r,
                 paint: p,
             } => {
+                let sc = affine_scale(mat);
+                let (cx, cy) = affine_pt(mat, *cx, *cy);
+                let rr = *r * sc;
                 let rect = Rect::new(
-                    (*cx - *r) as i32,
-                    (*cy - *r) as i32,
-                    (*r * 2.0) as i32,
-                    (*r * 2.0) as i32,
+                    (cx - rr) as i32,
+                    (cy - rr) as i32,
+                    (rr * 2.0) as i32,
+                    (rr * 2.0) as i32,
                 );
                 if p.style == 1 {
                     c.stroke_oval(rect, p.stroke_w.max(1.0) as i32, paint(p));
@@ -796,7 +855,16 @@ fn replay_guest_ops(c: &mut Canvas, ops: &[ovelo_dexrt::CanvasOp]) {
                 fill_type,
                 paint: p,
             } => {
-                let contours = flatten_path(cmds);
+                let mut contours = flatten_path(cmds);
+                if mat != [1.0, 0.0, 0.0, 0.0, 1.0, 0.0] {
+                    for pts in &mut contours {
+                        for xy in pts.as_chunks_mut::<2>().0 {
+                            let (x, y) = affine_pt(mat, xy[0], xy[1]);
+                            xy[0] = x;
+                            xy[1] = y;
+                        }
+                    }
+                }
                 let col = paint(p);
                 if p.style != 1 {
                     let contours_i: Vec<Vec<i32>> = contours
@@ -822,7 +890,15 @@ fn replay_guest_ops(c: &mut Canvas, ops: &[ovelo_dexrt::CanvasOp]) {
                 }
             }
             O::FillPoly { pts, argb } => {
-                let ip: Vec<i32> = pts.iter().map(|f| *f as i32).collect();
+                let ip: Vec<i32> = pts
+                    .as_chunks::<2>()
+                    .0
+                    .iter()
+                    .flat_map(|xy| {
+                        let (x, y) = affine_pt(mat, xy[0], xy[1]);
+                        [x as i32, y as i32]
+                    })
+                    .collect();
                 c.fill_poly(
                     &ip,
                     Paint {
@@ -843,12 +919,14 @@ fn replay_guest_ops(c: &mut Canvas, ops: &[ovelo_dexrt::CanvasOp]) {
                 y1,
                 paint: p,
             } => {
+                let (x0, y0) = affine_pt(mat, *x0, *y0);
+                let (x1, y1) = affine_pt(mat, *x1, *y1);
                 c.draw_line(
-                    *x0 as i32,
-                    *y0 as i32,
-                    *x1 as i32,
-                    *y1 as i32,
-                    p.stroke_w.max(1.0) as i32,
+                    x0 as i32,
+                    y0 as i32,
+                    x1 as i32,
+                    y1 as i32,
+                    (p.stroke_w.max(1.0) * affine_scale(mat)) as i32,
                     paint(p),
                 );
             }
@@ -864,7 +942,10 @@ fn replay_guest_ops(c: &mut Canvas, ops: &[ovelo_dexrt::CanvasOp]) {
                 } else if p.align == 2 {
                     px -= c.measure(text, p.text_size.max(1.0));
                 }
-                c.draw_text(text, px as i32, *y as i32, paint(p));
+                let (px, py) = affine_pt(mat, px, *y);
+                let mut tp = paint(p);
+                tp.text_size *= affine_scale(mat);
+                c.draw_text(text, px as i32, py as i32, tp);
             }
             O::Bitmap {
                 x,
@@ -902,11 +983,13 @@ fn replay_guest_ops(c: &mut Canvas, ops: &[ovelo_dexrt::CanvasOp]) {
                 });
                 let pixels: &[u8] = tinted.as_deref().unwrap_or(rgba.as_ref());
                 if dw > 0 && dh > 0 && !pixels.is_empty() {
+                    let (x, y) = affine_pt(mat, *x, *y);
+                    let sc = affine_scale(mat);
                     c.draw_image(
-                        *x as i32,
-                        *y as i32,
-                        dw,
-                        dh,
+                        x as i32,
+                        y as i32,
+                        ((dw as f32) * sc).max(1.0) as usize,
+                        ((dh as f32) * sc).max(1.0) as usize,
                         *src_w as usize,
                         *src_h as usize,
                         pixels,
