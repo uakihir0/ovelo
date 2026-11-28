@@ -6765,10 +6765,8 @@ fn handler_call(vm: &mut Vm, name: &str, args: &[V]) -> Rt<Option<Option<V>>> {
                 // For sendMessage* the posted object is a Message —
                 // stamp this handler as its target so the drain-time
                 // dispatch can route it back here.
-                if name.starts_with("send") && is_message(vm, r) {
-                    if let Some(&V::Ref(h)) = args.first() {
-                        pseudo_set(vm, r, P_MSG_TARGET, V::Ref(h));
-                    }
+                if let Some(&V::Ref(h)) = args.first() {
+                    pseudo_set(vm, r, P_MSG_TARGET, V::Ref(h));
                 }
                 // *Delayed takes (r, delayMs); *AtTime takes (r, when) —
                 // our clocks are epoch-ms so `when - now` is the delay.
@@ -6830,7 +6828,50 @@ fn handler_call(vm: &mut Vm, name: &str, args: &[V]) -> Rt<Option<Option<V>>> {
             }
             Some(None)
         }
-        "removeCallbacks" | "removeCallbacksAndMessages" | "removeEqualMessages" => Some(None),
+        "removeCallbacks" | "removeCallbacksAndMessages" | "removeEqualMessages" => {
+            let target = match args.first() {
+                Some(V::Ref(h)) => *h,
+                _ => 0,
+            };
+            let wanted = args.get(1).copied();
+            let token = args.get(2).copied();
+            let matches = |vm: &Vm, r: u32| {
+                if pseudo_get(vm, r, P_MSG_TARGET) != Some(V::Ref(target)) {
+                    return false;
+                }
+                match name {
+                    "removeCallbacks" => wanted == Some(V::Ref(r)),
+                    "removeEqualMessages" => pseudo_get(vm, r, P_MSG_WHAT) == token,
+                    _ => token.is_none_or(|t| {
+                        matches!(t, V::Ref(0) | V::I32(0))
+                            || pseudo_get(vm, r, P_MSG_OBJ) == Some(t)
+                    }),
+                }
+            };
+            let pm: Vec<bool> = vm
+                .pending_runnables
+                .iter()
+                .map(|(r, _)| matches(vm, *r))
+                .collect();
+            let dm: Vec<bool> = vm
+                .delayed_runnables
+                .iter()
+                .map(|(r, _, _)| matches(vm, *r))
+                .collect();
+            let mut pi = 0;
+            vm.pending_runnables.retain(|_| {
+                let hit = pm[pi];
+                pi += 1;
+                !hit
+            });
+            let mut di = 0;
+            vm.delayed_runnables.retain(|_| {
+                let hit = dm[di];
+                di += 1;
+                !hit
+            });
+            Some(None)
+        }
         "hasMessages" => {
             let found = if let (Some(&V::Ref(target)), Some(&what)) = (args.first(), args.get(1)) {
                 vm.pending_runnables.iter().any(|(r, _)| {

@@ -11,7 +11,7 @@ use crate::value::{HostState, Obj, V};
 /// `value_eq` (identity / string content / class mirror). A guest
 /// `equals` that throws propagates — swallowing it would let a
 /// `remove` succeed where Java surfaces the exception.
-fn elem_eq(vm: &mut Vm, e: V, other: V) -> Rt<bool> {
+pub(crate) fn elem_eq(vm: &mut Vm, e: V, other: V) -> Rt<bool> {
     elem_eq_depth(vm, e, other, 0)
 }
 

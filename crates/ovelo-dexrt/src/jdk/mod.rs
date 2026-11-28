@@ -1534,64 +1534,46 @@ pub(crate) fn map_pairs_of(vm: &Vm, h: u32) -> Vec<(V, V)> {
     }
 }
 
-pub(crate) fn map_get(vm: &Vm, h: u32, k: V) -> Option<V> {
+fn map_key_eq(vm: &mut Vm, a: V, b: V) -> bool {
+    collect::elem_eq(vm, a, b).unwrap_or_else(|_| value_eq(vm, a, b))
+}
+
+fn map_pairs_for_lookup(vm: &Vm, h: u32) -> Vec<(V, V)> {
     match vm.heap.get(h) {
         Some(Obj::Host {
             state: HostState::Map(m),
             ..
-        }) => m
-            .iter()
-            .find(|(ek, _)| value_eq(vm, *ek, k))
-            .map(|(_, v)| *v),
-        Some(Obj::Instance { .. }) => {
-            let hit = match guest_map_backing(vm, h, 8).and_then(|bh| vm.heap.get(bh)) {
-                Some(Obj::Host {
-                    state: HostState::Map(m),
-                    ..
-                }) => m
-                    .iter()
-                    .find(|(ek, _)| value_eq(vm, *ek, k))
-                    .map(|(_, v)| *v),
-                _ => None,
-            };
-            if crate::dbg_flag("OVELO_MAPDBG") {
-                let kd = match k {
-                    V::Ref(kh) => match vm.heap.get(kh) {
-                        Some(Obj::Str(s)) => s.clone(),
-                        _ => format!("{kh}"),
-                    },
-                    v => format!("{v:?}"),
-                };
-                if kd.contains("humbnail") || kd.contains("Renderer") {
-                    eprintln!(
-                        "[mapdbg] get h{h} {kd} -> {hit:?} ({})",
-                        hit.map(|v| class_of(vm, v)).unwrap_or_else(|| "-".into())
-                    );
-                }
-            }
-            hit
-        }
-        _ => None,
-    }
-}
-
-pub(crate) fn map_put(vm: &mut Vm, h: u32, k: V, v: V) -> Option<V> {
-    let pos = match vm.heap.get(h) {
-        Some(Obj::Host {
-            state: HostState::Map(m),
-            ..
-        }) => m.iter().position(|(ek, _)| value_eq(vm, *ek, k)),
+        }) => m.clone(),
         Some(Obj::Instance { .. }) => {
             match guest_map_backing(vm, h, 8).and_then(|bh| vm.heap.get(bh)) {
                 Some(Obj::Host {
                     state: HostState::Map(m),
                     ..
-                }) => m.iter().position(|(ek, _)| value_eq(vm, *ek, k)),
-                _ => None,
+                }) => m.clone(),
+                _ => Vec::new(),
             }
         }
-        _ => None,
-    };
+        _ => Vec::new(),
+    }
+}
+
+fn map_key_pos(vm: &mut Vm, h: u32, k: V) -> Option<usize> {
+    let pairs = map_pairs_for_lookup(vm, h);
+    for (i, (ek, _)) in pairs.into_iter().enumerate() {
+        if map_key_eq(vm, ek, k) {
+            return Some(i);
+        }
+    }
+    None
+}
+
+pub(crate) fn map_get(vm: &mut Vm, h: u32, k: V) -> Option<V> {
+    let i = map_key_pos(vm, h, k)?;
+    map_pairs_for_lookup(vm, h).get(i).map(|(_, v)| *v)
+}
+
+pub(crate) fn map_put(vm: &mut Vm, h: u32, k: V, v: V) -> Option<V> {
+    let pos = map_key_pos(vm, h, k);
     let m = map_mut(vm, h)?;
     if let Some(i) = pos {
         return Some(std::mem::replace(&mut m[i].1, v));
@@ -1601,22 +1583,7 @@ pub(crate) fn map_put(vm: &mut Vm, h: u32, k: V, v: V) -> Option<V> {
 }
 
 pub(crate) fn map_remove(vm: &mut Vm, h: u32, k: V) -> Option<V> {
-    let i = match vm.heap.get(h) {
-        Some(Obj::Host {
-            state: HostState::Map(m),
-            ..
-        }) => m.iter().position(|(ek, _)| value_eq(vm, *ek, k)),
-        Some(Obj::Instance { .. }) => {
-            match guest_map_backing(vm, h, 8).and_then(|bh| vm.heap.get(bh)) {
-                Some(Obj::Host {
-                    state: HostState::Map(m),
-                    ..
-                }) => m.iter().position(|(ek, _)| value_eq(vm, *ek, k)),
-                _ => None,
-            }
-        }
-        _ => None,
-    }?;
+    let i = map_key_pos(vm, h, k)?;
     let m = map_mut(vm, h)?;
     Some(m.remove(i).1)
 }
