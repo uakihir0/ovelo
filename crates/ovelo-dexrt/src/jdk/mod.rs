@@ -70,6 +70,7 @@ pub(crate) const P_RECTF_L: u32 = u32::MAX - 337;
 pub(crate) const P_RECTF_T: u32 = u32::MAX - 338;
 pub(crate) const P_RECTF_R: u32 = u32::MAX - 339;
 pub(crate) const P_RECTF_B: u32 = u32::MAX - 340;
+pub(crate) const P_DRAWABLE_CALLBACK: u64 = 0xFFFD_FE41;
 pub(crate) const P_INTERP_A: u32 = u32::MAX - 450;
 pub(crate) const P_INTERP_B: u32 = u32::MAX - 451;
 pub(crate) const P_INTERP_C: u32 = u32::MAX - 452;

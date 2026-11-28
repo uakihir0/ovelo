@@ -2631,7 +2631,15 @@ pub(crate) fn call(
         }
         "setImageBitmap" | "setImageDrawable" | "setImageURI" | "setImageIcon"
         | "setImageResource" => {
-            pseudo_set(vm, this, P_IMAGE, args.get(1).copied().unwrap_or(V::I32(0)));
+            let image = args.get(1).copied().unwrap_or(V::I32(0));
+            pseudo_set(vm, this, P_IMAGE, image);
+            if name == "setImageDrawable" {
+                if let V::Ref(dh) = image {
+                    if dh != 0 {
+                        pseudo_set(vm, dh, P_DRAWABLE_CALLBACK, V::Ref(this));
+                    }
+                }
+            }
             Some(None)
         }
         "getDrawable" => Some(Some(image_drawable(vm, this))),
@@ -3239,6 +3247,11 @@ pub(crate) fn call(
             Some(None)
         }
         "willNotDraw" => Some(Some(V::I32(0))),
+        "invalidateDrawable" => {
+            let n = pint(vm, this, P_INVALID_SEQ);
+            pseudo_set(vm, this, P_INVALID_SEQ, V::I32(n.wrapping_add(1)));
+            Some(None)
+        }
         "invalidate" | "postInvalidate" => {
             // A draw-only change touches no layout/text field, but the
             // host only re-records draw ops when `view_gen` moved —

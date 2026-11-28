@@ -7705,7 +7705,7 @@ fn graphics_call(
             c,
             "getBounds" | "copyBounds" | "setBounds" | "mutate" | "getIntrinsicWidth"
             | "getIntrinsicHeight" | "invalidateSelf" | "setAlpha" | "setColorFilter"
-            | "getOpacity" | "setVisible" | "isVisible",
+            | "getOpacity" | "setVisible" | "isVisible" | "getCallback" | "setCallback",
         ) if c.ends_with("Drawable;")
             || vm.assignable_desc(c, "Landroid/graphics/drawable/Drawable;") =>
         {
@@ -7772,6 +7772,18 @@ fn graphics_call(
                     Some(Some(V::I32(b - t)))
                 }
                 "getOpacity" => Some(Some(V::I32(-3))), // TRANSLUCENT
+                "getCallback" => Some(Some(
+                    pseudo_get(vm, h, P_DRAWABLE_CALLBACK).unwrap_or(V::Ref(0)),
+                )),
+                "setCallback" => {
+                    pseudo_set(
+                        vm,
+                        h,
+                        P_DRAWABLE_CALLBACK,
+                        args.get(1).copied().unwrap_or(V::Ref(0)),
+                    );
+                    Some(None)
+                }
                 // A Drawable is visible by default. Lottie gates starting
                 // its animator on this; the framework stub returning false
                 // leaves the play/pause morph permanently at its initial frame.
