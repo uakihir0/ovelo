@@ -2411,12 +2411,15 @@ fn audio_call(vm: &mut Vm, class: &str, name: &str, args: &[V]) -> Rt<Option<Opt
                 args.get(2).map(|v| i64v(*v)).unwrap_or(0)
             }
             .max(0);
+            let byte_buffer = matches!(args.get(1), Some(V::Ref(h)) if matches!(vm.heap.get(*h), Some(Obj::Host { .. })));
+            let nonblocking = byte_buffer && args.get(3).map(|v| i32v(*v)) == Some(1);
             let mut written = pseudo_i64(vm, this, P_AUDIO_WRITTEN);
             let capacity = pseudo_i64(vm, this, P_AUDIO_BUFFER_SIZE).max(0);
             let worker = vm.cur_thread != 0 && vm.cur_thread != vm.main_thread_h;
             let mut accepted = 0i64;
             while accepted < requested {
                 audio_update_consumed(vm, this);
+                written = pseudo_i64(vm, this, P_AUDIO_WRITTEN);
                 let consumed = pseudo_i64(vm, this, P_AUDIO_CONSUMED_BASE);
                 let available = (capacity - (written - consumed).max(0)).max(0);
                 let n = (requested - accepted).min(available);
@@ -2436,7 +2439,7 @@ fn audio_call(vm: &mut Vm, class: &str, name: &str, args: &[V]) -> Rt<Option<Opt
                     }
                     continue;
                 }
-                if !worker {
+                if !worker || nonblocking {
                     break;
                 }
                 // A stream-mode AudioTrack write blocks until playback
@@ -2459,12 +2462,14 @@ fn audio_call(vm: &mut Vm, class: &str, name: &str, args: &[V]) -> Rt<Option<Opt
                         Err(e) => return Err(e),
                     }
                     audio_update_consumed(vm, this);
+                    written = pseudo_i64(vm, this, P_AUDIO_WRITTEN);
                     let consumed = pseudo_i64(vm, this, P_AUDIO_CONSUMED_BASE);
                     if capacity - (written - consumed).max(0) > 0 {
                         break;
                     }
                 }
                 audio_update_consumed(vm, this);
+                written = pseudo_i64(vm, this, P_AUDIO_WRITTEN);
                 let consumed = pseudo_i64(vm, this, P_AUDIO_CONSUMED_BASE);
                 if capacity - (written - consumed).max(0) <= 0 {
                     break;
