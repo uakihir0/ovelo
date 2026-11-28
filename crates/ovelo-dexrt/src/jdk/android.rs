@@ -2411,57 +2411,77 @@ fn audio_call(vm: &mut Vm, class: &str, name: &str, args: &[V]) -> Rt<Option<Opt
                 args.get(2).map(|v| i64v(*v)).unwrap_or(0)
             }
             .max(0);
-            audio_update_consumed(vm, this);
-            let written_before = pseudo_i64(vm, this, P_AUDIO_WRITTEN);
-            let consumed = pseudo_i64(vm, this, P_AUDIO_CONSUMED_BASE);
+            let mut written = pseudo_i64(vm, this, P_AUDIO_WRITTEN);
             let capacity = pseudo_i64(vm, this, P_AUDIO_BUFFER_SIZE).max(0);
-            let occupied = (written_before - consumed).max(0);
-            let available = (capacity - occupied).max(0);
-            let n = requested.min(available);
-            if requested > 0
-                && n == 0
-                && vm.cur_thread != 0
-                && vm.cur_thread != vm.main_thread_h
-                && vm.cur_runnable != 0
-            {
-                // Model AudioTrack's blocking write by parking the
-                // renderer worker until playback consumes enough bytes
-                // for this chunk. Re-entering the runnable retries the
-                // same input buffer, so media3 observes real-time
-                // backpressure instead of consuming a track instantly.
-                let wait = if pseudo_i64(vm, this, P_AUDIO_PLAYING) != 0 {
-                    let bpm = audio_bytes_per_ms(vm, this);
-                    ((requested + bpm - 1) / bpm).clamp(1, 100) as u64
-                } else {
-                    10
-                };
-                vm.sleep_until
-                    .insert(vm.cur_runnable, super::now_ms() as u64 + wait);
-                return Err(crate::E::Vm(crate::err("ovelo.park")));
-            }
-            let written = written_before + n;
-            pseudo_set(vm, this, P_AUDIO_WRITTEN, V::I64(written));
-            if let Some(&V::Ref(bh)) = args.get(1) {
-                if matches!(vm.heap.get(bh), Some(Obj::Host { .. })) {
-                    let pos = i32v(pseudo_get(vm, bh, P_BBUF_POS).unwrap_or(V::I32(0))).max(0);
-                    let lim = pseudo_get(vm, bh, P_BBUF_LIM)
-                        .map(|v| i32v(v).max(0))
-                        .unwrap_or(i32::MAX);
-                    pseudo_set(vm, bh, P_BBUF_POS, V::I32((pos + n as i32).min(lim)));
+            let worker = vm.cur_thread != 0 && vm.cur_thread != vm.main_thread_h;
+            let mut accepted = 0i64;
+            while accepted < requested {
+                audio_update_consumed(vm, this);
+                let consumed = pseudo_i64(vm, this, P_AUDIO_CONSUMED_BASE);
+                let available = (capacity - (written - consumed).max(0)).max(0);
+                let n = (requested - accepted).min(available);
+                if n > 0 {
+                    written += n;
+                    accepted += n;
+                    pseudo_set(vm, this, P_AUDIO_WRITTEN, V::I64(written));
+                    if let Some(&V::Ref(bh)) = args.get(1) {
+                        if matches!(vm.heap.get(bh), Some(Obj::Host { .. })) {
+                            let pos =
+                                i32v(pseudo_get(vm, bh, P_BBUF_POS).unwrap_or(V::I32(0))).max(0);
+                            let lim = pseudo_get(vm, bh, P_BBUF_LIM)
+                                .map(|v| i32v(v).max(0))
+                                .unwrap_or(i32::MAX);
+                            pseudo_set(vm, bh, P_BBUF_POS, V::I32((pos + n as i32).min(lim)));
+                        }
+                    }
+                    continue;
+                }
+                if !worker {
+                    break;
+                }
+                // A stream-mode AudioTrack write blocks until playback
+                // consumes enough buffered bytes. Keep the dex stack intact
+                // and interleave queued work in small slices; unwinding here
+                // re-runs the renderer from its top and multiplies every
+                // allocation in the media pipeline.
+                let wait_started = super::now_ms() as u64;
+                loop {
+                    let playing = pseudo_i64(vm, this, P_AUDIO_PLAYING) != 0;
+                    let paused_out = !playing && super::now_ms() as u64 - wait_started >= 10;
+                    if paused_out {
+                        break;
+                    }
+                    match vm.park_drain_within(10) {
+                        Ok(()) => {}
+                        Err(crate::E::Vm(e)) if e.cause() == "ovelo.park" => {
+                            std::thread::sleep(std::time::Duration::from_millis(1));
+                        }
+                        Err(e) => return Err(e),
+                    }
+                    audio_update_consumed(vm, this);
+                    let consumed = pseudo_i64(vm, this, P_AUDIO_CONSUMED_BASE);
+                    if capacity - (written - consumed).max(0) > 0 {
+                        break;
+                    }
+                }
+                audio_update_consumed(vm, this);
+                let consumed = pseudo_i64(vm, this, P_AUDIO_CONSUMED_BASE);
+                if capacity - (written - consumed).max(0) <= 0 {
+                    break;
                 }
             }
             if crate::dbg_flag("AUDIODBG") {
                 eprintln!(
                     "[audio] write requested={} accepted={} total={} capacity={} consumed={} playing={}",
                     requested,
-                    n,
+                    accepted,
                     written,
                     capacity,
-                    consumed,
+                    pseudo_i64(vm, this, P_AUDIO_CONSUMED_BASE),
                     pseudo_i64(vm, this, P_AUDIO_PLAYING)
                 );
             }
-            Some(Some(V::I32(n as i32)))
+            Some(Some(V::I32(accepted as i32)))
         }
         "getPlaybackHeadPosition" => {
             let frame = audio_frame_size(vm, this).max(1);
