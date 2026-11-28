@@ -193,6 +193,8 @@ const P_RADIO_CHECKED: u32 = 0xFFFD_FFDB;
 /// clickable even without an OnClickListener — TabView relies on its
 /// performClick override exactly that way.
 const P_CLICKABLE: u32 = u32::MAX - 600;
+/// TextWatcher objects registered through `addTextChangedListener`.
+const P_TEXT_WATCHERS: u32 = u32::MAX - 601;
 /// CompoundButton/RadioGroup `OnCheckedChangeListener`.
 const P_CHECK_LISTENER: u32 = 0xFFFD_FFD3;
 /// Set while a checked-change callback is on the dex stack.
@@ -2709,6 +2711,28 @@ pub(crate) fn call(
                     _ => 0,
                 },
             )))
+        }
+        "addTextChangedListener" => {
+            let w = args.get(1).copied().unwrap_or(V::Ref(0));
+            if matches!(w, V::Ref(r) if r != 0) {
+                let a = text_watchers_arr(vm, this);
+                if let Some(Obj::Array { data, .. }) = vm.heap.get_mut(a) {
+                    if !data.contains(&w) {
+                        data.push(w);
+                    }
+                }
+            }
+            Some(None)
+        }
+        "removeTextChangedListener" => {
+            if let Some(w) = args.get(1).copied() {
+                if let Some(V::Ref(a)) = pseudo_get(vm, this, P_TEXT_WATCHERS) {
+                    if let Some(Obj::Array { data, .. }) = vm.heap.get_mut(a) {
+                        data.retain(|x| *x != w);
+                    }
+                }
+            }
+            Some(None)
         }
         "setOnClickListener"
         | "setOnLongClickListener"
@@ -7096,6 +7120,74 @@ pub(crate) fn children(vm: &Vm, h: u32) -> Vec<V> {
     }
 }
 
+fn text_watchers_arr(vm: &mut Vm, h: u32) -> u32 {
+    match pseudo_get(vm, h, P_TEXT_WATCHERS) {
+        Some(V::Ref(a)) if a != 0 => a,
+        _ => {
+            let a = vm.heap.alloc(Obj::Array {
+                elem: "Landroid/text/TextWatcher;".to_string(),
+                data: Vec::new(),
+            });
+            pseudo_set(vm, h, P_TEXT_WATCHERS, V::Ref(a));
+            a
+        }
+    }
+}
+
+fn text_watchers(vm: &Vm, h: u32) -> Vec<V> {
+    match pseudo_get(vm, h, P_TEXT_WATCHERS) {
+        Some(V::Ref(a)) => match vm.heap.get(a) {
+            Some(Obj::Array { data, .. }) => data.clone(),
+            _ => Vec::new(),
+        },
+        _ => Vec::new(),
+    }
+}
+
+fn notify_text_watchers(
+    vm: &mut Vm,
+    view: u32,
+    old_text: V,
+    new_text: V,
+    start: i32,
+    count: i32,
+    after: i32,
+) {
+    let watchers = text_watchers(vm, view);
+    if watchers.is_empty() {
+        return;
+    }
+    for w in watchers.iter().copied() {
+        let V::Ref(watcher) = w else { continue };
+        if watcher == 0 {
+            continue;
+        }
+        let _ = vm.call_virtual(
+            watcher,
+            "beforeTextChanged",
+            &[old_text, V::I32(start), V::I32(count), V::I32(after)],
+        );
+    }
+    for w in watchers.iter().copied() {
+        let V::Ref(watcher) = w else { continue };
+        if watcher == 0 {
+            continue;
+        }
+        let _ = vm.call_virtual(
+            watcher,
+            "onTextChanged",
+            &[new_text, V::I32(start), V::I32(count), V::I32(after)],
+        );
+    }
+    for w in watchers {
+        let V::Ref(watcher) = w else { continue };
+        if watcher == 0 {
+            continue;
+        }
+        let _ = vm.call_virtual(watcher, "afterTextChanged", &[new_text]);
+    }
+}
+
 fn generate_view_id() -> i32 {
     // AOSP: AtomicInteger starting at 1 — dex-created views and
     // RadioGroup's automatic child ids need nonzero unique values.
@@ -7806,8 +7898,22 @@ pub(crate) fn dispatch_key(
                 }
             }
             if changed {
-                let text = jdynstr(vm, &text);
-                pseudo_set(vm, view, P_TEXT, text);
+                let old_text = pseudo_get(vm, view, P_TEXT)
+                    .or_else(|| attr_find(vm, view, "text"))
+                    .and_then(|v| text_value_string(vm, v))
+                    .unwrap_or_default();
+                let old_len = old_text.chars().count() as i32;
+                let new_len = text.chars().count() as i32;
+                let start = old_len.min(new_len);
+                let (removed, added) = if keycode == 67 {
+                    ((old_len - new_len).max(0), 0)
+                } else {
+                    (0, (new_len - old_len).max(0))
+                };
+                let old_v = jdynstr(vm, &old_text);
+                let new_v = jdynstr(vm, &text);
+                notify_text_watchers(vm, view, old_v, new_v, start, removed, added);
+                pseudo_set(vm, view, P_TEXT, new_v);
                 return Ok(true);
             }
         }
