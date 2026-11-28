@@ -2500,19 +2500,28 @@ fn guest_draw_ops_impl(vm: &mut Vm, view: u32, w: i32, h: i32, expand: bool) -> 
         .flatten()
         .is_some();
     let drawable_draw = if !has && !has_dd {
-        match pseudo_get(vm, view, super::view::P_IMAGE) {
-            Some(V::Ref(d)) if d != 0 => match vm.heap.class_of(d) {
-                Some(dci)
-                    if vm
-                        .find_method_on_chain_sig(dci, "draw", &["Landroid/graphics/Canvas;"])
-                        .ok()
-                        .flatten()
-                        .is_some() =>
-                {
-                    Some(d)
-                }
-                _ => return Vec::new(),
-            },
+        let has_draw = |vm: &Vm, d: u32| {
+            vm.heap.class_of(d).is_some_and(|dci| {
+                vm.find_method_on_chain_sig(dci, "draw", &["Landroid/graphics/Canvas;"])
+                    .ok()
+                    .flatten()
+                    .is_some()
+            })
+        };
+        let direct = match pseudo_get(vm, view, super::view::P_IMAGE) {
+            Some(V::Ref(d)) if d != 0 => Some(d),
+            _ => None,
+        };
+        match direct.or_else(|| match vm.heap.get(view) {
+            Some(Obj::Instance { fields, .. }) | Some(Obj::Host { fields, .. }) => {
+                fields.values().find_map(|v| match v {
+                    V::Ref(d) if *d != 0 && has_draw(vm, *d) => Some(*d),
+                    _ => None,
+                })
+            }
+            _ => None,
+        }) {
+            Some(d) if has_draw(vm, d) => Some(d),
             _ => return Vec::new(),
         }
     } else {
