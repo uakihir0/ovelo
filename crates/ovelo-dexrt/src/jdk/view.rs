@@ -3297,19 +3297,16 @@ pub(crate) fn call(
         }
         "setProgress" => {
             let progress = args.get(1).copied().unwrap_or(V::I32(0));
-            pseudo_set(vm, this, P_PROGRESS, progress);
-            if let Some(V::Ref(listener)) = pseudo_get(vm, this, P_SEEK_LISTENER) {
-                if listener != 0 {
-                    let cb = host(vm, "Ljava/lang/Runnable;", HostState::Empty);
-                    if let V::Ref(cbh) = cb {
-                        pseudo_set(vm, cbh, P_DEFERRED_SEEK, V::Ref(listener));
-                        let call_args = arr(
-                            vm,
-                            "Ljava/lang/Object;",
-                            vec![V::Ref(this), progress, V::I32(0)],
-                        );
-                        pseudo_set(vm, cbh, P_DATA, call_args);
-                        vm.enqueue_runnable(cbh, true);
+            let old = pseudo_get(vm, this, P_PROGRESS).unwrap_or(V::I32(0));
+            if i32v(old) != i32v(progress) {
+                pseudo_set(vm, this, P_PROGRESS, progress);
+                if let Some(V::Ref(listener)) = pseudo_get(vm, this, P_SEEK_LISTENER) {
+                    if listener != 0 {
+                        vm.call_virtual_rt(
+                            listener,
+                            "onProgressChanged",
+                            &[V::Ref(this), progress, V::I32(0)],
+                        )?;
                     }
                 }
             }
