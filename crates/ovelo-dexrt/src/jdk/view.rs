@@ -7599,7 +7599,24 @@ pub(crate) fn dispatch_touch(
             }
             // A root's frame is already absolute (screen origin).
             if let Some(v) = deepest(vm, scan_root, x, y, 0, 0) {
-                target = v;
+                // AndroidComposeView owns hit-testing for its Compose
+                // semantics tree, including embedded classic Android
+                // views. Bypassing it with the host's structural deepest
+                // child sends touches to a background RecyclerView even
+                // when a Compose overlay button drew above it.
+                let mut composed = v;
+                let mut cur = v;
+                for _ in 0..32 {
+                    if class_of(vm, V::Ref(cur)).contains("AndroidComposeView") {
+                        composed = cur;
+                        break;
+                    }
+                    cur = match pseudo_get(vm, cur, P_PARENT) {
+                        Some(V::Ref(p)) if p != 0 && p != cur => p,
+                        _ => break,
+                    };
+                }
+                target = composed;
                 break;
             }
         }
