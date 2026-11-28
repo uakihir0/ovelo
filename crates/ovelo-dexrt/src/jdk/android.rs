@@ -496,9 +496,11 @@ pub(crate) fn call(
             }
             "openInputStream" => {
                 let uri = sv(vm, args.get(1).copied().unwrap_or(V::Ref(0))).unwrap_or_default();
-                let bytes = media_uri_path(vm, &uri)
-                    .and_then(|p| std::fs::read(io::fspath(vm, &p)).ok())
-                    .unwrap_or_default();
+                let Some(bytes) =
+                    media_uri_path(vm, &uri).and_then(|p| std::fs::read(io::fspath(vm, &p)).ok())
+                else {
+                    return Err(vm.throw_builtin("Ljava/io/FileNotFoundException;", &uri));
+                };
                 Some(Some(host(
                     vm,
                     "Ljava/io/FileInputStream;",
