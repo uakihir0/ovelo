@@ -6,6 +6,264 @@ use crate::value::{HostState, Obj, V};
 
 const P_REFQ_DEADLINE: u32 = u32::MAX - 402;
 
+/// Concatenated `dalvik.annotation.Signature` strings for a dex class.
+fn class_signature(vm: &Vm, desc: &str) -> Option<String> {
+    let cg = vm.class_gidx_of(desc)?;
+    let (cg, items) = vm.class_annotation_items(cg);
+    for it in items {
+        if vm
+            .dex_of(cg)
+            .and_then(|d| d.type_descriptor(it.type_idx).ok())
+            .as_deref()
+            != Some("Ldalvik/annotation/Signature;")
+        {
+            continue;
+        }
+        let mut out = String::new();
+        for (_, v) in it.elements {
+            if let ovelo_dex::EncodedValue::Array(vals) = v {
+                for v in vals {
+                    if let ovelo_dex::EncodedValue::String(si) = v {
+                        if let Some(s) = vm.dex_of(cg).and_then(|d| d.string(si).ok()) {
+                            out.push_str(&s);
+                        }
+                    }
+                }
+            }
+        }
+        if !out.is_empty() {
+            return Some(out);
+        }
+    }
+    None
+}
+
+/// Parse one type-use from a dex generic signature. This intentionally
+/// covers the concrete class/parameterized forms reflection users need;
+/// type variables degrade to Object; wildcards preserve their bounds.
+fn generic_type_value(vm: &mut Vm, sig: &str, pos: &mut usize) -> V {
+    let b = sig.as_bytes();
+    if *pos >= b.len() {
+        return V::Ref(vm.class_handle(OBJ));
+    }
+    match b[*pos] {
+        b'L' => {
+            *pos += 1;
+            let start = *pos;
+            while *pos < b.len() && b[*pos] != b';' && b[*pos] != b'<' {
+                *pos += 1;
+            }
+            let raw_desc = format!("L{};", &sig[start..*pos]);
+            let raw = V::Ref(vm.class_handle(&raw_desc));
+            if *pos < b.len() && b[*pos] == b'<' {
+                *pos += 1;
+                let mut args = Vec::new();
+                while *pos < b.len() && b[*pos] != b'>' {
+                    args.push(generic_type_value(vm, sig, pos));
+                    if *pos < b.len() && b[*pos] == b';' {
+                        *pos += 1;
+                    }
+                }
+                if *pos < b.len() && b[*pos] == b'>' {
+                    *pos += 1;
+                }
+                if *pos < b.len() && b[*pos] == b';' {
+                    *pos += 1;
+                }
+                let args_arr = arr(vm, "Ljava/lang/reflect/Type;", args);
+                let h = vm.alloc_host("Ljava/lang/reflect/ParameterizedType;", HostState::Empty);
+                pseudo_set(vm, h, P_TARGET, raw);
+                pseudo_set(vm, h, P_DATA, args_arr);
+                V::Ref(h)
+            } else {
+                if *pos < b.len() && b[*pos] == b';' {
+                    *pos += 1;
+                }
+                raw
+            }
+        }
+        b'[' => {
+            *pos += 1;
+            let inner = generic_type_value(vm, sig, pos);
+            let _ = inner;
+            V::Ref(vm.class_handle(OBJ))
+        }
+        b'+' | b'-' | b'*' => {
+            let kind = b[*pos];
+            *pos += 1;
+            let bound = if kind == b'*' {
+                V::Ref(vm.class_handle(OBJ))
+            } else {
+                generic_type_value(vm, sig, pos)
+            };
+            let obj = V::Ref(vm.class_handle(OBJ));
+            let empty = arr(vm, "Ljava/lang/reflect/Type;", vec![]);
+            let (upper, lower) = match kind {
+                b'+' => (arr(vm, "Ljava/lang/reflect/Type;", vec![bound]), empty),
+                b'-' => (
+                    arr(vm, "Ljava/lang/reflect/Type;", vec![obj]),
+                    arr(vm, "Ljava/lang/reflect/Type;", vec![bound]),
+                ),
+                _ => (arr(vm, "Ljava/lang/reflect/Type;", vec![obj]), empty),
+            };
+            let h = vm.alloc_host("Ljava/lang/reflect/WildcardType;", HostState::Empty);
+            pseudo_set(vm, h, P_TARGET, upper);
+            pseudo_set(vm, h, P_DATA, lower);
+            V::Ref(h)
+        }
+        b'T' => {
+            while *pos < b.len() && b[*pos] != b';' && b[*pos] != b'>' {
+                *pos += 1;
+            }
+            if *pos < b.len() && b[*pos] == b';' {
+                *pos += 1;
+            }
+            V::Ref(vm.class_handle(OBJ))
+        }
+        _ => {
+            *pos += 1;
+            V::Ref(vm.class_handle(OBJ))
+        }
+    }
+}
+
+/// First superclass type in a class Signature annotation, skipping any
+/// formal type-parameter list at the start.
+fn generic_superclass_value(vm: &mut Vm, sig: &str) -> Option<V> {
+    let mut pos = 0usize;
+    let b = sig.as_bytes();
+    if b.first() == Some(&b'<') {
+        let mut depth = 0i32;
+        while pos < b.len() {
+            match b[pos] {
+                b'<' => depth += 1,
+                b'>' => {
+                    depth -= 1;
+                    if depth == 0 {
+                        pos += 1;
+                        break;
+                    }
+                }
+                _ => {}
+            }
+            pos += 1;
+        }
+    }
+    (pos < b.len()).then(|| generic_type_value(vm, sig, &mut pos))
+}
+
+fn type_variable(vm: &mut Vm, owner_desc: &str, name: &str) -> V {
+    let key = (owner_desc.to_string(), name.to_string());
+    let existing = vm.typevar_cache.borrow().get(&key).copied();
+    if let Some(h) = existing {
+        return V::Ref(h);
+    }
+    let owner = class_obj(vm, owner_desc.to_string());
+    let h = vm.alloc_host("Ljava/lang/reflect/TypeVariable;", HostState::Empty);
+    pseudo_set(vm, h, P_TARGET, owner);
+    let name_v = jstr(vm, name);
+    pseudo_set(vm, h, P_DATA, name_v);
+    vm.typevar_cache.borrow_mut().insert(key, h);
+    V::Ref(h)
+}
+
+fn type_param_names(desc: &str) -> &'static [&'static str] {
+    match desc {
+        "Ljava/util/Collection;"
+        | "Ljava/util/List;"
+        | "Ljava/util/Set;"
+        | "Ljava/util/SortedSet;"
+        | "Ljava/util/NavigableSet;"
+        | "Ljava/util/Queue;"
+        | "Ljava/util/Deque;"
+        | "Ljava/util/ArrayList;"
+        | "Ljava/util/LinkedList;"
+        | "Ljava/util/HashSet;"
+        | "Ljava/util/LinkedHashSet;"
+        | "Ljava/util/TreeSet;"
+        | "Ljava/util/Vector;"
+        | "Ljava/lang/Iterable;" => &["E"],
+        "Ljava/util/Map;"
+        | "Ljava/util/SortedMap;"
+        | "Ljava/util/NavigableMap;"
+        | "Ljava/util/HashMap;"
+        | "Ljava/util/LinkedHashMap;"
+        | "Ljava/util/TreeMap;"
+        | "Ljava/util/concurrent/ConcurrentMap;"
+        | "Ljava/util/concurrent/ConcurrentHashMap;" => &["K", "V"],
+        _ => &[],
+    }
+}
+
+fn direct_interface_names(desc: &str) -> &'static [&'static str] {
+    match desc {
+        "Ljava/util/List;" => &["Ljava/util/Collection;"],
+        "Ljava/util/ArrayList;" | "Ljava/util/LinkedList;" | "Ljava/util/Vector;" => {
+            &["Ljava/util/List;"]
+        }
+        "Ljava/util/Collection;" => &["Ljava/lang/Iterable;"],
+        "Ljava/util/Set;" => &["Ljava/util/Collection;"],
+        "Ljava/util/HashSet;" | "Ljava/util/LinkedHashSet;" => &["Ljava/util/Set;"],
+        "Ljava/util/SortedSet;" => &["Ljava/util/Set;"],
+        "Ljava/util/NavigableSet;" | "Ljava/util/TreeSet;" => &["Ljava/util/SortedSet;"],
+        "Ljava/util/Queue;" => &["Ljava/util/Collection;"],
+        "Ljava/util/Deque;" => &["Ljava/util/Queue;"],
+        "Ljava/util/SortedMap;" => &["Ljava/util/Map;"],
+        "Ljava/util/NavigableMap;" => &["Ljava/util/SortedMap;"],
+        "Ljava/util/HashMap;" | "Ljava/util/LinkedHashMap;" | "Ljava/util/TreeMap;" => {
+            &["Ljava/util/Map;"]
+        }
+        "Ljava/util/concurrent/ConcurrentMap;" => &["Ljava/util/Map;"],
+        "Ljava/util/concurrent/ConcurrentHashMap;" => &["Ljava/util/concurrent/ConcurrentMap;"],
+        _ => &[],
+    }
+}
+
+fn parameterized_host_type(vm: &mut Vm, raw_desc: &str, args: Vec<V>) -> V {
+    let raw = V::Ref(vm.class_handle(raw_desc));
+    let args_arr = arr(vm, "Ljava/lang/reflect/Type;", args);
+    let h = vm.alloc_host("Ljava/lang/reflect/ParameterizedType;", HostState::Empty);
+    pseudo_set(vm, h, P_TARGET, raw);
+    pseudo_set(vm, h, P_DATA, args_arr);
+    V::Ref(h)
+}
+
+fn class_is_interface(vm: &Vm, desc: &str) -> bool {
+    if let Some(cg) = vm.class_gidx_of(desc) {
+        if let Some((_, def)) = vm.def_loc_of(cg) {
+            return def.access_flags & 0x0200 != 0;
+        }
+    }
+    matches!(
+        desc,
+        "Ljava/lang/CharSequence;"
+            | "Ljava/lang/Comparable;"
+            | "Ljava/lang/Iterable;"
+            | "Ljava/lang/Runnable;"
+            | "Ljava/io/Serializable;"
+            | "Ljava/io/Closeable;"
+            | "Ljava/io/Flushable;"
+            | "Ljava/lang/reflect/Type;"
+            | "Ljava/lang/reflect/ParameterizedType;"
+            | "Ljava/lang/reflect/WildcardType;"
+            | "Ljava/lang/reflect/GenericArrayType;"
+            | "Ljava/lang/reflect/TypeVariable;"
+            | "Ljava/util/Collection;"
+            | "Ljava/util/List;"
+            | "Ljava/util/Set;"
+            | "Ljava/util/SortedSet;"
+            | "Ljava/util/NavigableSet;"
+            | "Ljava/util/Queue;"
+            | "Ljava/util/Deque;"
+            | "Ljava/util/Map;"
+            | "Ljava/util/SortedMap;"
+            | "Ljava/util/NavigableMap;"
+            | "Ljava/util/Iterator;"
+            | "Ljava/util/ListIterator;"
+            | "Ljava/util/Enumeration;"
+    )
+}
+
 pub(crate) fn call(
     vm: &mut Vm,
     class: &str,
@@ -1726,9 +1984,21 @@ fn class_call(vm: &mut Vm, name: &str, _sig: &str, args: &[V]) -> Rt<Option<Opti
                 )))
             }
         }
-        "isInterface" | "isPrimitive" | "isEnum" | "isAnnotation" | "isSynthetic"
-        | "isAnonymousClass" | "isLocalClass" | "isMemberClass" | "isSealed" | "isRecord"
-        | "isHidden" => Some(Some(V::I32(0))),
+        "isInterface" => {
+            let d = class_desc_of(
+                vm,
+                match args[0] {
+                    V::Ref(h) => h,
+                    _ => 0,
+                },
+            )
+            .unwrap_or_default();
+            Some(Some(V::I32(class_is_interface(vm, &d) as i32)))
+        }
+        "isPrimitive" | "isEnum" | "isAnnotation" | "isSynthetic" | "isAnonymousClass"
+        | "isLocalClass" | "isMemberClass" | "isSealed" | "isRecord" | "isHidden" => {
+            Some(Some(V::I32(0)))
+        }
         "isArray" => {
             let d = class_desc_of(
                 vm,
@@ -1803,27 +2073,29 @@ fn class_call(vm: &mut Vm, name: &str, _sig: &str, args: &[V]) -> Rt<Option<Opti
             }
         }
         "getGenericSuperclass" => {
-            // A ParameterizedType over the real superclass: Gson's
-            // TypeToken checks `instanceof ParameterizedType` and reads
-            // actualTypeArguments[0]. The dex keeps no usable Signature
-            // annotation, so the type argument degrades to Object — the
-            // result still walks Gson's Object adapter instead of
-            // throwing "Must only create direct subclasses of TypeToken".
+            // Gson's TypeToken relies on the dex Signature annotation:
+            // its anonymous subclasses carry `TypeToken<List<Foo>>` even
+            // though the erasure superclass is plain TypeToken. Preserve
+            // that parameterized type; without it Gson silently chooses
+            // the Object adapter and produces LinkedTreeMap objects.
             let d = match args[0] {
                 V::Ref(h) => class_desc_of(vm, h).unwrap_or_default(),
                 _ => String::new(),
             };
+            if let Some(sig) = class_signature(vm, &d) {
+                if let Some(v) = generic_superclass_value(vm, &sig) {
+                    return Ok(Some(Some(v)));
+                }
+            }
             let sup = host_supers(&d)
                 .first()
                 .map(|x| (*x).to_string())
                 .or_else(|| vm.super_desc(&d));
             match sup {
                 Some(sup) => {
-                    // Interned `Obj::Class` mirrors so `getRawType() ==
-                    // TypeToken.class` (handle equality, Gson's check).
                     let raw = V::Ref(vm.class_handle(&sup));
                     let obj = V::Ref(vm.class_handle(OBJ));
-                    let args_arr = arr(vm, OBJ, vec![obj]);
+                    let args_arr = arr(vm, "Ljava/lang/reflect/Type;", vec![obj]);
                     let h =
                         vm.alloc_host("Ljava/lang/reflect/ParameterizedType;", HostState::Empty);
                     pseudo_set(vm, h, P_TARGET, raw);
@@ -1885,16 +2157,70 @@ fn class_call(vm: &mut Vm, name: &str, _sig: &str, args: &[V]) -> Rt<Option<Opti
             let items = vm.nested_class_mirrors(&owner);
             Some(Some(arr(vm, "Ljava/lang/Class;", items)))
         }
+        "getInterfaces" => {
+            let d = class_desc_of(
+                vm,
+                match args[0] {
+                    V::Ref(h) => h,
+                    _ => 0,
+                },
+            )
+            .unwrap_or_default();
+            let items = direct_interface_names(&d)
+                .iter()
+                .map(|x| class_obj(vm, (*x).to_string()))
+                .collect();
+            Some(Some(arr(vm, "Ljava/lang/Class;", items)))
+        }
+        "getTypeParameters" => {
+            let d = class_desc_of(
+                vm,
+                match args[0] {
+                    V::Ref(h) => h,
+                    _ => 0,
+                },
+            )
+            .unwrap_or_default();
+            let items = type_param_names(&d)
+                .iter()
+                .map(|x| type_variable(vm, &d, x))
+                .collect();
+            Some(Some(arr(vm, "Ljava/lang/reflect/TypeVariable;", items)))
+        }
+        "getGenericInterfaces" => {
+            let d = class_desc_of(
+                vm,
+                match args[0] {
+                    V::Ref(h) => h,
+                    _ => 0,
+                },
+            )
+            .unwrap_or_default();
+            let owner_params = type_param_names(&d);
+            let items = direct_interface_names(&d)
+                .iter()
+                .map(|x| {
+                    let target_params = type_param_names(x);
+                    if !target_params.is_empty() && target_params.len() == owner_params.len() {
+                        let targs = owner_params
+                            .iter()
+                            .map(|name| type_variable(vm, &d, name))
+                            .collect();
+                        parameterized_host_type(vm, x, targs)
+                    } else {
+                        class_obj(vm, (*x).to_string())
+                    }
+                })
+                .collect();
+            Some(Some(arr(vm, "Ljava/lang/reflect/Type;", items)))
+        }
         "getConstructors"
         | "getDeclaredConstructors"
-        | "getInterfaces"
         | "getEnumConstants"
         | "getPermittedSubclasses"
         | "getSigners"
-        | "getTypeParameters"
         | "getRecordComponents"
-        | "getNestMembers"
-        | "getGenericInterfaces" => Some(Some(arr(vm, OBJ, vec![]))),
+        | "getNestMembers" => Some(Some(arr(vm, OBJ, vec![]))),
         "getField" | "getDeclaredField" => {
             let owner = class_desc_of(
                 vm,
@@ -2105,7 +2431,27 @@ fn class_call(vm: &mut Vm, name: &str, _sig: &str, args: &[V]) -> Rt<Option<Opti
         | "getNestHost"
         | "describeConstable"
         | "getModifiers0" => Some(Some(V::Ref(0))),
-        "getModifiers" => Some(Some(V::I32(1))),
+        "getModifiers" => {
+            let d = class_desc_of(
+                vm,
+                match args[0] {
+                    V::Ref(h) => h,
+                    _ => 0,
+                },
+            )
+            .unwrap_or_default();
+            let flags = vm
+                .class_gidx_of(&d)
+                .and_then(|cg| vm.def_loc_of(cg).map(|(_, def)| def.access_flags & 0xffff))
+                .unwrap_or_else(|| {
+                    if class_is_interface(vm, &d) {
+                        0x0001 | 0x0200 | 0x0400
+                    } else {
+                        0x0001
+                    }
+                });
+            Some(Some(V::I32(flags as i32)))
+        }
         // Class-level dex annotations — Navigator.@Name, DI scopes,
         // retrofit annotations all ride getAnnotation; a null stub
         // throws IllegalArgumentException in getNameForNavigator.
@@ -3234,6 +3580,24 @@ fn reflect_call(
         .and_then(|v| sv(vm, v))
         .unwrap_or_default();
     Ok(match name {
+        _ if class == "Ljava/lang/reflect/TypeVariable;" => match name {
+            "getGenericDeclaration" => Some(pseudo_get(vm, h, P_TARGET).or(Some(V::Ref(0)))),
+            "getName" => Some(pseudo_get(vm, h, P_DATA).or(Some(V::Ref(0)))),
+            _ => None,
+        },
+        _ if class == "Ljava/lang/reflect/WildcardType;" => match name {
+            "getUpperBounds" => Some(pseudo_get(vm, h, P_TARGET).or(Some(arr(
+                vm,
+                "Ljava/lang/reflect/Type;",
+                vec![],
+            )))),
+            "getLowerBounds" => Some(pseudo_get(vm, h, P_DATA).or(Some(arr(
+                vm,
+                "Ljava/lang/reflect/Type;",
+                vec![],
+            )))),
+            _ => None,
+        },
         _ if class == "Ljava/lang/reflect/ParameterizedType;" => match name {
             "getActualTypeArguments" => {
                 Some(pseudo_get(vm, h, P_DATA).or(Some(arr(vm, OBJ, vec![]))))
@@ -3380,6 +3744,18 @@ fn reflect_call(
                 },
                 _ => vec![],
             };
+            if owner == "Ljava/lang/Class;" && member == "isRecord" {
+                return Ok(Some(Some(boxed_boolean(vm, false))));
+            }
+            if owner == "Lsun/misc/Unsafe;" && member == "allocateInstance" {
+                let d = match argv.first().copied() {
+                    Some(V::Ref(h)) => class_desc_of(vm, h).unwrap_or_default(),
+                    _ => String::new(),
+                };
+                if let Ok(h) = vm.alloc_instance_raw(&d) {
+                    return Ok(Some(Some(V::Ref(h))));
+                }
+            }
             let res = match meth_idx(vm, h) {
                 // The mirror knows its exact method — dispatch it
                 // instead of re-resolving by name+arity (wrong overload).

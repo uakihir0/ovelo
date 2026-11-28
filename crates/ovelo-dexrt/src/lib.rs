@@ -462,6 +462,7 @@ pub struct Vm {
     /// `assignable_desc` is hit by `isInstance`/`isAssignableFrom` in
     /// guest hot loops; each call re-walked the whole superclass chain.
     assignable_desc_cache: std::cell::RefCell<HashMap<String, HashMap<String, bool>>>,
+    pub(crate) typevar_cache: std::cell::RefCell<HashMap<(String, String), u32>>,
     /// `midx` → `(params)ret` signature — the unresolved/builtin dispatch
     /// path re-decoded the proto's full param list on every invoke.
     proto_sig_cache: std::cell::RefCell<HashMap<GIdx, String>>,
@@ -1036,6 +1037,7 @@ impl Vm {
             type_desc_cache: std::cell::RefCell::new(HashMap::new()),
             super_desc_cache: std::cell::RefCell::new(HashMap::new()),
             assignable_desc_cache: std::cell::RefCell::new(HashMap::new()),
+            typevar_cache: std::cell::RefCell::new(HashMap::new()),
             proto_sig_cache: std::cell::RefCell::new(HashMap::new()),
             str_const_cache: std::cell::RefCell::new(HashMap::new()),
             view_gen: 0,
