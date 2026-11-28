@@ -6833,7 +6833,10 @@ fn graphics_call(
             let _ = n;
             Some(Some(V::I32(0)))
         }
-        ("Landroid/graphics/Point;", "<init>" | "set" | "offset" | "negate" | "equals") => {
+        (
+            "Landroid/graphics/Point;",
+            "<init>" | "set" | "offset" | "negate" | "equals" | "hashCode" | "toString",
+        ) => {
             let this = match args.first().copied() {
                 Some(V::Ref(h)) => h,
                 _ => 0,
@@ -6866,6 +6869,14 @@ fn graphics_call(
                     let (x, y) = point_xy(vm, this);
                     point_write(vm, this, -x, -y);
                     Some(None)
+                }
+                "hashCode" => {
+                    let (x, y) = point_xy(vm, this);
+                    Some(Some(V::I32(x.wrapping_mul(31).wrapping_add(y))))
+                }
+                "toString" => {
+                    let (x, y) = point_xy(vm, this);
+                    Some(Some(jstr(vm, &format!("Point({x}, {y})"))))
                 }
                 _ => {
                     let (x, y) = point_xy(vm, this);
