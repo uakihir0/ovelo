@@ -3576,6 +3576,20 @@ pub(crate) fn host_supers(d: &str) -> &'static [&'static str] {
             OBJ,
         ],
         "Ljava/lang/Error;" => &[THROWABLE, "Ljava/io/Serializable;", OBJ],
+        // ----- android runtime throws
+        "Landroid/util/AndroidRuntimeException;" => &[
+            "Ljava/lang/RuntimeException;",
+            "Ljava/lang/Exception;",
+            THROWABLE,
+            OBJ,
+        ],
+        "Landroid/content/ActivityNotFoundException;" => &[
+            "Landroid/util/AndroidRuntimeException;",
+            "Ljava/lang/RuntimeException;",
+            "Ljava/lang/Exception;",
+            THROWABLE,
+            OBJ,
+        ],
         // ----- android.os
         "Landroid/os/BaseBundle;" => &[OBJ],
         "Landroid/os/Bundle;" => &[

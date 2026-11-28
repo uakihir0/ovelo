@@ -329,6 +329,8 @@ pub struct Vm {
     /// Attached `TextClock` views that tick — refreshed once per
     /// `drain_runnables` pass (AOSP ticks them per postDelayed).
     pub clock_views: Vec<u32>,
+    /// Visible toast overlay roots and their monotonic dismissal deadline.
+    pub(crate) toast_overlays: Vec<(u32, u64)>,
     /// Installed-APK resource index for `LayoutInflater.inflate` — `None`
     /// degrades inflation to bare placeholder views.
     pub apk_res: Option<Box<res::ApkResources>>,
@@ -935,6 +937,7 @@ impl Vm {
             bool_cache: [0, 0],
             int_cache: [0; 256],
             clock_views: Vec::new(),
+            toast_overlays: Vec::new(),
             apk_res: None,
             dbs: HashMap::new(),
             db_handles: HashMap::new(),
@@ -2734,6 +2737,7 @@ impl Vm {
             // instead of running an unbounded inner pass.
             jdk::http::drain_coil(self);
             jdk::android::drain_jobs(self);
+            jdk::view::drain_toasts(self);
             // Retry host calls that lost the borrow race during the last
             // pass — the outer callback has released by now, so the bridge
             // runs its host-side effects (GuestUi wiring etc.). attach_at

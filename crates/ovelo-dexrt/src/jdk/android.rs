@@ -409,6 +409,29 @@ pub(crate) fn call(
 ) -> Rt<Option<Option<V>>> {
     Ok(if class == "Landroid/util/Log;" {
         log_call(vm, name, args)
+    } else if class == "Landroid/widget/Toast;" {
+        match name {
+            "makeText" => Some(Some(view::toast_make(vm, args))),
+            "show" => {
+                if let Some(V::Ref(h)) = args.first().copied() {
+                    view::toast_show(vm, h);
+                }
+                Some(None)
+            }
+            "setText" => {
+                if let Some(V::Ref(h)) = args.first().copied() {
+                    pseudo_set(
+                        vm,
+                        h,
+                        view::P_TEXT,
+                        args.get(1).copied().unwrap_or(V::Ref(0)),
+                    );
+                }
+                Some(None)
+            }
+            "setDuration" | "setGravity" | "setMargin" | "cancel" => Some(None),
+            _ => None,
+        }
     } else if class == "Landroid/os/SystemProperties;" {
         // Private platform API — Compose reads debug flags through it
         // and registers a change listener; defaults + no-op keep the
@@ -5125,6 +5148,17 @@ fn context_call(
                         })
                     });
                     vm.pending_activity = Some((d, clone_intent(vm, ih)));
+                } else {
+                    // Android resolves the component before dispatch and
+                    // throws ActivityNotFoundException synchronously when
+                    // neither an explicit component nor any implicit
+                    // intent-filter matches. Apps use that signal to show
+                    // their "no app found" fallback; silently succeeding
+                    // hides the failure and leaves listeners looking dead.
+                    return Err(vm.throw_builtin(
+                        "Landroid/content/ActivityNotFoundException;",
+                        "No Activity found to handle Intent",
+                    ));
                 }
             }
             Some(Some(V::I32(0)))

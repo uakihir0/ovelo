@@ -104,6 +104,8 @@ const P_DIALOG_NEG_LISTENER: u32 = u32::MAX - 58;
 const P_DIALOG_CONTENT: u32 = u32::MAX - 59;
 /// Dialog cancelable flag (`setCancelable(false)` stores 0).
 const P_DIALOG_CANCELABLE: u32 = u32::MAX - 34;
+/// Toast duration flag (`LENGTH_SHORT`/`LENGTH_LONG`).
+const P_DURATION: u32 = u32::MAX - 36;
 /// Synthetic AlertDialog panel wrapping custom content.
 const P_DIALOG_PANEL: u32 = u32::MAX - 35;
 /// Pseudo key: a view's lazily-minted `Menu` (Toolbar.getMenu() etc.) /
@@ -9829,6 +9831,115 @@ fn dialog_view_scan(
 
 pub(crate) fn set_dialog_cancelable(vm: &mut Vm, dialog: u32, value: V) {
     pseudo_set(vm, dialog, P_DIALOG_CANCELABLE, V::I32(i32v(value)));
+}
+
+/// `Toast.makeText` state: the text value the host overlay will render.
+pub(crate) fn toast_make(vm: &mut Vm, args: &[V]) -> V {
+    let toast = vm.alloc_host("Landroid/widget/Toast;", HostState::Empty);
+    pseudo_set(vm, toast, P_TEXT, args.get(1).copied().unwrap_or(V::Ref(0)));
+    pseudo_set(
+        vm,
+        toast,
+        P_DURATION,
+        args.get(2).copied().unwrap_or(V::I32(0)),
+    );
+    V::Ref(toast)
+}
+
+fn toast_detach(vm: &mut Vm, root: u32) {
+    if let Some(V::Ref(parent)) = pseudo_get(vm, root, P_PARENT) {
+        if parent != 0 {
+            detach(vm, parent, V::Ref(root), false);
+        }
+    }
+    vm.view_roots.retain(|r| *r != root);
+    vm.toast_overlays.retain(|(h, _)| *h != root);
+}
+
+/// Show a Toast as a transient bottom-centered overlay. This intentionally
+/// uses the same independent view-root path as dialogs: apps commonly use
+/// toasts as the only visible error feedback, and swallowing them makes
+/// correct exception handling indistinguishable from a dead click.
+pub(crate) fn toast_show(vm: &mut Vm, toast: u32) {
+    if let Some(V::Ref(old)) = pseudo_get(vm, toast, P_POPUP_ROOT) {
+        if old != 0 {
+            toast_detach(vm, old);
+        }
+    }
+    // Android queues replacement toasts rather than stacking them.
+    let existing: Vec<u32> = vm.toast_overlays.iter().map(|(h, _)| *h).collect();
+    for root in existing {
+        toast_detach(vm, root);
+    }
+    let text_v = pseudo_get(vm, toast, P_TEXT).unwrap_or(V::Ref(0));
+    let text = if let Some(s) = sv(vm, text_v) {
+        s
+    } else {
+        let id = match text_v {
+            V::I32(i) => i64::from(i),
+            V::I64(i) => i,
+            _ => 0,
+        };
+        if id > 0 {
+            vm.apk_res
+                .as_ref()
+                .and_then(|r| r.string_of(id as u32).map(|s| s.to_string()))
+                .unwrap_or_default()
+        } else {
+            String::new()
+        }
+    };
+    if text.is_empty() {
+        return;
+    }
+    let parent = activity_content(vm, vm.cur_activity).unwrap_or(0);
+    if parent == 0 {
+        return;
+    }
+    let root = vm.alloc_host("Landroid/widget/TextView;", HostState::Empty);
+    pseudo_set(vm, root, P_IS_VIEW, V::I32(1));
+    let text_obj = jstr(vm, &text);
+    pseudo_set(vm, root, P_TEXT, text_obj);
+    pseudo_set(vm, root, P_TSIZE, V::F32(14.0));
+    pseudo_set(vm, root, P_TCOLOR, V::I32(0xffff_ffffu32 as i32));
+    pseudo_set(vm, root, P_BGCOLOR, V::I32(0xdd22_2222u32 as i32));
+    for (key, pad) in [(P_PAD_L, 16), (P_PAD_T, 8), (P_PAD_R, 16), (P_PAD_B, 8)] {
+        pseudo_set(vm, root, key, V::I32(pad));
+    }
+    let (ww, wh) = vm.window_size;
+    let width = ((text.chars().count() as i32) * 8 + 32).clamp(72, ww - 32);
+    let height = 38;
+    let x = ((ww - width) / 2).max(0);
+    let y = (wh - height - 92).max(0);
+    let pl = pint(vm, parent, P_LEFT);
+    let pt = pint(vm, parent, P_TOP);
+    frame_set(vm, root, x - pl, y - pt, x - pl + width, y - pt + height);
+    attach_at(vm, parent, V::Ref(root), None, false, None);
+    vm.view_roots.retain(|r| *r != root);
+    vm.view_roots.push(root);
+    let long = i32v(pseudo_get(vm, toast, P_DURATION).unwrap_or(V::I32(0))) != 0;
+    let deadline = (now_ms() + if long { 3500 } else { 2000 }) as u64;
+    vm.toast_overlays.push((root, deadline));
+    pseudo_set(vm, root, P_POPUP_ROOT, V::Ref(toast));
+    pseudo_set(vm, toast, P_POPUP_ROOT, V::Ref(root));
+    mark_layout_requested(vm, root);
+}
+
+/// Expire visible toast overlays at a drain boundary.
+pub(crate) fn drain_toasts(vm: &mut Vm) {
+    if vm.toast_overlays.is_empty() {
+        return;
+    }
+    let now = now_ms() as u64;
+    let expired: Vec<u32> = vm
+        .toast_overlays
+        .iter()
+        .filter_map(|(h, deadline)| (*deadline <= now).then_some(*h))
+        .collect();
+    for root in expired {
+        toast_detach(vm, root);
+        mark_layout_requested(vm, root);
+    }
 }
 
 /// Show a framework/appcompat dialog as a host overlay. Dex AlertDialog
