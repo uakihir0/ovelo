@@ -193,6 +193,8 @@ const P_RADIO_CHECKED: u32 = 0xFFFD_FFDB;
 /// clickable even without an OnClickListener — TabView relies on its
 /// performClick override exactly that way.
 const P_CLICKABLE: u32 = u32::MAX - 600;
+/// View alpha (`setAlpha`/XML alpha); zero-alpha views must not paint.
+const P_ALPHA: u32 = u32::MAX - 603;
 /// TextWatcher objects registered through `addTextChangedListener`.
 const P_TEXT_WATCHERS: u32 = u32::MAX - 601;
 /// CompoundButton/RadioGroup `OnCheckedChangeListener`.
@@ -1024,10 +1026,22 @@ pub(crate) fn dex_view_info(vm: &Vm, h: u32) -> Option<DexViewInfo> {
         },
         _ => None,
     });
-    let visible = !matches!(
-        pseudo_get(vm, h, P_VIS).or(vis_attr.map(V::I32)),
-        Some(V::I32(4) | V::I32(8))
-    );
+    let alpha_attr = attr_find(vm, h, "alpha").map(|v| match v {
+        V::F32(f) => f,
+        V::F64(f) => f as f32,
+        V::I32(i) => i as f32,
+        V::Ref(r) => s(vm, r).and_then(|x| x.parse::<f32>().ok()).unwrap_or(1.0),
+        _ => 1.0,
+    });
+    let alpha = match pseudo_get(vm, h, P_ALPHA) {
+        Some(v) => f64v(v) as f32,
+        None => alpha_attr.unwrap_or(1.0),
+    };
+    let visible = alpha != 0.0
+        && !matches!(
+            pseudo_get(vm, h, P_VIS).or(vis_attr.map(V::I32)),
+            Some(V::I32(4) | V::I32(8))
+        );
     let listener = match pseudo_get(vm, h, P_LISTENER) {
         Some(V::Ref(l)) => l,
         _ => 0,
@@ -3482,8 +3496,17 @@ pub(crate) fn call(
             );
             Some(None)
         }
-        "setAlpha"
-        | "setElevation"
+        "setAlpha" => {
+            pseudo_set(
+                vm,
+                this,
+                P_ALPHA,
+                args.get(1).copied().unwrap_or(V::F32(1.0)),
+            );
+            Some(None)
+        }
+        "getAlpha" => Some(Some(pseudo_get(vm, this, P_ALPHA).unwrap_or(V::F32(1.0)))),
+        "setElevation"
         | "setShowDividers"
         | "setTranslationX"
         | "setTranslationY"
