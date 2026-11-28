@@ -5707,10 +5707,19 @@ fn context_call(
                 // finishActivity*(requestCode) ends a *child* activity
                 // started for a result, not the caller — flagging it
                 // would mark `this` finished and abort its lifecycle.
-                "finishActivity"
-                | "finishActivityFromChild"
-                | "onBackPressed"
-                | "onUserInteraction"
+                "finishActivity" | "finishActivityFromChild" => Some(None),
+                // The platform Activity default is finish(). Modern
+                // OnBackPressedDispatcher paths fall through to this
+                // after their enabled callbacks have run; treating it
+                // as an empty lifecycle callback makes toolbar/up
+                // navigation a no-op in Fossify apps.
+                "onBackPressed" => {
+                    if let V::Ref(h) = args[0] {
+                        pseudo_set(vm, h, view::P_FINISHED, V::I32(1));
+                    }
+                    Some(None)
+                }
+                "onUserInteraction"
                 | "onPostResume"
                 | "onRetainNonConfigurationInstance"
                 | "moveTaskToBack" => Some(None),
