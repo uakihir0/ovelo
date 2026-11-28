@@ -644,16 +644,23 @@ fn view_content_image(
     h: u32,
     icon_only: bool,
 ) -> Option<(u32, u32, std::rc::Rc<Vec<u8>>)> {
-    pseudo_get(vm, h, P_IMAGE)
-        .and_then(|v| image_pixels(vm, v))
-        .or_else(|| {
-            // MaterialButton's `app:icon` is a compound drawable rather
-            // than an ImageView src. The host materialization has one
-            // centered image slot, which is correct for the common
-            // icon-only button; text+icon layout needs real compound
-            // drawable support and is intentionally not approximated.
-            icon_only.then(|| attr_find(vm, h, "icon").and_then(|v| image_pixels(vm, v)))?
-        })
+    let raw_image = pseudo_get(vm, h, P_IMAGE);
+    if crate::dbg_flag("OVELO_IMGDBG") {
+        let raw_desc = match raw_image {
+            Some(V::Ref(rh)) if rh != 0 => class_of(vm, V::Ref(rh)),
+            Some(v) => format!("{v:?}"),
+            None => "none".into(),
+        };
+        eprintln!("[imgdbg] h{h} {} raw={raw_desc}", class_of(vm, V::Ref(h)));
+    }
+    raw_image.and_then(|v| image_pixels(vm, v)).or_else(|| {
+        // MaterialButton's `app:icon` is a compound drawable rather
+        // than an ImageView src. The host materialization has one
+        // centered image slot, which is correct for the common
+        // icon-only button; text+icon layout needs real compound
+        // drawable support and is intentionally not approximated.
+        icon_only.then(|| attr_find(vm, h, "icon").and_then(|v| image_pixels(vm, v)))?
+    })
 }
 
 fn style_attr_color(vm: &Vm, style: u32, attr_id: u32) -> Option<i32> {

@@ -1402,7 +1402,7 @@ impl GuestUi {
         let mut info = vm.dex_view(h)?;
         if viewdbg() {
             eprintln!(
-                "[viewdbg] node {} h{h} vis={} kids={} text={:?} frame={:?} tc={:?} bg={:?} lp={}x{}",
+                "[viewdbg] node {} h{h} vis={} kids={} text={:?} frame={:?} tc={:?} bg={:?} lp={}x{} img={:?}",
                 info.desc,
                 info.visible as u8,
                 info.children.len(),
@@ -1412,6 +1412,7 @@ impl GuestUi {
                 info.bg_color,
                 info.lp_w,
                 info.lp_h,
+                info.image.as_ref().map(|(w,h,_)| (w,h)),
             );
         }
         // First attach to the window: AOSP's dispatchAttachedToWindow

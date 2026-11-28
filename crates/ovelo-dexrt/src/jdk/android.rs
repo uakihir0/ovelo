@@ -5753,7 +5753,11 @@ fn context_call(
                         vm.has_dex_virtual(r, "run", &[])
                     );
                 }
-                if let Err(e) = vm.call_virtual(r, "run", &[]) {
+                // `runOnUiThread` is often invoked from a worker callback;
+                // executing it inline would leave Thread.currentThread() on
+                // that worker, and libraries such as Glide reject the whole
+                // load before ever reaching ImageView.setImageDrawable.
+                if let Err(e) = run_on_main(vm, r) {
                     // The runnable is the app's UI-commit point — a throw
                     // here means the data never reaches the view. Swallowing
                     // it silently leaves every screen looking "empty for no
@@ -9099,6 +9103,13 @@ fn bitmap_decode(vm: &mut Vm, bytes: &[u8]) -> Option<V> {
     // Undecodable input -> null, matching `BitmapFactory` returning null
     // for corrupt/unsupported images (guest then null-checks normally).
     let Ok(img) = image::load_from_memory(bytes) else {
+        if crate::dbg_flag("OVELO_IMGDBG") {
+            eprintln!(
+                "[imgdbg] bitmap decode failed bytes={} head={:?}",
+                bytes.len(),
+                &bytes[..bytes.len().min(16)]
+            );
+        }
         return Some(V::Ref(0));
     };
     let rgba = img.to_rgba8();
@@ -9187,6 +9198,13 @@ fn audio_embedded_image(bytes: &[u8]) -> Option<Vec<u8>> {
 /// ignoring the returned handle would leave the pool bitmap blank.
 /// Pixels are scaled into the reused bitmap's dimensions.
 fn bitmap_decode_opts(vm: &mut Vm, bytes: &[u8], args: &[V]) -> Option<V> {
+    if crate::dbg_flag("OVELO_IMGDBG") {
+        eprintln!(
+            "[imgdbg] bitmap decode bytes={} png={}",
+            bytes.len(),
+            bytes.starts_with(b"\x89PNG")
+        );
+    }
     let in_bm = args.iter().find_map(|a| match a {
         V::Ref(h) if *h != 0 => vm
             .get_object_field(*h, "Landroid/graphics/BitmapFactory$Options;", "inBitmap")
@@ -9236,40 +9254,39 @@ pub(crate) fn bitmap_dims(vm: &Vm, v: V) -> (u32, u32) {
 /// like object holding a bitmap in any ref field (BitmapDrawable.mBitmapState.mBitmap,
 /// Glide's BitmapDrawable, …).
 pub(crate) fn bitmap_pixels(vm: &Vm, v: V) -> Option<(u32, u32, std::rc::Rc<Vec<u8>>)> {
+    // Breadth-first wrapper scan: BitmapDrawable/TransitionDrawable
+    // graphs contain many unrelated references, and depth-first field
+    // order can exhaust the cycle bound before reaching the nearby bitmap.
     let mut seen = hashbrown::HashSet::new();
-    bitmap_pixels_at(vm, v, 0, &mut seen)
-}
-
-fn bitmap_pixels_at(
-    vm: &Vm,
-    v: V,
-    depth: u32,
-    seen: &mut hashbrown::HashSet<u32>,
-) -> Option<(u32, u32, std::rc::Rc<Vec<u8>>)> {
-    // Depth and object-identity bounds: drawable graphs are commonly
-    // cyclic. Depth alone still explodes exponentially when two wrapper
-    // objects reference each other through several fields.
-    if depth > 8 {
-        return None;
+    let mut queue = std::collections::VecDeque::from([(v, 0u32)]);
+    while let Some((cur, depth)) = queue.pop_front() {
+        if depth > 8 {
+            continue;
+        }
+        let V::Ref(h) = cur else { continue };
+        if !seen.insert(h) {
+            continue;
+        }
+        match vm.heap.get(h) {
+            Some(Obj::Host {
+                state: HostState::Bitmap { w, h, rgba },
+                ..
+            }) => return Some((*w, *h, rgba.clone())),
+            Some(Obj::Instance { fields, .. }) | Some(Obj::Host { fields, .. }) => {
+                for f in fields.values() {
+                    queue.push_back((*f, depth + 1));
+                }
+            }
+            // LayerDrawable/TransitionDrawable keep drawables in an array.
+            Some(Obj::Array { data, .. }) => {
+                for f in data {
+                    queue.push_back((*f, depth + 1));
+                }
+            }
+            _ => {}
+        }
     }
-    let V::Ref(h) = v else { return None };
-    if !seen.insert(h) {
-        return None;
-    }
-    match vm.heap.get(h) {
-        Some(Obj::Host {
-            state: HostState::Bitmap { w, h, rgba },
-            ..
-        }) => Some((*w, *h, rgba.clone())),
-        Some(Obj::Instance { fields, .. }) | Some(Obj::Host { fields, .. }) => fields
-            .values()
-            .find_map(|f| bitmap_pixels_at(vm, *f, depth + 1, seen)),
-        // LayerDrawable/TransitionDrawable keep drawables in an array.
-        Some(Obj::Array { data, .. }) => data
-            .iter()
-            .find_map(|f| bitmap_pixels_at(vm, *f, depth + 1, seen)),
-        _ => None,
-    }
+    None
 }
 
 /// Nearest-neighbor RGBA8 scale.
