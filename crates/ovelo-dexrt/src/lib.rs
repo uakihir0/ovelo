@@ -1340,6 +1340,26 @@ impl Vm {
         jdk::class_of(self, V::Ref(h))
     }
 
+    /// Whether a heap object's runtime class descriptor contains `needle`,
+    /// without cloning the cached descriptor on every caller.
+    pub fn dbg_class_contains(&self, h: u32, needle: &str) -> bool {
+        match self.heap.get(h) {
+            Some(Obj::Instance { class_idx, .. }) => {
+                if let Some(hit) = self.type_desc_cache.borrow().get(class_idx) {
+                    return hit.as_deref().is_some_and(|d| d.contains(needle));
+                }
+                self.type_desc_of(*class_idx)
+                    .is_ok_and(|d| d.contains(needle))
+            }
+            Some(Obj::Host { desc, .. }) => desc.contains(needle),
+            Some(Obj::Throwable { descriptor, .. }) => descriptor.contains(needle),
+            Some(Obj::Str(_)) => "Ljava/lang/String;".contains(needle),
+            Some(Obj::Class { .. }) => "Ljava/lang/Class;".contains(needle),
+            Some(Obj::Array { elem, .. }) => elem.contains(needle),
+            None => false,
+        }
+    }
+
     /// Debug: a view's recorded P_PARENT handle (0 when none).
     pub fn dbg_view_parent(&self, h: u32) -> u32 {
         jdk::view::view_parent(self, h)

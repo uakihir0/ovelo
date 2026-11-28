@@ -1262,7 +1262,7 @@ impl GuestUi {
                     rc.borrow_mut().view_mut().measured
                 );
             }
-            let compose_view = vm.dbg_class_of(h).contains("/compose/ui/platform/");
+            let compose_view = vm.dbg_class_contains(h, "/compose/ui/platform/");
             if !vm.has_gl_renderer(h) && !compose_view {
                 continue;
             }
