@@ -1192,11 +1192,19 @@ fn tint_image(
 }
 
 fn image_pixels(vm: &Vm, v: V) -> Option<(u32, u32, std::rc::Rc<Vec<u8>>)> {
-    image_pixels_at(vm, v, 0)
+    let mut seen = hashbrown::HashSet::new();
+    image_pixels_at(vm, v, 0, &mut seen)
 }
 
-fn image_pixels_at(vm: &Vm, v: V, depth: u32) -> Option<(u32, u32, std::rc::Rc<Vec<u8>>)> {
-    // Depth bound: drawable graphs can be cyclic.
+fn image_pixels_at(
+    vm: &Vm,
+    v: V,
+    depth: u32,
+    seen: &mut hashbrown::HashSet<u32>,
+) -> Option<(u32, u32, std::rc::Rc<Vec<u8>>)> {
+    // Depth and object-identity bounds: drawable graphs are commonly
+    // cyclic. Depth alone still explodes exponentially when wrappers
+    // reference each other through several fields.
     if depth > 8 {
         return None;
     }
@@ -1204,28 +1212,51 @@ fn image_pixels_at(vm: &Vm, v: V, depth: u32) -> Option<(u32, u32, std::rc::Rc<V
         V::I32(res) if res > 0 => {
             super::vector::rctx(vm).and_then(|r| super::vector::drawable_bitmap(r, res as u32))
         }
-        V::Ref(h) => super::android::bitmap_pixels(vm, v)
-            .or_else(|| {
-                pseudo_get(vm, h, P_BITMAP_SLOT).and_then(|bmp| image_pixels_at(vm, bmp, depth + 1))
-            })
-            .or_else(|| {
-                let path = image_source_path(vm, v)?;
-                decode_image(&std::fs::read(io::fspath(vm, &path)).ok()?)
-            })
-            .or_else(|| match vm.heap.get(h) {
-                Some(Obj::Instance { fields, .. }) | Some(Obj::Host { fields, .. }) => fields
-                    .values()
-                    .find_map(|f| image_pixels_at(vm, *f, depth + 1)),
-                // LayerDrawable/TransitionDrawable keep their drawables
-                // in an array field — the topmost (last) layer wins: a
-                // TransitionDrawable's "to" drawable is the real image,
-                // layer[0] is a (often blank) placeholder.
-                Some(Obj::Array { data, .. }) => data
-                    .iter()
-                    .rev()
-                    .find_map(|f| image_pixels_at(vm, *f, depth + 1)),
+        V::Ref(h) => {
+            if !seen.insert(h) {
+                return None;
+            }
+            let direct_bitmap = match vm.heap.get(h) {
+                Some(Obj::Host {
+                    state: HostState::Bitmap { w, h, rgba },
+                    ..
+                }) => Some((*w, *h, rgba.clone())),
                 _ => None,
-            }),
+            };
+            direct_bitmap
+                .or_else(|| {
+                    // The outermost bitmap search already walks the wrapper
+                    // graph. Repeating that deep search at every nested node
+                    // multiplies cyclic drawable graphs into unbounded work.
+                    if depth == 0 {
+                        super::android::bitmap_pixels(vm, v)
+                    } else {
+                        None
+                    }
+                })
+                .or_else(|| {
+                    pseudo_get(vm, h, P_BITMAP_SLOT)
+                        .and_then(|bmp| image_pixels_at(vm, bmp, depth + 1, seen))
+                })
+                .or_else(|| {
+                    let path = image_source_path(vm, v)?;
+                    decode_image(&std::fs::read(io::fspath(vm, &path)).ok()?)
+                })
+                .or_else(|| match vm.heap.get(h) {
+                    Some(Obj::Instance { fields, .. }) | Some(Obj::Host { fields, .. }) => fields
+                        .values()
+                        .find_map(|f| image_pixels_at(vm, *f, depth + 1, seen)),
+                    // LayerDrawable/TransitionDrawable keep their drawables
+                    // in an array field — the topmost (last) layer wins: a
+                    // TransitionDrawable's "to" drawable is the real image,
+                    // layer[0] is a (often blank) placeholder.
+                    Some(Obj::Array { data, .. }) => data
+                        .iter()
+                        .rev()
+                        .find_map(|f| image_pixels_at(vm, *f, depth + 1, seen)),
+                    _ => None,
+                })
+        }
         _ => None,
     }
 }

@@ -9219,17 +9219,26 @@ pub(crate) fn bitmap_dims(vm: &Vm, v: V) -> (u32, u32) {
 /// like object holding a bitmap in any ref field (BitmapDrawable.mBitmapState.mBitmap,
 /// Glide's BitmapDrawable, …).
 pub(crate) fn bitmap_pixels(vm: &Vm, v: V) -> Option<(u32, u32, std::rc::Rc<Vec<u8>>)> {
-    bitmap_pixels_at(vm, v, 0)
+    let mut seen = hashbrown::HashSet::new();
+    bitmap_pixels_at(vm, v, 0, &mut seen)
 }
 
-fn bitmap_pixels_at(vm: &Vm, v: V, depth: u32) -> Option<(u32, u32, std::rc::Rc<Vec<u8>>)> {
-    // Depth bound: drawable graphs can be cyclic (a container holding a
-    // ref back to itself) — without this the field walk overflows the
-    // host stack.
+fn bitmap_pixels_at(
+    vm: &Vm,
+    v: V,
+    depth: u32,
+    seen: &mut hashbrown::HashSet<u32>,
+) -> Option<(u32, u32, std::rc::Rc<Vec<u8>>)> {
+    // Depth and object-identity bounds: drawable graphs are commonly
+    // cyclic. Depth alone still explodes exponentially when two wrapper
+    // objects reference each other through several fields.
     if depth > 8 {
         return None;
     }
     let V::Ref(h) = v else { return None };
+    if !seen.insert(h) {
+        return None;
+    }
     match vm.heap.get(h) {
         Some(Obj::Host {
             state: HostState::Bitmap { w, h, rgba },
@@ -9237,11 +9246,11 @@ fn bitmap_pixels_at(vm: &Vm, v: V, depth: u32) -> Option<(u32, u32, std::rc::Rc<
         }) => Some((*w, *h, rgba.clone())),
         Some(Obj::Instance { fields, .. }) | Some(Obj::Host { fields, .. }) => fields
             .values()
-            .find_map(|f| bitmap_pixels_at(vm, *f, depth + 1)),
+            .find_map(|f| bitmap_pixels_at(vm, *f, depth + 1, seen)),
         // LayerDrawable/TransitionDrawable keep drawables in an array.
         Some(Obj::Array { data, .. }) => data
             .iter()
-            .find_map(|f| bitmap_pixels_at(vm, *f, depth + 1)),
+            .find_map(|f| bitmap_pixels_at(vm, *f, depth + 1, seen)),
         _ => None,
     }
 }
