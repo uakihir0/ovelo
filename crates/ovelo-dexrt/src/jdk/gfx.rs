@@ -1616,10 +1616,77 @@ fn pathmeasure_call(vm: &mut Vm, name: &str, args: &[V]) -> Rt<Option<Option<V>>
         }
         "nextContour" => Some(Some(V::I32(0))),
         "isClosed" => Some(Some(V::I32(0))),
-        // Trim-path users need real segments, but an empty segment is a
-        // safer approximation than a host stub exception; path effects
-        // that use it are handled separately.
-        "getSegment" => Some(Some(V::I32(0))),
+        "getSegment" => {
+            let start_d = flt(arg(args, 1));
+            let end_d = flt(arg(args, 2));
+            let pts = measure_points(vm, h);
+            let mut total = 0.0f32;
+            let mut lens = Vec::new();
+            for w in pts.windows(2) {
+                let len = (w[1].0 - w[0].0).hypot(w[1].1 - w[0].1);
+                lens.push(len);
+                total += len;
+            }
+            let (a, b) = if start_d <= end_d {
+                (start_d, end_d)
+            } else {
+                (end_d, start_d)
+            };
+            let a = a.clamp(0.0, total);
+            let b = b.clamp(0.0, total);
+            let mut out: Vec<(f32, f32)> = Vec::new();
+            if b > a && pts.len() >= 2 {
+                let mut acc = 0.0f32;
+                for (i, w) in pts.windows(2).enumerate() {
+                    let len = lens.get(i).copied().unwrap_or(0.0);
+                    if len <= 1e-6 {
+                        continue;
+                    }
+                    let seg0 = acc;
+                    let seg1 = acc + len;
+                    acc = seg1;
+                    if seg1 < a || seg0 > b {
+                        continue;
+                    }
+                    let at = ((a - seg0) / len).clamp(0.0, 1.0);
+                    let bt = ((b - seg0) / len).clamp(0.0, 1.0);
+                    let pa = (
+                        w[0].0 + (w[1].0 - w[0].0) * at,
+                        w[0].1 + (w[1].1 - w[0].1) * at,
+                    );
+                    let pb = (
+                        w[0].0 + (w[1].0 - w[0].0) * bt,
+                        w[0].1 + (w[1].1 - w[0].1) * bt,
+                    );
+                    if out.is_empty() {
+                        out.push(pa);
+                    }
+                    if seg0 >= a && out.last() != Some(&w[0]) {
+                        out.push(w[0]);
+                    }
+                    if out.last() != Some(&pb) {
+                        out.push(pb);
+                    }
+                    if seg1 >= b {
+                        break;
+                    }
+                }
+            }
+            if let Some(&V::Ref(dst)) = args.get(3) {
+                backing_path_h(vm, dst);
+                let move_first = i32v(args.get(4).copied().unwrap_or(V::I32(1))) != 0;
+                with_path(vm, dst, |path| {
+                    for (i, (x, y)) in out.iter().enumerate() {
+                        if i == 0 && move_first {
+                            path.push(PathCmd::MoveTo { x: *x, y: *y });
+                        } else {
+                            path.push(PathCmd::LineTo { x: *x, y: *y });
+                        }
+                    }
+                });
+            }
+            Some(Some(V::I32((out.len() >= 2) as i32)))
+        }
         _ => return Ok(None),
     })
 }
