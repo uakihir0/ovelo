@@ -966,7 +966,14 @@ impl GuestUi {
                         // outside the ui borrow since onViewRemoved is
                         // guest code re-entering bridged methods.
                         vm.view_tree_detach(this, child, notify);
-                        let ui = ui.borrow();
+                        // Guest detach callbacks can run while the frame pump
+                        // already holds the UI bridge. The dex tree has been
+                        // updated above, so the next refresh can rebuild the
+                        // host side; skipping only this eager physical removal
+                        // is preferable to panicking across the reentrant call.
+                        let Ok(ui) = ui.try_borrow() else {
+                            return Ok(None);
+                        };
                         let Some(cv) = ui
                             .views
                             .get(&child)
