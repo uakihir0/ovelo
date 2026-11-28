@@ -9143,6 +9143,12 @@ pub(crate) fn media_uri_path(vm: &Vm, uri: &str) -> Option<String> {
         return Some(uri.to_string());
     }
     if uri.starts_with("content://media/") {
+        // Album-art URIs are keyed by album id, not media row id. Resolving
+        // them through the media table can collide with an unrelated image
+        // (ovelo's seeded forest.png) and make Glide show it as cover art.
+        if uri.contains("/audio/albumart/") {
+            return None;
+        }
         if let Some(id) = uri.rsplit('/').next().and_then(|t| t.parse::<i64>().ok()) {
             for (data, i) in &vm.media_ids {
                 if *i == id {
