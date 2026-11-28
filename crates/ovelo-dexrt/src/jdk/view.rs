@@ -3050,6 +3050,11 @@ pub(crate) fn call(
             HostState::Empty,
         ))),
         "getHandler" => Some(Some(host(vm, "Landroid/os/Handler;", HostState::Empty))),
+        // This runtime has no platform content-capture service. Returning
+        // a placeholder session makes Compose believe content capture is
+        // enabled, and its periodic change checker then forces measure
+        // passes from unrelated queued callbacks.
+        "getContentCaptureSession" => Some(Some(V::Ref(0))),
         "post" | "postOnAnimation" => {
             // AttachInfo.mRunQueue work runs on the next traversal —
             // our drain pass is the same tick; Compose's OwnerSnapshot

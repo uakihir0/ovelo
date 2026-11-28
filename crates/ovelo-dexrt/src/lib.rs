@@ -5617,11 +5617,27 @@ impl Vm {
                 let m = d.method(gl(loc.midx)).ok()?;
                 d.string(m.name_idx).ok()
             });
-            matches!(md.as_deref(), Some("measureAndLayout" | "applyChanges"))
+            // R8 keeps Compose UI's `$ui`-suffixed overloads under names
+            // such as `measureAndLayout-0kLqBqw`. Those overloads set the
+            // same measure-in-progress bit as the unsuffixed entry point,
+            // so nested frame callbacks must be treated as reentrant too;
+            // otherwise a blocking resource load can enter the delegate a
+            // second time and leave its bit stuck after the guest throws.
+            md.as_deref().is_some_and(|n| {
+                n == "applyChanges"
+                    || n == "measureAndLayout"
+                    || n.starts_with("measureAndLayout-")
+                    || n == "measureOnly"
+                    || n.starts_with("updateRootConstraints")
+            })
         };
         let compose_key = if compose_measure && !matches!(kind, InvokeKind::Static) {
             match args.first() {
-                Some(V::Ref(h)) if *h != 0 => Some((*h, loc.midx)),
+                // The delegate's reentrancy bit is object-wide, while R8
+                // gives its entry points distinct method ids. Normalize
+                // those ids or an outer `measureAndLayout-…` overload fails
+                // to exclude an inner unsuffixed call on the same delegate.
+                Some(V::Ref(h)) if *h != 0 => Some((*h, GX_NONE)),
                 _ => None,
             }
         } else {
@@ -5629,7 +5645,10 @@ impl Vm {
         };
         if compose_key.is_some_and(|key| self.compose_measure_active.contains(&key)) {
             if crate::dbg_flag("OVELO_COMPOSEDBG") {
-                eprintln!("[composedbg] reenter skip key={compose_key:?}");
+                eprintln!(
+                    "[composedbg] reenter skip key={compose_key:?} {}",
+                    self.describe_method(loc.midx)
+                );
             }
             let ret_desc = self
                 .dex_of(loc.midx)
@@ -5651,7 +5670,10 @@ impl Vm {
         }
         if let Some(key) = compose_key {
             if crate::dbg_flag("OVELO_COMPOSEDBG") {
-                eprintln!("[composedbg] push key={key:?}");
+                eprintln!(
+                    "[composedbg] push key={key:?} {}",
+                    self.describe_method(loc.midx)
+                );
             }
             self.compose_measure_active.push(key);
         }

@@ -327,6 +327,42 @@ pub struct GuestUi {
 type CtorMake = Rc<dyn Fn(&GuestUi) -> GuestView>;
 type PendingCtor = (u32, CtorMake);
 
+fn ctor_view_for(vm: &Vm, ui: &GuestUi, make: &CtorMake, this: u32) -> GuestView {
+    let mut gv = make(ui);
+    // Framework constructor references often resolve to an inherited
+    // platform owner (`new EditText` reaches `View.<init>`), losing the
+    // concrete widget kind. The receiver still knows its real class, so
+    // never leave a TextView/ViewGroup subclass bound as a Plain view.
+    if matches!(gv, GuestView::Plain(_)) {
+        if let Some(desc) = vm.class_descriptor_of(this) {
+            if vm.extends_named(&desc, "Button") {
+                gv = GuestView::Btn(Button::new(
+                    "",
+                    16.0,
+                    Color::srgb(0x20, 0x20, 0x20),
+                    ui.fonts.clone(),
+                ));
+            } else if vm.extends_named(&desc, "TextView") {
+                gv = GuestView::Text(TextView::new(
+                    "",
+                    16.0,
+                    Color::srgb(0x20, 0x20, 0x20),
+                    ui.fonts.clone(),
+                ));
+            } else if vm.extends_named(&desc, "FrameLayout")
+                || vm.extends_named(&desc, "RelativeLayout")
+                || vm.extends_named(&desc, "AbsoluteLayout")
+                || vm.extends_named(&desc, "ScrollView")
+            {
+                gv = GuestView::Group(ViewGroup::overlay(Length::MatchParent, Length::MatchParent));
+            } else if vm.extends_named(&desc, "ViewGroup") {
+                gv = GuestView::Group(ViewGroup::new(Length::MatchParent, Length::WrapContent));
+            }
+        }
+    }
+    gv
+}
+
 fn argb(c: i32) -> Color {
     Color::from_srgb8((c >> 16) as u8, (c >> 8) as u8, c as u8, (c >> 24) as u8)
 }
@@ -530,7 +566,7 @@ impl GuestUi {
     /// Without this, a programmatically created embedded Compose view is
     /// present in the dex tree but has no host view object for the frame
     /// pump, so its composition never records draw operations.
-    pub fn drain_pending_ctors(&mut self) {
+    pub fn drain_pending_ctors(&mut self, vm: &Vm) {
         let q = self.ctor_pending.clone();
         while let Some((this, make)) = q.borrow_mut().pop_front() {
             let upgrade = self
@@ -539,7 +575,7 @@ impl GuestUi {
                 .map(|rc| matches!(*rc.borrow(), GuestView::Plain(_)))
                 .unwrap_or(false);
             if upgrade || !self.views.contains_key(&this) {
-                let gv = make(self);
+                let gv = ctor_view_for(vm, self, &make, this);
                 self.views.insert(this, Rc::new(RefCell::new(gv)));
             }
         }
@@ -1107,9 +1143,30 @@ impl GuestUi {
                         _ => return Err(crate::err("guest.arg.type")),
                     };
                     let mut g = rc.borrow_mut();
-                    let tv = g
-                        .text_mut()
-                        .ok_or_else(|| crate::err("guest.setText.not_text"))?;
+                    let kind = match &*g {
+                        GuestView::Plain(_) => "plain",
+                        GuestView::Text(_) => "text",
+                        GuestView::Btn(_) => "button",
+                        GuestView::Group(_) => "group",
+                    };
+                    if g.text_mut().is_none() {
+                        // Constructor resolution can bind a framework widget
+                        // through its inherited View.<init> as Plain. Reaching
+                        // TextView.setText is itself proof that the receiver is
+                        // text-capable, so repair the host object rather than
+                        // failing guest code for that binding artifact.
+                        *g = GuestView::Text(TextView::new(
+                            "",
+                            16.0,
+                            Color::srgb(0x20, 0x20, 0x20),
+                            ui.fonts.clone(),
+                        ));
+                    }
+                    let tv = g.text_mut().ok_or_else(|| {
+                        let desc = vm.class_descriptor_of(this).unwrap_or_else(|| "?".into());
+                        crate::err("guest.setText.not_text")
+                            .with_detail(format!("h{this} {desc} kind={kind}"))
+                    })?;
                     tv.set_text(text);
                     ovelo_dexrt::mark_layout_requested(vm, this);
                     Ok(None)
@@ -1227,7 +1284,7 @@ impl GuestUi {
         // changes, so pump it every tick: for materialized dex views
         // AND for bridged `new` views (guest_content_set apps like
         // 2048 whose whole UI is a bridged GLSurfaceView).
-        self.drain_pending_ctors();
+        self.drain_pending_ctors(vm);
         vm.sync_decor_frames(self.root.w, self.root.h);
         self.pump_gl_frames(vm);
         if self.guest_content_set {
@@ -1683,7 +1740,7 @@ impl GuestUi {
                         .map(|rc| matches!(*rc.borrow(), GuestView::Plain(_)))
                         .unwrap_or(false);
                     if upgrade || !g.views.contains_key(&this) {
-                        let gv = make(&g);
+                        let gv = ctor_view_for(_vm, &g, &make, this);
                         g.views.insert(this, Rc::new(RefCell::new(gv)));
                     }
                     Ok(None)
