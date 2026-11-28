@@ -1014,7 +1014,33 @@ fn canvas_call(vm: &mut Vm, name: &str, sig: &str, args: &[V]) -> Rt<Option<Opti
             };
             match target {
                 Some(V::Ref(th)) if th != 0 => {
-                    bitmap_blit(vm, th, (x, y, dw, dh), (src_w, src_h), &rgba);
+                    if sig.contains("Landroid/graphics/Matrix;") {
+                        // Glide's fitCenter path is drawBitmap(src,
+                        // matrix, paint) into a pooled bitmap. The matrix
+                        // carries the real scale/centering; treating the
+                        // draw as an unscaled top-left blit leaves the
+                        // photo tiny inside an otherwise transparent
+                        // target bitmap.
+                        let local = match arg(args, 2) {
+                            V::Ref(mh) if mh != 0 => mat_read(vm, mh),
+                            _ => [1.0, 0.0, 0.0, 0.0, 1.0, 0.0],
+                        };
+                        let canvas = match this {
+                            V::Ref(h) => mat_read(vm, h),
+                            _ => [1.0, 0.0, 0.0, 0.0, 1.0, 0.0],
+                        };
+                        let total = mat_mul(canvas, local);
+                        if crate::dbg_flag("OVELO_IMGDBG") {
+                            eprintln!(
+                                "[imgdbg] drawBitmap matrix src={src_w}x{src_h} target={}x{} local={local:?} canvas={canvas:?} total={total:?}",
+                                android::bitmap_dims(vm, V::Ref(th)).0,
+                                android::bitmap_dims(vm, V::Ref(th)).1,
+                            );
+                        }
+                        bitmap_blit_affine(vm, th, total, (src_w, src_h), &rgba);
+                    } else {
+                        bitmap_blit(vm, th, (x, y, dw, dh), (src_w, src_h), &rgba);
+                    }
                 }
                 _ => rec(
                     vm,
@@ -1037,6 +1063,92 @@ fn canvas_call(vm: &mut Vm, name: &str, sig: &str, args: &[V]) -> Rt<Option<Opti
         // concat/clipPath/drawPicture/drawVertices/drawPatch.
         _ => None,
     })
+}
+
+/// Composite `src` through an affine matrix into bitmap `dst_h`.
+/// Nearest-neighbor inverse mapping is enough for the scale/translate
+/// matrices image loaders use, and also handles rotations without
+/// collapsing them to a top-left rect.
+fn bitmap_blit_affine(vm: &mut Vm, dst_h: u32, m: [f32; 6], src_dim: (u32, u32), src: &[u8]) {
+    let (sw, sh) = src_dim;
+    let (bw, bh, base) = match vm.heap.get(dst_h) {
+        Some(Obj::Host {
+            state: HostState::Bitmap { w, h, rgba },
+            ..
+        }) => (*w, *h, rgba.clone()),
+        _ => return,
+    };
+    if bw == 0 || bh == 0 || sw == 0 || sh == 0 {
+        return;
+    }
+    let Some(inv) = mat_inv(m) else { return };
+    let corners = [
+        mat_point(m, 0.0, 0.0),
+        mat_point(m, sw as f32, 0.0),
+        mat_point(m, 0.0, sh as f32),
+        mat_point(m, sw as f32, sh as f32),
+    ];
+    let minx = corners
+        .iter()
+        .map(|p| p.0)
+        .fold(f32::INFINITY, f32::min)
+        .floor()
+        .max(0.0) as u32;
+    let miny = corners
+        .iter()
+        .map(|p| p.1)
+        .fold(f32::INFINITY, f32::min)
+        .floor()
+        .max(0.0) as u32;
+    let maxx = corners
+        .iter()
+        .map(|p| p.0)
+        .fold(f32::NEG_INFINITY, f32::max)
+        .ceil()
+        .min(bw as f32) as u32;
+    let maxy = corners
+        .iter()
+        .map(|p| p.1)
+        .fold(f32::NEG_INFINITY, f32::max)
+        .ceil()
+        .min(bh as f32) as u32;
+    if minx >= maxx || miny >= maxy {
+        return;
+    }
+    let mut out = base.as_ref().clone();
+    for yy in miny..maxy {
+        for xx in minx..maxx {
+            // `inv` is already the inverse affine — applying
+            // inv_mat_point here would invert it a second time and
+            // shrink a scale-up draw into its top-left corner.
+            let (sx, sy) = mat_point(inv, xx as f32 + 0.5, yy as f32 + 0.5);
+            if sx < 0.0 || sy < 0.0 || sx >= sw as f32 || sy >= sh as f32 {
+                continue;
+            }
+            let si = ((sy as u32 * sw + sx as u32) * 4) as usize;
+            let di = ((yy * bw + xx) * 4) as usize;
+            let a = src[si + 3] as u32;
+            if a == 0 {
+                continue;
+            }
+            if a == 255 {
+                out[di..di + 4].copy_from_slice(&src[si..si + 4]);
+            } else {
+                let ia = 255 - a;
+                for c in 0..3 {
+                    out[di + c] = ((src[si + c] as u32 * a + out[di + c] as u32 * ia) / 255) as u8;
+                }
+                out[di + 3] = (a + (out[di + 3] as u32 * ia) / 255) as u8;
+            }
+        }
+    }
+    if let Some(Obj::Host {
+        state: HostState::Bitmap { rgba: dst, .. },
+        ..
+    }) = vm.heap.get_mut(dst_h)
+    {
+        *dst = std::rc::Rc::new(out);
+    }
 }
 
 /// Composite `src` (RGBA8, `sw`x`sh`) scaled into the dest rect
