@@ -3239,7 +3239,19 @@ pub(crate) fn call(
         // on a framework skeleton class — without an arm the super call
         // no-ops and children keep 0×0 frames (MonthViewWrapper).
         "onMeasure" => {
-            group_measure_fallback(vm, this, vint(args.get(1)), vint(args.get(2)));
+            if class == VIEW {
+                // AOSP View.onMeasure is a leaf default: it calls
+                // setMeasuredDimension(getDefaultSize(...)). In
+                // particular AT_MOST fills the offered size, unlike
+                // resolveSize; custom squared image views depend on
+                // that distinction inside RecyclerView grids.
+                let w = resolve_size(0, vint(args.get(1)), false) & 0x00FF_FFFF;
+                let h = resolve_size(0, vint(args.get(2)), false) & 0x00FF_FFFF;
+                pseudo_set(vm, this, P_MEAS_W, V::I32(w));
+                pseudo_set(vm, this, P_MEAS_H, V::I32(h));
+            } else {
+                group_measure_fallback(vm, this, vint(args.get(1)), vint(args.get(2)));
+            }
             Some(None)
         }
         "onLayout" => {
