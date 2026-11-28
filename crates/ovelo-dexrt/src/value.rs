@@ -200,6 +200,8 @@ pub enum HostState {
     /// `View.onDraw` append [`CanvasOp`]s the host view materializer
     /// replays into the real surface.
     CanvasOps(Vec<CanvasOp>),
+    /// An `android.util.JsonReader` cursor.
+    JsonReader(Box<JsonReaderState>),
 }
 
 /// One absolute `android.graphics.Path` command. Relative path methods
@@ -410,6 +412,55 @@ pub enum CanvasOp {
         /// `RenderNode` heap handle.
         node: u32,
     },
+}
+
+/// Parsed JSON value for `android.util.JsonReader`.
+#[derive(Debug, Clone)]
+pub enum JsonValue {
+    /// Object entries in document order.
+    Obj(Vec<(String, JsonValue)>),
+    /// Array items in document order.
+    Arr(Vec<JsonValue>),
+    /// JSON string.
+    Str(String),
+    /// JSON number.
+    Num(f64),
+    /// JSON boolean.
+    Bool(bool),
+    /// JSON null.
+    Null,
+}
+
+/// Traversal frame for a materialized JSON object/array.
+#[derive(Debug, Clone)]
+pub enum JsonFrame {
+    /// Object cursor; `pending` is the entry whose name was returned.
+    Obj {
+        /// Entries in document order.
+        entries: Vec<(String, JsonValue)>,
+        /// Next unnamed entry.
+        idx: usize,
+        /// Name already consumed, value not yet consumed.
+        pending: Option<usize>,
+    },
+    /// Array cursor.
+    Arr {
+        /// Items in document order.
+        items: Vec<JsonValue>,
+        /// Next item.
+        idx: usize,
+    },
+}
+
+/// Streaming-API cursor over a fully parsed JSON document.
+#[derive(Debug, Clone)]
+pub struct JsonReaderState {
+    /// Document root.
+    pub root: JsonValue,
+    /// Open object/array frames.
+    pub stack: Vec<JsonFrame>,
+    /// Whether the root value was consumed.
+    pub root_used: bool,
 }
 
 /// Snapshot of a `Paint` object's state at draw time.

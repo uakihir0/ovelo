@@ -2939,6 +2939,18 @@ pub(crate) fn platform_enum_consts(class: &str) -> Option<&'static [&'static str
             "HOURS",
             "DAYS",
         ],
+        "Landroid/util/JsonToken;" => &[
+            "BEGIN_OBJECT",
+            "END_OBJECT",
+            "BEGIN_ARRAY",
+            "END_ARRAY",
+            "NAME",
+            "STRING",
+            "NUMBER",
+            "BOOLEAN",
+            "NULL",
+            "END_DOCUMENT",
+        ],
         "Landroid/graphics/Bitmap$Config;" => &[
             "ALPHA_8",
             "RGB_565",

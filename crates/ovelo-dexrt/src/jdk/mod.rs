@@ -3759,6 +3759,7 @@ pub(crate) fn host_supers(d: &str) -> &'static [&'static str] {
         | "Landroid/util/TypedValue;"
         | "Landroid/util/LruCache;"
         | "Landroid/util/Patterns;"
+        | "Landroid/util/JsonToken;"
         | "Landroid/util/JsonReader;"
         | "Landroid/util/JsonWriter;"
         | "Landroid/util/MalformedJsonException;"

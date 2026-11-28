@@ -2,7 +2,9 @@
 //! SharedPreferences, Resources, Handler/Looper (inline), PackageManager.
 
 use super::*;
-use crate::value::{CanvasOp, HostState, Obj, PaintState, V};
+use crate::value::{
+    CanvasOp, HostState, JsonFrame, JsonReaderState, JsonValue, Obj, PaintState, V,
+};
 
 const P_SCR_START_X: u32 = u32::MAX - 300;
 const P_SCR_START_Y: u32 = u32::MAX - 301;
@@ -57,6 +59,343 @@ fn call_task_cancelled(vm: &mut Vm, this: u32, result: V) -> Rt<()> {
     Ok(())
 }
 
+struct JsonParser<'a> {
+    s: &'a [u8],
+    i: usize,
+}
+
+impl<'a> JsonParser<'a> {
+    fn ws(&mut self) {
+        while matches!(self.s.get(self.i), Some(b' ' | b'\n' | b'\r' | b'\t')) {
+            self.i += 1;
+        }
+    }
+    fn value(&mut self) -> Option<JsonValue> {
+        self.ws();
+        match *self.s.get(self.i)? {
+            b'{' => self.object(),
+            b'[' => self.array(),
+            b'"' => self.string().map(JsonValue::Str),
+            b't' if self.s[self.i..].starts_with(b"true") => {
+                self.i += 4;
+                Some(JsonValue::Bool(true))
+            }
+            b'f' if self.s[self.i..].starts_with(b"false") => {
+                self.i += 5;
+                Some(JsonValue::Bool(false))
+            }
+            b'n' if self.s[self.i..].starts_with(b"null") => {
+                self.i += 4;
+                Some(JsonValue::Null)
+            }
+            b'-' | b'0'..=b'9' => self.number(),
+            _ => None,
+        }
+    }
+    fn object(&mut self) -> Option<JsonValue> {
+        self.i += 1;
+        let mut out = Vec::new();
+        loop {
+            self.ws();
+            if self.s.get(self.i) == Some(&b'}') {
+                self.i += 1;
+                return Some(JsonValue::Obj(out));
+            }
+            let k = self.string()?;
+            self.ws();
+            if self.s.get(self.i) != Some(&b':') {
+                return None;
+            }
+            self.i += 1;
+            let v = self.value()?;
+            out.push((k, v));
+            self.ws();
+            match self.s.get(self.i) {
+                Some(b',') => self.i += 1,
+                Some(b'}') => {
+                    self.i += 1;
+                    return Some(JsonValue::Obj(out));
+                }
+                _ => return None,
+            }
+        }
+    }
+    fn array(&mut self) -> Option<JsonValue> {
+        self.i += 1;
+        let mut out = Vec::new();
+        loop {
+            self.ws();
+            if self.s.get(self.i) == Some(&b']') {
+                self.i += 1;
+                return Some(JsonValue::Arr(out));
+            }
+            out.push(self.value()?);
+            self.ws();
+            match self.s.get(self.i) {
+                Some(b',') => self.i += 1,
+                Some(b']') => {
+                    self.i += 1;
+                    return Some(JsonValue::Arr(out));
+                }
+                _ => return None,
+            }
+        }
+    }
+    fn string(&mut self) -> Option<String> {
+        if self.s.get(self.i) != Some(&b'"') {
+            return None;
+        }
+        self.i += 1;
+        let mut out = String::new();
+        while let Some(&b) = self.s.get(self.i) {
+            self.i += 1;
+            match b {
+                b'"' => return Some(out),
+                b'\\' => {
+                    let e = *self.s.get(self.i)?;
+                    self.i += 1;
+                    let c = match e {
+                        b'n' => '\n',
+                        b'r' => '\r',
+                        b't' => '\t',
+                        b'b' => '\u{8}',
+                        b'f' => '\u{c}',
+                        b'u' => {
+                            let h = self.s.get(self.i..self.i + 4)?;
+                            let n = u32::from_str_radix(std::str::from_utf8(h).ok()?, 16).ok()?;
+                            self.i += 4;
+                            char::from_u32(n).unwrap_or('\u{fffd}')
+                        }
+                        _ => e as char,
+                    };
+                    out.push(c);
+                }
+                _ => out.push(b as char),
+            }
+        }
+        None
+    }
+    fn number(&mut self) -> Option<JsonValue> {
+        let st = self.i;
+        if self.s.get(self.i) == Some(&b'-') {
+            self.i += 1;
+        }
+        while matches!(
+            self.s.get(self.i),
+            Some(b'0'..=b'9' | b'.' | b'e' | b'E' | b'+' | b'-')
+        ) {
+            self.i += 1;
+        }
+        std::str::from_utf8(&self.s[st..self.i])
+            .ok()?
+            .parse()
+            .ok()
+            .map(JsonValue::Num)
+    }
+}
+
+fn json_peek(st: &JsonReaderState) -> (String, Option<JsonValue>) {
+    match st.stack.last() {
+        Some(JsonFrame::Obj {
+            entries,
+            idx,
+            pending,
+        }) => {
+            if let Some(&pi) = pending.as_ref() {
+                return json_token(entries.get(pi).map(|(_, v)| v));
+            }
+            if *idx < entries.len() {
+                ("NAME".into(), None)
+            } else {
+                ("END_OBJECT".into(), None)
+            }
+        }
+        Some(JsonFrame::Arr { items, idx }) => {
+            if *idx < items.len() {
+                json_token(items.get(*idx))
+            } else {
+                ("END_ARRAY".into(), None)
+            }
+        }
+        None if !st.root_used => json_token(Some(&st.root)),
+        None => ("END_DOCUMENT".into(), None),
+    }
+}
+
+fn json_token(v: Option<&JsonValue>) -> (String, Option<JsonValue>) {
+    match v {
+        Some(JsonValue::Obj(_)) => ("BEGIN_OBJECT".into(), v.cloned()),
+        Some(JsonValue::Arr(_)) => ("BEGIN_ARRAY".into(), v.cloned()),
+        Some(JsonValue::Str(_)) => ("STRING".into(), v.cloned()),
+        Some(JsonValue::Num(_)) => ("NUMBER".into(), v.cloned()),
+        Some(JsonValue::Bool(_)) => ("BOOLEAN".into(), v.cloned()),
+        Some(JsonValue::Null) => ("NULL".into(), v.cloned()),
+        None => ("END_DOCUMENT".into(), None),
+    }
+}
+
+fn json_take(st: &mut JsonReaderState) -> Option<JsonValue> {
+    match st.stack.last_mut() {
+        Some(JsonFrame::Obj {
+            entries,
+            idx,
+            pending,
+        }) => {
+            let pi = pending.take()?;
+            *idx = (*idx + 1).max(pi + 1);
+            entries.get(pi).map(|(_, v)| v.clone())
+        }
+        Some(JsonFrame::Arr { items, idx }) => {
+            let v = items.get(*idx)?.clone();
+            *idx += 1;
+            Some(v)
+        }
+        None if !st.root_used => {
+            st.root_used = true;
+            Some(st.root.clone())
+        }
+        None => None,
+    }
+}
+
+fn json_boolish(v: Option<JsonValue>) -> bool {
+    match v {
+        Some(JsonValue::Bool(b)) => b,
+        Some(JsonValue::Str(s)) => s == "true",
+        _ => false,
+    }
+}
+
+fn jsonreader_call(vm: &mut Vm, name: &str, args: &[V]) -> Option<Option<V>> {
+    let this = match args.first().copied() {
+        Some(V::Ref(h)) => h,
+        _ => return Some(None),
+    };
+    if name == "<init>" {
+        let chars = match args.get(1).copied() {
+            Some(V::Ref(rh)) => match vm.heap.get(rh) {
+                Some(Obj::Host {
+                    state: HostState::Chars(chars, pos, _),
+                    ..
+                }) => Some(String::from_utf16_lossy(&chars[*pos..])),
+                _ => None,
+            },
+            _ => None,
+        };
+        if let Some(text) = chars {
+            if let Some(root) = (JsonParser {
+                s: text.as_bytes(),
+                i: 0,
+            })
+            .value()
+            {
+                let st = JsonReaderState {
+                    root,
+                    stack: Vec::new(),
+                    root_used: false,
+                };
+                if let Some(Obj::Host { state, .. }) = vm.heap.get_mut(this) {
+                    *state = HostState::JsonReader(Box::new(st));
+                }
+            }
+        }
+        return Some(None);
+    }
+    let mut st = match vm.heap.get(this) {
+        Some(Obj::Host {
+            state: HostState::JsonReader(st),
+            ..
+        }) => st.as_ref().clone(),
+        _ => return Some(None),
+    };
+    let out = match name {
+        "beginObject" => {
+            if let Some(JsonValue::Obj(entries)) = json_take(&mut st) {
+                st.stack.push(JsonFrame::Obj {
+                    entries,
+                    idx: 0,
+                    pending: None,
+                });
+            }
+            None
+        }
+        "beginArray" => {
+            if let Some(JsonValue::Arr(items)) = json_take(&mut st) {
+                st.stack.push(JsonFrame::Arr { items, idx: 0 });
+            }
+            None
+        }
+        "endObject" | "endArray" => {
+            st.stack.pop();
+            None
+        }
+        "hasNext" => Some(V::I32(match st.stack.last() {
+            Some(JsonFrame::Obj {
+                entries,
+                idx,
+                pending,
+            }) => (pending.is_none() && *idx < entries.len()) as i32,
+            Some(JsonFrame::Arr { items, idx }) => (*idx < items.len()) as i32,
+            None => (!st.root_used) as i32,
+        })),
+        "nextName" => {
+            let name = match st.stack.last_mut() {
+                Some(JsonFrame::Obj {
+                    entries,
+                    idx,
+                    pending,
+                }) if *idx < entries.len() => {
+                    *pending = Some(*idx);
+                    Some(entries[*idx].0.clone())
+                }
+                _ => None,
+            };
+            name.map(|n| jstr(vm, &n)).unwrap_or(V::Ref(0)).into()
+        }
+        "nextString" => Some(match json_take(&mut st) {
+            Some(JsonValue::Str(s)) => jstr(vm, &s),
+            Some(JsonValue::Num(n)) => jstr(vm, &n.to_string()),
+            Some(JsonValue::Bool(b)) => jstr(vm, if b { "true" } else { "false" }),
+            _ => V::Ref(0),
+        }),
+        "nextDouble" => Some(V::F64(match json_take(&mut st) {
+            Some(JsonValue::Num(n)) => n,
+            Some(JsonValue::Str(s)) => s.parse().unwrap_or(0.0),
+            _ => 0.0,
+        })),
+        "nextLong" => Some(V::I64(match json_take(&mut st) {
+            Some(JsonValue::Num(n)) => n as i64,
+            Some(JsonValue::Str(s)) => s.parse().unwrap_or(0),
+            _ => 0,
+        })),
+        "nextInt" => Some(V::I32(match json_take(&mut st) {
+            Some(JsonValue::Num(n)) => n as i32,
+            Some(JsonValue::Str(s)) => s.parse().unwrap_or(0),
+            _ => 0,
+        })),
+        "nextBoolean" => Some(V::I32(json_boolish(json_take(&mut st)) as i32)),
+        "nextNull" | "skipValue" => {
+            let _ = json_take(&mut st);
+            None
+        }
+        "peek" => {
+            let tok = json_peek(&st).0;
+            return Some(Some(lang::enum_const(vm, "Landroid/util/JsonToken;", &tok)));
+        }
+        "close" => {
+            st.stack.clear();
+            st.root_used = true;
+            None
+        }
+        "setLenient" | "promoteNameToValue" => None,
+        _ => None,
+    };
+    if let Some(Obj::Host { state, .. }) = vm.heap.get_mut(this) {
+        *state = HostState::JsonReader(Box::new(st));
+    }
+    Some(out)
+}
+
 pub(crate) fn call(
     vm: &mut Vm,
     class: &str,
@@ -83,6 +422,8 @@ pub(crate) fn call(
             }
             _ => None,
         }
+    } else if class == "Landroid/util/JsonReader;" {
+        jsonreader_call(vm, name, args)
     } else if class == "Landroid/util/Size;" {
         // Size's width/height are private final fields in the framework;
         // keep them as pseudo state because the constructor receiver can
