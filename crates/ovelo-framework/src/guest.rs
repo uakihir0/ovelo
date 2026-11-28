@@ -308,6 +308,9 @@ pub struct GuestUi {
     /// True once the guest set a real `GuestView` content view — the
     /// dex-tree renderer must not clobber it.
     guest_content_set: bool,
+    /// Per-handle Compose-view probe cache; repeating the class walk for
+    /// every non-GL view on every frame dominates media playback CPU.
+    compose_cache: HashMap<u32, bool>,
 }
 
 fn argb(c: i32) -> Color {
@@ -501,6 +504,7 @@ impl GuestUi {
             dex_attached: HashSet::new(),
             attach_pending: Vec::new(),
             guest_content_set: false,
+            compose_cache: HashMap::new(),
         }))
     }
 
@@ -1262,8 +1266,13 @@ impl GuestUi {
                     rc.borrow_mut().view_mut().measured
                 );
             }
-            let compose_view = vm.dbg_class_contains(h, "/compose/ui/platform/");
-            if !vm.has_gl_renderer(h) && !compose_view {
+            let has_gl = vm.has_gl_renderer(h);
+            let compose_view = !has_gl
+                && *self
+                    .compose_cache
+                    .entry(h)
+                    .or_insert_with(|| vm.dbg_class_contains(h, "/compose/ui/platform/"));
+            if !has_gl && !compose_view {
                 continue;
             }
             let (w, hh) = if self.dex_views.contains_key(&h) {
