@@ -3001,6 +3001,9 @@ pub(crate) fn platform_enum_consts(class: &str) -> Option<&'static [&'static str
             "LUMINOSITY",
         ],
         "Landroid/graphics/Path$Direction;" => &["CW", "CCW"],
+        "Landroid/graphics/Path$FillType;" => {
+            &["EVEN_ODD", "INVERSE_EVEN_ODD", "WINDING", "INVERSE_WINDING"]
+        }
         "Landroid/graphics/Region$Op;" => &[
             "DIFFERENCE",
             "INTERSECT",

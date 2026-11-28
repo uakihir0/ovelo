@@ -953,13 +953,14 @@ fn canvas_call(vm: &mut Vm, name: &str, sig: &str, args: &[V]) -> Rt<Option<Opti
         "drawPath" => {
             if let V::Ref(ph) = arg(args, 1) {
                 if let Some((cmds, fill_type)) = path_clone(vm, ph) {
+                    let paint = ps(vm, args);
                     rec(
                         vm,
                         this,
                         CanvasOp::Path {
                             cmds,
                             fill_type,
-                            paint: ps(vm, args),
+                            paint,
                         },
                     );
                 }
