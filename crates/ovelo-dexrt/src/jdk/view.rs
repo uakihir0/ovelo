@@ -7616,7 +7616,10 @@ pub(crate) fn dispatch_touch(
                         _ => break,
                     };
                 }
-                target = composed;
+                let classic_interactive = matches!(pseudo_get(vm, v, P_LISTENER), Some(V::Ref(l)) if l != 0)
+                    || pseudo_get(vm, v, P_DIALOG_BUTTON_WHICH).is_some()
+                    || is_compound_desc(vm, &class_of(vm, V::Ref(v)));
+                target = if classic_interactive { v } else { composed };
                 break;
             }
         }
