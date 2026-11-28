@@ -1791,7 +1791,7 @@ fn universal(vm: &mut Vm, class: &str, name: &str, sig: &str, args: &[V]) -> Rt<
     // receiver's concrete Point implementation.
     if matches!(name, "toString" | "hashCode") {
         if let Some(V::Ref(h)) = args.first().copied() {
-            if vm.class_descriptor_of(h).as_deref() == Some("Landroid/graphics/Point;") {
+            if vm.dbg_class_of(h) == "Landroid/graphics/Point;" {
                 let (x, y) = point_xy(vm, h);
                 return Ok(Some(Some(if name == "toString" {
                     jdynstr(vm, &format!("Point({x}, {y})"))
