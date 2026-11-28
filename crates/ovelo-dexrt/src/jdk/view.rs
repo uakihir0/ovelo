@@ -8474,6 +8474,7 @@ pub(crate) fn attach_at(
             };
             vm.content_frames.insert(owner, parent);
             vm.content_views.insert(owner, ch);
+            tag_decor_view_tree_owners(vm, top, owner);
             vm.decor_roots.insert(owner, top);
         }
     }
@@ -8804,6 +8805,27 @@ pub(crate) fn dialog_ctx(vm: &mut Vm, dialog: u32) -> V {
     pseudo_get(vm, dialog, P_CONTEXT).unwrap_or(V::Ref(0))
 }
 
+fn tag_decor_view_tree_owners(vm: &mut Vm, decor: u32, owner: u32) {
+    if owner == 0 {
+        return;
+    }
+    // ComponentActivity normally tags its decor with the activity as the
+    // view-tree Lifecycle/SavedState/ViewModelStore owner. That happens
+    // before a real PhoneWindow has a decor, which this runtime creates
+    // lazily, so the dex-side initialization can miss entirely. Restore
+    // the invariants here; embedded Compose views resolve these owners by
+    // walking their parents and otherwise compose against a null owner.
+    for name in [
+        "view_tree_lifecycle_owner",
+        "view_tree_saved_state_registry_owner",
+        "view_tree_view_model_store_owner",
+    ] {
+        if let Some(id) = vm.apk_res.as_ref().and_then(|r| r.id_named(name)) {
+            pseudo_set(vm, decor, tag_key(id as i32), V::Ref(owner));
+        }
+    }
+}
+
 /// The Window's decor view (a ViewGroup), created once. The decor
 /// always contains the framework content frame (`android.R.id.content`,
 /// `0x01020002`) that app content and AppCompat's sub-decor rebind into —
@@ -8818,13 +8840,15 @@ pub(crate) fn decor_of(vm: &mut Vm, window: u32) -> Option<u32> {
     // which activity's decor applies.
     let owner = match pseudo_get(vm, window, P_TARGET) {
         Some(V::Ref(a)) => a,
-        _ => 0,
+        _ => vm.cur_activity,
     };
     if let Some(&d) = vm.decor_roots.get(&owner) {
+        tag_decor_view_tree_owners(vm, d, owner);
         pseudo_set(vm, window, P_DECOR, V::Ref(d));
         return Some(d);
     }
     if let Some(V::Ref(d)) = pseudo_get(vm, window, P_DECOR) {
+        tag_decor_view_tree_owners(vm, d, owner);
         return Some(d);
     }
     let d = vm.alloc_host(VIEWGROUP, HostState::Empty);
@@ -8851,6 +8875,7 @@ pub(crate) fn decor_of(vm: &mut Vm, window: u32) -> Option<u32> {
     frame_set(vm, d, 0, 0, ww, wh);
     frame_set(vm, cf, 0, 0, ww, wh);
     vm.content_frames.insert(owner, cf);
+    tag_decor_view_tree_owners(vm, d, owner);
     pseudo_set(vm, window, P_DECOR, V::Ref(d));
     // The synthetic decor is parentless so no attach events fire early,
     // but it is still the window's render/input root once content is
