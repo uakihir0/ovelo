@@ -2481,7 +2481,32 @@ fn thread_call(vm: &mut Vm, name: &str, _sig: &str, args: &[V]) -> Rt<Option<Opt
                     // every Thread.sleep and must never hit the worker
                     // repark cap.
                     let rcls = super::class_of(vm, V::Ref(r));
-                    eprintln!("[thread] start {rcls} runnable=0x{r:x}");
+                    if crate::dbg_flag("OVELO_THRDBG") {
+                        let inner_v = vm.get_object_field(r, "Lu5;", "h");
+                        let inner = inner_v
+                            .map(|v| match v {
+                                V::Ref(x) if x != 0 => super::class_of(vm, V::Ref(x)),
+                                _ => format!("{v:?}"),
+                            })
+                            .unwrap_or_else(|| "?".into());
+                        let mut detail = String::new();
+                        if let Some(V::Ref(x)) = inner_v {
+                            let mode = vm
+                                .get_object_field(x, "Lad2;", "g")
+                                .map(|v| format!("{v:?}"))
+                                .unwrap_or_else(|| "?".into());
+                            let cls = |name: &str| {
+                                vm.get_object_field(x, "Lad2;", name)
+                                    .map(|v| match v {
+                                        V::Ref(y) if y != 0 => super::class_of(vm, V::Ref(y)),
+                                        _ => format!("{v:?}"),
+                                    })
+                                    .unwrap_or_else(|| "?".into())
+                            };
+                            detail = format!(" mode={mode} i={} h={}", cls("i"), cls("h"));
+                        }
+                        eprintln!("[thread] start {rcls} inner={inner}{detail} runnable=0x{r:x}");
+                    }
                     // GLSurfaceView$GLThread waits on surface state inside
                     // its own manager — set it directly since the real
                     // SurfaceHolder.Callback chain never fires here.

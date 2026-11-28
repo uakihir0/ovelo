@@ -4053,8 +4053,18 @@ fn dialog_call(vm: &mut Vm, name: &str, args: &[V]) -> Rt<Option<Option<V>>> {
     }))
 }
 
+/// JobInfo uses content-triggered scheduling. Unlike latency/expedited
+/// jobs, these must not fire merely because they were scheduled.
+const P_JOB_CONTENT_TRIGGER: u32 = u32::MAX - 602;
+
 fn copy_job_fields(vm: &mut Vm, from: u32, to: u32) {
-    for k in [P_COMPONENT, P_DATA, P_FLAGS, P_META as u32] {
+    for k in [
+        P_COMPONENT,
+        P_DATA,
+        P_FLAGS,
+        P_META as u32,
+        P_JOB_CONTENT_TRIGGER,
+    ] {
         if let Some(v) = pseudo_get(vm, from, k) {
             pseudo_set(vm, to, k, v);
         }
@@ -4102,9 +4112,11 @@ fn job_call(vm: &mut Vm, class: &str, name: &str, args: &[V]) -> Rt<Option<Optio
             copy_job_fields(vm, this, jh);
             Some(Some(V::Ref(jh)))
         }
-        ("Landroid/app/job/JobInfo$Builder;", n)
-            if n.starts_with("set") || n == "addTriggerContentUri" =>
-        {
+        ("Landroid/app/job/JobInfo$Builder;", "addTriggerContentUri") => {
+            pseudo_set(vm, this, P_JOB_CONTENT_TRIGGER, V::I32(1));
+            Some(Some(args[0]))
+        }
+        ("Landroid/app/job/JobInfo$Builder;", n) if n.starts_with("set") => {
             // Constraint details decide *when* AOSP runs the job; the
             // runtime's scheduler is best-effort and currently only needs
             // extras/component/identity preserved. Every builder setter
@@ -4191,6 +4203,11 @@ pub(crate) fn drain_jobs(vm: &mut Vm) {
         .partition(|(_, _, t)| *t <= now);
     vm.pending_jobs = later;
     for (jh, ch, _) in due {
+        // A content-triggered job is armed for future media changes; it
+        // is not runnable just because its latency (usually zero) is due.
+        if pseudo_get(vm, jh, P_JOB_CONTENT_TRIGGER).is_some() {
+            continue;
+        }
         let Some(desc) = job_service_desc(vm, ch) else {
             continue;
         };
