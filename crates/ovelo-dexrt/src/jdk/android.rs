@@ -148,7 +148,7 @@ pub(crate) fn call(
     } else if class.starts_with("Landroid/media/Audio")
         || class.starts_with("Landroid/media/session/PlaybackState")
     {
-        audio_call(vm, class, name, args)
+        audio_call(vm, class, name, args)?
     } else if class.starts_with("Landroid/media/MediaCodec")
         || class.starts_with("Landroid/media/MediaFormat")
     {
@@ -2211,12 +2211,12 @@ fn media_codec_call(
     }
 }
 
-fn audio_call(vm: &mut Vm, class: &str, name: &str, args: &[V]) -> Option<Option<V>> {
+fn audio_call(vm: &mut Vm, class: &str, name: &str, args: &[V]) -> Rt<Option<Option<V>>> {
     let this = match args.first() {
         Some(&V::Ref(h)) => h,
         _ => 0,
     };
-    match name {
+    Ok(match name {
         "<init>" => {
             if class == "Landroid/media/AudioTrack;" && args.len() >= 7 {
                 // Legacy streamType/sampleRate/channelConfig/encoding/size/mode ctor.
@@ -2415,12 +2415,30 @@ fn audio_call(vm: &mut Vm, class: &str, name: &str, args: &[V]) -> Option<Option
             let written_before = pseudo_i64(vm, this, P_AUDIO_WRITTEN);
             let consumed = pseudo_i64(vm, this, P_AUDIO_CONSUMED_BASE);
             let capacity = pseudo_i64(vm, this, P_AUDIO_BUFFER_SIZE).max(0);
-            // A cooperative VM cannot block in write() the way a real
-            // AudioTrack thread would. Accept the full request once the
-            // nominal buffer is full rather than spinning forever inside
-            // the caller; playback position is still governed by
-            // consumed bytes below.
-            let n = requested;
+            let occupied = (written_before - consumed).max(0);
+            let available = (capacity - occupied).max(0);
+            let n = requested.min(available);
+            if requested > 0
+                && n == 0
+                && vm.cur_thread != 0
+                && vm.cur_thread != vm.main_thread_h
+                && vm.cur_runnable != 0
+            {
+                // Model AudioTrack's blocking write by parking the
+                // renderer worker until playback consumes enough bytes
+                // for this chunk. Re-entering the runnable retries the
+                // same input buffer, so media3 observes real-time
+                // backpressure instead of consuming a track instantly.
+                let wait = if pseudo_i64(vm, this, P_AUDIO_PLAYING) != 0 {
+                    let bpm = audio_bytes_per_ms(vm, this);
+                    ((requested + bpm - 1) / bpm).clamp(1, 100) as u64
+                } else {
+                    10
+                };
+                vm.sleep_until
+                    .insert(vm.cur_runnable, super::now_ms() as u64 + wait);
+                return Err(crate::E::Vm(crate::err("ovelo.park")));
+            }
             let written = written_before + n;
             pseudo_set(vm, this, P_AUDIO_WRITTEN, V::I64(written));
             if let Some(&V::Ref(bh)) = args.get(1) {
@@ -2511,7 +2529,7 @@ fn audio_call(vm: &mut Vm, class: &str, name: &str, args: &[V]) -> Option<Option
         "getTimestamp" => Some(Some(V::I32(0))),
         "getAudioFormat" => Some(Some(pseudo_get(vm, this, P_TARGET).unwrap_or(V::Ref(0)))),
         _ => None,
-    }
+    })
 }
 
 fn mint_notification(vm: &mut Vm) -> V {
