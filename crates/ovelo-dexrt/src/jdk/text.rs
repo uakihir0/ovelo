@@ -35,7 +35,9 @@ pub(crate) fn call(
     args: &[V],
 ) -> Rt<Option<Option<V>>> {
     match class {
-        "Ljava/text/BreakIterator;" => Ok(breakiter_call(vm, name, args)),
+        "Ljava/text/BreakIterator;" | "Landroid/icu/text/BreakIterator;" => {
+            Ok(breakiter_call(vm, name, args))
+        }
         "Landroid/text/StaticLayout$Builder;" | "Landroid/text/Layout$Builder;" => {
             Ok(builder_call(vm, name, args))
         }
