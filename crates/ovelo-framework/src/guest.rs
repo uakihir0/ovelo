@@ -776,9 +776,15 @@ impl GuestUi {
                     // Look up then materialize in two statements — the
                     // `or_else` closure would run `borrow_mut` while the
                     // `borrow` temporary is still live and panic.
-                    let mut cv = ui.borrow().views.get(&child).cloned();
+                    let mut cv = ui
+                        .try_borrow()
+                        .ok()
+                        .and_then(|ui| ui.views.get(&child).cloned());
                     if cv.is_none() {
-                        cv = ui.borrow_mut().materialize_dex(vm, child);
+                        cv = ui
+                            .try_borrow_mut()
+                            .ok()
+                            .and_then(|mut ui| ui.materialize_dex(vm, child));
                     }
                     let Some(cv) = cv else {
                         return Ok(z_ret);
@@ -788,16 +794,17 @@ impl GuestUi {
                     // either kind must accept the child or rows added
                     // to a dex group (RecyclerView's attachViewToParent)
                     // orphan the whole subtree.
-                    let Some(rc) = ui
-                        .borrow()
-                        .views
-                        .get(&this)
-                        .cloned()
-                        .or_else(|| ui.borrow().dex_views.get(&this).cloned())
-                    else {
+                    let Some(rc) = ui.try_borrow().ok().and_then(|ui| {
+                        ui.views
+                            .get(&this)
+                            .cloned()
+                            .or_else(|| ui.dex_views.get(&this).cloned())
+                    }) else {
                         return Ok(z_ret);
                     };
-                    let mut g = rc.borrow_mut();
+                    let Ok(mut g) = rc.try_borrow_mut() else {
+                        return Ok(z_ret);
+                    };
                     let GuestView::Group(gr) = &mut *g else {
                         return Ok(z_ret);
                     };
@@ -910,10 +917,16 @@ impl GuestUi {
                 {
                     vm.view_tree_detach(this, c, true);
                 }
-                if let Some(rc) = ui.borrow().views.get(&this).cloned() {
-                    if let GuestView::Group(gr) = &mut *rc.borrow_mut() {
-                        gr.children.clear();
-                        gr.view.invalidate();
+                if let Some(rc) = ui
+                    .try_borrow()
+                    .ok()
+                    .and_then(|ui| ui.views.get(&this).cloned())
+                {
+                    if let Ok(mut g) = rc.try_borrow_mut() {
+                        if let GuestView::Group(gr) = &mut *g {
+                            gr.children.clear();
+                            gr.view.invalidate();
+                        }
                     }
                 }
                 Ok(None)
@@ -935,7 +948,9 @@ impl GuestUi {
                 // dex view tree both need it. Outside the ui borrow:
                 // inflation and onViewAdded are guest code.
                 vm.view_set_content(activity, v);
-                let mut ui = ui.borrow_mut();
+                let Ok(mut ui) = ui.try_borrow_mut() else {
+                    return Ok(None);
+                };
                 if let Some(cv) = ui.views.get(&v).cloned() {
                     ui.guest_content_set = true;
                     if viewdbg() {
