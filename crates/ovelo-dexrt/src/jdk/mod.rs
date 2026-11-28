@@ -1787,6 +1787,20 @@ pub(crate) fn call(
 
 /// Methods that mean the same thing on every object.
 fn universal(vm: &mut Vm, class: &str, name: &str, sig: &str, args: &[V]) -> Rt<Option<Option<V>>> {
+    // Static/interface dispatch through Object must still observe the
+    // receiver's concrete Point implementation.
+    if matches!(name, "toString" | "hashCode") {
+        if let Some(V::Ref(h)) = args.first().copied() {
+            if vm.class_descriptor_of(h).as_deref() == Some("Landroid/graphics/Point;") {
+                let (x, y) = point_xy(vm, h);
+                return Ok(Some(Some(if name == "toString" {
+                    jdynstr(vm, &format!("Point({x}, {y})"))
+                } else {
+                    V::I32(x.wrapping_mul(31).wrapping_add(y))
+                })));
+            }
+        }
+    }
     // UUID implements these object operations from its 128-bit value in
     // the collections module; the generic identity/object-id versions
     // would make equal UUIDs and serialized UUID strings unusable.

@@ -6876,7 +6876,7 @@ fn graphics_call(
                 }
                 "toString" => {
                     let (x, y) = point_xy(vm, this);
-                    Some(Some(jstr(vm, &format!("Point({x}, {y})"))))
+                    Some(Some(jdynstr(vm, &format!("Point({x}, {y})"))))
                 }
                 _ => {
                     let (x, y) = point_xy(vm, this);
