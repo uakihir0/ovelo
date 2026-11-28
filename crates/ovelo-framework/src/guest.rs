@@ -317,7 +317,15 @@ pub struct GuestUi {
     gl_cache: HashMap<u32, bool>,
     gl_probe_gen: u64,
     gl_active: bool,
+    /// View constructor bindings deferred because guest code created the
+    /// view while this bridge was already borrowed. The queue itself is
+    /// outside the GuestUi borrow so the constructor callback can always
+    /// enqueue; refresh drains it once host mutations are safe.
+    ctor_pending: Rc<RefCell<VecDeque<PendingCtor>>>,
 }
+
+type CtorMake = Rc<dyn Fn(&GuestUi) -> GuestView>;
+type PendingCtor = (u32, CtorMake);
 
 fn argb(c: i32) -> Color {
     Color::from_srgb8((c >> 16) as u8, (c >> 8) as u8, c as u8, (c >> 24) as u8)
@@ -514,7 +522,27 @@ impl GuestUi {
             gl_cache: HashMap::new(),
             gl_probe_gen: u64::MAX,
             gl_active: false,
+            ctor_pending: Rc::new(RefCell::new(VecDeque::new())),
         }))
+    }
+
+    /// Bind views whose constructors ran while the bridge was borrowed.
+    /// Without this, a programmatically created embedded Compose view is
+    /// present in the dex tree but has no host view object for the frame
+    /// pump, so its composition never records draw operations.
+    pub fn drain_pending_ctors(&mut self) {
+        let q = self.ctor_pending.clone();
+        while let Some((this, make)) = q.borrow_mut().pop_front() {
+            let upgrade = self
+                .views
+                .get(&this)
+                .map(|rc| matches!(*rc.borrow(), GuestView::Plain(_)))
+                .unwrap_or(false);
+            if upgrade || !self.views.contains_key(&this) {
+                let gv = make(self);
+                self.views.insert(this, Rc::new(RefCell::new(gv)));
+            }
+        }
     }
 
     /// `(listener, view)` pairs queued by click listeners — pump them
@@ -1175,6 +1203,7 @@ impl GuestUi {
         // changes, so pump it every tick: for materialized dex views
         // AND for bridged `new` views (guest_content_set apps like
         // 2048 whose whole UI is a bridged GLSurfaceView).
+        self.drain_pending_ctors();
         vm.sync_decor_frames(self.root.w, self.root.h);
         self.pump_gl_frames(vm);
         if self.guest_content_set {
@@ -1602,6 +1631,8 @@ impl GuestUi {
         make: impl Fn(&GuestUi) -> GuestView + 'static,
     ) {
         let ui2 = ui.clone();
+        let pending = ui.borrow().ctor_pending.clone();
+        let make: CtorMake = Rc::new(make);
         let _ = vm.register_host(
             class,
             "<init>",
@@ -1611,10 +1642,11 @@ impl GuestUi {
                     let this = ref_arg(a, 0)?;
                     let Ok(mut g) = ui2.try_borrow_mut() else {
                         // Guest draw/measure callbacks can construct views
-                        // while the UI bridge is already borrowed. The dex
-                        // tree materialization path can recreate the host
-                        // object later; crashing the process here loses the
-                        // whole frame instead.
+                        // while the UI bridge is already borrowed. Defer the
+                        // binding instead of dropping it: programmatically
+                        // created embedded views (notably nested Compose
+                        // views) may never pass through dex materialization.
+                        pending.borrow_mut().push_back((this, make.clone()));
                         return Ok(None);
                     };
                     // A subclass super-call can fire a LESS specific ctor
