@@ -1840,7 +1840,9 @@ fn universal(vm: &mut Vm, class: &str, name: &str, sig: &str, args: &[V]) -> Rt<
         // Exact boxed owners implement value equality themselves below;
         // Object/Number interface dispatches still use this value-aware
         // universal path.
-        "hashCode" if !lang::primitive_type(class) => Some(Some(lang::hashcode(vm, args))),
+        "hashCode" if class != STRING && !lang::primitive_type(class) => {
+            Some(Some(lang::hashcode(vm, args)))
+        }
         // `Arrays.equals` is a static deep-ish array comparison, not
         // Object.equals; let the collections module implement it. Treating
         // it as identity makes two freshly copied empty input arrays differ,
