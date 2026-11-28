@@ -64,6 +64,12 @@ pub(crate) const P_RECT_R: u32 = u32::MAX - 9;
 pub(crate) const P_RECT_B: u32 = u32::MAX - 10;
 pub(crate) const P_POINT_X: u32 = u32::MAX - 333;
 pub(crate) const P_POINT_Y: u32 = u32::MAX - 334;
+pub(crate) const P_POINTF_X: u32 = u32::MAX - 335;
+pub(crate) const P_POINTF_Y: u32 = u32::MAX - 336;
+pub(crate) const P_RECTF_L: u32 = u32::MAX - 337;
+pub(crate) const P_RECTF_T: u32 = u32::MAX - 338;
+pub(crate) const P_RECTF_R: u32 = u32::MAX - 339;
+pub(crate) const P_RECTF_B: u32 = u32::MAX - 340;
 
 pub(crate) fn point_write(vm: &mut Vm, h: u32, x: i32, y: i32) {
     pseudo_set(vm, h, P_POINT_X, V::I32(x));
@@ -97,6 +103,83 @@ pub(crate) fn point_xy(vm: &Vm, h: u32) -> (i32, i32) {
         i32v(pseudo_get(vm, h, key).unwrap_or(V::I32(0)))
     };
     (read("x", P_POINT_X), read("y", P_POINT_Y))
+}
+
+pub(crate) fn pointf_write(vm: &mut Vm, h: u32, x: f32, y: f32) {
+    pseudo_set(vm, h, P_POINTF_X, V::F32(x));
+    pseudo_set(vm, h, P_POINTF_Y, V::F32(y));
+    for (name, v) in [("x", x), ("y", y)] {
+        if let Some(f) = vm
+            .field_index_of("Landroid/graphics/PointF;", name)
+            .map(|g| vm.canon_field(g))
+        {
+            if let Some(Obj::Instance { fields, .. } | Obj::Host { fields, .. }) =
+                vm.heap.get_mut(h)
+            {
+                fields.insert(f, V::F32(v));
+            }
+        }
+    }
+}
+
+pub(crate) fn pointf_xy(vm: &Vm, h: u32) -> (f32, f32) {
+    let read = |name: &str, key: u32| -> f32 {
+        if let Some(f) = vm
+            .field_index_of("Landroid/graphics/PointF;", name)
+            .map(|g| vm.canon_field(g))
+        {
+            if let Some(Obj::Instance { fields, .. } | Obj::Host { fields, .. }) = vm.heap.get(h) {
+                if let Some(v) = fields.get(&f) {
+                    return f64v(*v) as f32;
+                }
+            }
+        }
+        f64v(pseudo_get(vm, h, key).unwrap_or(V::F32(0.0))) as f32
+    };
+    (read("x", P_POINTF_X), read("y", P_POINTF_Y))
+}
+
+pub(crate) fn rectf_write(vm: &mut Vm, h: u32, l: f32, t: f32, r: f32, b: f32) {
+    for (name, key, v) in [
+        ("left", P_RECTF_L, l),
+        ("top", P_RECTF_T, t),
+        ("right", P_RECTF_R, r),
+        ("bottom", P_RECTF_B, b),
+    ] {
+        pseudo_set(vm, h, key, V::F32(v));
+        if let Some(f) = vm
+            .field_index_of("Landroid/graphics/RectF;", name)
+            .map(|g| vm.canon_field(g))
+        {
+            if let Some(Obj::Instance { fields, .. } | Obj::Host { fields, .. }) =
+                vm.heap.get_mut(h)
+            {
+                fields.insert(f, V::F32(v));
+            }
+        }
+    }
+}
+
+pub(crate) fn rectf_edges(vm: &Vm, h: u32) -> (f32, f32, f32, f32) {
+    let read = |name: &str, key: u32| -> f32 {
+        if let Some(f) = vm
+            .field_index_of("Landroid/graphics/RectF;", name)
+            .map(|g| vm.canon_field(g))
+        {
+            if let Some(Obj::Instance { fields, .. } | Obj::Host { fields, .. }) = vm.heap.get(h) {
+                if let Some(v) = fields.get(&f) {
+                    return f64v(*v) as f32;
+                }
+            }
+        }
+        f64v(pseudo_get(vm, h, key).unwrap_or(V::F32(0.0))) as f32
+    };
+    (
+        read("left", P_RECTF_L),
+        read("top", P_RECTF_T),
+        read("right", P_RECTF_R),
+        read("bottom", P_RECTF_B),
+    )
 }
 pub(crate) const P_BOUNDS: u32 = u32::MAX - 11;
 /// Thread was `start()`ed once — JVM forbids a second start.
@@ -2824,8 +2907,12 @@ pub(crate) fn ifield(vm: &Vm, h: u32, owner: &str, name: &str) -> Option<V> {
         ("Landroid/graphics/Point;", "y") => {
             Some(pseudo_get(vm, h, P_POINT_Y).unwrap_or(V::I32(0)))
         }
-        ("Landroid/graphics/RectF;", "left" | "top" | "right" | "bottom")
-        | ("Landroid/graphics/PointF;", "x" | "y") => Some(V::I32(0)),
+        ("Landroid/graphics/PointF;", "x") => Some(V::F32(pointf_xy(vm, h).0)),
+        ("Landroid/graphics/PointF;", "y") => Some(V::F32(pointf_xy(vm, h).1)),
+        ("Landroid/graphics/RectF;", "left") => Some(V::F32(rectf_edges(vm, h).0)),
+        ("Landroid/graphics/RectF;", "top") => Some(V::F32(rectf_edges(vm, h).1)),
+        ("Landroid/graphics/RectF;", "right") => Some(V::F32(rectf_edges(vm, h).2)),
+        ("Landroid/graphics/RectF;", "bottom") => Some(V::F32(rectf_edges(vm, h).3)),
         // Rect edges are real stored ints (set/setBounds/offset write
         // them as pseudo fields) so drawable bounds round-trip.
         ("Landroid/graphics/Rect;", "left") => {

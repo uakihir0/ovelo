@@ -31,6 +31,10 @@ const P_PLAY_POSITION: u32 = u32::MAX - 330;
 const P_PLAY_SPEED: u32 = u32::MAX - 331;
 const P_PLAY_ACTIONS: u32 = u32::MAX - 332;
 
+fn flt32(v: V) -> f32 {
+    f64v(v) as f32
+}
+
 fn task_cancelled(vm: &Vm, this: u32) -> bool {
     pseudo_get(vm, this, P_TASK_CANCELLED)
         .map(i32v)
@@ -7355,7 +7359,20 @@ fn graphics_call(
     // generic set*/draw* stubs below would silently eat every call.
     if matches!(
         class,
-        "Landroid/graphics/Canvas;" | "Landroid/graphics/Paint;" | "Landroid/text/TextPaint;"
+        "Landroid/graphics/Canvas;"
+            | "Landroid/graphics/RecordingCanvas;"
+            | "Landroid/view/DisplayListCanvas;"
+            | "Landroid/graphics/Path;"
+            | "Landroid/graphics/RenderNode;"
+            | "Landroid/view/RenderNode;"
+            | "Landroid/graphics/Paint;"
+            | "Landroid/text/TextPaint;"
+            | "Landroid/graphics/BlendModeColorFilter;"
+            | "Landroid/graphics/PorterDuffColorFilter;"
+            | "Landroid/graphics/LightingColorFilter;"
+            | "Landroid/graphics/ColorFilter;"
+            | "Landroid/graphics/Matrix;"
+            | "Landroid/graphics/PathMeasure;"
     ) {
         return Ok(None);
     }
@@ -7544,7 +7561,9 @@ fn graphics_call(
             "getBounds" | "copyBounds" | "setBounds" | "mutate" | "getIntrinsicWidth"
             | "getIntrinsicHeight" | "invalidateSelf" | "setAlpha" | "setColorFilter"
             | "getOpacity" | "setVisible",
-        ) if c.ends_with("Drawable;") => {
+        ) if c.ends_with("Drawable;")
+            || vm.assignable_desc(c, "Landroid/graphics/drawable/Drawable;") =>
+        {
             let V::Ref(h) = args.first().copied().unwrap_or(V::Ref(0)) else {
                 return Ok(Some(None));
             };
@@ -7854,8 +7873,155 @@ fn graphics_call(
             })
         }
         ("Landroid/graphics/RectF;", n) => {
-            let _ = n;
-            Some(Some(V::I32(0)))
+            let this = match args.first().copied() {
+                Some(V::Ref(h)) => h,
+                _ => 0,
+            };
+            match n {
+                "<init>" => {
+                    if args.len() >= 5 {
+                        rectf_write(
+                            vm,
+                            this,
+                            flt32(args[1]),
+                            flt32(args[2]),
+                            flt32(args[3]),
+                            flt32(args[4]),
+                        );
+                    } else if let Some(V::Ref(src)) = args.get(1).copied() {
+                        let (l, t, r, b) = rectf_edges(vm, src);
+                        rectf_write(vm, this, l, t, r, b);
+                    } else {
+                        rectf_write(vm, this, 0.0, 0.0, 0.0, 0.0);
+                    }
+                    Some(None)
+                }
+                "set" => {
+                    if args.len() >= 5 {
+                        rectf_write(
+                            vm,
+                            this,
+                            flt32(args[1]),
+                            flt32(args[2]),
+                            flt32(args[3]),
+                            flt32(args[4]),
+                        );
+                    } else if let Some(V::Ref(src)) = args.get(1).copied() {
+                        let (l, t, r, b) = rectf_edges(vm, src);
+                        rectf_write(vm, this, l, t, r, b);
+                    }
+                    Some(None)
+                }
+                "offset" => {
+                    let (l, t, r, b) = rectf_edges(vm, this);
+                    rectf_write(
+                        vm,
+                        this,
+                        l + flt32(args.get(1).copied().unwrap_or(V::F32(0.0))),
+                        t + flt32(args.get(2).copied().unwrap_or(V::F32(0.0))),
+                        r + flt32(args.get(1).copied().unwrap_or(V::F32(0.0))),
+                        b + flt32(args.get(2).copied().unwrap_or(V::F32(0.0))),
+                    );
+                    Some(None)
+                }
+                "width" => {
+                    let (l, _, r, _) = rectf_edges(vm, this);
+                    Some(Some(V::F32(r - l)))
+                }
+                "height" => {
+                    let (_, t, _, b) = rectf_edges(vm, this);
+                    Some(Some(V::F32(b - t)))
+                }
+                "centerX" => {
+                    let (l, _, r, _) = rectf_edges(vm, this);
+                    Some(Some(V::F32((l + r) * 0.5)))
+                }
+                "centerY" => {
+                    let (_, t, _, b) = rectf_edges(vm, this);
+                    Some(Some(V::F32((t + b) * 0.5)))
+                }
+                "isEmpty" => {
+                    let (l, t, r, b) = rectf_edges(vm, this);
+                    Some(Some(V::I32((l >= r || t >= b) as i32)))
+                }
+                "contains" => {
+                    let (l, t, r, b) = rectf_edges(vm, this);
+                    let inside = if args.len() >= 4 {
+                        let (x, y) = (flt32(args[1]), flt32(args[2]));
+                        x >= l && x < r && y >= t && y < b
+                    } else {
+                        false
+                    };
+                    Some(Some(V::I32(inside as i32)))
+                }
+                _ => return Ok(None),
+            }
+        }
+        ("Landroid/graphics/PointF;", n) => {
+            let this = match args.first().copied() {
+                Some(V::Ref(h)) => h,
+                _ => 0,
+            };
+            match n {
+                "<init>" => {
+                    if args.len() >= 3 {
+                        pointf_write(vm, this, flt32(args[1]), flt32(args[2]));
+                    } else if let Some(V::Ref(src)) = args.get(1).copied() {
+                        let (x, y) = pointf_xy(vm, src);
+                        pointf_write(vm, this, x, y);
+                    } else {
+                        pointf_write(vm, this, 0.0, 0.0);
+                    }
+                    Some(None)
+                }
+                "set" => {
+                    if args.len() >= 3 {
+                        pointf_write(vm, this, flt32(args[1]), flt32(args[2]));
+                    } else if let Some(V::Ref(src)) = args.get(1).copied() {
+                        let (x, y) = pointf_xy(vm, src);
+                        pointf_write(vm, this, x, y);
+                    }
+                    Some(None)
+                }
+                "offset" => {
+                    let (x, y) = pointf_xy(vm, this);
+                    pointf_write(
+                        vm,
+                        this,
+                        x + flt32(args.get(1).copied().unwrap_or(V::F32(0.0))),
+                        y + flt32(args.get(2).copied().unwrap_or(V::F32(0.0))),
+                    );
+                    Some(None)
+                }
+                "negate" => {
+                    let (x, y) = pointf_xy(vm, this);
+                    pointf_write(vm, this, -x, -y);
+                    Some(None)
+                }
+                "equals" => {
+                    let (x, y) = pointf_xy(vm, this);
+                    let eq = if args.len() >= 3 {
+                        x == flt32(args[1]) && y == flt32(args[2])
+                    } else {
+                        match args.get(1).copied() {
+                            Some(V::Ref(other)) if other != 0 => (x, y) == pointf_xy(vm, other),
+                            _ => false,
+                        }
+                    };
+                    Some(Some(V::I32(eq as i32)))
+                }
+                "hashCode" => {
+                    let (x, y) = pointf_xy(vm, this);
+                    Some(Some(V::I32(
+                        x.to_bits() as i32 ^ (y.to_bits() as i32).rotate_left(16),
+                    )))
+                }
+                "toString" => {
+                    let (x, y) = pointf_xy(vm, this);
+                    Some(Some(jdynstr(vm, &format!("PointF({x}, {y})"))))
+                }
+                _ => return Ok(None),
+            }
         }
         (
             "Landroid/graphics/Point;",

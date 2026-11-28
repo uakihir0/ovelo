@@ -43,6 +43,8 @@ const PK_MATSTACK: u32 = 0xFFFD_FF19;
 const PK_M0: u32 = 0xFFFD_FF20;
 /// Dex `Path` subclass → backing host GraphicsPath handle.
 const PK_PATHDATA: u32 = 0xFFFD_FF40;
+/// PathMeasure → source Path handle.
+const PK_PM_PATH: u32 = 0xFFFD_FF41;
 
 fn flt(v: V) -> f32 {
     f64v(v) as f32
@@ -1465,6 +1467,164 @@ fn host_enum_const(vm: &mut Vm, desc: &str, name: &str) -> V {
 }
 
 // ---------------------------------------------------------------------
+// android.graphics.PathMeasure — flattened-polyline arc-length model.
+// Lottie evaluates positional keyframes through getPosTan; returning
+// zeroes there leaves every animated transform at its origin.
+
+fn path_points(cmds: &[PathCmd]) -> Vec<(f32, f32)> {
+    let mut out = Vec::new();
+    let mut cur = (0.0f32, 0.0f32);
+    let mut start = (0.0f32, 0.0f32);
+    for cmd in cmds {
+        match *cmd {
+            PathCmd::MoveTo { x, y } => {
+                cur = (x, y);
+                start = cur;
+                out.push(cur);
+            }
+            PathCmd::LineTo { x, y } => {
+                cur = (x, y);
+                out.push(cur);
+            }
+            PathCmd::QuadTo { cx, cy, x, y } => {
+                let p0 = cur;
+                for i in 1..=12 {
+                    let t = i as f32 / 12.0;
+                    let u = 1.0 - t;
+                    out.push((
+                        u * u * p0.0 + 2.0 * u * t * cx + t * t * x,
+                        u * u * p0.1 + 2.0 * u * t * cy + t * t * y,
+                    ));
+                }
+                cur = (x, y);
+            }
+            PathCmd::CubicTo {
+                cx1,
+                cy1,
+                cx2,
+                cy2,
+                x,
+                y,
+            } => {
+                let p0 = cur;
+                for i in 1..=20 {
+                    let t = i as f32 / 20.0;
+                    let u = 1.0 - t;
+                    out.push((
+                        u * u * u * p0.0
+                            + 3.0 * u * u * t * cx1
+                            + 3.0 * u * t * t * cx2
+                            + t * t * t * x,
+                        u * u * u * p0.1
+                            + 3.0 * u * u * t * cy1
+                            + 3.0 * u * t * t * cy2
+                            + t * t * t * y,
+                    ));
+                }
+                cur = (x, y);
+            }
+            PathCmd::Close => {
+                cur = start;
+                out.push(start);
+            }
+        }
+    }
+    out
+}
+
+fn measure_points(vm: &Vm, h: u32) -> Vec<(f32, f32)> {
+    match pseudo_get(vm, h, PK_PM_PATH) {
+        Some(V::Ref(ph)) => path_clone(vm, ph)
+            .map(|(cmds, _)| path_points(&cmds))
+            .unwrap_or_default(),
+        _ => Vec::new(),
+    }
+}
+
+fn pathmeasure_call(vm: &mut Vm, name: &str, args: &[V]) -> Rt<Option<Option<V>>> {
+    let V::Ref(h) = args.first().copied().unwrap_or(V::Ref(0)) else {
+        return Ok(Some(None));
+    };
+    Ok(match name {
+        "<init>" => {
+            if let Some(&V::Ref(ph)) = args.get(1) {
+                pseudo_set(vm, h, PK_PM_PATH, V::Ref(ph));
+            }
+            Some(None)
+        }
+        "setPath" => {
+            if let Some(&V::Ref(ph)) = args.get(1) {
+                pseudo_set(vm, h, PK_PM_PATH, V::Ref(ph));
+            } else {
+                pseudo_set(vm, h, PK_PM_PATH, V::Ref(0));
+            }
+            Some(None)
+        }
+        "getLength" => {
+            let pts = measure_points(vm, h);
+            let len = pts
+                .windows(2)
+                .map(|w| (w[1].0 - w[0].0).hypot(w[1].1 - w[0].1))
+                .sum::<f32>();
+            Some(Some(V::F32(len)))
+        }
+        "getPosTan" => {
+            let dist = flt(arg(args, 1)).max(0.0);
+            let pts = measure_points(vm, h);
+            let mut pos = (0.0f32, 0.0f32);
+            let mut tan = (0.0f32, 0.0f32);
+            let mut ok = false;
+            if pts.len() >= 2 {
+                let total = pts
+                    .windows(2)
+                    .map(|w| (w[1].0 - w[0].0).hypot(w[1].1 - w[0].1))
+                    .sum::<f32>();
+                let mut remain = dist.min(total);
+                for w in pts.windows(2) {
+                    let dx = w[1].0 - w[0].0;
+                    let dy = w[1].1 - w[0].1;
+                    let len = dx.hypot(dy);
+                    if len <= 1e-6 {
+                        continue;
+                    }
+                    if remain <= len || w[1] == *pts.last().unwrap_or(&(0.0, 0.0)) {
+                        let t = (remain / len).clamp(0.0, 1.0);
+                        pos = (w[0].0 + dx * t, w[0].1 + dy * t);
+                        tan = (dx / len, dy / len);
+                        ok = true;
+                        break;
+                    }
+                    remain -= len;
+                }
+                if !ok {
+                    pos = *pts.last().unwrap_or(&(0.0, 0.0));
+                    let w = pts.windows(2).last().unwrap_or(&[(0.0, 0.0), (0.0, 0.0)]);
+                    let dx = w[1].0 - w[0].0;
+                    let dy = w[1].1 - w[0].1;
+                    let len = dx.hypot(dy).max(1e-6);
+                    tan = (dx / len, dy / len);
+                    ok = total > 0.0;
+                }
+            }
+            if let Some(v) = args.get(2) {
+                mat_write_arr(vm, v, 0, &[pos.0, pos.1]);
+            }
+            if let Some(v) = args.get(3) {
+                mat_write_arr(vm, v, 0, &[tan.0, tan.1]);
+            }
+            Some(Some(V::I32(ok as i32)))
+        }
+        "nextContour" => Some(Some(V::I32(0))),
+        "isClosed" => Some(Some(V::I32(0))),
+        // Trim-path users need real segments, but an empty segment is a
+        // safer approximation than a host stub exception; path effects
+        // that use it are handled separately.
+        "getSegment" => Some(Some(V::I32(0))),
+        _ => return Ok(None),
+    })
+}
+
+// ---------------------------------------------------------------------
 // android.graphics.Matrix — 2x3 affine tracked in pseudo fields.
 
 fn mat_read(vm: &Vm, h: u32) -> [f32; 6] {
@@ -1667,12 +1827,7 @@ fn matrix_call(vm: &mut Vm, name: &str, _sig: &str, args: &[V]) -> Rt<Option<Opt
                     _ => [1.0, 0.0, 0.0, 0.0, 1.0, 0.0],
                 });
                 if let (Some(l), Some(r)) = (a, b) {
-                    let m = if mode == "post" {
-                        mat_mul(l, r)
-                    } else {
-                        mat_mul(r, l)
-                    };
-                    mat_write(vm, this, m);
+                    mat_write(vm, this, mat_mul(l, r));
                 } else {
                     // (post|pre)Concat(Matrix) — one arg.
                     let o = args.get(1).map(|v| match v {
@@ -1680,10 +1835,11 @@ fn matrix_call(vm: &mut Vm, name: &str, _sig: &str, args: &[V]) -> Rt<Option<Opt
                         _ => [1.0, 0.0, 0.0, 0.0, 1.0, 0.0],
                     });
                     let cur = mat_read(vm, this);
+                    let o = o.unwrap_or([1.0, 0.0, 0.0, 0.0, 1.0, 0.0]);
                     let m = if mode == "post" {
-                        mat_mul(cur, o.unwrap_or([1.0, 0.0, 0.0, 0.0, 1.0, 0.0]))
+                        mat_mul(o, cur)
                     } else {
-                        mat_mul(o.unwrap_or([1.0, 0.0, 0.0, 0.0, 1.0, 0.0]), cur)
+                        mat_mul(cur, o)
                     };
                     mat_write(vm, this, m);
                 }
@@ -1718,8 +1874,8 @@ fn matrix_call(vm: &mut Vm, name: &str, _sig: &str, args: &[V]) -> Rt<Option<Opt
                 let cur = mat_read(vm, this);
                 let m = match mode {
                     "set" => op,
-                    "pre" => mat_mul(op, cur),
-                    _ => mat_mul(cur, op),
+                    "pre" => mat_mul(cur, op),
+                    _ => mat_mul(op, cur),
                 };
                 mat_write(vm, this, m);
             }
@@ -1881,6 +2037,46 @@ fn matrix_call(vm: &mut Vm, name: &str, _sig: &str, args: &[V]) -> Rt<Option<Opt
         "setPolyToPoly" | "setRectToRect" | "setScaleToFit" => Some(Some(V::I32(1))),
         _ => return Ok(None),
     })
+}
+
+fn xform_path_cmd(cmd: PathCmd, m: [f32; 6]) -> PathCmd {
+    let p = |x: f32, y: f32| mat_point(m, x, y);
+    match cmd {
+        PathCmd::MoveTo { x, y } => {
+            let (x, y) = p(x, y);
+            PathCmd::MoveTo { x, y }
+        }
+        PathCmd::LineTo { x, y } => {
+            let (x, y) = p(x, y);
+            PathCmd::LineTo { x, y }
+        }
+        PathCmd::QuadTo { cx, cy, x, y } => {
+            let (cx, cy) = p(cx, cy);
+            let (x, y) = p(x, y);
+            PathCmd::QuadTo { cx, cy, x, y }
+        }
+        PathCmd::CubicTo {
+            cx1,
+            cy1,
+            cx2,
+            cy2,
+            x,
+            y,
+        } => {
+            let (cx1, cy1) = p(cx1, cy1);
+            let (cx2, cy2) = p(cx2, cy2);
+            let (x, y) = p(x, y);
+            PathCmd::CubicTo {
+                cx1,
+                cy1,
+                cx2,
+                cy2,
+                x,
+                y,
+            }
+        }
+        PathCmd::Close => PathCmd::Close,
+    }
 }
 
 fn path_positions(cmds: &[PathCmd]) -> ((f32, f32), (f32, f32)) {
@@ -2084,6 +2280,42 @@ fn path_call(vm: &mut Vm, name: &str, args: &[V]) -> Rt<Option<Option<V>>> {
         "isEmpty" => Some(Some(V::I32(
             path_clone(vm, h).is_none_or(|(cmds, _)| cmds.is_empty()) as i32,
         ))),
+        "addPath" => {
+            if let V::Ref(src) = arg(args, 1) {
+                if let Some((cmds, _)) = path_clone(vm, src) {
+                    let m = if let Some(&V::Ref(mh)) = args.get(2) {
+                        mat_read(vm, mh)
+                    } else if args.len() >= 4 {
+                        [1.0, 0.0, flt(arg(args, 2)), 0.0, 1.0, flt(arg(args, 3))]
+                    } else {
+                        [1.0, 0.0, 0.0, 0.0, 1.0, 0.0]
+                    };
+                    with_path(vm, h, |dst| {
+                        dst.extend(cmds.iter().map(|cmd| xform_path_cmd(*cmd, m)));
+                    });
+                }
+            }
+            Some(None)
+        }
+        "transform" => {
+            if let Some(&V::Ref(mh)) = args.get(1) {
+                let m = mat_read(vm, mh);
+                if let Some(&V::Ref(dst_h)) = args.get(2) {
+                    if let Some((cmds, ft)) = path_clone(vm, h) {
+                        backing_path_h(vm, dst_h);
+                        with_path(vm, dst_h, |dst| {
+                            *dst = cmds.iter().map(|cmd| xform_path_cmd(*cmd, m)).collect();
+                        });
+                        pseudo_set(vm, dst_h, PK_FILLORD, V::I32(ft));
+                    }
+                } else if let Some((cmds, _)) = path_clone(vm, h) {
+                    let transformed: Vec<PathCmd> =
+                        cmds.iter().map(|cmd| xform_path_cmd(*cmd, m)).collect();
+                    with_path(vm, h, |dst| *dst = transformed);
+                }
+            }
+            Some(None)
+        }
         "setFillType" => {
             let ft = arg(args, 1);
             let ord = match enum_name(vm, ft).as_deref() {
@@ -2304,6 +2536,7 @@ pub(crate) fn call(
         | "Landroid/graphics/RecordingCanvas;"
         | "Landroid/view/DisplayListCanvas;" => canvas_call(vm, name, sig, args),
         "Landroid/graphics/Path;" => path_call(vm, name, args),
+        "Landroid/graphics/PathMeasure;" => pathmeasure_call(vm, name, args),
         "Landroid/graphics/RenderNode;" | "Landroid/view/RenderNode;" => {
             rendernode_call(vm, name, args)
         }
@@ -2538,6 +2771,29 @@ fn guest_draw_ops_impl(vm: &mut Vm, view: u32, w: i32, h: i32, expand: bool) -> 
     pseudo_set(vm, canvas, PK_CH, V::I32(h));
     let mut err = false;
     if let Some(d) = drawable_draw {
+        // ImageView normally sizes its drawable in configureBounds before
+        // onDraw. The lightweight custom-drawable path bypasses that
+        // framework method, so preserve the same contract here; Lottie
+        // scales its composition from these bounds.
+        let rh = match pseudo_get(vm, d, super::P_BOUNDS) {
+            Some(V::Ref(rh)) => rh,
+            _ => {
+                let rect = host(vm, "Landroid/graphics/Rect;", HostState::Empty);
+                if let V::Ref(rh) = rect {
+                    pseudo_set(vm, d, super::P_BOUNDS, V::Ref(rh));
+                    rh
+                } else {
+                    0
+                }
+            }
+        };
+        super::android::rect_write(vm, rh, 0, 0, w, h);
+        let _ = vm.call_virtual_sig(
+            d,
+            "setBounds",
+            &["I", "I", "I", "I"],
+            &[V::I32(0), V::I32(0), V::I32(w), V::I32(h)],
+        );
         let r = vm.call_virtual_sig(d, "draw", &["Landroid/graphics/Canvas;"], &[V::Ref(canvas)]);
         if let Err(e) = &r {
             if crate::dbg_flag("OVELO_DRAWDBG") {
