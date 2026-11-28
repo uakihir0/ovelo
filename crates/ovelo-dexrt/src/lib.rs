@@ -38,16 +38,19 @@ fn err(cause: &str) -> OveloError {
 /// process start, but the interpreter consulted getenv once per
 /// instruction (`aget`/`sget`/`iget` sites) and per dispatch.
 pub(crate) fn dbg_flag(name: &'static str) -> bool {
+    // Hot interpreter paths ask this every instruction/callback. Static
+    // names have stable addresses and are few, so pointer-indexed linear
+    // lookup avoids both env lookups and string SipHashing.
     thread_local! {
-        static CACHE: std::cell::RefCell<HashMap<&'static str, bool>> =
-            std::cell::RefCell::new(HashMap::new());
+        static CACHE: std::cell::RefCell<Vec<(usize, bool)>> = const { std::cell::RefCell::new(Vec::new()) };
     }
+    let key = name.as_ptr() as usize;
     CACHE.with(|c| {
-        if let Some(v) = c.borrow().get(name) {
+        if let Some((_, v)) = c.borrow().iter().find(|(k, _)| *k == key) {
             return *v;
         }
         let v = std::env::var_os(name).is_some();
-        c.borrow_mut().insert(name, v);
+        c.borrow_mut().push((key, v));
         v
     })
 }

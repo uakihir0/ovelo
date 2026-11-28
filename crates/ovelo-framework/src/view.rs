@@ -100,6 +100,9 @@ pub struct View {
     pub raw_custom_ops: Option<Rc<Vec<ovelo_dexrt::CanvasOp>>>,
     /// Guest invalidate sequence at which `raw_custom_ops` was recorded.
     pub raw_custom_ops_seq: i32,
+    /// Canvas size used for that recording; layout changes require a
+    /// fresh recording even when the view was not explicitly invalidated.
+    pub raw_custom_ops_size: (i32, i32),
     /// Pressed while the pointer that went down on this view is still
     /// down; a click only fires when the release also lands inside.
     pub pressed: bool,
@@ -124,6 +127,7 @@ impl View {
             custom_ops: None,
             raw_custom_ops: None,
             raw_custom_ops_seq: -1,
+            raw_custom_ops_size: (0, 0),
             pressed: false,
             dirty: true,
         }

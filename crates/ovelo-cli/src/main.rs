@@ -2011,7 +2011,7 @@ fn run_app(store: &InstallStore, package: &str) -> Result<(), OveloError> {
             // fills all live on this queue after the lifecycle drains
             // end. Without it they stall once the window opens.
             if dex_frame.is_multiple_of(30) || vm.has_queued_runnables() {
-                let work = vm.drain_runnables(64);
+                let _work = vm.drain_runnables(64);
                 // GC when the heap passes its growth mark — interpreter
                 // churn otherwise grows the heap unboundedly. Only runs
                 // between dex activations (collect_garbage gates itself).
@@ -2026,16 +2026,14 @@ fn run_app(store: &InstallStore, package: &str) -> Result<(), OveloError> {
                     let mut roots = ui2.borrow().guest_handles().into_iter();
                     vm.collect_garbage(&mut roots);
                 }
-                // Drive the expensive layout pass only on real change:
-                // runnable work done this tick, guest view state
-                // mutated since the last pass, or a periodic catch-all
-                // for fills that don't bump view_gen (adapter attaches
-                // do). Idle trees converge and stop paying interpreter
-                // cost + RSS growth every half second.
-                if work > 0
-                    || vm.view_gen != vm.layout_gen_done.get()
-                    || dex_frame.is_multiple_of(600)
-                {
+                // Drive the expensive layout pass only when guest view
+                // state mutated since the last pass, plus a periodic
+                // catch-all for fills that don't bump view_gen (adapter
+                // attaches do). Background workers often stay busy during
+                // media playback without touching the view tree; treating
+                // their progress as a layout change re-ran the recursive
+                // interpreter measure pass on every tick.
+                if vm.view_gen != vm.layout_gen_done.get() || dex_frame.is_multiple_of(600) {
                     // Run adapter containers' layout pass OUTSIDE the ui
                     // borrow — guest code re-enters bridged view methods.
                     let (win_w, win_h) = {

@@ -311,6 +311,12 @@ pub struct GuestUi {
     /// Per-handle Compose-view probe cache; repeating the class walk for
     /// every non-GL view on every frame dominates media playback CPU.
     compose_cache: HashMap<u32, bool>,
+    /// Per-handle GL-renderer probe cache, and the generation at which a
+    /// scan found no pumpable GL/Compose view. Idle non-GL apps then skip
+    /// this whole per-view scan instead of paying it for every frame.
+    gl_cache: HashMap<u32, bool>,
+    gl_probe_gen: u64,
+    gl_active: bool,
 }
 
 fn argb(c: i32) -> Color {
@@ -505,6 +511,9 @@ impl GuestUi {
             attach_pending: Vec::new(),
             guest_content_set: false,
             compose_cache: HashMap::new(),
+            gl_cache: HashMap::new(),
+            gl_probe_gen: u64::MAX,
+            gl_active: false,
         }))
     }
 
@@ -1230,6 +1239,10 @@ impl GuestUi {
     /// view-tree generation changes. Covers both the materialized dex
     /// tree (`dex_views`) and bridged `new` views (`views`).
     fn pump_gl_frames(&mut self, vm: &mut Vm) {
+        if !self.gl_active && self.gl_probe_gen == vm.view_gen {
+            return;
+        }
+        let mut any_active = false;
         // Push host-computed bounds back onto the dex view objects:
         // `getWidth()`/`getHeight()` read the dex-side frame, which the
         // host layout engine never ran `layout()` to set (Korge's GL
@@ -1266,7 +1279,10 @@ impl GuestUi {
                     rc.borrow_mut().view_mut().measured
                 );
             }
-            let has_gl = vm.has_gl_renderer(h);
+            let has_gl = *self
+                .gl_cache
+                .entry(h)
+                .or_insert_with(|| vm.has_gl_renderer(h));
             let compose_view = !has_gl
                 && *self
                     .compose_cache
@@ -1275,6 +1291,7 @@ impl GuestUi {
             if !has_gl && !compose_view {
                 continue;
             }
+            any_active = true;
             let (w, hh) = if self.dex_views.contains_key(&h) {
                 // Materialized node: must still be mounted, and its
                 // size comes from the dex-side frame.
@@ -1376,6 +1393,8 @@ impl GuestUi {
             // traversal skips the draw entirely.
             v.invalidate();
         }
+        self.gl_active = any_active;
+        self.gl_probe_gen = vm.view_gen;
     }
 
     fn materialize_dex(&mut self, vm: &mut Vm, h: u32) -> Option<Rc<RefCell<GuestView>>> {
@@ -1434,11 +1453,30 @@ impl GuestUi {
         // x=0 — an overlapping pile at the parent origin), so keep
         // the last good ops until a frame lands.
         vm.dump_node_tree(h);
-        let capture = ow > 0 && oh > 0 && !vm.compose_measure_active(h);
-        let ops = capture.then(|| {
-            let raw = vm.guest_draw_ops_raw(h, ow, oh);
-            (raw.clone(), vm.expand_display_list_ops(&raw))
-        });
+        let valid_size = ow > 0 && oh > 0 && !vm.compose_measure_active(h);
+        let cur_seq = vm.view_invalid_seq(h);
+        let (cached_raw, cached_seq, cached_size) = {
+            let g = rc.borrow();
+            (
+                g.view().raw_custom_ops.clone(),
+                g.view().raw_custom_ops_seq,
+                g.view().raw_custom_ops_size,
+            )
+        };
+        let cache_fresh = cached_seq == cur_seq && cached_size == (ow, oh);
+        let capture = valid_size && !cache_fresh;
+        let ops = if capture {
+            let raw = Rc::new(vm.guest_draw_ops_raw(h, ow, oh));
+            let expanded = vm.expand_display_list_ops(&raw);
+            Some((raw, expanded, true))
+        } else if valid_size {
+            cached_raw.map(|raw| {
+                let expanded = vm.expand_display_list_ops(&raw);
+                (raw, expanded, false)
+            })
+        } else {
+            None
+        };
         // Guest onDraw may itself call setters such as setTextColor.
         // `info` was snapshotted before that guest code ran; refresh it
         // or this materialize writes the pre-draw color back and the
@@ -1460,14 +1498,16 @@ impl GuestUi {
         // `g` borrows the view object while `self.materialize_dex`
         // recurses into children — different cells, no aliasing.
         update_dex_view(&mut g, &info);
-        if let Some((raw_ops, ops)) = ops {
-            g.view_mut().raw_custom_ops = if raw_ops.is_empty() {
+        if let Some((raw_ops, ops, recaptured)) = ops {
+            let v = g.view_mut();
+            v.raw_custom_ops = if raw_ops.is_empty() {
                 None
             } else {
-                Some(Rc::new(raw_ops))
+                Some(raw_ops)
             };
-            g.view_mut().raw_custom_ops_seq = vm.view_invalid_seq(h);
-            g.view_mut().custom_ops = if ops.is_empty() {
+            v.raw_custom_ops_seq = vm.view_invalid_seq(h);
+            v.raw_custom_ops_size = (ow, oh);
+            v.custom_ops = if ops.is_empty() {
                 None
             } else {
                 Some(Rc::new(ops))
@@ -1476,7 +1516,9 @@ impl GuestUi {
             // onDraw runs during materialize, mid-traversal) must mark
             // the view dirty or the frame that carries them never
             // repaints — the window stays at its clear color.
-            g.view_mut().invalidate();
+            if recaptured {
+                v.invalidate();
+            }
         }
         if let GuestView::Group(gr) = &mut *g {
             let mut kids: Vec<Box<dyn Drawable>> = Vec::new();
@@ -1654,15 +1696,21 @@ fn viewdbg() -> bool {
 
 /// Cached env flag — per-frame/per-view checks must not hit getenv.
 fn dbg_flag(name: &'static str) -> bool {
-    static CACHE: std::sync::OnceLock<std::sync::RwLock<HashMap<&'static str, bool>>> =
-        std::sync::OnceLock::new();
-    let cache = CACHE.get_or_init(|| std::sync::RwLock::new(HashMap::new()));
-    if let Some(v) = cache.read().unwrap().get(name) {
-        return *v;
+    // This runs per view per frame; even a locked SipHash map is hot.
+    // Static flag names have stable addresses, and there are only a few
+    // distinct ones, so a tiny thread-local pointer-indexed vec wins.
+    thread_local! {
+        static CACHE: std::cell::RefCell<Vec<(usize, bool)>> = const { std::cell::RefCell::new(Vec::new()) };
     }
-    let v = std::env::var_os(name).is_some();
-    cache.write().unwrap().insert(name, v);
-    v
+    let key = name.as_ptr() as usize;
+    CACHE.with(|c| {
+        if let Some((_, v)) = c.borrow().iter().find(|(k, _)| *k == key) {
+            return *v;
+        }
+        let v = std::env::var_os(name).is_some();
+        c.borrow_mut().push((key, v));
+        v
+    })
 }
 
 /// Absolute (window) origin of a view handle: a bridged view answers
