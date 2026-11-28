@@ -189,6 +189,10 @@ const P_ORIENTATION: u32 = 0xFFFD_FFDD;
 /// CompoundButton checked state / RadioGroup's checked child id.
 const P_CHECKED: u32 = 0xFFFD_FFDC;
 const P_RADIO_CHECKED: u32 = 0xFFFD_FFDB;
+/// Explicit `setClickable` state. Android views consume touches when
+/// clickable even without an OnClickListener — TabView relies on its
+/// performClick override exactly that way.
+const P_CLICKABLE: u32 = u32::MAX - 600;
 /// CompoundButton/RadioGroup `OnCheckedChangeListener`.
 const P_CHECK_LISTENER: u32 = 0xFFFD_FFD3;
 /// Set while a checked-change callback is on the dex stack.
@@ -2721,7 +2725,11 @@ pub(crate) fn call(
                 }
                 _ => P_LISTENER,
             };
-            pseudo_set(vm, this, key, args.get(1).copied().unwrap_or(V::Ref(0)));
+            let listener = args.get(1).copied().unwrap_or(V::Ref(0));
+            pseudo_set(vm, this, key, listener);
+            if key == P_LISTENER && listener != V::Ref(0) {
+                pseudo_set(vm, this, P_CLICKABLE, V::I32(1));
+            }
             Some(match ret(sig) {
                 "V" => None,
                 _ => Some(V::I32(1)),
@@ -2797,12 +2805,12 @@ pub(crate) fn call(
         "isShown"
         | "hasWindowFocus"
         | "isEnabled"
-        | "isClickable"
         | "isFocusable"
         | "isFocusableInTouchMode"
         | "isFocusableOnScreen"
         | "hasFocusable"
         | "isImportantForAccessibility" => Some(Some(V::I32(1))),
+        "isClickable" => Some(Some(V::I32(pint(vm, this, P_CLICKABLE)))),
         "isAttachedToWindow" => Some(Some(V::I32(pint(vm, this, P_ATTACHED)))),
         "isFocused" => Some(Some(V::I32(pint(vm, this, P_FOCUSED)))),
         "hasFocus" => {
@@ -3349,6 +3357,15 @@ pub(crate) fn call(
         "getMax" => Some(Some(
             pseudo_get(vm, this, P_PROGRESS_MAX).unwrap_or(V::I32(100)),
         )),
+        "setClickable" => {
+            pseudo_set(
+                vm,
+                this,
+                P_CLICKABLE,
+                args.get(1).copied().unwrap_or(V::I32(0)),
+            );
+            Some(None)
+        }
         "setAlpha"
         | "setElevation"
         | "setShowDividers"
@@ -3364,7 +3381,6 @@ pub(crate) fn call(
         | "setActivated"
         | "setPressed"
         | "setEnabled"
-        | "setClickable"
         | "setLongClickable"
         | "setFocusable"
         | "setFocusableInTouchMode"
@@ -7438,6 +7454,7 @@ pub(crate) fn dispatch_touch(
                 _ => None,
             };
             let clickable = listener.is_some()
+                || pint(vm, v, P_CLICKABLE) != 0
                 || pseudo_get(vm, v, P_DIALOG_BUTTON_WHICH).is_some()
                 || is_compound_desc(vm, &class_of(vm, V::Ref(v)));
             if clickable {
