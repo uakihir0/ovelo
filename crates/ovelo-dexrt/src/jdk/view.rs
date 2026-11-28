@@ -903,6 +903,16 @@ fn grid_child_width_fixup(vm: &mut Vm, parent: u32) {
 /// Store a view frame; returns whether it changed (View.setFrame's
 /// contract and `layout`'s `changed` argument).
 pub(crate) fn frame_set(vm: &mut Vm, h: u32, l: i32, t: i32, r: i32, b: i32) -> bool {
+    let old_w = if pseudo_get(vm, h, P_RIGHT).is_some() {
+        pint(vm, h, P_RIGHT) - pint(vm, h, P_LEFT)
+    } else {
+        0
+    };
+    let old_h = if pseudo_get(vm, h, P_BOTTOM).is_some() {
+        pint(vm, h, P_BOTTOM) - pint(vm, h, P_TOP)
+    } else {
+        0
+    };
     let changed = pint(vm, h, P_LEFT) != l
         || pint(vm, h, P_TOP) != t
         || pint(vm, h, P_RIGHT) != r
@@ -919,6 +929,26 @@ pub(crate) fn frame_set(vm: &mut Vm, h: u32, l: i32, t: i32, r: i32, b: i32) -> 
         pseudo_set(vm, h, P_TOP, V::I32(t));
         pseudo_set(vm, h, P_RIGHT, V::I32(r));
         pseudo_set(vm, h, P_BOTTOM, V::I32(b));
+        let (w, hh) = (r - l, b - t);
+        if (w != old_w || hh != old_h)
+            && vm.has_dex_virtual(h, "onSizeChanged", &["I", "I", "I", "I"])
+        {
+            // View.setFrame performs this callback before returning.
+            // Image loaders (notably Glide's ViewSizeObserver) rely on
+            // it when a RecyclerView layout changes the cell size after
+            // the initial, under-measured pass.
+            if vm
+                .call_virtual_rt(
+                    h,
+                    "onSizeChanged",
+                    &[V::I32(w), V::I32(hh), V::I32(old_w), V::I32(old_h)],
+                )
+                .is_err()
+                && crate::dbg_flag("OVELO_VIEWDBG")
+            {
+                eprintln!("[viewdbg] onSizeChanged h{h} err");
+            }
+        }
     }
     changed
 }
