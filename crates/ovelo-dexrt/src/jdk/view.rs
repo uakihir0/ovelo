@@ -4998,13 +4998,17 @@ fn child_measure_spec(spec: i32, padding: i32, child_dim: i32) -> i32 {
     let size = if size < 0 { 0 } else { size };
     let (mode, out) = match spec & MODE_MASK {
         m if m == EXACTLY => match child_dim {
-            d if d >= 0 => (EXACTLY, d),
+            d if d > 0 => (EXACTLY, d),
+            // LinearLayout uses 0dp together with layout_weight. The
+            // generic child-spec rules must not measure that as a real
+            // zero-sized view before the weight distribution pass.
+            0 => (AT_MOST, size),
             -2 => (AT_MOST, size), // WRAP_CONTENT
             _ => (EXACTLY, size),  // MATCH_PARENT (-1) / unspecified
         },
         m if m == AT_MOST => match child_dim {
-            d if d >= 0 => (EXACTLY, d),
-            -2 => (AT_MOST, size),
+            d if d > 0 => (EXACTLY, d),
+            0 | -2 => (AT_MOST, size),
             _ => (AT_MOST, size),
         },
         // UNSPECIFIED: a fixed child dimension still measures EXACTLY
@@ -5194,6 +5198,28 @@ fn view_padding(vm: &Vm, h: u32) -> (i32, i32, i32, i32) {
 /// framework containers (RelativeLayout, FrameLayout, LinearLayout)
 /// arrive as skeleton classes with no dex `onMeasure`/`onLayout`, so
 /// without a host fallback their children stay 0×0 forever.
+fn is_appbar_layout_class(vm: &Vm, desc: &str) -> bool {
+    let mut d = desc.to_string();
+    for _ in 0..32 {
+        if d.contains("AppBarLayout") {
+            return true;
+        }
+        // R8 strips the canonical Material class name (Music Player has
+        // AppBarLayout as `Lyk;`), but its public API method names survive.
+        if vm.has_method_named(&d, "getDownNestedPreScrollRange")
+            && vm.has_method_named(&d, "getLiftOnScrollTargetViewId")
+        {
+            return true;
+        }
+        let Some(next) = vm.super_desc(&d) else { break };
+        if next == d {
+            break;
+        }
+        d = next;
+    }
+    false
+}
+
 #[allow(clippy::too_many_arguments)]
 fn measure_child(
     vm: &mut Vm,
@@ -5202,7 +5228,7 @@ fn measure_child(
     pw: i32,
     w_used: i32,
     ph: i32,
-    h_used: i32,
+    mut h_used: i32,
     margins: bool,
 ) {
     // Child dims/margins come from its LayoutParams; AOSP's
@@ -5250,6 +5276,36 @@ fn measure_child(
         }
     }
     let (lp_w, lp_h) = (lp_w.unwrap_or(-2), lp_h.unwrap_or(-2));
+    // CoordinatorLayout's scrolling-view behavior gives a match_parent
+    // content child the space remaining below the preceding AppBarLayout.
+    // The behavior is dex-side and depends on several AndroidX invariants;
+    // preserve its essential measurement contract or the content root is
+    // measured full-height and its bottom-constrained controls land below
+    // the window (Music Player's tab bar did exactly that).
+    if lp_h == -1 && vm.extends_named(&class_of(vm, V::Ref(parent)), "CoordinatorLayout") {
+        let mut prior_bar_h = 0;
+        for sibling in children(vm, parent) {
+            let V::Ref(sh) = sibling else { continue };
+            if sh == child {
+                break;
+            }
+            if sh == 0 || view_is_gone(vm, sh) {
+                continue;
+            }
+            let sd = class_of(vm, V::Ref(sh));
+            if is_appbar_layout_class(vm, &sd) {
+                let mut mh = pint(vm, sh, P_MEAS_H) & 0x00FF_FFFF;
+                if mh == 0 {
+                    measure_child(vm, parent, sh, pw, 0, ph, 0, true);
+                    mh = pint(vm, sh, P_MEAS_H) & 0x00FF_FFFF;
+                }
+                prior_bar_h = prior_bar_h.max(mh);
+            }
+        }
+        if prior_bar_h > 0 {
+            h_used = h_used.max(prior_bar_h);
+        }
+    }
     // Parent padding halves the space handed to children.
     let (pl, pt, pr, pb) = view_padding(vm, parent);
     let pad_w = pl + pr;
