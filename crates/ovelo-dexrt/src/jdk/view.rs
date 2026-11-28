@@ -658,12 +658,25 @@ fn view_content_image(
         eprintln!("[imgdbg] h{h} {} raw={raw_desc}", class_of(vm, V::Ref(h)));
     }
     raw_image.and_then(|v| image_pixels(vm, v)).or_else(|| {
-        // MaterialButton's `app:icon` is a compound drawable rather
-        // than an ImageView src. The host materialization has one
-        // centered image slot, which is correct for the common
-        // icon-only button; text+icon layout needs real compound
+        // MaterialButton and ActionMenuItemView icons are compound
+        // drawables rather than an ImageView src. The host materialization
+        // has one centered image slot, which is correct for the common
+        // icon-only button/menu item; text+icon layout needs real compound
         // drawable support and is intentionally not approximated.
-        icon_only.then(|| attr_find(vm, h, "icon").and_then(|v| image_pixels(vm, v)))?
+        if !icon_only {
+            return None;
+        }
+        let compound = match pseudo_get(vm, h, P_COMPOUND_DRAWABLES) {
+            Some(V::Ref(ah)) if ah != 0 => match vm.heap.get(ah) {
+                Some(Obj::Array { data, .. }) => data.clone(),
+                _ => Vec::new(),
+            },
+            _ => Vec::new(),
+        };
+        compound
+            .iter()
+            .find_map(|v| image_pixels(vm, *v))
+            .or_else(|| attr_find(vm, h, "icon").and_then(|v| image_pixels(vm, v)))
     })
 }
 
@@ -10208,6 +10221,21 @@ pub(crate) fn register_menu_overrides(vm: &mut Vm) {
                 "A",
             ) {
                 pseudo_set(vm, iv, P_IMAGE, icon);
+            }
+            Ok(None)
+        })) as HostCall,
+    );
+    // AppCompat action menu items keep their icon in a dex field and
+    // forward it through TextView compound drawables. Bind it as the host
+    // image directly so icon-only toolbar actions have intrinsic size and
+    // rasterize in the host materialization.
+    let _ = vm.register_host(
+        "Landroidx/appcompat/view/menu/ActionMenuItemView;",
+        "setIcon",
+        "(Landroid/graphics/drawable/Drawable;)V",
+        Rc::new(RefCell::new(|vm: &mut Vm, a: &[V]| {
+            if let Some(V::Ref(this)) = a.first().copied() {
+                pseudo_set(vm, this, P_IMAGE, a.get(1).copied().unwrap_or(V::Ref(0)));
             }
             Ok(None)
         })) as HostCall,
