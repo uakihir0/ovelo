@@ -6,6 +6,61 @@ use crate::value::{HostState, Obj, V};
 
 const P_REFQ_DEADLINE: u32 = u32::MAX - 402;
 
+/// `Field.get` always returns an object. Primitive dex fields hold raw
+/// register values internally, so reflection must box them before guest
+/// serializers call `Object.getClass` or compare wrapper types.
+fn box_reflected_field(vm: &mut Vm, desc: Option<String>, v: V) -> V {
+    let int = |v: V| match v {
+        V::I32(x) => x,
+        V::I64(x) => x as i32,
+        _ => 0,
+    };
+    match desc.as_deref() {
+        Some("Z") => boxed_boolean(vm, int(v) != 0),
+        Some("B") => host(
+            vm,
+            "Ljava/lang/Byte;",
+            HostState::Slot(V::I32(int(v) as i8 as i32)),
+        ),
+        Some("S") => host(
+            vm,
+            "Ljava/lang/Short;",
+            HostState::Slot(V::I32(int(v) as i16 as i32)),
+        ),
+        Some("C") => host(
+            vm,
+            "Ljava/lang/Character;",
+            HostState::Slot(V::I32(int(v) as u16 as i32)),
+        ),
+        Some("I") => boxed_integer(vm, int(v)),
+        Some("J") => {
+            let x = match v {
+                V::I64(x) => x,
+                V::I32(x) => x as i64,
+                _ => 0,
+            };
+            host(vm, "Ljava/lang/Long;", HostState::Slot(V::I64(x)))
+        }
+        Some("F") => {
+            let x = match v {
+                V::F32(x) => x,
+                V::I32(x) => f32::from_bits(x as u32),
+                _ => 0.0,
+            };
+            host(vm, "Ljava/lang/Float;", HostState::Slot(V::F32(x)))
+        }
+        Some("D") => {
+            let x = match v {
+                V::F64(x) => x,
+                V::I64(x) => f64::from_bits(x as u64),
+                _ => 0.0,
+            };
+            host(vm, "Ljava/lang/Double;", HostState::Slot(V::F64(x)))
+        }
+        _ => v,
+    }
+}
+
 /// Concatenated `dalvik.annotation.Signature` strings for a dex class.
 fn class_signature(vm: &Vm, desc: &str) -> Option<String> {
     let cg = vm.class_gidx_of(desc)?;
@@ -3871,6 +3926,11 @@ fn reflect_call(
                         _ if name == "getFloat" => V::F32(0.0),
                         _ if name == "getDouble" => V::F64(0.0),
                         _ => V::I32(0),
+                    };
+                    let v = if name == "get" {
+                        box_reflected_field(vm, vm.field_type_desc(fid as crate::GIdx), v)
+                    } else {
+                        v
                     };
                     Some(Some(v))
                 }
