@@ -1036,7 +1036,10 @@ fn list_call(vm: &mut Vm, name: &str, sig: &str, args: &[V]) -> Rt<Option<Option
                     Some(l) => l,
                     None => return Ok(None),
                 };
-                Some(Some(if l.is_empty() { V::Ref(0) } else { l.remove(0) }))
+                if l.is_empty() {
+                    return Err(vm.throw_builtin("Ljava/util/NoSuchElementException;", ""));
+                }
+                Some(Some(l.remove(0)))
             } else {
                 // Guest-backed collections mutate themselves — without
                 // a host store this arm cannot remove, so defer to dex.
