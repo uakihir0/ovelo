@@ -719,6 +719,29 @@ fn stream_call(vm: &mut Vm, name: &str, args: &[V]) -> Rt<Option<Option<V>>> {
         Some(&V::Ref(h)) => h,
         _ => 0,
     };
+    // `Writer.write(String)` is a concrete JDK default that delegates to
+    // `write(String, off, len)`. Gson's AppendableWriter is a dex Writer
+    // subclass which overrides only the ranged overload, so host dispatch
+    // must perform that virtual delegation instead of dropping the text.
+    if name == "write" && args.len() == 2 {
+        if let (Some(V::Ref(text_h)), Some(ci)) = (args.get(1).copied(), vm.heap.class_of(this)) {
+            if matches!(vm.heap.get(this), Some(Obj::Instance { .. })) {
+                if let Some(text) = sv(vm, V::Ref(text_h)) {
+                    if let Ok(Some(midx)) =
+                        vm.find_method_on_chain_sig(ci, "write", &["Ljava/lang/String;", "I", "I"])
+                    {
+                        let len = text.chars().count() as i32;
+                        vm.invoke_no_host(
+                            midx,
+                            vec![V::Ref(this), V::Ref(text_h), V::I32(0), V::I32(len)],
+                            crate::InvokeKind::Virtual,
+                        )?;
+                        return Ok(Some(None));
+                    }
+                }
+            }
+        }
+    }
     // ByteArrayOutputStream accumulates into the same Bytes payload —
     // handled before the mutable borrow below because the write source
     // and the returned array/string need second heap accesses.
