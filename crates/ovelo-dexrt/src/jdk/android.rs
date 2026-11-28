@@ -23,6 +23,7 @@ const P_AUDIO_TRANSFER: u32 = u32::MAX - 325;
 const P_AUDIO_PLAYING: u32 = u32::MAX - 326;
 const P_AUDIO_START_MS: u32 = u32::MAX - 327;
 const P_AUDIO_WRITTEN: u32 = u32::MAX - 328;
+const P_AUDIO_CONSUMED_BASE: u32 = u32::MAX - 333;
 const P_PLAY_STATE: u32 = u32::MAX - 329;
 const P_PLAY_POSITION: u32 = u32::MAX - 330;
 const P_PLAY_SPEED: u32 = u32::MAX - 331;
@@ -148,6 +149,10 @@ pub(crate) fn call(
         || class.starts_with("Landroid/media/session/PlaybackState")
     {
         audio_call(vm, class, name, args)
+    } else if class.starts_with("Landroid/media/MediaCodec")
+        || class.starts_with("Landroid/media/MediaFormat")
+    {
+        media_codec_call(vm, class, name, sig, args)
     } else if class == "Landroid/media/session/MediaSession;"
         || class == "Landroid/media/session/MediaController;"
         || class == "Landroid/media/session/MediaController$TransportControls;"
@@ -1623,6 +1628,20 @@ fn audio_frame_size(vm: &Vm, h: u32) -> i64 {
     channels * bytes_per_sample
 }
 
+fn audio_bytes_per_ms(vm: &Vm, h: u32) -> i64 {
+    (pseudo_i64(vm, h, P_AUDIO_SAMPLE_RATE).max(1) * audio_frame_size(vm, h).max(1) / 1000).max(1)
+}
+
+fn audio_update_consumed(vm: &mut Vm, h: u32) {
+    if pseudo_i64(vm, h, P_AUDIO_PLAYING) != 0 {
+        let elapsed = (now_ms() - pseudo_i64(vm, h, P_AUDIO_START_MS)).max(0);
+        let consumed =
+            pseudo_i64(vm, h, P_AUDIO_CONSUMED_BASE) + elapsed * audio_bytes_per_ms(vm, h);
+        pseudo_set(vm, h, P_AUDIO_CONSUMED_BASE, V::I64(consumed));
+        pseudo_set(vm, h, P_AUDIO_START_MS, V::I64(now_ms()));
+    }
+}
+
 fn mint_audio_track(vm: &mut Vm, builder: u32) -> V {
     let v = host(vm, "Landroid/media/AudioTrack;", HostState::Empty);
     if let V::Ref(th) = v {
@@ -1658,6 +1677,538 @@ fn playback_state_copy(vm: &mut Vm, from: u32, desc: &str) -> V {
         }
     }
     v
+}
+
+const P_CODEC_CALLBACK: u64 = 0xFFFD_FD10;
+const P_CODEC_FORMAT: u64 = 0xFFFD_FD11;
+const P_CODEC_INPUT_ARRAY: u64 = 0xFFFD_FD12;
+const P_CODEC_OUTPUT_ARRAY: u64 = 0xFFFD_FD13;
+const P_CODEC_INPUT_AVAIL: u64 = 0xFFFD_FD14;
+const P_CODEC_INPUT_CLIENT: u64 = 0xFFFD_FD15;
+const P_CODEC_OUTPUT_READY: u64 = 0xFFFD_FD16;
+const P_CODEC_OUTPUT_CLIENT: u64 = 0xFFFD_FD17;
+const P_CODEC_STARTED: u64 = 0xFFFD_FD18;
+const P_CODEC_SIZE: u64 = 0xFFFD_FD19;
+const CODEC_SLOTS: i64 = 4;
+
+fn codec_bits(vm: &Vm, h: u32, key: u64) -> i64 {
+    pseudo_get(vm, h, key).map(i64v).unwrap_or(0)
+}
+
+fn set_codec_bits(vm: &mut Vm, h: u32, key: u64, bits: i64) {
+    pseudo_set(vm, h, key, V::I64(bits));
+}
+
+fn named_field_write(vm: &mut Vm, h: u32, owner: &str, name: &str, v: V) {
+    if let Some(g) = vm.field_index_of(owner, name).map(|g| vm.canon_field(g)) {
+        if let Some(Obj::Instance { fields, .. } | Obj::Host { fields, .. }) = vm.heap.get_mut(h) {
+            fields.insert(g, v);
+        }
+    }
+}
+
+fn buffer_info_set(vm: &mut Vm, h: u32, offset: i32, size: i32, pts: i64, flags: i32) {
+    for (name, v) in [
+        ("offset", V::I32(offset)),
+        ("size", V::I32(size)),
+        ("presentationTimeUs", V::I64(pts)),
+        ("flags", V::I32(flags)),
+    ] {
+        named_field_write(vm, h, "Landroid/media/MediaCodec$BufferInfo;", name, v);
+    }
+    pseudo_set(vm, h, P_DATA, V::I64(size as i64));
+    pseudo_set(vm, h, P_FLAGS, V::I32(flags));
+}
+
+fn alloc_byte_buffer(vm: &mut Vm, capacity: usize) -> V {
+    let backing = vm.heap.alloc(Obj::Array {
+        elem: "B".into(),
+        data: vec![V::I32(0); capacity],
+    });
+    host(
+        vm,
+        "Ljava/nio/ByteBuffer;",
+        HostState::Slot(V::Ref(backing)),
+    )
+}
+
+fn bb_backing(vm: &Vm, h: u32) -> Option<u32> {
+    match vm.heap.get(h) {
+        Some(Obj::Host {
+            state: HostState::Slot(V::Ref(b)),
+            ..
+        }) if matches!(vm.heap.get(*b), Some(Obj::Array { .. })) => Some(*b),
+        _ => None,
+    }
+}
+
+fn bb_copy_from(vm: &Vm, h: u32, offset: usize, size: usize) -> Vec<u8> {
+    let Some(b) = bb_backing(vm, h) else {
+        return Vec::new();
+    };
+    let base = i32v(pseudo_get(vm, h, P_BBUF_BASE).unwrap_or(V::I32(0))).max(0) as usize;
+    match vm.heap.get(b) {
+        Some(Obj::Array { data, .. }) => {
+            let start = base.saturating_add(offset).min(data.len());
+            let end = start.saturating_add(size).min(data.len());
+            data[start..end].iter().map(|v| i32v(*v) as u8).collect()
+        }
+        _ => Vec::new(),
+    }
+}
+
+fn bb_replace(vm: &mut Vm, h: u32, bytes: &[u8]) {
+    if let Some(b) = bb_backing(vm, h) {
+        if let Some(Obj::Array { data, .. }) = vm.heap.get_mut(b) {
+            for (i, byte) in bytes.iter().copied().enumerate().take(data.len()) {
+                data[i] = V::I32(byte as i8 as i32);
+            }
+        }
+    }
+    pseudo_set(vm, h, P_BBUF_POS, V::I32(0));
+    pseudo_set(vm, h, P_BBUF_LIM, V::I32(bytes.len() as i32));
+}
+
+fn codec_array(vm: &mut Vm, h: u32, key: u64) -> Option<u32> {
+    match pseudo_get(vm, h, key) {
+        Some(V::Ref(a)) if matches!(vm.heap.get(a), Some(Obj::Array { .. })) => Some(a),
+        _ => None,
+    }
+}
+
+fn codec_buffer_at(vm: &Vm, arrh: u32, index: i32) -> Option<u32> {
+    match vm.heap.get(arrh) {
+        Some(Obj::Array { data, .. }) => match data.get(index.max(0) as usize) {
+            Some(V::Ref(h)) => Some(*h),
+            _ => None,
+        },
+        _ => None,
+    }
+}
+
+fn ensure_codec_buffers(vm: &mut Vm, h: u32) {
+    if codec_array(vm, h, P_CODEC_INPUT_ARRAY).is_some() {
+        return;
+    }
+    let capacity = pseudo_get(vm, h, P_CODEC_SIZE)
+        .map(i64v)
+        .unwrap_or(131072)
+        .clamp(4096, 1024 * 1024) as usize;
+    let mut inputs = Vec::new();
+    let mut outputs = Vec::new();
+    for _ in 0..CODEC_SLOTS {
+        inputs.push(alloc_byte_buffer(vm, capacity));
+        outputs.push(alloc_byte_buffer(vm, capacity));
+    }
+    let ia = arr(vm, "Ljava/nio/ByteBuffer;", inputs);
+    let oa = arr(vm, "Ljava/nio/ByteBuffer;", outputs);
+    pseudo_set(vm, h, P_CODEC_INPUT_ARRAY, ia);
+    pseudo_set(vm, h, P_CODEC_OUTPUT_ARRAY, oa);
+}
+
+fn codec_input_available(vm: &mut Vm, codec: u32, index: i32) {
+    if let Some(V::Ref(cb)) = pseudo_get(vm, codec, P_CODEC_CALLBACK) {
+        let _ = vm.call_virtual(
+            cb,
+            "onInputBufferAvailable",
+            &[V::Ref(codec), V::I32(index)],
+        );
+    }
+}
+
+fn codec_format_changed(vm: &mut Vm, codec: u32) {
+    if let (Some(V::Ref(cb)), Some(fmt)) = (
+        pseudo_get(vm, codec, P_CODEC_CALLBACK),
+        pseudo_get(vm, codec, P_CODEC_FORMAT),
+    ) {
+        let _ = vm.call_virtual(cb, "onOutputFormatChanged", &[V::Ref(codec), fmt]);
+    }
+}
+
+fn format_entries(vm: &Vm, h: u32) -> Vec<(V, V)> {
+    match vm.heap.get(h) {
+        Some(Obj::Host {
+            state: HostState::Map(entries),
+            ..
+        }) => entries.clone(),
+        _ => Vec::new(),
+    }
+}
+
+fn format_get(vm: &Vm, h: u32, key: &str) -> Option<V> {
+    format_entries(vm, h)
+        .into_iter()
+        .find(|(k, _)| sv(vm, *k).as_deref() == Some(key))
+        .map(|(_, v)| v)
+}
+
+fn format_put(vm: &mut Vm, h: u32, key: V, value: V) {
+    let key_string = sv(vm, key).unwrap_or_default();
+    let existing = format_entries(vm, h)
+        .iter()
+        .position(|(k, _)| sv(vm, *k).as_deref() == Some(key_string.as_str()));
+    if let Some(Obj::Host { state, .. }) = vm.heap.get_mut(h) {
+        if !matches!(state, HostState::Map(_)) {
+            *state = HostState::Map(Vec::new());
+        }
+        if let HostState::Map(entries) = state {
+            if let Some(index) = existing {
+                entries[index].1 = value;
+            } else {
+                entries.push((key, value));
+            }
+        }
+    }
+}
+
+fn mint_codec_info(vm: &mut Vm) -> V {
+    host(
+        vm,
+        "Landroid/media/MediaCodecInfo;",
+        HostState::StrBuf("ovelo.raw.decoder".into()),
+    )
+}
+
+fn media_codec_call(
+    vm: &mut Vm,
+    class: &str,
+    name: &str,
+    _sig: &str,
+    args: &[V],
+) -> Option<Option<V>> {
+    let this = match args.first() {
+        Some(&V::Ref(h)) => h,
+        _ => 0,
+    };
+    match name {
+        "<init>" => Some(None),
+        "getCodecInfos" if class == "Landroid/media/MediaCodecList;" => {
+            let info = mint_codec_info(vm);
+            Some(Some(arr(vm, "Landroid/media/MediaCodecInfo;", vec![info])))
+        }
+        "getName" if class == "Landroid/media/MediaCodecInfo;" => {
+            Some(Some(jstr(vm, "ovelo.raw.decoder")))
+        }
+        "getSupportedTypes" if class == "Landroid/media/MediaCodecInfo;" => {
+            let raw = jstr(vm, "audio/raw");
+            Some(Some(arr(vm, "Ljava/lang/String;", vec![raw])))
+        }
+        "isAlias" | "isEncoder" | "isHardwareAccelerated" | "isVendor"
+            if class == "Landroid/media/MediaCodecInfo;" =>
+        {
+            Some(Some(V::I32(0)))
+        }
+        "isSoftwareOnly" if class == "Landroid/media/MediaCodecInfo;" => Some(Some(V::I32(1))),
+        "getCapabilitiesForType" if class == "Landroid/media/MediaCodecInfo;" => {
+            let caps = host(
+                vm,
+                "Landroid/media/MediaCodecInfo$CodecCapabilities;",
+                HostState::Empty,
+            );
+            if let V::Ref(ch) = caps {
+                let level = host(
+                    vm,
+                    "Landroid/media/MediaCodecInfo$CodecProfileLevel;",
+                    HostState::Empty,
+                );
+                let levels = arr(
+                    vm,
+                    "Landroid/media/MediaCodecInfo$CodecProfileLevel;",
+                    vec![level],
+                );
+                named_field_write(
+                    vm,
+                    ch,
+                    "Landroid/media/MediaCodecInfo$CodecCapabilities;",
+                    "profileLevels",
+                    levels,
+                );
+            }
+            Some(Some(caps))
+        }
+        "getAudioCapabilities" if class == "Landroid/media/MediaCodecInfo$CodecCapabilities;" => {
+            Some(Some(host(
+                vm,
+                "Landroid/media/MediaCodecInfo$AudioCapabilities;",
+                HostState::Empty,
+            )))
+        }
+        "getVideoCapabilities" if class == "Landroid/media/MediaCodecInfo$CodecCapabilities;" => {
+            Some(Some(host(
+                vm,
+                "Landroid/media/MediaCodecInfo$VideoCapabilities;",
+                HostState::Empty,
+            )))
+        }
+        "isFeatureSupported" | "isFeatureRequired"
+            if class == "Landroid/media/MediaCodecInfo$CodecCapabilities;" =>
+        {
+            Some(Some(V::I32(0)))
+        }
+        "getMaxInputChannelCount"
+            if class == "Landroid/media/MediaCodecInfo$AudioCapabilities;" =>
+        {
+            Some(Some(V::I32(8)))
+        }
+        "isSampleRateSupported" if class == "Landroid/media/MediaCodecInfo$AudioCapabilities;" => {
+            Some(Some(V::I32(1)))
+        }
+        "createByCodecName" | "createDecoderByType" | "createEncoderByType" => {
+            let v = host(vm, "Landroid/media/MediaCodec;", HostState::Empty);
+            Some(Some(v))
+        }
+        "setCallback" if class == "Landroid/media/MediaCodec;" => {
+            pseudo_set(
+                vm,
+                this,
+                P_CODEC_CALLBACK,
+                args.get(1).copied().unwrap_or(V::Ref(0)),
+            );
+            Some(None)
+        }
+        "configure" if class == "Landroid/media/MediaCodec;" => {
+            pseudo_set(
+                vm,
+                this,
+                P_CODEC_FORMAT,
+                args.get(1).copied().unwrap_or(V::Ref(0)),
+            );
+            if let Some(V::Ref(fh)) = args.get(1).copied() {
+                if let Some(v) = format_get(vm, fh, "max-input-size") {
+                    pseudo_set(vm, this, P_CODEC_SIZE, v);
+                }
+            }
+            ensure_codec_buffers(vm, this);
+            Some(None)
+        }
+        "start" if class == "Landroid/media/MediaCodec;" => {
+            ensure_codec_buffers(vm, this);
+            pseudo_set(vm, this, P_CODEC_STARTED, V::I32(1));
+            let all = (1i64 << CODEC_SLOTS) - 1;
+            set_codec_bits(vm, this, P_CODEC_INPUT_AVAIL, all);
+            set_codec_bits(vm, this, P_CODEC_INPUT_CLIENT, 0);
+            set_codec_bits(vm, this, P_CODEC_OUTPUT_READY, 0);
+            set_codec_bits(vm, this, P_CODEC_OUTPUT_CLIENT, 0);
+            codec_format_changed(vm, this);
+            for i in 0..CODEC_SLOTS as i32 {
+                codec_input_available(vm, this, i);
+            }
+            Some(None)
+        }
+        "dequeueInputBuffer" if class == "Landroid/media/MediaCodec;" => {
+            let avail = codec_bits(vm, this, P_CODEC_INPUT_AVAIL);
+            let mut out = -1;
+            for i in 0..CODEC_SLOTS {
+                if avail & (1i64 << i) != 0 {
+                    set_codec_bits(vm, this, P_CODEC_INPUT_AVAIL, avail & !(1i64 << i));
+                    set_codec_bits(
+                        vm,
+                        this,
+                        P_CODEC_INPUT_CLIENT,
+                        codec_bits(vm, this, P_CODEC_INPUT_CLIENT) | (1i64 << i),
+                    );
+                    out = i as i32;
+                    break;
+                }
+            }
+            Some(Some(V::I32(out)))
+        }
+        "getInputBuffer" | "getOutputBuffer" if class == "Landroid/media/MediaCodec;" => {
+            ensure_codec_buffers(vm, this);
+            let key = if name == "getInputBuffer" {
+                P_CODEC_INPUT_ARRAY
+            } else {
+                P_CODEC_OUTPUT_ARRAY
+            };
+            let index = args.get(1).map(|v| i32v(*v)).unwrap_or(-1);
+            let h = codec_array(vm, this, key).and_then(|a| codec_buffer_at(vm, a, index));
+            Some(Some(h.map(V::Ref).unwrap_or(V::Ref(0))))
+        }
+        "queueInputBuffer" if class == "Landroid/media/MediaCodec;" => {
+            let index = args.get(1).map(|v| i32v(*v)).unwrap_or(-1);
+            let offset = args.get(2).map(|v| i32v(*v)).unwrap_or(0).max(0) as usize;
+            let size = args.get(3).map(|v| i32v(*v)).unwrap_or(0).max(0) as usize;
+            let pts = args.get(4).map(|v| i64v(*v)).unwrap_or(0);
+            let flags = args.get(5).map(|v| i32v(*v)).unwrap_or(0);
+            if index >= 0 && index < CODEC_SLOTS as i32 {
+                let bit = 1i64 << index;
+                if let (Some(ia), Some(oa)) = (
+                    codec_array(vm, this, P_CODEC_INPUT_ARRAY),
+                    codec_array(vm, this, P_CODEC_OUTPUT_ARRAY),
+                ) {
+                    if let (Some(input), Some(output)) = (
+                        codec_buffer_at(vm, ia, index),
+                        codec_buffer_at(vm, oa, index),
+                    ) {
+                        let bytes = bb_copy_from(vm, input, offset, size);
+                        bb_replace(vm, output, &bytes);
+                        let entry = host(
+                            vm,
+                            "Landroid/media/MediaCodec$BufferInfo;",
+                            HostState::Empty,
+                        );
+                        if let V::Ref(eh) = entry {
+                            buffer_info_set(vm, eh, 0, bytes.len() as i32, pts, flags);
+                        }
+                        pseudo_set(vm, output, P_DATA, V::I64(pts));
+                        pseudo_set(vm, output, P_FLAGS, V::I32(flags));
+                        pseudo_set(vm, output, P_TARGET, V::I32(bytes.len() as i32));
+                    }
+                }
+                set_codec_bits(
+                    vm,
+                    this,
+                    P_CODEC_INPUT_CLIENT,
+                    codec_bits(vm, this, P_CODEC_INPUT_CLIENT) & !bit,
+                );
+                set_codec_bits(
+                    vm,
+                    this,
+                    P_CODEC_OUTPUT_READY,
+                    codec_bits(vm, this, P_CODEC_OUTPUT_READY) | bit,
+                );
+                if let Some(V::Ref(cb)) = pseudo_get(vm, this, P_CODEC_CALLBACK) {
+                    let info = host(
+                        vm,
+                        "Landroid/media/MediaCodec$BufferInfo;",
+                        HostState::Empty,
+                    );
+                    if let V::Ref(ih) = info {
+                        buffer_info_set(vm, ih, 0, size as i32, pts, flags);
+                        let _ = vm.call_virtual(
+                            cb,
+                            "onOutputBufferAvailable",
+                            &[V::Ref(this), V::I32(index), V::Ref(ih)],
+                        );
+                    }
+                }
+            }
+            Some(None)
+        }
+        "dequeueOutputBuffer" if class == "Landroid/media/MediaCodec;" => {
+            let ready = codec_bits(vm, this, P_CODEC_OUTPUT_READY);
+            let mut out = -1;
+            for i in 0..CODEC_SLOTS {
+                if ready & (1i64 << i) != 0 {
+                    let bit = 1i64 << i;
+                    set_codec_bits(vm, this, P_CODEC_OUTPUT_READY, ready & !bit);
+                    set_codec_bits(
+                        vm,
+                        this,
+                        P_CODEC_OUTPUT_CLIENT,
+                        codec_bits(vm, this, P_CODEC_OUTPUT_CLIENT) | bit,
+                    );
+                    if let Some(oa) = codec_array(vm, this, P_CODEC_OUTPUT_ARRAY) {
+                        if let Some(buf) = codec_buffer_at(vm, oa, i as i32) {
+                            if let Some(V::Ref(info)) = args.get(1).copied() {
+                                let size =
+                                    pseudo_get(vm, buf, P_TARGET).map(i64v).unwrap_or(0) as i32;
+                                let pts = pseudo_get(vm, buf, P_DATA).map(i64v).unwrap_or(0);
+                                let flags = pseudo_get(vm, buf, P_FLAGS).map(i32v).unwrap_or(0);
+                                buffer_info_set(vm, info, 0, size, pts, flags);
+                            }
+                        }
+                    }
+                    out = i as i32;
+                    break;
+                }
+            }
+            Some(Some(V::I32(out)))
+        }
+        "releaseOutputBuffer" if class == "Landroid/media/MediaCodec;" => {
+            let index = args.get(1).map(|v| i32v(*v)).unwrap_or(-1);
+            if index >= 0 && index < CODEC_SLOTS as i32 {
+                let bit = 1i64 << index;
+                set_codec_bits(
+                    vm,
+                    this,
+                    P_CODEC_OUTPUT_CLIENT,
+                    codec_bits(vm, this, P_CODEC_OUTPUT_CLIENT) & !bit,
+                );
+                set_codec_bits(
+                    vm,
+                    this,
+                    P_CODEC_INPUT_AVAIL,
+                    codec_bits(vm, this, P_CODEC_INPUT_AVAIL) | bit,
+                );
+                codec_input_available(vm, this, index);
+            }
+            Some(None)
+        }
+        "flush" if class == "Landroid/media/MediaCodec;" => {
+            let all = (1i64 << CODEC_SLOTS) - 1;
+            set_codec_bits(vm, this, P_CODEC_INPUT_AVAIL, all);
+            set_codec_bits(vm, this, P_CODEC_INPUT_CLIENT, 0);
+            set_codec_bits(vm, this, P_CODEC_OUTPUT_READY, 0);
+            set_codec_bits(vm, this, P_CODEC_OUTPUT_CLIENT, 0);
+            for i in 0..CODEC_SLOTS as i32 {
+                codec_input_available(vm, this, i);
+            }
+            Some(None)
+        }
+        "getOutputFormat" if class == "Landroid/media/MediaCodec;" => Some(Some(
+            pseudo_get(vm, this, P_CODEC_FORMAT)
+                .unwrap_or_else(|| host(vm, "Landroid/media/MediaFormat;", HostState::Map(vec![]))),
+        )),
+        "stop" | "release" | "reset" if class == "Landroid/media/MediaCodec;" => {
+            pseudo_set(vm, this, P_CODEC_STARTED, V::I32(0));
+            Some(None)
+        }
+        "setParameters" | "subscribeToVendorParameters" | "unsubscribeFromVendorParameters"
+            if class == "Landroid/media/MediaCodec;" =>
+        {
+            Some(None)
+        }
+        "set" if class == "Landroid/media/MediaCodec$BufferInfo;" => {
+            buffer_info_set(
+                vm,
+                this,
+                args.get(1).map(|v| i32v(*v)).unwrap_or(0),
+                args.get(2).map(|v| i32v(*v)).unwrap_or(0),
+                args.get(3).map(|v| i64v(*v)).unwrap_or(0),
+                args.get(4).map(|v| i32v(*v)).unwrap_or(0),
+            );
+            Some(None)
+        }
+        "setString" | "setInteger" | "setLong" | "setFloat" | "setByteBuffer"
+            if class == "Landroid/media/MediaFormat;" =>
+        {
+            if let Some(&key) = args.get(1) {
+                format_put(vm, this, key, args.get(2).copied().unwrap_or(V::I32(0)));
+            }
+            Some(None)
+        }
+        "containsKey" if class == "Landroid/media/MediaFormat;" => {
+            let key = sv(vm, args.get(1).copied().unwrap_or(V::Ref(0))).unwrap_or_default();
+            Some(Some(V::I32(format_get(vm, this, &key).is_some() as i32)))
+        }
+        "getString" | "getInteger" | "getLong" | "getFloat" | "getByteBuffer"
+            if class == "Landroid/media/MediaFormat;" =>
+        {
+            let key = sv(vm, args.get(1).copied().unwrap_or(V::Ref(0))).unwrap_or_default();
+            let v = format_get(vm, this, &key).unwrap_or(match name {
+                "getString" => jstr(vm, ""),
+                "getByteBuffer" => V::Ref(0),
+                "getLong" => V::I64(0),
+                "getFloat" => V::F32(0.0),
+                _ => V::I32(0),
+            });
+            Some(Some(v))
+        }
+        "getValueTypeForKey" if class == "Landroid/media/MediaFormat;" => {
+            let key = sv(vm, args.get(1).copied().unwrap_or(V::Ref(0))).unwrap_or_default();
+            let ty = match format_get(vm, this, &key) {
+                Some(V::I32(_)) => 1,
+                Some(V::I64(_)) => 2,
+                Some(V::F32(_)) | Some(V::F64(_)) => 3,
+                Some(V::Ref(h)) if matches!(vm.heap.get(h), Some(Obj::Str { .. })) => 4,
+                Some(V::Ref(_)) => 5,
+                _ => 0,
+            };
+            Some(Some(V::I32(ty)))
+        }
+        _ => None,
+    }
 }
 
 fn audio_call(vm: &mut Vm, class: &str, name: &str, args: &[V]) -> Option<Option<V>> {
@@ -1743,6 +2294,17 @@ fn audio_call(vm: &mut Vm, class: &str, name: &str, args: &[V]) -> Option<Option
             Some(Some(args[0]))
         }
         "setAudioAttributes" | "setOffloadedPlayback" | "setPerformanceMode" => Some(Some(args[0])),
+        "setWillPauseWhenDucked" | "setAcceptsDelayedFocusGain" => Some(Some(args[0])),
+        "setOnAudioFocusChangeListener" => Some(Some(args[0])),
+        "build" if class == "Landroid/media/AudioFocusRequest$Builder;" => Some(Some(host(
+            vm,
+            "Landroid/media/AudioFocusRequest;",
+            HostState::Empty,
+        ))),
+        "requestAudioFocus" | "abandonAudioFocusRequest" | "abandonAudioFocus" => {
+            Some(Some(V::I32(1)))
+        }
+        "generateAudioSessionId" => Some(Some(V::I32(1))),
         "build" if class == "Landroid/media/AudioFormat$Builder;" => {
             let v = host(vm, "Landroid/media/AudioFormat;", HostState::Empty);
             if let V::Ref(fh) = v {
@@ -1814,6 +2376,13 @@ fn audio_call(vm: &mut Vm, class: &str, name: &str, args: &[V]) -> Option<Option
             },
         ))),
         "play" => {
+            if crate::dbg_flag("AUDIODBG") {
+                eprintln!(
+                    "[audio] play rate={} written={}",
+                    pseudo_i64(vm, this, P_AUDIO_SAMPLE_RATE),
+                    pseudo_i64(vm, this, P_AUDIO_WRITTEN)
+                );
+            }
             if pseudo_i64(vm, this, P_AUDIO_PLAYING) == 0 {
                 pseudo_set(vm, this, P_AUDIO_PLAYING, V::I32(1));
                 pseudo_set(vm, this, P_AUDIO_START_MS, V::I64(now_ms()));
@@ -1822,22 +2391,37 @@ fn audio_call(vm: &mut Vm, class: &str, name: &str, args: &[V]) -> Option<Option
         }
         "pause" | "stop" | "flush" => {
             if name != "flush" {
+                audio_update_consumed(vm, this);
                 pseudo_set(vm, this, P_AUDIO_PLAYING, V::I32(0));
+            } else {
+                pseudo_set(vm, this, P_AUDIO_CONSUMED_BASE, V::I64(0));
+                pseudo_set(vm, this, P_AUDIO_WRITTEN, V::I64(0));
             }
             Some(None)
         }
         "release" => {
+            audio_update_consumed(vm, this);
             pseudo_set(vm, this, P_AUDIO_PLAYING, V::I32(0));
             Some(None)
         }
         "write" => {
-            let n = if matches!(args.get(1), Some(V::Ref(h)) if matches!(vm.heap.get(*h), Some(Obj::Array { .. }))) {
+            let requested = if matches!(args.get(1), Some(V::Ref(h)) if matches!(vm.heap.get(*h), Some(Obj::Array { .. }))) {
                 args.get(3).map(|v| i64v(*v)).unwrap_or(0)
             } else {
                 args.get(2).map(|v| i64v(*v)).unwrap_or(0)
             }
             .max(0);
-            let written = pseudo_i64(vm, this, P_AUDIO_WRITTEN) + n;
+            audio_update_consumed(vm, this);
+            let written_before = pseudo_i64(vm, this, P_AUDIO_WRITTEN);
+            let consumed = pseudo_i64(vm, this, P_AUDIO_CONSUMED_BASE);
+            let capacity = pseudo_i64(vm, this, P_AUDIO_BUFFER_SIZE).max(0);
+            // A cooperative VM cannot block in write() the way a real
+            // AudioTrack thread would. Accept the full request once the
+            // nominal buffer is full rather than spinning forever inside
+            // the caller; playback position is still governed by
+            // consumed bytes below.
+            let n = requested;
+            let written = written_before + n;
             pseudo_set(vm, this, P_AUDIO_WRITTEN, V::I64(written));
             if let Some(&V::Ref(bh)) = args.get(1) {
                 if matches!(vm.heap.get(bh), Some(Obj::Host { .. })) {
@@ -1848,20 +2432,33 @@ fn audio_call(vm: &mut Vm, class: &str, name: &str, args: &[V]) -> Option<Option
                     pseudo_set(vm, bh, P_BBUF_POS, V::I32((pos + n as i32).min(lim)));
                 }
             }
+            if crate::dbg_flag("AUDIODBG") {
+                eprintln!(
+                    "[audio] write requested={} accepted={} total={} capacity={} consumed={} playing={}",
+                    requested,
+                    n,
+                    written,
+                    capacity,
+                    consumed,
+                    pseudo_i64(vm, this, P_AUDIO_PLAYING)
+                );
+            }
             Some(Some(V::I32(n as i32)))
         }
         "getPlaybackHeadPosition" => {
-            let rate = pseudo_i64(vm, this, P_AUDIO_SAMPLE_RATE).max(1);
             let frame = audio_frame_size(vm, this).max(1);
-            let written_frames = pseudo_i64(vm, this, P_AUDIO_WRITTEN) / frame;
-            let elapsed_frames = if pseudo_i64(vm, this, P_AUDIO_PLAYING) != 0 {
-                ((now_ms() - pseudo_i64(vm, this, P_AUDIO_START_MS)).max(0) * rate) / 1000
-            } else {
-                written_frames
-            };
-            Some(Some(V::I32(
-                (written_frames.min(elapsed_frames) & 0xffff_ffff) as i32,
-            )))
+            audio_update_consumed(vm, this);
+            let consumed_frames = pseudo_i64(vm, this, P_AUDIO_CONSUMED_BASE) / frame;
+            let out = (consumed_frames & 0xffff_ffff) as i32;
+            if crate::dbg_flag("AUDIODBG") {
+                eprintln!(
+                    "[audio] head={} consumed_frames={} playing={}",
+                    out,
+                    consumed_frames,
+                    pseudo_i64(vm, this, P_AUDIO_PLAYING)
+                );
+            }
+            Some(Some(V::I32(out)))
         }
         "getSampleRate" => Some(Some(V::I32(
             pseudo_i64(vm, this, P_AUDIO_SAMPLE_RATE).max(0) as i32,

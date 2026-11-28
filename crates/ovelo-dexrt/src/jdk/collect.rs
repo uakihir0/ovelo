@@ -1030,16 +1030,24 @@ fn list_call(vm: &mut Vm, name: &str, sig: &str, args: &[V]) -> Rt<Option<Option
                     None => return Ok(None),
                 };
                 Some(Some(if i < l.len() { l.remove(i) } else { V::Ref(0) }))
+            } else if p.is_empty() {
+                // Queue.remove() is a no-arg overload that removes the head.
+                let l = match list_mut(vm, h) {
+                    Some(l) => l,
+                    None => return Ok(None),
+                };
+                Some(Some(if l.is_empty() { V::Ref(0) } else { l.remove(0) }))
             } else {
                 // Guest-backed collections mutate themselves — without
                 // a host store this arm cannot remove, so defer to dex.
                 if list_mut(vm, h).is_none() {
                     return Ok(None);
                 }
+                let needle = args.get(1).copied().unwrap_or(V::Ref(0));
                 let items: Vec<V> = list_snapshot(vm, h).unwrap_or_default();
                 let mut pos = None;
                 for (i, e) in items.iter().enumerate() {
-                    if elem_eq(vm, *e, args[1])? {
+                    if elem_eq(vm, *e, needle)? {
                         pos = Some(i);
                         break;
                     }
