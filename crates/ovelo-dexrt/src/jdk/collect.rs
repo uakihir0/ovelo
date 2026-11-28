@@ -1484,7 +1484,15 @@ fn list_call(vm: &mut Vm, name: &str, sig: &str, args: &[V]) -> Rt<Option<Option
             Some(Some(it))
         }
         "toArray" => {
-            let items: Vec<V> = list_snapshot(vm, h).unwrap_or_default();
+            // Guest collections (notably kotlin.collections.builders.SetBuilder)
+            // keep their entries in dex-side backing arrays, so a host backing-store
+            // snapshot cannot see them. AbstractCollection.toArray is specified in
+            // terms of iterator(); fall back to the guest iterator instead of
+            // silently producing an empty array.
+            let items: Vec<V> = match list_snapshot(vm, h) {
+                Some(items) => items,
+                None => collection_elements_rt(vm, h)?.unwrap_or_default(),
+            };
             if crate::dbg_flag("OVELO_ITERDBG") && items.iter().any(|v| is_null(*v)) {
                 let caller = vm
                     .stack
