@@ -54,6 +54,7 @@ pub(crate) const P_METH: u32 = u32::MAX - 44;
 pub(crate) const P_PAINT: u32 = u32::MAX - 37;
 /// The `P_TARGET` pseudo key (ResolveInfo's `*Info` member, ...).
 pub const P_TARGET: u32 = u32::MAX - 5;
+pub(crate) const P_DEFERRED_SEEK: u32 = u32::MAX - 400;
 pub(crate) const P_EDIT_PARENT: u32 = u32::MAX - 6;
 // Rect pseudo-fields (left/top/right/bottom ints) + a Drawable's
 // cached bounds Rect handle.
@@ -496,6 +497,21 @@ fn complete_host_future(vm: &mut Vm, future: u32, value: V) {
 }
 
 fn dispatch_task(vm: &mut Vm, r: u32) -> std::result::Result<Option<V>, ovelo_error::OveloError> {
+    if let Some(V::Ref(listener)) = pseudo_get(vm, r, P_DEFERRED_SEEK) {
+        let args = match pseudo_get(vm, r, P_DATA).and_then(|v| {
+            if let V::Ref(h) = v {
+                vm.heap.get(h)
+            } else {
+                None
+            }
+        }) {
+            Some(Obj::Array { data, .. }) => data.clone(),
+            _ => Vec::new(),
+        };
+        return vm
+            .call_virtual(listener, "onProgressChanged", &args)
+            .map(|_| None);
+    }
     if let Some(V::Ref(target)) = pseudo_get(vm, r, P_FUTURE_TARGET) {
         let callable = matches!(pseudo_get(vm, r, P_FUTURE_CALLABLE), Some(V::I32(1)));
         let result = if callable {

@@ -142,6 +142,7 @@ pub(crate) const P_RESULT_CODE: u32 = 0xFFFD_FFD1;
 pub(crate) const P_RESULT_INTENT: u32 = 0xFFFD_FFD0;
 const P_PROGRESS: u32 = 0xFFFD_FFCF;
 const P_PROGRESS_MAX: u32 = 0xFFFD_FFCE;
+const P_SEEK_LISTENER: u32 = 0xFFFD_FFCD;
 
 // TypedArray backing — below the `tag_key` band (which bottoms out at
 // ~u32::MAX - 0x10014).
@@ -3295,11 +3296,31 @@ pub(crate) fn call(
             Some(Some(out))
         }
         "setProgress" => {
+            let progress = args.get(1).copied().unwrap_or(V::I32(0));
+            pseudo_set(vm, this, P_PROGRESS, progress);
+            if let Some(V::Ref(listener)) = pseudo_get(vm, this, P_SEEK_LISTENER) {
+                if listener != 0 {
+                    let cb = host(vm, "Ljava/lang/Runnable;", HostState::Empty);
+                    if let V::Ref(cbh) = cb {
+                        pseudo_set(vm, cbh, P_DEFERRED_SEEK, V::Ref(listener));
+                        let call_args = arr(
+                            vm,
+                            "Ljava/lang/Object;",
+                            vec![V::Ref(this), progress, V::I32(0)],
+                        );
+                        pseudo_set(vm, cbh, P_DATA, call_args);
+                        vm.enqueue_runnable(cbh, true);
+                    }
+                }
+            }
+            Some(None)
+        }
+        "setOnSeekBarChangeListener" => {
             pseudo_set(
                 vm,
                 this,
-                P_PROGRESS,
-                args.get(1).copied().unwrap_or(V::I32(0)),
+                P_SEEK_LISTENER,
+                args.get(1).copied().unwrap_or(V::Ref(0)),
             );
             Some(None)
         }
