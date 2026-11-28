@@ -7886,6 +7886,10 @@ pub(crate) fn attach_at(
                 Some(i) if i <= data.len() => data.insert(i, child),
                 _ => data.push(child),
             }
+            // The child list lives in a backing array, not in a pseudo
+            // field on the view, so this structural mutation otherwise
+            // escapes view_gen when layout-request bits were already set.
+            vm.view_gen = vm.view_gen.wrapping_add(1);
         }
         pseudo_set(vm, parent, P_IS_GROUP, V::I32(1));
     }
@@ -8081,6 +8085,7 @@ pub(crate) fn detach(vm: &mut Vm, parent: u32, child: V, notify: bool) {
     if let Some(i) = pos {
         if let Some(Obj::Array { data, .. }) = vm.heap.get_mut(a) {
             data.remove(i);
+            vm.view_gen = vm.view_gen.wrapping_add(1);
         }
         mark_layout_requested(vm, parent);
         if let V::Ref(ch) = child {
