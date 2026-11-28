@@ -1612,7 +1612,15 @@ impl GuestUi {
             name,
             proto,
             Rc::new(RefCell::new(move |vm2: &mut Vm, a: &[V]| {
-                let mut g = ui2.borrow_mut();
+                let Ok(mut g) = ui2.try_borrow_mut() else {
+                    // Guest measure/draw code can re-enter bridged setters
+                    // while the UI bridge is already borrowed. Android
+                    // coalesces those view mutations into the same frame;
+                    // dropping the nested write is closer than crashing
+                    // the process, and the outer pass still applies its
+                    // own state.
+                    return Ok(None);
+                };
                 f(&mut g, vm2, a).map_err(|e| e.with_detail(format!("{class2}.{name2}")))
             })) as HostCall,
         );
