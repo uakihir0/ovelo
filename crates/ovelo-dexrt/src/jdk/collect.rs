@@ -11,7 +11,7 @@ use crate::value::{HostState, Obj, V};
 /// `value_eq` (identity / string content / class mirror). A guest
 /// `equals` that throws propagates — swallowing it would let a
 /// `remove` succeed where Java surfaces the exception.
-fn elem_eq(vm: &mut Vm, e: V, other: V) -> Rt<bool> {
+pub(crate) fn elem_eq(vm: &mut Vm, e: V, other: V) -> Rt<bool> {
     elem_eq_depth(vm, e, other, 0)
 }
 
@@ -175,6 +175,19 @@ fn elem_eq_depth(vm: &mut Vm, e: V, other: V, depth: u8) -> Rt<bool> {
         }
     }
     match e {
+        V::Ref(h)
+            if h != 0
+                && matches!(
+                    vm.heap.get(h),
+                    Some(Obj::Host { desc, .. }) if desc == "Ljava/math/BigDecimal;"
+                ) =>
+        {
+            match vm.call_virtual_rt(h, "equals", &[other]) {
+                Ok(Some(v)) => Ok(i32v(v) != 0),
+                Ok(None) => Ok(value_eq(vm, e, other)),
+                Err(e2) => Err(e2),
+            }
+        }
         V::Ref(h) if h != 0 && matches!(vm.heap.get(h), Some(Obj::Instance { .. })) => {
             match vm.call_virtual_rt(h, "equals", &[other]) {
                 Ok(Some(v)) => Ok(i32v(v) != 0),
@@ -392,6 +405,18 @@ fn is_set_obj(vm: &Vm, v: V) -> bool {
     }
 }
 
+fn enqueue_executor_task(vm: &mut Vm, ex: u32, r: u32) {
+    if vm.single_executors.contains(&ex) && vm.executor_active.contains_key(&ex) {
+        vm.executor_queues.entry(ex).or_default().push_back(r);
+    } else {
+        if vm.single_executors.contains(&ex) {
+            vm.executor_active.insert(ex, r);
+            vm.runnable_executor.insert(r, ex);
+        }
+        vm.enqueue_runnable(r, false);
+    }
+}
+
 pub(crate) fn call(
     vm: &mut Vm,
     class: &str,
@@ -464,6 +489,91 @@ pub(crate) fn call(
         pair_call(vm, name, args)?
     } else if class.starts_with("Landroid/util/Sparse") {
         sparse_call(vm, class, name, args)?
+    } else if class == "Ljava/util/concurrent/FutureTask;" {
+        let this = args.first().copied().unwrap_or(V::Ref(0));
+        let this_h = match this {
+            V::Ref(h) => h,
+            _ => 0,
+        };
+        match name {
+            "<init>" => {
+                if this_h != 0 {
+                    pseudo_set(
+                        vm,
+                        this_h,
+                        P_FT_TASK,
+                        args.get(1).copied().unwrap_or(V::Ref(0)),
+                    );
+                    pseudo_set(
+                        vm,
+                        this_h,
+                        P_FT_DEFAULT,
+                        args.get(2).copied().unwrap_or(V::Ref(0)),
+                    );
+                    pseudo_set(vm, this_h, P_FT_CALLABLE, V::I32((args.len() == 2) as i32));
+                    pseudo_set(vm, this_h, P_FUTURE_DONE, V::I32(0));
+                    pseudo_set(vm, this_h, P_FT_CANCELLED, V::I32(0));
+                }
+                Some(None)
+            }
+            "run" => {
+                if this_h == 0
+                    || matches!(pseudo_get(vm, this_h, P_FUTURE_DONE), Some(V::I32(1)))
+                    || matches!(pseudo_get(vm, this_h, P_FT_CANCELLED), Some(V::I32(1)))
+                {
+                    return Ok(Some(None));
+                }
+                let task = pseudo_get(vm, this_h, P_FT_TASK).unwrap_or(V::Ref(0));
+                let callable = matches!(pseudo_get(vm, this_h, P_FT_CALLABLE), Some(V::I32(1)));
+                let result = if callable {
+                    match task {
+                        V::Ref(t) if t != 0 => vm.call_virtual_rt(t, "call", &[])?,
+                        _ => None,
+                    }
+                } else {
+                    if let V::Ref(t) = task {
+                        if t != 0 {
+                            vm.call_virtual_rt(t, "run", &[])?;
+                        }
+                    }
+                    Some(pseudo_get(vm, this_h, P_FT_DEFAULT).unwrap_or(V::Ref(0)))
+                };
+                pseudo_set(
+                    vm,
+                    this_h,
+                    P_FT_RESULT,
+                    result.unwrap_or(pseudo_get(vm, this_h, P_FT_DEFAULT).unwrap_or(V::Ref(0))),
+                );
+                pseudo_set(vm, this_h, P_FUTURE_DONE, V::I32(1));
+                // FutureTask.run finishes through the virtual done() hook;
+                // Lottie's subclass uses it to publish the composition.
+                let _ = vm.call_virtual_rt(this_h, "done", &[])?;
+                Some(None)
+            }
+            "get" => {
+                let v = pseudo_get(vm, this_h, P_FT_RESULT).unwrap_or(V::Ref(0));
+                Some(Some(v))
+            }
+            "isDone" => Some(Some(V::I32(matches!(
+                pseudo_get(vm, this_h, P_FUTURE_DONE),
+                Some(V::I32(1))
+            ) as i32))),
+            "isCancelled" => Some(Some(V::I32(matches!(
+                pseudo_get(vm, this_h, P_FT_CANCELLED),
+                Some(V::I32(1))
+            ) as i32))),
+            "cancel" => {
+                if matches!(pseudo_get(vm, this_h, P_FUTURE_DONE), Some(V::I32(1))) {
+                    return Ok(Some(Some(V::I32(0))));
+                }
+                pseudo_set(vm, this_h, P_FT_CANCELLED, V::I32(1));
+                pseudo_set(vm, this_h, P_FUTURE_DONE, V::I32(1));
+                let _ = vm.call_virtual_rt(this_h, "done", &[])?;
+                Some(Some(V::I32(1)))
+            }
+            "done" => Some(None),
+            _ => None,
+        }
     } else if class == "Ljava/util/concurrent/TimeUnit;" {
         match name {
             // `dst.convert(d, src)` — real unit math (kotlin.time
@@ -506,26 +616,76 @@ pub(crate) fn call(
                     // (they run on a worker thread at the next drain).
                     // A single-thread executor additionally serializes
                     // those jobs instead of admitting them all at once.
-                    if vm.single_executors.contains(&ex) && vm.executor_active.contains_key(&ex) {
-                        vm.executor_queues.entry(ex).or_default().push_back(r);
-                    } else {
-                        if vm.single_executors.contains(&ex) {
-                            vm.executor_active.insert(ex, r);
-                            vm.runnable_executor.insert(r, ex);
-                        }
-                        vm.enqueue_runnable(r, false);
-                    }
+                    enqueue_executor_task(vm, ex, r);
                 }
                 Some(None)
             }
             "submit" => {
-                if let V::Ref(r) = args[1] {
-                    vm.enqueue_runnable(r, false);
+                // Submit is asynchronous and ordered through the same executor
+                // queue as execute. The wrapper completes the returned future
+                // when the worker drain reaches it.
+                if let (V::Ref(ex), V::Ref(task)) = (args[0], args[1]) {
+                    // AbstractExecutorService.submit is defined in terms of
+                    // virtual newTaskFor/execute. Dex subclasses such as
+                    // Guava's listening decorator override those methods and
+                    // require the returned RunnableFuture to implement their
+                    // ListenableFuture interface; a host Future cannot pass
+                    // that check-cast. Preserve the virtual dispatch for dex
+                    // executor instances, falling back to the host future for
+                    // plain executor host objects.
+                    if matches!(vm.heap.get(ex), Some(Obj::Instance { .. })) {
+                        let callable = sig.contains("Callable");
+                        let nt_args: Vec<V> = if callable {
+                            vec![V::Ref(task)]
+                        } else {
+                            vec![V::Ref(task), args.get(2).copied().unwrap_or(V::Ref(0))]
+                        };
+                        if let Some(future @ V::Ref(fh)) =
+                            vm.call_virtual_rt(ex, "newTaskFor", &nt_args)?
+                        {
+                            let has_dex_execute = vm
+                                .heap
+                                .class_of(ex)
+                                .and_then(|ci| {
+                                    vm.resolve_call_args(ci, "execute", &[future])
+                                        .ok()
+                                        .map(|(m, _)| m.is_some())
+                                })
+                                .unwrap_or(false);
+                            if has_dex_execute {
+                                vm.call_virtual_rt(ex, "execute", &[future])?;
+                            } else {
+                                // A dex subclass of a host ThreadPoolExecutor
+                                // can inherit execute without overriding it.
+                                enqueue_executor_task(vm, ex, fh);
+                            }
+                            return Ok(Some(Some(future)));
+                        }
+                    }
+                    let future_v = host(
+                        vm,
+                        "Ljava/util/concurrent/Future;",
+                        HostState::Slot(V::Ref(0)),
+                    );
+                    let wrapper_v = host(vm, "Ljava/lang/Runnable;", HostState::Empty);
+                    if let (V::Ref(future), V::Ref(wrapper)) = (future_v, wrapper_v) {
+                        pseudo_set(vm, future, P_FUTURE_DONE, V::I32(0));
+                        pseudo_set(vm, wrapper, P_FUTURE_TARGET, V::Ref(task));
+                        pseudo_set(vm, wrapper, P_FUTURE, V::Ref(future));
+                        pseudo_set(
+                            vm,
+                            wrapper,
+                            P_FUTURE_CALLABLE,
+                            V::I32(sig.contains("Callable") as i32),
+                        );
+                        enqueue_executor_task(vm, ex, wrapper);
+                    }
+                    return Ok(Some(Some(future_v)));
                 }
                 Some(Some(host(
                     vm,
                     "Ljava/util/concurrent/Future;",
-                    HostState::Empty,
+                    HostState::Slot(V::Ref(0)),
                 )))
             }
             "isShutdown" | "isTerminated" => Some(Some(V::I32(0))),
@@ -556,7 +716,55 @@ pub(crate) fn call(
                 }
                 Some(Some(v))
             }
-            "get" | "call" => Some(Some(V::Ref(0))),
+            "addListener" => {
+                // The inline submit future is already complete, so its
+                // listener can run immediately. Dropping it breaks media3's
+                // Futures.transform chain that resolves media ids to URIs.
+                if let (Some(&V::Ref(future)), Some(&V::Ref(r))) = (args.first(), args.get(1)) {
+                    if matches!(pseudo_get(vm, future, P_FUTURE_DONE), Some(V::I32(1))) {
+                        let _ = vm.call_virtual_rt(r, "run", &[]);
+                    } else {
+                        let lh = match pseudo_get(vm, future, P_FUTURE_LISTENERS) {
+                            Some(V::Ref(h)) => h,
+                            _ => {
+                                let v = host(vm, "Ljava/util/ArrayList;", HostState::List(vec![]));
+                                let V::Ref(h) = v else { unreachable!() };
+                                pseudo_set(vm, future, P_FUTURE_LISTENERS, V::Ref(h));
+                                h
+                            }
+                        };
+                        if let Some(Obj::Host {
+                            state: HostState::List(items),
+                            ..
+                        }) = vm.heap.get_mut(lh)
+                        {
+                            items.push(V::Ref(r));
+                        }
+                    }
+                }
+                Some(None)
+            }
+            "get" | "call" => {
+                if name == "get" {
+                    let sv = match args.first().copied().unwrap_or(V::Ref(0)) {
+                        V::Ref(h) => match vm.heap.get(h) {
+                            Some(Obj::Host {
+                                state: HostState::Slot(v),
+                                ..
+                            }) => Some(*v),
+                            Some(Obj::Instance { fields, .. }) | Some(Obj::Host { fields, .. }) => {
+                                fields.get(&P_SLOT).copied()
+                            }
+                            _ => None,
+                        },
+                        _ => None,
+                    };
+                    if let Some(v) = sv {
+                        return Ok(Some(Some(v)));
+                    }
+                }
+                Some(Some(V::Ref(0)))
+            }
             "isDone" | "isCancelled" => Some(Some(V::I32(1))),
             "cancel" => Some(Some(V::I32(1))),
             "park" | "parkNanos" | "parkUntil" => {
@@ -829,7 +1037,7 @@ fn list_call(vm: &mut Vm, name: &str, sig: &str, args: &[V]) -> Rt<Option<Option
             } else if dup {
                 Some(Some(V::I32(0)))
             } else {
-                if crate::dbg_flag("OVELO_ITERDBG") && matches!(args[1], V::Ref(0)) {
+                if crate::dbg_flag("OVELO_ITERDBG") && is_null(args[1]) {
                     eprintln!("[iterdbg] add(null) on h{h} len={}", l.len());
                 }
                 l.push(args[1]);
@@ -907,16 +1115,27 @@ fn list_call(vm: &mut Vm, name: &str, sig: &str, args: &[V]) -> Rt<Option<Option
                     None => return Ok(None),
                 };
                 Some(Some(if i < l.len() { l.remove(i) } else { V::Ref(0) }))
+            } else if p.is_empty() {
+                // Queue.remove() is a no-arg overload that removes the head.
+                let l = match list_mut(vm, h) {
+                    Some(l) => l,
+                    None => return Ok(None),
+                };
+                if l.is_empty() {
+                    return Err(vm.throw_builtin("Ljava/util/NoSuchElementException;", ""));
+                }
+                Some(Some(l.remove(0)))
             } else {
                 // Guest-backed collections mutate themselves — without
                 // a host store this arm cannot remove, so defer to dex.
                 if list_mut(vm, h).is_none() {
                     return Ok(None);
                 }
+                let needle = args.get(1).copied().unwrap_or(V::Ref(0));
                 let items: Vec<V> = list_snapshot(vm, h).unwrap_or_default();
                 let mut pos = None;
                 for (i, e) in items.iter().enumerate() {
-                    if elem_eq(vm, *e, args[1])? {
+                    if elem_eq(vm, *e, needle)? {
                         pos = Some(i);
                         break;
                     }
@@ -1265,7 +1484,28 @@ fn list_call(vm: &mut Vm, name: &str, sig: &str, args: &[V]) -> Rt<Option<Option
             Some(Some(it))
         }
         "toArray" => {
-            let items: Vec<V> = list_snapshot(vm, h).unwrap_or_default();
+            // Guest collections (notably kotlin.collections.builders.SetBuilder)
+            // keep their entries in dex-side backing arrays, so a host backing-store
+            // snapshot cannot see them. AbstractCollection.toArray is specified in
+            // terms of iterator(); fall back to the guest iterator instead of
+            // silently producing an empty array.
+            let items: Vec<V> = match list_snapshot(vm, h) {
+                Some(items) => items,
+                None => collection_elements_rt(vm, h)?.unwrap_or_default(),
+            };
+            if crate::dbg_flag("OVELO_ITERDBG") && items.iter().any(|v| is_null(*v)) {
+                let caller = vm
+                    .stack
+                    .last()
+                    .map(|&m| vm.describe_method(m).to_string())
+                    .unwrap_or_default();
+                eprintln!(
+                    "[iterdbg] toArray h{h} {} len={} nulls={} @{caller}",
+                    vm.dbg_class_of(h),
+                    items.len(),
+                    items.iter().filter(|v| is_null(**v)).count()
+                );
+            }
             let elem = match args.get(1) {
                 Some(V::Ref(ah)) => match vm.heap.get(*ah) {
                     Some(Obj::Array { elem, .. }) => elem.clone(),
@@ -1334,10 +1574,11 @@ fn list_call(vm: &mut Vm, name: &str, sig: &str, args: &[V]) -> Rt<Option<Option
                 write_sorted_list(vm, h, items);
                 Some(None)
             } else if name.ends_with("stream") || name.ends_with("Stream") {
+                let items = list_snapshot(vm, h).unwrap_or_default();
                 Some(Some(host(
                     vm,
                     "Ljava/util/stream/Stream;",
-                    HostState::Empty,
+                    HostState::List(items),
                 )))
             } else {
                 Some(None)
@@ -1452,7 +1693,42 @@ fn map_call(vm: &mut Vm, name: &str, sig: &str, args: &[V]) -> Rt<Option<Option<
             // copy the destination starts empty and callers iterate
             // nothing (navigation NavigatorProvider attach loop).
             if let Some(V::Ref(sh)) = args.get(1).copied() {
-                for (k, v) in map_pairs_of(vm, sh) {
+                let mut pairs = map_pairs_of(vm, sh);
+                if pairs.is_empty() && matches!(vm.heap.get(sh), Some(Obj::Instance { .. })) {
+                    // Kotlin's immutable MapBuilder keeps entries in dex-side
+                    // arrays, so host backing-store scans see nothing. Copy
+                    // constructors still receive it as a Map; enumerate it
+                    // through the guest entrySet contract instead.
+                    if let Ok(Some(V::Ref(entries))) = vm.call_virtual(sh, "entrySet", &[]) {
+                        if let Ok(Some(V::Ref(it))) = vm.call_virtual(entries, "iterator", &[]) {
+                            for _ in 0..10000 {
+                                let more = matches!(
+                                    vm.call_virtual(it, "hasNext", &[]),
+                                    Ok(Some(v)) if i32v(v) != 0
+                                );
+                                if !more {
+                                    break;
+                                }
+                                let Ok(Some(V::Ref(entry))) = vm.call_virtual(it, "next", &[])
+                                else {
+                                    break;
+                                };
+                                let key = vm
+                                    .call_virtual(entry, "getKey", &[])
+                                    .ok()
+                                    .flatten()
+                                    .unwrap_or(V::Ref(0));
+                                let value = vm
+                                    .call_virtual(entry, "getValue", &[])
+                                    .ok()
+                                    .flatten()
+                                    .unwrap_or(V::Ref(0));
+                                pairs.push((key, value));
+                            }
+                        }
+                    }
+                }
+                for (k, v) in pairs {
                     map_put(vm, h, k, v);
                 }
             }
@@ -1510,6 +1786,7 @@ fn map_call(vm: &mut Vm, name: &str, sig: &str, args: &[V]) -> Rt<Option<Option<
         | "putShort"
         | "putByte"
         | "putParcelable"
+        | "putBinder"
         | "putSerializable"
         | "putBundle"
         | "putCharSequence"
@@ -1527,6 +1804,17 @@ fn map_call(vm: &mut Vm, name: &str, sig: &str, args: &[V]) -> Rt<Option<Option<
         | "putStringArray"
         | "putParcelableArray"
         | "putCharSequenceArray" => {
+            if crate::dbg_flag("OVELO_MAPDBG") {
+                let ks = s(
+                    vm,
+                    match args[1] {
+                        V::Ref(h2) => h2,
+                        _ => 0,
+                    },
+                )
+                .unwrap_or_else(|| format!("{:?}", args[1]));
+                eprintln!("[map] typed-put h={h} {name} key={ks}");
+            }
             map_put(vm, h, args[1], args[2]);
             Some(None)
         }
@@ -1587,6 +1875,7 @@ fn map_call(vm: &mut Vm, name: &str, sig: &str, args: &[V]) -> Rt<Option<Option<
         }
         "getString"
         | "getParcelable"
+        | "getBinder"
         | "getSerializable"
         | "getBundle"
         | "getCharSequence"
@@ -2771,11 +3060,51 @@ fn arrays_static(vm: &mut Vm, name: &str, _sig: &str, args: &[V]) -> Rt<Option<O
         "binarySearch" => {
             let idx = match args[0] {
                 V::Ref(h) => match vm.heap.get(h) {
-                    Some(Obj::Array { data, .. }) => data
-                        .iter()
-                        .position(|e| value_eq(vm, *e, args[1]))
-                        .map(|i| i as i32)
-                        .unwrap_or(-1),
+                    Some(Obj::Array { data, .. }) => {
+                        let data = data.clone();
+                        let ranged = args.len() >= 4
+                            && matches!(args.get(1), Some(V::I32(_)))
+                            && matches!(args.get(2), Some(V::I32(_)));
+                        let key_i = if ranged { 3 } else { 1 };
+                        let key = args.get(key_i).copied().unwrap_or(V::Ref(0));
+                        let comparator = args
+                            .get(if ranged { 4 } else { 2 })
+                            .copied()
+                            .and_then(|v| if let V::Ref(c) = v { Some(c) } else { None })
+                            .unwrap_or(0);
+                        let mut low = if ranged {
+                            i32v(args[1]).max(0) as usize
+                        } else {
+                            0
+                        }
+                        .min(data.len());
+                        let mut high = if ranged {
+                            (i32v(args[2]).max(0) as usize).min(data.len())
+                        } else {
+                            data.len()
+                        };
+                        let mut hit = None;
+                        while low < high {
+                            let mid = (low + high) / 2;
+                            let c = if comparator != 0 {
+                                vm.call_virtual_rt(comparator, "compare", &[data[mid], key])?
+                                    .map(i32v)
+                                    .unwrap_or(0)
+                                    .signum()
+                            } else {
+                                natural_cmp(vm, data[mid], key).signum()
+                            };
+                            if c < 0 {
+                                low = mid + 1;
+                            } else if c > 0 {
+                                high = mid;
+                            } else {
+                                hit = Some(mid);
+                                break;
+                            }
+                        }
+                        hit.map(|i| i as i32).unwrap_or(-((low + 1) as i32))
+                    }
                     _ => -1,
                 },
                 _ => -1,
@@ -2784,11 +3113,32 @@ fn arrays_static(vm: &mut Vm, name: &str, _sig: &str, args: &[V]) -> Rt<Option<O
         }
         "compare" | "mismatch" => Some(Some(V::I32(0))),
         "equals0" => Some(Some(V::I32(1))),
-        "stream" => Some(Some(host(
-            vm,
-            "Ljava/util/stream/Stream;",
-            HostState::Empty,
-        ))),
+        "stream" => {
+            let data = match args.first().copied().unwrap_or(V::Ref(0)) {
+                V::Ref(h) => match vm.heap.get(h) {
+                    Some(Obj::Array { data, .. }) => data.clone(),
+                    _ => vec![],
+                },
+                _ => vec![],
+            };
+            let from = args
+                .get(1)
+                .map(|v| i32v(*v).max(0) as usize)
+                .unwrap_or(0)
+                .min(data.len());
+            let to = args
+                .get(2)
+                .map(|v| i32v(*v).max(0) as usize)
+                .unwrap_or(data.len())
+                .min(data.len())
+                .max(from);
+            let items = data[from..to].to_vec();
+            Some(Some(host(
+                vm,
+                "Ljava/util/stream/Stream;",
+                HostState::List(items),
+            )))
+        }
         "copyOf0" => Some(Some(args[0])),
         _ => None,
     })
@@ -2800,7 +3150,18 @@ fn objects_static(vm: &mut Vm, name: &str, args: &[V]) -> Rt<Option<Option<V>>> 
         "deepEquals" => Some(Some(V::I32(value_eq(vm, args[0], args[1]) as i32))),
         "hashCode" => Some(Some(hash_of(vm, args[0]))),
         "hash" => {
-            let h = args.iter().fold(1i32, |acc, v| {
+            // `Objects.hash(values...)` boxes its varargs into one array
+            // before dispatch. Hashing that array itself gives a fresh
+            // identity hash on every call, so object keys whose hashCode
+            // uses Objects.hash become unstable in ArrayMap/HashMap.
+            let values = match args.first().copied() {
+                Some(V::Ref(h)) => match vm.heap.get(h) {
+                    Some(Obj::Array { data, .. }) => data.clone(),
+                    _ => vec![args[0]],
+                },
+                _ => Vec::new(),
+            };
+            let h = values.iter().fold(1i32, |acc, v| {
                 acc.wrapping_mul(31).wrapping_add(match hash_of(vm, *v) {
                     V::I32(i) => i,
                     _ => 0,
@@ -2861,10 +3222,16 @@ pub(crate) fn natural_cmp(vm: &mut Vm, a: V, b: V) -> i32 {
         (V::Ref(0), _) => -1,
         (_, V::Ref(0)) => 1,
         (V::Ref(x), V::Ref(y)) => {
+            let ca = class_of(vm, V::Ref(x));
+            let cb = class_of(vm, V::Ref(y));
+            if ca == cb && vm.assignable_desc(&ca, "Ljava/lang/Enum;") {
+                return (lang::enum_ordinal(vm, V::Ref(x)) - lang::enum_ordinal(vm, V::Ref(y)))
+                    .signum();
+            }
             let sa = s(vm, x);
             let sb = s(vm, y);
             match (sa, sb) {
-                (Some(pa), Some(pb)) => pa.cmp(&pb) as i32,
+                (Some(pa), Some(pb)) => pa.encode_utf16().cmp(pb.encode_utf16()) as i32,
                 _ => {
                     // Guest objects with a real `compareTo` (okio
                     // ByteString, HttpUrl, …) must order by it —
@@ -3028,25 +3395,180 @@ fn random_call(vm: &mut Vm, name: &str, args: &[V], secure: bool) -> Option<Opti
     }))
 }
 
+fn uuid_bits(vm: &Vm, h: u32) -> Option<(i64, i64)> {
+    match vm.heap.get(h) {
+        Some(Obj::Host {
+            state: HostState::Uuid { msb, lsb },
+            ..
+        }) => Some((*msb, *lsb)),
+        _ => None,
+    }
+}
+
+fn uuid_text(msb: i64, lsb: i64) -> String {
+    let hex = format!("{:016x}{:016x}", msb as u64, lsb as u64);
+    format!(
+        "{}-{}-{}-{}-{}",
+        &hex[..8],
+        &hex[8..12],
+        &hex[12..16],
+        &hex[16..20],
+        &hex[20..]
+    )
+}
+
+fn parse_uuid_text(text: &str) -> Option<(i64, i64)> {
+    let hex: String = text.chars().filter(|c| *c != '-').collect();
+    if hex.len() != 32 || !hex.chars().all(|c| c.is_ascii_hexdigit()) {
+        return None;
+    }
+    let msb = u64::from_str_radix(&hex[..16], 16).ok()? as i64;
+    let lsb = u64::from_str_radix(&hex[16..], 16).ok()? as i64;
+    Some((msb, lsb))
+}
+
+fn uuid_from_bytes(mut bytes: [u8; 16], version: u8) -> (i64, i64) {
+    bytes[6] = (bytes[6] & 0x0f) | (version << 4);
+    bytes[8] = (bytes[8] & 0x3f) | 0x80;
+    let msb = i64::from_be_bytes(bytes[..8].try_into().unwrap_or([0; 8]));
+    let lsb = i64::from_be_bytes(bytes[8..].try_into().unwrap_or([0; 8]));
+    (msb, lsb)
+}
+
+fn random_uuid_bits() -> (i64, i64) {
+    use std::io::Read;
+    let mut bytes = [0u8; 16];
+    if std::fs::File::open("/dev/urandom")
+        .and_then(|mut f| f.read_exact(&mut bytes))
+        .is_err()
+    {
+        let seed = now_ms() as u64;
+        bytes[..8].copy_from_slice(&seed.to_be_bytes());
+        bytes[8..].copy_from_slice(&seed.rotate_left(23).to_be_bytes());
+    }
+    uuid_from_bytes(bytes, 4)
+}
+
+fn uuid_obj(vm: &mut Vm, msb: i64, lsb: i64) -> V {
+    host(vm, "Ljava/util/UUID;", HostState::Uuid { msb, lsb })
+}
+
 fn uuid_call(vm: &mut Vm, name: &str, args: &[V]) -> Option<Option<V>> {
     match name {
-        "randomUUID" => Some(Some(host(
-            vm,
-            "Ljava/util/UUID;",
-            HostState::Slot(V::I64(now_ms())),
-        ))),
-        "toString" => Some(Some(jstr(
-            vm,
-            &format!("{:08x}-0000-4000-8000-000000000000", now_ms() & 0xffffffff),
-        ))),
-        "nameUUIDFromBytes" => Some(Some(host(vm, "Ljava/util/UUID;", HostState::Slot(args[0])))),
-        "fromString" => Some(Some(host(
-            vm,
-            "Ljava/util/UUID;",
-            HostState::Slot(V::I64(0)),
-        ))),
-        "getMostSignificantBits" | "getLeastSignificantBits" => Some(Some(V::I64(0))),
-        "version" | "variant" | "timestamp" | "clockSequence" | "node" => Some(Some(V::I64(0))),
+        "<init>" => {
+            if let (Some(V::Ref(h)), Some(msb), Some(lsb)) =
+                (args.first(), args.get(1), args.get(2))
+            {
+                let bits = (i64v(*msb), i64v(*lsb));
+                if let Some(Obj::Host { state, .. }) = vm.heap.get_mut(*h) {
+                    *state = HostState::Uuid {
+                        msb: bits.0,
+                        lsb: bits.1,
+                    };
+                }
+            }
+            Some(None)
+        }
+        "randomUUID" => {
+            let (msb, lsb) = random_uuid_bits();
+            Some(Some(uuid_obj(vm, msb, lsb)))
+        }
+        "fromString" => {
+            let text = args.first().and_then(|v| sv(vm, *v)).unwrap_or_default();
+            let (msb, lsb) = parse_uuid_text(&text).unwrap_or((0, 0));
+            Some(Some(uuid_obj(vm, msb, lsb)))
+        }
+        "nameUUIDFromBytes" => {
+            let input: Vec<u8> = match args.first() {
+                Some(V::Ref(h)) => match vm.heap.get(*h) {
+                    Some(Obj::Array { data, .. }) => data.iter().map(|v| i32v(*v) as u8).collect(),
+                    _ => Vec::new(),
+                },
+                _ => Vec::new(),
+            };
+            use md5::Digest as _;
+            let digest = md5::Md5::digest(&input);
+            let mut bytes = [0u8; 16];
+            bytes.copy_from_slice(&digest[..16]);
+            let (msb, lsb) = uuid_from_bytes(bytes, 3);
+            Some(Some(uuid_obj(vm, msb, lsb)))
+        }
+        "toString" => {
+            let text = match args.first() {
+                Some(V::Ref(h)) => uuid_bits(vm, *h)
+                    .map(|(msb, lsb)| uuid_text(msb, lsb))
+                    .unwrap_or_else(|| uuid_text(0, 0)),
+                _ => uuid_text(0, 0),
+            };
+            Some(Some(jdynstr(vm, &text)))
+        }
+        "getMostSignificantBits" => Some(Some(V::I64(match args.first() {
+            Some(V::Ref(h)) => uuid_bits(vm, *h).map(|v| v.0).unwrap_or(0),
+            _ => 0,
+        }))),
+        "getLeastSignificantBits" => Some(Some(V::I64(match args.first() {
+            Some(V::Ref(h)) => uuid_bits(vm, *h).map(|v| v.1).unwrap_or(0),
+            _ => 0,
+        }))),
+        "equals" => {
+            let eq = match (args.first(), args.get(1)) {
+                (Some(V::Ref(a)), Some(V::Ref(b))) => {
+                    match (uuid_bits(vm, *a), uuid_bits(vm, *b)) {
+                        (Some(x), Some(y)) => x == y,
+                        _ => false,
+                    }
+                }
+                _ => false,
+            };
+            Some(Some(V::I32(eq as i32)))
+        }
+        "hashCode" => {
+            let hash = match args.first() {
+                Some(V::Ref(h)) => uuid_bits(vm, *h)
+                    .map(|(msb, lsb)| {
+                        ((msb >> 32) as i32) ^ (msb as i32) ^ ((lsb >> 32) as i32) ^ (lsb as i32)
+                    })
+                    .unwrap_or(0),
+                _ => 0,
+            };
+            Some(Some(V::I32(hash)))
+        }
+        "compareTo" => {
+            let cmp = match (args.first(), args.get(1)) {
+                (Some(V::Ref(a)), Some(V::Ref(b))) => {
+                    match (uuid_bits(vm, *a), uuid_bits(vm, *b)) {
+                        (Some(x), Some(y)) => x.cmp(&y) as i32,
+                        _ => 0,
+                    }
+                }
+                _ => 0,
+            };
+            Some(Some(V::I32(cmp)))
+        }
+        "version" => Some(Some(V::I64(match args.first() {
+            Some(V::Ref(h)) => uuid_bits(vm, *h)
+                .map(|(msb, _)| (msb >> 12) & 0xf)
+                .unwrap_or(0),
+            _ => 0,
+        }))),
+        "variant" => Some(Some(V::I64(match args.first() {
+            Some(V::Ref(h)) => uuid_bits(vm, *h)
+                .map(|(_, lsb)| {
+                    let bits = lsb as u64;
+                    if bits & 0x8000_0000_0000_0000 == 0 {
+                        0
+                    } else if bits & 0x4000_0000_0000_0000 == 0 {
+                        1
+                    } else if bits & 0x2000_0000_0000_0000 == 0 {
+                        2
+                    } else {
+                        3
+                    }
+                })
+                .unwrap_or(0),
+            _ => 0,
+        }))),
+        "timestamp" | "clockSequence" | "node" => Some(Some(V::I64(0))),
         _ => None,
     }
 }
@@ -3668,6 +4190,17 @@ fn num_wide(vm: &Vm, fid: u64) -> bool {
 
 fn pair_call(vm: &mut Vm, name: &str, args: &[V]) -> Rt<Option<Option<V>>> {
     Ok(match name {
+        "<init>" => {
+            if let (Some(&V::Ref(h)), Some(&first), Some(&second)) =
+                (args.first(), args.get(1), args.get(2))
+            {
+                if let Some(Obj::Host { state, .. }) = vm.heap.get_mut(h) {
+                    *state = HostState::Slot(first);
+                }
+                pseudo_set(vm, h, P_DATA, second);
+            }
+            Some(None)
+        }
         "create" => {
             let h = vm.alloc_host("Landroid/util/Pair;", HostState::Slot(args[0]));
             pseudo_set(vm, h, P_DATA, args[1]);

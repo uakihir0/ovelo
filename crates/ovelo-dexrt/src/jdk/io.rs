@@ -3,6 +3,7 @@
 use super::rx::{full_match, Rx};
 use super::*;
 use crate::value::{DigestState, HostState, Obj, V};
+use hmac::Mac as _;
 use sha2::Digest as _;
 
 pub(crate) fn call(
@@ -19,10 +20,16 @@ pub(crate) fn call(
         print_call(vm, name, sig, args)
     } else if class == "Ljava/security/MessageDigest;" {
         digest_call(vm, name, args)?
+    } else if class == "Ljavax/crypto/Mac;" {
+        mac_call(vm, name, args)?
+    } else if class == "Ljavax/crypto/spec/SecretKeySpec;" {
+        key_spec_call(vm, name, args)?
     } else if class == "Ljava/util/jar/JarFile;" || class == "Ljava/util/zip/ZipFile;" {
         zip_file_call(vm, class, name, args)
     } else if class == "Ljava/util/jar/JarEntry;" || class == "Ljava/util/zip/ZipEntry;" {
         zip_entry_call(vm, name, args)
+    } else if class == "Landroid/util/AtomicFile;" {
+        atomic_file_call(vm, name, args)?
     } else if class == "Ljava/security/CodeSigner;"
         || class == "Ljava/security/cert/CertPath;"
         || class == "Ljava/security/cert/Certificate;"
@@ -88,6 +95,10 @@ pub(crate) fn call(
             }
         }
         Some(None)
+    } else if class == "Ljava/io/ObjectOutputStream;" {
+        object_output_call(vm, name, args)?
+    } else if class == "Ljava/io/ObjectInputStream;" {
+        object_input_call(vm, name, args)?
     } else if class == "Ljava/io/ByteArrayInputStream;" && name == "<init>" {
         // ByteArrayInputStream(byte[]) / (byte[], off, len): store the
         // payload so reads serve the real bytes.
@@ -235,10 +246,11 @@ pub(crate) fn call(
         || desc_is_a(class, "Ljava/text/DateFormat;")
         || class == "Ljava/text/NumberFormat;"
         || class == "Ljava/text/DecimalFormat;"
+        || class == "Ljava/text/DecimalFormatSymbols;"
     {
         format_call(vm, name, args)
     } else if class == "Lorg/json/JSONObject;" {
-        json_obj(vm, name, args)
+        json_obj(vm, name, args)?
     } else if class == "Lorg/json/JSONArray;" {
         json_arr(vm, name, args)
     } else if class == "Ljavax/net/ssl/TrustManagerFactory;" {
@@ -507,11 +519,229 @@ fn writer_text(vm: &mut Vm, v: V, lo_v: Option<V>, hi_v: Option<V>, len_mode: bo
     }
 }
 
+const OVELO_SER_MAGIC: &[u8; 8] = b"OVLSER1\0";
+
+fn object_output_call(vm: &mut Vm, name: &str, args: &[V]) -> Rt<Option<Option<V>>> {
+    let this = match args.first().copied() {
+        Some(V::Ref(h)) => h,
+        _ => 0,
+    };
+    Ok(Some(match name {
+        "<init>" => {
+            pseudo_set(vm, this, P_DATA, args.get(1).copied().unwrap_or(V::Ref(0)));
+            None
+        }
+        "writeObject" => {
+            let obj = args.get(1).copied().unwrap_or(V::Ref(0));
+            let h = match obj {
+                V::Ref(h) => h,
+                _ => 0,
+            };
+            let mut bytes = OVELO_SER_MAGIC.to_vec();
+            bytes.extend_from_slice(&h.to_le_bytes());
+            let arr_v = byte_arr(vm, &bytes);
+            if let Some(sink) = pseudo_get(vm, this, P_DATA) {
+                let write_args = [sink, arr_v, V::I32(0), V::I32(bytes.len() as i32)];
+                let _ = stream_call(vm, "write", &write_args)?;
+            }
+            None
+        }
+        "flush" | "close" => {
+            if let Some(sink) = pseudo_get(vm, this, P_DATA) {
+                let close_args = [sink];
+                let _ = stream_call(vm, name, &close_args)?;
+            }
+            None
+        }
+        _ => return Ok(None),
+    }))
+}
+
+fn object_input_call(vm: &mut Vm, name: &str, args: &[V]) -> Rt<Option<Option<V>>> {
+    let this = match args.first().copied() {
+        Some(V::Ref(h)) => h,
+        _ => 0,
+    };
+    Ok(Some(match name {
+        "<init>" => {
+            pseudo_set(vm, this, P_DATA, args.get(1).copied().unwrap_or(V::Ref(0)));
+            None
+        }
+        "readObject" => {
+            let source = pseudo_get(vm, this, P_DATA).unwrap_or(V::Ref(0));
+            let bytes = match source {
+                V::Ref(sh) => match vm.heap.get(sh) {
+                    Some(Obj::Host {
+                        state: HostState::Bytes(b, p),
+                        ..
+                    }) => b[*p..].to_vec(),
+                    _ => Vec::new(),
+                },
+                _ => Vec::new(),
+            };
+            if bytes.len() >= 12 && bytes[..8] == OVELO_SER_MAGIC[..] {
+                let h = u32::from_le_bytes([bytes[8], bytes[9], bytes[10], bytes[11]]);
+                Some(shallow_clone_object(vm, h))
+            } else {
+                Some(V::Ref(0))
+            }
+        }
+        "close" => None,
+        _ => return Ok(None),
+    }))
+}
+
+/// Serialization-roundtrip object copy used by ObjectInputStream above.
+/// Copying the instance field map gives the deep-clone callers the
+/// object identity and assignability they need while immutable leaves
+/// (strings, UUID placeholders) can safely stay shared.
+fn shallow_clone_object(vm: &mut Vm, h: u32) -> V {
+    let cloned = match vm.heap.get(h) {
+        Some(Obj::Instance { class_idx, fields }) => Some((*class_idx, fields.clone())),
+        _ => None,
+    };
+    if let Some((class_idx, fields)) = cloned {
+        return V::Ref(vm.heap.alloc(Obj::Instance { class_idx, fields }));
+    }
+    V::Ref(h)
+}
+
+/// android.util.AtomicFile. Aegis uses this for vault persistence; the
+/// compatibility implementation writes the base file directly (no backup
+/// rename dance), which preserves the API contract apps rely on.
+fn atomic_file_call(vm: &mut Vm, name: &str, args: &[V]) -> Rt<Option<Option<V>>> {
+    let this = match args.first().copied() {
+        Some(V::Ref(h)) => h,
+        _ => 0,
+    };
+    let path_of = |vm: &Vm| -> String {
+        match vm.heap.get(this) {
+            Some(Obj::Host {
+                state: HostState::Path(p),
+                ..
+            }) => p.clone(),
+            _ => pseudo_get(vm, this, P_DATA)
+                .and_then(|v| stream_arg_path(vm, v))
+                .unwrap_or_default(),
+        }
+    };
+    Ok(Some(match name {
+        "<init>" => {
+            let file = args.get(1).copied().unwrap_or(V::Ref(0));
+            if let Some(path) = stream_arg_path(vm, file) {
+                replace_host_state(
+                    vm,
+                    args[0],
+                    "Landroid/util/AtomicFile;",
+                    HostState::Path(path),
+                );
+                pseudo_set(vm, this, P_DATA, file);
+            }
+            None
+        }
+        "getBaseFile" => Some(pseudo_get(vm, this, P_DATA).unwrap_or(V::Ref(0))),
+        "startWrite" => {
+            let guest = path_of(vm);
+            let path = fspath(vm, &guest);
+            if let Some(parent) = path.parent() {
+                let _ = std::fs::create_dir_all(parent);
+            }
+            // Preserve the last complete file until the replacement is
+            // finished. AtomicFile's contract is exactly this recovery
+            // dance; truncating in place would lose the vault on error.
+            let bak = fspath(vm, &format!("{guest}.bak"));
+            if path.exists() {
+                let _ = std::fs::remove_file(&bak);
+                if std::fs::rename(&path, &bak).is_err() {
+                    return Err(vm.throw_builtin(
+                        "Ljava/io/IOException;",
+                        "AtomicFile backup rename failed",
+                    ));
+                }
+            }
+            let file = std::fs::OpenOptions::new()
+                .write(true)
+                .create(true)
+                .truncate(true)
+                .open(path)
+                .ok();
+            let Some(file) = file else {
+                return Err(
+                    vm.throw_builtin("Ljava/io/IOException;", "AtomicFile startWrite failed")
+                );
+            };
+            Some(host(
+                vm,
+                "Ljava/io/FileOutputStream;",
+                HostState::File(file),
+            ))
+        }
+        "finishWrite" => {
+            if let Some(V::Ref(h)) = args.get(1).copied() {
+                let close_args = [V::Ref(h)];
+                let _ = stream_call(vm, "close", &close_args)?;
+            }
+            let guest = path_of(vm);
+            let _ = std::fs::remove_file(fspath(vm, &format!("{guest}.bak")));
+            None
+        }
+        "failWrite" => {
+            if let Some(V::Ref(h)) = args.get(1).copied() {
+                let close_args = [V::Ref(h)];
+                let _ = stream_call(vm, "close", &close_args)?;
+            }
+            let guest = path_of(vm);
+            let path = fspath(vm, &guest);
+            let bak = fspath(vm, &format!("{guest}.bak"));
+            let _ = std::fs::remove_file(&path);
+            if bak.exists() {
+                let _ = std::fs::rename(&bak, &path);
+            }
+            None
+        }
+        "readFully" => {
+            let guest = path_of(vm);
+            let bytes = std::fs::read(fspath(vm, &guest)).unwrap_or_default();
+            Some(byte_arr(vm, &bytes))
+        }
+        "delete" => {
+            let guest = path_of(vm);
+            let _ = std::fs::remove_file(fspath(vm, &guest));
+            let _ = std::fs::remove_file(fspath(vm, &format!("{guest}.bak")));
+            None
+        }
+        _ => return Ok(None),
+    }))
+}
+
 fn stream_call(vm: &mut Vm, name: &str, args: &[V]) -> Rt<Option<Option<V>>> {
     let this = match args.first() {
         Some(&V::Ref(h)) => h,
         _ => 0,
     };
+    // `Writer.write(String)` is a concrete JDK default that delegates to
+    // `write(String, off, len)`. Gson's AppendableWriter is a dex Writer
+    // subclass which overrides only the ranged overload, so host dispatch
+    // must perform that virtual delegation instead of dropping the text.
+    if name == "write" && args.len() == 2 {
+        if let (Some(V::Ref(text_h)), Some(ci)) = (args.get(1).copied(), vm.heap.class_of(this)) {
+            if matches!(vm.heap.get(this), Some(Obj::Instance { .. })) {
+                if let Some(text) = sv(vm, V::Ref(text_h)) {
+                    if let Ok(Some(midx)) =
+                        vm.find_method_on_chain_sig(ci, "write", &["Ljava/lang/String;", "I", "I"])
+                    {
+                        let len = text.chars().count() as i32;
+                        vm.invoke_no_host(
+                            midx,
+                            vec![V::Ref(this), V::Ref(text_h), V::I32(0), V::I32(len)],
+                            crate::InvokeKind::Virtual,
+                        )?;
+                        return Ok(Some(None));
+                    }
+                }
+            }
+        }
+    }
     // ByteArrayOutputStream accumulates into the same Bytes payload —
     // handled before the mutable borrow below because the write source
     // and the returned array/string need second heap accesses.
@@ -1479,14 +1709,7 @@ fn file_call(vm: &mut Vm, name: &str, args: &[V]) -> Option<Option<V>> {
                 .is_ok() as i32,
         )),
         "renameTo" => {
-            let to = s(
-                vm,
-                match args[1] {
-                    V::Ref(h) => h,
-                    _ => 0,
-                },
-            )
-            .unwrap_or_default();
+            let to = sv(vm, args.get(1).copied().unwrap_or(V::Ref(0))).unwrap_or_default();
             Some(V::I32(
                 std::fs::rename(&std_path, fspath(vm, &to)).is_ok() as i32
             ))
@@ -2212,6 +2435,8 @@ fn format_call(vm: &mut Vm, name: &str, args: &[V]) -> Option<Option<V>> {
             HostState::Empty,
         ))),
         "getAvailableLocales" => Some(Some(arr(vm, "Ljava/util/Locale;", vec![]))),
+        "getDecimalSeparator" => Some(Some(V::I32('.' as i32))),
+        "getGroupingSeparator" => Some(Some(V::I32(',' as i32))),
         "get2DigitYearStart" | "set2DigitYearStart" => Some(Some(V::Ref(0))),
         "parseObject" => Some(Some(V::Ref(0))),
         _ => None,
@@ -2449,12 +2674,46 @@ fn json_dump_d(vm: &Vm, v: V, depth: u32) -> String {
     }
 }
 
-fn json_obj(vm: &mut Vm, name: &str, args: &[V]) -> Option<Option<V>> {
+fn json_coerce_number(vm: &Vm, v: V, name: &str) -> V {
+    let parsed = sv(vm, v);
+    let string_num = parsed.as_deref().and_then(|s| s.parse::<f64>().ok());
+    if name.ends_with("Int") {
+        let out = match v {
+            V::I32(i) => i,
+            // Long.intValue is a narrowing integer conversion.
+            V::I64(i) => i as i32,
+            // Floating-point intValue clamps out-of-range values.
+            V::F32(f) => f as i32,
+            V::F64(f) => f as i32,
+            _ => string_num.map(|f| f as i32).unwrap_or(0),
+        };
+        V::I32(out)
+    } else if name.ends_with("Long") {
+        let out = match v {
+            V::I32(i) => i as i64,
+            V::I64(i) => i,
+            V::F32(f) => f as i64,
+            V::F64(f) => f as i64,
+            _ => string_num.map(|f| f as i64).unwrap_or(0),
+        };
+        V::I64(out)
+    } else if name.ends_with("Double") {
+        V::F64(string_num.unwrap_or_else(|| f64v(v)))
+    } else {
+        let truthy = parsed
+            .as_deref()
+            .map(|s| s.eq_ignore_ascii_case("true"))
+            .unwrap_or_else(|| i64v(v) != 0);
+        V::I32(truthy as i32)
+    }
+}
+
+fn json_obj(vm: &mut Vm, name: &str, args: &[V]) -> Rt<Option<Option<V>>> {
     let h = match args.first() {
         Some(V::Ref(h)) => *h,
-        _ => return None,
+        _ => return Ok(None),
     };
-    match name {
+    Ok(match name {
         "<init>" => {
             if let Some(src) = args.get(1).and_then(|v| sv(vm, *v)) {
                 let b: Vec<char> = src.chars().collect();
@@ -2478,8 +2737,37 @@ fn json_obj(vm: &mut Vm, name: &str, args: &[V]) -> Option<Option<V>> {
             map_put(vm, h, args[1], args.get(2).copied().unwrap_or(V::Ref(0)));
             Some(V::Ref(h))
         }
-        "get" | "opt" | "getJSONObject" | "getJSONArray" => {
-            map_get(vm, h, args[1]).or(Some(V::Ref(0)))
+        "get" | "opt" => match map_get(vm, h, args[1]) {
+            Some(V::Ref(0)) => Some(json_null(vm)),
+            v => v.or(Some(V::Ref(0))),
+        },
+        "getJSONObject" | "getJSONArray" | "optJSONObject" | "optJSONArray" => {
+            let v = match map_get(vm, h, args[1]) {
+                Some(V::Ref(0)) => json_null(vm),
+                Some(v) => v,
+                None => V::Ref(0),
+            };
+            let want_arr = name.ends_with("JSONArray");
+            let is_null = matches!(v, V::Ref(0)) || matches!(v, V::Ref(vh) if vh == vm.json_null_h);
+            let matches_type = matches!(v, V::Ref(vh) if vh != 0 && matches!(
+                vm.heap.get(vh),
+                Some(Obj::Host { desc, .. })
+                    if (want_arr && desc == "Lorg/json/JSONArray;")
+                        || (!want_arr && desc == "Lorg/json/JSONObject;")
+            ));
+            if matches_type {
+                Some(v)
+            } else if name.starts_with("opt") {
+                Some(V::Ref(0))
+            } else {
+                let key = sv(vm, args[1]).unwrap_or_default();
+                let why = if is_null {
+                    format!("Value null at {key} is not an object")
+                } else {
+                    format!("Value at {key} has the wrong type")
+                };
+                return Err(vm.throw_builtin("Lorg/json/JSONException;", &why));
+            }
         }
         "getString" | "optString" | "getName" => {
             let v = map_get(vm, h, args[1]);
@@ -2498,7 +2786,9 @@ fn json_obj(vm: &mut Vm, name: &str, args: &[V]) -> Option<Option<V>> {
         | "optBoolean" => {
             let dflt = args.get(1 + (name.starts_with('o') as usize));
             match map_get(vm, h, args[1]) {
-                Some(v) if !matches!(v, V::Ref(0)) => Some(json_unbox(vm, v)),
+                Some(v) if !matches!(v, V::Ref(0)) => {
+                    Some(json_coerce_number(vm, json_unbox(vm, v), name))
+                }
                 _ => Some(dflt.copied().unwrap_or(V::I32(0))),
             }
         }
@@ -2540,9 +2830,9 @@ fn json_obj(vm: &mut Vm, name: &str, args: &[V]) -> Option<Option<V>> {
             ))
         }
         "toString" | "toStringInt" => Some(jstr(vm, &json_dump_v(vm, V::Ref(h)))),
-        _ => return None,
+        _ => return Ok(None),
     }
-    .map(Some)
+    .map(Some))
 }
 
 fn json_arr(vm: &mut Vm, name: &str, args: &[V]) -> Option<Option<V>> {
@@ -3393,6 +3683,35 @@ fn nio_call(vm: &mut Vm, class: &str, name: &str, args: &[V]) -> Option<Option<V
                     );
                 }
             }
+            Some(Some(v))
+        }
+        "order" if args.len() == 1 => {
+            // No-arg order() must return the canonical static ByteOrder
+            // object: media3 compares the result with LITTLE_ENDIAN by
+            // reference identity.
+            let little = i32v(pseudo_get(vm, this, P_BBUF_ORD).unwrap_or(V::I32(0))) != 0;
+            let cell = if little {
+                vm.byteorder_h.get()
+            } else {
+                vm.byteorder_big_h.get()
+            };
+            let v = if cell != 0 && vm.heap.get(cell).is_some() {
+                V::Ref(cell)
+            } else {
+                let v = host(
+                    vm,
+                    "Ljava/nio/ByteOrder;",
+                    HostState::Slot(V::I32(little as i32)),
+                );
+                if let V::Ref(h) = v {
+                    if little {
+                        vm.byteorder_h.set(h);
+                    } else {
+                        vm.byteorder_big_h.set(h);
+                    }
+                }
+                v
+            };
             Some(Some(v))
         }
         "order" => {
@@ -4286,6 +4605,16 @@ fn digest_finish(state: &mut DigestState) -> Vec<u8> {
     }
 }
 
+fn array_len(vm: &Vm, array: V) -> usize {
+    let V::Ref(h) = array else {
+        return 0;
+    };
+    match vm.heap.get(h) {
+        Some(Obj::Array { data, .. }) => data.len(),
+        _ => 0,
+    }
+}
+
 fn array_bytes(vm: &Vm, array: V, offset: usize, len: Option<usize>) -> Vec<u8> {
     let V::Ref(h) = array else {
         return Vec::new();
@@ -4298,6 +4627,357 @@ fn array_bytes(vm: &Vm, array: V, offset: usize, len: Option<usize>) -> Vec<u8> 
         .map(|len| start.saturating_add(len).min(data.len()))
         .unwrap_or(data.len());
     data[start..end].iter().map(|v| i32v(*v) as u8).collect()
+}
+
+fn key_spec_call(vm: &mut Vm, name: &str, args: &[V]) -> Rt<Option<Option<V>>> {
+    Ok(Some(match name {
+        "<init>" => {
+            let (bytes, algorithm) = if args.len() >= 5 {
+                let array = args.get(1).copied().unwrap_or(V::Ref(0));
+                let offset = i32v(args[2]);
+                let len = i32v(args[3]);
+                let array_len = array_len(vm, array);
+                let start = offset.max(0) as usize;
+                if offset < 0
+                    || len < 0
+                    || start > array_len
+                    || len as usize > array_len.saturating_sub(start)
+                {
+                    return Err(vm.throw_builtin(
+                        "Ljava/lang/IllegalArgumentException;",
+                        "key range outside array",
+                    ));
+                }
+                (
+                    array_bytes(vm, array, start, Some(len as usize)),
+                    args.get(4).and_then(|v| sv(vm, *v)).unwrap_or_default(),
+                )
+            } else {
+                (
+                    array_bytes(vm, args.get(1).copied().unwrap_or(V::Ref(0)), 0, None),
+                    args.get(2).and_then(|v| sv(vm, *v)).unwrap_or_default(),
+                )
+            };
+            replace_host_state(
+                vm,
+                args[0],
+                "Ljavax/crypto/spec/SecretKeySpec;",
+                HostState::Key { algorithm, bytes },
+            );
+            None
+        }
+        "getEncoded" => {
+            let bytes = match args.first() {
+                Some(V::Ref(h)) => match vm.heap.get(*h) {
+                    Some(Obj::Host {
+                        state: HostState::Key { bytes, .. },
+                        ..
+                    }) => bytes.clone(),
+                    _ => Vec::new(),
+                },
+                _ => Vec::new(),
+            };
+            Some(byte_arr(vm, &bytes))
+        }
+        "getAlgorithm" => {
+            let algorithm = match args.first() {
+                Some(V::Ref(h)) => match vm.heap.get(*h) {
+                    Some(Obj::Host {
+                        state: HostState::Key { algorithm, .. },
+                        ..
+                    }) => algorithm.clone(),
+                    _ => String::new(),
+                },
+                _ => String::new(),
+            };
+            Some(jstr(vm, &algorithm))
+        }
+        _ => return Ok(None),
+    }))
+}
+
+fn mac_algorithm(algorithm: &str) -> Option<String> {
+    let normalized = algorithm.to_ascii_uppercase().replace(['-', '_'], "");
+    matches!(
+        normalized.as_str(),
+        "HMACSHA1" | "HMACSHA256" | "HMACSHA384" | "HMACSHA512"
+    )
+    .then_some(normalized)
+}
+
+fn mac_output_len(algorithm: &str) -> usize {
+    match algorithm {
+        "HMACMD5" => 16,
+        "HMACSHA1" => 20,
+        "HMACSHA256" => 32,
+        "HMACSHA384" => 48,
+        "HMACSHA512" => 64,
+        _ => 0,
+    }
+}
+
+fn mac_compute(algorithm: &str, key: &[u8], data: &[u8]) -> Option<Vec<u8>> {
+    macro_rules! compute {
+        ($digest:ty) => {{
+            let mut mac = hmac::Hmac::<$digest>::new_from_slice(key).ok()?;
+            mac.update(data);
+            Some(mac.finalize().into_bytes().to_vec())
+        }};
+    }
+    match algorithm {
+        "HMACMD5" => compute!(md5::Md5),
+        "HMACSHA1" => compute!(sha1::Sha1),
+        "HMACSHA256" => compute!(sha2::Sha256),
+        "HMACSHA384" => compute!(sha2::Sha384),
+        "HMACSHA512" => compute!(sha2::Sha512),
+        _ => None,
+    }
+}
+
+fn consume_mac_input(vm: &mut Vm, args: &[V], consumed: usize) {
+    if args.len() != 2 {
+        return;
+    }
+    let Some(V::Ref(h)) = args.get(1).copied() else {
+        return;
+    };
+    let is_buffer = matches!(
+        vm.heap.get(h),
+        Some(Obj::Host {
+            state: HostState::Slot(V::Ref(_)),
+            ..
+        })
+    );
+    if is_buffer {
+        let (_, pos) = bb_bytes(vm, h);
+        pseudo_set(vm, h, P_BBUF_POS, V::I32((pos + consumed) as i32));
+    }
+}
+
+fn mac_input_bytes(vm: &Vm, args: &[V]) -> Vec<u8> {
+    match args.len() {
+        2 => match args.get(1).copied().unwrap_or(V::I32(0)) {
+            v @ V::Ref(h) => match vm.heap.get(h) {
+                Some(Obj::Host {
+                    state: HostState::Slot(V::Ref(_)),
+                    ..
+                }) => bb_bytes(vm, h).0,
+                _ => array_bytes(vm, v, 0, None),
+            },
+            v => vec![i32v(v) as u8],
+        },
+        4 => array_bytes(
+            vm,
+            args.get(1).copied().unwrap_or(V::Ref(0)),
+            i32v(args[2]).max(0) as usize,
+            Some(i32v(args[3]).max(0) as usize),
+        ),
+        _ => Vec::new(),
+    }
+}
+
+fn mac_initialized(vm: &Vm, args: &[V]) -> bool {
+    match args.first() {
+        Some(V::Ref(h)) => match vm.heap.get(*h) {
+            Some(Obj::Host {
+                state: HostState::Mac { key, .. },
+                ..
+            }) => !key.is_empty(),
+            _ => false,
+        },
+        _ => false,
+    }
+}
+
+fn mac_call(vm: &mut Vm, name: &str, args: &[V]) -> Rt<Option<Option<V>>> {
+    Ok(Some(match name {
+        "getInstance" => {
+            let algorithm = args.first().and_then(|v| sv(vm, *v)).unwrap_or_default();
+            let Some(algorithm) = mac_algorithm(&algorithm) else {
+                return Err(vm.throw_builtin(
+                    "Ljava/security/NoSuchAlgorithmException;",
+                    "unsupported Mac algorithm",
+                ));
+            };
+            Some(host(
+                vm,
+                "Ljavax/crypto/Mac;",
+                HostState::Mac {
+                    algorithm,
+                    key: Vec::new(),
+                    data: Vec::new(),
+                },
+            ))
+        }
+        "init" => {
+            let key = match args.get(1).copied() {
+                Some(V::Ref(h)) => match vm.heap.get(h) {
+                    Some(Obj::Host {
+                        state: HostState::Key { bytes, .. },
+                        ..
+                    }) => bytes.clone(),
+                    _ => Vec::new(),
+                },
+                _ => Vec::new(),
+            };
+            if key.is_empty() {
+                return Err(vm.throw_builtin("Ljava/security/InvalidKeyException;", "empty key"));
+            }
+            if let Some(V::Ref(h)) = args.first() {
+                if let Some(Obj::Host {
+                    state: HostState::Mac { key: k, data, .. },
+                    ..
+                }) = vm.heap.get_mut(*h)
+                {
+                    *k = key;
+                    data.clear();
+                }
+            }
+            None
+        }
+        "update" => {
+            if !mac_initialized(vm, args) {
+                return Err(
+                    vm.throw_builtin("Ljava/lang/IllegalStateException;", "Mac not initialized")
+                );
+            }
+            let bytes = mac_input_bytes(vm, args);
+            consume_mac_input(vm, args, bytes.len());
+            if let Some(V::Ref(h)) = args.first() {
+                if let Some(Obj::Host {
+                    state: HostState::Mac { data, .. },
+                    ..
+                }) = vm.heap.get_mut(*h)
+                {
+                    data.extend_from_slice(&bytes);
+                }
+            }
+            None
+        }
+        "doFinal" => {
+            if !mac_initialized(vm, args) {
+                return Err(
+                    vm.throw_builtin("Ljava/lang/IllegalStateException;", "Mac not initialized")
+                );
+            }
+            let output_target = args.len() == 3;
+            if output_target {
+                let required = match args.first() {
+                    Some(V::Ref(h)) => match vm.heap.get(*h) {
+                        Some(Obj::Host {
+                            state: HostState::Mac { algorithm, .. },
+                            ..
+                        }) => mac_output_len(algorithm),
+                        _ => 0,
+                    },
+                    _ => 0,
+                };
+                let offset = i32v(args[2]);
+                let capacity = array_len(vm, args[1]);
+                if offset < 0
+                    || offset as usize > capacity
+                    || required > capacity.saturating_sub(offset as usize)
+                {
+                    return Err(vm.throw_builtin(
+                        "Ljavax/crypto/ShortBufferException;",
+                        "output buffer too small",
+                    ));
+                }
+            }
+            if args.len() == 2 {
+                let bytes = mac_input_bytes(vm, args);
+                consume_mac_input(vm, args, bytes.len());
+                if let Some(V::Ref(h)) = args.first() {
+                    if let Some(Obj::Host {
+                        state: HostState::Mac { data, .. },
+                        ..
+                    }) = vm.heap.get_mut(*h)
+                    {
+                        data.extend_from_slice(&bytes);
+                    }
+                }
+            }
+            let state = match args.first() {
+                Some(V::Ref(h)) => match vm.heap.get_mut(*h) {
+                    Some(Obj::Host {
+                        state:
+                            HostState::Mac {
+                                algorithm,
+                                key,
+                                data,
+                            },
+                        ..
+                    }) => {
+                        let state = (algorithm.clone(), key.clone(), data.clone());
+                        data.clear();
+                        state
+                    }
+                    _ => (String::new(), Vec::new(), Vec::new()),
+                },
+                _ => (String::new(), Vec::new(), Vec::new()),
+            };
+            if state.1.is_empty() {
+                return Err(
+                    vm.throw_builtin("Ljava/lang/IllegalStateException;", "Mac not initialized")
+                );
+            }
+            let out = mac_compute(&state.0, &state.1, &state.2).unwrap_or_default();
+            if output_target {
+                let offset = i32v(args[2]).max(0) as usize;
+                if let V::Ref(array_h) = args[1] {
+                    if let Some(Obj::Array { data, .. }) = vm.heap.get_mut(array_h) {
+                        for (i, byte) in out.iter().enumerate() {
+                            if let Some(slot) = data.get_mut(offset + i) {
+                                *slot = V::I32(*byte as i8 as i32);
+                            }
+                        }
+                    }
+                }
+                None
+            } else {
+                Some(byte_arr(vm, &out))
+            }
+        }
+        "reset" => {
+            if let Some(V::Ref(h)) = args.first() {
+                if let Some(Obj::Host {
+                    state: HostState::Mac { data, .. },
+                    ..
+                }) = vm.heap.get_mut(*h)
+                {
+                    data.clear();
+                }
+            }
+            None
+        }
+        "getAlgorithm" => {
+            let algorithm = match args.first() {
+                Some(V::Ref(h)) => match vm.heap.get(*h) {
+                    Some(Obj::Host {
+                        state: HostState::Mac { algorithm, .. },
+                        ..
+                    }) => algorithm.clone(),
+                    _ => String::new(),
+                },
+                _ => String::new(),
+            };
+            Some(jstr(vm, &algorithm))
+        }
+        "getMacLength" => {
+            let len = match args.first() {
+                Some(V::Ref(h)) => match vm.heap.get(*h) {
+                    Some(Obj::Host {
+                        state: HostState::Mac { algorithm, .. },
+                        ..
+                    }) => mac_output_len(algorithm),
+                    _ => 0,
+                },
+                _ => 0,
+            };
+            Some(V::I32(len as i32))
+        }
+        _ => return Ok(None),
+    }))
 }
 
 fn digest_call(vm: &mut Vm, name: &str, args: &[V]) -> Rt<Option<Option<V>>> {

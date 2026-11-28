@@ -2,7 +2,403 @@
 //! SharedPreferences, Resources, Handler/Looper (inline), PackageManager.
 
 use super::*;
-use crate::value::{CanvasOp, HostState, Obj, PaintState, V};
+use crate::value::{
+    CanvasOp, HostState, JsonFrame, JsonReaderState, JsonValue, Obj, PaintState, V,
+};
+
+const P_SCR_START_X: u32 = u32::MAX - 300;
+const P_SCR_START_Y: u32 = u32::MAX - 301;
+const P_SCR_FINAL_X: u32 = u32::MAX - 302;
+const P_SCR_FINAL_Y: u32 = u32::MAX - 303;
+const P_SCR_CURR_X: u32 = u32::MAX - 304;
+const P_SCR_CURR_Y: u32 = u32::MAX - 305;
+const P_SCR_START_T: u32 = u32::MAX - 306;
+const P_SCR_DURATION: u32 = u32::MAX - 307;
+const P_SCR_STATE: u32 = u32::MAX - 308;
+const P_TASK_CANCELLED: u64 = 0xFFFD_FD00;
+const P_AUDIO_SAMPLE_RATE: u32 = u32::MAX - 320;
+const P_AUDIO_CHANNEL_MASK: u32 = u32::MAX - 321;
+const P_AUDIO_ENCODING: u32 = u32::MAX - 322;
+const P_AUDIO_BUFFER_SIZE: u32 = u32::MAX - 323;
+const P_AUDIO_SESSION: u32 = u32::MAX - 324;
+const P_AUDIO_TRANSFER: u32 = u32::MAX - 325;
+const P_AUDIO_PLAYING: u32 = u32::MAX - 326;
+const P_AUDIO_START_MS: u32 = u32::MAX - 327;
+const P_AUDIO_WRITTEN: u32 = u32::MAX - 328;
+const P_AUDIO_CONSUMED_BASE: u32 = u32::MAX - 333;
+const P_PLAY_STATE: u32 = u32::MAX - 329;
+const P_PLAY_POSITION: u32 = u32::MAX - 330;
+const P_PLAY_SPEED: u32 = u32::MAX - 331;
+const P_PLAY_ACTIONS: u32 = u32::MAX - 332;
+
+fn flt32(v: V) -> f32 {
+    f64v(v) as f32
+}
+
+fn task_cancelled(vm: &Vm, this: u32) -> bool {
+    pseudo_get(vm, this, P_TASK_CANCELLED)
+        .map(i32v)
+        .unwrap_or(0)
+        != 0
+}
+
+fn has_virtual(vm: &mut Vm, this: u32, name: &str, args: &[V]) -> bool {
+    let Some(ci) = vm.heap.class_of(this) else {
+        return false;
+    };
+    vm.resolve_call_args(ci, name, args)
+        .map(|(m, _)| m.is_some())
+        .unwrap_or(false)
+}
+
+fn call_task_cancelled(vm: &mut Vm, this: u32, result: V) -> Rt<()> {
+    // AsyncTask's result-taking default delegates to the no-arg
+    // overload. The framework base is host-side here, so reproduce
+    // that fallback explicitly for subclasses overriding either form.
+    if has_virtual(vm, this, "onCancelled", &[result]) {
+        let _ = vm.call_virtual_rt(this, "onCancelled", &[result])?;
+    } else {
+        let _ = vm.call_virtual_rt(this, "onCancelled", &[])?;
+    }
+    Ok(())
+}
+
+struct JsonParser<'a> {
+    s: &'a [u8],
+    i: usize,
+}
+
+impl<'a> JsonParser<'a> {
+    fn ws(&mut self) {
+        while matches!(self.s.get(self.i), Some(b' ' | b'\n' | b'\r' | b'\t')) {
+            self.i += 1;
+        }
+    }
+    fn value(&mut self) -> Option<JsonValue> {
+        self.ws();
+        match *self.s.get(self.i)? {
+            b'{' => self.object(),
+            b'[' => self.array(),
+            b'"' => self.string().map(JsonValue::Str),
+            b't' if self.s[self.i..].starts_with(b"true") => {
+                self.i += 4;
+                Some(JsonValue::Bool(true))
+            }
+            b'f' if self.s[self.i..].starts_with(b"false") => {
+                self.i += 5;
+                Some(JsonValue::Bool(false))
+            }
+            b'n' if self.s[self.i..].starts_with(b"null") => {
+                self.i += 4;
+                Some(JsonValue::Null)
+            }
+            b'-' | b'0'..=b'9' => self.number(),
+            _ => None,
+        }
+    }
+    fn object(&mut self) -> Option<JsonValue> {
+        self.i += 1;
+        let mut out = Vec::new();
+        loop {
+            self.ws();
+            if self.s.get(self.i) == Some(&b'}') {
+                self.i += 1;
+                return Some(JsonValue::Obj(out));
+            }
+            let k = self.string()?;
+            self.ws();
+            if self.s.get(self.i) != Some(&b':') {
+                return None;
+            }
+            self.i += 1;
+            let v = self.value()?;
+            out.push((k, v));
+            self.ws();
+            match self.s.get(self.i) {
+                Some(b',') => self.i += 1,
+                Some(b'}') => {
+                    self.i += 1;
+                    return Some(JsonValue::Obj(out));
+                }
+                _ => return None,
+            }
+        }
+    }
+    fn array(&mut self) -> Option<JsonValue> {
+        self.i += 1;
+        let mut out = Vec::new();
+        loop {
+            self.ws();
+            if self.s.get(self.i) == Some(&b']') {
+                self.i += 1;
+                return Some(JsonValue::Arr(out));
+            }
+            out.push(self.value()?);
+            self.ws();
+            match self.s.get(self.i) {
+                Some(b',') => self.i += 1,
+                Some(b']') => {
+                    self.i += 1;
+                    return Some(JsonValue::Arr(out));
+                }
+                _ => return None,
+            }
+        }
+    }
+    fn string(&mut self) -> Option<String> {
+        if self.s.get(self.i) != Some(&b'"') {
+            return None;
+        }
+        self.i += 1;
+        let mut out = String::new();
+        while let Some(&b) = self.s.get(self.i) {
+            self.i += 1;
+            match b {
+                b'"' => return Some(out),
+                b'\\' => {
+                    let e = *self.s.get(self.i)?;
+                    self.i += 1;
+                    let c = match e {
+                        b'n' => '\n',
+                        b'r' => '\r',
+                        b't' => '\t',
+                        b'b' => '\u{8}',
+                        b'f' => '\u{c}',
+                        b'u' => {
+                            let h = self.s.get(self.i..self.i + 4)?;
+                            let n = u32::from_str_radix(std::str::from_utf8(h).ok()?, 16).ok()?;
+                            self.i += 4;
+                            char::from_u32(n).unwrap_or('\u{fffd}')
+                        }
+                        _ => e as char,
+                    };
+                    out.push(c);
+                }
+                _ => out.push(b as char),
+            }
+        }
+        None
+    }
+    fn number(&mut self) -> Option<JsonValue> {
+        let st = self.i;
+        if self.s.get(self.i) == Some(&b'-') {
+            self.i += 1;
+        }
+        while matches!(
+            self.s.get(self.i),
+            Some(b'0'..=b'9' | b'.' | b'e' | b'E' | b'+' | b'-')
+        ) {
+            self.i += 1;
+        }
+        std::str::from_utf8(&self.s[st..self.i])
+            .ok()?
+            .parse()
+            .ok()
+            .map(JsonValue::Num)
+    }
+}
+
+fn json_peek(st: &JsonReaderState) -> (String, Option<JsonValue>) {
+    match st.stack.last() {
+        Some(JsonFrame::Obj {
+            entries,
+            idx,
+            pending,
+        }) => {
+            if let Some(&pi) = pending.as_ref() {
+                return json_token(entries.get(pi).map(|(_, v)| v));
+            }
+            if *idx < entries.len() {
+                ("NAME".into(), None)
+            } else {
+                ("END_OBJECT".into(), None)
+            }
+        }
+        Some(JsonFrame::Arr { items, idx }) => {
+            if *idx < items.len() {
+                json_token(items.get(*idx))
+            } else {
+                ("END_ARRAY".into(), None)
+            }
+        }
+        None if !st.root_used => json_token(Some(&st.root)),
+        None => ("END_DOCUMENT".into(), None),
+    }
+}
+
+fn json_token(v: Option<&JsonValue>) -> (String, Option<JsonValue>) {
+    match v {
+        Some(JsonValue::Obj(_)) => ("BEGIN_OBJECT".into(), v.cloned()),
+        Some(JsonValue::Arr(_)) => ("BEGIN_ARRAY".into(), v.cloned()),
+        Some(JsonValue::Str(_)) => ("STRING".into(), v.cloned()),
+        Some(JsonValue::Num(_)) => ("NUMBER".into(), v.cloned()),
+        Some(JsonValue::Bool(_)) => ("BOOLEAN".into(), v.cloned()),
+        Some(JsonValue::Null) => ("NULL".into(), v.cloned()),
+        None => ("END_DOCUMENT".into(), None),
+    }
+}
+
+fn json_take(st: &mut JsonReaderState) -> Option<JsonValue> {
+    match st.stack.last_mut() {
+        Some(JsonFrame::Obj {
+            entries,
+            idx,
+            pending,
+        }) => {
+            let pi = pending.take()?;
+            *idx = (*idx + 1).max(pi + 1);
+            entries.get(pi).map(|(_, v)| v.clone())
+        }
+        Some(JsonFrame::Arr { items, idx }) => {
+            let v = items.get(*idx)?.clone();
+            *idx += 1;
+            Some(v)
+        }
+        None if !st.root_used => {
+            st.root_used = true;
+            Some(st.root.clone())
+        }
+        None => None,
+    }
+}
+
+fn json_boolish(v: Option<JsonValue>) -> bool {
+    match v {
+        Some(JsonValue::Bool(b)) => b,
+        Some(JsonValue::Str(s)) => s == "true",
+        _ => false,
+    }
+}
+
+fn jsonreader_call(vm: &mut Vm, name: &str, args: &[V]) -> Option<Option<V>> {
+    let this = match args.first().copied() {
+        Some(V::Ref(h)) => h,
+        _ => return Some(None),
+    };
+    if name == "<init>" {
+        let chars = match args.get(1).copied() {
+            Some(V::Ref(rh)) => match vm.heap.get(rh) {
+                Some(Obj::Host {
+                    state: HostState::Chars(chars, pos, _),
+                    ..
+                }) => Some(String::from_utf16_lossy(&chars[*pos..])),
+                _ => None,
+            },
+            _ => None,
+        };
+        if let Some(text) = chars {
+            if let Some(root) = (JsonParser {
+                s: text.as_bytes(),
+                i: 0,
+            })
+            .value()
+            {
+                let st = JsonReaderState {
+                    root,
+                    stack: Vec::new(),
+                    root_used: false,
+                };
+                if let Some(Obj::Host { state, .. }) = vm.heap.get_mut(this) {
+                    *state = HostState::JsonReader(Box::new(st));
+                }
+            }
+        }
+        return Some(None);
+    }
+    let mut st = match vm.heap.get(this) {
+        Some(Obj::Host {
+            state: HostState::JsonReader(st),
+            ..
+        }) => st.as_ref().clone(),
+        _ => return Some(None),
+    };
+    let out = match name {
+        "beginObject" => {
+            if let Some(JsonValue::Obj(entries)) = json_take(&mut st) {
+                st.stack.push(JsonFrame::Obj {
+                    entries,
+                    idx: 0,
+                    pending: None,
+                });
+            }
+            None
+        }
+        "beginArray" => {
+            if let Some(JsonValue::Arr(items)) = json_take(&mut st) {
+                st.stack.push(JsonFrame::Arr { items, idx: 0 });
+            }
+            None
+        }
+        "endObject" | "endArray" => {
+            st.stack.pop();
+            None
+        }
+        "hasNext" => Some(V::I32(match st.stack.last() {
+            Some(JsonFrame::Obj {
+                entries,
+                idx,
+                pending,
+            }) => (pending.is_none() && *idx < entries.len()) as i32,
+            Some(JsonFrame::Arr { items, idx }) => (*idx < items.len()) as i32,
+            None => (!st.root_used) as i32,
+        })),
+        "nextName" => {
+            let name = match st.stack.last_mut() {
+                Some(JsonFrame::Obj {
+                    entries,
+                    idx,
+                    pending,
+                }) if *idx < entries.len() => {
+                    *pending = Some(*idx);
+                    Some(entries[*idx].0.clone())
+                }
+                _ => None,
+            };
+            name.map(|n| jstr(vm, &n)).unwrap_or(V::Ref(0)).into()
+        }
+        "nextString" => Some(match json_take(&mut st) {
+            Some(JsonValue::Str(s)) => jstr(vm, &s),
+            Some(JsonValue::Num(n)) => jstr(vm, &n.to_string()),
+            Some(JsonValue::Bool(b)) => jstr(vm, if b { "true" } else { "false" }),
+            _ => V::Ref(0),
+        }),
+        "nextDouble" => Some(V::F64(match json_take(&mut st) {
+            Some(JsonValue::Num(n)) => n,
+            Some(JsonValue::Str(s)) => s.parse().unwrap_or(0.0),
+            _ => 0.0,
+        })),
+        "nextLong" => Some(V::I64(match json_take(&mut st) {
+            Some(JsonValue::Num(n)) => n as i64,
+            Some(JsonValue::Str(s)) => s.parse().unwrap_or(0),
+            _ => 0,
+        })),
+        "nextInt" => Some(V::I32(match json_take(&mut st) {
+            Some(JsonValue::Num(n)) => n as i32,
+            Some(JsonValue::Str(s)) => s.parse().unwrap_or(0),
+            _ => 0,
+        })),
+        "nextBoolean" => Some(V::I32(json_boolish(json_take(&mut st)) as i32)),
+        "nextNull" | "skipValue" => {
+            let _ = json_take(&mut st);
+            None
+        }
+        "peek" => {
+            let tok = json_peek(&st).0;
+            return Some(Some(lang::enum_const(vm, "Landroid/util/JsonToken;", &tok)));
+        }
+        "close" => {
+            st.stack.clear();
+            st.root_used = true;
+            None
+        }
+        "setLenient" | "promoteNameToValue" => None,
+        _ => None,
+    };
+    if let Some(Obj::Host { state, .. }) = vm.heap.get_mut(this) {
+        *state = HostState::JsonReader(Box::new(st));
+    }
+    Some(out)
+}
 
 pub(crate) fn call(
     vm: &mut Vm,
@@ -13,6 +409,46 @@ pub(crate) fn call(
 ) -> Rt<Option<Option<V>>> {
     Ok(if class == "Landroid/util/Log;" {
         log_call(vm, name, args)
+    } else if class == "Landroid/telephony/PhoneNumberUtils;" {
+        // Keep the input number when no locale formatter exists; returning
+        // a stub object makes Fossify render blank phone rows.
+        match name {
+            "formatNumber"
+            | "normalizeNumber"
+            | "stripSeparators"
+            | "extractNetworkPortion"
+            | "extractPostPortion" => Some(Some(args[0])),
+            "isNonSeparator" => Some(Some(V::I32(
+                sv(vm, args[0])
+                    .and_then(|t| t.chars().next())
+                    .is_some_and(|c| c.is_ascii_alphanumeric() || c == '*') as i32,
+            ))),
+            "isReallyDialable" => Some(Some(V::I32(1))),
+            _ => None,
+        }
+    } else if class == "Landroid/widget/Toast;" {
+        match name {
+            "makeText" => Some(Some(view::toast_make(vm, args))),
+            "show" => {
+                if let Some(V::Ref(h)) = args.first().copied() {
+                    view::toast_show(vm, h);
+                }
+                Some(None)
+            }
+            "setText" => {
+                if let Some(V::Ref(h)) = args.first().copied() {
+                    pseudo_set(
+                        vm,
+                        h,
+                        view::P_TEXT,
+                        args.get(1).copied().unwrap_or(V::Ref(0)),
+                    );
+                }
+                Some(None)
+            }
+            "setDuration" | "setGravity" | "setMargin" | "cancel" => Some(None),
+            _ => None,
+        }
     } else if class == "Landroid/os/SystemProperties;" {
         // Private platform API — Compose reads debug flags through it
         // and registers a change listener; defaults + no-op keep the
@@ -28,6 +464,42 @@ pub(crate) fn call(
             "set" | "addChangeCallback" | "removeChangeCallback" | "reportSyspropChanged" => {
                 Some(None)
             }
+            _ => None,
+        }
+    } else if class == "Landroid/util/JsonReader;" {
+        jsonreader_call(vm, name, args)
+    } else if class == "Landroid/util/Size;" {
+        // Size's width/height are private final fields in the framework;
+        // keep them as pseudo state because the constructor receiver can
+        // be either a host object or a classless dex instance.
+        const P_SIZE_WIDTH: u32 = u32::MAX - 335;
+        const P_SIZE_HEIGHT: u32 = u32::MAX - 336;
+        let this = match args.first().copied() {
+            Some(V::Ref(h)) => h,
+            _ => 0,
+        };
+        match name {
+            "<init>" => {
+                pseudo_set(
+                    vm,
+                    this,
+                    P_SIZE_WIDTH,
+                    args.get(1).copied().unwrap_or(V::I32(0)),
+                );
+                pseudo_set(
+                    vm,
+                    this,
+                    P_SIZE_HEIGHT,
+                    args.get(2).copied().unwrap_or(V::I32(0)),
+                );
+                Some(None)
+            }
+            "getWidth" => Some(Some(
+                pseudo_get(vm, this, P_SIZE_WIDTH).unwrap_or(V::I32(0)),
+            )),
+            "getHeight" => Some(Some(
+                pseudo_get(vm, this, P_SIZE_HEIGHT).unwrap_or(V::I32(0)),
+            )),
             _ => None,
         }
     } else if class == "Landroid/text/TextUtils;" {
@@ -58,6 +530,33 @@ pub(crate) fn call(
         intent_call(vm, name, sig, args)?
     } else if class == "Landroid/content/ComponentName;" {
         component_call(vm, name, args)?
+    } else if class.starts_with("Landroid/media/Audio")
+        || class.starts_with("Landroid/media/session/PlaybackState")
+        || class == "Landroid/media/MediaMetadataRetriever;"
+    {
+        audio_call(vm, class, name, args)?
+    } else if class.starts_with("Landroid/media/MediaCodec")
+        || class.starts_with("Landroid/media/MediaFormat")
+    {
+        media_codec_call(vm, class, name, sig, args)
+    } else if class == "Landroid/media/session/MediaSession;"
+        || class == "Landroid/media/session/MediaController;"
+        || class == "Landroid/media/session/MediaController$TransportControls;"
+    {
+        match name {
+            "setPlaybackState" | "setPlaybackToLocal" | "sendCustomAction" => Some(None),
+            "getTransportControls" => Some(Some(host(
+                vm,
+                "Landroid/media/session/MediaController$TransportControls;",
+                HostState::Empty,
+            ))),
+            _ => None,
+        }
+    } else if class == "Landroid/app/Notification;"
+        || class == "Landroid/app/Notification$Builder;"
+        || class == "Landroid/app/Notification$MediaStyle;"
+    {
+        notification_call(vm, class, name, args)
     } else if class == "Landroid/app/ActivityManager;" {
         // Report a normal modern-device memory budget. Coil derives
         // its memory-cache byte capacity from these values; the
@@ -339,9 +838,27 @@ pub(crate) fn call(
                 // Glide's local-uri fetcher reads the pixels through a
                 // parcelled descriptor — hand it the file's real bytes.
                 let uri = sv(vm, args.get(1).copied().unwrap_or(V::Ref(0))).unwrap_or_default();
-                let bytes = media_uri_path(vm, &uri)
-                    .and_then(|p| std::fs::read(io::fspath(vm, &p)).ok())
+                let path = media_uri_path(vm, &uri);
+                let bytes = path
+                    .as_deref()
+                    .and_then(|p| std::fs::read(io::fspath(vm, p)).ok())
                     .unwrap_or_default();
+                if crate::dbg_flag("OVELO_CONTENTDBG") {
+                    eprintln!(
+                        "[content] {name} uri={uri:?} path={path:?} bytes={}",
+                        bytes.len()
+                    );
+                }
+                let wants_image = name == "openTypedAssetFileDescriptor"
+                    && sv(vm, args.get(2).copied().unwrap_or(V::Ref(0)))
+                        .unwrap_or_default()
+                        .starts_with("image/");
+                if wants_image && image::load_from_memory(&bytes).is_err() {
+                    // An audio/media URI is not an image asset. In particular
+                    // Glide must fail this load rather than synthesize a
+                    // video frame or placeholder bitmap from the audio bytes.
+                    return Err(vm.throw_builtin("Ljava/io/FileNotFoundException;", &uri));
+                }
                 if bytes.is_empty() {
                     Some(Some(V::Ref(0)))
                 } else {
@@ -380,9 +897,11 @@ pub(crate) fn call(
             }
             "openInputStream" => {
                 let uri = sv(vm, args.get(1).copied().unwrap_or(V::Ref(0))).unwrap_or_default();
-                let bytes = media_uri_path(vm, &uri)
-                    .and_then(|p| std::fs::read(io::fspath(vm, &p)).ok())
-                    .unwrap_or_default();
+                let Some(bytes) =
+                    media_uri_path(vm, &uri).and_then(|p| std::fs::read(io::fspath(vm, &p)).ok())
+                else {
+                    return Err(vm.throw_builtin("Ljava/io/FileNotFoundException;", &uri));
+                };
                 Some(Some(host(
                     vm,
                     "Ljava/io/FileInputStream;",
@@ -580,6 +1099,8 @@ pub(crate) fn call(
             "setData" | "copyFrom" => Some(None),
             _ => None,
         }
+    } else if class == "Landroid/widget/Scroller;" || class == "Landroid/widget/OverScroller;" {
+        scroller_call(vm, name, sig, args)
     } else if class == "Landroid/os/SystemClock;" {
         match name {
             "uptimeMillis" | "elapsedRealtime" | "currentThreadTimeMillis" => {
@@ -588,6 +1109,128 @@ pub(crate) fn call(
             "elapsedRealtimeNanos" | "nanoTime" => Some(Some(V::I64(crate::jdk::now_nanos()))),
             "sleep" | "setCurrentTimeMillis" => Some(None),
             _ => None,
+        }
+    } else if matches!(
+        class,
+        "Landroid/view/animation/BaseInterpolator;"
+            | "Landroid/view/animation/LinearInterpolator;"
+            | "Landroid/view/animation/AccelerateInterpolator;"
+            | "Landroid/view/animation/DecelerateInterpolator;"
+            | "Landroid/view/animation/OvershootInterpolator;"
+            | "Landroid/view/animation/PathInterpolator;"
+    ) {
+        fn fv(v: Option<&V>) -> f32 {
+            v.map(|v| f64v(*v) as f32).unwrap_or(0.0)
+        }
+        if name == "<init>" {
+            if let Some(&V::Ref(this)) = args.first() {
+                let vals = match class {
+                    "Landroid/view/animation/AccelerateInterpolator;"
+                    | "Landroid/view/animation/DecelerateInterpolator;"
+                    | "Landroid/view/animation/OvershootInterpolator;" => {
+                        [fv(args.get(1)), 0.0, 0.0, 0.0]
+                    }
+                    "Landroid/view/animation/PathInterpolator;" => {
+                        if args.len() == 3 {
+                            let qx = fv(args.get(1));
+                            let qy = fv(args.get(2));
+                            [
+                                2.0 * qx / 3.0,
+                                2.0 * qy / 3.0,
+                                (qx + 1.0) / 3.0,
+                                (qy + 1.0) / 3.0,
+                            ]
+                        } else {
+                            [
+                                fv(args.get(1)),
+                                fv(args.get(2)),
+                                fv(args.get(3)),
+                                fv(args.get(4)),
+                            ]
+                        }
+                    }
+                    _ => [0.0; 4],
+                };
+                for (key, v) in [
+                    (P_INTERP_A, vals[0]),
+                    (P_INTERP_B, vals[1]),
+                    (P_INTERP_C, vals[2]),
+                    (P_INTERP_D, vals[3]),
+                ] {
+                    pseudo_set(vm, this, key, V::F32(v));
+                }
+            }
+            Some(None)
+        } else if name == "getInterpolation" {
+            let input = fv(args.get(1)).clamp(0.0, 1.0);
+            let out = match class {
+                "Landroid/view/animation/AccelerateInterpolator;" => {
+                    let factor = match args.first() {
+                        Some(&V::Ref(this)) => {
+                            f64v(pseudo_get(vm, this, P_INTERP_A).unwrap_or(V::F32(1.0))) as f32
+                        }
+                        _ => 1.0,
+                    };
+                    input.powf(if factor == 0.0 { 2.0 } else { 2.0 * factor })
+                }
+                "Landroid/view/animation/DecelerateInterpolator;" => {
+                    let factor = match args.first() {
+                        Some(&V::Ref(this)) => {
+                            f64v(pseudo_get(vm, this, P_INTERP_A).unwrap_or(V::F32(1.0))) as f32
+                        }
+                        _ => 1.0,
+                    };
+                    let factor = if factor == 0.0 { 1.0 } else { factor };
+                    1.0 - (1.0 - input).powf(2.0 * factor)
+                }
+                "Landroid/view/animation/OvershootInterpolator;" => {
+                    let tension = match args.first() {
+                        Some(&V::Ref(this)) => {
+                            let t = f64v(pseudo_get(vm, this, P_INTERP_A).unwrap_or(V::F32(2.0)))
+                                as f32;
+                            if t == 0.0 {
+                                2.0
+                            } else {
+                                t
+                            }
+                        }
+                        _ => 2.0,
+                    };
+                    let t = input - 1.0;
+                    t * t * ((tension + 1.0) * t + tension) + 1.0
+                }
+                "Landroid/view/animation/PathInterpolator;" => {
+                    let (x1, y1, x2, y2) = match args.first() {
+                        Some(&V::Ref(this)) => (
+                            f64v(pseudo_get(vm, this, P_INTERP_A).unwrap_or(V::F32(0.0))) as f32,
+                            f64v(pseudo_get(vm, this, P_INTERP_B).unwrap_or(V::F32(0.0))) as f32,
+                            f64v(pseudo_get(vm, this, P_INTERP_C).unwrap_or(V::F32(1.0))) as f32,
+                            f64v(pseudo_get(vm, this, P_INTERP_D).unwrap_or(V::F32(1.0))) as f32,
+                        ),
+                        _ => (0.0, 0.0, 1.0, 1.0),
+                    };
+                    let bez = |t: f32, a: f32, b: f32| {
+                        let u = 1.0 - t;
+                        3.0 * u * u * t * a + 3.0 * u * t * t * b + t * t * t
+                    };
+                    let mut lo = 0.0f32;
+                    let mut hi = 1.0f32;
+                    let mut t = input;
+                    for _ in 0..24 {
+                        t = (lo + hi) * 0.5;
+                        if bez(t, x1, x2) < input {
+                            lo = t;
+                        } else {
+                            hi = t;
+                        }
+                    }
+                    bez(t, y1, y2)
+                }
+                _ => input,
+            };
+            Some(Some(V::F32(out)))
+        } else {
+            Some(None)
         }
     } else if class == "Landroid/view/animation/AnimationUtils;" {
         match name {
@@ -731,12 +1374,45 @@ pub(crate) fn call(
     } else if desc_is_a(class, "Landroid/os/AsyncTask;") {
         match name {
             "execute" | "executeOnExecutor" => {
-                // inline: doInBackground → onPostExecute is the real
-                // contract; just run doInBackground and return this.
+                // Run the task contract inline on this cooperative VM:
+                // the no-op stub left every AsyncTask permanently pending.
+                let this = match args.first() {
+                    Some(V::Ref(h)) if *h != 0 => *h,
+                    _ => return Ok(Some(Some(args[0]))),
+                };
+                let params = if name == "executeOnExecutor" {
+                    args.get(2).copied()
+                } else {
+                    args.get(1).copied()
+                }
+                .unwrap_or(V::Ref(0));
+                let _ = vm.call_virtual_rt(this, "onPreExecute", &[])?;
+                if task_cancelled(vm, this) {
+                    call_task_cancelled(vm, this, V::Ref(0))?;
+                } else if let Some(result) =
+                    vm.call_virtual_rt(this, "doInBackground", &[params])?
+                {
+                    if task_cancelled(vm, this) {
+                        call_task_cancelled(vm, this, result)?;
+                    } else {
+                        let _ = vm.call_virtual_rt(this, "onPostExecute", &[result])?;
+                    }
+                }
                 Some(Some(args[0]))
             }
-            "cancel" => Some(Some(V::I32(1))),
-            "isCancelled" => Some(Some(V::I32(0))),
+            "cancel" => {
+                if let Some(V::Ref(this)) = args.first().copied() {
+                    pseudo_set(vm, this, P_TASK_CANCELLED, V::I32(1));
+                }
+                Some(Some(V::I32(1)))
+            }
+            "isCancelled" => {
+                let cancelled = match args.first().copied() {
+                    Some(V::Ref(this)) => task_cancelled(vm, this),
+                    _ => false,
+                };
+                Some(Some(V::I32(cancelled as i32)))
+            }
             "getStatus" => Some(Some(V::Ref(0))),
             "get" => Some(Some(V::Ref(0))),
             _ => None,
@@ -825,7 +1501,80 @@ pub(crate) fn call(
                     Some(None)
                 }
             }
-            "getInterfaceDescriptor" | "getInterfaceDescriptor0" => Some(Some(jstr(vm, ""))),
+            "attachInterface" => {
+                if let Some(V::Ref(bh)) = args.first().copied() {
+                    if let Some(interface) = args.get(1).copied() {
+                        pseudo_set(vm, bh, P_BINDER_INTERFACE, interface);
+                    }
+                    if let Some(descriptor) = args.get(2).copied() {
+                        pseudo_set(vm, bh, P_BINDER_DESCRIPTOR, descriptor);
+                    }
+                }
+                Some(None)
+            }
+            "queryLocalInterface" => {
+                let this = match args.first().copied() {
+                    Some(V::Ref(h)) => h,
+                    _ => 0,
+                };
+                let wanted = args.get(1).copied().and_then(|v| sv(vm, v));
+                let stored = pseudo_get(vm, this, P_BINDER_DESCRIPTOR).and_then(|v| sv(vm, v));
+                let out = if wanted.is_some() && wanted == stored {
+                    pseudo_get(vm, this, P_BINDER_INTERFACE).unwrap_or(V::Ref(0))
+                } else {
+                    V::Ref(0)
+                };
+                Some(Some(out))
+            }
+            "getInterfaceDescriptor" | "getInterfaceDescriptor0" => {
+                let this = match args.first().copied() {
+                    Some(V::Ref(h)) => h,
+                    _ => 0,
+                };
+                Some(Some(
+                    pseudo_get(vm, this, P_BINDER_DESCRIPTOR).unwrap_or(V::Ref(0)),
+                ))
+            }
+            _ => None,
+        }
+    } else if class == "Landroid/app/PendingIntent;" {
+        match name {
+            "getActivity" | "getService" | "getForegroundService" | "getBroadcast" => {
+                let pi = host(vm, "Landroid/app/PendingIntent;", HostState::Empty);
+                if let V::Ref(ph) = pi {
+                    let kind = match name {
+                        "getActivity" => "activity",
+                        "getBroadcast" => "broadcast",
+                        "getService" => "service",
+                        _ => "foregroundservice",
+                    };
+                    let kv = jstr(vm, kind);
+                    pseudo_set(vm, ph, P_ACTION, kv);
+                    if let Some(intent) = args.get(3).copied() {
+                        pseudo_set(vm, ph, P_DATA, intent);
+                    }
+                }
+                Some(Some(pi))
+            }
+            "isActivity" | "isBroadcast" | "isService" | "isForegroundService" => {
+                let wanted = name.trim_start_matches("is").to_ascii_lowercase();
+                let actual = args
+                    .first()
+                    .copied()
+                    .and_then(|v| match v {
+                        V::Ref(h) => pseudo_get(vm, h, P_ACTION).and_then(|k| sv(vm, k)),
+                        _ => None,
+                    })
+                    .unwrap_or_default();
+                Some(Some(V::I32((actual == wanted) as i32)))
+            }
+            "send" | "sendAndReturnResult" => Some(None),
+            "cancel" => Some(None),
+            "getIntentSender"
+            | "getCreatorPackage"
+            | "getCreatorUid"
+            | "getCreatorUserHandle"
+            | "getIntent" => Some(Some(V::Ref(0))),
             _ => None,
         }
     } else if class == "Landroid/content/ClipData;" || class == "Landroid/content/ClipboardManager;"
@@ -1180,6 +1929,1281 @@ fn measurespec_call(vm: &mut Vm, name: &str, args: &[V]) -> Option<Option<V>> {
 
 // ---------------------------------------------------------------------
 // Log
+
+fn scroller_call(vm: &mut Vm, name: &str, sig: &str, args: &[V]) -> Option<Option<V>> {
+    let h = match args.first() {
+        Some(V::Ref(h)) if *h != 0 => *h,
+        _ => return Some(None),
+    };
+    fn pi(vm: &Vm, h: u32, key: u32) -> i32 {
+        match pseudo_get(vm, h, key) {
+            Some(v) => i32v(v),
+            None => 0,
+        }
+    }
+    fn spi(vm: &mut Vm, h: u32, key: u32, v: i32) {
+        pseudo_set(vm, h, key, V::I32(v));
+    }
+    match name {
+        "<init>" => {
+            spi(vm, h, P_SCR_STATE, 2);
+            Some(None)
+        }
+        "startScroll" => {
+            let sx = i32v(args.get(1).copied().unwrap_or(V::I32(0)));
+            let sy = i32v(args.get(2).copied().unwrap_or(V::I32(0)));
+            let dx = i32v(args.get(3).copied().unwrap_or(V::I32(0)));
+            let dy = i32v(args.get(4).copied().unwrap_or(V::I32(0)));
+            let duration = if sig == "(IIIII)V" {
+                i32v(args.get(5).copied().unwrap_or(V::I32(250))).max(1)
+            } else {
+                250
+            };
+            spi(vm, h, P_SCR_START_X, sx);
+            spi(vm, h, P_SCR_START_Y, sy);
+            spi(vm, h, P_SCR_FINAL_X, sx + dx);
+            spi(vm, h, P_SCR_FINAL_Y, sy + dy);
+            spi(vm, h, P_SCR_CURR_X, sx);
+            spi(vm, h, P_SCR_CURR_Y, sy);
+            pseudo_set(vm, h, P_SCR_START_T, V::I64(crate::jdk::now_mono_ms()));
+            spi(vm, h, P_SCR_DURATION, duration);
+            spi(vm, h, P_SCR_STATE, 0);
+            vm.scroll_anim_until_ms = vm
+                .scroll_anim_until_ms
+                .max(crate::jdk::now_mono_ms() + duration as i64 + 100);
+            Some(None)
+        }
+        "fling" => {
+            let sx = i32v(args.get(1).copied().unwrap_or(V::I32(0)));
+            let sy = i32v(args.get(2).copied().unwrap_or(V::I32(0)));
+            let vx = i32v(args.get(3).copied().unwrap_or(V::I32(0))) as f32;
+            let vy = i32v(args.get(4).copied().unwrap_or(V::I32(0))) as f32;
+            let min_x = i32v(args.get(5).copied().unwrap_or(V::I32(i32::MIN)));
+            let max_x = i32v(args.get(6).copied().unwrap_or(V::I32(i32::MAX)));
+            let min_y = i32v(args.get(7).copied().unwrap_or(V::I32(i32::MIN)));
+            let max_y = i32v(args.get(8).copied().unwrap_or(V::I32(i32::MAX)));
+            // AOSP uses a physical friction model. A bounded half-second
+            // approximation preserves the important contract for View
+            // flingers: curr positions advance over time and finish at a
+            // clamped edge.
+            let duration = 500;
+            let fx = (sx + (vx * duration as f32 / 2000.0) as i32).clamp(min_x, max_x);
+            let fy = (sy + (vy * duration as f32 / 2000.0) as i32).clamp(min_y, max_y);
+            spi(vm, h, P_SCR_START_X, sx);
+            spi(vm, h, P_SCR_START_Y, sy);
+            spi(vm, h, P_SCR_FINAL_X, fx);
+            spi(vm, h, P_SCR_FINAL_Y, fy);
+            spi(vm, h, P_SCR_CURR_X, sx);
+            spi(vm, h, P_SCR_CURR_Y, sy);
+            pseudo_set(vm, h, P_SCR_START_T, V::I64(crate::jdk::now_mono_ms()));
+            spi(vm, h, P_SCR_DURATION, duration);
+            spi(vm, h, P_SCR_STATE, 0);
+            vm.scroll_anim_until_ms = vm
+                .scroll_anim_until_ms
+                .max(crate::jdk::now_mono_ms() + duration as i64 + 100);
+            Some(None)
+        }
+        "computeScrollOffset" => {
+            let state = pi(vm, h, P_SCR_STATE);
+            if state >= 2 {
+                return Some(Some(V::I32(0)));
+            }
+            let start_t = match pseudo_get(vm, h, P_SCR_START_T) {
+                Some(V::I64(t)) => t,
+                _ => crate::jdk::now_mono_ms(),
+            };
+            let dur = pi(vm, h, P_SCR_DURATION).max(1) as i64;
+            let elapsed = (crate::jdk::now_mono_ms() - start_t).max(0);
+            let done = elapsed >= dur;
+            let t = (elapsed as f32 / dur as f32).min(1.0);
+            // Ease-out interpolation approximates Scroller's deceleration
+            // closely enough for page snapping while remaining monotonic.
+            let eased = 1.0 - (1.0 - t) * (1.0 - t);
+            let sx = pi(vm, h, P_SCR_START_X);
+            let sy = pi(vm, h, P_SCR_START_Y);
+            let fx = pi(vm, h, P_SCR_FINAL_X);
+            let fy = pi(vm, h, P_SCR_FINAL_Y);
+            let cx = if done {
+                fx
+            } else {
+                sx + ((fx - sx) as f32 * eased) as i32
+            };
+            let cy = if done {
+                fy
+            } else {
+                sy + ((fy - sy) as f32 * eased) as i32
+            };
+            spi(vm, h, P_SCR_CURR_X, cx);
+            spi(vm, h, P_SCR_CURR_Y, cy);
+            if done {
+                // Emit the final position once, then report completion on
+                // the next compute pass just like a finished animation.
+                let next = if state == 0 { 1 } else { 2 };
+                spi(vm, h, P_SCR_STATE, next);
+            }
+            Some(Some(V::I32(1)))
+        }
+        "getCurrX" => Some(Some(V::I32(pi(vm, h, P_SCR_CURR_X)))),
+        "getCurrY" => Some(Some(V::I32(pi(vm, h, P_SCR_CURR_Y)))),
+        "getFinalX" => Some(Some(V::I32(pi(vm, h, P_SCR_FINAL_X)))),
+        "getFinalY" => Some(Some(V::I32(pi(vm, h, P_SCR_FINAL_Y)))),
+        "getStartX" => Some(Some(V::I32(pi(vm, h, P_SCR_START_X)))),
+        "getStartY" => Some(Some(V::I32(pi(vm, h, P_SCR_START_Y)))),
+        "isFinished" => Some(Some(V::I32((pi(vm, h, P_SCR_STATE) != 0) as i32))),
+        "abortAnimation" => {
+            spi(vm, h, P_SCR_CURR_X, pi(vm, h, P_SCR_FINAL_X));
+            spi(vm, h, P_SCR_CURR_Y, pi(vm, h, P_SCR_FINAL_Y));
+            spi(vm, h, P_SCR_STATE, 2);
+            Some(None)
+        }
+        "forceFinished" => {
+            let finished = i32v(args.get(1).copied().unwrap_or(V::I32(0))) != 0;
+            spi(vm, h, P_SCR_STATE, if finished { 2 } else { 0 });
+            Some(None)
+        }
+        "getCurrVelocity" => {
+            let dx = pi(vm, h, P_SCR_FINAL_X) - pi(vm, h, P_SCR_START_X);
+            let dy = pi(vm, h, P_SCR_FINAL_Y) - pi(vm, h, P_SCR_START_Y);
+            let dur = pi(vm, h, P_SCR_DURATION).max(1) as f32 / 1000.0;
+            Some(Some(V::F32((((dx * dx + dy * dy) as f32).sqrt()) / dur)))
+        }
+        "getDuration" => Some(Some(V::I32(pi(vm, h, P_SCR_DURATION)))),
+        "timePassed" => {
+            let start_t = match pseudo_get(vm, h, P_SCR_START_T) {
+                Some(V::I64(t)) => t,
+                _ => crate::jdk::now_mono_ms(),
+            };
+            Some(Some(V::I32((crate::jdk::now_mono_ms() - start_t) as i32)))
+        }
+        "springBack" => Some(Some(V::I32(0))),
+        "notifyHorizontalEdgeReached"
+        | "notifyVerticalEdgeReached"
+        | "setFriction"
+        | "setFinalX"
+        | "setFinalY"
+        | "extendDuration" => {
+            if name == "setFinalX" {
+                spi(
+                    vm,
+                    h,
+                    P_SCR_FINAL_X,
+                    i32v(args.get(1).copied().unwrap_or(V::I32(0))),
+                );
+            } else if name == "setFinalY" {
+                spi(
+                    vm,
+                    h,
+                    P_SCR_FINAL_Y,
+                    i32v(args.get(1).copied().unwrap_or(V::I32(0))),
+                );
+            } else if name == "extendDuration" {
+                let cur = pi(vm, h, P_SCR_DURATION);
+                spi(
+                    vm,
+                    h,
+                    P_SCR_DURATION,
+                    cur + i32v(args.get(1).copied().unwrap_or(V::I32(0))),
+                );
+            }
+            Some(None)
+        }
+        _ => None,
+    }
+}
+
+fn pseudo_i64(vm: &Vm, h: u32, key: u32) -> i64 {
+    pseudo_get(vm, h, key).map(i64v).unwrap_or(0)
+}
+
+fn copy_audio_fields(vm: &mut Vm, from: u32, to: u32) {
+    for key in [
+        P_AUDIO_SAMPLE_RATE,
+        P_AUDIO_CHANNEL_MASK,
+        P_AUDIO_ENCODING,
+        P_AUDIO_BUFFER_SIZE,
+        P_AUDIO_SESSION,
+        P_AUDIO_TRANSFER,
+    ] {
+        if let Some(v) = pseudo_get(vm, from, key) {
+            pseudo_set(vm, to, key, v);
+        }
+    }
+}
+
+fn audio_frame_size(vm: &Vm, h: u32) -> i64 {
+    let encoding = pseudo_i64(vm, h, P_AUDIO_ENCODING);
+    let bytes_per_sample = match encoding {
+        2 | 3 => 2, // PCM_16BIT / PCM_8BIT approximation for 3 below
+        4 => 4,     // PCM_FLOAT
+        _ => 2,
+    };
+    if encoding == 3 {
+        // PCM_8BIT really is one byte per sample.
+        let channels = pseudo_i64(vm, h, P_AUDIO_CHANNEL_MASK).count_ones().max(1) as i64;
+        return channels;
+    }
+    let channels = pseudo_i64(vm, h, P_AUDIO_CHANNEL_MASK).count_ones().max(1) as i64;
+    channels * bytes_per_sample
+}
+
+fn audio_bytes_per_ms(vm: &Vm, h: u32) -> i64 {
+    (pseudo_i64(vm, h, P_AUDIO_SAMPLE_RATE).max(1) * audio_frame_size(vm, h).max(1) / 1000).max(1)
+}
+
+fn audio_update_consumed(vm: &mut Vm, h: u32) {
+    if pseudo_i64(vm, h, P_AUDIO_PLAYING) != 0 {
+        let elapsed = (now_ms() - pseudo_i64(vm, h, P_AUDIO_START_MS)).max(0);
+        let consumed =
+            pseudo_i64(vm, h, P_AUDIO_CONSUMED_BASE) + elapsed * audio_bytes_per_ms(vm, h);
+        pseudo_set(vm, h, P_AUDIO_CONSUMED_BASE, V::I64(consumed));
+        pseudo_set(vm, h, P_AUDIO_START_MS, V::I64(now_ms()));
+    }
+}
+
+fn mint_audio_track(vm: &mut Vm, builder: u32) -> V {
+    let v = host(vm, "Landroid/media/AudioTrack;", HostState::Empty);
+    if let V::Ref(th) = v {
+        copy_audio_fields(vm, builder, th);
+        if let Some(format) = pseudo_get(vm, builder, P_TARGET) {
+            if let V::Ref(fh) = format {
+                copy_audio_fields(vm, fh, th);
+                pseudo_set(vm, th, P_TARGET, format);
+            }
+        }
+        if pseudo_i64(vm, th, P_AUDIO_BUFFER_SIZE) == 0 {
+            let rate = pseudo_i64(vm, th, P_AUDIO_SAMPLE_RATE).max(8000);
+            let frame = audio_frame_size(vm, th).max(1);
+            pseudo_set(vm, th, P_AUDIO_BUFFER_SIZE, V::I64(rate * frame / 2));
+        }
+    }
+    v
+}
+
+fn playback_state_copy(vm: &mut Vm, from: u32, desc: &str) -> V {
+    let v = host(vm, desc, HostState::Empty);
+    if let V::Ref(to) = v {
+        for key in [
+            P_PLAY_STATE,
+            P_PLAY_POSITION,
+            P_PLAY_SPEED,
+            P_PLAY_ACTIONS,
+            P_DATA,
+        ] {
+            if let Some(x) = pseudo_get(vm, from, key) {
+                pseudo_set(vm, to, key, x);
+            }
+        }
+    }
+    v
+}
+
+const P_CODEC_CALLBACK: u64 = 0xFFFD_FD10;
+const P_CODEC_FORMAT: u64 = 0xFFFD_FD11;
+const P_CODEC_INPUT_ARRAY: u64 = 0xFFFD_FD12;
+const P_CODEC_OUTPUT_ARRAY: u64 = 0xFFFD_FD13;
+const P_CODEC_INPUT_AVAIL: u64 = 0xFFFD_FD14;
+const P_CODEC_INPUT_CLIENT: u64 = 0xFFFD_FD15;
+const P_CODEC_OUTPUT_READY: u64 = 0xFFFD_FD16;
+const P_CODEC_OUTPUT_CLIENT: u64 = 0xFFFD_FD17;
+const P_CODEC_STARTED: u64 = 0xFFFD_FD18;
+const P_CODEC_SIZE: u64 = 0xFFFD_FD19;
+const CODEC_SLOTS: i64 = 4;
+
+fn codec_bits(vm: &Vm, h: u32, key: u64) -> i64 {
+    pseudo_get(vm, h, key).map(i64v).unwrap_or(0)
+}
+
+fn set_codec_bits(vm: &mut Vm, h: u32, key: u64, bits: i64) {
+    pseudo_set(vm, h, key, V::I64(bits));
+}
+
+fn named_field_write(vm: &mut Vm, h: u32, owner: &str, name: &str, v: V) {
+    if let Some(g) = vm.field_index_of(owner, name).map(|g| vm.canon_field(g)) {
+        if let Some(Obj::Instance { fields, .. } | Obj::Host { fields, .. }) = vm.heap.get_mut(h) {
+            fields.insert(g, v);
+        }
+    }
+}
+
+fn buffer_info_set(vm: &mut Vm, h: u32, offset: i32, size: i32, pts: i64, flags: i32) {
+    for (name, v) in [
+        ("offset", V::I32(offset)),
+        ("size", V::I32(size)),
+        ("presentationTimeUs", V::I64(pts)),
+        ("flags", V::I32(flags)),
+    ] {
+        named_field_write(vm, h, "Landroid/media/MediaCodec$BufferInfo;", name, v);
+    }
+    pseudo_set(vm, h, P_DATA, V::I64(size as i64));
+    pseudo_set(vm, h, P_FLAGS, V::I32(flags));
+}
+
+fn alloc_byte_buffer(vm: &mut Vm, capacity: usize) -> V {
+    let backing = vm.heap.alloc(Obj::Array {
+        elem: "B".into(),
+        data: vec![V::I32(0); capacity],
+    });
+    host(
+        vm,
+        "Ljava/nio/ByteBuffer;",
+        HostState::Slot(V::Ref(backing)),
+    )
+}
+
+fn bb_backing(vm: &Vm, h: u32) -> Option<u32> {
+    match vm.heap.get(h) {
+        Some(Obj::Host {
+            state: HostState::Slot(V::Ref(b)),
+            ..
+        }) if matches!(vm.heap.get(*b), Some(Obj::Array { .. })) => Some(*b),
+        _ => None,
+    }
+}
+
+fn bb_copy_from(vm: &Vm, h: u32, offset: usize, size: usize) -> Vec<u8> {
+    let Some(b) = bb_backing(vm, h) else {
+        return Vec::new();
+    };
+    let base = i32v(pseudo_get(vm, h, P_BBUF_BASE).unwrap_or(V::I32(0))).max(0) as usize;
+    match vm.heap.get(b) {
+        Some(Obj::Array { data, .. }) => {
+            let start = base.saturating_add(offset).min(data.len());
+            let end = start.saturating_add(size).min(data.len());
+            data[start..end].iter().map(|v| i32v(*v) as u8).collect()
+        }
+        _ => Vec::new(),
+    }
+}
+
+fn bb_replace(vm: &mut Vm, h: u32, bytes: &[u8]) {
+    if let Some(b) = bb_backing(vm, h) {
+        if let Some(Obj::Array { data, .. }) = vm.heap.get_mut(b) {
+            for (i, byte) in bytes.iter().copied().enumerate().take(data.len()) {
+                data[i] = V::I32(byte as i8 as i32);
+            }
+        }
+    }
+    pseudo_set(vm, h, P_BBUF_POS, V::I32(0));
+    pseudo_set(vm, h, P_BBUF_LIM, V::I32(bytes.len() as i32));
+}
+
+fn codec_array(vm: &mut Vm, h: u32, key: u64) -> Option<u32> {
+    match pseudo_get(vm, h, key) {
+        Some(V::Ref(a)) if matches!(vm.heap.get(a), Some(Obj::Array { .. })) => Some(a),
+        _ => None,
+    }
+}
+
+fn codec_buffer_at(vm: &Vm, arrh: u32, index: i32) -> Option<u32> {
+    match vm.heap.get(arrh) {
+        Some(Obj::Array { data, .. }) => match data.get(index.max(0) as usize) {
+            Some(V::Ref(h)) => Some(*h),
+            _ => None,
+        },
+        _ => None,
+    }
+}
+
+fn ensure_codec_buffers(vm: &mut Vm, h: u32) {
+    if codec_array(vm, h, P_CODEC_INPUT_ARRAY).is_some() {
+        return;
+    }
+    let capacity = pseudo_get(vm, h, P_CODEC_SIZE)
+        .map(i64v)
+        .unwrap_or(131072)
+        .clamp(4096, 1024 * 1024) as usize;
+    let mut inputs = Vec::new();
+    let mut outputs = Vec::new();
+    for _ in 0..CODEC_SLOTS {
+        inputs.push(alloc_byte_buffer(vm, capacity));
+        outputs.push(alloc_byte_buffer(vm, capacity));
+    }
+    let ia = arr(vm, "Ljava/nio/ByteBuffer;", inputs);
+    let oa = arr(vm, "Ljava/nio/ByteBuffer;", outputs);
+    pseudo_set(vm, h, P_CODEC_INPUT_ARRAY, ia);
+    pseudo_set(vm, h, P_CODEC_OUTPUT_ARRAY, oa);
+}
+
+fn codec_input_available(vm: &mut Vm, codec: u32, index: i32) {
+    if let Some(V::Ref(cb)) = pseudo_get(vm, codec, P_CODEC_CALLBACK) {
+        let _ = vm.call_virtual(
+            cb,
+            "onInputBufferAvailable",
+            &[V::Ref(codec), V::I32(index)],
+        );
+    }
+}
+
+fn codec_format_changed(vm: &mut Vm, codec: u32) {
+    if let (Some(V::Ref(cb)), Some(fmt)) = (
+        pseudo_get(vm, codec, P_CODEC_CALLBACK),
+        pseudo_get(vm, codec, P_CODEC_FORMAT),
+    ) {
+        let _ = vm.call_virtual(cb, "onOutputFormatChanged", &[V::Ref(codec), fmt]);
+    }
+}
+
+fn format_entries(vm: &Vm, h: u32) -> Vec<(V, V)> {
+    match vm.heap.get(h) {
+        Some(Obj::Host {
+            state: HostState::Map(entries),
+            ..
+        }) => entries.clone(),
+        _ => Vec::new(),
+    }
+}
+
+fn format_get(vm: &Vm, h: u32, key: &str) -> Option<V> {
+    format_entries(vm, h)
+        .into_iter()
+        .find(|(k, _)| sv(vm, *k).as_deref() == Some(key))
+        .map(|(_, v)| v)
+}
+
+fn format_put(vm: &mut Vm, h: u32, key: V, value: V) {
+    let key_string = sv(vm, key).unwrap_or_default();
+    let existing = format_entries(vm, h)
+        .iter()
+        .position(|(k, _)| sv(vm, *k).as_deref() == Some(key_string.as_str()));
+    if let Some(Obj::Host { state, .. }) = vm.heap.get_mut(h) {
+        if !matches!(state, HostState::Map(_)) {
+            *state = HostState::Map(Vec::new());
+        }
+        if let HostState::Map(entries) = state {
+            if let Some(index) = existing {
+                entries[index].1 = value;
+            } else {
+                entries.push((key, value));
+            }
+        }
+    }
+}
+
+fn mint_codec_info(vm: &mut Vm) -> V {
+    host(
+        vm,
+        "Landroid/media/MediaCodecInfo;",
+        HostState::StrBuf("ovelo.raw.decoder".into()),
+    )
+}
+
+fn media_codec_call(
+    vm: &mut Vm,
+    class: &str,
+    name: &str,
+    _sig: &str,
+    args: &[V],
+) -> Option<Option<V>> {
+    let this = match args.first() {
+        Some(&V::Ref(h)) => h,
+        _ => 0,
+    };
+    match name {
+        "<init>" => Some(None),
+        "getCodecInfos" if class == "Landroid/media/MediaCodecList;" => {
+            let info = mint_codec_info(vm);
+            Some(Some(arr(vm, "Landroid/media/MediaCodecInfo;", vec![info])))
+        }
+        "getName" if class == "Landroid/media/MediaCodecInfo;" => {
+            Some(Some(jstr(vm, "ovelo.raw.decoder")))
+        }
+        "getSupportedTypes" if class == "Landroid/media/MediaCodecInfo;" => {
+            let raw = jstr(vm, "audio/raw");
+            Some(Some(arr(vm, "Ljava/lang/String;", vec![raw])))
+        }
+        "isAlias" | "isEncoder" | "isHardwareAccelerated" | "isVendor"
+            if class == "Landroid/media/MediaCodecInfo;" =>
+        {
+            Some(Some(V::I32(0)))
+        }
+        "isSoftwareOnly" if class == "Landroid/media/MediaCodecInfo;" => Some(Some(V::I32(1))),
+        "getCapabilitiesForType" if class == "Landroid/media/MediaCodecInfo;" => {
+            let caps = host(
+                vm,
+                "Landroid/media/MediaCodecInfo$CodecCapabilities;",
+                HostState::Empty,
+            );
+            if let V::Ref(ch) = caps {
+                let level = host(
+                    vm,
+                    "Landroid/media/MediaCodecInfo$CodecProfileLevel;",
+                    HostState::Empty,
+                );
+                let levels = arr(
+                    vm,
+                    "Landroid/media/MediaCodecInfo$CodecProfileLevel;",
+                    vec![level],
+                );
+                named_field_write(
+                    vm,
+                    ch,
+                    "Landroid/media/MediaCodecInfo$CodecCapabilities;",
+                    "profileLevels",
+                    levels,
+                );
+            }
+            Some(Some(caps))
+        }
+        "getAudioCapabilities" if class == "Landroid/media/MediaCodecInfo$CodecCapabilities;" => {
+            Some(Some(host(
+                vm,
+                "Landroid/media/MediaCodecInfo$AudioCapabilities;",
+                HostState::Empty,
+            )))
+        }
+        "getVideoCapabilities" if class == "Landroid/media/MediaCodecInfo$CodecCapabilities;" => {
+            Some(Some(host(
+                vm,
+                "Landroid/media/MediaCodecInfo$VideoCapabilities;",
+                HostState::Empty,
+            )))
+        }
+        "isFeatureSupported" | "isFeatureRequired"
+            if class == "Landroid/media/MediaCodecInfo$CodecCapabilities;" =>
+        {
+            Some(Some(V::I32(0)))
+        }
+        "getMaxInputChannelCount"
+            if class == "Landroid/media/MediaCodecInfo$AudioCapabilities;" =>
+        {
+            Some(Some(V::I32(8)))
+        }
+        "isSampleRateSupported" if class == "Landroid/media/MediaCodecInfo$AudioCapabilities;" => {
+            Some(Some(V::I32(1)))
+        }
+        "createByCodecName" | "createDecoderByType" | "createEncoderByType" => {
+            let v = host(vm, "Landroid/media/MediaCodec;", HostState::Empty);
+            Some(Some(v))
+        }
+        "setCallback" if class == "Landroid/media/MediaCodec;" => {
+            pseudo_set(
+                vm,
+                this,
+                P_CODEC_CALLBACK,
+                args.get(1).copied().unwrap_or(V::Ref(0)),
+            );
+            Some(None)
+        }
+        "configure" if class == "Landroid/media/MediaCodec;" => {
+            pseudo_set(
+                vm,
+                this,
+                P_CODEC_FORMAT,
+                args.get(1).copied().unwrap_or(V::Ref(0)),
+            );
+            if let Some(V::Ref(fh)) = args.get(1).copied() {
+                if let Some(v) = format_get(vm, fh, "max-input-size") {
+                    pseudo_set(vm, this, P_CODEC_SIZE, v);
+                }
+            }
+            ensure_codec_buffers(vm, this);
+            Some(None)
+        }
+        "start" if class == "Landroid/media/MediaCodec;" => {
+            ensure_codec_buffers(vm, this);
+            pseudo_set(vm, this, P_CODEC_STARTED, V::I32(1));
+            let all = (1i64 << CODEC_SLOTS) - 1;
+            set_codec_bits(vm, this, P_CODEC_INPUT_AVAIL, all);
+            set_codec_bits(vm, this, P_CODEC_INPUT_CLIENT, 0);
+            set_codec_bits(vm, this, P_CODEC_OUTPUT_READY, 0);
+            set_codec_bits(vm, this, P_CODEC_OUTPUT_CLIENT, 0);
+            codec_format_changed(vm, this);
+            for i in 0..CODEC_SLOTS as i32 {
+                codec_input_available(vm, this, i);
+            }
+            Some(None)
+        }
+        "dequeueInputBuffer" if class == "Landroid/media/MediaCodec;" => {
+            let avail = codec_bits(vm, this, P_CODEC_INPUT_AVAIL);
+            let mut out = -1;
+            for i in 0..CODEC_SLOTS {
+                if avail & (1i64 << i) != 0 {
+                    set_codec_bits(vm, this, P_CODEC_INPUT_AVAIL, avail & !(1i64 << i));
+                    set_codec_bits(
+                        vm,
+                        this,
+                        P_CODEC_INPUT_CLIENT,
+                        codec_bits(vm, this, P_CODEC_INPUT_CLIENT) | (1i64 << i),
+                    );
+                    out = i as i32;
+                    break;
+                }
+            }
+            Some(Some(V::I32(out)))
+        }
+        "getInputBuffer" | "getOutputBuffer" if class == "Landroid/media/MediaCodec;" => {
+            ensure_codec_buffers(vm, this);
+            let key = if name == "getInputBuffer" {
+                P_CODEC_INPUT_ARRAY
+            } else {
+                P_CODEC_OUTPUT_ARRAY
+            };
+            let index = args.get(1).map(|v| i32v(*v)).unwrap_or(-1);
+            let h = codec_array(vm, this, key).and_then(|a| codec_buffer_at(vm, a, index));
+            Some(Some(h.map(V::Ref).unwrap_or(V::Ref(0))))
+        }
+        "queueInputBuffer" if class == "Landroid/media/MediaCodec;" => {
+            let index = args.get(1).map(|v| i32v(*v)).unwrap_or(-1);
+            let offset = args.get(2).map(|v| i32v(*v)).unwrap_or(0).max(0) as usize;
+            let size = args.get(3).map(|v| i32v(*v)).unwrap_or(0).max(0) as usize;
+            let pts = args.get(4).map(|v| i64v(*v)).unwrap_or(0);
+            let flags = args.get(5).map(|v| i32v(*v)).unwrap_or(0);
+            if index >= 0 && index < CODEC_SLOTS as i32 {
+                let bit = 1i64 << index;
+                if let (Some(ia), Some(oa)) = (
+                    codec_array(vm, this, P_CODEC_INPUT_ARRAY),
+                    codec_array(vm, this, P_CODEC_OUTPUT_ARRAY),
+                ) {
+                    if let (Some(input), Some(output)) = (
+                        codec_buffer_at(vm, ia, index),
+                        codec_buffer_at(vm, oa, index),
+                    ) {
+                        let bytes = bb_copy_from(vm, input, offset, size);
+                        bb_replace(vm, output, &bytes);
+                        let entry = host(
+                            vm,
+                            "Landroid/media/MediaCodec$BufferInfo;",
+                            HostState::Empty,
+                        );
+                        if let V::Ref(eh) = entry {
+                            buffer_info_set(vm, eh, 0, bytes.len() as i32, pts, flags);
+                        }
+                        pseudo_set(vm, output, P_DATA, V::I64(pts));
+                        pseudo_set(vm, output, P_FLAGS, V::I32(flags));
+                        pseudo_set(vm, output, P_TARGET, V::I32(bytes.len() as i32));
+                    }
+                }
+                set_codec_bits(
+                    vm,
+                    this,
+                    P_CODEC_INPUT_CLIENT,
+                    codec_bits(vm, this, P_CODEC_INPUT_CLIENT) & !bit,
+                );
+                set_codec_bits(
+                    vm,
+                    this,
+                    P_CODEC_OUTPUT_READY,
+                    codec_bits(vm, this, P_CODEC_OUTPUT_READY) | bit,
+                );
+                if let Some(V::Ref(cb)) = pseudo_get(vm, this, P_CODEC_CALLBACK) {
+                    let info = host(
+                        vm,
+                        "Landroid/media/MediaCodec$BufferInfo;",
+                        HostState::Empty,
+                    );
+                    if let V::Ref(ih) = info {
+                        buffer_info_set(vm, ih, 0, size as i32, pts, flags);
+                        let _ = vm.call_virtual(
+                            cb,
+                            "onOutputBufferAvailable",
+                            &[V::Ref(this), V::I32(index), V::Ref(ih)],
+                        );
+                    }
+                }
+            }
+            Some(None)
+        }
+        "dequeueOutputBuffer" if class == "Landroid/media/MediaCodec;" => {
+            let ready = codec_bits(vm, this, P_CODEC_OUTPUT_READY);
+            let mut out = -1;
+            for i in 0..CODEC_SLOTS {
+                if ready & (1i64 << i) != 0 {
+                    let bit = 1i64 << i;
+                    set_codec_bits(vm, this, P_CODEC_OUTPUT_READY, ready & !bit);
+                    set_codec_bits(
+                        vm,
+                        this,
+                        P_CODEC_OUTPUT_CLIENT,
+                        codec_bits(vm, this, P_CODEC_OUTPUT_CLIENT) | bit,
+                    );
+                    if let Some(oa) = codec_array(vm, this, P_CODEC_OUTPUT_ARRAY) {
+                        if let Some(buf) = codec_buffer_at(vm, oa, i as i32) {
+                            if let Some(V::Ref(info)) = args.get(1).copied() {
+                                let size =
+                                    pseudo_get(vm, buf, P_TARGET).map(i64v).unwrap_or(0) as i32;
+                                let pts = pseudo_get(vm, buf, P_DATA).map(i64v).unwrap_or(0);
+                                let flags = pseudo_get(vm, buf, P_FLAGS).map(i32v).unwrap_or(0);
+                                buffer_info_set(vm, info, 0, size, pts, flags);
+                            }
+                        }
+                    }
+                    out = i as i32;
+                    break;
+                }
+            }
+            Some(Some(V::I32(out)))
+        }
+        "releaseOutputBuffer" if class == "Landroid/media/MediaCodec;" => {
+            let index = args.get(1).map(|v| i32v(*v)).unwrap_or(-1);
+            if index >= 0 && index < CODEC_SLOTS as i32 {
+                let bit = 1i64 << index;
+                set_codec_bits(
+                    vm,
+                    this,
+                    P_CODEC_OUTPUT_CLIENT,
+                    codec_bits(vm, this, P_CODEC_OUTPUT_CLIENT) & !bit,
+                );
+                set_codec_bits(
+                    vm,
+                    this,
+                    P_CODEC_INPUT_AVAIL,
+                    codec_bits(vm, this, P_CODEC_INPUT_AVAIL) | bit,
+                );
+                codec_input_available(vm, this, index);
+            }
+            Some(None)
+        }
+        "flush" if class == "Landroid/media/MediaCodec;" => {
+            let all = (1i64 << CODEC_SLOTS) - 1;
+            set_codec_bits(vm, this, P_CODEC_INPUT_AVAIL, all);
+            set_codec_bits(vm, this, P_CODEC_INPUT_CLIENT, 0);
+            set_codec_bits(vm, this, P_CODEC_OUTPUT_READY, 0);
+            set_codec_bits(vm, this, P_CODEC_OUTPUT_CLIENT, 0);
+            for i in 0..CODEC_SLOTS as i32 {
+                codec_input_available(vm, this, i);
+            }
+            Some(None)
+        }
+        "getOutputFormat" if class == "Landroid/media/MediaCodec;" => Some(Some(
+            pseudo_get(vm, this, P_CODEC_FORMAT)
+                .unwrap_or_else(|| host(vm, "Landroid/media/MediaFormat;", HostState::Map(vec![]))),
+        )),
+        "stop" | "release" | "reset" if class == "Landroid/media/MediaCodec;" => {
+            pseudo_set(vm, this, P_CODEC_STARTED, V::I32(0));
+            Some(None)
+        }
+        "setParameters" | "subscribeToVendorParameters" | "unsubscribeFromVendorParameters"
+            if class == "Landroid/media/MediaCodec;" =>
+        {
+            Some(None)
+        }
+        "set" if class == "Landroid/media/MediaCodec$BufferInfo;" => {
+            buffer_info_set(
+                vm,
+                this,
+                args.get(1).map(|v| i32v(*v)).unwrap_or(0),
+                args.get(2).map(|v| i32v(*v)).unwrap_or(0),
+                args.get(3).map(|v| i64v(*v)).unwrap_or(0),
+                args.get(4).map(|v| i32v(*v)).unwrap_or(0),
+            );
+            Some(None)
+        }
+        "setString" | "setInteger" | "setLong" | "setFloat" | "setByteBuffer"
+            if class == "Landroid/media/MediaFormat;" =>
+        {
+            if let Some(&key) = args.get(1) {
+                format_put(vm, this, key, args.get(2).copied().unwrap_or(V::I32(0)));
+            }
+            Some(None)
+        }
+        "containsKey" if class == "Landroid/media/MediaFormat;" => {
+            let key = sv(vm, args.get(1).copied().unwrap_or(V::Ref(0))).unwrap_or_default();
+            Some(Some(V::I32(format_get(vm, this, &key).is_some() as i32)))
+        }
+        "getString" | "getInteger" | "getLong" | "getFloat" | "getByteBuffer"
+            if class == "Landroid/media/MediaFormat;" =>
+        {
+            let key = sv(vm, args.get(1).copied().unwrap_or(V::Ref(0))).unwrap_or_default();
+            let v = format_get(vm, this, &key).unwrap_or(match name {
+                "getString" => jstr(vm, ""),
+                "getByteBuffer" => V::Ref(0),
+                "getLong" => V::I64(0),
+                "getFloat" => V::F32(0.0),
+                _ => V::I32(0),
+            });
+            Some(Some(v))
+        }
+        "getValueTypeForKey" if class == "Landroid/media/MediaFormat;" => {
+            let key = sv(vm, args.get(1).copied().unwrap_or(V::Ref(0))).unwrap_or_default();
+            let ty = match format_get(vm, this, &key) {
+                Some(V::I32(_)) => 1,
+                Some(V::I64(_)) => 2,
+                Some(V::F32(_)) | Some(V::F64(_)) => 3,
+                Some(V::Ref(h)) if matches!(vm.heap.get(h), Some(Obj::Str { .. })) => 4,
+                Some(V::Ref(_)) => 5,
+                _ => 0,
+            };
+            Some(Some(V::I32(ty)))
+        }
+        _ => None,
+    }
+}
+
+fn audio_call(vm: &mut Vm, class: &str, name: &str, args: &[V]) -> Rt<Option<Option<V>>> {
+    let this = match args.first() {
+        Some(&V::Ref(h)) => h,
+        _ => 0,
+    };
+    Ok(match name {
+        "<init>" => {
+            if class == "Landroid/media/AudioTrack;" && args.len() >= 7 {
+                // Legacy streamType/sampleRate/channelConfig/encoding/size/mode ctor.
+                pseudo_set(vm, this, P_AUDIO_SAMPLE_RATE, args[2]);
+                pseudo_set(vm, this, P_AUDIO_CHANNEL_MASK, args[3]);
+                pseudo_set(vm, this, P_AUDIO_ENCODING, args[4]);
+                pseudo_set(vm, this, P_AUDIO_BUFFER_SIZE, args[5]);
+            }
+            Some(None)
+        }
+        "setSampleRate" => {
+            pseudo_set(
+                vm,
+                this,
+                P_AUDIO_SAMPLE_RATE,
+                args.get(1).copied().unwrap_or(V::I32(0)),
+            );
+            Some(Some(args[0]))
+        }
+        "setChannelMask" | "setChannelConfig" => {
+            pseudo_set(
+                vm,
+                this,
+                P_AUDIO_CHANNEL_MASK,
+                args.get(1).copied().unwrap_or(V::I32(0)),
+            );
+            Some(Some(args[0]))
+        }
+        "setEncoding" => {
+            pseudo_set(
+                vm,
+                this,
+                P_AUDIO_ENCODING,
+                args.get(1).copied().unwrap_or(V::I32(0)),
+            );
+            Some(Some(args[0]))
+        }
+        "setAudioFormat" => {
+            pseudo_set(
+                vm,
+                this,
+                P_TARGET,
+                args.get(1).copied().unwrap_or(V::Ref(0)),
+            );
+            if let Some(&V::Ref(fh)) = args.get(1) {
+                copy_audio_fields(vm, fh, this);
+            }
+            Some(Some(args[0]))
+        }
+        "setBufferSizeInBytes" => {
+            pseudo_set(
+                vm,
+                this,
+                P_AUDIO_BUFFER_SIZE,
+                args.get(1).copied().unwrap_or(V::I32(0)),
+            );
+            Some(Some(args[0]))
+        }
+        "setSessionId" => {
+            pseudo_set(
+                vm,
+                this,
+                P_AUDIO_SESSION,
+                args.get(1).copied().unwrap_or(V::I32(0)),
+            );
+            Some(Some(args[0]))
+        }
+        "setTransferMode" => {
+            pseudo_set(
+                vm,
+                this,
+                P_AUDIO_TRANSFER,
+                args.get(1).copied().unwrap_or(V::I32(0)),
+            );
+            Some(Some(args[0]))
+        }
+        "setAudioAttributes" | "setOffloadedPlayback" | "setPerformanceMode" => Some(Some(args[0])),
+        "setWillPauseWhenDucked" | "setAcceptsDelayedFocusGain" => Some(Some(args[0])),
+        "setOnAudioFocusChangeListener" => Some(Some(args[0])),
+        "build" if class == "Landroid/media/AudioFocusRequest$Builder;" => Some(Some(host(
+            vm,
+            "Landroid/media/AudioFocusRequest;",
+            HostState::Empty,
+        ))),
+        "requestAudioFocus" | "abandonAudioFocusRequest" | "abandonAudioFocus" => {
+            Some(Some(V::I32(1)))
+        }
+        "generateAudioSessionId" => Some(Some(V::I32(1))),
+        // There is no video decoder in the runtime. In particular an
+        // audio-only file must not produce a typed placeholder Bitmap:
+        // Glide treats that as a successful video frame and displays
+        // whatever bytes the placeholder pipeline later accumulates.
+        "getFrameAtTime" | "getScaledFrameAtTime" | "getFrameAtIndex"
+            if class == "Landroid/media/MediaMetadataRetriever;" =>
+        {
+            Some(Some(V::Ref(0)))
+        }
+        "getEmbeddedPicture" if class == "Landroid/media/MediaMetadataRetriever;" => {
+            Some(Some(V::Ref(0)))
+        }
+        "build" if class == "Landroid/media/AudioFormat$Builder;" => {
+            let v = host(vm, "Landroid/media/AudioFormat;", HostState::Empty);
+            if let V::Ref(fh) = v {
+                copy_audio_fields(vm, this, fh);
+            }
+            Some(Some(v))
+        }
+        "build" if class == "Landroid/media/AudioTrack$Builder;" => {
+            Some(Some(mint_audio_track(vm, this)))
+        }
+        "build" if class == "Landroid/media/session/PlaybackState$Builder;" => Some(Some(
+            playback_state_copy(vm, this, "Landroid/media/session/PlaybackState;"),
+        )),
+        "build" if class == "Landroid/media/session/PlaybackState$CustomAction$Builder;" => {
+            Some(Some(playback_state_copy(
+                vm,
+                this,
+                "Landroid/media/session/PlaybackState$CustomAction;",
+            )))
+        }
+        "setState" if class == "Landroid/media/session/PlaybackState$Builder;" => {
+            pseudo_set(
+                vm,
+                this,
+                P_PLAY_STATE,
+                args.get(1).copied().unwrap_or(V::I32(0)),
+            );
+            pseudo_set(
+                vm,
+                this,
+                P_PLAY_POSITION,
+                args.get(2).copied().unwrap_or(V::I64(0)),
+            );
+            pseudo_set(
+                vm,
+                this,
+                P_PLAY_SPEED,
+                args.get(3).copied().unwrap_or(V::F32(1.0)),
+            );
+            Some(Some(args[0]))
+        }
+        "setActions" => {
+            pseudo_set(
+                vm,
+                this,
+                P_PLAY_ACTIONS,
+                args.get(1).copied().unwrap_or(V::I64(0)),
+            );
+            Some(Some(args[0]))
+        }
+        "setBufferedPosition"
+        | "setActiveQueueItemId"
+        | "setErrorMessage"
+        | "setExtras"
+        | "addCustomAction" => Some(Some(args[0])),
+        "getMinBufferSize" => {
+            // Static overload: (sampleRate, channelMask, encoding).
+            let rate = args.first().map(|v| i64v(*v)).unwrap_or(8000).max(1);
+            let mask = args.get(1).map(|v| i64v(*v)).unwrap_or(4);
+            let channels = mask.count_ones().max(1) as i64;
+            Some(Some(V::I32((rate * channels).max(2048) as i32)))
+        }
+        "getState" if class == "Landroid/media/AudioTrack;" => Some(Some(V::I32(1))),
+        "getPlayState" => Some(Some(V::I32(
+            if pseudo_i64(vm, this, P_AUDIO_PLAYING) != 0 {
+                3
+            } else {
+                2
+            },
+        ))),
+        "play" => {
+            if crate::dbg_flag("AUDIODBG") {
+                eprintln!(
+                    "[audio] play rate={} written={}",
+                    pseudo_i64(vm, this, P_AUDIO_SAMPLE_RATE),
+                    pseudo_i64(vm, this, P_AUDIO_WRITTEN)
+                );
+            }
+            if pseudo_i64(vm, this, P_AUDIO_PLAYING) == 0 {
+                pseudo_set(vm, this, P_AUDIO_PLAYING, V::I32(1));
+                pseudo_set(vm, this, P_AUDIO_START_MS, V::I64(now_ms()));
+            }
+            Some(None)
+        }
+        "pause" | "stop" | "flush" => {
+            if name != "flush" {
+                audio_update_consumed(vm, this);
+                pseudo_set(vm, this, P_AUDIO_PLAYING, V::I32(0));
+            } else {
+                pseudo_set(vm, this, P_AUDIO_CONSUMED_BASE, V::I64(0));
+                pseudo_set(vm, this, P_AUDIO_WRITTEN, V::I64(0));
+            }
+            Some(None)
+        }
+        "release" => {
+            audio_update_consumed(vm, this);
+            pseudo_set(vm, this, P_AUDIO_PLAYING, V::I32(0));
+            Some(None)
+        }
+        "write" => {
+            let requested = if matches!(args.get(1), Some(V::Ref(h)) if matches!(vm.heap.get(*h), Some(Obj::Array { .. }))) {
+                args.get(3).map(|v| i64v(*v)).unwrap_or(0)
+            } else {
+                args.get(2).map(|v| i64v(*v)).unwrap_or(0)
+            }
+            .max(0);
+            let byte_buffer = matches!(args.get(1), Some(V::Ref(h)) if matches!(vm.heap.get(*h), Some(Obj::Host { .. })));
+            let nonblocking = byte_buffer && args.get(3).map(|v| i32v(*v)) == Some(1);
+            let mut written = pseudo_i64(vm, this, P_AUDIO_WRITTEN);
+            let capacity = pseudo_i64(vm, this, P_AUDIO_BUFFER_SIZE).max(0);
+            let worker = vm.cur_thread != 0 && vm.cur_thread != vm.main_thread_h;
+            let mut accepted = 0i64;
+            while accepted < requested {
+                audio_update_consumed(vm, this);
+                written = pseudo_i64(vm, this, P_AUDIO_WRITTEN);
+                let consumed = pseudo_i64(vm, this, P_AUDIO_CONSUMED_BASE);
+                let available = (capacity - (written - consumed).max(0)).max(0);
+                let n = (requested - accepted).min(available);
+                if n > 0 {
+                    written += n;
+                    accepted += n;
+                    pseudo_set(vm, this, P_AUDIO_WRITTEN, V::I64(written));
+                    if let Some(&V::Ref(bh)) = args.get(1) {
+                        if matches!(vm.heap.get(bh), Some(Obj::Host { .. })) {
+                            let pos =
+                                i32v(pseudo_get(vm, bh, P_BBUF_POS).unwrap_or(V::I32(0))).max(0);
+                            let lim = pseudo_get(vm, bh, P_BBUF_LIM)
+                                .map(|v| i32v(v).max(0))
+                                .unwrap_or(i32::MAX);
+                            pseudo_set(vm, bh, P_BBUF_POS, V::I32((pos + n as i32).min(lim)));
+                        }
+                    }
+                    continue;
+                }
+                if !worker || nonblocking {
+                    break;
+                }
+                // A stream-mode AudioTrack write blocks until playback
+                // consumes enough buffered bytes. Keep the dex stack intact
+                // and interleave queued work in small slices; unwinding here
+                // re-runs the renderer from its top and multiplies every
+                // allocation in the media pipeline.
+                let wait_started = super::now_ms() as u64;
+                loop {
+                    let playing = pseudo_i64(vm, this, P_AUDIO_PLAYING) != 0;
+                    let paused_out = !playing && super::now_ms() as u64 - wait_started >= 10;
+                    if paused_out {
+                        break;
+                    }
+                    match vm.park_drain_within(10) {
+                        Ok(()) => {}
+                        Err(crate::E::Vm(e)) if e.cause() == "ovelo.park" => {
+                            std::thread::sleep(std::time::Duration::from_millis(1));
+                        }
+                        Err(e) => return Err(e),
+                    }
+                    audio_update_consumed(vm, this);
+                    written = pseudo_i64(vm, this, P_AUDIO_WRITTEN);
+                    let consumed = pseudo_i64(vm, this, P_AUDIO_CONSUMED_BASE);
+                    if capacity - (written - consumed).max(0) > 0 {
+                        break;
+                    }
+                }
+                audio_update_consumed(vm, this);
+                written = pseudo_i64(vm, this, P_AUDIO_WRITTEN);
+                let consumed = pseudo_i64(vm, this, P_AUDIO_CONSUMED_BASE);
+                if capacity - (written - consumed).max(0) <= 0 {
+                    break;
+                }
+            }
+            if crate::dbg_flag("AUDIODBG") {
+                eprintln!(
+                    "[audio] write requested={} accepted={} total={} capacity={} consumed={} playing={}",
+                    requested,
+                    accepted,
+                    written,
+                    capacity,
+                    pseudo_i64(vm, this, P_AUDIO_CONSUMED_BASE),
+                    pseudo_i64(vm, this, P_AUDIO_PLAYING)
+                );
+            }
+            Some(Some(V::I32(accepted as i32)))
+        }
+        "getPlaybackHeadPosition" => {
+            let frame = audio_frame_size(vm, this).max(1);
+            audio_update_consumed(vm, this);
+            let consumed_frames = pseudo_i64(vm, this, P_AUDIO_CONSUMED_BASE) / frame;
+            let out = (consumed_frames & 0xffff_ffff) as i32;
+            if crate::dbg_flag("AUDIODBG") {
+                eprintln!(
+                    "[audio] head={} consumed_frames={} playing={}",
+                    out,
+                    consumed_frames,
+                    pseudo_i64(vm, this, P_AUDIO_PLAYING)
+                );
+            }
+            Some(Some(V::I32(out)))
+        }
+        "getSampleRate" => Some(Some(V::I32(
+            pseudo_i64(vm, this, P_AUDIO_SAMPLE_RATE).max(0) as i32,
+        ))),
+        "getChannelConfiguration" | "getChannelMask" => Some(Some(V::I32(
+            pseudo_i64(vm, this, P_AUDIO_CHANNEL_MASK).max(0) as i32,
+        ))),
+        "getEncoding" => Some(Some(V::I32(
+            pseudo_i64(vm, this, P_AUDIO_ENCODING).max(0) as i32
+        ))),
+        "getBufferSizeInFrames" => {
+            let frame = audio_frame_size(vm, this).max(1);
+            Some(Some(V::I32(
+                (pseudo_i64(vm, this, P_AUDIO_BUFFER_SIZE) / frame).max(0) as i32,
+            )))
+        }
+        "getBufferSizeInBytes" => Some(Some(V::I32(
+            pseudo_i64(vm, this, P_AUDIO_BUFFER_SIZE).max(0) as i32,
+        ))),
+        "getAudioSessionId" => Some(Some(V::I32(
+            pseudo_i64(vm, this, P_AUDIO_SESSION).max(0) as i32
+        ))),
+        "getState" if class == "Landroid/media/session/PlaybackState;" => {
+            Some(Some(V::I32(pseudo_i64(vm, this, P_PLAY_STATE) as i32)))
+        }
+        "getPosition" => Some(Some(V::I64(pseudo_i64(vm, this, P_PLAY_POSITION)))),
+        "getPlaybackSpeed" => Some(Some(V::F32(
+            pseudo_get(vm, this, P_PLAY_SPEED).map(f64v).unwrap_or(1.0) as f32,
+        ))),
+        "getActions" => Some(Some(V::I64(pseudo_i64(vm, this, P_PLAY_ACTIONS)))),
+        "setVolume"
+        | "setStereoVolume"
+        | "setPlaybackParams"
+        | "setPlaybackPositionUpdateListener"
+        | "setPositionNotificationPeriod"
+        | "setNotificationMarkerPosition"
+        | "registerStreamEventCallback"
+        | "unregisterStreamEventCallback"
+        | "addOnCodecConfigChangedListener"
+        | "removeOnCodecConfigChangedListener" => {
+            if name == "setVolume" || name == "setStereoVolume" {
+                Some(Some(V::I32(0)))
+            } else {
+                Some(None)
+            }
+        }
+        "getUnderrunCount" | "getPositionNotificationPeriod" | "getNotificationMarkerPosition" => {
+            Some(Some(V::I32(0)))
+        }
+        "getTimestamp" => Some(Some(V::I32(0))),
+        "getAudioFormat" => Some(Some(pseudo_get(vm, this, P_TARGET).unwrap_or(V::Ref(0)))),
+        _ => None,
+    })
+}
+
+fn mint_notification(vm: &mut Vm) -> V {
+    let notification = host(vm, "Landroid/app/Notification;", HostState::Empty);
+    if let V::Ref(nh) = notification {
+        let extras = vm.alloc_host("Landroid/os/Bundle;", HostState::Map(Vec::new()));
+        pseudo_set(vm, nh, P_DATA, V::Ref(extras));
+    }
+    notification
+}
+
+fn notification_target(vm: &mut Vm, builder: V) -> V {
+    if let V::Ref(bh) = builder {
+        if let Some(v) = pseudo_get(vm, bh, P_TARGET) {
+            if !matches!(v, V::Ref(0) | V::I32(0)) {
+                return v;
+            }
+        }
+        let notification = mint_notification(vm);
+        pseudo_set(vm, bh, P_TARGET, notification);
+        notification
+    } else {
+        V::Ref(0)
+    }
+}
+
+fn notification_call(vm: &mut Vm, class: &str, name: &str, args: &[V]) -> Option<Option<V>> {
+    match name {
+        "<init>" => {
+            if class == "Landroid/app/Notification;" {
+                if let Some(V::Ref(nh)) = args.first() {
+                    let extras = vm.alloc_host("Landroid/os/Bundle;", HostState::Map(Vec::new()));
+                    pseudo_set(vm, *nh, P_DATA, V::Ref(extras));
+                }
+            } else if class == "Landroid/app/Notification$Builder;" {
+                let notification = mint_notification(vm);
+                if let Some(V::Ref(bh)) = args.first() {
+                    pseudo_set(vm, *bh, P_TARGET, notification);
+                }
+            }
+            Some(None)
+        }
+        "build" => {
+            let notification = notification_target(vm, args[0]);
+            Some(Some(notification))
+        }
+        "getExtras" => {
+            let extras = match args.first().copied() {
+                Some(V::Ref(h)) => pseudo_get(vm, h, P_DATA).unwrap_or(V::Ref(0)),
+                _ => V::Ref(0),
+            };
+            Some(Some(extras))
+        }
+        "setExtras" | "addExtras" => {
+            if class == "Landroid/app/Notification$Builder;" {
+                let notification = notification_target(vm, args[0]);
+                if let (V::Ref(nh), Some(&V::Ref(sh))) = (notification, args.get(1)) {
+                    if let Some(V::Ref(extras)) = pseudo_get(vm, nh, P_DATA) {
+                        let pairs = match vm.heap.get(sh) {
+                            Some(Obj::Host {
+                                state: HostState::Map(m),
+                                ..
+                            }) => m.clone(),
+                            _ => vec![],
+                        };
+                        for (k, v) in pairs {
+                            map_put(vm, extras, k, v);
+                        }
+                    }
+                }
+            }
+            Some(Some(args[0]))
+        }
+        "setMediaSession"
+        | "setShowActionsInCompactView"
+        | "setStyle"
+        | "setContentTitle"
+        | "setContentText"
+        | "setSubText"
+        | "setContentInfo"
+        | "setTicker"
+        | "setSmallIcon"
+        | "setLargeIcon"
+        | "setContentIntent"
+        | "setDeleteIntent"
+        | "setFullScreenIntent"
+        | "setWhen"
+        | "setShowWhen"
+        | "setUsesChronometer"
+        | "setOngoing"
+        | "setOnlyAlertOnce"
+        | "setAutoCancel"
+        | "setLocalOnly"
+        | "setCategory"
+        | "setPriority"
+        | "setVisibility"
+        | "setColor"
+        | "setColorized"
+        | "setChannelId"
+        | "setShortcutId"
+        | "setTimeoutAfter"
+        | "setGroup"
+        | "setGroupSummary"
+        | "setGroupAlertBehavior"
+        | "setSound"
+        | "setDefaults"
+        | "setLights"
+        | "setVibrate"
+        | "setAllowSystemGeneratedContextualActions"
+        | "setBubbleMetadata"
+        | "setForegroundServiceBehavior"
+        | "setNumber"
+        | "setBadgeIconType"
+        | "setProgress"
+        | "addAction"
+        | "extend" => Some(Some(args[0])),
+        _ => None,
+    }
+}
 
 fn log_call(vm: &mut Vm, name: &str, args: &[V]) -> Option<Option<V>> {
     match name {
@@ -1581,6 +3605,193 @@ fn uri_call(vm: &mut Vm, name: &str, args: &[V]) -> Rt<Option<Option<V>>> {
 // ---------------------------------------------------------------------
 // Intent — map + pseudo fields for action/data/component
 
+fn intent_map_handle(vm: &mut Vm, h: u32) -> Option<u32> {
+    match vm.heap.get(h) {
+        Some(Obj::Host {
+            state: HostState::Map(_),
+            ..
+        }) => Some(h),
+        Some(Obj::Instance { .. }) => {
+            if let Some(V::Ref(bh)) = pseudo_get(vm, h, P_MAP_BACKING) {
+                if matches!(
+                    vm.heap.get(bh),
+                    Some(Obj::Host {
+                        state: HostState::Map(_),
+                        ..
+                    })
+                ) {
+                    return Some(bh);
+                }
+            }
+            let bh = vm.alloc_host("Landroid/os/Bundle;", HostState::Map(Vec::new()));
+            pseudo_set(vm, h, P_MAP_BACKING, V::Ref(bh));
+            Some(bh)
+        }
+        _ => None,
+    }
+}
+
+fn intent_map_pairs(vm: &mut Vm, h: u32) -> Vec<(V, V)> {
+    match intent_map_handle(vm, h).and_then(|mh| vm.heap.get(mh)) {
+        Some(Obj::Host {
+            state: HostState::Map(m),
+            ..
+        }) => m.clone(),
+        _ => Vec::new(),
+    }
+}
+
+fn intent_map_put(vm: &mut Vm, h: u32, k: V, v: V) {
+    if let Some(mh) = intent_map_handle(vm, h) {
+        map_put(vm, mh, k, v);
+    }
+}
+
+fn intent_map_get(vm: &mut Vm, h: u32, k: V) -> Option<V> {
+    intent_map_handle(vm, h).and_then(|mh| map_get(vm, mh, k))
+}
+
+fn intent_map_remove(vm: &mut Vm, h: u32, k: V) {
+    if let Some(mh) = intent_map_handle(vm, h) {
+        map_remove(vm, mh, k);
+    }
+}
+
+fn clone_intent(vm: &mut Vm, h: u32) -> V {
+    let m = intent_map_pairs(vm, h);
+    let nh = vm.alloc_host("Landroid/content/Intent;", HostState::Map(m));
+    for k in [P_ACTION, P_DATA, P_TYPE, P_PACKAGE, P_FLAGS, P_COMPONENT] {
+        if let Some(v) = pseudo_get(vm, h, k) {
+            pseudo_set(vm, nh, k, v);
+        }
+    }
+    V::Ref(nh)
+}
+
+fn intent_field_eq(vm: &Vm, a: V, b: V) -> bool {
+    if a == b {
+        return true;
+    }
+    match (a, b) {
+        (V::Ref(x), V::Ref(y)) if x != 0 && y != 0 => {
+            match (sv(vm, V::Ref(x)), sv(vm, V::Ref(y))) {
+                (Some(xs), Some(ys)) => xs == ys,
+                _ => false,
+            }
+        }
+        _ => false,
+    }
+}
+
+fn component_class_key(vm: &Vm, v: V) -> Option<String> {
+    let V::Ref(h) = v else { return None };
+    if h == 0 {
+        return None;
+    }
+    let d = pseudo_get(vm, h, P_DATA)
+        .and_then(|v| sv(vm, v))
+        .or_else(|| vm.class_descriptor_of(h))
+        .or_else(|| sv(vm, V::Ref(h)))?;
+    Some(if d.starts_with('L') && d.ends_with(';') {
+        d
+    } else {
+        format!("L{};", d.replace('.', "/"))
+    })
+}
+
+/// The intent identity Android uses for bind/rebind matching: action,
+/// data, type, package and component — not flags or extras.
+fn intents_match(vm: &Vm, a: u32, b: u32) -> bool {
+    [P_ACTION, P_DATA, P_TYPE, P_PACKAGE].iter().all(|&k| {
+        intent_field_eq(
+            vm,
+            pseudo_get(vm, a, k).unwrap_or(V::Ref(0)),
+            pseudo_get(vm, b, k).unwrap_or(V::Ref(0)),
+        )
+    }) && component_class_key(vm, pseudo_get(vm, a, P_COMPONENT).unwrap_or(V::Ref(0)))
+        == component_class_key(vm, pseudo_get(vm, b, P_COMPONENT).unwrap_or(V::Ref(0)))
+}
+
+fn mime_matches(pattern: &str, actual: &str) -> bool {
+    if pattern == "*" || actual == "*/*" || pattern == "*/*" {
+        return true;
+    }
+    let Some((pt, ps)) = pattern.split_once('/') else {
+        return false;
+    };
+    let Some((at, asub)) = actual.split_once('/') else {
+        return false;
+    };
+    pt.eq_ignore_ascii_case(at) && (ps == "*" || asub == "*" || ps.eq_ignore_ascii_case(asub))
+}
+
+fn uri_scheme(uri: &str) -> &str {
+    let Some(colon) = uri.find(':') else {
+        return "";
+    };
+    if uri[..colon].contains(['/', '?', '#']) {
+        ""
+    } else {
+        &uri[..colon]
+    }
+}
+
+/// Resolve an implicit activity Intent against the manifest filters the
+/// launcher installed on the VM. This intentionally implements the
+/// small Android data test most apps rely on: action + DEFAULT category
+/// plus MIME wildcards and an optional scheme constraint.
+fn resolve_implicit_activity(vm: &mut Vm, ih: u32) -> Option<String> {
+    let action = pseudo_get(vm, ih, P_ACTION).and_then(|v| sv(vm, v))?;
+    if action.is_empty() {
+        return None;
+    }
+    let mime = pseudo_get(vm, ih, P_TYPE)
+        .and_then(|v| sv(vm, v))
+        .unwrap_or_default();
+    let data = pseudo_get(vm, ih, P_DATA)
+        .and_then(|v| sv(vm, v))
+        .unwrap_or_default();
+    let scheme = uri_scheme(&data).to_string();
+    if let Some(package) = pseudo_get(vm, ih, P_PACKAGE).and_then(|v| sv(vm, v)) {
+        if !package.is_empty() && vm.guest_package.as_deref() != Some(package.as_str()) {
+            return None;
+        }
+    }
+    vm.activity_intent_filters.iter().find_map(|filter| {
+        if !filter.actions.iter().any(|a| a == &action) {
+            return None;
+        }
+        if !filter
+            .categories
+            .iter()
+            .any(|c| c == "android.intent.category.DEFAULT")
+        {
+            return None;
+        }
+        if filter.schemes.is_empty() {
+            if filter.mime_types.is_empty() {
+                if !data.is_empty() || !mime.is_empty() {
+                    return None;
+                }
+            } else if !matches!(scheme.as_str(), "" | "content" | "file") {
+                return None;
+            }
+        } else if scheme.is_empty() || !filter.schemes.iter().any(|s| s == &scheme) {
+            return None;
+        }
+        let mime_ok = if mime.is_empty() {
+            filter.mime_types.is_empty()
+        } else {
+            filter.mime_types.iter().any(|m| mime_matches(m, &mime))
+        };
+        if !mime_ok {
+            return None;
+        }
+        let activity = filter.activity.replace('.', "/");
+        Some(format!("L{activity};"))
+    })
+}
+
 fn intent_call(vm: &mut Vm, name: &str, sig: &str, args: &[V]) -> Rt<Option<Option<V>>> {
     let V::Ref(h) = args.first().copied().unwrap_or(V::Ref(0)) else {
         return Ok(None);
@@ -1592,7 +3803,15 @@ fn intent_call(vm: &mut Vm, name: &str, sig: &str, args: &[V]) -> Rt<Option<Opti
             // the *Context* — the component is the Class arg.
             if let Some(a) = args.get(1) {
                 match sv(vm, *a) {
-                    Some(_) => pseudo_set(vm, h, P_ACTION, *a),
+                    Some(_) => {
+                        pseudo_set(vm, h, P_ACTION, *a);
+                        if let Some(uri) = args.get(2).copied().filter(|v| *v != V::Ref(0)) {
+                            pseudo_set(vm, h, P_DATA, uri);
+                        }
+                        if args.len() > 4 {
+                            pseudo_set(vm, h, P_COMPONENT, args[4]);
+                        }
+                    }
                     None => {
                         let target = args.get(2).copied().unwrap_or(*a);
                         pseudo_set(vm, h, P_COMPONENT, target);
@@ -1606,16 +3825,29 @@ fn intent_call(vm: &mut Vm, name: &str, sig: &str, args: &[V]) -> Rt<Option<Opti
             Some(Some(args[0]))
         }
         "getAction" => Some(Some(pseudo_get(vm, h, P_ACTION).unwrap_or(V::Ref(0)))),
-        "setData" | "setDataAndType" | "setDataAndNormalize" => {
+        "setData" | "setDataAndNormalize" => {
             pseudo_set(vm, h, P_DATA, args[1]);
+            pseudo_set(vm, h, P_TYPE, V::Ref(0));
             Some(Some(args[0]))
         }
-        "getData" | "getDataString" => Some(Some(pseudo_get(vm, h, P_DATA).unwrap_or(V::Ref(0)))),
+        "setDataAndType" | "setDataAndTypeAndNormalize" => {
+            pseudo_set(vm, h, P_DATA, args[1]);
+            pseudo_set(vm, h, P_TYPE, args.get(2).copied().unwrap_or(V::Ref(0)));
+            Some(Some(args[0]))
+        }
+        "getData" => Some(Some(pseudo_get(vm, h, P_DATA).unwrap_or(V::Ref(0)))),
+        "getDataString" => Some(Some(
+            pseudo_get(vm, h, P_DATA)
+                .and_then(|v| sv(vm, v))
+                .map(|s| jdynstr(vm, &s))
+                .unwrap_or(V::Ref(0)),
+        )),
         "setType" => {
-            pseudo_set(vm, h, P_FLAGS, args[1]);
+            pseudo_set(vm, h, P_TYPE, args[1]);
+            pseudo_set(vm, h, P_DATA, V::Ref(0));
             Some(Some(args[0]))
         }
-        "getType" => Some(Some(pseudo_get(vm, h, P_FLAGS).unwrap_or(V::Ref(0)))),
+        "getType" => Some(Some(pseudo_get(vm, h, P_TYPE).unwrap_or(V::Ref(0)))),
         "setComponent" => {
             pseudo_set(vm, h, P_COMPONENT, args[1]);
             Some(Some(args[0]))
@@ -1627,13 +3859,25 @@ fn intent_call(vm: &mut Vm, name: &str, sig: &str, args: &[V]) -> Rt<Option<Opti
             Some(Some(args[0]))
         }
         "getComponent" => Some(Some(pseudo_get(vm, h, P_COMPONENT).unwrap_or(V::Ref(0)))),
-        "setPackage" | "addCategory" | "removeCategory" | "addFlags" | "setFlags"
-        | "setSelector" | "setClipData" | "setSourceBounds" | "setIdentifier" => {
+        "addFlags" => {
+            let cur = pseudo_get(vm, h, P_FLAGS).map(i32v).unwrap_or(0);
+            pseudo_set(vm, h, P_FLAGS, V::I32(cur | i32v(args[1])));
             Some(Some(args[0]))
         }
+        "setFlags" => {
+            pseudo_set(vm, h, P_FLAGS, V::I32(i32v(args[1])));
+            Some(Some(args[0]))
+        }
+        "setPackage" => {
+            pseudo_set(vm, h, P_PACKAGE, args[1]);
+            Some(Some(args[0]))
+        }
+        "addCategory" | "removeCategory" | "setSelector" | "setClipData" | "setSourceBounds"
+        | "setIdentifier" => Some(Some(args[0])),
         "getPackage" | "getCategories" | "getFlags" | "getSelector" | "getClipData"
         | "getSourceBounds" | "getIdentifier" => Some(Some(match name {
-            "getFlags" => V::I32(0),
+            "getPackage" => pseudo_get(vm, h, P_PACKAGE).unwrap_or(V::Ref(0)),
+            "getFlags" => pseudo_get(vm, h, P_FLAGS).unwrap_or(V::I32(0)),
             "getCategories" => {
                 return Ok(Some(Some(host(
                     vm,
@@ -1648,17 +3892,17 @@ fn intent_call(vm: &mut Vm, name: &str, sig: &str, args: &[V]) -> Rt<Option<Opti
         | "putStringArrayListExtra"
         | "putIntegerArrayListExtra"
         | "putParcelableArrayListExtra" => {
-            map_put(vm, h, args[1], args[2]);
+            intent_map_put(vm, h, args[1], args[2]);
             Some(Some(args[0]))
         }
         "getStringExtra"
         | "getCharSequenceExtra"
         | "getSerializableExtra"
         | "getParcelableExtra"
-        | "getBundleExtra" => Some(Some(map_get(vm, h, args[1]).unwrap_or(V::Ref(0)))),
+        | "getBundleExtra" => Some(Some(intent_map_get(vm, h, args[1]).unwrap_or(V::Ref(0)))),
         n if n.starts_with("get") && n.ends_with("Extra") => {
             // getIntExtra/getBooleanExtra/…: map get with default arg
-            let v = map_get(vm, h, args[1])
+            let v = intent_map_get(vm, h, args[1])
                 .or_else(|| args.get(2).copied())
                 .unwrap_or(V::I32(0));
             Some(Some(match v {
@@ -1668,11 +3912,11 @@ fn intent_call(vm: &mut Vm, name: &str, sig: &str, args: &[V]) -> Rt<Option<Opti
             }))
         }
         "hasExtra" => {
-            let c = map_get(vm, h, args[1]).is_some();
+            let c = intent_map_get(vm, h, args[1]).is_some();
             Some(Some(V::I32(c as i32)))
         }
         "removeExtra" => {
-            map_remove(vm, h, args[1]);
+            intent_map_remove(vm, h, args[1]);
             Some(None)
         }
         "replaceExtras" => Some(Some(args[0])),
@@ -1680,13 +3924,7 @@ fn intent_call(vm: &mut Vm, name: &str, sig: &str, args: &[V]) -> Rt<Option<Opti
             // AOSP returns the Bundle (or null), never the Intent —
             // `createSavedStateHandle` check-casts the result to
             // Bundle, so an Intent here throws ClassCastException.
-            let m = match vm.heap.get(h) {
-                Some(Obj::Host {
-                    state: HostState::Map(m),
-                    ..
-                }) => m.clone(),
-                _ => vec![],
-            };
+            let m = intent_map_pairs(vm, h);
             if m.is_empty() {
                 Some(Some(V::Ref(0)))
             } else {
@@ -1704,54 +3942,39 @@ fn intent_call(vm: &mut Vm, name: &str, sig: &str, args: &[V]) -> Rt<Option<Opti
                     _ => vec![],
                 };
                 for (k, v) in pairs {
-                    map_put(vm, h, k, v);
+                    intent_map_put(vm, h, k, v);
                 }
             }
             Some(Some(args[0]))
         }
-        "clone" => {
-            let m: Vec<(V, V)> = match vm.heap.get(h) {
-                Some(Obj::Host {
-                    state: HostState::Map(m),
-                    ..
-                }) => m.clone(),
-                _ => vec![],
-            };
-            let nh = vm.alloc_host("Landroid/content/Intent;", HostState::Map(m));
-            for k in [P_ACTION, P_DATA, P_FLAGS, P_COMPONENT] {
-                if let Some(v) = pseudo_get(vm, h, k) {
-                    pseudo_set(vm, nh, k, v);
-                }
-            }
-            Some(Some(V::Ref(nh)))
-        }
+        "clone" => Some(Some(clone_intent(vm, h))),
         "fillIn" | "filterEquals" | "filterHashCode" => Some(Some(V::I32(0))),
         "toUri" | "toInsecureString" | "toShortString" => Some(Some(jstr(vm, ""))),
         "getIntExtra" => Some(Some(
-            map_get(vm, h, args[1])
+            intent_map_get(vm, h, args[1])
                 .map(|v| V::I32(i32v(v)))
                 .or_else(|| args.get(2).copied())
                 .unwrap_or(V::I32(0)),
         )),
         "getLongExtra" => Some(Some(
-            map_get(vm, h, args[1])
+            intent_map_get(vm, h, args[1])
                 .map(|v| V::I64(i64v(v)))
                 .or_else(|| args.get(2).copied())
                 .unwrap_or(V::I64(0)),
         )),
         "getBooleanExtra" => Some(Some(
-            map_get(vm, h, args[1])
+            intent_map_get(vm, h, args[1])
                 .map(|v| V::I32((i32v(v) != 0) as i32))
                 .or_else(|| args.get(2).copied())
                 .unwrap_or(V::I32(0)),
         )),
         "getFloatExtra" => Some(Some(V::F32(f64v(
-            map_get(vm, h, args[1])
+            intent_map_get(vm, h, args[1])
                 .or_else(|| args.get(2).copied())
                 .unwrap_or(V::F32(0.0)),
         ) as f32))),
         "getDoubleExtra" => Some(Some(V::F64(f64v(
-            map_get(vm, h, args[1])
+            intent_map_get(vm, h, args[1])
                 .or_else(|| args.get(2).copied())
                 .unwrap_or(V::F64(0.0)),
         )))),
@@ -1822,6 +4045,14 @@ fn dialog_call(vm: &mut Vm, name: &str, args: &[V]) -> Rt<Option<Option<V>>> {
             Some(V::Ref(hit))
         }
         "isShowing" | "isCancelable" => Some(V::I32(1)),
+        "getButton" => {
+            let this = match args.first() {
+                Some(V::Ref(h)) => *h,
+                _ => 0,
+            };
+            let which = i32v(args.get(1).copied().unwrap_or(V::I32(0)));
+            Some(V::Ref(view::dialog_button_ref(vm, this, which)))
+        }
         "show" => {
             if let Some(V::Ref(this)) = args.first().copied() {
                 view::dialog_show(vm, this);
@@ -1870,8 +4101,18 @@ fn dialog_call(vm: &mut Vm, name: &str, args: &[V]) -> Rt<Option<Option<V>>> {
     }))
 }
 
+/// JobInfo uses content-triggered scheduling. Unlike latency/expedited
+/// jobs, these must not fire merely because they were scheduled.
+const P_JOB_CONTENT_TRIGGER: u32 = u32::MAX - 602;
+
 fn copy_job_fields(vm: &mut Vm, from: u32, to: u32) {
-    for k in [P_COMPONENT, P_DATA, P_FLAGS, P_META as u32] {
+    for k in [
+        P_COMPONENT,
+        P_DATA,
+        P_FLAGS,
+        P_META as u32,
+        P_JOB_CONTENT_TRIGGER,
+    ] {
         if let Some(v) = pseudo_get(vm, from, k) {
             pseudo_set(vm, to, k, v);
         }
@@ -1919,9 +4160,11 @@ fn job_call(vm: &mut Vm, class: &str, name: &str, args: &[V]) -> Rt<Option<Optio
             copy_job_fields(vm, this, jh);
             Some(Some(V::Ref(jh)))
         }
-        ("Landroid/app/job/JobInfo$Builder;", n)
-            if n.starts_with("set") || n == "addTriggerContentUri" =>
-        {
+        ("Landroid/app/job/JobInfo$Builder;", "addTriggerContentUri") => {
+            pseudo_set(vm, this, P_JOB_CONTENT_TRIGGER, V::I32(1));
+            Some(Some(args[0]))
+        }
+        ("Landroid/app/job/JobInfo$Builder;", n) if n.starts_with("set") => {
             // Constraint details decide *when* AOSP runs the job; the
             // runtime's scheduler is best-effort and currently only needs
             // extras/component/identity preserved. Every builder setter
@@ -2008,6 +4251,11 @@ pub(crate) fn drain_jobs(vm: &mut Vm) {
         .partition(|(_, _, t)| *t <= now);
     vm.pending_jobs = later;
     for (jh, ch, _) in due {
+        // A content-triggered job is armed for future media changes; it
+        // is not runnable just because its latency (usually zero) is due.
+        if pseudo_get(vm, jh, P_JOB_CONTENT_TRIGGER).is_some() {
+            continue;
+        }
         let Some(desc) = job_service_desc(vm, ch) else {
             continue;
         };
@@ -2799,16 +5047,19 @@ fn context_call(
             }
         }
         "getSystemServiceName" => Some(Some(jstr(vm, "java.lang.Object"))),
-        "getFilesDir" => Some(Some(host(
-            vm,
-            "Ljava/io/File;",
-            HostState::Path("/data/local/ovelo/files".into()),
-        ))),
-        "getCacheDir" => Some(Some(host(
-            vm,
-            "Ljava/io/File;",
-            HostState::Path("/data/local/ovelo/cache".into()),
-        ))),
+        "getFilesDir" | "getCacheDir" => {
+            let logical = if name == "getFilesDir" {
+                "/data/local/ovelo/files"
+            } else {
+                "/data/local/ovelo/cache"
+            };
+            let _ = std::fs::create_dir_all(io::fspath(vm, logical));
+            Some(Some(host(
+                vm,
+                "Ljava/io/File;",
+                HostState::Path(logical.into()),
+            )))
+        }
         "getDatabasePath" => {
             let name = sv(vm, args.get(1).copied().unwrap_or(V::Ref(0)))
                 .unwrap_or_else(|| "db".to_string());
@@ -2883,8 +5134,9 @@ fn context_call(
             // Intent travels with the launch so the target's getIntent
             // sees the caller's extras/URI.
             if let Some(V::Ref(ih)) = args.get(1).copied() {
+                let mut desc = None;
                 if let Some(c) = pseudo_get(vm, ih, P_COMPONENT) {
-                    let desc = match c {
+                    desc = match c {
                         // A ComponentName carries the target class
                         // dotted in P_DATA; Class mirrors and bare
                         // class-name strings resolve through their
@@ -2902,9 +5154,36 @@ fn context_call(
                             }),
                         _ => None,
                     };
-                    if let Some(d) = desc {
-                        vm.pending_activity = Some((d, V::Ref(ih)));
-                    }
+                }
+                if desc.is_none() {
+                    desc = resolve_implicit_activity(vm, ih);
+                }
+                if let Some(d) = desc {
+                    let request = match name {
+                        "startActivityForResult" => args.get(2).map(|v| i32v(*v)),
+                        "startActivityFromChild" | "startActivityFromFragment" => {
+                            args.get(3).map(|v| i32v(*v))
+                        }
+                        _ => None,
+                    };
+                    vm.pending_activity_caller = request.and_then(|request_code| {
+                        (request_code >= 0).then(|| match args[0] {
+                            V::Ref(caller) => (caller, request_code),
+                            _ => (0, request_code),
+                        })
+                    });
+                    vm.pending_activity = Some((d, clone_intent(vm, ih)));
+                } else {
+                    // Android resolves the component before dispatch and
+                    // throws ActivityNotFoundException synchronously when
+                    // neither an explicit component nor any implicit
+                    // intent-filter matches. Apps use that signal to show
+                    // their "no app found" fallback; silently succeeding
+                    // hides the failure and leaves listeners looking dead.
+                    return Err(vm.throw_builtin(
+                        "Landroid/content/ActivityNotFoundException;",
+                        "No Activity found to handle Intent",
+                    ));
                 }
             }
             Some(Some(V::I32(0)))
@@ -2948,6 +5227,7 @@ fn context_call(
                         h
                     }
                 };
+                vm.service_started.insert(sh);
                 vm.service_seq += 1;
                 let sid = vm.service_seq;
                 vm.service_start_id.insert(sh, sid);
@@ -2974,10 +5254,14 @@ fn context_call(
             if args.len() > 1 && vm.service_start_id.get(&this).copied() != Some(i64v(args[1])) {
                 return Ok(Some(Some(V::I32(0))));
             }
+            let has_bindings = vm.service_bind_counts.get(&this).copied().unwrap_or(0) > 0;
             if vm.services.values().any(|sh| *sh == this) {
-                vm.services.retain(|_, sh| *sh != this);
+                vm.service_started.remove(&this);
                 vm.service_start_id.remove(&this);
-            } else {
+                if !has_bindings {
+                    vm.services.retain(|_, sh| *sh != this);
+                }
+            } else if !has_bindings {
                 // Self-stop before startService registered the handle
                 // (inside onCreate): the starter consults this set and
                 // skips insert/onStartCommand entirely.
@@ -2985,11 +5269,115 @@ fn context_call(
             }
             // Defer onDestroy to the drain loop: running it inline
             // tears the service down while its own onStartCommand (or
-            // the startService call) is still on the stack.
-            if !vm.pending_destroy.contains(&this) {
+            // the startService call) is still on the stack. Live bound
+            // clients keep the service up after the start request ends.
+            if !has_bindings && !vm.pending_destroy.contains(&this) {
                 vm.pending_destroy.push(this);
             }
             Some(Some(V::I32(1)))
+        }
+        "bindService" | "bindServiceAsUser" | "bindIsolatedService" => {
+            // Bind the live service through its real onBind path and
+            // deliver ServiceConnection.onServiceConnected. Media3's
+            // MediaController never becomes connected without this
+            // round trip, so playback actions queue forever.
+            let bound = (|| -> Option<()> {
+                let V::Ref(ih) = args.get(1).copied()? else {
+                    return None;
+                };
+                let V::Ref(ch) = pseudo_get(vm, ih, P_COMPONENT)? else {
+                    return None;
+                };
+                let desc = vm
+                    .class_descriptor_of(ch)
+                    .or_else(|| sv(vm, V::Ref(ch)))
+                    .or_else(|| pseudo_get(vm, ch, P_DATA).and_then(|v| sv(vm, v)))?;
+                let desc = if desc.starts_with('L') {
+                    desc
+                } else {
+                    format!("L{};", desc.replace('.', "/"))
+                };
+                let sh = match vm.services.get(&desc) {
+                    Some(&h) => h,
+                    None => {
+                        let h = vm.instantiate(&desc).ok()?;
+                        let _ = vm.call_virtual(h, "onCreate", &[]);
+                        if vm.service_stop_pending.remove(&h) {
+                            return None;
+                        }
+                        vm.services.insert(desc.clone(), h);
+                        h
+                    }
+                };
+                let conn = args.iter().skip(2).find_map(|v| match v {
+                    V::Ref(h)
+                        if *h != 0
+                            && vm.has_dex_virtual(
+                                *h,
+                                "onServiceConnected",
+                                &["Landroid/content/ComponentName;", "Landroid/os/IBinder;"],
+                            ) =>
+                    {
+                        Some(*h)
+                    }
+                    _ => None,
+                })?;
+                if !vm.service_bindings.contains_key(&conn) {
+                    vm.service_bindings.insert(conn, sh);
+                    *vm.service_bind_counts.entry(sh).or_insert(0) += 1;
+                    let bind_intent = clone_intent(vm, ih);
+                    vm.service_bind_intents.insert(conn, bind_intent);
+                }
+                let rebind_intent = match vm.service_rebind.get(&sh).copied() {
+                    Some(ri @ V::Ref(rh)) if intents_match(vm, rh, ih) => {
+                        vm.service_rebind.remove(&sh);
+                        Some(ri)
+                    }
+                    _ => None,
+                };
+                let binder = if let Some(rebind_intent) = rebind_intent {
+                    let _ = vm.call_virtual(sh, "onRebind", &[rebind_intent]);
+                    vm.service_binders.get(&sh).copied().unwrap_or(V::Ref(0))
+                } else {
+                    let bind_result = vm.call_virtual(sh, "onBind", &[V::Ref(ih)]);
+                    if crate::dbg_flag("OVELO_BINDDBG") {
+                        eprintln!("[binddbg] service={desc} h{sh} onBind={bind_result:?}");
+                    }
+                    let binder = bind_result.ok().flatten().unwrap_or(V::Ref(0));
+                    vm.service_binders.insert(sh, binder);
+                    binder
+                };
+                let component = if vm
+                    .class_descriptor_of(ch)
+                    .is_some_and(|d| d == "Landroid/content/ComponentName;")
+                {
+                    V::Ref(ch)
+                } else {
+                    let cn = host(vm, "Landroid/content/ComponentName;", HostState::Empty);
+                    if let V::Ref(cnh) = cn {
+                        let pkg = vm.guest_package.clone().unwrap_or_default();
+                        let cls = desc
+                            .trim_start_matches('L')
+                            .trim_end_matches(';')
+                            .replace('/', ".");
+                        let pv = jstr(vm, &pkg);
+                        let cv = jstr(vm, &cls);
+                        pseudo_set(vm, cnh, P_COMPONENT, pv);
+                        pseudo_set(vm, cnh, P_DATA, cv);
+                    }
+                    cn
+                };
+                let connected = if binder == V::Ref(0) {
+                    vm.call_virtual(conn, "onNullBinding", &[component])
+                } else {
+                    vm.call_virtual(conn, "onServiceConnected", &[component, binder])
+                };
+                if crate::dbg_flag("OVELO_BINDDBG") {
+                    eprintln!("[binddbg] conn=h{conn} binder={binder:?} connected={connected:?}");
+                }
+                Some(())
+            })();
+            Some(Some(V::I32(if bound.is_some() { 1 } else { 0 })))
         }
         "stopService" => {
             let desc = args
@@ -3011,20 +5399,51 @@ fn context_call(
                     }
                 });
             if let Some(desc) = desc {
-                if let Some(sh) = vm.services.remove(&desc) {
+                if let Some(&sh) = vm.services.get(&desc) {
+                    vm.service_started.remove(&sh);
                     vm.service_start_id.remove(&sh);
-                    // Same deferred-teardown rule as stopSelf: the
-                    // caller may be this service's own callback.
-                    if !vm.pending_destroy.contains(&sh) {
-                        vm.pending_destroy.push(sh);
+                    if vm.service_bind_counts.get(&sh).copied().unwrap_or(0) == 0 {
+                        vm.services.remove(&desc);
+                        // Same deferred-teardown rule as stopSelf: the
+                        // caller may be this service's own callback.
+                        if !vm.pending_destroy.contains(&sh) {
+                            vm.pending_destroy.push(sh);
+                        }
                     }
                 }
             }
             Some(Some(V::I32(1)))
         }
-        "bindService"
-        | "unbindService"
-        | "sendBroadcast"
+        "unbindService" => {
+            if let Some(V::Ref(conn)) = args.get(1).copied() {
+                if let Some(sh) = vm.service_bindings.remove(&conn) {
+                    let intent = vm.service_bind_intents.remove(&conn).unwrap_or(V::Ref(0));
+                    let remaining = vm
+                        .service_bind_counts
+                        .get(&sh)
+                        .copied()
+                        .unwrap_or(1)
+                        .saturating_sub(1);
+                    if remaining == 0 {
+                        vm.service_bind_counts.remove(&sh);
+                        let unbind = vm.call_virtual(sh, "onUnbind", &[intent]);
+                        if matches!(unbind, Ok(Some(V::I32(v))) if v != 0) {
+                            vm.service_rebind.insert(sh, intent);
+                        }
+                        if !vm.service_started.contains(&sh) {
+                            vm.services.retain(|_, live| *live != sh);
+                            if !vm.pending_destroy.contains(&sh) {
+                                vm.pending_destroy.push(sh);
+                            }
+                        }
+                    } else {
+                        vm.service_bind_counts.insert(sh, remaining);
+                    }
+                }
+            }
+            Some(None)
+        }
+        "sendBroadcast"
         | "sendOrderedBroadcast"
         | "sendStickyBroadcast"
         | "registerReceiver"
@@ -3060,8 +5479,6 @@ fn context_call(
         | "createWindowContext"
         | "moveResources"
         | "reloadResources"
-        | "bindServiceAsUser"
-        | "bindIsolatedService"
         | "updateServiceGroup" => {
             if name.starts_with("check") {
                 // checkSelfPermission/checkPermission/…: PERMISSION_
@@ -3073,10 +5490,7 @@ fn context_call(
                     .map(|p| vm.granted_permissions.contains(&p))
                     .unwrap_or(true);
                 Some(Some(V::I32(if g { 0 } else { -1 })))
-            } else if matches!(
-                name,
-                "bindService" | "bindServiceAsUser" | "bindIsolatedService" | "stopService"
-            ) {
+            } else if matches!(name, "stopService") {
                 Some(Some(V::I32(1)))
             } else if matches!(
                 name,
@@ -3103,11 +5517,15 @@ fn context_call(
         }
         "setWallpaper" | "clearWallpaper" => Some(None),
         // ----- Activity instance methods
-        "getIntent" => Some(Some(host(
-            vm,
-            "Landroid/content/Intent;",
-            HostState::Map(vec![]),
-        ))),
+        "getIntent" => {
+            let i = match args[0] {
+                V::Ref(h) => view::activity_intent(vm, h),
+                _ => None,
+            };
+            Some(Some(i.unwrap_or_else(|| {
+                host(vm, "Landroid/content/Intent;", HostState::Map(vec![]))
+            })))
+        }
         "requestPermissions" => {
             // (String[] perms, int requestCode): model "user grants
             // everything asked" — dangerous permissions join the
@@ -3156,12 +5574,25 @@ fn context_call(
             }
             Some(None)
         }
+        "setResult" => {
+            if let V::Ref(h) = args[0] {
+                pseudo_set(
+                    vm,
+                    h,
+                    view::P_RESULT_CODE,
+                    args.get(1).copied().unwrap_or(V::I32(0)),
+                );
+                if let Some(intent) = args.get(2).copied() {
+                    pseudo_set(vm, h, view::P_RESULT_INTENT, intent);
+                }
+            }
+            Some(None)
+        }
         "setIntent"
         | "requestWindowFeature"
         | "setTitle"
         | "setTitleColor"
         | "setVisible"
-        | "setResult"
         | "setRequestedOrientation"
         | "setTaskDescription"
         | "setVolumeControlStream"
@@ -3218,17 +5649,33 @@ fn context_call(
                 _ => 0,
             };
             let id = i32v(args.get(1).copied().unwrap_or(V::I32(0)));
-            let hit = view::content_root(vm, act)
+            let decor_hit = view::window_of(vm, act)
+                .and_then(|w| view::decor_of(vm, w))
                 .and_then(|root| view::find_in_tree(vm, root, id))
                 .unwrap_or(0);
+            let hit = if decor_hit != 0 {
+                decor_hit
+            } else {
+                view::content_root(vm, act)
+                    .and_then(|root| view::find_in_tree(vm, root, id))
+                    .unwrap_or(0)
+            };
             Some(Some(V::Ref(hit)))
         }
-        "setContentView" | "addContentView" => {
+        "setContentView" => {
             let act = match args.first() {
                 Some(V::Ref(h)) => *h,
                 _ => 0,
             };
             view::set_content_view(vm, act, args.get(1).copied().unwrap_or(V::Ref(0)));
+            Some(None)
+        }
+        "addContentView" => {
+            let act = match args.first() {
+                Some(V::Ref(h)) => *h,
+                _ => 0,
+            };
+            view::add_content_view(vm, act, args.get(1).copied().unwrap_or(V::Ref(0)));
             Some(None)
         }
         "setContentView_Int" => Some(None),
@@ -3319,10 +5766,19 @@ fn context_call(
                 // finishActivity*(requestCode) ends a *child* activity
                 // started for a result, not the caller — flagging it
                 // would mark `this` finished and abort its lifecycle.
-                "finishActivity"
-                | "finishActivityFromChild"
-                | "onBackPressed"
-                | "onUserInteraction"
+                "finishActivity" | "finishActivityFromChild" => Some(None),
+                // The platform Activity default is finish(). Modern
+                // OnBackPressedDispatcher paths fall through to this
+                // after their enabled callbacks have run; treating it
+                // as an empty lifecycle callback makes toolbar/up
+                // navigation a no-op in Fossify apps.
+                "onBackPressed" => {
+                    if let V::Ref(h) = args[0] {
+                        pseudo_set(vm, h, view::P_FINISHED, V::I32(1));
+                    }
+                    Some(None)
+                }
+                "onUserInteraction"
                 | "onPostResume"
                 | "onRetainNonConfigurationInstance"
                 | "moveTaskToBack" => Some(None),
@@ -3365,7 +5821,11 @@ fn context_call(
                         vm.has_dex_virtual(r, "run", &[])
                     );
                 }
-                if let Err(e) = vm.call_virtual(r, "run", &[]) {
+                // `runOnUiThread` is often invoked from a worker callback;
+                // executing it inline would leave Thread.currentThread() on
+                // that worker, and libraries such as Glide reject the whole
+                // load before ever reaching ImageView.setImageDrawable.
+                if let Err(e) = run_on_main(vm, r) {
                     // The runnable is the app's UI-commit point — a throw
                     // here means the data never reaches the view. Swallowing
                     // it silently leaves every screen looking "empty for no
@@ -3387,6 +5847,28 @@ fn context_call(
                 &[V::Ref(0)],
             );
             Some(None)
+        }
+        "onMenuItemSelected" => {
+            // AOSP Activity dispatches panel-menu items to the activity's
+            // options-item callback. ComponentActivity/AppCompatActivity
+            // call this framework implementation through super, so leaving
+            // it as an empty lifecycle default makes every toolbar action
+            // report unhandled before the guest override is consulted.
+            let this = match args.first() {
+                Some(V::Ref(h)) => *h,
+                _ => 0,
+            };
+            let feature = i32v(args.get(1).copied().unwrap_or(V::I32(0)));
+            let item = args.get(2).copied().unwrap_or(V::Ref(0));
+            let handled = if feature == 0 || feature == 8 {
+                matches!(
+                    vm.call_virtual_rt(this, "onOptionsItemSelected", &[item])?,
+                    Some(V::I32(v)) if v != 0
+                )
+            } else {
+                false
+            };
+            Some(Some(V::I32(handled as i32)))
         }
         "onCreate"
         | "onStart"
@@ -3731,6 +6213,15 @@ fn pm_call(vm: &mut Vm, name: &str, args: &[V]) -> Rt<Option<Option<V>>> {
                     None => Some(Some(V::Ref(0))),
                 }
             }
+            "getPackagesForUid" => {
+                let pkg = vm.guest_package.clone().unwrap_or_default();
+                let pv = jstr(vm, &pkg);
+                Some(Some(vm.alloc_array("Ljava/lang/String;", vec![pv])))
+            }
+            "getNameForUid" => {
+                let pkg = vm.guest_package.clone().unwrap_or_default();
+                Some(Some(jstr(vm, &pkg)))
+            }
             "getInstallerPackageName"
             | "getDrawable"
             | "getActivityIcon"
@@ -3753,8 +6244,6 @@ fn pm_call(vm: &mut Vm, name: &str, args: &[V]) -> Rt<Option<Option<V>>> {
             | "getUserBadgedIcon"
             | "getUserBadgedLabel"
             | "getUserBadgedDrawableForDensity"
-            | "getPackagesForUid"
-            | "getNameForUid"
             | "resolveActivity"
             | "resolveService"
             | "resolveContentProvider"
@@ -4566,13 +7055,31 @@ fn res_misc(vm: &mut Vm, class: &str, name: &str, args: &[V]) -> Rt<Option<Optio
             let Some(v) = found else {
                 return Ok(Some(Some(V::I32(0))));
             };
+            // Theme binding resolves `?attr/x` and nested @color/@dimen
+            // references before exposing the TypedValue. Keeping the
+            // intermediate TYPE_REFERENCE makes color-valued attrs look
+            // like array resources (Material ProgressIndicator then
+            // reads them with getIntArray and crashes).
+            let resolved = match v {
+                V::I32(id) if (id as u32) >> 24 == 0x7f || (id as u32) >> 24 == 0x01 => {
+                    view::resolve_ta_id(vm, id as u32)
+                }
+                _ => None,
+            };
+            let fill = |vm: &mut Vm, tv: V| {
+                if let Some((rid, ev)) = resolved.clone() {
+                    fill_typed_value_ev(vm, tv, &ev, rid);
+                } else {
+                    fill_typed_value(vm, tv, v);
+                }
+            };
             if name == "peekValue" {
                 let t = host(vm, "Landroid/util/TypedValue;", HostState::Empty);
-                fill_typed_value(vm, t, v);
+                fill(vm, t);
                 return Ok(Some(Some(t)));
             }
             if let Some(tv) = args.get(2).copied() {
-                fill_typed_value(vm, tv, v);
+                fill(vm, tv);
             }
             Some(Some(V::I32(1)))
         }
@@ -4813,6 +7320,14 @@ fn res_misc(vm: &mut Vm, class: &str, name: &str, args: &[V]) -> Rt<Option<Optio
 // ---------------------------------------------------------------------
 // Handler / Looper — run posted work inline (single looper model)
 
+fn handler_message_matches(vm: &Vm, r: u32, target: u32, what: V, obj: Option<V>) -> bool {
+    pseudo_get(vm, r, P_MSG_TARGET) == Some(V::Ref(target))
+        && pseudo_get(vm, r, P_MSG_WHAT) == Some(what)
+        && obj.is_none_or(|o| {
+            matches!(o, V::Ref(0) | V::I32(0)) || pseudo_get(vm, r, P_MSG_OBJ) == Some(o)
+        })
+}
+
 fn handler_call(vm: &mut Vm, name: &str, args: &[V]) -> Rt<Option<Option<V>>> {
     Ok(match name {
         "post"
@@ -4831,28 +7346,45 @@ fn handler_call(vm: &mut Vm, name: &str, args: &[V]) -> Rt<Option<Option<V>>> {
         | "postAsIdle"
         | "executeOrSendMessage"
         | "sendToTarget" => {
-            if let Some(V::Ref(r)) = args.get(1).copied() {
+            let mut message = None;
+            if name.starts_with("sendEmpty") {
+                if let (Some(&V::Ref(target)), Some(&what)) = (args.first(), args.get(1)) {
+                    let m = host(vm, "Landroid/os/Message;", HostState::Empty);
+                    if let V::Ref(mh) = m {
+                        pseudo_set(vm, mh, P_MSG_TARGET, V::Ref(target));
+                        pseudo_set(vm, mh, P_MSG_WHAT, what);
+                        message = Some(V::Ref(mh));
+                    }
+                }
+            }
+            if let Some(r) = args
+                .get(1)
+                .copied()
+                .filter(|v| matches!(v, V::Ref(_)))
+                .or(message)
+                .and_then(|v| if let V::Ref(h) = v { Some(h) } else { None })
+            {
                 // Handler posts land on the main looper — deferred so a
                 // re-posting callback can't spin inside its own frame.
                 // For sendMessage* the posted object is a Message —
                 // stamp this handler as its target so the drain-time
                 // dispatch can route it back here.
-                if name.starts_with("send") && is_message(vm, r) {
-                    if let Some(&V::Ref(h)) = args.first() {
-                        pseudo_set(vm, r, P_MSG_TARGET, V::Ref(h));
-                    }
+                if let Some(&V::Ref(h)) = args.first() {
+                    pseudo_set(vm, r, P_MSG_TARGET, V::Ref(h));
                 }
                 // *Delayed takes (r, delayMs); *AtTime takes (r, when) —
                 // our clocks are epoch-ms so `when - now` is the delay.
                 let delay = if name.contains("Delayed") {
                     args.get(2).copied().map(i64v).unwrap_or(0)
                 } else if name.contains("AtTime") {
-                    args.get(2).copied().map(i64v).unwrap_or(0) - now_ms()
+                    args.get(2).copied().map(i64v).unwrap_or(0) - crate::jdk::now_mono_ms()
                 } else {
                     0
                 };
                 if delay > 0 {
                     vm.enqueue_runnable_delayed(r, true, delay);
+                } else if name.contains("AtFrontOfQueue") {
+                    vm.pending_runnables.push_front((r, true));
                 } else {
                     vm.enqueue_runnable(r, true);
                 }
@@ -4869,11 +7401,94 @@ fn handler_call(vm: &mut Vm, name: &str, args: &[V]) -> Rt<Option<Option<V>>> {
             }
             Some(None)
         }
-        "removeCallbacks"
-        | "removeMessages"
-        | "removeCallbacksAndMessages"
-        | "removeEqualMessages" => Some(None),
-        "hasMessages" | "hasCallbacks" | "hasEqualMessages" => Some(Some(V::I32(0))),
+        "removeMessages" => {
+            if let (Some(&V::Ref(target)), Some(&what)) = (args.first(), args.get(1)) {
+                let pending_match: Vec<bool> = vm
+                    .pending_runnables
+                    .iter()
+                    .map(|(r, _)| {
+                        handler_message_matches(vm, *r, target, what, args.get(2).copied())
+                    })
+                    .collect();
+                let delayed_match: Vec<bool> = vm
+                    .delayed_runnables
+                    .iter()
+                    .map(|(r, _, _)| {
+                        handler_message_matches(vm, *r, target, what, args.get(2).copied())
+                    })
+                    .collect();
+                let mut pi = 0;
+                vm.pending_runnables.retain(|_| {
+                    let hit = pending_match[pi];
+                    pi += 1;
+                    !hit
+                });
+                let mut di = 0;
+                vm.delayed_runnables.retain(|_| {
+                    let hit = delayed_match[di];
+                    di += 1;
+                    !hit
+                });
+            }
+            Some(None)
+        }
+        "removeCallbacks" | "removeCallbacksAndMessages" | "removeEqualMessages" => {
+            let target = match args.first() {
+                Some(V::Ref(h)) => *h,
+                _ => 0,
+            };
+            let wanted = args.get(1).copied();
+            let token = args.get(2).copied();
+            let matches = |vm: &Vm, r: u32| {
+                if pseudo_get(vm, r, P_MSG_TARGET) != Some(V::Ref(target)) {
+                    return false;
+                }
+                match name {
+                    "removeCallbacks" => wanted == Some(V::Ref(r)),
+                    "removeEqualMessages" => pseudo_get(vm, r, P_MSG_WHAT) == token,
+                    _ => token.is_none_or(|t| {
+                        matches!(t, V::Ref(0) | V::I32(0))
+                            || pseudo_get(vm, r, P_MSG_OBJ) == Some(t)
+                    }),
+                }
+            };
+            let pm: Vec<bool> = vm
+                .pending_runnables
+                .iter()
+                .map(|(r, _)| matches(vm, *r))
+                .collect();
+            let dm: Vec<bool> = vm
+                .delayed_runnables
+                .iter()
+                .map(|(r, _, _)| matches(vm, *r))
+                .collect();
+            let mut pi = 0;
+            vm.pending_runnables.retain(|_| {
+                let hit = pm[pi];
+                pi += 1;
+                !hit
+            });
+            let mut di = 0;
+            vm.delayed_runnables.retain(|_| {
+                let hit = dm[di];
+                di += 1;
+                !hit
+            });
+            Some(None)
+        }
+        "hasMessages" => {
+            let found = if let (Some(&V::Ref(target)), Some(&what)) = (args.first(), args.get(1)) {
+                vm.pending_runnables.iter().any(|(r, _)| {
+                    handler_message_matches(vm, *r, target, what, args.get(2).copied())
+                }) || vm.delayed_runnables.iter().any(|(r, _, _)| {
+                    handler_message_matches(vm, *r, target, what, args.get(2).copied())
+                })
+            } else {
+                false
+            };
+            Some(Some(V::I32(found as i32)))
+        }
+        "hasCallbacks" | "hasEqualMessages" => Some(Some(V::I32(0))),
         "obtainMessage" => {
             // obtainMessage(what[, obj|arg1,arg2,obj]) — target is `this`.
             let m = host(vm, "Landroid/os/Message;", HostState::Empty);
@@ -4978,7 +7593,20 @@ fn graphics_call(
     // generic set*/draw* stubs below would silently eat every call.
     if matches!(
         class,
-        "Landroid/graphics/Canvas;" | "Landroid/graphics/Paint;" | "Landroid/text/TextPaint;"
+        "Landroid/graphics/Canvas;"
+            | "Landroid/graphics/RecordingCanvas;"
+            | "Landroid/view/DisplayListCanvas;"
+            | "Landroid/graphics/Path;"
+            | "Landroid/graphics/RenderNode;"
+            | "Landroid/view/RenderNode;"
+            | "Landroid/graphics/Paint;"
+            | "Landroid/text/TextPaint;"
+            | "Landroid/graphics/BlendModeColorFilter;"
+            | "Landroid/graphics/PorterDuffColorFilter;"
+            | "Landroid/graphics/LightingColorFilter;"
+            | "Landroid/graphics/ColorFilter;"
+            | "Landroid/graphics/Matrix;"
+            | "Landroid/graphics/PathMeasure;"
     ) {
         return Ok(None);
     }
@@ -5166,8 +7794,10 @@ fn graphics_call(
             c,
             "getBounds" | "copyBounds" | "setBounds" | "mutate" | "getIntrinsicWidth"
             | "getIntrinsicHeight" | "invalidateSelf" | "setAlpha" | "setColorFilter"
-            | "getOpacity" | "setVisible",
-        ) if c.ends_with("Drawable;") => {
+            | "getOpacity" | "setVisible" | "isVisible" | "getCallback" | "setCallback",
+        ) if c.ends_with("Drawable;")
+            || vm.assignable_desc(c, "Landroid/graphics/drawable/Drawable;") =>
+        {
             let V::Ref(h) = args.first().copied().unwrap_or(V::Ref(0)) else {
                 return Ok(Some(None));
             };
@@ -5231,7 +7861,38 @@ fn graphics_call(
                     Some(Some(V::I32(b - t)))
                 }
                 "getOpacity" => Some(Some(V::I32(-3))), // TRANSLUCENT
-                "setVisible" => Some(Some(V::I32(0))),
+                "getCallback" => Some(Some(
+                    pseudo_get(vm, h, P_DRAWABLE_CALLBACK).unwrap_or(V::Ref(0)),
+                )),
+                "setCallback" => {
+                    pseudo_set(
+                        vm,
+                        h,
+                        P_DRAWABLE_CALLBACK,
+                        args.get(1).copied().unwrap_or(V::Ref(0)),
+                    );
+                    Some(None)
+                }
+                // A Drawable is visible by default. Lottie gates starting
+                // its animator on this; the framework stub returning false
+                // leaves the play/pause morph permanently at its initial frame.
+                "isVisible" => Some(Some(V::I32(
+                    if matches!(pseudo_get(vm, h, 0xFFFD_FE40u64), Some(V::I32(0))) {
+                        0
+                    } else {
+                        1
+                    },
+                ))),
+                "setVisible" => {
+                    let vis = i32v(args.get(1).copied().unwrap_or(V::I32(1)));
+                    let old = if matches!(pseudo_get(vm, h, 0xFFFD_FE40u64), Some(V::I32(0))) {
+                        0
+                    } else {
+                        1
+                    };
+                    pseudo_set(vm, h, 0xFFFD_FE40u64, V::I32(vis));
+                    Some(Some(V::I32((vis != old) as i32)))
+                }
                 _ => Some(None),
             }
         }
@@ -5477,14 +8138,213 @@ fn graphics_call(
             })
         }
         ("Landroid/graphics/RectF;", n) => {
-            let _ = n;
-            Some(Some(V::I32(0)))
+            let this = match args.first().copied() {
+                Some(V::Ref(h)) => h,
+                _ => 0,
+            };
+            match n {
+                "<init>" => {
+                    if args.len() >= 5 {
+                        rectf_write(
+                            vm,
+                            this,
+                            flt32(args[1]),
+                            flt32(args[2]),
+                            flt32(args[3]),
+                            flt32(args[4]),
+                        );
+                    } else if let Some(V::Ref(src)) = args.get(1).copied() {
+                        let (l, t, r, b) = rectf_edges(vm, src);
+                        rectf_write(vm, this, l, t, r, b);
+                    } else {
+                        rectf_write(vm, this, 0.0, 0.0, 0.0, 0.0);
+                    }
+                    Some(None)
+                }
+                "set" => {
+                    if args.len() >= 5 {
+                        rectf_write(
+                            vm,
+                            this,
+                            flt32(args[1]),
+                            flt32(args[2]),
+                            flt32(args[3]),
+                            flt32(args[4]),
+                        );
+                    } else if let Some(V::Ref(src)) = args.get(1).copied() {
+                        let (l, t, r, b) = rectf_edges(vm, src);
+                        rectf_write(vm, this, l, t, r, b);
+                    }
+                    Some(None)
+                }
+                "offset" => {
+                    let (l, t, r, b) = rectf_edges(vm, this);
+                    rectf_write(
+                        vm,
+                        this,
+                        l + flt32(args.get(1).copied().unwrap_or(V::F32(0.0))),
+                        t + flt32(args.get(2).copied().unwrap_or(V::F32(0.0))),
+                        r + flt32(args.get(1).copied().unwrap_or(V::F32(0.0))),
+                        b + flt32(args.get(2).copied().unwrap_or(V::F32(0.0))),
+                    );
+                    Some(None)
+                }
+                "width" => {
+                    let (l, _, r, _) = rectf_edges(vm, this);
+                    Some(Some(V::F32(r - l)))
+                }
+                "height" => {
+                    let (_, t, _, b) = rectf_edges(vm, this);
+                    Some(Some(V::F32(b - t)))
+                }
+                "centerX" => {
+                    let (l, _, r, _) = rectf_edges(vm, this);
+                    Some(Some(V::F32((l + r) * 0.5)))
+                }
+                "centerY" => {
+                    let (_, t, _, b) = rectf_edges(vm, this);
+                    Some(Some(V::F32((t + b) * 0.5)))
+                }
+                "isEmpty" => {
+                    let (l, t, r, b) = rectf_edges(vm, this);
+                    Some(Some(V::I32((l >= r || t >= b) as i32)))
+                }
+                "contains" => {
+                    let (l, t, r, b) = rectf_edges(vm, this);
+                    let inside = if args.len() >= 4 {
+                        let (x, y) = (flt32(args[1]), flt32(args[2]));
+                        x >= l && x < r && y >= t && y < b
+                    } else {
+                        false
+                    };
+                    Some(Some(V::I32(inside as i32)))
+                }
+                _ => return Ok(None),
+            }
         }
-        ("Landroid/graphics/Point;", "set" | "offset" | "negate" | "equals") => {
-            if name == "equals" {
-                Some(Some(V::I32(0)))
-            } else {
-                Some(None)
+        ("Landroid/graphics/PointF;", n) => {
+            let this = match args.first().copied() {
+                Some(V::Ref(h)) => h,
+                _ => 0,
+            };
+            match n {
+                "<init>" => {
+                    if args.len() >= 3 {
+                        pointf_write(vm, this, flt32(args[1]), flt32(args[2]));
+                    } else if let Some(V::Ref(src)) = args.get(1).copied() {
+                        let (x, y) = pointf_xy(vm, src);
+                        pointf_write(vm, this, x, y);
+                    } else {
+                        pointf_write(vm, this, 0.0, 0.0);
+                    }
+                    Some(None)
+                }
+                "set" => {
+                    if args.len() >= 3 {
+                        pointf_write(vm, this, flt32(args[1]), flt32(args[2]));
+                    } else if let Some(V::Ref(src)) = args.get(1).copied() {
+                        let (x, y) = pointf_xy(vm, src);
+                        pointf_write(vm, this, x, y);
+                    }
+                    Some(None)
+                }
+                "offset" => {
+                    let (x, y) = pointf_xy(vm, this);
+                    pointf_write(
+                        vm,
+                        this,
+                        x + flt32(args.get(1).copied().unwrap_or(V::F32(0.0))),
+                        y + flt32(args.get(2).copied().unwrap_or(V::F32(0.0))),
+                    );
+                    Some(None)
+                }
+                "negate" => {
+                    let (x, y) = pointf_xy(vm, this);
+                    pointf_write(vm, this, -x, -y);
+                    Some(None)
+                }
+                "equals" => {
+                    let (x, y) = pointf_xy(vm, this);
+                    let eq = if args.len() >= 3 {
+                        x == flt32(args[1]) && y == flt32(args[2])
+                    } else {
+                        match args.get(1).copied() {
+                            Some(V::Ref(other)) if other != 0 => (x, y) == pointf_xy(vm, other),
+                            _ => false,
+                        }
+                    };
+                    Some(Some(V::I32(eq as i32)))
+                }
+                "hashCode" => {
+                    let (x, y) = pointf_xy(vm, this);
+                    Some(Some(V::I32(
+                        x.to_bits() as i32 ^ (y.to_bits() as i32).rotate_left(16),
+                    )))
+                }
+                "toString" => {
+                    let (x, y) = pointf_xy(vm, this);
+                    Some(Some(jdynstr(vm, &format!("PointF({x}, {y})"))))
+                }
+                _ => return Ok(None),
+            }
+        }
+        (
+            "Landroid/graphics/Point;",
+            "<init>" | "set" | "offset" | "negate" | "equals" | "hashCode" | "toString",
+        ) => {
+            let this = match args.first().copied() {
+                Some(V::Ref(h)) => h,
+                _ => 0,
+            };
+            match name {
+                "<init>" => {
+                    if args.len() >= 3 {
+                        point_write(vm, this, i32v(args[1]), i32v(args[2]));
+                    } else if let Some(V::Ref(src)) = args.get(1).copied() {
+                        let (x, y) = point_xy(vm, src);
+                        point_write(vm, this, x, y);
+                    }
+                    Some(None)
+                }
+                "set" => {
+                    point_write(vm, this, i32v(args[1]), i32v(args[2]));
+                    Some(None)
+                }
+                "offset" => {
+                    let (x, y) = point_xy(vm, this);
+                    point_write(
+                        vm,
+                        this,
+                        x + i32v(args.get(1).copied().unwrap_or(V::I32(0))),
+                        y + i32v(args.get(2).copied().unwrap_or(V::I32(0))),
+                    );
+                    Some(None)
+                }
+                "negate" => {
+                    let (x, y) = point_xy(vm, this);
+                    point_write(vm, this, -x, -y);
+                    Some(None)
+                }
+                "hashCode" => {
+                    let (x, y) = point_xy(vm, this);
+                    Some(Some(V::I32(x.wrapping_mul(31).wrapping_add(y))))
+                }
+                "toString" => {
+                    let (x, y) = point_xy(vm, this);
+                    Some(Some(jdynstr(vm, &format!("Point({x}, {y})"))))
+                }
+                _ => {
+                    let (x, y) = point_xy(vm, this);
+                    let eq = if args.len() >= 3 {
+                        x == i32v(args[1]) && y == i32v(args[2])
+                    } else {
+                        match args.get(1).copied() {
+                            Some(V::Ref(other)) if other != 0 => (x, y) == point_xy(vm, other),
+                            _ => false,
+                        }
+                    };
+                    Some(Some(V::I32(eq as i32)))
+                }
             }
         }
         (
@@ -5572,6 +8432,21 @@ fn graphics_call(
                 Some(V::Ref(h)) => pseudo_get(vm, *h, P_BITMAP_SLOT).unwrap_or(V::Ref(0)),
                 _ => V::Ref(0),
             }))
+        }
+        ("Landroid/provider/MediaStore$Images$Media;", "getBitmap") => {
+            let uri = sv(vm, args.get(1).copied().unwrap_or(V::Ref(0))).unwrap_or_default();
+            let bytes = media_uri_path(vm, &uri)
+                .and_then(|p| std::fs::read(io::fspath(vm, &p)).ok())
+                .unwrap_or_default();
+            Some(bitmap_decode(vm, &bytes))
+        }
+        ("Landroid/media/ThumbnailUtils;", "createAudioThumbnail" | "createVideoThumbnail") => {
+            let path = sv(vm, args.first().copied().unwrap_or(V::Ref(0))).unwrap_or_default();
+            let bytes = std::fs::read(io::fspath(vm, &path)).unwrap_or_default();
+            Some(match audio_embedded_image(&bytes) {
+                Some(img) => bitmap_decode(vm, &img),
+                None => Some(V::Ref(0)),
+            })
         }
         ("Landroid/graphics/BitmapFactory;", "decodeFile") => {
             let path = sv(vm, args[0]).unwrap_or_default();
@@ -6296,6 +9171,13 @@ fn bitmap_decode(vm: &mut Vm, bytes: &[u8]) -> Option<V> {
     // Undecodable input -> null, matching `BitmapFactory` returning null
     // for corrupt/unsupported images (guest then null-checks normally).
     let Ok(img) = image::load_from_memory(bytes) else {
+        if crate::dbg_flag("OVELO_IMGDBG") {
+            eprintln!(
+                "[imgdbg] bitmap decode failed bytes={} head={:?}",
+                bytes.len(),
+                &bytes[..bytes.len().min(16)]
+            );
+        }
         return Some(V::Ref(0));
     };
     let rgba = img.to_rgba8();
@@ -6311,11 +9193,86 @@ fn bitmap_decode(vm: &mut Vm, bytes: &[u8]) -> Option<V> {
     ))
 }
 
+/// Embedded image bytes in an ID3v2 APIC frame, when present.
+/// WAV files and tagless audio have none; returning `None` lets the
+/// caller follow Android's no-artwork path instead of inventing pixels.
+fn audio_embedded_image(bytes: &[u8]) -> Option<Vec<u8>> {
+    if bytes.len() < 10 || &bytes[..3] != b"ID3" {
+        return None;
+    }
+    let major = bytes[3];
+    let syncsafe = |b: &[u8]| -> usize {
+        ((b[0] & 0x7f) as usize) << 21
+            | ((b[1] & 0x7f) as usize) << 14
+            | ((b[2] & 0x7f) as usize) << 7
+            | (b[3] & 0x7f) as usize
+    };
+    let tag_end = (10 + syncsafe(&bytes[6..10])).min(bytes.len());
+    let mut pos = 10usize;
+    // Skip an extended header when present.
+    if bytes[5] & 0x40 != 0 && pos + 4 <= tag_end {
+        let ext = if major == 3 {
+            u32::from_be_bytes(bytes[pos..pos + 4].try_into().ok()?) as usize
+        } else {
+            syncsafe(&bytes[pos..pos + 4])
+        };
+        pos = (pos + ext + usize::from(major == 3) * 4).min(tag_end);
+    }
+    while pos + 10 <= tag_end {
+        let id = &bytes[pos..pos + 4];
+        if id == [0, 0, 0, 0] {
+            break;
+        }
+        let size = if major == 4 {
+            syncsafe(&bytes[pos + 4..pos + 8])
+        } else {
+            u32::from_be_bytes(bytes[pos + 4..pos + 8].try_into().ok()?) as usize
+        };
+        let start = pos + 10;
+        let end = start.saturating_add(size).min(tag_end);
+        if id == b"APIC" && start + 4 < end {
+            let f = &bytes[start..end];
+            let encoding = f[0];
+            let mut i = 1usize;
+            while i < f.len() && f[i] != 0 {
+                i += 1;
+            }
+            i = (i + 2).min(f.len()); // MIME NUL + picture type
+                                      // Description is NUL-terminated; UTF-16 encodings use a
+                                      // two-byte terminator. Artwork almost always has an empty
+                                      // description, so scan conservatively for the terminator.
+            if matches!(encoding, 1 | 2) {
+                while i + 1 < f.len() && !(f[i] == 0 && f[i + 1] == 0) {
+                    i += 2;
+                }
+                i = (i + 2).min(f.len());
+            } else {
+                while i < f.len() && f[i] != 0 {
+                    i += 1;
+                }
+                i = (i + 1).min(f.len());
+            }
+            if i < end - start {
+                return Some(f[i..].to_vec());
+            }
+        }
+        pos = end.max(pos + 10);
+    }
+    None
+}
+
 /// Decode honoring `Options.inBitmap`: Glide's BitmapPool pre-allocates
 /// the destination Bitmap and reads it back from the options object —
 /// ignoring the returned handle would leave the pool bitmap blank.
 /// Pixels are scaled into the reused bitmap's dimensions.
 fn bitmap_decode_opts(vm: &mut Vm, bytes: &[u8], args: &[V]) -> Option<V> {
+    if crate::dbg_flag("OVELO_IMGDBG") {
+        eprintln!(
+            "[imgdbg] bitmap decode bytes={} png={}",
+            bytes.len(),
+            bytes.starts_with(b"\x89PNG")
+        );
+    }
     let in_bm = args.iter().find_map(|a| match a {
         V::Ref(h) if *h != 0 => vm
             .get_object_field(*h, "Landroid/graphics/BitmapFactory$Options;", "inBitmap")
@@ -6365,31 +9322,39 @@ pub(crate) fn bitmap_dims(vm: &Vm, v: V) -> (u32, u32) {
 /// like object holding a bitmap in any ref field (BitmapDrawable.mBitmapState.mBitmap,
 /// Glide's BitmapDrawable, …).
 pub(crate) fn bitmap_pixels(vm: &Vm, v: V) -> Option<(u32, u32, std::rc::Rc<Vec<u8>>)> {
-    bitmap_pixels_at(vm, v, 0)
-}
-
-fn bitmap_pixels_at(vm: &Vm, v: V, depth: u32) -> Option<(u32, u32, std::rc::Rc<Vec<u8>>)> {
-    // Depth bound: drawable graphs can be cyclic (a container holding a
-    // ref back to itself) — without this the field walk overflows the
-    // host stack.
-    if depth > 8 {
-        return None;
+    // Breadth-first wrapper scan: BitmapDrawable/TransitionDrawable
+    // graphs contain many unrelated references, and depth-first field
+    // order can exhaust the cycle bound before reaching the nearby bitmap.
+    let mut seen = hashbrown::HashSet::new();
+    let mut queue = std::collections::VecDeque::from([(v, 0u32)]);
+    while let Some((cur, depth)) = queue.pop_front() {
+        if depth > 8 {
+            continue;
+        }
+        let V::Ref(h) = cur else { continue };
+        if !seen.insert(h) {
+            continue;
+        }
+        match vm.heap.get(h) {
+            Some(Obj::Host {
+                state: HostState::Bitmap { w, h, rgba },
+                ..
+            }) => return Some((*w, *h, rgba.clone())),
+            Some(Obj::Instance { fields, .. }) | Some(Obj::Host { fields, .. }) => {
+                for f in fields.values() {
+                    queue.push_back((*f, depth + 1));
+                }
+            }
+            // LayerDrawable/TransitionDrawable keep drawables in an array.
+            Some(Obj::Array { data, .. }) => {
+                for f in data {
+                    queue.push_back((*f, depth + 1));
+                }
+            }
+            _ => {}
+        }
     }
-    let V::Ref(h) = v else { return None };
-    match vm.heap.get(h) {
-        Some(Obj::Host {
-            state: HostState::Bitmap { w, h, rgba },
-            ..
-        }) => Some((*w, *h, rgba.clone())),
-        Some(Obj::Instance { fields, .. }) | Some(Obj::Host { fields, .. }) => fields
-            .values()
-            .find_map(|f| bitmap_pixels_at(vm, *f, depth + 1)),
-        // LayerDrawable/TransitionDrawable keep drawables in an array.
-        Some(Obj::Array { data, .. }) => data
-            .iter()
-            .find_map(|f| bitmap_pixels_at(vm, *f, depth + 1)),
-        _ => None,
-    }
+    None
 }
 
 /// Nearest-neighbor RGBA8 scale.
@@ -6423,6 +9388,12 @@ pub(crate) fn media_uri_path(vm: &Vm, uri: &str) -> Option<String> {
         return Some(uri.to_string());
     }
     if uri.starts_with("content://media/") {
+        // Album-art URIs are keyed by album id, not media row id. Resolving
+        // them through the media table can collide with an unrelated image
+        // (ovelo's seeded forest.png) and make Glide show it as cover art.
+        if uri.contains("/audio/albumart/") {
+            return None;
+        }
         if let Some(id) = uri.rsplit('/').next().and_then(|t| t.parse::<i64>().ok()) {
             for (data, i) in &vm.media_ids {
                 if *i == id {

@@ -17,8 +17,8 @@ mod value;
 
 pub use aot::Aot;
 pub use jdk::view::{
-    fire_global_layout, fire_pre_draw, is_popup_root, mark_layout_requested, DexViewInfo,
-    P_BGCOLOR, P_TCOLOR, P_TEXT, P_TSIZE,
+    drive_compute_scroll, fire_global_layout, fire_pre_draw, is_popup_root, mark_layout_requested,
+    DexViewInfo, P_BGCOLOR, P_TCOLOR, P_TEXT, P_TSIZE,
 };
 pub use jdk::{pseudo_get, pseudo_set, P_ACTION, P_APPINFO, P_COMPONENT, P_DATA, P_META, P_TARGET};
 pub use value::{CanvasOp, PaintState, PathCmd};
@@ -38,16 +38,19 @@ fn err(cause: &str) -> OveloError {
 /// process start, but the interpreter consulted getenv once per
 /// instruction (`aget`/`sget`/`iget` sites) and per dispatch.
 pub(crate) fn dbg_flag(name: &'static str) -> bool {
+    // Hot interpreter paths ask this every instruction/callback. Static
+    // names have stable addresses and are few, so pointer-indexed linear
+    // lookup avoids both env lookups and string SipHashing.
     thread_local! {
-        static CACHE: std::cell::RefCell<HashMap<&'static str, bool>> =
-            std::cell::RefCell::new(HashMap::new());
+        static CACHE: std::cell::RefCell<Vec<(usize, bool)>> = const { std::cell::RefCell::new(Vec::new()) };
     }
+    let key = name.as_ptr() as usize;
     CACHE.with(|c| {
-        if let Some(v) = c.borrow().get(name) {
+        if let Some((_, v)) = c.borrow().iter().find(|(k, _)| *k == key) {
             return *v;
         }
         let v = std::env::var_os(name).is_some();
-        c.borrow_mut().insert(name, v);
+        c.borrow_mut().push((key, v));
         v
     })
 }
@@ -165,6 +168,21 @@ pub type HostCall = std::rc::Rc<std::cell::RefCell<dyn FnMut(&mut Vm, &[V]) -> R
 /// for platform classes), its class descriptor, and the call itself.
 type NamedHost = (GIdx, String, HostCall);
 
+/// Manifest-declared activity intent filter used for implicit launches.
+#[derive(Debug, Clone, Default)]
+pub struct ActivityIntentFilter {
+    /// Qualified activity class name (dotted Java form).
+    pub activity: String,
+    /// Declared action names.
+    pub actions: Vec<String>,
+    /// Declared category names.
+    pub categories: Vec<String>,
+    /// Declared data MIME types.
+    pub mime_types: Vec<String>,
+    /// Declared data schemes.
+    pub schemes: Vec<String>,
+}
+
 /// DEX interpreter over one or more [`DexFile`]s (multi-dex apps).
 pub struct Vm {
     dexes: Vec<DexFile>,
@@ -211,6 +229,9 @@ pub struct Vm {
     /// store — `PackageManager.queryIntentActivities` enumerates them
     /// for launchers, `getLaunchIntentForPackage` resolves per package.
     pub installed_launchers: Vec<(String, String)>,
+    /// Current app's activity intent filters, used to resolve implicit
+    /// intra-app ACTION_VIEW-style launches.
+    pub activity_intent_filters: Vec<ActivityIntentFilter>,
     /// On-disk path per installed package — `loadIcon` /
     /// `getApplicationIcon` read and decode the APK lazily, so a
     /// non-launcher app doesn't pin every installed APK in memory.
@@ -240,6 +261,9 @@ pub struct Vm {
     /// Interned `Application` — `getApplication[Context]` must return a
     /// real Application-typed object (callers `check-cast` it).
     pub(crate) app_h: u32,
+    /// Interned org.json JSONObject.NULL sentinel — reference equality
+    /// against the static field must hold across parses and reads.
+    pub(crate) json_null_h: u32,
     /// sun.misc.Unsafe model: offset tokens minted by `objectFieldOffset`,
     /// `(object handle, offset)` -> stored value (CAS/volatile get/put).
     pub(crate) unsafe_offsets: HashMap<(u32, i64), V>,
@@ -305,6 +329,8 @@ pub struct Vm {
     /// Attached `TextClock` views that tick — refreshed once per
     /// `drain_runnables` pass (AOSP ticks them per postDelayed).
     pub clock_views: Vec<u32>,
+    /// Visible toast overlay roots and their monotonic dismissal deadline.
+    pub(crate) toast_overlays: Vec<(u32, u64)>,
     /// Installed-APK resource index for `LayoutInflater.inflate` — `None`
     /// degrades inflation to bare placeholder views.
     pub apk_res: Option<Box<res::ApkResources>>,
@@ -330,6 +356,19 @@ pub struct Vm {
     /// delivers decoded bitmaps as drawables — coil's own coroutine
     /// pipeline suspends on a dispatcher our loop never resumes.
     pub(crate) coil_jobs: Vec<(u64, u32)>,
+    /// Services with an active start request — a bound service is only
+    /// destroyed after unbinding when no started lifecycle keeps it up.
+    pub(crate) service_started: hashbrown::HashSet<u32>,
+    /// ServiceConnection handle -> bound service handle.
+    pub(crate) service_bindings: HashMap<u32, u32>,
+    /// Live binding count per service handle.
+    pub(crate) service_bind_counts: HashMap<u32, usize>,
+    /// ServiceConnection handle -> intent copy delivered to `onUnbind`.
+    pub(crate) service_bind_intents: HashMap<u32, V>,
+    /// Binder returned by each service's active `onBind` lifecycle.
+    pub(crate) service_binders: HashMap<u32, V>,
+    /// Intent awaiting `onRebind` after `onUnbind` returned true.
+    pub(crate) service_rebind: HashMap<u32, V>,
     /// Last `startId` delivered to each running Service — `stopSelf(id)`
     /// only stops when the id matches the most recent request.
     pub(crate) service_start_id: HashMap<u32, i64>,
@@ -423,6 +462,7 @@ pub struct Vm {
     /// `assignable_desc` is hit by `isInstance`/`isAssignableFrom` in
     /// guest hot loops; each call re-walked the whole superclass chain.
     assignable_desc_cache: std::cell::RefCell<HashMap<String, HashMap<String, bool>>>,
+    pub(crate) typevar_cache: std::cell::RefCell<HashMap<(String, String), u32>>,
     /// `midx` → `(params)ret` signature — the unresolved/builtin dispatch
     /// path re-decoded the proto's full param list on every invoke.
     proto_sig_cache: std::cell::RefCell<HashMap<GIdx, String>>,
@@ -474,12 +514,19 @@ pub struct Vm {
     /// Any `GLSurfaceView.setRenderer` has been bound. Non-GL apps
     /// must not scan every view every frame looking for renderers.
     pub(crate) gl_renderer_active: bool,
+    /// Wall-clock deadline through which at least one Scroller animation
+    /// may still be active. Lets the frame loop drive computeScroll only
+    /// while animation progress can actually change.
+    pub(crate) scroll_anim_until_ms: i64,
     /// The one `Choreographer.getInstance()` handle — identity matters
     /// (dex code compares instances).
     pub(crate) choreographer_h: u32,
     /// The shared `ByteOrder.nativeOrder()` object — buffer helpers
     /// (Korge's `Lb8`) request it per window write, 100k+/10s.
     pub(crate) byteorder_h: std::cell::Cell<u32>,
+    /// The shared `ByteOrder.BIG_ENDIAN` object — static constants are
+    /// identity-compared by nio/media pipelines.
+    pub(crate) byteorder_big_h: std::cell::Cell<u32>,
     /// `Application.ActivityLifecycleCallbacks` handles registered via
     /// `registerActivityLifecycleCallbacks` — application-global in
     /// AOSP. androidx ReportFragment relies on these to drive
@@ -619,6 +666,16 @@ pub struct Vm {
     /// descriptor, the Intent the caller passed). The runner drains
     /// it into a real second-Activity dispatch.
     pub pending_activity: Option<(String, V)>,
+    /// Caller activities awaiting a finished child activity.
+    pub activity_back: Vec<u32>,
+    /// Caller/request code associated with the next pending activity launch.
+    pub pending_activity_caller: Option<(u32, i32)>,
+    /// Child activity handle → caller activity and request code.
+    pub activity_callers: HashMap<u32, (u32, i32)>,
+    /// Theme resource selected while each activity is foregrounded.
+    pub activity_themes: HashMap<u32, u32>,
+    /// Activities whose options menu was already created.
+    pub activity_menu_created: hashbrown::HashSet<u32>,
     /// canonical class_idx → `java.lang.Class` mirror handle — Class
     /// objects are singletons (`Foo.class == x.getClass()`).
     class_mirrors: HashMap<GIdx, u32>,
@@ -810,6 +867,13 @@ impl Vm {
         jdk::pseudo_set(self, provider, jdk::view::P_CONTEXT, context);
     }
 
+    /// Whether a Scroller animation may still be progressing. Used by
+    /// the frame loop to avoid walking every view tree each frame once
+    /// all scroll animations have finished.
+    pub fn scroll_animation_active(&self) -> bool {
+        crate::jdk::now_mono_ms() <= self.scroll_anim_until_ms
+    }
+
     /// Static field value stored on class `class_idx` (`None` when the
     /// class is unloaded or the field unset). Used by `Enum.values()`.
     pub(crate) fn static_of(&self, class_idx: GIdx, field_idx: GIdx) -> Option<V> {
@@ -840,6 +904,7 @@ impl Vm {
                 .join("emulated")
                 .join("0"),
             installed_launchers: Vec::new(),
+            activity_intent_filters: Vec::new(),
             installed_apk_paths: std::collections::BTreeMap::new(),
             depth: 0,
             stack: Vec::new(),
@@ -851,6 +916,7 @@ impl Vm {
             main_looper_h: 0,
             main_dispatcher_h: 0,
             app_h: 0,
+            json_null_h: 0,
             unsafe_offsets: HashMap::new(),
             unsafe_next_offset: 0,
             trace_field: std::env::var("OVELO_TRACE_FIELD").ok(),
@@ -864,7 +930,7 @@ impl Vm {
             content_views: HashMap::new(),
             decor_roots: HashMap::new(),
             content_frames: HashMap::new(),
-            window_size: (720, 1280),
+            window_size: (360, 640),
             touch_gesture_down_time: -1,
             touch_gesture_target: 0,
             enum_cache: HashMap::new(),
@@ -872,6 +938,7 @@ impl Vm {
             bool_cache: [0, 0],
             int_cache: [0; 256],
             clock_views: Vec::new(),
+            toast_overlays: Vec::new(),
             apk_res: None,
             dbs: HashMap::new(),
             db_handles: HashMap::new(),
@@ -881,6 +948,12 @@ impl Vm {
             bundled_h: 0,
             services: HashMap::new(),
             coil_jobs: Vec::new(),
+            service_started: hashbrown::HashSet::new(),
+            service_bindings: HashMap::new(),
+            service_bind_counts: HashMap::new(),
+            service_bind_intents: HashMap::new(),
+            service_binders: HashMap::new(),
+            service_rebind: HashMap::new(),
             service_start_id: HashMap::new(),
             service_seq: 0,
             service_stop_pending: hashbrown::HashSet::new(),
@@ -889,6 +962,11 @@ impl Vm {
             theme_id: 0,
             total_steps: 0,
             pending_activity: None,
+            activity_back: Vec::new(),
+            pending_activity_caller: None,
+            activity_callers: HashMap::new(),
+            activity_themes: HashMap::new(),
+            activity_menu_created: hashbrown::HashSet::new(),
             pending_runnables: std::collections::VecDeque::new(),
             single_executors: hashbrown::HashSet::new(),
             executor_queues: HashMap::new(),
@@ -899,8 +977,10 @@ impl Vm {
             frame_callbacks: Vec::new(),
             sched_prefer_worker: false,
             gl_renderer_active: false,
+            scroll_anim_until_ms: 0,
             choreographer_h: 0,
             byteorder_h: std::cell::Cell::new(0),
+            byteorder_big_h: std::cell::Cell::new(0),
             activity_callbacks: Vec::new(),
             delayed_runnables: Vec::new(),
             pending_surface: Vec::new(),
@@ -957,6 +1037,7 @@ impl Vm {
             type_desc_cache: std::cell::RefCell::new(HashMap::new()),
             super_desc_cache: std::cell::RefCell::new(HashMap::new()),
             assignable_desc_cache: std::cell::RefCell::new(HashMap::new()),
+            typevar_cache: std::cell::RefCell::new(HashMap::new()),
             proto_sig_cache: std::cell::RefCell::new(HashMap::new()),
             str_const_cache: std::cell::RefCell::new(HashMap::new()),
             view_gen: 0,
@@ -965,6 +1046,16 @@ impl Vm {
             class_mirrors: HashMap::new(),
             granted_permissions: hashbrown::HashSet::new(),
         };
+        // Android creates the app-private sandbox before any application
+        // code runs. Do the same independent of which Context wrapper the
+        // app first calls `getFilesDir`/`getCacheDir` through.
+        for dir in [
+            "data/local/ovelo/files",
+            "data/local/ovelo/cache",
+            "data/local/ovelo/databases",
+        ] {
+            let _ = std::fs::create_dir_all(v.guest_root.join(dir));
+        }
         v.add_dex(dex)?;
         Ok(v)
     }
@@ -1255,6 +1346,26 @@ impl Vm {
     /// Runtime class descriptor for any heap object handle (debug use).
     pub fn dbg_class_of(&self, h: u32) -> String {
         jdk::class_of(self, V::Ref(h))
+    }
+
+    /// Whether a heap object's runtime class descriptor contains `needle`,
+    /// without cloning the cached descriptor on every caller.
+    pub fn dbg_class_contains(&self, h: u32, needle: &str) -> bool {
+        match self.heap.get(h) {
+            Some(Obj::Instance { class_idx, .. }) => {
+                if let Some(hit) = self.type_desc_cache.borrow().get(class_idx) {
+                    return hit.as_deref().is_some_and(|d| d.contains(needle));
+                }
+                self.type_desc_of(*class_idx)
+                    .is_ok_and(|d| d.contains(needle))
+            }
+            Some(Obj::Host { desc, .. }) => desc.contains(needle),
+            Some(Obj::Throwable { descriptor, .. }) => descriptor.contains(needle),
+            Some(Obj::Str(_)) => "Ljava/lang/String;".contains(needle),
+            Some(Obj::Class { .. }) => "Ljava/lang/Class;".contains(needle),
+            Some(Obj::Array { elem, .. }) => elem.contains(needle),
+            None => false,
+        }
     }
 
     /// Debug: a view's recorded P_PARENT handle (0 when none).
@@ -2095,7 +2206,7 @@ impl Vm {
             }
         };
         if self.depth == 0 {
-            self.drain_runnables(500);
+            self.drain_runnables(8);
         }
         out
     }
@@ -2122,7 +2233,7 @@ impl Vm {
         a.extend_from_slice(&eff_args);
         let out = self.invoke(midx, a, InvokeKind::Virtual);
         if self.depth == 0 {
-            self.drain_runnables(500);
+            self.drain_runnables(8);
         }
         out
     }
@@ -2462,6 +2573,7 @@ impl Vm {
         roots.extend(self.frame_callbacks.iter().map(|(h, _)| *h));
         roots.push(self.choreographer_h);
         roots.push(self.byteorder_h.get());
+        roots.push(self.byteorder_big_h.get());
         roots.extend(self.parked_runnables.keys().copied());
         roots.extend(self.thread_runnables.iter().copied());
         roots.extend(self.runnable_thread.values().copied());
@@ -2492,6 +2604,7 @@ impl Vm {
             self.main_dispatcher_h,
             self.app_h,
             self.cur_activity,
+            self.json_null_h,
         ]);
         roots.extend(self.view_roots.iter().copied());
         roots.extend(self.prefs_files.values().copied());
@@ -2504,6 +2617,12 @@ impl Vm {
         roots.extend(self.enum_name_cache.values().copied());
         roots.extend(self.bool_cache.into_iter().filter(|h| *h != 0));
         roots.extend(self.int_cache.into_iter().filter(|h| *h != 0));
+        roots.extend(self.activity_back.iter().copied());
+        roots.extend(self.activity_callers.keys().copied());
+        roots.extend(self.activity_callers.values().map(|(caller, _)| *caller));
+        if let Some((caller, _)) = self.pending_activity_caller {
+            roots.push(caller);
+        }
         roots.extend(self.content_views.keys().copied());
         roots.extend(self.content_views.values().copied());
         roots.extend(self.decor_roots.keys().copied());
@@ -2512,6 +2631,20 @@ impl Vm {
         // by its view-tree parent; once detached and unreferenced it is
         // collected and drain_runnables prunes the stale handle.
         roots.extend(self.db_handles.values().copied());
+        roots.extend(self.services.values().copied());
+        roots.extend(self.service_bindings.keys().copied());
+        roots.extend(self.service_bind_intents.values().filter_map(|v| match v {
+            V::Ref(h) if *h != 0 => Some(*h),
+            _ => None,
+        }));
+        roots.extend(self.service_binders.values().filter_map(|v| match v {
+            V::Ref(h) if *h != 0 => Some(*h),
+            _ => None,
+        }));
+        roots.extend(self.service_rebind.values().filter_map(|v| match v {
+            V::Ref(h) if *h != 0 => Some(*h),
+            _ => None,
+        }));
         // Stopped services and coil delivery targets must survive until
         // the drain runs their onDestroy / attaches the drawable —
         // collecting either first silently drops the delivery.
@@ -2558,6 +2691,28 @@ impl Vm {
     /// Run up to `max` queued runnables (main + worker queues).
     /// Returns how many completed — re-parked workers don't count.
     pub fn drain_runnables(&mut self, max: usize) -> usize {
+        self.drain_runnables_impl(max, false)
+    }
+
+    /// Drain only worker-side tasks. Blocking future waits must not
+    /// run unrelated main-loop callbacks ahead of their natural turn.
+    pub(crate) fn drain_worker_runnables(&mut self, max: usize) -> usize {
+        if !self.draining {
+            return self.drain_runnables_impl(max, true);
+        }
+        if self.park_depth >= 8 {
+            return 0;
+        }
+        self.park_depth += 1;
+        let was = self.draining;
+        self.draining = false;
+        let ran = self.drain_runnables_impl(max, true);
+        self.draining = was;
+        self.park_depth -= 1;
+        ran
+    }
+
+    fn drain_runnables_impl(&mut self, max: usize, workers_only: bool) -> usize {
         if self.draining {
             return 0;
         }
@@ -2574,101 +2729,104 @@ impl Vm {
             self.pending_runnables.push_back((r, on_main));
         }
         self.draining = true;
-        // Host-side async deliveries before guest work: finished coil
-        // image fetches become drawables, and services that stopped
-        // since the last pass get their onDestroy here — not inline
-        // inside their own callback. Runs AFTER the draining flag is
-        // set so a nested drain from a delivered callback early-returns
-        // instead of running an unbounded inner pass.
-        jdk::http::drain_coil(self);
-        jdk::android::drain_jobs(self);
-        // Retry host calls that lost the borrow race during the last
-        // pass — the outer callback has released by now, so the bridge
-        // runs its host-side effects (GuestUi wiring etc.). attach_at
-        // dedupes the dex side it already did via the builtin fallback.
-        self.in_host_retry = true;
-        for (midx, args) in std::mem::take(&mut self.pending_host_retry) {
-            let host = self
-                .hosts
-                .get(&midx)
-                .cloned()
-                .or_else(|| self.host_named(midx).ok().flatten());
-            if let Some(f) = host {
-                if let Ok(mut g) = f.try_borrow_mut() {
-                    let _ = g(self, &args);
+        let dbg = crate::dbg_flag("OVELO_DRAINDBG");
+        if !workers_only {
+            // Host-side async deliveries before guest work: finished coil
+            // image fetches become drawables, and services that stopped
+            // since the last pass get their onDestroy here — not inline
+            // inside their own callback. Runs AFTER the draining flag is
+            // set so a nested drain from a delivered callback early-returns
+            // instead of running an unbounded inner pass.
+            jdk::http::drain_coil(self);
+            jdk::android::drain_jobs(self);
+            jdk::view::drain_toasts(self);
+            // Retry host calls that lost the borrow race during the last
+            // pass — the outer callback has released by now, so the bridge
+            // runs its host-side effects (GuestUi wiring etc.). attach_at
+            // dedupes the dex side it already did via the builtin fallback.
+            self.in_host_retry = true;
+            for (midx, args) in std::mem::take(&mut self.pending_host_retry) {
+                let host = self
+                    .hosts
+                    .get(&midx)
+                    .cloned()
+                    .or_else(|| self.host_named(midx).ok().flatten());
+                if let Some(f) = host {
+                    if let Ok(mut g) = f.try_borrow_mut() {
+                        let _ = g(self, &args);
+                    }
                 }
             }
-        }
-        self.in_host_retry = false;
-        for (holder, cb, tries) in std::mem::take(&mut self.pending_surface) {
-            let (mut sw, mut sh) = surface_holder_size(self, holder);
-            if sw <= 0 || sh <= 0 {
-                if tries < 240 {
-                    // Not laid out yet — retry next tick so the guest
-                    // never builds a projection over a 0x0 surface.
-                    self.pending_surface.push((holder, cb, tries + 1));
-                    continue;
+            self.in_host_retry = false;
+            for (holder, cb, tries) in std::mem::take(&mut self.pending_surface) {
+                let (mut sw, mut sh) = surface_holder_size(self, holder);
+                if sw <= 0 || sh <= 0 {
+                    if tries < 240 {
+                        // Not laid out yet — retry next tick so the guest
+                        // never builds a projection over a 0x0 surface.
+                        self.pending_surface.push((holder, cb, tries + 1));
+                        continue;
+                    }
+                    // View never laid out (hidden SurfaceView etc.) —
+                    // report the window default rather than 0x0.
+                    (sw, sh) = (720, 1280);
                 }
-                // View never laid out (hidden SurfaceView etc.) —
-                // report the window default rather than 0x0.
-                (sw, sh) = (720, 1280);
-            }
-            let wh = V::Ref(holder);
-            if crate::dbg_flag("OVELO_DRAWDBG") {
-                eprintln!("[gldbg] surfaceCreated+Changed h{holder} cb{cb} {sw}x{sh}");
-            }
-            let _ = self.call_virtual(cb, "surfaceCreated", &[wh]);
-            let _ = self.call_virtual(
-                cb,
-                "surfaceChanged",
-                &[wh, V::I32(0), V::I32(sw), V::I32(sh)],
-            );
-            self.surface_sizes.insert(holder, (sw, sh));
-        }
-        // Redispatch `surfaceChanged` on registered holders whose owning
-        // view's size changed (first layout, rotation, ...).
-        for (holder, cb) in std::mem::take(&mut self.surface_cbs) {
-            let (sw, sh) = surface_holder_size(self, holder);
-            if sw > 0 && sh > 0 && self.surface_sizes.get(&holder) != Some(&(sw, sh)) {
-                self.surface_sizes.insert(holder, (sw, sh));
+                let wh = V::Ref(holder);
+                if crate::dbg_flag("OVELO_DRAWDBG") {
+                    eprintln!("[gldbg] surfaceCreated+Changed h{holder} cb{cb} {sw}x{sh}");
+                }
+                let _ = self.call_virtual(cb, "surfaceCreated", &[wh]);
                 let _ = self.call_virtual(
                     cb,
                     "surfaceChanged",
-                    &[V::Ref(holder), V::I32(0), V::I32(sw), V::I32(sh)],
+                    &[wh, V::I32(0), V::I32(sw), V::I32(sh)],
+                );
+                self.surface_sizes.insert(holder, (sw, sh));
+            }
+            // Redispatch `surfaceChanged` on registered holders whose owning
+            // view's size changed (first layout, rotation, ...).
+            for (holder, cb) in std::mem::take(&mut self.surface_cbs) {
+                let (sw, sh) = surface_holder_size(self, holder);
+                if sw > 0 && sh > 0 && self.surface_sizes.get(&holder) != Some(&(sw, sh)) {
+                    self.surface_sizes.insert(holder, (sw, sh));
+                    let _ = self.call_virtual(
+                        cb,
+                        "surfaceChanged",
+                        &[V::Ref(holder), V::I32(0), V::I32(sw), V::I32(sh)],
+                    );
+                }
+                self.surface_cbs.push((holder, cb));
+            }
+            for h in std::mem::take(&mut self.pending_destroy) {
+                let _ = self.call_virtual(h, "onDestroy", &[]);
+            }
+            jdk::view::deliver_attach_callbacks(self);
+            // Choreographer frame callbacks — `drain_runnables` runs once
+            // per frame tick, so a due callback fires on the next pass; one
+            // that reposts itself lands in `frame_callbacks` again (the
+            // Recomposer's loop works exactly that way).
+            let frame_nanos = V::I64(jdk::now_nanos());
+            let due_cbs: Vec<_> = self
+                .frame_callbacks
+                .extract_if(.., |(_, t)| *t <= now)
+                .collect();
+            if dbg && !due_cbs.is_empty() {
+                eprintln!(
+                    "[drain] framecb due={} pending={}",
+                    due_cbs.len(),
+                    self.frame_callbacks.len()
                 );
             }
-            self.surface_cbs.push((holder, cb));
-        }
-        for h in std::mem::take(&mut self.pending_destroy) {
-            let _ = self.call_virtual(h, "onDestroy", &[]);
-        }
-        jdk::view::deliver_attach_callbacks(self);
-        // Choreographer frame callbacks — `drain_runnables` runs once
-        // per frame tick, so a due callback fires on the next pass; one
-        // that reposts itself lands in `frame_callbacks` again (the
-        // Recomposer's loop works exactly that way).
-        let frame_nanos = V::I64(jdk::now_nanos());
-        let due_cbs: Vec<_> = self
-            .frame_callbacks
-            .extract_if(.., |(_, t)| *t <= now)
-            .collect();
-        let dbg = crate::dbg_flag("OVELO_DRAINDBG");
-        if dbg && !due_cbs.is_empty() {
-            eprintln!(
-                "[drain] framecb due={} pending={}",
-                due_cbs.len(),
-                self.frame_callbacks.len()
-            );
-        }
-        for (cb, _) in due_cbs {
-            let before_steps = self.total_steps;
-            let out = self.call_virtual(cb, "doFrame", &[frame_nanos]);
-            if dbg {
-                eprintln!(
-                    "[drain] doFrame h{cb} steps={} out={:?}",
-                    self.total_steps - before_steps,
-                    out
-                );
+            for (cb, _) in due_cbs {
+                let before_steps = self.total_steps;
+                let out = self.call_virtual(cb, "doFrame", &[frame_nanos]);
+                if dbg {
+                    eprintln!(
+                        "[drain] doFrame h{cb} steps={} out={:?}",
+                        self.total_steps - before_steps,
+                        out
+                    );
+                }
             }
         }
         let mut ran = 0usize;
@@ -2678,22 +2836,28 @@ impl Vm {
             // enough main-queue work that a queued IO worker can remain
             // behind it indefinitely. Alternate sides when both are
             // present; fall back to whichever side has work.
-            let preferred = self.pending_runnables.iter().position(|(_, on_main)| {
-                if self.sched_prefer_worker {
-                    !on_main
-                } else {
-                    *on_main
-                }
-            });
-            let idx = preferred.or_else(|| {
-                self.pending_runnables.iter().position(|(_, on_main)| {
+            let idx = if workers_only {
+                self.pending_runnables
+                    .iter()
+                    .position(|(_, on_main)| !on_main)
+            } else {
+                let preferred = self.pending_runnables.iter().position(|(_, on_main)| {
                     if self.sched_prefer_worker {
-                        *on_main
-                    } else {
                         !on_main
+                    } else {
+                        *on_main
                     }
+                });
+                preferred.or_else(|| {
+                    self.pending_runnables.iter().position(|(_, on_main)| {
+                        if self.sched_prefer_worker {
+                            *on_main
+                        } else {
+                            !on_main
+                        }
+                    })
                 })
-            });
+            };
             let Some((r, on_main)) = idx.and_then(|i| self.pending_runnables.remove(i)) else {
                 break;
             };
@@ -2891,28 +3055,30 @@ impl Vm {
                 }
             }
         }
-        // TextClock tick: AOSP reschedules the ticker runnable every
-        // second; the drain cadence is our clock signal. Handles are
-        // re-validated against the class chain — a GC'd slot recycled
-        // for a non-clock object must be dropped, not overwritten.
-        if !self.clock_views.is_empty() {
-            let mut live: Vec<u32> = Vec::with_capacity(self.clock_views.len());
-            for i in 0..self.clock_views.len() {
-                let h = self.clock_views[i];
-                // Same classification the registration site uses —
-                // `jdk::class_of` covers host-backed clocks whose
-                // class_idx is GX_NONE, which `heap.class_of` misses.
-                let is_clock = self.heap.get(h).is_some()
-                    && self.assignable_desc(
-                        &jdk::class_of(self, V::Ref(h)),
-                        "Landroid/widget/TextClock;",
-                    );
-                if is_clock {
-                    live.push(h);
-                    jdk::view::textclock_update(self, h);
+        if !workers_only {
+            // TextClock tick: AOSP reschedules the ticker runnable every
+            // second; the drain cadence is our clock signal. Handles are
+            // re-validated against the class chain — a GC'd slot recycled
+            // for a non-clock object must be dropped, not overwritten.
+            if !self.clock_views.is_empty() {
+                let mut live: Vec<u32> = Vec::with_capacity(self.clock_views.len());
+                for i in 0..self.clock_views.len() {
+                    let h = self.clock_views[i];
+                    // Same classification the registration site uses —
+                    // `jdk::class_of` covers host-backed clocks whose
+                    // class_idx is GX_NONE, which `heap.class_of` misses.
+                    let is_clock = self.heap.get(h).is_some()
+                        && self.assignable_desc(
+                            &jdk::class_of(self, V::Ref(h)),
+                            "Landroid/widget/TextClock;",
+                        );
+                    if is_clock {
+                        live.push(h);
+                        jdk::view::textclock_update(self, h);
+                    }
                 }
+                self.clock_views = live;
             }
-            self.clock_views = live;
         }
         self.draining = false;
         ran
@@ -3176,6 +3342,29 @@ impl Vm {
             Some(V::I32(res)) if res > 0 => Some(self.drawable_for_res(res as u32)),
             _ => None,
         }
+    }
+
+    /// Drop renderer bookkeeping for a finished activity so a later GC can
+    /// reclaim its view tree and activity object.
+    pub fn retire_activity(&mut self, activity: u32) {
+        let content = self.content_views.remove(&activity);
+        let decor = self.decor_roots.remove(&activity);
+        for root in [content, decor].into_iter().flatten() {
+            self.view_roots.retain(|h| *h != root);
+        }
+        self.activity_themes.remove(&activity);
+        self.activity_menu_created.remove(&activity);
+    }
+
+    /// Result code and data recorded by `Activity.setResult`.
+    pub fn activity_result(&self, activity: u32) -> (i32, Option<V>) {
+        (
+            match jdk::pseudo_get(self, activity, jdk::view::P_RESULT_CODE) {
+                Some(v) => jdk::i32v(v),
+                None => 0,
+            },
+            jdk::pseudo_get(self, activity, jdk::view::P_RESULT_INTENT),
+        )
     }
 
     /// Whether the guest called `finish()` on this Activity — remaining
@@ -3645,7 +3834,7 @@ impl Vm {
             }
         };
         if self.depth == 0 {
-            self.drain_runnables(500);
+            self.drain_runnables(8);
         }
         out
     }
@@ -3674,7 +3863,7 @@ impl Vm {
         self.def_loc_of(class_idx).map(|(_, d)| d)
     }
 
-    fn class_data_of(&self, class_idx: GIdx) -> Result<Option<std::rc::Rc<ClassData>>> {
+    pub(crate) fn class_data_of(&self, class_idx: GIdx) -> Result<Option<std::rc::Rc<ClassData>>> {
         match self.def_loc_of(class_idx) {
             Some((cg, d)) => Ok(Some(
                 self.dex_of(cg)
@@ -3949,16 +4138,6 @@ impl Vm {
             // (skipping `RuntimeException` — `catch (RuntimeException)`
             // must not catch these).
             "Ljava/security/GeneralSecurityException;"
-            | "Ljava/security/NoSuchAlgorithmException;"
-            | "Ljava/security/NoSuchProviderException;"
-            | "Ljava/security/InvalidKeyException;"
-            | "Ljava/security/SignatureException;"
-            | "Ljava/security/KeyException;"
-            | "Ljava/security/cert/CertificateException;"
-            | "Ljavax/crypto/BadPaddingException;"
-            | "Ljavax/crypto/IllegalBlockSizeException;"
-            | "Ljavax/crypto/NoSuchPaddingException;"
-            | "Ljavax/crypto/ShortBufferException;"
             | "Ljava/text/ParseException;"
             | "Ljava/lang/instrument/IllegalClassFormatException;"
             | "Ljava/lang/InterruptedException;"
@@ -3975,6 +4154,27 @@ impl Vm {
             | "Ljava/util/zip/DataFormatException;"
             | "Ljava/net/URISyntaxException;"
             | "Landroid/os/RemoteException;" => &[
+                "Ljava/lang/Exception;",
+                "Ljava/lang/Throwable;",
+                "Ljava/lang/Object;",
+            ],
+            "Ljava/security/NoSuchAlgorithmException;"
+            | "Ljava/security/NoSuchProviderException;"
+            | "Ljava/security/SignatureException;"
+            | "Ljava/security/KeyException;"
+            | "Ljava/security/cert/CertificateException;"
+            | "Ljavax/crypto/BadPaddingException;"
+            | "Ljavax/crypto/IllegalBlockSizeException;"
+            | "Ljavax/crypto/NoSuchPaddingException;"
+            | "Ljavax/crypto/ShortBufferException;" => &[
+                "Ljava/security/GeneralSecurityException;",
+                "Ljava/lang/Exception;",
+                "Ljava/lang/Throwable;",
+                "Ljava/lang/Object;",
+            ],
+            "Ljava/security/InvalidKeyException;" => &[
+                "Ljava/security/KeyException;",
+                "Ljava/security/GeneralSecurityException;",
                 "Ljava/lang/Exception;",
                 "Ljava/lang/Throwable;",
                 "Ljava/lang/Object;",
@@ -4106,6 +4306,7 @@ impl Vm {
             | "Ljava/util/SplittableRandom;" => {
                 HostState::Slot(V::I64(0x9E3779B97F4A7C15_u64 as i64))
             }
+            "Ljava/math/BigDecimal;" => HostState::Slot(V::F64(0.0)),
             "Ljava/lang/Integer;"
             | "Ljava/lang/Long;"
             | "Ljava/lang/Short;"
@@ -4170,9 +4371,11 @@ impl Vm {
     /// A named field exposed by a host object (`PackageInfo.versionCode`,
     /// `Message.what`, `Pair.first`…) — read when `iget` misses `fields`.
     fn builtin_ifield(&self, h: u32, f: GIdx) -> Option<V> {
-        let Some(Obj::Host { .. }) = self.heap.get(h) else {
-            return None;
-        };
+        // Framework objects are sometimes materialized as ordinary dex
+        // instances even when their class has no guest implementation
+        // (new Point(); Display.getRealSize(point) is the load-bearing
+        // case). Their builtin named fields must still answer instead of
+        // the type default, or host-side writes remain invisible.
         let d = self.dex_of(f)?;
         let fd = d.field(gl(f)).ok()?;
         let owner = d.type_descriptor(fd.class_idx as u32).ok()?;
@@ -5123,7 +5326,7 @@ impl Vm {
             }
         };
         if self.depth == 0 {
-            self.drain_runnables(500);
+            self.drain_runnables(8);
         }
         out
     }
@@ -5414,11 +5617,27 @@ impl Vm {
                 let m = d.method(gl(loc.midx)).ok()?;
                 d.string(m.name_idx).ok()
             });
-            matches!(md.as_deref(), Some("measureAndLayout" | "applyChanges"))
+            // R8 keeps Compose UI's `$ui`-suffixed overloads under names
+            // such as `measureAndLayout-0kLqBqw`. Those overloads set the
+            // same measure-in-progress bit as the unsuffixed entry point,
+            // so nested frame callbacks must be treated as reentrant too;
+            // otherwise a blocking resource load can enter the delegate a
+            // second time and leave its bit stuck after the guest throws.
+            md.as_deref().is_some_and(|n| {
+                n == "applyChanges"
+                    || n == "measureAndLayout"
+                    || n.starts_with("measureAndLayout-")
+                    || n == "measureOnly"
+                    || n.starts_with("updateRootConstraints")
+            })
         };
         let compose_key = if compose_measure && !matches!(kind, InvokeKind::Static) {
             match args.first() {
-                Some(V::Ref(h)) if *h != 0 => Some((*h, loc.midx)),
+                // The delegate's reentrancy bit is object-wide, while R8
+                // gives its entry points distinct method ids. Normalize
+                // those ids or an outer `measureAndLayout-…` overload fails
+                // to exclude an inner unsuffixed call on the same delegate.
+                Some(V::Ref(h)) if *h != 0 => Some((*h, GX_NONE)),
                 _ => None,
             }
         } else {
@@ -5426,7 +5645,10 @@ impl Vm {
         };
         if compose_key.is_some_and(|key| self.compose_measure_active.contains(&key)) {
             if crate::dbg_flag("OVELO_COMPOSEDBG") {
-                eprintln!("[composedbg] reenter skip key={compose_key:?}");
+                eprintln!(
+                    "[composedbg] reenter skip key={compose_key:?} {}",
+                    self.describe_method(loc.midx)
+                );
             }
             let ret_desc = self
                 .dex_of(loc.midx)
@@ -5448,7 +5670,10 @@ impl Vm {
         }
         if let Some(key) = compose_key {
             if crate::dbg_flag("OVELO_COMPOSEDBG") {
-                eprintln!("[composedbg] push key={key:?}");
+                eprintln!(
+                    "[composedbg] push key={key:?} {}",
+                    self.describe_method(loc.midx)
+                );
             }
             self.compose_measure_active.push(key);
         }
@@ -6268,8 +6493,48 @@ impl Vm {
         Some(v)
     }
 
+    /// Coerce a register value to a field's declared primitive type.
+    pub(crate) fn coerce_field_value(&self, f: GIdx, v: V) -> V {
+        // Reflective writers pass boxed primitives (`Integer`, `Boolean`,
+        // …) while direct `iput` carries the primitive register value.
+        // Primitive dex fields must never retain the box object itself;
+        // object fields still need the original reference.
+        let desc = self.field_type_desc(f);
+        let primitive = matches!(
+            desc.as_deref(),
+            Some("B" | "S" | "I" | "J" | "F" | "D" | "Z" | "C")
+        );
+        if !primitive {
+            return v;
+        }
+        let unboxed = match v {
+            V::Ref(h) if h != 0 => crate::jdk::slot_of(self, h).unwrap_or(v),
+            x => x,
+        };
+        match desc.as_deref() {
+            Some("F") => match unboxed {
+                V::I32(b) => V::F32(f32::from_bits(b as u32)),
+                x => x,
+            },
+            Some("D") => match unboxed {
+                V::I64(b) => V::F64(f64::from_bits(b as u64)),
+                x => x,
+            },
+            Some("J") => match unboxed {
+                V::I32(b) => V::I64(b as i64),
+                x => x,
+            },
+            Some("I" | "B" | "S" | "C" | "Z") => match unboxed {
+                V::I64(x) => V::I32(x as i32),
+                x => x,
+            },
+            _ => unboxed,
+        }
+    }
+
     /// Write a static like the `sput` opcode.
     pub(crate) fn sput_pub(&mut self, f: GIdx, v: V) {
+        let v = self.coerce_field_value(f, v);
         let f = self.canon_field(f);
         let owner = self
             .dex_of(f)
@@ -7316,9 +7581,14 @@ impl Vm {
                         self.describe_method(fr.loc.midx)
                     );
                 }
-                match self.heap.get_mut(h) {
+                let iv = self.coerce_field_value(f, r(0)?);
+                let message_obj = match self.heap.get_mut(h) {
                     Some(Obj::Instance { fields, .. }) | Some(Obj::Host { fields, .. }) => {
-                        fields.insert(f, r(0)?);
+                        fields.insert(f, iv);
+                        matches!(
+                            self.heap.get(h),
+                            Some(Obj::Host { desc, .. }) if desc == "Landroid/os/Message;"
+                        ) && self.dbg_field_name(f) == "Landroid/os/Message;.obj"
                     }
                     _ => {
                         return Err(E::Vm(errd(
@@ -7330,6 +7600,9 @@ impl Vm {
                             ),
                         )))
                     }
+                };
+                if message_obj {
+                    jdk::pseudo_set(self, h, jdk::P_MSG_OBJ, r(0)?);
                 }
             }
             // ---- static fields ----

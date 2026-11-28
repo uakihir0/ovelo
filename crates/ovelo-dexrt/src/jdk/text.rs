@@ -35,7 +35,9 @@ pub(crate) fn call(
     args: &[V],
 ) -> Rt<Option<Option<V>>> {
     match class {
-        "Ljava/text/BreakIterator;" => Ok(breakiter_call(vm, name, args)),
+        "Ljava/text/BreakIterator;" | "Landroid/icu/text/BreakIterator;" => {
+            Ok(breakiter_call(vm, name, args))
+        }
         "Landroid/text/StaticLayout$Builder;" | "Landroid/text/Layout$Builder;" => {
             Ok(builder_call(vm, name, args))
         }
@@ -46,7 +48,15 @@ pub(crate) fn call(
         "Landroid/text/SpannableString;"
         | "Landroid/text/SpannableStringBuilder;"
         | "Landroid/text/Spannable;"
-        | "Landroid/text/Spanned;" => Ok(spannable_call(vm, name, args)),
+        | "Landroid/text/Spanned;"
+        | "Landroid/text/Editable;"
+        | "Landroid/text/GetChars;" => {
+            if name == "getChars" {
+                getchars_call(vm, args)
+            } else {
+                Ok(spannable_call(vm, name, args))
+            }
+        }
         "Landroid/text/Layout$Alignment;" => Ok(align_call(vm, name, args)),
         "Landroid/text/style/CharacterStyle;" => Ok(chstyle_call(name, args)),
         _ => Ok(None),
@@ -113,14 +123,18 @@ fn spannable_call(vm: &mut Vm, name: &str, args: &[V]) -> Option<Option<V>> {
             }
             Some(None)
         }
-        "length" => Some(Some(V::I32(cs_text(vm, this).chars().count() as i32))),
+        "length" => Some(Some(
+            V::I32(cs_text(vm, this).encode_utf16().count() as i32),
+        )),
         "charAt" => {
             let t = cs_text(vm, this);
-            let ix = args.get(1).map(|v| i64v(*v)).unwrap_or(0) as usize;
-            Some(Some(V::I32(t.chars().nth(ix).unwrap_or('\0') as i32)))
+            let ix = args.get(1).map(|v| i64v(*v)).unwrap_or(0).max(0) as usize;
+            Some(Some(V::I32(
+                t.encode_utf16().nth(ix).map(|u| u as i32).unwrap_or(0),
+            )))
         }
         "subSequence" => {
-            let t: Vec<char> = cs_text(vm, this).chars().collect();
+            let t: Vec<u16> = cs_text(vm, this).encode_utf16().collect();
             let (a, b) = (
                 args.get(1).map(|v| i64v(*v)).unwrap_or(0).max(0) as usize,
                 args.get(2)
@@ -130,7 +144,7 @@ fn spannable_call(vm: &mut Vm, name: &str, args: &[V]) -> Option<Option<V>> {
             );
             Some(Some(jstr(
                 vm,
-                &t[a.min(t.len())..b.min(t.len())].iter().collect::<String>(),
+                &String::from_utf16_lossy(&t[a.min(t.len())..b.min(t.len())]),
             )))
         }
         "toString" => Some(Some(jstr(vm, &cs_text(vm, this)))),
@@ -157,6 +171,46 @@ fn spannable_call(vm: &mut Vm, name: &str, args: &[V]) -> Option<Option<V>> {
         }
         _ => None,
     }
+}
+
+/// `GetChars.getChars` — Java indexes and `char[]` elements are UTF-16
+/// code units, so iterating Rust scalar values would split surrogate
+/// pairs and shift every following index.
+fn getchars_call(vm: &mut Vm, args: &[V]) -> Rt<Option<Option<V>>> {
+    let this = match args.first() {
+        Some(&V::Ref(h)) => h,
+        _ => 0,
+    };
+    let units: Vec<u16> = cs_text(vm, this).encode_utf16().collect();
+    let start = args.get(1).map(|v| i32v(*v)).unwrap_or(0);
+    let end = args.get(2).map(|v| i32v(*v)).unwrap_or(0);
+    let dst_start = args.get(4).map(|v| i32v(*v)).unwrap_or(0);
+    let count = end.wrapping_sub(start);
+    let (dst_len, dh) = match args.get(3).copied() {
+        Some(V::Ref(dh)) => match vm.heap.get(dh) {
+            Some(Obj::Array { data, .. }) => (data.len(), dh),
+            _ => (0, 0),
+        },
+        _ => (0, 0),
+    };
+    let bad = start < 0
+        || end < start
+        || end as usize > units.len()
+        || dst_start < 0
+        || count as usize > dst_len.saturating_sub(dst_start.max(0) as usize);
+    if bad {
+        return Err(vm.throw_builtin(
+            "Ljava/lang/IndexOutOfBoundsException;",
+            "getChars range outside text or destination",
+        ));
+    }
+    if let Some(Obj::Array { data, .. }) = vm.heap.get_mut(dh) {
+        let (start, end, dst_start) = (start as usize, end as usize, dst_start as usize);
+        for (i, unit) in units[start..end].iter().enumerate() {
+            data[dst_start + i] = V::I32(*unit as i32);
+        }
+    }
+    Ok(Some(None))
 }
 
 /// `BoringLayout$Metrics` — `width` canon field + pseudo mirror.

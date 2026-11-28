@@ -76,7 +76,7 @@ impl ApkResources {
         // outranks `default`; a bucket with an unknown qualifier, or an
         // understood one that fails, returns 0 and stays a last-seen
         // fallback only for entries with no default.
-        // Device: portrait 360x360dp (what Configuration reports),
+        // Device: portrait 360x640dp (what Configuration reports),
         // API 35, NIGHT mode (Configuration.uiMode reports
         // UI_MODE_NIGHT_YES) — `night` buckets match, `notnight` fail.
         // Matched-key precedence follows AOSP: smallestScreenWidth >
@@ -105,7 +105,7 @@ impl ApkResources {
                 } else if let Some(n) = num(part, "h", "dp") {
                     has_h = 1;
                     h = n as i64;
-                    n <= 360
+                    n <= 640
                 } else if let Some(n) = part.strip_prefix('v').and_then(|s| s.parse::<u32>().ok()) {
                     n <= 35
                 } else {
@@ -519,7 +519,7 @@ impl ApkResources {
     }
 
     /// res_id → decoded `TYPE_DIMENSION`/`TYPE_FRACTION` value scaled to
-    /// px (density 2.0, matching the `scaledDensity` stub), or plain
+    /// px (density 1.0, matching the `scaledDensity` stub), or plain
     /// numeric data for int/float values. `TYPE_REFERENCE` aliases are
     /// chased — a `<dimen>` may point at another entry; a chain that
     /// lands on a non-numeric type means the id isn't a dimension and
@@ -558,9 +558,9 @@ fn complex_to_float(data: u32) -> f32 {
 }
 
 /// A `Res_value` as px-ish float: dimensions/fractions decode through
-/// `complexToFloat` scaled by unit (density 2.0), ints/floats cast.
+/// `complexToFloat` scaled by unit (density 1.0), ints/floats cast.
 pub fn typed_px(v: &EntryValue) -> f32 {
-    const DENSITY: f32 = 2.0;
+    const DENSITY: f32 = 1.0;
     match v.data_type {
         0x05 => {
             // TYPE_DIMENSION: px=1, dip/sp=density, pt/in/mm scaled.

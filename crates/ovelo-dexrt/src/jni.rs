@@ -815,7 +815,19 @@ fn sig_return(sig: &str) -> String {
 fn call_obj(obj: u64, mid: u64, args: &[V], is_static: bool) -> Option<V> {
     let g = mid_of(mid)?;
     let mut v = vm();
-    if let Some((owner, name, _)) = named_of(g) {
+    if let Some((owner, name, sig)) = named_of(g) {
+        if !is_static && name == "<init>" {
+            // Constructor overloads commonly share arity (`String(String)`
+            // and `String(byte[])`), so the by-name compatibility fallback
+            // must keep the JNI signature instead of re-resolving loosely.
+            let mut a = Vec::with_capacity(args.len() + 1);
+            a.push(V::Ref(obj as u32));
+            a.extend_from_slice(args);
+            return jdk::call(&mut v, &owner, &name, &sig, &a)
+                .ok()
+                .flatten()
+                .flatten();
+        }
         let res = if is_static {
             v.call_static_named(&owner, &name, args.to_vec())
         } else {

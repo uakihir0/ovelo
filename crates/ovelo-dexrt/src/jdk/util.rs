@@ -2,13 +2,40 @@
 //! service loader, stream stubs.
 
 use super::*;
-use crate::value::{HostState, V};
+use crate::value::{HostState, Obj, V};
+
+fn stream_items(vm: &Vm, v: V) -> Vec<V> {
+    match v {
+        V::Ref(h) => match vm.heap.get(h) {
+            Some(Obj::Host {
+                state: HostState::List(items),
+                ..
+            }) => items.clone(),
+            _ => vec![],
+        },
+        _ => vec![],
+    }
+}
+
+fn stream_obj(vm: &mut Vm, items: Vec<V>) -> V {
+    host(vm, "Ljava/util/stream/Stream;", HostState::List(items))
+}
+
+fn i64num(v: V) -> i64 {
+    match v {
+        V::I32(i) => i as i64,
+        V::I64(i) => i,
+        V::F32(f) => f as i64,
+        V::F64(f) => f as i64,
+        _ => 0,
+    }
+}
 
 pub(crate) fn call(
     vm: &mut Vm,
     class: &str,
     name: &str,
-    _sig: &str,
+    sig: &str,
     args: &[V],
 ) -> Rt<Option<Option<V>>> {
     Ok(
@@ -88,11 +115,14 @@ pub(crate) fn call(
             || class == "Ljava/util/concurrent/CompletableFuture;"
         {
             match name {
-                "iterator" => Some(Some(host(
-                    vm,
-                    "Ljava/util/Iterator;",
-                    HostState::Iter(std::rc::Rc::new(vec![]), 0),
-                ))),
+                "iterator" => {
+                    let items = stream_items(vm, args.first().copied().unwrap_or(V::Ref(0)));
+                    Some(Some(host(
+                        vm,
+                        "Ljava/util/Iterator;",
+                        HostState::Iter(std::rc::Rc::new(items), 0),
+                    )))
+                }
                 "load" | "loadInstalled" | "stream" => {
                     Some(Some(host(vm, class, HostState::Empty)))
                 }
@@ -102,21 +132,113 @@ pub(crate) fn call(
                 | "min" | "max" | "sorted" | "distinct" | "limit" | "skip" | "peek" | "onClose"
                 | "close" | "isParallel" | "sequential" | "parallel" | "unordered"
                 | "iterator0" | "spliterator" => {
-                    if matches!(
-                        name,
-                        "count" | "anyMatch" | "allMatch" | "noneMatch" | "isParallel"
-                    ) {
-                        Some(Some(V::I32(0)))
-                    } else if matches!(name, "toArray" | "toList") {
-                        Some(Some(host(vm, "Ljava/util/List;", HostState::List(vec![]))))
-                    } else if matches!(name, "findFirst" | "findAny" | "min" | "max") {
-                        Some(Some(host(
+                    let this = args.first().copied().unwrap_or(V::Ref(0));
+                    let items = stream_items(vm, this);
+                    match name {
+                        "forEach" | "forEachOrdered" | "peek" => {
+                            if let Some(V::Ref(consumer)) = args.get(1).copied() {
+                                for item in items.iter().copied() {
+                                    vm.call_virtual_rt(consumer, "accept", &[item])?;
+                                }
+                            }
+                            if name == "peek" {
+                                Some(Some(stream_obj(vm, items)))
+                            } else {
+                                Some(None)
+                            }
+                        }
+                        "filter" => {
+                            let mut out = Vec::new();
+                            if let Some(V::Ref(pred)) = args.get(1).copied() {
+                                for item in items {
+                                    let keep = vm
+                                        .call_virtual_rt(pred, "test", &[item])?
+                                        .map(|v| i32v(v) != 0)
+                                        .unwrap_or(false);
+                                    if keep {
+                                        out.push(item);
+                                    }
+                                }
+                            }
+                            Some(Some(stream_obj(vm, out)))
+                        }
+                        "map" | "mapToInt" | "mapToLong" | "mapToDouble" | "flatMap" => {
+                            let mut out = Vec::new();
+                            if let Some(V::Ref(f)) = args.get(1).copied() {
+                                for item in items {
+                                    if let Some(mapped) = vm.call_virtual_rt(f, "apply", &[item])? {
+                                        if name == "flatMap" {
+                                            out.extend(stream_items(vm, mapped));
+                                        } else {
+                                            out.push(mapped);
+                                        }
+                                    }
+                                }
+                            }
+                            Some(Some(stream_obj(vm, out)))
+                        }
+                        "limit" => {
+                            let n =
+                                i64num(args.get(1).copied().unwrap_or(V::I64(0))).max(0) as usize;
+                            Some(Some(stream_obj(vm, items.into_iter().take(n).collect())))
+                        }
+                        "skip" => {
+                            let n =
+                                i64num(args.get(1).copied().unwrap_or(V::I64(0))).max(0) as usize;
+                            Some(Some(stream_obj(vm, items.into_iter().skip(n).collect())))
+                        }
+                        "count" => Some(Some(V::I64(items.len() as i64))),
+                        "toList" => {
+                            Some(Some(host(vm, "Ljava/util/List;", HostState::List(items))))
+                        }
+                        "toArray" => Some(Some(arr(vm, "Ljava/lang/Object;", items))),
+                        "findFirst" | "findAny" => {
+                            let v = items.first().copied().unwrap_or(V::Ref(0));
+                            Some(Some(host(vm, "Ljava/util/Optional;", HostState::Slot(v))))
+                        }
+                        "anyMatch" | "allMatch" | "noneMatch" => {
+                            let mut yes = 0usize;
+                            let mut total = 0usize;
+                            if let Some(V::Ref(pred)) = args.get(1).copied() {
+                                for item in items {
+                                    total += 1;
+                                    if vm
+                                        .call_virtual_rt(pred, "test", &[item])?
+                                        .map(|v| i32v(v) != 0)
+                                        .unwrap_or(false)
+                                    {
+                                        yes += 1;
+                                    }
+                                }
+                            }
+                            let r = if name == "anyMatch" {
+                                yes != 0
+                            } else if name == "allMatch" {
+                                yes == total
+                            } else {
+                                yes == 0
+                            };
+                            Some(Some(V::I32(r as i32)))
+                        }
+                        "iterator0" => Some(Some(host(
                             vm,
-                            "Ljava/util/Optional;",
-                            HostState::Slot(V::Ref(0)),
-                        )))
-                    } else {
-                        Some(Some(args[0]))
+                            "Ljava/util/Iterator;",
+                            HostState::Iter(std::rc::Rc::new(items), 0),
+                        ))),
+                        "isParallel" => Some(Some(V::I32(0))),
+                        "close" | "onClose" | "sequential" | "parallel" | "unordered"
+                        | "sorted" | "distinct" => Some(Some(args[0])),
+                        "min" | "max" | "reduce" | "collect" | "spliterator" => {
+                            if matches!(name, "min" | "max") {
+                                let v = items.first().copied().unwrap_or(V::Ref(0));
+                                Some(Some(host(vm, "Ljava/util/Optional;", HostState::Slot(v))))
+                            } else if name == "reduce" && items.len() == 1 {
+                                Some(Some(items[0]))
+                            } else {
+                                Some(Some(args[0]))
+                            }
+                        }
+                        _ => Some(Some(args[0])),
                     }
                 }
                 "of" | "empty" | "concat" | "builder" | "generate" | "iterate" | "range"
@@ -159,9 +281,86 @@ pub(crate) fn call(
                             | "completeExceptionally"
                             | "cancel"
                     ) {
-                        Some(Some(V::I32(matches!(name, "isDone") as i32)))
+                        let done = args.first().and_then(|v| match v {
+                            V::Ref(h) => pseudo_get(vm, *h, P_FUTURE_DONE),
+                            _ => None,
+                        });
+                        Some(Some(V::I32(match (name, done) {
+                            ("isDone", Some(v)) => i32v(v),
+                            ("isDone", None) => 1,
+                            _ => 0,
+                        })))
                     } else if name == "complete" {
                         Some(Some(V::I32(1)))
+                    } else if matches!(name, "get" | "join" | "getNow") {
+                        if let Some(V::Ref(h)) = args.first() {
+                            // ExecutorService.submit futures start pending.
+                            // `get` blocks in Java; pump the cooperative
+                            // scheduler for a bounded interval so the queued
+                            // wrapper can complete before reading the slot.
+                            let timeout_ms =
+                                if sig == "(JLjava/util/concurrent/TimeUnit;)Ljava/lang/Object;" {
+                                    let unit =
+                                        lang::enum_ordinal(vm, *args.get(2).unwrap_or(&V::Ref(0)));
+                                    let d = i64v(args.get(1).copied().unwrap_or(V::I64(0)));
+                                    match unit {
+                                        0 => d / 1_000_000,
+                                        1 => d / 1_000,
+                                        2 => d,
+                                        3 => d.saturating_mul(1_000),
+                                        4 => d.saturating_mul(60_000),
+                                        5 => d.saturating_mul(3_600_000),
+                                        6 => d.saturating_mul(86_400_000),
+                                        _ => d,
+                                    }
+                                } else {
+                                    i64::MAX
+                                };
+                            if timeout_ms == 0 {
+                                if matches!(pseudo_get(vm, *h, P_FUTURE_DONE), Some(V::I32(0))) {
+                                    return Err(vm.throw_builtin(
+                                        "Ljava/util/concurrent/TimeoutException;",
+                                        "future not complete",
+                                    ));
+                                }
+                            } else {
+                                let wait_ms = if sig == "()Ljava/lang/Object;" {
+                                    1_000
+                                } else {
+                                    timeout_ms.max(0)
+                                };
+                                let deadline = now_ms().saturating_add(wait_ms);
+                                loop {
+                                    if !matches!(pseudo_get(vm, *h, P_FUTURE_DONE), Some(V::I32(0)))
+                                    {
+                                        break;
+                                    }
+                                    if now_ms() >= deadline {
+                                        if sig != "()Ljava/lang/Object;" {
+                                            return Err(vm.throw_builtin(
+                                                "Ljava/util/concurrent/TimeoutException;",
+                                                "future not complete",
+                                            ));
+                                        }
+                                        break;
+                                    }
+                                    if vm.drain_worker_runnables(16) == 0 {
+                                        if sig == "()Ljava/lang/Object;" {
+                                            break;
+                                        }
+                                        std::thread::sleep(std::time::Duration::from_millis(1));
+                                    }
+                                }
+                            }
+                        }
+                        if let Some(v) = args.first().and_then(|v| match v {
+                            V::Ref(h) => slot_of(vm, *h),
+                            _ => None,
+                        }) {
+                            Some(Some(v))
+                        } else {
+                            Some(Some(args[0]))
+                        }
                     } else {
                         Some(Some(args[0]))
                     }

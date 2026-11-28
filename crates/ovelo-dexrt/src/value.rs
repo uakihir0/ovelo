@@ -115,10 +115,35 @@ pub enum HostState {
     Millis(i64),
     /// One mutable slot (`Atomic*` holders, boxed primitives).
     Slot(V),
+    /// A `java.util.UUID` as most/least significant bits.
+    Uuid {
+        /// Most significant 64 bits.
+        msb: i64,
+        /// Least significant 64 bits.
+        lsb: i64,
+    },
     /// A filesystem path (`java.io.File`).
     Path(String),
     /// A streaming `java.security.MessageDigest`.
     Digest(Box<DigestState>),
+    /// A `javax.crypto.Mac`: algorithm plus the key/data inputs. The
+    /// concrete HMAC is computed at doFinal so one state type covers all
+    /// digest widths.
+    Mac {
+        /// JCA algorithm name.
+        algorithm: String,
+        /// Initialized key bytes; empty means uninitialized.
+        key: Vec<u8>,
+        /// Buffered input bytes.
+        data: Vec<u8>,
+    },
+    /// Raw key bytes (`javax.crypto.spec.SecretKeySpec`).
+    Key {
+        /// JCA key algorithm.
+        algorithm: String,
+        /// Encoded key bytes.
+        bytes: Vec<u8>,
+    },
     /// A regex pattern string (`java.util.regex.Pattern`).
     Regex(String),
     /// A readable byte stream (`InputStream` over real bytes — raw
@@ -175,6 +200,8 @@ pub enum HostState {
     /// `View.onDraw` append [`CanvasOp`]s the host view materializer
     /// replays into the real surface.
     CanvasOps(Vec<CanvasOp>),
+    /// An `android.util.JsonReader` cursor.
+    JsonReader(Box<JsonReaderState>),
 }
 
 /// One absolute `android.graphics.Path` command. Relative path methods
@@ -239,6 +266,11 @@ pub enum CanvasOp {
         dx: f32,
         /// Vertical shift px.
         dy: f32,
+    },
+    /// Affine matrix concat/scale/rotate/skew (`[a,b,c,d,e,f]`).
+    Matrix {
+        /// Row-major affine coefficients.
+        m: [f32; 6],
     },
     /// `clipRect(l, t, r, b)` (intersect).
     ClipRect {
@@ -380,6 +412,55 @@ pub enum CanvasOp {
         /// `RenderNode` heap handle.
         node: u32,
     },
+}
+
+/// Parsed JSON value for `android.util.JsonReader`.
+#[derive(Debug, Clone)]
+pub enum JsonValue {
+    /// Object entries in document order.
+    Obj(Vec<(String, JsonValue)>),
+    /// Array items in document order.
+    Arr(Vec<JsonValue>),
+    /// JSON string.
+    Str(String),
+    /// JSON number.
+    Num(f64),
+    /// JSON boolean.
+    Bool(bool),
+    /// JSON null.
+    Null,
+}
+
+/// Traversal frame for a materialized JSON object/array.
+#[derive(Debug, Clone)]
+pub enum JsonFrame {
+    /// Object cursor; `pending` is the entry whose name was returned.
+    Obj {
+        /// Entries in document order.
+        entries: Vec<(String, JsonValue)>,
+        /// Next unnamed entry.
+        idx: usize,
+        /// Name already consumed, value not yet consumed.
+        pending: Option<usize>,
+    },
+    /// Array cursor.
+    Arr {
+        /// Items in document order.
+        items: Vec<JsonValue>,
+        /// Next item.
+        idx: usize,
+    },
+}
+
+/// Streaming-API cursor over a fully parsed JSON document.
+#[derive(Debug, Clone)]
+pub struct JsonReaderState {
+    /// Document root.
+    pub root: JsonValue,
+    /// Open object/array frames.
+    pub stack: Vec<JsonFrame>,
+    /// Whether the root value was consumed.
+    pub root_used: bool,
 }
 
 /// Snapshot of a `Paint` object's state at draw time.

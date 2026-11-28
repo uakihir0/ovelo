@@ -308,6 +308,59 @@ pub struct GuestUi {
     /// True once the guest set a real `GuestView` content view — the
     /// dex-tree renderer must not clobber it.
     guest_content_set: bool,
+    /// Per-handle Compose-view probe cache; repeating the class walk for
+    /// every non-GL view on every frame dominates media playback CPU.
+    compose_cache: HashMap<u32, bool>,
+    /// Per-handle GL-renderer probe cache, and the generation at which a
+    /// scan found no pumpable GL/Compose view. Idle non-GL apps then skip
+    /// this whole per-view scan instead of paying it for every frame.
+    gl_cache: HashMap<u32, bool>,
+    gl_probe_gen: u64,
+    gl_active: bool,
+    /// View constructor bindings deferred because guest code created the
+    /// view while this bridge was already borrowed. The queue itself is
+    /// outside the GuestUi borrow so the constructor callback can always
+    /// enqueue; refresh drains it once host mutations are safe.
+    ctor_pending: Rc<RefCell<VecDeque<PendingCtor>>>,
+}
+
+type CtorMake = Rc<dyn Fn(&GuestUi) -> GuestView>;
+type PendingCtor = (u32, CtorMake);
+
+fn ctor_view_for(vm: &Vm, ui: &GuestUi, make: &CtorMake, this: u32) -> GuestView {
+    let mut gv = make(ui);
+    // Framework constructor references often resolve to an inherited
+    // platform owner (`new EditText` reaches `View.<init>`), losing the
+    // concrete widget kind. The receiver still knows its real class, so
+    // never leave a TextView/ViewGroup subclass bound as a Plain view.
+    if matches!(gv, GuestView::Plain(_)) {
+        if let Some(desc) = vm.class_descriptor_of(this) {
+            if vm.extends_named(&desc, "Button") {
+                gv = GuestView::Btn(Button::new(
+                    "",
+                    16.0,
+                    Color::srgb(0x20, 0x20, 0x20),
+                    ui.fonts.clone(),
+                ));
+            } else if vm.extends_named(&desc, "TextView") {
+                gv = GuestView::Text(TextView::new(
+                    "",
+                    16.0,
+                    Color::srgb(0x20, 0x20, 0x20),
+                    ui.fonts.clone(),
+                ));
+            } else if vm.extends_named(&desc, "FrameLayout")
+                || vm.extends_named(&desc, "RelativeLayout")
+                || vm.extends_named(&desc, "AbsoluteLayout")
+                || vm.extends_named(&desc, "ScrollView")
+            {
+                gv = GuestView::Group(ViewGroup::overlay(Length::MatchParent, Length::MatchParent));
+            } else if vm.extends_named(&desc, "ViewGroup") {
+                gv = GuestView::Group(ViewGroup::new(Length::MatchParent, Length::WrapContent));
+            }
+        }
+    }
+    gv
 }
 
 fn argb(c: i32) -> Color {
@@ -501,7 +554,31 @@ impl GuestUi {
             dex_attached: HashSet::new(),
             attach_pending: Vec::new(),
             guest_content_set: false,
+            compose_cache: HashMap::new(),
+            gl_cache: HashMap::new(),
+            gl_probe_gen: u64::MAX,
+            gl_active: false,
+            ctor_pending: Rc::new(RefCell::new(VecDeque::new())),
         }))
+    }
+
+    /// Bind views whose constructors ran while the bridge was borrowed.
+    /// Without this, a programmatically created embedded Compose view is
+    /// present in the dex tree but has no host view object for the frame
+    /// pump, so its composition never records draw operations.
+    pub fn drain_pending_ctors(&mut self, vm: &Vm) {
+        let q = self.ctor_pending.clone();
+        while let Some((this, make)) = q.borrow_mut().pop_front() {
+            let upgrade = self
+                .views
+                .get(&this)
+                .map(|rc| matches!(*rc.borrow(), GuestView::Plain(_)))
+                .unwrap_or(false);
+            if upgrade || !self.views.contains_key(&this) {
+                let gv = ctor_view_for(vm, self, &make, this);
+                self.views.insert(this, Rc::new(RefCell::new(gv)));
+            }
+        }
     }
 
     /// `(listener, view)` pairs queued by click listeners — pump them
@@ -557,7 +634,19 @@ impl GuestUi {
             "Landroidx/compose/ui/graphics/InlineClassHelperKt;",
             "throwIllegalArgumentException",
             "(Ljava/lang/String;)V",
-            Rc::new(RefCell::new(|_vm: &mut Vm, _a: &[V]| Ok(None))) as HostCall,
+            Rc::new(RefCell::new(|vm: &mut Vm, a: &[V]| {
+                if std::env::var_os("OVELO_COMPOSEDBG").is_some() {
+                    let msg = match a.first() {
+                        Some(V::Ref(h)) => match vm.heap().get(*h) {
+                            Some(ovelo_dexrt::Obj::Str(s)) => s.clone(),
+                            _ => format!("{:?}", a.first()),
+                        },
+                        other => format!("{other:?}"),
+                    };
+                    eprintln!("[composedbg] suppressed compose error: {msg}");
+                }
+                Ok(None)
+            })) as HostCall,
         );
         // Fragment host callbacks are only partially modeled; once a
         // fragment transaction reaches onGetLayoutInflater, returning
@@ -602,7 +691,19 @@ impl GuestUi {
             "Landroidx/compose/runtime/ComposerKt;",
             "composeImmediateRuntimeError",
             "(Ljava/lang/String;)V",
-            Rc::new(RefCell::new(|_vm: &mut Vm, _a: &[V]| Ok(None))) as HostCall,
+            Rc::new(RefCell::new(|vm: &mut Vm, a: &[V]| {
+                if std::env::var_os("OVELO_COMPOSEDBG").is_some() {
+                    let msg = match a.first() {
+                        Some(V::Ref(h)) => match vm.heap().get(*h) {
+                            Some(ovelo_dexrt::Obj::Str(s)) => s.clone(),
+                            _ => format!("{:?}", a.first()),
+                        },
+                        other => format!("{other:?}"),
+                    };
+                    eprintln!("[composedbg] suppressed compose error: {msg}");
+                }
+                Ok(None)
+            })) as HostCall,
         );
         // ---- constructors -------------------------------------------------
         Self::ctor(ui, vm, "Landroid/view/View;", |_ui| {
@@ -763,9 +864,15 @@ impl GuestUi {
                     // Look up then materialize in two statements — the
                     // `or_else` closure would run `borrow_mut` while the
                     // `borrow` temporary is still live and panic.
-                    let mut cv = ui.borrow().views.get(&child).cloned();
+                    let mut cv = ui
+                        .try_borrow()
+                        .ok()
+                        .and_then(|ui| ui.views.get(&child).cloned());
                     if cv.is_none() {
-                        cv = ui.borrow_mut().materialize_dex(vm, child);
+                        cv = ui
+                            .try_borrow_mut()
+                            .ok()
+                            .and_then(|mut ui| ui.materialize_dex(vm, child));
                     }
                     let Some(cv) = cv else {
                         return Ok(z_ret);
@@ -775,16 +882,17 @@ impl GuestUi {
                     // either kind must accept the child or rows added
                     // to a dex group (RecyclerView's attachViewToParent)
                     // orphan the whole subtree.
-                    let Some(rc) = ui
-                        .borrow()
-                        .views
-                        .get(&this)
-                        .cloned()
-                        .or_else(|| ui.borrow().dex_views.get(&this).cloned())
-                    else {
+                    let Some(rc) = ui.try_borrow().ok().and_then(|ui| {
+                        ui.views
+                            .get(&this)
+                            .cloned()
+                            .or_else(|| ui.dex_views.get(&this).cloned())
+                    }) else {
                         return Ok(z_ret);
                     };
-                    let mut g = rc.borrow_mut();
+                    let Ok(mut g) = rc.try_borrow_mut() else {
+                        return Ok(z_ret);
+                    };
                     let GuestView::Group(gr) = &mut *g else {
                         return Ok(z_ret);
                     };
@@ -858,7 +966,14 @@ impl GuestUi {
                         // outside the ui borrow since onViewRemoved is
                         // guest code re-entering bridged methods.
                         vm.view_tree_detach(this, child, notify);
-                        let ui = ui.borrow();
+                        // Guest detach callbacks can run while the frame pump
+                        // already holds the UI bridge. The dex tree has been
+                        // updated above, so the next refresh can rebuild the
+                        // host side; skipping only this eager physical removal
+                        // is preferable to panicking across the reentrant call.
+                        let Ok(ui) = ui.try_borrow() else {
+                            return Ok(None);
+                        };
                         let Some(cv) = ui
                             .views
                             .get(&child)
@@ -897,10 +1012,16 @@ impl GuestUi {
                 {
                     vm.view_tree_detach(this, c, true);
                 }
-                if let Some(rc) = ui.borrow().views.get(&this).cloned() {
-                    if let GuestView::Group(gr) = &mut *rc.borrow_mut() {
-                        gr.children.clear();
-                        gr.view.invalidate();
+                if let Some(rc) = ui
+                    .try_borrow()
+                    .ok()
+                    .and_then(|ui| ui.views.get(&this).cloned())
+                {
+                    if let Ok(mut g) = rc.try_borrow_mut() {
+                        if let GuestView::Group(gr) = &mut *g {
+                            gr.children.clear();
+                            gr.view.invalidate();
+                        }
                     }
                 }
                 Ok(None)
@@ -922,7 +1043,9 @@ impl GuestUi {
                 // dex view tree both need it. Outside the ui borrow:
                 // inflation and onViewAdded are guest code.
                 vm.view_set_content(activity, v);
-                let mut ui = ui.borrow_mut();
+                let Ok(mut ui) = ui.try_borrow_mut() else {
+                    return Ok(None);
+                };
                 if let Some(cv) = ui.views.get(&v).cloned() {
                     ui.guest_content_set = true;
                     if viewdbg() {
@@ -1027,9 +1150,30 @@ impl GuestUi {
                         _ => return Err(crate::err("guest.arg.type")),
                     };
                     let mut g = rc.borrow_mut();
-                    let tv = g
-                        .text_mut()
-                        .ok_or_else(|| crate::err("guest.setText.not_text"))?;
+                    let kind = match &*g {
+                        GuestView::Plain(_) => "plain",
+                        GuestView::Text(_) => "text",
+                        GuestView::Btn(_) => "button",
+                        GuestView::Group(_) => "group",
+                    };
+                    if g.text_mut().is_none() {
+                        // Constructor resolution can bind a framework widget
+                        // through its inherited View.<init> as Plain. Reaching
+                        // TextView.setText is itself proof that the receiver is
+                        // text-capable, so repair the host object rather than
+                        // failing guest code for that binding artifact.
+                        *g = GuestView::Text(TextView::new(
+                            "",
+                            16.0,
+                            Color::srgb(0x20, 0x20, 0x20),
+                            ui.fonts.clone(),
+                        ));
+                    }
+                    let tv = g.text_mut().ok_or_else(|| {
+                        let desc = vm.class_descriptor_of(this).unwrap_or_else(|| "?".into());
+                        crate::err("guest.setText.not_text")
+                            .with_detail(format!("h{this} {desc} kind={kind}"))
+                    })?;
                     tv.set_text(text);
                     ovelo_dexrt::mark_layout_requested(vm, this);
                     Ok(None)
@@ -1129,6 +1273,12 @@ impl GuestUi {
         }
     }
 
+    /// Force the next dex-tree refresh to rematerialize even when the root
+    /// handle is unchanged — activity switches replace which tree is current.
+    pub fn invalidate_dex_tree(&mut self) {
+        self.dex_gen_seen = u64::MAX;
+    }
+
     /// Materialize the Activity's dex view tree (from `setContentView(res)`
     /// inflation) into real host views and hang it under the root — the
     /// renderer for apps that build UI from layout xml rather than
@@ -1141,6 +1291,7 @@ impl GuestUi {
         // changes, so pump it every tick: for materialized dex views
         // AND for bridged `new` views (guest_content_set apps like
         // 2048 whose whole UI is a bridged GLSurfaceView).
+        self.drain_pending_ctors(vm);
         vm.sync_decor_frames(self.root.w, self.root.h);
         self.pump_gl_frames(vm);
         if self.guest_content_set {
@@ -1220,6 +1371,10 @@ impl GuestUi {
     /// view-tree generation changes. Covers both the materialized dex
     /// tree (`dex_views`) and bridged `new` views (`views`).
     fn pump_gl_frames(&mut self, vm: &mut Vm) {
+        if !self.gl_active && self.gl_probe_gen == vm.view_gen {
+            return;
+        }
+        let mut any_active = false;
         // Push host-computed bounds back onto the dex view objects:
         // `getWidth()`/`getHeight()` read the dex-side frame, which the
         // host layout engine never ran `layout()` to set (Korge's GL
@@ -1256,10 +1411,19 @@ impl GuestUi {
                     rc.borrow_mut().view_mut().measured
                 );
             }
-            let compose_view = vm.dbg_class_of(h).contains("/compose/ui/platform/");
-            if !vm.has_gl_renderer(h) && !compose_view {
+            let has_gl = *self
+                .gl_cache
+                .entry(h)
+                .or_insert_with(|| vm.has_gl_renderer(h));
+            let compose_view = !has_gl
+                && *self
+                    .compose_cache
+                    .entry(h)
+                    .or_insert_with(|| vm.dbg_class_contains(h, "/compose/ui/platform/"));
+            if !has_gl && !compose_view {
                 continue;
             }
+            any_active = true;
             let (w, hh) = if self.dex_views.contains_key(&h) {
                 // Materialized node: must still be mounted, and its
                 // size comes from the dex-side frame.
@@ -1361,6 +1525,8 @@ impl GuestUi {
             // traversal skips the draw entirely.
             v.invalidate();
         }
+        self.gl_active = any_active;
+        self.gl_probe_gen = vm.view_gen;
     }
 
     fn materialize_dex(&mut self, vm: &mut Vm, h: u32) -> Option<Rc<RefCell<GuestView>>> {
@@ -1368,7 +1534,7 @@ impl GuestUi {
         let mut info = vm.dex_view(h)?;
         if viewdbg() {
             eprintln!(
-                "[viewdbg] node {} h{h} vis={} kids={} text={:?} frame={:?} tc={:?} bg={:?} lp={}x{}",
+                "[viewdbg] node {} h{h} vis={} kids={} text={:?} frame={:?} tc={:?} bg={:?} lp={}x{} img={:?}",
                 info.desc,
                 info.visible as u8,
                 info.children.len(),
@@ -1378,6 +1544,7 @@ impl GuestUi {
                 info.bg_color,
                 info.lp_w,
                 info.lp_h,
+                info.image.as_ref().map(|(w,h,_)| (w,h)),
             );
         }
         // First attach to the window: AOSP's dispatchAttachedToWindow
@@ -1419,11 +1586,30 @@ impl GuestUi {
         // x=0 — an overlapping pile at the parent origin), so keep
         // the last good ops until a frame lands.
         vm.dump_node_tree(h);
-        let capture = ow > 0 && oh > 0 && !vm.compose_measure_active(h);
-        let ops = capture.then(|| {
-            let raw = vm.guest_draw_ops_raw(h, ow, oh);
-            (raw.clone(), vm.expand_display_list_ops(&raw))
-        });
+        let valid_size = ow > 0 && oh > 0 && !vm.compose_measure_active(h);
+        let cur_seq = vm.view_invalid_seq(h);
+        let (cached_raw, cached_seq, cached_size) = {
+            let g = rc.borrow();
+            (
+                g.view().raw_custom_ops.clone(),
+                g.view().raw_custom_ops_seq,
+                g.view().raw_custom_ops_size,
+            )
+        };
+        let cache_fresh = cached_seq == cur_seq && cached_size == (ow, oh);
+        let capture = valid_size && !cache_fresh;
+        let ops = if capture {
+            let raw = Rc::new(vm.guest_draw_ops_raw(h, ow, oh));
+            let expanded = vm.expand_display_list_ops(&raw);
+            Some((raw, expanded, true))
+        } else if valid_size {
+            cached_raw.map(|raw| {
+                let expanded = vm.expand_display_list_ops(&raw);
+                (raw, expanded, false)
+            })
+        } else {
+            None
+        };
         // Guest onDraw may itself call setters such as setTextColor.
         // `info` was snapshotted before that guest code ran; refresh it
         // or this materialize writes the pre-draw color back and the
@@ -1445,14 +1631,16 @@ impl GuestUi {
         // `g` borrows the view object while `self.materialize_dex`
         // recurses into children — different cells, no aliasing.
         update_dex_view(&mut g, &info);
-        if let Some((raw_ops, ops)) = ops {
-            g.view_mut().raw_custom_ops = if raw_ops.is_empty() {
+        if let Some((raw_ops, ops, recaptured)) = ops {
+            let v = g.view_mut();
+            v.raw_custom_ops = if raw_ops.is_empty() {
                 None
             } else {
-                Some(Rc::new(raw_ops))
+                Some(raw_ops)
             };
-            g.view_mut().raw_custom_ops_seq = vm.view_invalid_seq(h);
-            g.view_mut().custom_ops = if ops.is_empty() {
+            v.raw_custom_ops_seq = vm.view_invalid_seq(h);
+            v.raw_custom_ops_size = (ow, oh);
+            v.custom_ops = if ops.is_empty() {
                 None
             } else {
                 Some(Rc::new(ops))
@@ -1461,7 +1649,9 @@ impl GuestUi {
             // onDraw runs during materialize, mid-traversal) must mark
             // the view dirty or the frame that carries them never
             // repaints — the window stays at its clear color.
-            g.view_mut().invalidate();
+            if recaptured {
+                v.invalidate();
+            }
         }
         if let GuestView::Group(gr) = &mut *g {
             let mut kids: Vec<Box<dyn Drawable>> = Vec::new();
@@ -1529,6 +1719,8 @@ impl GuestUi {
         make: impl Fn(&GuestUi) -> GuestView + 'static,
     ) {
         let ui2 = ui.clone();
+        let pending = ui.borrow().ctor_pending.clone();
+        let make: CtorMake = Rc::new(make);
         let _ = vm.register_host(
             class,
             "<init>",
@@ -1538,10 +1730,11 @@ impl GuestUi {
                     let this = ref_arg(a, 0)?;
                     let Ok(mut g) = ui2.try_borrow_mut() else {
                         // Guest draw/measure callbacks can construct views
-                        // while the UI bridge is already borrowed. The dex
-                        // tree materialization path can recreate the host
-                        // object later; crashing the process here loses the
-                        // whole frame instead.
+                        // while the UI bridge is already borrowed. Defer the
+                        // binding instead of dropping it: programmatically
+                        // created embedded views (notably nested Compose
+                        // views) may never pass through dex materialization.
+                        pending.borrow_mut().push_back((this, make.clone()));
                         return Ok(None);
                     };
                     // A subclass super-call can fire a LESS specific ctor
@@ -1554,7 +1747,7 @@ impl GuestUi {
                         .map(|rc| matches!(*rc.borrow(), GuestView::Plain(_)))
                         .unwrap_or(false);
                     if upgrade || !g.views.contains_key(&this) {
-                        let gv = make(&g);
+                        let gv = ctor_view_for(_vm, &g, &make, this);
                         g.views.insert(this, Rc::new(RefCell::new(gv)));
                     }
                     Ok(None)
@@ -1606,7 +1799,15 @@ impl GuestUi {
             name,
             proto,
             Rc::new(RefCell::new(move |vm2: &mut Vm, a: &[V]| {
-                let mut g = ui2.borrow_mut();
+                let Ok(mut g) = ui2.try_borrow_mut() else {
+                    // Guest measure/draw code can re-enter bridged setters
+                    // while the UI bridge is already borrowed. Android
+                    // coalesces those view mutations into the same frame;
+                    // dropping the nested write is closer than crashing
+                    // the process, and the outer pass still applies its
+                    // own state.
+                    return Ok(None);
+                };
                 f(&mut g, vm2, a).map_err(|e| e.with_detail(format!("{class2}.{name2}")))
             })) as HostCall,
         );
@@ -1631,15 +1832,21 @@ fn viewdbg() -> bool {
 
 /// Cached env flag — per-frame/per-view checks must not hit getenv.
 fn dbg_flag(name: &'static str) -> bool {
-    static CACHE: std::sync::OnceLock<std::sync::RwLock<HashMap<&'static str, bool>>> =
-        std::sync::OnceLock::new();
-    let cache = CACHE.get_or_init(|| std::sync::RwLock::new(HashMap::new()));
-    if let Some(v) = cache.read().unwrap().get(name) {
-        return *v;
+    // This runs per view per frame; even a locked SipHash map is hot.
+    // Static flag names have stable addresses, and there are only a few
+    // distinct ones, so a tiny thread-local pointer-indexed vec wins.
+    thread_local! {
+        static CACHE: std::cell::RefCell<Vec<(usize, bool)>> = const { std::cell::RefCell::new(Vec::new()) };
     }
-    let v = std::env::var_os(name).is_some();
-    cache.write().unwrap().insert(name, v);
-    v
+    let key = name.as_ptr() as usize;
+    CACHE.with(|c| {
+        if let Some((_, v)) = c.borrow().iter().find(|(k, _)| *k == key) {
+            return *v;
+        }
+        let v = std::env::var_os(name).is_some();
+        c.borrow_mut().push((key, v));
+        v
+    })
 }
 
 /// Absolute (window) origin of a view handle: a bridged view answers
@@ -1676,7 +1883,9 @@ fn abs_origin(vm: &Vm, views: &HashMap<u32, Rc<RefCell<GuestView>>>, mut cur: u3
 /// against: a hardcoded size lays out the content wider than the
 /// buffer and clips the right/bottom columns offscreen.
 pub fn drive_dex_layout_pass(vm: &mut Vm, activity: u32, frame: u32, win_w: i32, win_h: i32) {
-    if !frame.is_multiple_of(30) {
+    let do_layout = frame.is_multiple_of(30);
+    let do_scroll = vm.scroll_animation_active();
+    if !do_layout && !do_scroll {
         return;
     }
     let Some(root) = vm.activity_content(activity) else {
@@ -1686,7 +1895,20 @@ pub fn drive_dex_layout_pass(vm: &mut Vm, activity: u32, frame: u32, win_w: i32,
     // DrawerLayout throw unless both specs are EXACTLY, so
     // UNSPECIFIED/0 would leave them unmeasured forever.
     const MS_EXACTLY: i32 = 1 << 30;
-    fn walk(vm: &mut Vm, h: u32, depth: u32, win_w: i32, win_h: i32, drove: &mut bool) {
+    #[derive(Clone, Copy)]
+    struct Drive {
+        layout: bool,
+        scroll: bool,
+    }
+    fn walk(
+        vm: &mut Vm,
+        h: u32,
+        depth: u32,
+        win_w: i32,
+        win_h: i32,
+        drove: &mut bool,
+        drive: Drive,
+    ) {
         if depth > 64 {
             return;
         }
@@ -1738,7 +1960,7 @@ pub fn drive_dex_layout_pass(vm: &mut Vm, activity: u32, frame: u32, win_w: i32,
         // capture (blank screen). Once a stable tree reports no layout
         // request, leave its dex-computed frames alone instead of
         // re-running the whole solver twice a second.
-        if !parent_is_dex && needs_layout {
+        if drive.layout && !parent_is_dex && needs_layout {
             *drove = true;
             // The root tracks the window: after a resize its stored
             // frame is stale, so re-measure at the new extent — the
@@ -1863,22 +2085,43 @@ pub fn drive_dex_layout_pass(vm: &mut Vm, activity: u32, frame: u32, win_w: i32,
                 eprintln!("[viewdbg] recycler {h} fields: {fields:?}");
             }
         }
+        // Android's View.draw pipeline calls computeScroll() while a
+        // Scroller is active. The host renderer snapshots dex state
+        // without executing View.draw, so drive the override at layout
+        // boundaries instead; otherwise ViewPager smooth-scrolls start a
+        // Scroller whose curr position never advances.
+        if drive.scroll {
+            ovelo_dexrt::drive_compute_scroll(vm, h);
+        }
         // Re-snapshot: the layout pass may have attached children.
         let kids = vm.dex_view(h).map(|i| i.children).unwrap_or_default();
         for ch in kids {
-            walk(vm, ch, depth + 1, win_w, win_h, drove);
+            walk(vm, ch, depth + 1, win_w, win_h, drove, drive);
         }
     }
     let mut drove = false;
-    walk(vm, root, 0, win_w, win_h, &mut drove);
+    walk(
+        vm,
+        root,
+        0,
+        win_w,
+        win_h,
+        &mut drove,
+        Drive {
+            layout: do_layout,
+            scroll: do_scroll,
+        },
+    );
     // Android fires OnGlobalLayoutListener after an actual layout pass.
     // Firing it for a skipped clean-tree walk just re-enters guest code
     // every frame; adapter fills still get the real pass that lays them out.
-    ovelo_dexrt::fire_pre_draw(vm, root);
-    if drove {
-        ovelo_dexrt::fire_global_layout(vm, root);
+    if do_layout {
+        ovelo_dexrt::fire_pre_draw(vm, root);
+        if drove {
+            ovelo_dexrt::fire_global_layout(vm, root);
+        }
+        vm.layout_gen_done.set(vm.view_gen);
     }
-    vm.layout_gen_done.set(vm.view_gen);
 }
 
 #[cfg(test)]

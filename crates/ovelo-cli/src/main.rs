@@ -1002,7 +1002,7 @@ fn register_compat_shims(
         }
     }
     let own_pkg = manifest.package.clone();
-    for (info_desc, meth, names, launcher_scope) in [
+    for (info_desc, meth, names, launcher_scope, intent_filters) in [
         (
             "Landroid/content/pm/ServiceInfo;",
             "queryIntentServices",
@@ -1012,12 +1012,14 @@ fn register_compat_shims(
                 .map(|s| (s.clone(), manifest.package.clone()))
                 .collect::<Vec<_>>(),
             false,
+            vec![],
         ),
         (
             "Landroid/content/pm/ActivityInfo;",
             "queryIntentActivities",
             launcher_pairs.clone(),
             true,
+            vec![],
         ),
         (
             "Landroid/content/pm/ActivityInfo;",
@@ -1028,6 +1030,7 @@ fn register_compat_shims(
                 .map(|s| (s.clone(), manifest.package.clone()))
                 .collect::<Vec<_>>(),
             false,
+            manifest.receiver_intent_filters.clone(),
         ),
         (
             "Landroid/content/pm/ProviderInfo;",
@@ -1038,6 +1041,7 @@ fn register_compat_shims(
                 .map(|s| (s.clone(), manifest.package.clone()))
                 .collect::<Vec<_>>(),
             false,
+            vec![],
         ),
     ] {
         let _ = v.register_host(
@@ -1048,6 +1052,14 @@ fn register_compat_shims(
                 let own_pkg = own_pkg.clone();
                 Rc::new(RefCell::new(move |vm: &mut ovelo_dexrt::Vm, a: &[V]| {
                     let want = intent_class(vm, a.get(1).copied());
+                    let action = match a.get(1).copied() {
+                        Some(V::Ref(ih)) => ovelo_dexrt::pseudo_get(vm, ih, ovelo_dexrt::P_ACTION)
+                            .and_then(|v| match v {
+                                V::Ref(s) => vm.heap.str_val(s).map(str::to_string),
+                                _ => None,
+                            }),
+                        _ => None,
+                    };
                     // Other apps' launcher activities only answer a
                     // MAIN query — an implicit VIEW/EDIT intent must not
                     // see unrelated apps (their filters don't match).
@@ -1071,6 +1083,15 @@ fn register_compat_shims(
                         .filter(|(n, p)| {
                             want.as_deref().is_none_or(|c| n.ends_with(c) || *n == c)
                                 && (*p == own_pkg || want.is_some() || main_query)
+                                && (intent_filters.is_empty()
+                                    || want.is_some()
+                                    || action.is_none()
+                                    || intent_filters.iter().any(|f| {
+                                        f.activity == *n
+                                            && action.as_ref().is_some_and(|act| {
+                                                f.actions.iter().any(|a| a == act)
+                                            })
+                                    }))
                         })
                         .map(|(n, p)| mint_ri(vm, info_desc, n, p))
                         .collect();
@@ -1213,7 +1234,17 @@ fn drain_pending_activity(
         match vm.instantiate(&next) {
             Ok(h2) => {
                 println!("activity {} (started)", disp(&next));
+                if *this != 0 && *this != h2 && !vm.is_finishing(*this) {
+                    vm.activity_themes.insert(*this, prev_theme);
+                    vm.activity_back.push(*this);
+                }
+                vm.activity_themes.insert(h2, vm.theme_id);
                 vm.set_activity_intent(h2, intent);
+                if let Some(caller) = vm.pending_activity_caller.take() {
+                    vm.activity_callers.insert(h2, caller);
+                } else {
+                    vm.activity_callers.remove(&h2);
+                }
                 *this = h2;
                 run_activity_cbs(vm, *this, callbacks);
             }
@@ -1224,6 +1255,59 @@ fn drain_pending_activity(
             }
         }
     }
+}
+
+/// Restore the top unfinished caller after Activity.finish(). The
+/// runtime keeps a single window, so finishing is a back-stack pop plus
+/// retargeting materialization at the previous activity's tree.
+fn pop_finished_activity(vm: &mut ovelo_dexrt::Vm, this: &mut u32) -> bool {
+    if !vm.is_finishing(*this) {
+        return false;
+    }
+    while let Some(prev) = vm.activity_back.pop() {
+        if !vm.is_finishing(prev) {
+            let finished = *this;
+            *this = prev;
+            vm.set_activity(prev);
+            if let Some(theme) = vm.activity_themes.get(&prev).copied() {
+                vm.theme_id = theme;
+            }
+            if let Some((caller, request_code)) = vm.activity_callers.remove(&finished) {
+                if caller == prev {
+                    let (result_code, data) = vm.activity_result(finished);
+                    let intent = data.unwrap_or(ovelo_dexrt::V::Ref(0));
+                    if let Err(e) = vm.call_virtual(
+                        prev,
+                        "onActivityResult",
+                        &[
+                            ovelo_dexrt::V::I32(request_code),
+                            ovelo_dexrt::V::I32(result_code),
+                            intent,
+                        ],
+                    ) {
+                        println!("onActivityResult crashed: {e}");
+                    }
+                }
+            }
+            let resume = ["onStart".to_string(), "onResume".to_string()];
+            run_activity_cbs(vm, prev, &resume);
+            // Result callbacks often mutate adapter data without the
+            // dex RecyclerView's requestLayout reaching the host root.
+            // Resuming an activity is exactly the point where those
+            // mutations become visible, so force one fresh layout pass.
+            {
+                // JNI worker threads can mutate the heap concurrently;
+                // even this small root-state write must use the VM lock.
+                let _vmg = ovelo_dexrt::lock_vm();
+                if let Some(root) = vm.activity_content(prev) {
+                    ovelo_dexrt::mark_layout_requested(vm, root);
+                }
+            }
+            vm.retire_activity(finished);
+            return true;
+        }
+    }
+    false
 }
 
 /// Deliver the queued lifecycle callbacks to a guest Activity:
@@ -1240,6 +1324,9 @@ fn run_activity_cbs(vm: &mut ovelo_dexrt::Vm, this: u32, callbacks: &[String]) {
         if cb == "onResume" {
             let menu = vm.menu_for(this);
             for menu_cb in ["onCreateOptionsMenu", "onPrepareOptionsMenu"] {
+                if menu_cb == "onCreateOptionsMenu" && !vm.activity_menu_created.insert(this) {
+                    continue;
+                }
                 vm.call_virtual(this, menu_cb, &[menu])
                     .inspect_err(|e| println!("callback {menu_cb} crashed: {e}"))
                     .ok();
@@ -1506,6 +1593,18 @@ fn run_app(store: &InstallStore, package: &str) -> Result<(), OveloError> {
                 // handler (an empty answer sends them to a setup screen).
                 v.guest_package = Some(rec.app.package.clone());
                 v.guest_app_class = info.manifest.application_class.clone();
+                v.activity_intent_filters = info
+                    .manifest
+                    .activity_intent_filters
+                    .iter()
+                    .map(|f| ovelo_dexrt::ActivityIntentFilter {
+                        activity: f.activity.clone(),
+                        actions: f.actions.clone(),
+                        categories: f.categories.clone(),
+                        mime_types: f.mime_types.clone(),
+                        schemes: f.schemes.clone(),
+                    })
+                    .collect();
                 // Launcher queries (home screen) enumerate every
                 // installed app's launcher activity — parse each
                 // record's manifest once at startup.
@@ -1761,7 +1860,7 @@ fn run_app(store: &InstallStore, package: &str) -> Result<(), OveloError> {
             ovelo_ui::Color::srgb(0x20, 0x20, 0x20),
             fonts2.clone(),
         );
-        title.padding = 16;
+        title.view.padding = (16, 16, 16, 16);
         col.children.push(Box::new(title));
         let taps = std::rc::Rc::new(std::cell::Cell::new(0u32));
         let mut ok = ovelo_framework::Button::new(
@@ -1799,6 +1898,9 @@ fn run_app(store: &InstallStore, package: &str) -> Result<(), OveloError> {
                 continue;
             };
             let (tx, ty) = (pt.x as i32, pt.y as i32);
+            if std::env::var_os("OVELO_INPUTDBG").is_some() {
+                eprintln!("[inputdbg] host x={tx} y={ty} raw=({},{})", pt.x, pt.y);
+            }
             // Android MotionEvent action codes.
             let a = match ev.action {
                 ovelo_host::MotionAction::Down => 0,
@@ -1894,6 +1996,10 @@ fn run_app(store: &InstallStore, package: &str) -> Result<(), OveloError> {
         // Apps that inflate layout xml (setContentView(res)) live in the
         // VM's dex view tree — materialize it into drawable host views.
         if let Some((vm, this)) = &mut guest {
+            if pop_finished_activity(vm, this) {
+                ui2.borrow_mut().invalidate_dex_tree();
+                println!("activity finished — restoring previous");
+            }
             // One lock for the whole tick — drain_runnables, GC and
             // the layout pass all touch the heap between invokes, and
             // guest-pthread JNI calls must not alias them.
@@ -1905,7 +2011,7 @@ fn run_app(store: &InstallStore, package: &str) -> Result<(), OveloError> {
             // fills all live on this queue after the lifecycle drains
             // end. Without it they stall once the window opens.
             if dex_frame.is_multiple_of(30) || vm.has_queued_runnables() {
-                let work = vm.drain_runnables(64);
+                let _work = vm.drain_runnables(64);
                 // GC when the heap passes its growth mark — interpreter
                 // churn otherwise grows the heap unboundedly. Only runs
                 // between dex activations (collect_garbage gates itself).
@@ -1920,16 +2026,14 @@ fn run_app(store: &InstallStore, package: &str) -> Result<(), OveloError> {
                     let mut roots = ui2.borrow().guest_handles().into_iter();
                     vm.collect_garbage(&mut roots);
                 }
-                // Drive the expensive layout pass only on real change:
-                // runnable work done this tick, guest view state
-                // mutated since the last pass, or a periodic catch-all
-                // for fills that don't bump view_gen (adapter attaches
-                // do). Idle trees converge and stop paying interpreter
-                // cost + RSS growth every half second.
-                if work > 0
-                    || vm.view_gen != vm.layout_gen_done.get()
-                    || dex_frame.is_multiple_of(600)
-                {
+                // Drive the expensive layout pass only when guest view
+                // state mutated since the last pass, plus a periodic
+                // catch-all for fills that don't bump view_gen (adapter
+                // attaches do). Background workers often stay busy during
+                // media playback without touching the view tree; treating
+                // their progress as a layout change re-ran the recursive
+                // interpreter measure pass on every tick.
+                if vm.view_gen != vm.layout_gen_done.get() || dex_frame.is_multiple_of(600) {
                     // Run adapter containers' layout pass OUTSIDE the ui
                     // borrow — guest code re-enters bridged view methods.
                     let (win_w, win_h) = {
@@ -1977,7 +2081,7 @@ fn run_app(store: &InstallStore, package: &str) -> Result<(), OveloError> {
 /// MediaStore to index and players to probe, no asset file needed.
 fn wav_tone(freq_hz: f32) -> Vec<u8> {
     const RATE: u32 = 8000;
-    let n = (RATE as f32 * 0.4) as usize;
+    let n = (RATE as f32 * 10.0) as usize;
     let mut data = Vec::with_capacity(n + 44);
     let data_len = n as u32;
     data.extend_from_slice(b"RIFF");

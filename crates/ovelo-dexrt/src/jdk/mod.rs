@@ -14,6 +14,7 @@ pub(crate) mod http;
 mod io;
 pub(crate) mod kser;
 mod lang;
+mod math;
 mod rx;
 mod text;
 pub(crate) mod time;
@@ -37,6 +38,12 @@ pub const P_ACTION: u32 = u32::MAX - 1;
 /// The `P_DATA` pseudo key (Intent data, `*Info` name, ...).
 pub const P_DATA: u32 = u32::MAX - 2;
 pub(crate) const P_FLAGS: u32 = u32::MAX - 3;
+/// The `P_TYPE` pseudo key (Intent MIME type).
+pub(crate) const P_TYPE: u32 = u32::MAX - 75;
+/// The `P_PACKAGE` pseudo key (Intent package restriction).
+pub(crate) const P_PACKAGE: u32 = u32::MAX - 76;
+pub(crate) const P_BINDER_INTERFACE: u32 = u32::MAX - 77;
+pub(crate) const P_BINDER_DESCRIPTOR: u32 = u32::MAX - 78;
 /// The `P_COMPONENT` pseudo key (Intent component, `*Info` package).
 pub const P_COMPONENT: u32 = u32::MAX - 4;
 /// Resolved `GIdx` of the `<init>` a `Constructor` mirror stands for.
@@ -47,6 +54,7 @@ pub(crate) const P_METH: u32 = u32::MAX - 44;
 pub(crate) const P_PAINT: u32 = u32::MAX - 37;
 /// The `P_TARGET` pseudo key (ResolveInfo's `*Info` member, ...).
 pub const P_TARGET: u32 = u32::MAX - 5;
+pub(crate) const P_MONITOR_GEN: u32 = u32::MAX - 401;
 pub(crate) const P_EDIT_PARENT: u32 = u32::MAX - 6;
 // Rect pseudo-fields (left/top/right/bottom ints) + a Drawable's
 // cached bounds Rect handle.
@@ -54,6 +62,130 @@ pub(crate) const P_RECT_L: u32 = u32::MAX - 7;
 pub(crate) const P_RECT_T: u32 = u32::MAX - 8;
 pub(crate) const P_RECT_R: u32 = u32::MAX - 9;
 pub(crate) const P_RECT_B: u32 = u32::MAX - 10;
+pub(crate) const P_POINT_X: u32 = u32::MAX - 333;
+pub(crate) const P_POINT_Y: u32 = u32::MAX - 334;
+pub(crate) const P_POINTF_X: u32 = u32::MAX - 335;
+pub(crate) const P_POINTF_Y: u32 = u32::MAX - 336;
+pub(crate) const P_RECTF_L: u32 = u32::MAX - 337;
+pub(crate) const P_RECTF_T: u32 = u32::MAX - 338;
+pub(crate) const P_RECTF_R: u32 = u32::MAX - 339;
+pub(crate) const P_RECTF_B: u32 = u32::MAX - 340;
+pub(crate) const P_DRAWABLE_CALLBACK: u64 = 0xFFFD_FE41;
+pub(crate) const P_INTERP_A: u32 = u32::MAX - 450;
+pub(crate) const P_INTERP_B: u32 = u32::MAX - 451;
+pub(crate) const P_INTERP_C: u32 = u32::MAX - 452;
+pub(crate) const P_INTERP_D: u32 = u32::MAX - 453;
+
+pub(crate) fn point_write(vm: &mut Vm, h: u32, x: i32, y: i32) {
+    pseudo_set(vm, h, P_POINT_X, V::I32(x));
+    pseudo_set(vm, h, P_POINT_Y, V::I32(y));
+    for (name, v) in [("x", x), ("y", y)] {
+        if let Some(f) = vm
+            .field_index_of("Landroid/graphics/Point;", name)
+            .map(|g| vm.canon_field(g))
+        {
+            if let Some(Obj::Instance { fields, .. } | Obj::Host { fields, .. }) =
+                vm.heap.get_mut(h)
+            {
+                fields.insert(f, V::I32(v));
+            }
+        }
+    }
+}
+
+pub(crate) fn point_xy(vm: &Vm, h: u32) -> (i32, i32) {
+    let read = |name: &str, key: u32| -> i32 {
+        if let Some(f) = vm
+            .field_index_of("Landroid/graphics/Point;", name)
+            .map(|g| vm.canon_field(g))
+        {
+            if let Some(Obj::Instance { fields, .. } | Obj::Host { fields, .. }) = vm.heap.get(h) {
+                if let Some(v) = fields.get(&f) {
+                    return i32v(*v);
+                }
+            }
+        }
+        i32v(pseudo_get(vm, h, key).unwrap_or(V::I32(0)))
+    };
+    (read("x", P_POINT_X), read("y", P_POINT_Y))
+}
+
+pub(crate) fn pointf_write(vm: &mut Vm, h: u32, x: f32, y: f32) {
+    pseudo_set(vm, h, P_POINTF_X, V::F32(x));
+    pseudo_set(vm, h, P_POINTF_Y, V::F32(y));
+    for (name, v) in [("x", x), ("y", y)] {
+        if let Some(f) = vm
+            .field_index_of("Landroid/graphics/PointF;", name)
+            .map(|g| vm.canon_field(g))
+        {
+            if let Some(Obj::Instance { fields, .. } | Obj::Host { fields, .. }) =
+                vm.heap.get_mut(h)
+            {
+                fields.insert(f, V::F32(v));
+            }
+        }
+    }
+}
+
+pub(crate) fn pointf_xy(vm: &Vm, h: u32) -> (f32, f32) {
+    let read = |name: &str, key: u32| -> f32 {
+        if let Some(f) = vm
+            .field_index_of("Landroid/graphics/PointF;", name)
+            .map(|g| vm.canon_field(g))
+        {
+            if let Some(Obj::Instance { fields, .. } | Obj::Host { fields, .. }) = vm.heap.get(h) {
+                if let Some(v) = fields.get(&f) {
+                    return f64v(*v) as f32;
+                }
+            }
+        }
+        f64v(pseudo_get(vm, h, key).unwrap_or(V::F32(0.0))) as f32
+    };
+    (read("x", P_POINTF_X), read("y", P_POINTF_Y))
+}
+
+pub(crate) fn rectf_write(vm: &mut Vm, h: u32, l: f32, t: f32, r: f32, b: f32) {
+    for (name, key, v) in [
+        ("left", P_RECTF_L, l),
+        ("top", P_RECTF_T, t),
+        ("right", P_RECTF_R, r),
+        ("bottom", P_RECTF_B, b),
+    ] {
+        pseudo_set(vm, h, key, V::F32(v));
+        if let Some(f) = vm
+            .field_index_of("Landroid/graphics/RectF;", name)
+            .map(|g| vm.canon_field(g))
+        {
+            if let Some(Obj::Instance { fields, .. } | Obj::Host { fields, .. }) =
+                vm.heap.get_mut(h)
+            {
+                fields.insert(f, V::F32(v));
+            }
+        }
+    }
+}
+
+pub(crate) fn rectf_edges(vm: &Vm, h: u32) -> (f32, f32, f32, f32) {
+    let read = |name: &str, key: u32| -> f32 {
+        if let Some(f) = vm
+            .field_index_of("Landroid/graphics/RectF;", name)
+            .map(|g| vm.canon_field(g))
+        {
+            if let Some(Obj::Instance { fields, .. } | Obj::Host { fields, .. }) = vm.heap.get(h) {
+                if let Some(v) = fields.get(&f) {
+                    return f64v(*v) as f32;
+                }
+            }
+        }
+        f64v(pseudo_get(vm, h, key).unwrap_or(V::F32(0.0))) as f32
+    };
+    (
+        read("left", P_RECTF_L),
+        read("top", P_RECTF_T),
+        read("right", P_RECTF_R),
+        read("bottom", P_RECTF_B),
+    )
+}
 pub(crate) const P_BOUNDS: u32 = u32::MAX - 11;
 /// Thread was `start()`ed once — JVM forbids a second start.
 pub(crate) const P_STARTED: u32 = u32::MAX - 12;
@@ -160,6 +292,17 @@ pub(crate) const P_CSL_STATES: u64 = 0xFFFD_FEF8;
 pub(crate) const P_CSL_COLORS: u64 = 0xFFFD_FEF9;
 /// Resting enabled/unchecked color chosen from a ColorStateList.
 pub(crate) const P_CSL_RESTING: u64 = 0xFFFD_FEFA;
+/// Host future-completion bookkeeping for ExecutorService.submit.
+pub(crate) const P_FUTURE_TARGET: u64 = 0xFFFD_FEFB;
+pub(crate) const P_FUTURE: u64 = 0xFFFD_FEFC;
+pub(crate) const P_FUTURE_CALLABLE: u64 = 0xFFFD_FEFD;
+pub(crate) const P_FUTURE_DONE: u64 = 0xFFFD_FEFE;
+pub(crate) const P_FUTURE_LISTENERS: u64 = 0xFFFD_FEFF;
+pub(crate) const P_FT_TASK: u64 = 0xFFFD_FE20;
+pub(crate) const P_FT_RESULT: u64 = 0xFFFD_FE21;
+pub(crate) const P_FT_DEFAULT: u64 = 0xFFFD_FE22;
+pub(crate) const P_FT_CALLABLE: u64 = 0xFFFD_FE23;
+pub(crate) const P_FT_CANCELLED: u64 = 0xFFFD_FE24;
 
 pub(crate) fn now_ms() -> i64 {
     std::time::SystemTime::now()
@@ -424,7 +567,81 @@ fn is_message(vm: &Vm, h: u32) -> bool {
 /// else `call()` — Callable-only tasks (RxJava `ScheduledDirectTask`)
 /// have no `run`, and the builtin `Runnable` fallback would sink the
 /// call into a silent no-op, dropping the real work.
+fn complete_host_future(vm: &mut Vm, future: u32, value: V) {
+    if let Some(Obj::Host { state, .. }) = vm.heap.get_mut(future) {
+        *state = HostState::Slot(value);
+    }
+    pseudo_set(vm, future, P_FUTURE_DONE, V::I32(1));
+    let listeners = pseudo_get(vm, future, P_FUTURE_LISTENERS)
+        .and_then(|v| if let V::Ref(h) = v { Some(h) } else { None })
+        .and_then(|h| match vm.heap.get(h) {
+            Some(Obj::Host {
+                state: HostState::List(items),
+                ..
+            }) => Some(items.clone()),
+            _ => None,
+        })
+        .unwrap_or_default();
+    for listener in listeners {
+        if let V::Ref(l) = listener {
+            let _ = vm.call_virtual_rt(l, "run", &[]);
+        }
+    }
+}
+
+fn future_task_run(vm: &mut Vm, r: u32) -> std::result::Result<Option<V>, ovelo_error::OveloError> {
+    if matches!(pseudo_get(vm, r, P_FUTURE_DONE), Some(V::I32(1)))
+        || matches!(pseudo_get(vm, r, P_FT_CANCELLED), Some(V::I32(1)))
+    {
+        return Ok(None);
+    }
+    let task = pseudo_get(vm, r, P_FT_TASK).unwrap_or(V::Ref(0));
+    let callable = matches!(pseudo_get(vm, r, P_FT_CALLABLE), Some(V::I32(1)));
+    let result = if callable {
+        match task {
+            V::Ref(t) if t != 0 => vm.call_virtual(t, "call", &[])?,
+            _ => None,
+        }
+    } else {
+        if let V::Ref(t) = task {
+            if t != 0 {
+                vm.call_virtual(t, "run", &[])?;
+            }
+        }
+        Some(pseudo_get(vm, r, P_FT_DEFAULT).unwrap_or(V::Ref(0)))
+    };
+    pseudo_set(
+        vm,
+        r,
+        P_FT_RESULT,
+        result.unwrap_or(pseudo_get(vm, r, P_FT_DEFAULT).unwrap_or(V::Ref(0))),
+    );
+    pseudo_set(vm, r, P_FUTURE_DONE, V::I32(1));
+    let _ = vm.call_virtual(r, "done", &[])?;
+    Ok(None)
+}
+
 fn dispatch_task(vm: &mut Vm, r: u32) -> std::result::Result<Option<V>, ovelo_error::OveloError> {
+    if pseudo_get(vm, r, P_FT_TASK).is_some() {
+        return future_task_run(vm, r);
+    }
+    if let Some(V::Ref(target)) = pseudo_get(vm, r, P_FUTURE_TARGET) {
+        let callable = matches!(pseudo_get(vm, r, P_FUTURE_CALLABLE), Some(V::I32(1)));
+        let result = if callable {
+            vm.call_virtual(target, "call", &[])
+        } else {
+            vm.call_virtual(target, "run", &[]).map(|_| None)
+        };
+        if let Some(V::Ref(future)) = pseudo_get(vm, r, P_FUTURE) {
+            let value = match &result {
+                Ok(v) => v.unwrap_or(V::Ref(0)),
+                Err(_) => V::Ref(0),
+            };
+            complete_host_future(vm, future, value);
+        }
+        result?;
+        return Ok(None);
+    }
     if let Some(ci) = vm.heap.class_of(r) {
         let has_run = vm
             .find_method_on_chain(ci, "run", 0, Some(&[]))
@@ -632,6 +849,14 @@ pub(crate) fn v_to_s(vm: &mut Vm, v: V) -> String {
                         } else {
                             "true".to_string()
                         }
+                    } else if desc == "Ljava/math/BigDecimal;" {
+                        math::fmt_bd(match inner {
+                            V::F64(f) => *f,
+                            V::F32(f) => *f as f64,
+                            V::I64(i) => *i as f64,
+                            V::I32(i) => *i as f64,
+                            _ => 0.0,
+                        })
                     } else {
                         v_to_s(vm, *inner)
                     }
@@ -1130,13 +1355,51 @@ pub(crate) fn guest_list_backing(
             _ => {}
         }
     }
-    let cands: Vec<u32> = fields
+    let mut cands: Vec<u32> = fields
         .values()
         .filter_map(|v| match v {
             V::Ref(x) if *x != 0 && *x != h => Some(*x),
             _ => None,
         })
         .collect();
+    // Immutable hash collections keep both the dense element array and
+    // a sparse hash-table array in sibling fields. HashMap iteration order
+    // must not decide which one is the backing store: when a logical size
+    // is known, prefer the candidate whose first window is densest.
+    if let Some(n) = size_field {
+        let backing_score = |x: u32| -> (usize, usize) {
+            let (len, holes) = match vm.heap.get(x) {
+                Some(Obj::Array { data, .. }) => (
+                    data.len(),
+                    data.iter()
+                        .take(n)
+                        .filter(|v| matches!(v, V::Ref(0) | V::I32(0)))
+                        .count(),
+                ),
+                Some(Obj::Host {
+                    state: HostState::List(l),
+                    ..
+                }) => (
+                    l.len(),
+                    l.iter()
+                        .take(n)
+                        .filter(|v| matches!(v, V::Ref(0) | V::I32(0)))
+                        .count(),
+                ),
+                _ => (0, usize::MAX),
+            };
+            if len < n || holes == usize::MAX {
+                (usize::MAX, usize::MAX)
+            } else {
+                // Densest first; on a tie the tightest window is more
+                // likely the element store than a sparse hash table or
+                // oversized auxiliary buffer. Stores shorter than the
+                // logical size can never back the collection.
+                (holes, len)
+            }
+        };
+        cands.sort_by_key(|&x| backing_score(x));
+    }
     for &x in &cands {
         let len = match vm.heap.get(x) {
             Some(Obj::Host {
@@ -1400,66 +1663,48 @@ pub(crate) fn map_pairs_of(vm: &Vm, h: u32) -> Vec<(V, V)> {
     }
 }
 
-pub(crate) fn map_get(vm: &Vm, h: u32, k: V) -> Option<V> {
+fn map_key_eq(vm: &mut Vm, a: V, b: V) -> bool {
+    collect::elem_eq(vm, a, b).unwrap_or_else(|_| value_eq(vm, a, b))
+}
+
+fn map_pairs_for_lookup(vm: &Vm, h: u32) -> Vec<(V, V)> {
     match vm.heap.get(h) {
         Some(Obj::Host {
             state: HostState::Map(m),
             ..
-        }) => m
-            .iter()
-            .find(|(ek, _)| value_eq(vm, *ek, k))
-            .map(|(_, v)| *v),
-        Some(Obj::Instance { .. }) => {
-            let hit = match guest_map_backing(vm, h, 8).and_then(|bh| vm.heap.get(bh)) {
-                Some(Obj::Host {
-                    state: HostState::Map(m),
-                    ..
-                }) => m
-                    .iter()
-                    .find(|(ek, _)| value_eq(vm, *ek, k))
-                    .map(|(_, v)| *v),
-                _ => None,
-            };
-            if crate::dbg_flag("OVELO_MAPDBG") {
-                let kd = match k {
-                    V::Ref(kh) => match vm.heap.get(kh) {
-                        Some(Obj::Str(s)) => s.clone(),
-                        _ => format!("{kh}"),
-                    },
-                    v => format!("{v:?}"),
-                };
-                if kd.contains("humbnail") || kd.contains("Renderer") {
-                    eprintln!(
-                        "[mapdbg] get h{h} {kd} -> {hit:?} ({})",
-                        hit.map(|v| class_of(vm, v)).unwrap_or_else(|| "-".into())
-                    );
-                }
-            }
-            hit
-        }
-        _ => None,
-    }
-}
-
-pub(crate) fn map_put(vm: &mut Vm, h: u32, k: V, v: V) -> Option<V> {
-    let pos = match vm.heap.get(h) {
-        Some(Obj::Host {
-            state: HostState::Map(m),
-            ..
-        }) => m.iter().position(|(ek, _)| value_eq(vm, *ek, k)),
+        }) => m.clone(),
         Some(Obj::Instance { .. }) => {
             match guest_map_backing(vm, h, 8).and_then(|bh| vm.heap.get(bh)) {
                 Some(Obj::Host {
                     state: HostState::Map(m),
                     ..
-                }) => m.iter().position(|(ek, _)| value_eq(vm, *ek, k)),
-                _ => None,
+                }) => m.clone(),
+                _ => Vec::new(),
             }
         }
-        _ => None,
-    };
+        _ => Vec::new(),
+    }
+}
+
+fn map_key_pos(vm: &mut Vm, h: u32, k: V) -> Option<usize> {
+    let pairs = map_pairs_for_lookup(vm, h);
+    for (i, (ek, _)) in pairs.into_iter().enumerate() {
+        if map_key_eq(vm, ek, k) {
+            return Some(i);
+        }
+    }
+    None
+}
+
+pub(crate) fn map_get(vm: &mut Vm, h: u32, k: V) -> Option<V> {
+    let i = map_key_pos(vm, h, k)?;
+    map_pairs_for_lookup(vm, h).get(i).map(|(_, v)| *v)
+}
+
+pub(crate) fn map_put(vm: &mut Vm, h: u32, k: V, v: V) -> Option<V> {
+    let pos = map_key_pos(vm, h, k);
     let m = map_mut(vm, h)?;
-    if let Some(i) = pos {
+    if let Some(i) = pos.filter(|i| *i < m.len()) {
         return Some(std::mem::replace(&mut m[i].1, v));
     }
     m.push((k, v));
@@ -1467,23 +1712,11 @@ pub(crate) fn map_put(vm: &mut Vm, h: u32, k: V, v: V) -> Option<V> {
 }
 
 pub(crate) fn map_remove(vm: &mut Vm, h: u32, k: V) -> Option<V> {
-    let i = match vm.heap.get(h) {
-        Some(Obj::Host {
-            state: HostState::Map(m),
-            ..
-        }) => m.iter().position(|(ek, _)| value_eq(vm, *ek, k)),
-        Some(Obj::Instance { .. }) => {
-            match guest_map_backing(vm, h, 8).and_then(|bh| vm.heap.get(bh)) {
-                Some(Obj::Host {
-                    state: HostState::Map(m),
-                    ..
-                }) => m.iter().position(|(ek, _)| value_eq(vm, *ek, k)),
-                _ => None,
-            }
-        }
-        _ => None,
-    }?;
+    let i = map_key_pos(vm, h, k)?;
     let m = map_mut(vm, h)?;
+    if i >= m.len() {
+        return None;
+    }
     Some(m.remove(i).1)
 }
 
@@ -1615,6 +1848,9 @@ pub(crate) fn call(
     if let Some(r) = universal(vm, class, name, sig, args)? {
         return Ok(Some(r));
     }
+    if let Some(r) = math::call(vm, class, name, sig, args)? {
+        return Ok(Some(r));
+    }
     if let Some(r) = lang::call(vm, class, name, sig, args)? {
         return Ok(Some(r));
     }
@@ -1650,6 +1886,30 @@ pub(crate) fn call(
 
 /// Methods that mean the same thing on every object.
 fn universal(vm: &mut Vm, class: &str, name: &str, sig: &str, args: &[V]) -> Rt<Option<Option<V>>> {
+    // Static/interface dispatch through Object must still observe the
+    // receiver's concrete Point implementation.
+    if matches!(name, "toString" | "hashCode") {
+        if let Some(V::Ref(h)) = args.first().copied() {
+            if vm.dbg_class_of(h) == "Landroid/graphics/Point;" {
+                let (x, y) = point_xy(vm, h);
+                return Ok(Some(Some(if name == "toString" {
+                    jdynstr(vm, &format!("Point({x}, {y})"))
+                } else {
+                    V::I32(x.wrapping_mul(31).wrapping_add(y))
+                })));
+            }
+        }
+    }
+    // UUID implements these object operations from its 128-bit value in
+    // the collections module; the generic identity/object-id versions
+    // would make equal UUIDs and serialized UUID strings unusable.
+    if matches!(
+        class,
+        "Ljava/util/UUID;" | "Ljava/math/BigDecimal;" | "Landroid/graphics/Point;"
+    ) && matches!(name, "toString" | "hashCode" | "equals")
+    {
+        return Ok(None);
+    }
     Ok(match name {
         "toString" if ret(sig) == STRING && class != STRING => {
             // JSON containers serialize through `json_dump_v`, not the
@@ -1668,7 +1928,9 @@ fn universal(vm: &mut Vm, class: &str, name: &str, sig: &str, args: &[V]) -> Rt<
         // Exact boxed owners implement value equality themselves below;
         // Object/Number interface dispatches still use this value-aware
         // universal path.
-        "hashCode" if !lang::primitive_type(class) => Some(Some(lang::hashcode(vm, args))),
+        "hashCode" if class != STRING && !lang::primitive_type(class) => {
+            Some(Some(lang::hashcode(vm, args)))
+        }
         // `Arrays.equals` is a static deep-ish array comparison, not
         // Object.equals; let the collections module implement it. Treating
         // it as identity makes two freshly copied empty input arrays differ,
@@ -1766,31 +2028,65 @@ fn universal(vm: &mut Vm, class: &str, name: &str, sig: &str, args: &[V]) -> Rt<
         // dispatcher itself.
         "getImmediate" => Some(Some(args[0])),
         "notify" | "notifyAll" => {
-            // A notify can cut a wait(ms) short — promote sleepers
-            // the same way LockSupport.unpark promotes parked ones.
+            // Generation-count the target so an in-line waiter can observe
+            // the notification without unwinding its Java stack. Waking
+            // sleepers remains necessary for runnables parked by older
+            // scheduling paths.
+            if let V::Ref(h) = args[0] {
+                if h != 0 {
+                    let gen = i64v(pseudo_get(vm, h, P_MONITOR_GEN).unwrap_or(V::I64(0)));
+                    pseudo_set(vm, h, P_MONITOR_GEN, V::I64(gen + 1));
+                }
+            }
             vm.wake_parked();
             Some(None)
         }
         "finalize" => Some(None),
         "wait" => {
-            // A worker thread's `wait()` can't really suspend — yield
-            // with ovelo.park so the drain lets other runnables (the
-            // render task that will set the flag it waits on) run, then
-            // re-enter. On the main thread stay a no-op.
+            // Preserve the dex stack across the wait. Parking unwinds a
+            // logical Java Thread back to the top of run(); blocking users
+            // such as Glide's RequestFutureTarget.get() then submit the
+            // same work again every time they wake. Java permits spurious
+            // wakeups, so wait out only a short slice while interleaving
+            // other queued work, then let the caller re-check its condition
+            // in the same activation.
             if vm.cur_thread != 0 && vm.cur_thread != vm.main_thread_h {
-                // wait() / wait(ms): record a wake deadline — with no
-                // timeout use a short retry slice.
-                let ms = match args.get(1).copied().unwrap_or(V::I64(1)) {
-                    V::I64(m) => m.max(1),
-                    V::I32(m) => (m as i64).max(1),
-                    _ => 1,
+                let timeout_ms = match args.get(1).copied() {
+                    Some(V::I64(m)) => m.max(0),
+                    Some(V::I32(m)) => (m as i64).max(0),
+                    _ => 0,
                 };
-                let due = (now_ms().saturating_add(ms)).max(0) as u64;
-                if vm.cur_runnable != 0 {
-                    vm.sleep_until.insert(vm.cur_runnable, due);
-                    vm.park_waiters.insert(vm.cur_runnable);
+                let slice = if timeout_ms == 0 {
+                    10
+                } else {
+                    timeout_ms.clamp(1, 10)
+                };
+                let target = match args[0] {
+                    V::Ref(h) => h,
+                    _ => 0,
+                };
+                let start_gen = if target != 0 {
+                    i64v(pseudo_get(vm, target, P_MONITOR_GEN).unwrap_or(V::I64(0)))
+                } else {
+                    0
+                };
+                let deadline = now_ms().saturating_add(slice) as u64;
+                while (now_ms() as u64) < deadline {
+                    if target != 0
+                        && i64v(pseudo_get(vm, target, P_MONITOR_GEN).unwrap_or(V::I64(0)))
+                            != start_gen
+                    {
+                        break;
+                    }
+                    let remain = deadline.saturating_sub(now_ms() as u64);
+                    match vm.park_drain_within(remain.min(5)) {
+                        Ok(()) => {}
+                        Err(crate::E::Vm(e)) if e.cause() == "ovelo.park" => {
+                            std::thread::sleep(std::time::Duration::from_millis(1));
+                        }
+                        Err(e) => return Err(e),
+                    }
                 }
-                return Err(crate::E::Vm(crate::err("ovelo.park")));
             }
             Some(None)
         }
@@ -1889,6 +2185,15 @@ fn universal(vm: &mut Vm, class: &str, name: &str, sig: &str, args: &[V]) -> Rt<
 /// `ftype` is the field's declared type — a self-typed field
 /// (`TimeUnit.SECONDS: Ljava/util/concurrent/TimeUnit;`) is an enum
 /// constant and gets a stable host object carrying its name.
+pub(crate) fn json_null(vm: &mut Vm) -> V {
+    if vm.json_null_h == 0 {
+        if let V::Ref(h) = host(vm, "Lorg/json/JSONObject$Null;", HostState::Empty) {
+            vm.json_null_h = h;
+        }
+    }
+    V::Ref(vm.json_null_h)
+}
+
 pub(crate) fn sfield(vm: &mut Vm, owner: &str, name: &str, ftype: &str) -> Option<V> {
     // Reflective static reads (`Field.get(null)`) on host classes reach
     // here by name — the dex field index never sees them.
@@ -1932,6 +2237,59 @@ pub(crate) fn sfield(vm: &mut Vm, owner: &str, name: &str, ftype: &str) -> Optio
         ("Ljava/lang/Float;", "NaN") => V::F32(f32::NAN),
         ("Ljava/lang/Float;", "SIZE") => V::I32(32),
         ("Ljava/lang/Float;", "BYTES") => V::I32(4),
+        ("Ljava/math/BigDecimal;", "ZERO") => {
+            return Some(host(vm, owner, HostState::Slot(V::F64(0.0))));
+        }
+        ("Ljava/math/BigDecimal;", "ONE") => {
+            return Some(host(vm, owner, HostState::Slot(V::F64(1.0))));
+        }
+        ("Ljava/math/BigDecimal;", "TEN") => {
+            return Some(host(vm, owner, HostState::Slot(V::F64(10.0))));
+        }
+        ("Ljava/math/MathContext;", "UNLIMITED") => {
+            return Some(host(vm, owner, HostState::List(vec![V::I32(0), V::I32(4)])));
+        }
+        ("Ljava/math/MathContext;", "DECIMAL32") => {
+            return Some(host(vm, owner, HostState::List(vec![V::I32(7), V::I32(6)])));
+        }
+        ("Ljava/math/MathContext;", "DECIMAL64") => {
+            return Some(host(
+                vm,
+                owner,
+                HostState::List(vec![V::I32(16), V::I32(6)]),
+            ));
+        }
+        ("Ljava/math/MathContext;", "DECIMAL128") => {
+            return Some(host(
+                vm,
+                owner,
+                HostState::List(vec![V::I32(34), V::I32(6)]),
+            ));
+        }
+        ("Ljava/math/RoundingMode;", "UP") => {
+            return Some(host(vm, owner, HostState::Slot(V::I32(0))));
+        }
+        ("Ljava/math/RoundingMode;", "DOWN") => {
+            return Some(host(vm, owner, HostState::Slot(V::I32(1))));
+        }
+        ("Ljava/math/RoundingMode;", "CEILING") => {
+            return Some(host(vm, owner, HostState::Slot(V::I32(2))));
+        }
+        ("Ljava/math/RoundingMode;", "FLOOR") => {
+            return Some(host(vm, owner, HostState::Slot(V::I32(3))));
+        }
+        ("Ljava/math/RoundingMode;", "HALF_UP") => {
+            return Some(host(vm, owner, HostState::Slot(V::I32(4))));
+        }
+        ("Ljava/math/RoundingMode;", "HALF_DOWN") => {
+            return Some(host(vm, owner, HostState::Slot(V::I32(5))));
+        }
+        ("Ljava/math/RoundingMode;", "HALF_EVEN") => {
+            return Some(host(vm, owner, HostState::Slot(V::I32(6))));
+        }
+        ("Ljava/math/RoundingMode;", "UNNECESSARY") => {
+            return Some(host(vm, owner, HostState::Slot(V::I32(7))));
+        }
         ("Ljava/lang/Math;", "PI") => V::F64(std::f64::consts::PI),
         ("Ljava/lang/Math;", "E") => V::F64(std::f64::consts::E),
         // BreakIterator.DONE — loops compare `next()` against it; the
@@ -2041,10 +2399,26 @@ pub(crate) fn sfield(vm: &mut Vm, owner: &str, name: &str, ftype: &str) -> Optio
             return Some(host(vm, "Ljava/io/InputStream;", HostState::Empty))
         }
         ("Ljava/nio/ByteOrder;", "BIG_ENDIAN") => {
-            return Some(host(vm, "Ljava/nio/ByteOrder;", HostState::Slot(V::I32(0))))
+            let h = vm.byteorder_big_h.get();
+            if h != 0 && vm.heap.get(h).is_some() {
+                return Some(V::Ref(h));
+            }
+            let v = host(vm, "Ljava/nio/ByteOrder;", HostState::Slot(V::I32(0)));
+            if let V::Ref(hh) = v {
+                vm.byteorder_big_h.set(hh);
+            }
+            return Some(v);
         }
         ("Ljava/nio/ByteOrder;", "LITTLE_ENDIAN") => {
-            return Some(host(vm, "Ljava/nio/ByteOrder;", HostState::Slot(V::I32(1))))
+            let h = vm.byteorder_h.get();
+            if h != 0 && vm.heap.get(h).is_some() {
+                return Some(V::Ref(h));
+            }
+            let v = host(vm, "Ljava/nio/ByteOrder;", HostState::Slot(V::I32(1)));
+            if let V::Ref(hh) = v {
+                vm.byteorder_h.set(hh);
+            }
+            return Some(v);
         }
         ("Ljava/lang/Void;", "TYPE") => return Some(class_obj(vm, "V".into())),
         ("Ljava/lang/String;", "CASE_INSENSITIVE_ORDER") => {
@@ -2256,9 +2630,7 @@ pub(crate) fn sfield(vm: &mut Vm, owner: &str, name: &str, ftype: &str) -> Optio
         ("Landroid/content/Intent;", "FLAG_ACTIVITY_SINGLE_TOP") => V::I32(0x20000000),
         ("Landroid/content/Intent;", "FLAG_GRANT_READ_URI_PERMISSION") => V::I32(1),
         ("Landroid/content/Intent;", "FLAG_GRANT_WRITE_URI_PERMISSION") => V::I32(2),
-        ("Lorg/json/JSONObject;", "NULL") => {
-            return Some(host(vm, "Lorg/json/JSONObject$Null;", HostState::Empty))
-        }
+        ("Lorg/json/JSONObject;", "NULL") => return Some(json_null(vm)),
         // MediaStore$Images$Media.EXTERNAL_CONTENT_URI & friends —
         // content-provider base URIs guests parse/query on. Null here
         // NPEs inside <clinit> (fossify gallery NewPhotoFetcher).
@@ -2440,12 +2812,19 @@ fn context_service_name(n: &str) -> &'static str {
 /// `DisplayMetrics.density`, `Point.x`…).
 pub(crate) fn ifield(vm: &Vm, h: u32, owner: &str, name: &str) -> Option<V> {
     match (owner, name) {
-        ("Landroid/util/DisplayMetrics;", "density") => Some(V::F32(2.0)),
-        ("Landroid/util/DisplayMetrics;", "densityDpi") => Some(V::I32(320)),
-        ("Landroid/util/DisplayMetrics;", "scaledDensity") => Some(V::F32(2.0)),
-        ("Landroid/util/DisplayMetrics;", "widthPixels") => Some(V::I32(1080)),
-        ("Landroid/util/DisplayMetrics;", "heightPixels") => Some(V::I32(1920)),
-        ("Landroid/util/DisplayMetrics;", "xdpi" | "ydpi") => Some(V::F32(320.0)),
+        ("Landroid/util/Pair;" | "Landroidx/core/util/Pair;", "first") => {
+            Some(slot_of(vm, h).unwrap_or(V::Ref(0)))
+        }
+        ("Landroid/util/Pair;" | "Landroidx/core/util/Pair;", "second") => {
+            Some(pseudo_get(vm, h, P_DATA).unwrap_or(V::Ref(0)))
+        }
+
+        ("Landroid/util/DisplayMetrics;", "density") => Some(V::F32(1.0)),
+        ("Landroid/util/DisplayMetrics;", "densityDpi") => Some(V::I32(160)),
+        ("Landroid/util/DisplayMetrics;", "scaledDensity") => Some(V::F32(1.0)),
+        ("Landroid/util/DisplayMetrics;", "widthPixels") => Some(V::I32(vm.window_size.0)),
+        ("Landroid/util/DisplayMetrics;", "heightPixels") => Some(V::I32(vm.window_size.1)),
+        ("Landroid/util/DisplayMetrics;", "xdpi" | "ydpi") => Some(V::F32(160.0)),
         // androidx.startup reads `getProviderInfo(...).metaData` for the
         // manifest <meta-data> bundle — the handle our CLI attaches.
         ("Landroid/content/pm/ProviderInfo;", "metaData") => {
@@ -2514,6 +2893,9 @@ pub(crate) fn ifield(vm: &Vm, h: u32, owner: &str, name: &str) -> Option<V> {
         ("Landroid/content/pm/ProviderInfo;", "authority") => {
             Some(pseudo_get(vm, h, P_FLAGS).unwrap_or(V::Ref(0)))
         }
+        ("Landroid/app/Notification;", "extras") => {
+            Some(pseudo_get(vm, h, P_DATA).unwrap_or(V::Ref(0)))
+        }
         ("Landroid/os/Message;", "what") => {
             Some(pseudo_get(vm, h, P_MSG_WHAT).unwrap_or(V::I32(0)))
         }
@@ -2524,9 +2906,18 @@ pub(crate) fn ifield(vm: &Vm, h: u32, owner: &str, name: &str) -> Option<V> {
             Some(pseudo_get(vm, h, P_MSG_ARG2).unwrap_or(V::I32(0)))
         }
         ("Landroid/os/Message;", "obj") => Some(pseudo_get(vm, h, P_MSG_OBJ).unwrap_or(V::Ref(0))),
-        ("Landroid/graphics/Point;", "x" | "y")
-        | ("Landroid/graphics/RectF;", "left" | "top" | "right" | "bottom")
-        | ("Landroid/graphics/PointF;", "x" | "y") => Some(V::I32(0)),
+        ("Landroid/graphics/Point;", "x") => {
+            Some(pseudo_get(vm, h, P_POINT_X).unwrap_or(V::I32(0)))
+        }
+        ("Landroid/graphics/Point;", "y") => {
+            Some(pseudo_get(vm, h, P_POINT_Y).unwrap_or(V::I32(0)))
+        }
+        ("Landroid/graphics/PointF;", "x") => Some(V::F32(pointf_xy(vm, h).0)),
+        ("Landroid/graphics/PointF;", "y") => Some(V::F32(pointf_xy(vm, h).1)),
+        ("Landroid/graphics/RectF;", "left") => Some(V::F32(rectf_edges(vm, h).0)),
+        ("Landroid/graphics/RectF;", "top") => Some(V::F32(rectf_edges(vm, h).1)),
+        ("Landroid/graphics/RectF;", "right") => Some(V::F32(rectf_edges(vm, h).2)),
+        ("Landroid/graphics/RectF;", "bottom") => Some(V::F32(rectf_edges(vm, h).3)),
         // Rect edges are real stored ints (set/setBounds/offset write
         // them as pseudo fields) so drawable bounds round-trip.
         ("Landroid/graphics/Rect;", "left") => {
@@ -2550,8 +2941,8 @@ pub(crate) fn ifield(vm: &Vm, h: u32, owner: &str, name: &str) -> Option<V> {
         ("Landroid/content/res/Configuration;", "uiMode") => {
             Some(pseudo_get(vm, h, crate::P_META).unwrap_or(V::I32(0x21)))
         }
-        ("Landroid/content/res/Configuration;", "screenWidthDp")
-        | ("Landroid/content/res/Configuration;", "screenHeightDp") => Some(V::I32(360)),
+        ("Landroid/content/res/Configuration;", "screenWidthDp") => Some(V::I32(vm.window_size.0)),
+        ("Landroid/content/res/Configuration;", "screenHeightDp") => Some(V::I32(vm.window_size.1)),
         _ => None,
     }
 }
@@ -2616,6 +3007,10 @@ pub(crate) fn host_supers(d: &str) -> &'static [&'static str] {
             OBJ,
         ],
         "Ljava/lang/ClassLoader;" => &[OBJ],
+        "Ljava/lang/reflect/ParameterizedType;" => &["Ljava/lang/reflect/Type;", OBJ],
+        "Ljava/lang/reflect/WildcardType;" => &["Ljava/lang/reflect/Type;", OBJ],
+        "Ljava/lang/reflect/GenericArrayType;" => &["Ljava/lang/reflect/Type;", OBJ],
+        "Ljava/lang/reflect/TypeVariable;" => &["Ljava/lang/reflect/Type;", OBJ],
         "Ljava/lang/Enum;" => &["Ljava/lang/Comparable;", "Ljava/io/Serializable;", OBJ],
         "Ljava/lang/Throwable;" => &["Ljava/io/Serializable;", OBJ],
         "Ljava/lang/StackTraceElement;" => &["Ljava/io/Serializable;", OBJ],
@@ -2973,6 +3368,15 @@ pub(crate) fn host_supers(d: &str) -> &'static [&'static str] {
         | "Ljava/util/concurrent/Callable;"
         | "Ljava/util/concurrent/Future;"
         | "Ljava/util/concurrent/BlockingQueue;" => &[OBJ],
+        "Ljava/util/concurrent/FutureTask;" => &[
+            "Ljava/util/concurrent/RunnableFuture;",
+            "Ljava/util/concurrent/Future;",
+            "Ljava/lang/Runnable;",
+            OBJ,
+        ],
+        "Ljava/util/concurrent/RunnableFuture;" => {
+            &["Ljava/util/concurrent/Future;", "Ljava/lang/Runnable;", OBJ]
+        }
         "Ljava/util/Iterator;"
         | "Ljava/util/Enumeration;"
         | "Ljava/util/Comparator;"
@@ -3176,6 +3580,20 @@ pub(crate) fn host_supers(d: &str) -> &'static [&'static str] {
             OBJ,
         ],
         "Ljava/lang/Error;" => &[THROWABLE, "Ljava/io/Serializable;", OBJ],
+        // ----- android runtime throws
+        "Landroid/util/AndroidRuntimeException;" => &[
+            "Ljava/lang/RuntimeException;",
+            "Ljava/lang/Exception;",
+            THROWABLE,
+            OBJ,
+        ],
+        "Landroid/content/ActivityNotFoundException;" => &[
+            "Landroid/util/AndroidRuntimeException;",
+            "Ljava/lang/RuntimeException;",
+            "Ljava/lang/Exception;",
+            THROWABLE,
+            OBJ,
+        ],
         // ----- android.os
         "Landroid/os/BaseBundle;" => &[OBJ],
         "Landroid/os/Bundle;" => &[
@@ -3442,6 +3860,12 @@ pub(crate) fn host_supers(d: &str) -> &'static [&'static str] {
         | "Landroid/view/animation/Animation;"
         | "Landroid/view/animation/AnimationUtils;"
         | "Landroid/view/animation/Interpolator;"
+        | "Landroid/view/animation/BaseInterpolator;"
+        | "Landroid/view/animation/LinearInterpolator;"
+        | "Landroid/view/animation/AccelerateInterpolator;"
+        | "Landroid/view/animation/DecelerateInterpolator;"
+        | "Landroid/view/animation/OvershootInterpolator;"
+        | "Landroid/view/animation/PathInterpolator;"
         | "Landroid/view/ViewPropertyAnimator;"
         | "Landroid/animation/ValueAnimator;"
         | "Landroid/animation/ObjectAnimator;"
@@ -3502,6 +3926,7 @@ pub(crate) fn host_supers(d: &str) -> &'static [&'static str] {
         | "Landroid/util/TypedValue;"
         | "Landroid/util/LruCache;"
         | "Landroid/util/Patterns;"
+        | "Landroid/util/JsonToken;"
         | "Landroid/util/JsonReader;"
         | "Landroid/util/JsonWriter;"
         | "Landroid/util/MalformedJsonException;"
@@ -3667,11 +4092,33 @@ pub(crate) fn host_supers(d: &str) -> &'static [&'static str] {
         // ----- android.media / hardware
         "Landroid/media/MediaPlayer;"
         | "Landroid/media/MediaRecorder;"
+        | "Landroid/media/MediaCodec;"
+        | "Landroid/media/MediaCodec$BufferInfo;"
+        | "Landroid/media/MediaCodec$Callback;"
+        | "Landroid/media/MediaCodec$CryptoInfo;"
+        | "Landroid/media/MediaCodecList;"
+        | "Landroid/media/MediaCodecInfo;"
+        | "Landroid/media/MediaCodecInfo$CodecCapabilities;"
+        | "Landroid/media/MediaCodecInfo$AudioCapabilities;"
+        | "Landroid/media/MediaCodecInfo$VideoCapabilities;"
+        | "Landroid/media/MediaCodecInfo$CodecProfileLevel;"
+        | "Landroid/media/MediaFormat;"
         | "Landroid/media/AudioManager;"
         | "Landroid/media/SoundPool;"
         | "Landroid/media/ToneGenerator;"
         | "Landroid/media/MediaMetadataRetriever;"
         | "Landroid/media/AudioTrack;"
+        | "Landroid/media/AudioTrack$Builder;"
+        | "Landroid/media/AudioFormat;"
+        | "Landroid/media/AudioFormat$Builder;"
+        | "Landroid/media/AudioAttributes;"
+        | "Landroid/media/AudioAttributes$Builder;"
+        | "Landroid/media/AudioFocusRequest;"
+        | "Landroid/media/AudioFocusRequest$Builder;"
+        | "Landroid/media/session/PlaybackState;"
+        | "Landroid/media/session/PlaybackState$Builder;"
+        | "Landroid/media/session/PlaybackState$CustomAction;"
+        | "Landroid/media/session/PlaybackState$CustomAction$Builder;"
         | "Landroid/media/AudioRecord;"
         | "Landroid/media/Image;"
         | "Landroid/hardware/Camera;"
