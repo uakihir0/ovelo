@@ -838,6 +838,59 @@ pub fn is_popup_root(vm: &Vm, h: u32) -> bool {
     h != 0 && pseudo_get(vm, h, P_POPUP_ROOT).is_some()
 }
 
+/// GridLayoutManager positions columns by pitch even when the generic
+/// measure pass under-measures a wrap_content item. Preserve that pitch
+/// in the laid-out child frame; vertically stacked lists have no positive
+/// x pitch and are unaffected.
+type GridFrame = (u32, i32, i32, i32, i32);
+
+fn grid_child_width_fixup(vm: &mut Vm, parent: u32) {
+    let pd = class_of(vm, V::Ref(parent));
+    if !pd.contains("RecyclerView") && !vm.extends_named(&pd, "RecyclerView") {
+        return;
+    }
+    let mut rows: Vec<(i32, Vec<GridFrame>)> = Vec::new();
+    for c in children(vm, parent) {
+        let V::Ref(h) = c else { continue };
+        if h == 0 || view_is_gone(vm, h) {
+            continue;
+        }
+        let (l, t, r, b) = (
+            pint(vm, h, P_LEFT),
+            pint(vm, h, P_TOP),
+            pint(vm, h, P_RIGHT),
+            pint(vm, h, P_BOTTOM),
+        );
+        if r <= l || b <= t {
+            continue;
+        }
+        if let Some((_, row)) = rows.iter_mut().find(|(rt, _)| (*rt - t).abs() <= 4) {
+            row.push((h, l, t, r, b));
+        } else {
+            rows.push((t, vec![(h, l, t, r, b)]));
+        }
+    }
+    for (_, mut row) in rows {
+        if row.len() < 2 {
+            continue;
+        }
+        row.sort_by_key(|x| x.1);
+        let pitch = row
+            .windows(2)
+            .filter_map(|w| (w[1].1 > w[0].1).then_some(w[1].1 - w[0].1))
+            .min()
+            .unwrap_or(0);
+        if pitch <= 0 {
+            continue;
+        }
+        for (h, l, t, r, _b) in row {
+            if pitch > (r - l) * 2 {
+                frame_set(vm, h, l, t, l + pitch, t + pitch);
+            }
+        }
+    }
+}
+
 /// Store a view frame; returns whether it changed (View.setFrame's
 /// contract and `layout`'s `changed` argument).
 pub(crate) fn frame_set(vm: &mut Vm, h: u32, l: i32, t: i32, r: i32, b: i32) -> bool {
@@ -3104,6 +3157,7 @@ pub(crate) fn call(
                     }
                     return Err(e);
                 }
+                grid_child_width_fixup(vm, this);
                 // AOSP clears PFLAG_LAYOUT_REQUESTED once the view is laid out.
                 pseudo_set(vm, this, P_LAYOUT_REQ, V::I32(0));
             } else {
