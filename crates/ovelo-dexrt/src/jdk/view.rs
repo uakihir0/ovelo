@@ -4578,12 +4578,11 @@ pub(crate) fn ta_lookup(vm: &mut Vm, h: u32, index: usize) -> Option<V> {
     }
     let attr_id = *ta_attrs(vm, h).get(index)? as u32;
     if crate::dbg_flag("OVELO_VIEWDBG") {
-        eprintln!(
-            "[viewdbg] ta_lookup[{index}] attr_id={attr_id:#x} name={:?}",
-            vm.apk_res
-                .as_ref()
-                .and_then(|r| r.attr_name(attr_id).map(|s| s.to_string()))
-        );
+        let aname = vm
+            .apk_res
+            .as_ref()
+            .and_then(|r| r.attr_name(attr_id).map(|s| s.to_string()));
+        eprintln!("[viewdbg] ta_lookup[{index}] attr_id={attr_id:#x} name={aname:?}");
     }
     // 1) Explicit AttributeSet: match by entry name (app attrs and
     //    framework attrs share the local-name space). An
@@ -4659,6 +4658,15 @@ pub(crate) fn ta_lookup(vm: &mut Vm, h: u32, index: usize) -> Option<V> {
             if ev.data_type != 0x02 {
                 return Some(entry_v(vm, &ev));
             }
+            // Framework-theme defaults are not packaged in the app's
+            // resources.arsc. When a style item is `?android:textColor`
+            // (or another framework attr) keep the attribute reference
+            // as the TypedArray value instead of reporting the attr as
+            // absent; Android's TypedArray can surface TYPE_ATTRIBUTE,
+            // and accessory getters resolve/coerce it later. Libraries
+            // such as IndicatorFastScroll validate presence before use,
+            // so dropping the value incorrectly aborts construction.
+            return Some(V::I32(ev.data as i32));
         }};
     }
     // 2) Explicit style (obtainStyledAttributes(resId, attrs)).
