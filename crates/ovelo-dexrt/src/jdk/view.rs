@@ -84,7 +84,7 @@ const P_WIN_OWNER: u32 = u32::MAX - 24;
 const P_VTO: u32 = u32::MAX - 25;
 /// `ImageView`'s current image: a `Bitmap` handle, a `Drawable`
 /// handle, or a `Uri`/res-id the renderer resolves.
-const P_IMAGE: u32 = u32::MAX - 27;
+pub(crate) const P_IMAGE: u32 = u32::MAX - 27;
 /// Stable placeholder returned by `getDrawable()` before any image is
 /// set. Kept separate from P_IMAGE so it does not suppress XML src.
 const P_IMAGE_PLACEHOLDER: u32 = u32::MAX - 30;

@@ -2499,9 +2499,25 @@ fn guest_draw_ops_impl(vm: &mut Vm, view: u32, w: i32, h: i32, expand: bool) -> 
         .ok()
         .flatten()
         .is_some();
-    if !has && !has_dd {
-        return Vec::new();
-    }
+    let drawable_draw = if !has && !has_dd {
+        match pseudo_get(vm, view, super::view::P_IMAGE) {
+            Some(V::Ref(d)) if d != 0 => match vm.heap.class_of(d) {
+                Some(dci)
+                    if vm
+                        .find_method_on_chain_sig(dci, "draw", &["Landroid/graphics/Canvas;"])
+                        .ok()
+                        .flatten()
+                        .is_some() =>
+                {
+                    Some(d)
+                }
+                _ => return Vec::new(),
+            },
+            _ => return Vec::new(),
+        }
+    } else {
+        None
+    };
     let V::Ref(canvas) = host(
         vm,
         "Landroid/graphics/Canvas;",
@@ -2512,6 +2528,15 @@ fn guest_draw_ops_impl(vm: &mut Vm, view: u32, w: i32, h: i32, expand: bool) -> 
     pseudo_set(vm, canvas, PK_CW, V::I32(w));
     pseudo_set(vm, canvas, PK_CH, V::I32(h));
     let mut err = false;
+    if let Some(d) = drawable_draw {
+        let r = vm.call_virtual_sig(d, "draw", &["Landroid/graphics/Canvas;"], &[V::Ref(canvas)]);
+        if let Err(e) = &r {
+            if crate::dbg_flag("OVELO_DRAWDBG") {
+                eprintln!("[drawdbg] drawable draw h{d} for h{view} ERR {e}");
+            }
+        }
+        err = r.is_err();
+    }
     if has {
         let r = vm.call_virtual_sig(
             view,
