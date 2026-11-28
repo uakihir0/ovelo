@@ -489,6 +489,91 @@ pub(crate) fn call(
         pair_call(vm, name, args)?
     } else if class.starts_with("Landroid/util/Sparse") {
         sparse_call(vm, class, name, args)?
+    } else if class == "Ljava/util/concurrent/FutureTask;" {
+        let this = args.first().copied().unwrap_or(V::Ref(0));
+        let this_h = match this {
+            V::Ref(h) => h,
+            _ => 0,
+        };
+        match name {
+            "<init>" => {
+                if this_h != 0 {
+                    pseudo_set(
+                        vm,
+                        this_h,
+                        P_FT_TASK,
+                        args.get(1).copied().unwrap_or(V::Ref(0)),
+                    );
+                    pseudo_set(
+                        vm,
+                        this_h,
+                        P_FT_DEFAULT,
+                        args.get(2).copied().unwrap_or(V::Ref(0)),
+                    );
+                    pseudo_set(vm, this_h, P_FT_CALLABLE, V::I32((args.len() == 2) as i32));
+                    pseudo_set(vm, this_h, P_FUTURE_DONE, V::I32(0));
+                    pseudo_set(vm, this_h, P_FT_CANCELLED, V::I32(0));
+                }
+                Some(None)
+            }
+            "run" => {
+                if this_h == 0
+                    || matches!(pseudo_get(vm, this_h, P_FUTURE_DONE), Some(V::I32(1)))
+                    || matches!(pseudo_get(vm, this_h, P_FT_CANCELLED), Some(V::I32(1)))
+                {
+                    return Ok(Some(None));
+                }
+                let task = pseudo_get(vm, this_h, P_FT_TASK).unwrap_or(V::Ref(0));
+                let callable = matches!(pseudo_get(vm, this_h, P_FT_CALLABLE), Some(V::I32(1)));
+                let result = if callable {
+                    match task {
+                        V::Ref(t) if t != 0 => vm.call_virtual_rt(t, "call", &[])?,
+                        _ => None,
+                    }
+                } else {
+                    if let V::Ref(t) = task {
+                        if t != 0 {
+                            vm.call_virtual_rt(t, "run", &[])?;
+                        }
+                    }
+                    Some(pseudo_get(vm, this_h, P_FT_DEFAULT).unwrap_or(V::Ref(0)))
+                };
+                pseudo_set(
+                    vm,
+                    this_h,
+                    P_FT_RESULT,
+                    result.unwrap_or(pseudo_get(vm, this_h, P_FT_DEFAULT).unwrap_or(V::Ref(0))),
+                );
+                pseudo_set(vm, this_h, P_FUTURE_DONE, V::I32(1));
+                // FutureTask.run finishes through the virtual done() hook;
+                // Lottie's subclass uses it to publish the composition.
+                let _ = vm.call_virtual_rt(this_h, "done", &[])?;
+                Some(None)
+            }
+            "get" => {
+                let v = pseudo_get(vm, this_h, P_FT_RESULT).unwrap_or(V::Ref(0));
+                Some(Some(v))
+            }
+            "isDone" => Some(Some(V::I32(matches!(
+                pseudo_get(vm, this_h, P_FUTURE_DONE),
+                Some(V::I32(1))
+            ) as i32))),
+            "isCancelled" => Some(Some(V::I32(matches!(
+                pseudo_get(vm, this_h, P_FT_CANCELLED),
+                Some(V::I32(1))
+            ) as i32))),
+            "cancel" => {
+                if matches!(pseudo_get(vm, this_h, P_FUTURE_DONE), Some(V::I32(1))) {
+                    return Ok(Some(Some(V::I32(0))));
+                }
+                pseudo_set(vm, this_h, P_FT_CANCELLED, V::I32(1));
+                pseudo_set(vm, this_h, P_FUTURE_DONE, V::I32(1));
+                let _ = vm.call_virtual_rt(this_h, "done", &[])?;
+                Some(Some(V::I32(1)))
+            }
+            "done" => Some(None),
+            _ => None,
+        }
     } else if class == "Ljava/util/concurrent/TimeUnit;" {
         match name {
             // `dst.convert(d, src)` — real unit math (kotlin.time

@@ -210,6 +210,11 @@ pub(crate) const P_FUTURE: u64 = 0xFFFD_FEFC;
 pub(crate) const P_FUTURE_CALLABLE: u64 = 0xFFFD_FEFD;
 pub(crate) const P_FUTURE_DONE: u64 = 0xFFFD_FEFE;
 pub(crate) const P_FUTURE_LISTENERS: u64 = 0xFFFD_FEFF;
+pub(crate) const P_FT_TASK: u64 = 0xFFFD_FE20;
+pub(crate) const P_FT_RESULT: u64 = 0xFFFD_FE21;
+pub(crate) const P_FT_DEFAULT: u64 = 0xFFFD_FE22;
+pub(crate) const P_FT_CALLABLE: u64 = 0xFFFD_FE23;
+pub(crate) const P_FT_CANCELLED: u64 = 0xFFFD_FE24;
 
 pub(crate) fn now_ms() -> i64 {
     std::time::SystemTime::now()
@@ -496,7 +501,42 @@ fn complete_host_future(vm: &mut Vm, future: u32, value: V) {
     }
 }
 
+fn future_task_run(vm: &mut Vm, r: u32) -> std::result::Result<Option<V>, ovelo_error::OveloError> {
+    if matches!(pseudo_get(vm, r, P_FUTURE_DONE), Some(V::I32(1)))
+        || matches!(pseudo_get(vm, r, P_FT_CANCELLED), Some(V::I32(1)))
+    {
+        return Ok(None);
+    }
+    let task = pseudo_get(vm, r, P_FT_TASK).unwrap_or(V::Ref(0));
+    let callable = matches!(pseudo_get(vm, r, P_FT_CALLABLE), Some(V::I32(1)));
+    let result = if callable {
+        match task {
+            V::Ref(t) if t != 0 => vm.call_virtual(t, "call", &[])?,
+            _ => None,
+        }
+    } else {
+        if let V::Ref(t) = task {
+            if t != 0 {
+                vm.call_virtual(t, "run", &[])?;
+            }
+        }
+        Some(pseudo_get(vm, r, P_FT_DEFAULT).unwrap_or(V::Ref(0)))
+    };
+    pseudo_set(
+        vm,
+        r,
+        P_FT_RESULT,
+        result.unwrap_or(pseudo_get(vm, r, P_FT_DEFAULT).unwrap_or(V::Ref(0))),
+    );
+    pseudo_set(vm, r, P_FUTURE_DONE, V::I32(1));
+    let _ = vm.call_virtual(r, "done", &[])?;
+    Ok(None)
+}
+
 fn dispatch_task(vm: &mut Vm, r: u32) -> std::result::Result<Option<V>, ovelo_error::OveloError> {
+    if pseudo_get(vm, r, P_FT_TASK).is_some() {
+        return future_task_run(vm, r);
+    }
     if let Some(V::Ref(target)) = pseudo_get(vm, r, P_FUTURE_TARGET) {
         let callable = matches!(pseudo_get(vm, r, P_FUTURE_CALLABLE), Some(V::I32(1)));
         let result = if callable {
@@ -3230,6 +3270,15 @@ pub(crate) fn host_supers(d: &str) -> &'static [&'static str] {
         | "Ljava/util/concurrent/Callable;"
         | "Ljava/util/concurrent/Future;"
         | "Ljava/util/concurrent/BlockingQueue;" => &[OBJ],
+        "Ljava/util/concurrent/FutureTask;" => &[
+            "Ljava/util/concurrent/RunnableFuture;",
+            "Ljava/util/concurrent/Future;",
+            "Ljava/lang/Runnable;",
+            OBJ,
+        ],
+        "Ljava/util/concurrent/RunnableFuture;" => {
+            &["Ljava/util/concurrent/Future;", "Ljava/lang/Runnable;", OBJ]
+        }
         "Ljava/util/Iterator;"
         | "Ljava/util/Enumeration;"
         | "Ljava/util/Comparator;"
