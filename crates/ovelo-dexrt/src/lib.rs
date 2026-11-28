@@ -2178,7 +2178,7 @@ impl Vm {
             }
         };
         if self.depth == 0 {
-            self.drain_runnables(500);
+            self.drain_runnables(8);
         }
         out
     }
@@ -2205,7 +2205,7 @@ impl Vm {
         a.extend_from_slice(&eff_args);
         let out = self.invoke(midx, a, InvokeKind::Virtual);
         if self.depth == 0 {
-            self.drain_runnables(500);
+            self.drain_runnables(8);
         }
         out
     }
@@ -3805,7 +3805,7 @@ impl Vm {
             }
         };
         if self.depth == 0 {
-            self.drain_runnables(500);
+            self.drain_runnables(8);
         }
         out
     }
@@ -5297,7 +5297,7 @@ impl Vm {
             }
         };
         if self.depth == 0 {
-            self.drain_runnables(500);
+            self.drain_runnables(8);
         }
         out
     }
