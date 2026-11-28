@@ -598,7 +598,19 @@ impl GuestUi {
             "Landroidx/compose/ui/graphics/InlineClassHelperKt;",
             "throwIllegalArgumentException",
             "(Ljava/lang/String;)V",
-            Rc::new(RefCell::new(|_vm: &mut Vm, _a: &[V]| Ok(None))) as HostCall,
+            Rc::new(RefCell::new(|vm: &mut Vm, a: &[V]| {
+                if std::env::var_os("OVELO_COMPOSEDBG").is_some() {
+                    let msg = match a.first() {
+                        Some(V::Ref(h)) => match vm.heap().get(*h) {
+                            Some(ovelo_dexrt::Obj::Str(s)) => s.clone(),
+                            _ => format!("{:?}", a.first()),
+                        },
+                        other => format!("{other:?}"),
+                    };
+                    eprintln!("[composedbg] suppressed compose error: {msg}");
+                }
+                Ok(None)
+            })) as HostCall,
         );
         // Fragment host callbacks are only partially modeled; once a
         // fragment transaction reaches onGetLayoutInflater, returning
@@ -643,7 +655,19 @@ impl GuestUi {
             "Landroidx/compose/runtime/ComposerKt;",
             "composeImmediateRuntimeError",
             "(Ljava/lang/String;)V",
-            Rc::new(RefCell::new(|_vm: &mut Vm, _a: &[V]| Ok(None))) as HostCall,
+            Rc::new(RefCell::new(|vm: &mut Vm, a: &[V]| {
+                if std::env::var_os("OVELO_COMPOSEDBG").is_some() {
+                    let msg = match a.first() {
+                        Some(V::Ref(h)) => match vm.heap().get(*h) {
+                            Some(ovelo_dexrt::Obj::Str(s)) => s.clone(),
+                            _ => format!("{:?}", a.first()),
+                        },
+                        other => format!("{other:?}"),
+                    };
+                    eprintln!("[composedbg] suppressed compose error: {msg}");
+                }
+                Ok(None)
+            })) as HostCall,
         );
         // ---- constructors -------------------------------------------------
         Self::ctor(ui, vm, "Landroid/view/View;", |_ui| {
