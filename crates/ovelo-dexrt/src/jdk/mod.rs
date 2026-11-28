@@ -1575,7 +1575,7 @@ pub(crate) fn map_get(vm: &mut Vm, h: u32, k: V) -> Option<V> {
 pub(crate) fn map_put(vm: &mut Vm, h: u32, k: V, v: V) -> Option<V> {
     let pos = map_key_pos(vm, h, k);
     let m = map_mut(vm, h)?;
-    if let Some(i) = pos {
+    if let Some(i) = pos.filter(|i| *i < m.len()) {
         return Some(std::mem::replace(&mut m[i].1, v));
     }
     m.push((k, v));
@@ -1585,6 +1585,9 @@ pub(crate) fn map_put(vm: &mut Vm, h: u32, k: V, v: V) -> Option<V> {
 pub(crate) fn map_remove(vm: &mut Vm, h: u32, k: V) -> Option<V> {
     let i = map_key_pos(vm, h, k)?;
     let m = map_mut(vm, h)?;
+    if i >= m.len() {
+        return None;
+    }
     Some(m.remove(i).1)
 }
 
