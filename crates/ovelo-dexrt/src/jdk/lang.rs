@@ -67,36 +67,27 @@ pub(crate) fn call(
             // single recycled object instead of minting millions.
             "poll" => Some(Some(V::Ref(0))),
             "remove" => {
-                let this = args.first().copied().unwrap_or(V::Ref(0));
-                let cached = if let V::Ref(q) = this {
-                    match vm.heap.get(q) {
-                        Some(Obj::Host {
-                            state: HostState::Slot(v),
-                            ..
-                        }) if !matches!(v, V::Ref(0) | V::I32(0)) => Some(*v),
-                        Some(Obj::Host { .. }) => {
-                            let r = vm.alloc_host(
-                                "Ljava/lang/ref/Reference;",
-                                HostState::Slot(V::Ref(0)),
-                            );
-                            if let Some(Obj::Host { state, .. }) = vm.heap.get_mut(q) {
-                                *state = HostState::Slot(V::Ref(r));
-                            }
-                            Some(V::Ref(r))
-                        }
-                        _ => None,
-                    }
-                } else {
-                    None
+                // No host-GC reference is ever enqueued. The faithful
+                // blocking state is therefore a long sleep, not a cached
+                // base-class Reference: Glide's cleaner casts remove()'s
+                // result to its own reference subclass, and the recycled
+                // dummy object crashes that watcher thread. Sleeping the
+                // cooperative runnable is harmless here because re-running
+                // the watcher just blocks in remove() again.
+                let timeout = match args.get(1).copied() {
+                    Some(V::I64(ms)) => ms.max(1),
+                    Some(V::I32(ms)) => (ms as i64).max(1),
+                    _ => 60_000,
                 };
-                match cached {
-                    Some(v) => Some(Some(v)),
-                    _ => {
-                        let r =
-                            vm.alloc_host("Ljava/lang/ref/Reference;", HostState::Slot(V::Ref(0)));
-                        Some(Some(V::Ref(r)))
-                    }
+                if vm.cur_runnable != 0 {
+                    vm.sleep_until.insert(
+                        vm.cur_runnable,
+                        (now_ms().saturating_add(timeout)).max(0) as u64,
+                    );
+                    vm.park_waiters.insert(vm.cur_runnable);
+                    return Err(crate::E::Vm(crate::err("ovelo.park")));
                 }
+                Some(Some(V::Ref(0)))
             }
             _ => None,
         }
