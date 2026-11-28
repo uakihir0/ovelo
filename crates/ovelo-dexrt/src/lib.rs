@@ -6473,20 +6473,40 @@ impl Vm {
 
     /// Coerce a register value to a field's declared primitive type.
     pub(crate) fn coerce_field_value(&self, f: GIdx, v: V) -> V {
-        match self.field_type_desc(f).as_deref() {
-            Some("F") => match v {
+        // Reflective writers pass boxed primitives (`Integer`, `Boolean`,
+        // …) while direct `iput` carries the primitive register value.
+        // Primitive dex fields must never retain the box object itself;
+        // object fields still need the original reference.
+        let desc = self.field_type_desc(f);
+        let primitive = matches!(
+            desc.as_deref(),
+            Some("B" | "S" | "I" | "J" | "F" | "D" | "Z" | "C")
+        );
+        if !primitive {
+            return v;
+        }
+        let unboxed = match v {
+            V::Ref(h) if h != 0 => crate::jdk::slot_of(self, h).unwrap_or(v),
+            x => x,
+        };
+        match desc.as_deref() {
+            Some("F") => match unboxed {
                 V::I32(b) => V::F32(f32::from_bits(b as u32)),
                 x => x,
             },
-            Some("D") => match v {
+            Some("D") => match unboxed {
                 V::I64(b) => V::F64(f64::from_bits(b as u64)),
                 x => x,
             },
-            Some("J") => match v {
+            Some("J") => match unboxed {
                 V::I32(b) => V::I64(b as i64),
                 x => x,
             },
-            _ => v,
+            Some("I" | "B" | "S" | "C" | "Z") => match unboxed {
+                V::I64(x) => V::I32(x as i32),
+                x => x,
+            },
+            _ => unboxed,
         }
     }
 

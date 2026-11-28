@@ -3877,7 +3877,8 @@ fn reflect_call(
                 "set" | "setInt" | "setLong" | "setBoolean" | "setByte" | "setShort"
                 | "setChar" | "setFloat" | "setDouble" => {
                     let obj = args.get(1).copied().unwrap_or(V::Ref(0));
-                    let v = args.get(2).copied().unwrap_or(V::Ref(0));
+                    let raw = args.get(2).copied().unwrap_or(V::Ref(0));
+                    let v = vm.coerce_field_value(fid as crate::GIdx, raw);
                     if let V::Ref(oh) = obj {
                         if let Some(f) = fields_mut(vm, oh) {
                             f.insert(fid, v);

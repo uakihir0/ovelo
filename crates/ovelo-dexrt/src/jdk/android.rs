@@ -409,6 +409,23 @@ pub(crate) fn call(
 ) -> Rt<Option<Option<V>>> {
     Ok(if class == "Landroid/util/Log;" {
         log_call(vm, name, args)
+    } else if class == "Landroid/telephony/PhoneNumberUtils;" {
+        // Keep the input number when no locale formatter exists; returning
+        // a stub object makes Fossify render blank phone rows.
+        match name {
+            "formatNumber"
+            | "normalizeNumber"
+            | "stripSeparators"
+            | "extractNetworkPortion"
+            | "extractPostPortion" => Some(Some(args[0])),
+            "isNonSeparator" => Some(Some(V::I32(
+                sv(vm, args[0])
+                    .and_then(|t| t.chars().next())
+                    .is_some_and(|c| c.is_ascii_alphanumeric() || c == '*') as i32,
+            ))),
+            "isReallyDialable" => Some(Some(V::I32(1))),
+            _ => None,
+        }
     } else if class == "Landroid/widget/Toast;" {
         match name {
             "makeText" => Some(Some(view::toast_make(vm, args))),
