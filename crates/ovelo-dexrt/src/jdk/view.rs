@@ -2917,23 +2917,27 @@ pub(crate) fn call(
             })
         }
         "performClick" | "callOnClick" => {
-            if let (Some(V::Ref(dialog)), Some(which_v)) = (
-                pseudo_get(vm, this, P_DIALOG_BUTTON_DIALOG),
-                pseudo_get(vm, this, P_DIALOG_BUTTON_WHICH),
-            ) {
-                let which = i32v(which_v);
-                let listener = if which == -1 {
-                    pseudo_get(vm, dialog, P_DIALOG_POS_LISTENER)
-                } else {
-                    pseudo_get(vm, dialog, P_DIALOG_NEG_LISTENER)
-                };
-                if let Some(V::Ref(l)) = listener {
-                    if l != 0 {
-                        let _ = vm.call_virtual(l, "onClick", &[V::Ref(dialog), V::I32(which)]);
+            let has_custom_click_listener =
+                matches!(pseudo_get(vm, this, P_LISTENER), Some(V::Ref(l)) if l != 0);
+            if !has_custom_click_listener {
+                if let (Some(V::Ref(dialog)), Some(which_v)) = (
+                    pseudo_get(vm, this, P_DIALOG_BUTTON_DIALOG),
+                    pseudo_get(vm, this, P_DIALOG_BUTTON_WHICH),
+                ) {
+                    let which = i32v(which_v);
+                    let listener = if which == -1 {
+                        pseudo_get(vm, dialog, P_DIALOG_POS_LISTENER)
+                    } else {
+                        pseudo_get(vm, dialog, P_DIALOG_NEG_LISTENER)
+                    };
+                    if let Some(V::Ref(l)) = listener {
+                        if l != 0 {
+                            let _ = vm.call_virtual(l, "onClick", &[V::Ref(dialog), V::I32(which)]);
+                        }
                     }
+                    dialog_dismiss(vm, dialog);
+                    return Ok(Some(Some(V::I32(1))));
                 }
-                dialog_dismiss(vm, dialog);
-                return Ok(Some(Some(V::I32(1))));
             }
             let desc = class_of(vm, V::Ref(this));
             if is_compound_desc(vm, &desc) {
@@ -9777,6 +9781,84 @@ fn dialog_button(vm: &mut Vm, dialog: u32, which: i32, label: &str) -> u32 {
     b
 }
 
+fn declared_button_fields(vm: &Vm, h: u32) -> Vec<crate::GIdx> {
+    let desc = class_of(vm, V::Ref(h));
+    let Some(ty) = vm.type_index_of(&desc) else {
+        return Vec::new();
+    };
+    let Some((cg, _)) = vm.def_loc_of(ty) else {
+        return Vec::new();
+    };
+    let Ok(Some(cd)) = vm.class_data_of(cg) else {
+        return Vec::new();
+    };
+    cd.instance_fields
+        .iter()
+        .map(|f| crate::gx(crate::gd(cg), f.field_idx))
+        .filter(|g| vm.field_type_desc(*g).as_deref() == Some("Landroid/widget/Button;"))
+        .map(|g| vm.canon_field(g))
+        .collect()
+}
+
+fn link_alert_controller_buttons(
+    vm: &mut Vm,
+    h: u32,
+    positive: u32,
+    negative: u32,
+    depth: usize,
+    seen: &mut std::collections::HashSet<u32>,
+) -> bool {
+    if h == 0 || depth > 5 || !seen.insert(h) {
+        return false;
+    }
+    let buttons = declared_button_fields(vm, h);
+    if buttons.len() >= 3 {
+        if let Some(fields) = fields_mut(vm, h) {
+            if positive != 0 {
+                fields.insert(buttons[0], V::Ref(positive));
+            }
+            if negative != 0 {
+                fields.insert(buttons[1], V::Ref(negative));
+            }
+        }
+        return true;
+    }
+    let vals: Vec<V> = match vm.heap.get(h) {
+        Some(Obj::Instance { fields, .. }) | Some(Obj::Host { fields, .. }) => {
+            fields.values().copied().collect()
+        }
+        _ => Vec::new(),
+    };
+    for v in vals {
+        if let V::Ref(ch) = v {
+            if ch != 0 && link_alert_controller_buttons(vm, ch, positive, negative, depth + 1, seen)
+            {
+                return true;
+            }
+        }
+    }
+    false
+}
+
+/// Existing synthetic AlertDialog button for `Dialog.getButton`.
+pub(crate) fn dialog_button_ref(vm: &Vm, dialog: u32, which: i32) -> u32 {
+    let panel = match pseudo_get(vm, dialog, P_DIALOG_PANEL) {
+        Some(V::Ref(p)) if p != 0 => p,
+        _ => return 0,
+    };
+    children(vm, panel)
+        .into_iter()
+        .find_map(|v| match v {
+            V::Ref(h)
+                if h != 0 && pseudo_get(vm, h, P_DIALOG_BUTTON_WHICH).map(i32v) == Some(which) =>
+            {
+                Some(h)
+            }
+            _ => None,
+        })
+        .unwrap_or(0)
+}
+
 fn layout_dialog_buttons(vm: &mut Vm, root: u32, width: i32, height: i32) {
     let buttons: Vec<u32> = children(vm, root)
         .into_iter()
@@ -10072,18 +10154,30 @@ pub(crate) fn dialog_show(vm: &mut Vm, dialog: u32) {
         neg_label.clone()
     };
     let mut any_buttons = false;
+    let mut positive_button = 0;
+    let mut negative_button = 0;
     if positive_label.is_some() || pos_listener != 0 {
         let label = positive_label.as_deref().unwrap_or("OK");
         let button = dialog_button(vm, dialog, -1, label);
         attach_at(vm, root, V::Ref(button), None, false, None);
+        positive_button = button;
         any_buttons = true;
     }
     if negative_label.is_some() || neg_listener != 0 {
         let label = negative_label.as_deref().unwrap_or("Cancel");
         let button = dialog_button(vm, dialog, -2, label);
         attach_at(vm, root, V::Ref(button), None, false, None);
+        negative_button = button;
         any_buttons = true;
     }
+    link_alert_controller_buttons(
+        vm,
+        dialog,
+        positive_button,
+        negative_button,
+        0,
+        &mut std::collections::HashSet::new(),
+    );
     pseudo_set(vm, root, P_DIALOG_HAS_BUTTONS, V::I32(any_buttons as i32));
     pseudo_set(vm, root, P_DIALOG_CONTENT, V::Ref(content));
     let parent = activity_content(vm, vm.cur_activity).unwrap_or(0);

@@ -4045,6 +4045,14 @@ fn dialog_call(vm: &mut Vm, name: &str, args: &[V]) -> Rt<Option<Option<V>>> {
             Some(V::Ref(hit))
         }
         "isShowing" | "isCancelable" => Some(V::I32(1)),
+        "getButton" => {
+            let this = match args.first() {
+                Some(V::Ref(h)) => *h,
+                _ => 0,
+            };
+            let which = i32v(args.get(1).copied().unwrap_or(V::I32(0)));
+            Some(V::Ref(view::dialog_button_ref(vm, this, which)))
+        }
         "show" => {
             if let Some(V::Ref(this)) = args.first().copied() {
                 view::dialog_show(vm, this);

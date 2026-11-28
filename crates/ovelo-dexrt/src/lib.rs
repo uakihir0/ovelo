@@ -3863,7 +3863,7 @@ impl Vm {
         self.def_loc_of(class_idx).map(|(_, d)| d)
     }
 
-    fn class_data_of(&self, class_idx: GIdx) -> Result<Option<std::rc::Rc<ClassData>>> {
+    pub(crate) fn class_data_of(&self, class_idx: GIdx) -> Result<Option<std::rc::Rc<ClassData>>> {
         match self.def_loc_of(class_idx) {
             Some((cg, d)) => Ok(Some(
                 self.dex_of(cg)
