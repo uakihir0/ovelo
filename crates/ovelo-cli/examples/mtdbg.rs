@@ -94,6 +94,10 @@ fn main() {
                             if let Ok(td) = dex.type_descriptor(ix) {
                                 line += &format!(" -> type {td}");
                             }
+                        } else if n.starts_with("const-string") {
+                            if let Ok(sv) = dex.string(ix) {
+                                line += &format!(" -> string {sv:?}");
+                            }
                         } else if n.starts_with("iget")
                             || n.starts_with("iput")
                             || n.starts_with("sget")
