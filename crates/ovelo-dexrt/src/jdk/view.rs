@@ -1627,10 +1627,12 @@ pub(crate) fn call(
         | "getFrameDeadlineNanos"
             if class == CHOR =>
         {
+            // Frame timestamps share the monotonic nanoTime origin passed to
+            // doFrame; wall-clock epoch nanos make animation deltas negative.
             let t = if name == "getFrameTime" {
-                now_ms()
+                now_mono_ms()
             } else {
-                now_ms() * 1_000_000
+                now_nanos()
             };
             Some(Some(V::I64(t)))
         }
