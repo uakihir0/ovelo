@@ -4,6 +4,8 @@
 use super::*;
 use crate::value::{HostState, Obj, V};
 
+const P_REFQ_DEADLINE: u32 = u32::MAX - 402;
+
 pub(crate) fn call(
     vm: &mut Vm,
     class: &str,
@@ -74,18 +76,39 @@ pub(crate) fn call(
                 // dummy object crashes that watcher thread. Sleeping the
                 // cooperative runnable is harmless here because re-running
                 // the watcher just blocks in remove() again.
-                let timeout = match args.get(1).copied() {
-                    Some(V::I64(ms)) => ms.max(1),
-                    Some(V::I32(ms)) => (ms as i64).max(1),
-                    _ => 60_000,
-                };
-                if vm.cur_runnable != 0 {
-                    vm.sleep_until.insert(
-                        vm.cur_runnable,
-                        (now_ms().saturating_add(timeout)).max(0) as u64,
-                    );
-                    vm.park_waiters.insert(vm.cur_runnable);
-                    return Err(crate::E::Vm(crate::err("ovelo.park")));
+                let timeout = args.get(1).copied().map(|v| i64v(v).max(1));
+                let now = now_ms();
+                if let V::Ref(q) = args.first().copied().unwrap_or(V::Ref(0)) {
+                    if q != 0 {
+                        if let Some(ms) = timeout {
+                            let key = P_REFQ_DEADLINE;
+                            let due = match pseudo_get(vm, q, key) {
+                                Some(v) => i64v(v),
+                                None => {
+                                    let due = now.saturating_add(ms);
+                                    pseudo_set(vm, q, key, V::I64(due));
+                                    due
+                                }
+                            };
+                            if now < due {
+                                if vm.cur_runnable != 0 {
+                                    vm.sleep_until.insert(vm.cur_runnable, due.max(0) as u64);
+                                    vm.park_waiters.insert(vm.cur_runnable);
+                                    return Err(crate::E::Vm(crate::err("ovelo.park")));
+                                }
+                            } else {
+                                if let Some(f) = fields_mut(vm, q) {
+                                    f.remove(&(key as u64));
+                                }
+                                return Ok(Some(Some(V::Ref(0))));
+                            }
+                        } else if vm.cur_runnable != 0 {
+                            vm.sleep_until
+                                .insert(vm.cur_runnable, now.saturating_add(60_000).max(0) as u64);
+                            vm.park_waiters.insert(vm.cur_runnable);
+                            return Err(crate::E::Vm(crate::err("ovelo.park")));
+                        }
+                    }
                 }
                 Some(Some(V::Ref(0)))
             }
