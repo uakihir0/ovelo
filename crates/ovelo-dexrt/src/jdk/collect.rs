@@ -1685,7 +1685,42 @@ fn map_call(vm: &mut Vm, name: &str, sig: &str, args: &[V]) -> Rt<Option<Option<
             // copy the destination starts empty and callers iterate
             // nothing (navigation NavigatorProvider attach loop).
             if let Some(V::Ref(sh)) = args.get(1).copied() {
-                for (k, v) in map_pairs_of(vm, sh) {
+                let mut pairs = map_pairs_of(vm, sh);
+                if pairs.is_empty() && matches!(vm.heap.get(sh), Some(Obj::Instance { .. })) {
+                    // Kotlin's immutable MapBuilder keeps entries in dex-side
+                    // arrays, so host backing-store scans see nothing. Copy
+                    // constructors still receive it as a Map; enumerate it
+                    // through the guest entrySet contract instead.
+                    if let Ok(Some(V::Ref(entries))) = vm.call_virtual(sh, "entrySet", &[]) {
+                        if let Ok(Some(V::Ref(it))) = vm.call_virtual(entries, "iterator", &[]) {
+                            for _ in 0..10000 {
+                                let more = matches!(
+                                    vm.call_virtual(it, "hasNext", &[]),
+                                    Ok(Some(v)) if i32v(v) != 0
+                                );
+                                if !more {
+                                    break;
+                                }
+                                let Ok(Some(V::Ref(entry))) = vm.call_virtual(it, "next", &[])
+                                else {
+                                    break;
+                                };
+                                let key = vm
+                                    .call_virtual(entry, "getKey", &[])
+                                    .ok()
+                                    .flatten()
+                                    .unwrap_or(V::Ref(0));
+                                let value = vm
+                                    .call_virtual(entry, "getValue", &[])
+                                    .ok()
+                                    .flatten()
+                                    .unwrap_or(V::Ref(0));
+                                pairs.push((key, value));
+                            }
+                        }
+                    }
+                }
+                for (k, v) in pairs {
                     map_put(vm, h, k, v);
                 }
             }
@@ -1761,6 +1796,17 @@ fn map_call(vm: &mut Vm, name: &str, sig: &str, args: &[V]) -> Rt<Option<Option<
         | "putStringArray"
         | "putParcelableArray"
         | "putCharSequenceArray" => {
+            if crate::dbg_flag("OVELO_MAPDBG") {
+                let ks = s(
+                    vm,
+                    match args[1] {
+                        V::Ref(h2) => h2,
+                        _ => 0,
+                    },
+                )
+                .unwrap_or_else(|| format!("{:?}", args[1]));
+                eprintln!("[map] typed-put h={h} {name} key={ks}");
+            }
             map_put(vm, h, args[1], args[2]);
             Some(None)
         }
