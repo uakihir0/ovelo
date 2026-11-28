@@ -641,7 +641,12 @@ fn canvas_call(vm: &mut Vm, name: &str, sig: &str, args: &[V]) -> Rt<Option<Opti
         }
         "scale" => {
             let (sx, sy) = (flt(arg(args, 1)), flt(arg(args, 2)));
-            let m = mat_op("Scale", sx, sy, 0.0, 0.0);
+            let (px, py) = if args.len() >= 5 {
+                (flt(arg(args, 3)), flt(arg(args, 4)))
+            } else {
+                (0.0, 0.0)
+            };
+            let m = mat_op("Scale", sx, sy, px, py);
             if let V::Ref(h) = this {
                 let cur = mat_read(vm, h);
                 mat_write(vm, h, mat_mul(cur, m));
@@ -651,7 +656,12 @@ fn canvas_call(vm: &mut Vm, name: &str, sig: &str, args: &[V]) -> Rt<Option<Opti
         }
         "rotate" => {
             let deg = flt(arg(args, 1));
-            let m = mat_op("Rotate", deg, 0.0, 0.0, 0.0);
+            let (px, py) = if args.len() >= 4 {
+                (flt(arg(args, 2)), flt(arg(args, 3)))
+            } else {
+                (0.0, 0.0)
+            };
+            let m = mat_op("Rotate", deg, 0.0, px, py);
             if let V::Ref(h) = this {
                 let cur = mat_read(vm, h);
                 mat_write(vm, h, mat_mul(cur, m));
@@ -1517,7 +1527,7 @@ fn mat_op(kind: &str, a1: f32, a2: f32, px: f32, py: f32) -> [f32; 6] {
             let (s, c) = a1.to_radians().sin_cos();
             [c, -s, 0.0, s, c, 0.0]
         }
-        "Skew" => [1.0, a1.tan(), 0.0, a2.tan(), 1.0, 0.0],
+        "Skew" => [1.0, a1, 0.0, a2, 1.0, 0.0],
         _ => [1.0, 0.0, 0.0, 0.0, 1.0, 0.0],
     };
     if px != 0.0 || py != 0.0 {
