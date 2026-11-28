@@ -6462,8 +6462,28 @@ impl Vm {
         Some(v)
     }
 
+    /// Coerce a register value to a field's declared primitive type.
+    pub(crate) fn coerce_field_value(&self, f: GIdx, v: V) -> V {
+        match self.field_type_desc(f).as_deref() {
+            Some("F") => match v {
+                V::I32(b) => V::F32(f32::from_bits(b as u32)),
+                x => x,
+            },
+            Some("D") => match v {
+                V::I64(b) => V::F64(f64::from_bits(b as u64)),
+                x => x,
+            },
+            Some("J") => match v {
+                V::I32(b) => V::I64(b as i64),
+                x => x,
+            },
+            _ => v,
+        }
+    }
+
     /// Write a static like the `sput` opcode.
     pub(crate) fn sput_pub(&mut self, f: GIdx, v: V) {
+        let v = self.coerce_field_value(f, v);
         let f = self.canon_field(f);
         let owner = self
             .dex_of(f)
@@ -7510,9 +7530,10 @@ impl Vm {
                         self.describe_method(fr.loc.midx)
                     );
                 }
+                let iv = self.coerce_field_value(f, r(0)?);
                 let message_obj = match self.heap.get_mut(h) {
                     Some(Obj::Instance { fields, .. }) | Some(Obj::Host { fields, .. }) => {
-                        fields.insert(f, r(0)?);
+                        fields.insert(f, iv);
                         matches!(
                             self.heap.get(h),
                             Some(Obj::Host { desc, .. }) if desc == "Landroid/os/Message;"
