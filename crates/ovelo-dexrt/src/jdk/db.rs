@@ -439,9 +439,13 @@ pub(crate) fn media_cursor(vm: &mut Vm, uri: &str, projection: &[String]) -> V {
         // A scoped volume (images/video/audio) filters by media
         // type; "file"/"media" volumes accept everything.
         let wanted = if images {
-            mtype == 1
+            // Thumbnail tables are keyed by thumbnail rows, not media rows.
+            // Until ovelo models that table, an empty cursor is correct:
+            // returning the first image makes Glide use an unrelated file as
+            // the thumbnail for any requested media id.
+            mtype == 1 && !uri.contains("/thumbnails")
         } else if video {
-            mtype == 3
+            mtype == 3 && !uri.contains("/thumbnails")
         } else if audio {
             mtype == 2
         } else {
