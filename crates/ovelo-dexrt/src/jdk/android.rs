@@ -492,6 +492,7 @@ pub(crate) fn call(
         component_call(vm, name, args)?
     } else if class.starts_with("Landroid/media/Audio")
         || class.starts_with("Landroid/media/session/PlaybackState")
+        || class == "Landroid/media/MediaMetadataRetriever;"
     {
         audio_call(vm, class, name, args)?
     } else if class.starts_with("Landroid/media/MediaCodec")
@@ -807,6 +808,16 @@ pub(crate) fn call(
                         "[content] {name} uri={uri:?} path={path:?} bytes={}",
                         bytes.len()
                     );
+                }
+                let wants_image = name == "openTypedAssetFileDescriptor"
+                    && sv(vm, args.get(2).copied().unwrap_or(V::Ref(0)))
+                        .unwrap_or_default()
+                        .starts_with("image/");
+                if wants_image && image::load_from_memory(&bytes).is_err() {
+                    // An audio/media URI is not an image asset. In particular
+                    // Glide must fail this load rather than synthesize a
+                    // video frame or placeholder bitmap from the audio bytes.
+                    return Err(vm.throw_builtin("Ljava/io/FileNotFoundException;", &uri));
                 }
                 if bytes.is_empty() {
                     Some(Some(V::Ref(0)))
@@ -2650,6 +2661,18 @@ fn audio_call(vm: &mut Vm, class: &str, name: &str, args: &[V]) -> Rt<Option<Opt
             Some(Some(V::I32(1)))
         }
         "generateAudioSessionId" => Some(Some(V::I32(1))),
+        // There is no video decoder in the runtime. In particular an
+        // audio-only file must not produce a typed placeholder Bitmap:
+        // Glide treats that as a successful video frame and displays
+        // whatever bytes the placeholder pipeline later accumulates.
+        "getFrameAtTime" | "getScaledFrameAtTime" | "getFrameAtIndex"
+            if class == "Landroid/media/MediaMetadataRetriever;" =>
+        {
+            Some(Some(V::Ref(0)))
+        }
+        "getEmbeddedPicture" if class == "Landroid/media/MediaMetadataRetriever;" => {
+            Some(Some(V::Ref(0)))
+        }
         "build" if class == "Landroid/media/AudioFormat$Builder;" => {
             let v = host(vm, "Landroid/media/AudioFormat;", HostState::Empty);
             if let V::Ref(fh) = v {
@@ -8187,6 +8210,21 @@ fn graphics_call(
                 _ => V::Ref(0),
             }))
         }
+        ("Landroid/provider/MediaStore$Images$Media;", "getBitmap") => {
+            let uri = sv(vm, args.get(1).copied().unwrap_or(V::Ref(0))).unwrap_or_default();
+            let bytes = media_uri_path(vm, &uri)
+                .and_then(|p| std::fs::read(io::fspath(vm, &p)).ok())
+                .unwrap_or_default();
+            Some(bitmap_decode(vm, &bytes))
+        }
+        ("Landroid/media/ThumbnailUtils;", "createAudioThumbnail" | "createVideoThumbnail") => {
+            let path = sv(vm, args.first().copied().unwrap_or(V::Ref(0))).unwrap_or_default();
+            let bytes = std::fs::read(io::fspath(vm, &path)).unwrap_or_default();
+            Some(match audio_embedded_image(&bytes) {
+                Some(img) => bitmap_decode(vm, &img),
+                None => Some(V::Ref(0)),
+            })
+        }
         ("Landroid/graphics/BitmapFactory;", "decodeFile") => {
             let path = sv(vm, args[0]).unwrap_or_default();
             let bytes = std::fs::read(io::fspath(vm, &path)).unwrap_or_default();
@@ -8923,6 +8961,74 @@ fn bitmap_decode(vm: &mut Vm, bytes: &[u8]) -> Option<V> {
             rgba: std::rc::Rc::new(rgba.into_raw()),
         },
     ))
+}
+
+/// Embedded image bytes in an ID3v2 APIC frame, when present.
+/// WAV files and tagless audio have none; returning `None` lets the
+/// caller follow Android's no-artwork path instead of inventing pixels.
+fn audio_embedded_image(bytes: &[u8]) -> Option<Vec<u8>> {
+    if bytes.len() < 10 || &bytes[..3] != b"ID3" {
+        return None;
+    }
+    let major = bytes[3];
+    let syncsafe = |b: &[u8]| -> usize {
+        ((b[0] & 0x7f) as usize) << 21
+            | ((b[1] & 0x7f) as usize) << 14
+            | ((b[2] & 0x7f) as usize) << 7
+            | (b[3] & 0x7f) as usize
+    };
+    let tag_end = (10 + syncsafe(&bytes[6..10])).min(bytes.len());
+    let mut pos = 10usize;
+    // Skip an extended header when present.
+    if bytes[5] & 0x40 != 0 && pos + 4 <= tag_end {
+        let ext = if major == 3 {
+            u32::from_be_bytes(bytes[pos..pos + 4].try_into().ok()?) as usize
+        } else {
+            syncsafe(&bytes[pos..pos + 4])
+        };
+        pos = (pos + ext + usize::from(major == 3) * 4).min(tag_end);
+    }
+    while pos + 10 <= tag_end {
+        let id = &bytes[pos..pos + 4];
+        if id == [0, 0, 0, 0] {
+            break;
+        }
+        let size = if major == 4 {
+            syncsafe(&bytes[pos + 4..pos + 8])
+        } else {
+            u32::from_be_bytes(bytes[pos + 4..pos + 8].try_into().ok()?) as usize
+        };
+        let start = pos + 10;
+        let end = start.saturating_add(size).min(tag_end);
+        if id == b"APIC" && start + 4 < end {
+            let f = &bytes[start..end];
+            let encoding = f[0];
+            let mut i = 1usize;
+            while i < f.len() && f[i] != 0 {
+                i += 1;
+            }
+            i = (i + 2).min(f.len()); // MIME NUL + picture type
+                                      // Description is NUL-terminated; UTF-16 encodings use a
+                                      // two-byte terminator. Artwork almost always has an empty
+                                      // description, so scan conservatively for the terminator.
+            if matches!(encoding, 1 | 2) {
+                while i + 1 < f.len() && !(f[i] == 0 && f[i + 1] == 0) {
+                    i += 2;
+                }
+                i = (i + 2).min(f.len());
+            } else {
+                while i < f.len() && f[i] != 0 {
+                    i += 1;
+                }
+                i = (i + 1).min(f.len());
+            }
+            if i < end - start {
+                return Some(f[i..].to_vec());
+            }
+        }
+        pos = end.max(pos + 10);
+    }
+    None
 }
 
 /// Decode honoring `Options.inBitmap`: Glide's BitmapPool pre-allocates
